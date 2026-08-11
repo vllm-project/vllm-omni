@@ -49,23 +49,14 @@ def _load_module(name: str, filename: str):
 
 def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     """Build the dict of modules to inject into sys.modules."""
-    platforms_mock = mocker.MagicMock()
-    platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
-    platforms_mock.current_omni_platform.is_musa.return_value = False
-    platforms_mock.current_omni_platform.is_npu.return_value = False
 
     class NativeCustomOp(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self._forward_method = (
-                self.forward_musa if platforms_mock.current_omni_platform.is_musa() else self.forward_native
-            )
-
         def forward(self, *args, **kwargs):
-            return self._forward_method(*args, **kwargs)
-
-        def forward_musa(self, *args, **kwargs):
             return self.forward_native(*args, **kwargs)
+
+    platforms_mock = mocker.MagicMock()
+    platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
+    platforms_mock.current_omni_platform.is_npu.return_value = False
 
     logger_mock = mocker.MagicMock()
     logger_mock.init_logger = lambda name: mocker.MagicMock()
@@ -292,85 +283,6 @@ class TestCodePredictorDtypeAlignment:
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
-
-    def test_setup_compile_uses_compiled_forward_on_musa(self, mocker: MockerFixture, loaded_target_classes) -> None:
-        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
-        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
-        predictor = code_predictor_wrapper(
-            vllm_config=_make_vllm_config(mocker, max_num_seqs=2),
-            config=cp_config,
-            talker_config=talker_config,
-        )
-        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
-        mocker.patch.object(common_mod.current_omni_platform, "is_musa", return_value=True)
-        mocker.patch.object(common_mod.current_omni_platform, "supports_torch_inductor", return_value=True)
-        compiled_forward = mocker.MagicMock()
-        compile_mock = mocker.patch.object(common_mod.torch, "compile", return_value=compiled_forward)
-        warmup_mock = mocker.patch.object(predictor, "_warmup_buckets")
-
-        predictor._setup_compile()
-
-        assert predictor._compiled_model_fwd is compiled_forward
-        compile_mock.assert_called_once_with(
-            predictor.model.forward,
-            dynamic=False,
-            options={"epilogue_fusion": False},
-        )
-        warmup_mock.assert_called_once_with()
-
-    def test_rotary_native_forward_does_not_query_platform(
-        self,
-        mocker: MockerFixture,
-        loaded_target_classes,
-    ) -> None:
-        cp_config, _ = _make_tiny_config(loaded_target_classes)
-        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
-        is_musa_mock = mocker.patch.object(
-            common_mod.current_omni_platform,
-            "is_musa",
-            return_value=False,
-        )
-        rotary = common_mod._RotaryEmbedding(cp_config)
-        assert rotary._forward_method.__func__ is rotary.forward_native.__func__
-
-        is_musa_mock.reset_mock()
-        position_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
-        x = torch.zeros((2, 3, cp_config.hidden_size))
-        cos, sin = rotary.forward_native(x, position_ids)
-
-        is_musa_mock.assert_not_called()
-        freqs = position_ids.float().unsqueeze(-1) * rotary.inv_freq.view(1, 1, -1)
-        embedding = torch.cat((freqs, freqs), dim=-1)
-        torch.testing.assert_close(cos, embedding.cos())
-        torch.testing.assert_close(sin, embedding.sin())
-
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-    def test_rotary_musa_dispatch_matches_native_reference(
-        self,
-        mocker: MockerFixture,
-        loaded_target_classes,
-        dtype: torch.dtype,
-    ) -> None:
-        cp_config, _ = _make_tiny_config(loaded_target_classes)
-        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
-        mocker.patch.object(
-            common_mod.current_omni_platform,
-            "is_musa",
-            return_value=True,
-        )
-        rotary = common_mod._RotaryEmbedding(cp_config)
-        assert rotary._forward_method.__func__ is rotary.forward_musa.__func__
-
-        position_ids = torch.tensor([[0, 1, 2], [3, 4, 5]])
-        x = torch.zeros((2, 3, cp_config.hidden_size), dtype=dtype)
-
-        musa_cos, musa_sin = rotary(x, position_ids)
-        native_cos, native_sin = rotary.forward_native(x, position_ids)
-
-        assert musa_cos.dtype == dtype
-        assert musa_sin.dtype == dtype
-        torch.testing.assert_close(musa_cos, native_cos)
-        torch.testing.assert_close(musa_sin, native_sin)
 
     def test_forward_with_mismatched_input_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """forward() should not crash when inputs are float32 but model is float16."""
