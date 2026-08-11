@@ -150,6 +150,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._connector_config = {
+            "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
+            "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
+        }
+        if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
+            raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
+        raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
+        capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        self._hift_graph_config = {
+            "enabled": bool(extra.get("enable_hift_graph", False)),
+            "capture_batch_sizes": capture_batch_sizes,
+        }
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -727,18 +739,16 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
+        # In-tree adapter over StepAudio2Token2WavCore on every platform. It
+        # matches the external `stepaudio2-minicpmo` Token2wav bit-for-bit on
+        # CUDA (same cosyvoice2 flow/DiT modules and weights) while dropping
+        # that package's hard-coded `.cuda()` calls, and auto-applies the
+        # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
+        # on NPU.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav as Token2wav,
+        )
         from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
@@ -765,4 +775,31 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+
+        trt_stepper = None
+        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        # TensorRT is CUDA-only; other platforms ignore the toggle.
+        if use_trt and current_omni_platform.is_cuda():
+            from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
+
+            dtype_name = str(
+                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
+            ).lower()
+            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            max_batch = int(extra.get("token2wav_trt_max_batch", 16))
+            device = next(token2wav.flow.parameters()).device
+            trt_stepper = build_dit_trt_stepper(
+                token2wav.flow.decoder.estimator,
+                device=device,
+                dtype=trt_dtype,
+                max_batch=max_batch,
+            )
+            logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
+            token2wav.enable_trt_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            trt_stepper=trt_stepper,
+            connector_config=self._connector_config,
+            hift_graph_config=self._hift_graph_config,
+        )

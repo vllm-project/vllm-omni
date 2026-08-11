@@ -354,12 +354,11 @@ class _ProjectedTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.downsample_ratio: int = 1
-        # Upstream always materializes a learned Linear here regardless of
-        # whether input_dimension == d_model — substituting Identity when
-        # the dims happen to match silently drops a trained projection.
-        self.in_proj = nn.Linear(input_dimension, d_model, bias=False)
+        self.in_proj = nn.Linear(input_dimension, d_model, bias=False) if input_dimension != d_model else nn.Identity()
         self.transformer = _Transformer(d_model=d_model, **kwargs)
-        self.out_proj = nn.Linear(d_model, output_dimension, bias=False)
+        self.out_proj = (
+            nn.Linear(d_model, output_dimension, bias=False) if output_dimension != d_model else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.in_proj(x.transpose(1, 2))  # (B, D, T) → (B, T, d_model)

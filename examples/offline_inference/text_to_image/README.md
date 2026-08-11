@@ -43,6 +43,23 @@ This folder provides several entrypoints for experimenting with text-to-image di
 
 Default model: `Qwen/Qwen-Image`
 
+### LingBot-Video
+
+LingBot-Video uses the same checkpoint for image and video generation. Run the
+shared T2I entry point with:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a red fox standing in fresh snow" \
+  --height 192 --width 320 --num-inference-steps 2 \
+  --guidance-scale 3.0 --extra-body '{"flow_shift":3.0}' \
+  --output lingbot_t2i.png
+```
+
+The LingBot prompt builder selects the `image` output modality and requests one
+frame. Passing an input image is not supported in LingBot T2I mode.
+
 ## Quick Start
 
 ### Python API
@@ -260,7 +277,7 @@ if __name__ == "__main__":
     For diffusion pipelines, the input list is sliced into single-item requests
     before feeding into the diffusion pipeline. For request-level batching
     controls such as `max_num_seqs`, see
-    [Request-Level Batching](../../../docs/user_guide/diffusion/request_batching.md).
+    [Diffusion Execution Modes](../../../docs/user_guide/diffusion/execution_modes.md).
 
 ### Negative Prompts
 

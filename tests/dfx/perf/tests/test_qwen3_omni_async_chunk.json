@@ -44,27 +44,29 @@
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            96.4061,
-            140.8147,
-            271.9025,
-            362.2916,
-            507.776
-          ],
-          "mean_e2el_ms": [
-            18507.4582,
-            28365.4956,
-            31907.9613,
-            48161.5829,
-            72630.8601
-          ],
-          "mean_audio_rtf": [
-            0.1175,
-            0.18,
-            0.2359,
-            0.3278,
-            0.6296
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              96.4061,
+              140.8147,
+              271.9025,
+              362.2916,
+              507.776
+            ],
+            "mean_e2el_ms": [
+              18507.4582,
+              28365.4956,
+              31907.9613,
+              48161.5829,
+              72630.8601
+            ],
+            "mean_audio_rtf": [
+              0.1175,
+              0.18,
+              0.2359,
+              0.3278,
+              0.6296
+            ]
+          }
         }
       },
       {
@@ -91,15 +93,17 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            354.0951
-          ],
-          "mean_e2el_ms": [
-            3952.5615
-          ],
-          "mean_audio_rtf": [
-            0.117
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              354.0951
+            ],
+            "mean_e2el_ms": [
+              3952.5615
+            ],
+            "mean_audio_rtf": [
+              0.117
+            ]
+          }
         }
       },
       {
@@ -128,15 +132,17 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            259.6317
-          ],
-          "mean_e2el_ms": [
-            4253.3009
-          ],
-          "mean_audio_rtf": [
-            0.1448
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              259.6317
+            ],
+            "mean_e2el_ms": [
+              4253.3009
+            ],
+            "mean_audio_rtf": [
+              0.1448
+            ]
+          }
         }
       },
       {
@@ -167,15 +173,17 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            457.4453
-          ],
-          "mean_e2el_ms": [
-            5912.5623
-          ],
-          "mean_audio_rtf": [
-            0.1967
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              457.4453
+            ],
+            "mean_e2el_ms": [
+              5912.5623
+            ],
+            "mean_audio_rtf": [
+              0.1967
+            ]
+          }
         }
       },
       {
@@ -206,20 +214,22 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            90.8033,
-            202.1779,
-            326.5864,
-            544.8914,
-            961.3929
-          ],
-          "mean_e2el_ms": [
-            4517.3411,
-            7857.9711,
-            9861.1687,
-            13283.3363,
-            19541.0736
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              90.8033,
+              202.1779,
+              326.5864,
+              544.8914,
+              961.3929
+            ],
+            "mean_e2el_ms": [
+              4517.3411,
+              7857.9711,
+              9861.1687,
+              13283.3363,
+              19541.0736
+            ]
+          }
         }
       },
       {
@@ -251,12 +261,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            318.048
-          ],
-          "mean_e2el_ms": [
-            807.6114
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              318.048
+            ],
+            "mean_e2el_ms": [
+              807.6114
+            ]
+          }
         }
       },
       {
@@ -290,12 +302,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            186.168
-          ],
-          "mean_e2el_ms": [
-            726.1137
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              186.168
+            ],
+            "mean_e2el_ms": [
+              726.1137
+            ]
+          }
         }
       },
       {
@@ -331,12 +345,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            375.5282
-          ],
-          "mean_e2el_ms": [
-            1006.1663
-          ]
+          "H100": {
+            "mean_ttft_ms": [
+              375.5282
+            ],
+            "mean_e2el_ms": [
+              1006.1663
+            ]
+          }
         }
       }
     ]

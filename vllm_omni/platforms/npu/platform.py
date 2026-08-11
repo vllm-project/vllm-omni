@@ -130,6 +130,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -137,6 +138,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                     "FLASH_ATTN."
                 )
                 backend_upper = "FLASH_ATTN"
+
+            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
+                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
+                # forward, but CANN snapshots the custom-op registry at the
+                # first custom-op regInfo lookup in the process (e.g. a
+                # vllm-ascend custom op during model load/warmup). Import
+                # mindiesd here so its env.py prepends the mindiesd vendor
+                # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
+                # that snapshot; otherwise aclnnLaserAttention /
+                # FusedAttentionScore fail with EZ1001 "does not support
+                # opType" for the rest of the process.
+                import mindiesd  # noqa: F401
 
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
