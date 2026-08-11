@@ -1,19 +1,20 @@
 # MiniMax-H3 on RTX 4090
 
-This recipe uses BF16 weights, tiled VAE decode, tensor parallelism across two
-GPUs, and distributed layerwise offload (DLO). It is the 24 GiB sibling of
-[MiniMax-H3-5090.md](MiniMax-H3-5090.md): the topology is identical, but the
-resident DiT-block count is lower so the per-rank peak fits in 24 GiB. Lower
-resident counts reduce HBM use and increase CPU-to-GPU transfer time.
+This recipe uses BF16 weights, tiled VAE decode, tensor parallelism, optional
+Ulysses sequence parallelism, and distributed layerwise offload (DLO). It is the
+24 GiB sibling of [MiniMax-H3-5090.md](MiniMax-H3-5090.md): the two-GPU topology
+matches that recipe, but the resident DiT-block count is lower so the per-rank
+peak fits in 24 GiB. Lower resident counts reduce HBM use and increase
+CPU-to-GPU transfer time.
 
 ## Capacity requirements
 
-| Resource | Two RTX 4090s |
-| --- | ---: |
-| GPU HBM | 24 GiB per GPU |
-| Checkpoint storage | 135 GiB per partition |
-| Available system RAM | 200 GiB minimum |
-| Recommended system RAM | 384 GiB |
+| Resource | Two RTX 4090s | Four RTX 4090s |
+| --- | ---: | ---: |
+| GPU HBM | 24 GiB per GPU | 24 GiB per GPU |
+| Checkpoint storage | 135 GiB per partition | 135 GiB per partition |
+| Available system RAM | 200 GiB minimum | 200 GiB minimum |
+| Recommended system RAM | 384 GiB | 384 GiB |
 
 `FL2VA` and `Ref2VA` are separate 135 GiB checkpoint partitions. Start one
 server at a time. DLO keeps rank-local weights in pinned host memory; increasing
@@ -58,25 +59,65 @@ increase activation memory; begin with one request at a time.
 streams non-resident DiT blocks over PCIe on every denoising step, so a 60-step
 request takes several minutes and would otherwise hit the 600-second default.
 
+## Four RTX 4090s: 1024x576, 5 seconds
+
+Keep TP2 and raise Ulysses sequence parallel to 2 so the world size is
+`TP × USP = 4`. Text-encoder TP and VAE patch parallel follow the GPU count.
+Resident layers stay at 12: adding USP does not shard DiT weights further, so
+per-GPU peak HBM stays close to the two-GPU profile while wall-clock improves.
+
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
+  --omni --trust-remote-code --host 0.0.0.0 --port 8000 \
+  --num-gpus 4 --tensor-parallel-size 2 --text-encoder-tp-size 4 \
+  --usp 2 --ring 1 --vae-patch-parallel-size 4 \
+  --vae-parallel-mode tile --vae-use-tiling \
+  --enable-distributed-layerwise-offload --dlo-no-use-allgather \
+  --dlo-resident-layers 12 --enforce-eager \
+  --diffusion-attention-backend CUDNN_ATTN
+```
+
+For Ref2VA, stop the FL2VA server and restart the same command with
+`/path/to/MiniMax-H3/Ref2VA`. Pin four dedicated GPUs; if the launcher exposes
+fewer than four devices, startup fails with
+`Stage 0 requires 4 device(s) based on parallel_config`.
+
 ## Target-hardware validation
 
-Measured on 2 x RTX 4090 (24,564 MiB each, driver 580.126.09) with the serve
-command above, at vLLM-Omni `0.26.1.dev55+g81b48e83e`, vLLM `0.26.0`, and
-PyTorch `2.11.0+cu130`. Both GPUs were dedicated to this server. `Client E2E`
+Measured on RTX 4090 (24,564 MiB each, driver 580.126.09) with the serve
+commands above, at vLLM-Omni `0.26.1.dev55+g81b48e83e`, vLLM `0.26.0`, and
+PyTorch `2.11.0+cu130`. GPUs used by each server were dedicated. `Client E2E`
 and `Peak per GPU` come from the `/v1/videos/sync` response headers
 `x-inference-time-s` and `x-peak-memory-mb`; the latter is the rank-0 CUDA
 reserved high-water mark, so it is a per-GPU figure.
 
-| Task | Shape | Frames | Steps | Client E2E | Peak per GPU | Output validation |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| T2VA (`FL2VA`) | 1024x576 | 124 at 24 FPS | 60 | 7 min 9 s | 15.3 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
-| Ref2VA | 1024x576 | 124 at 24 FPS | 60 | 14 min 52 s | 14.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+| GPUs | Topology | Task | Shape | Frames | Steps | Client E2E | Peak per GPU | Output validation |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2 | TP2 × USP1 | T2VA (`FL2VA`) | 1024x576 | 124 at 24 FPS | 60 | 7 min 9 s | 15.3 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+| 2 | TP2 × USP1 | Ref2VA | 1024x576 | 124 at 24 FPS | 60 | 14 min 52 s | 14.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+| 4 | TP2 × USP2 | T2VA (`FL2VA`) | 1024x576 | 124 at 24 FPS | 60 | 4 min 29 s | 15.2 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
+| 4 | TP2 × USP2 | Ref2VA | 1024x576 | 124 at 24 FPS | 60 | 9 min 5 s | 16.1 GiB | H.264 video + 32 kHz stereo AAC; successful `/v1/videos/sync` 200 |
 
-Both rows use `seed=1101`, `flow_shift=12`, and `audio_flow_shift=3.0`, and each
-was run twice. T2VA measured 434.9 s and 429.3 s; Ref2VA measured 891.9 s and
+All rows use `seed=1101`, `flow_shift=12`, and `audio_flow_shift=3.0`.
+
+Two-GPU repeats: T2VA measured 434.9 s and 429.3 s; Ref2VA measured 891.9 s and
 892.1 s. Peak memory was identical across repeats for both tasks, and the two
-outputs of each pair agreed to within 115 bytes. These are single-request
-validation runs, not concurrent throughput benchmarks.
+outputs of each pair agreed to within 115 bytes.
+
+Four-GPU T2VA repeats: 273.8 s and 269.5 s, peaking at 15,560 MiB and
+15,612 MiB. Four-GPU Ref2VA is a single successful end-to-end run (545.2 s,
+16,448 MiB). Follow-up Ref2VA requests on this build completed diffusion but
+then hit the engine's hardcoded 30 s async output wait
+(`_ASYNC_OUTPUT_TIMEOUT` in `diffusion_engine.py`) during post-compute D2H,
+so they are not reported as repeats.
+
+Relative to the two-GPU baseline on the same shape, four-GPU TP2×USP2 was about
+1.6× faster for both tasks, while per-GPU peak HBM stayed in the mid-15 GiB
+range because USP does not further shard resident DiT weights. These are
+single-request validation runs, not concurrent throughput benchmarks.
 
 ## Request examples
 
