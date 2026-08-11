@@ -64,6 +64,11 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
+_ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 60.0
+
+# Worker entry points that release device memory. Background D2H/SHM packing
+# still reads model output tensors, so it must finish before these run.
+_MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
 @dataclass
@@ -828,6 +833,8 @@ class WorkerProc:
 
         self._async_output_queue: queue.Queue | None = None
         self._async_output_thread: threading.Thread | None = None
+        self._async_output_done = threading.Condition()
+        self._async_output_pending = 0
         if not self.od_config.step_execution:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
@@ -872,6 +879,8 @@ class WorkerProc:
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
+            with self._async_output_done:
+                self._async_output_pending += 1
             self._async_output_queue.put((output, async_output_id, gpu_event))
             msg = AsyncDiffusionOutput(
                 kind=AsyncOutputKind.COMPUTE_DONE,
@@ -929,6 +938,31 @@ class WorkerProc:
                         error="Background D2H/SHM packing failed",
                     )
                 )
+            finally:
+                with self._async_output_done:
+                    # Clamped: only items enqueued by _return_result are counted.
+                    self._async_output_pending = max(0, self._async_output_pending - 1)
+                    self._async_output_done.notify_all()
+
+    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
+        """Block until background D2H/SHM packing has no work left.
+
+        Returns False if outputs are still in flight when ``timeout`` expires.
+        """
+        with self._async_output_done:
+            if self._async_output_pending == 0:
+                return True
+            drained = self._async_output_done.wait_for(lambda: self._async_output_pending == 0, timeout=timeout)
+            pending = self._async_output_pending
+        if not drained:
+            logger.warning(
+                "Worker %d: %d async output(s) still in flight after %.1fs; "
+                "releasing device memory now may drop OUTPUT_READY messages",
+                self.gpu_id,
+                pending,
+                timeout,
+            )
+        return drained
 
     def shutdown(self) -> None:
         """Stop background work and release worker-owned IPC resources."""
@@ -1027,6 +1061,8 @@ class WorkerProc:
         }
 
         try:
+            if method in _MEMORY_RELEASING_METHODS:
+                self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
@@ -1088,6 +1124,7 @@ class WorkerProc:
                 continue
 
             if isinstance(msg, dict) and msg.get("type") == "sleep":
+                self.drain_async_outputs()
                 task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
                 ack = self.worker.handle_sleep_task(task)
                 self._return_result(ack)
