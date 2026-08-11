@@ -363,6 +363,24 @@ def test_completion_route_forwards_supported_non_stream_request(mocker: MockerFi
     app.state.engine_client.generate.assert_not_called()
 
 
+def test_completion_route_without_registered_handler_returns_404(mocker: MockerFixture):
+    app = FastAPI()
+    app.include_router(api_server_module.router)
+    app.state.engine_client = mocker.MagicMock()
+
+    response = TestClient(app).post(
+        "/v1/completions",
+        json={"model": "diffusion-model", "prompt": "hello"},
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["type"] == "NotFoundError"
+    assert body["error"]["code"] == 404
+    assert "Completions API" in body["error"]["message"]
+    app.state.engine_client.generate.assert_not_called()
+
+
 def test_completion_route_preserves_endpoint_load_metrics_header(mocker: MockerFixture):
     class FakeCompletionHandler:
         def __init__(self):

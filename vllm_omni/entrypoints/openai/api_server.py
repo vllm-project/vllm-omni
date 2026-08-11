@@ -1179,7 +1179,7 @@ def OmniBatchChat(request: Request) -> OmniOpenAIServingChatBatch | None:
 
 
 def Omnicompletion(request: Request) -> OpenAIServingCompletion | None:
-    return request.app.state.openai_serving_completion
+    return getattr(request.app.state, "openai_serving_completion", None)
 
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
