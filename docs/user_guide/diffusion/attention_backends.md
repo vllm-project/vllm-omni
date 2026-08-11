@@ -266,9 +266,8 @@ win at high fidelity.
 The kernel requires CUDA, BF16 activations, and `head_dim=128`. It has no
 `cu_seqlens` support, so the packed varlen layout is sliced to its real length
 first (the alignment-padding document is excluded and its output rows are
-masked by the model). Dense layers and early denoise steps run the exact
-packed-varlen `FLASH_ATTN` path, so the sparse kernel is measured against a
-bit-identical dense baseline.
+masked by the model). Dense layers and early denoise steps use the packed dense
+fallback: cuDNN on SM120 and the FlashAttention varlen path elsewhere.
 
 Install the upstream package (not bundled):
 
@@ -300,7 +299,10 @@ For MiniMax-H3 the recommended starting point is the config above
 denoise steps stay dense). Raise `tau` or cut `dense_steps` for more speed at
 the cost of fidelity — on 4× B300 the measured sweep drops from 35.3 dB PSNR
 (default) to 26.3 dB at the aggressive τ=2.0 / dense_steps=5 point (see the
-verification comment on the implementing PR).
+verification comment on the implementing PR). The
+[4× RTX PRO 5000 SM120 speed/quality sweep](https://github.com/lishunyang12/vllm-omni-rankings/tree/main/scripts/minimax_h3_sol_attn_sm120)
+measures a 1.097× quality-first speedup and up to 1.161× while passing all
+configured visual-quality gates.
 
 Programmatically the same block is a typed `SolAttnSpec` (values validated at
 construction):

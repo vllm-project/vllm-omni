@@ -5,6 +5,9 @@ This folder contains an online-serving benchmark script for diffusion models.
 It sends requests to a vLLM OpenAI-compatible endpoint and reports throughput,
 latency percentiles, and optional SLO attainment.
 
+For the offline MiniMax-H3 Sol-Attn benchmark and measured RTX PRO 5000 SM120
+results, see the [speed/quality sweep](./sol_attn_sm120_results.md).
+
 The main entrypoint is:
 
 - `benchmarks/diffusion/diffusion_benchmark_serving.py`
