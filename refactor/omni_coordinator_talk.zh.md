@@ -70,8 +70,9 @@ handshake／input／output **唔經** Coord；Coord 只維護 membership。
 
 ### 1.4 `OmniCoordClientForStage` 邊個 new？
 
-**唔係 Master。** Master 只回 `coordinator_router_address`（analysis 回覆欄位表）。  
-Stage 進程自己起：LLM 用 `create_stage_coord_client`；Diffusion 直接 ctor（P2 S3 雙路徑）。
+**現状：** 唔係 Master new。Master 只回 `coordinator_router_address`；Stage 自己起 client（只做 update／HB；**唔做** bootstrap register）。LLM：`create_stage_coord_client`；Diffusion：直接 ctor（P2 S3）。  
+
+**目標 B：** Stage 已知 Coord 地址 → `new ClientForStage` → **`register`＋update／HB**；**Hub 刪除**。
 
 ---
 
@@ -180,18 +181,19 @@ Stage 進程自己起：LLM 用 `create_stage_coord_client`；Diffusion 直接 c
 
 | # | 痛點 | 方向 |
 |---|------|------|
-| M1 | Master 同 Coord **並列** | 併入 Coord；register／update 同一 owner |
+| M1 | Master 同 Coord **並列** | 併入 Coord；Stage 經 ClientForStage 做 register／update |
 | M2 | Hub＋Mem 間接層 | Pool **直讀** Coord（隨合併落地） |
 
-目標形狀（投影 analysis §6 目標圖）：
+目標形狀（投影 analysis §6 目標圖；**定案 B**）：
 
-- **刪除**獨立 Master／Hub／`MembershipController`（唔係「收窄」）  
-- Coord 兼做 register（派 HS／IO）＋ registry  
-- `StagePool` **直讀** Coord；class **沿用舊名**  
+- **刪除**獨立 Master、**`OmniCoordClientForHub`**、`MembershipController`  
+- Coord 兼做 register（對端）＋ registry  
+- Stage 側：`OmniCoordClientForStage`（可改名）**兼做** `register`＋`update`／`heartbeat`  
+- `StagePool` **直讀** Coord（**唔經 Hub**）；class **沿用舊名**  
 
 金句：
 
-> 兩個 P1 同級；**refactor 真正要交嘅係合併 Master（PR2）**。
+> 兩個 P1 同級；**refactor 真正要交嘅係合併 Master（PR2）**。Hub 目標刪除。
 
 ### 4.3 P2（對齊 analysis S1–S5）
 
@@ -228,7 +230,7 @@ Stage 進程自己起：LLM 用 `create_stage_coord_client`；Diffusion 直接 c
 | | **PR1** | **PR2（主線）** |
 |--|---------|-----------------|
 | 對應 | P0 預期＋**P1 可靠性**＋P2 小清理 | **P1 重構**＋自訂 LB |
-| 做 | SPOF／註冊測試；R1–R5；死 API；**統一 LLM／Diff 路徑**；LB 歸屬（仍只內建三策略） | Master→Coord；**刪除** Hub／Mem；Pool 直讀；dotted-path 自訂 LB |
+| 做 | SPOF／註冊測試；R1–R5；死 API；**統一 LLM／Diff 路徑**；LB 歸屬（仍只內建三策略） | Master→Coord；ClientForStage **兼 register**；**刪除** Hub／Mem；Pool 直讀；自訂 LB |
 | 唔做 | 合併 Master；自訂 LB；刪 Hub／Mem | 完整 HA |
 | 順序 | **建議先**（鎖行為、降回歸） | refactor **主交付**；依賴 PR1 先落地 |
 
@@ -245,10 +247,12 @@ vllm serve ... --omni-lb-policy=mypkg.lb:MyBalancer
 字串傳到 `_build_load_balancer_factory` 先 `importlib`；內建 `random`／`round-robin`／`least-queue-length` 保留。  
 上游 core **冇**呢個跨 stage `LoadBalancer`；風格近 production-stack dotted callback。
 
-### PR2 目標時序（對照現状／analysis §6）
+### PR2 目標時序（對照現状／analysis §6；定案 B）
 
-- 只起 Coord（含舊 Master 職責）→ Stage **向 Coord register** → client update → Pool **直讀** Coord  
-- 使用期：heartbeat／registry／pick 三線，**唔經 Hub**  
+- 只起 Coord → Stage **已知 Coord 地址** → `new ClientForStage` → **`register`（HS／IO）** → 同一 client `update`／heartbeat → Pool **直讀** Coord  
+- **`ClientForHub` 冇咗**（刪除）；使用期唔經 PUB／SUB／Hub  
+
+**Q&A 預答：** 點解唔再要 Hub？——合併後 Head 唔使訂閱 Coord PUB 做缓存；Pool 直問 Coord，少一層 stale／ownership。
 
 ---
 
@@ -279,7 +283,10 @@ A：算緩解。registry 仍空，要可靠重註冊。真 HA 另案。（analys
 A：係。PR2 清 ownership，唔消除單點。
 
 **Q：`OmniCoordClientForStage` 係咪 Master new？**  
-A：唔係。Master 只回 router 字串；Stage 自己起。
+A：現状唔係（Master 只回 router）。**目標 B**：Stage 已知 Coord 地址，自己 `new` client，再 `register`。
+
+**Q：目標仲有冇 `ClientForHub`？**  
+A：**冇。** PR2 刪除；Pool 直讀 Coord。
 
 **Q：Runtime 公開 API 係咪好多？**  
 A：唔多。對外就建構＋兩個地址＋`close`。

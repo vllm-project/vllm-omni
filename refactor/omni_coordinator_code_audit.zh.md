@@ -1,9 +1,10 @@
 # OmniCoordinator Code Audit（逐 function）
 
-> 配套系統分析：`[omni_coordinator_analysis.zh.md](omni_coordinator_analysis.zh.md)`  
+> 配套系統分析：[`omni_coordinator_analysis.zh.md`](omni_coordinator_analysis.zh.md)／[`omni_coordinator_analysis.md`](omni_coordinator_analysis.md)  
+> 講稿：[`omni_coordinator_talk.zh.md`](omni_coordinator_talk.zh.md)  
 > 範圍：`vllm_omni/distributed/omni_coordinator/` 全部 7 檔  
 > 基準：`main` @ `c27623c2`  
-> 判定：`keep`｜`fix`｜`delete_or_privatize`｜`test_only`
+> 判定：`keep`｜`fix`｜`delete_or_privatize`｜`test_only`（**現状**；目標見 analysis §6 **定案 B**）
 
 呼叫者欄：「生產」= `vllm_omni/` 非 test；「僅 test」= `tests/`；「內部」= 套件內。
 
@@ -41,6 +42,9 @@
 
 ### 0.3 `OmniCoordClientForStage`（`omni_coord_client_for_stage.py`）
 
+**現状：** 只做 membership（`update`／heartbeat）；**無** bootstrap `register`（仍走 `OmniMasterServer`）。  
+**目標（analysis §6 定案 B）：** 擴展為 `register`＋`update`／`heartbeat`（類名可再收斂）；啟動時已知 Coord 地址。
+
 | API | 簽名／形狀 | 用途 |
 |-----|------------|------|
 | `__init__` | `(coord_zmq_addr, input_address, output_address, stage_id, *, replica_id=0)` | DEALER connect；首發 `update`；起 heartbeat thread |
@@ -54,6 +58,9 @@
 | `create_stage_coord_client` | `(..., *, get_queue_length: Callable[[], int] \| None = None) -> OmniCoordClientForStage` | 建 client 並可掛 `_on_heartbeat` 刷新 queue |
 
 ### 0.4 `OmniCoordClientForHub`（`omni_coord_client_for_hub.py`）
+
+**現状：** Head SUB 缓存；Mem／Pool 讀 snapshot。  
+**目標（analysis §6）：** **刪除**——`StagePool` 直讀 Coord；唔再經 PUB／SUB／Hub。
 
 | API | 簽名／形狀 | 用途 |
 |-----|------------|------|
@@ -129,8 +136,8 @@
 | `OmniCoordinatorRuntime`         | 係（`stage_runtime`）            | `keep`            |
 | `OmniCoordinator`                | 主要 tests；生產經 `runtime` 子模組    | `keep`            |
 | `create_stage_coord_client`      | 係（LLM proc）                   | `keep`            |
-| `OmniCoordClientForStage`        | 係（Diffusion 直接用）              | `keep`            |
-| `OmniCoordClientForHub`          | Membership 多從子模組 import       | `keep`            |
+| `OmniCoordClientForStage`        | 係（Diffusion 直接用）              | `keep`（目標擴 `register`） |
+| `OmniCoordClientForHub`          | Membership 多從子模組 import       | `keep`（目標 **刪除**） |
 | `LoadBalancingPolicy`／LB classes | 係                             | `keep`            |
 | `ReplicaStatus`／`ReplicaInfo`    | 係                             | `keep`            |
 | `ReplicaList`                    | 少；tests／內部                    | `keep`            |
@@ -307,20 +314,16 @@
 
 
 
-## 10. 建議 cleanup PR 切分（審計導向）
+## 10. 建議 PR 切分（對齊 analysis §6）
 
+系統級切分以 analysis 為準（唔用本節舊 A–F 字母，避免同「定案 B」撞名）：
 
-| PR  | 內容                                                                    | 風險            |
-| --- | --------------------------------------------------------------------- | ------------- |
-| A   | 文件：SPOF＋本 audit（無碼）                                                   | 無             |
-| B   | 刪／私有化 dead public mutators；`update_info` 標 test-only 或留並加註            | 低（測要改 import） |
-| C   | `_parse_replica_event` 強制 int／缺省 0；heartbeat 未知 addr upsert 或 warning | 中（行為變）        |
-| D   | Stage registration 可靠送達（Again retry／blocking）                         | 中             |
-| E   | Runtime graceful close + 統一 idempotent close                          | 中             |
-| F   | Diffusion 改 `create_stage_coord_client`                               | 低             |
+| PR | 內容 | 對應 |
+|----|------|------|
+| **PR1** | SPOF／註冊測試；R1–R5；死 API；統一 LLM／Diff 路徑；LB 歸屬（仍只內建三策略） | P0＋P1 可靠性＋P2 小清理 |
+| **PR2** | Master→Coord；**ClientForStage 兼 `register`**；**刪 Hub／Mem**；Pool 直讀；dotted-path 自訂 LB | P1 重構主線＋自訂 LB |
 
-
-**唔**把 example3 合併 Master 塞入上表必做項。
+本 audit 逐項修復（Again／upsert／close／int／dead API）優先落入 **PR1**。
 
 ---
 

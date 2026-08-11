@@ -2,7 +2,9 @@
 
 > Simplified Chinese (canonical for CN reviewers): [`omni_coordinator_analysis.zh.md`](omni_coordinator_analysis.zh.md)  
 > Per-function audit (zh): [`omni_coordinator_code_audit.zh.md`](omni_coordinator_code_audit.zh.md)  
-> Level: **analysis** (current state + risks); not final design.
+> Talk notes (internal, zh): [`omni_coordinator_talk.zh.md`](omni_coordinator_talk.zh.md)  
+> Level: **analysis** (current state + risks); not final design.  
+> **PR2 Decision B:** `OmniCoordClientForStage` owns `register`＋`update`／`heartbeat`; delete `OmniCoordClientForHub`／`MembershipController`.
 
 **Scope:** all 7 files under `vllm_omni/distributed/omni_coordinator/`  
 **Code base:** `main` @ `c27623c2`
@@ -203,7 +205,7 @@ For this refactor effort: **two P1 rows** — reliability and Master merge are p
 
 | # | Issue | Impact | Direction |
 |---|-------|--------|-----------|
-| M1 | `OmniMasterServer` parallel to `OmniCoordinator` | Split entrypoints; address echo vs registry | Fold into Coord; one owner for register／update |
+| M1 | `OmniMasterServer` parallel to `OmniCoordinator` | Split entrypoints; address echo vs registry | Fold into Coord; Stage uses `ClientForStage` for register／update (one client＋one Coord owner) |
 | M2 | Hub＋`MembershipController` indirection | Fragmented Head ownership | Pool reads Coord directly (with the merge) |
 
 > P0 = “only one Coord”; P1 reliability = “path not reliable enough”; P1 refactor = “Master／Coord dual ownership must collapse” (refactor mainline).
@@ -304,29 +306,30 @@ Severity order: **P0 SPOF → two P1s (reliability＋Master merge) → P2 bounda
 
 ### PR2 — Merge OmniMasterServer into OmniCoordinator + custom LB
 
-**Target shape:** No parallel standalone `OmniMasterServer`. `OmniCoordinator` owns both **handshake／I／O address allocation** and **membership registry**; `StagePool` queries Coord directly; users may inject a custom `LoadBalancer`.
+**Target shape:** No parallel standalone `OmniMasterServer`. `OmniCoordinator` owns both **handshake／I／O address allocation** and **membership registry**; on the Stage side, **`OmniCoordClientForStage` (rename optional) owns `register`＋`update`／`heartbeat`**; on the Head side, **delete Hub／MembershipController** and let `StagePool` query Coord directly; users may inject a custom `LoadBalancer`.
 
 | Block | Content |
 |-------|---------|
 | Merge | Fold `OmniMasterServer` into `OmniCoordinator` |
-| Simplify Head | Delete `OmniCoordClientForHub`, `MembershipController`; `StagePool` reads Coord directly |
+| Stage client | Extend `OmniCoordClientForStage`: `register` (HS／IO allocation)＋existing `update`／`heartbeat`; Coord address known at startup (Head／env／CLI — no Master reply echoing router) |
+| Simplify Head | **Delete** `OmniCoordClientForHub`, `MembershipController` (no PUB／SUB hop); `StagePool` reads Coord directly |
 | Startup | `DistStageRuntime`／headless talk only to Coord |
 | **Custom LB** | `--omni-lb-policy=mypkg:MyBalancer` dotted path (below); `StagePool.pick` still only calls `LoadBalancer.select` |
 
-**Out of scope:** Full HA (still a single in-memory registry). **Depends on:** PR1. Current state: §1.1.
+**Out of scope:** Full HA (still a single in-memory registry). **Depends on:** PR1 landing first. Current state: §1.1.
 
-#### Delete／merge map (keep existing class names)
+#### Delete／merge map (keep existing class names; Stage client may rename later)
 
 | Today | After PR2 |
 |-------|-----------|
 | `OmniMasterServer` | **Merged into** `OmniCoordinator` |
-| `OmniCoordinator` | **Keep:** registry＋heartbeat; also register |
+| `OmniCoordinator` | **Keep:** registry＋heartbeat; also register (server side) |
 | `OmniCoordinatorRuntime` | **Keep** |
-| `OmniCoordClientForHub` | **Delete** |
+| `OmniCoordClientForHub` | **Delete** (Pool no longer uses SUB cache) |
 | `MembershipController` | **Delete** |
 | `StagePool` | **Keep**; query Coord directly |
 | `LoadBalancer` | **Keep**; add custom-policy injection |
-| `OmniCoordClientForStage` | **Keep** |
+| `OmniCoordClientForStage` | **Keep and extend**: `register`＋`update`／`heartbeat` (rename optional) |
 
 #### Target static structure
 
@@ -348,7 +351,7 @@ flowchart LR
   end
 
   subgraph R["Stage"]
-    SC[OmniCoordClientForStage]
+    SC["OmniCoordClientForStage\nregister plus update HB"]
   end
 
   RT -->|starts| OC
@@ -357,6 +360,9 @@ flowchart LR
 
   L ~~~ C ~~~ R
 ```
+
+> **Decision B:** Stage talks to Coord **only via** `OmniCoordClientForStage` (or one renamed client): `register` first for handshake／input／output／replica_id, then the same connection for `update`／`heartbeat`.  
+> **`OmniCoordClientForHub` is deleted in the target** — no PUB→SUB→Hub cache; `StagePool` queries Coord directly.
 
 #### Target startup sequence
 
@@ -373,16 +379,17 @@ sequenceDiagram
   Head->>RT: new
   RT->>OC: start
   OC-->>RT: ready
-  RT-->>Head: addresses
+  RT-->>Head: coord addresses
 
-  Note over Head,Stage: Register with Coord after init
+  Note over Head,Stage: Stage already knows Coord addr; register via ClientForStage
   Head->>Stage: init local or wait headless
-  Stage->>OC: register
-  OC-->>Stage: handshake input output replica_id
+  Stage->>SC: new with coord addr
+  SC->>OC: register
+  OC-->>SC: handshake input output replica_id
+  SC-->>Stage: addresses
   Note over Head,Stage: Head bind HS/IO; engine connect
 
-  Note over Stage,Pool: Membership direct
-  Stage->>SC: new
+  Note over Stage,Pool: Same client continues membership; no Hub
   SC->>OC: DEALER update
   Head->>Pool: ready
   Pool->>OC: direct query
@@ -394,7 +401,7 @@ sequenceDiagram
 |------|-------|----------|
 | Heartbeat | `OmniCoordClientForStage` | DEALER heartbeat → Coord |
 | Registry | `OmniCoordinator` | Refresh liveness／queue |
-| Pick | `StagePool` + `LoadBalancer` | Direct snapshot → `select` (custom allowed) |
+| Pick | `StagePool` + `LoadBalancer` | **Direct Coord** snapshot → `select` (custom allowed; **no Hub**) |
 
 ```mermaid
 sequenceDiagram
@@ -453,9 +460,9 @@ Do not require `entry_points`／`LoadBalancerRegistry` as the primary path (name
 
 **Acceptance (draft):**
 
-- Headless／local register still completes handshake and HELLO／READY  
+- Headless／local path completes handshake and HELLO／READY via `OmniCoordClientForStage.register`  
 - Pick ≥ PR1 baseline; `--omni-lb-policy=mypkg:MyBalancer` loads and selects  
-- Production path no longer depends on standalone Master／Hub／MembershipController  
+- Production path no longer depends on standalone Master／`OmniCoordClientForHub`／MembershipController  
 
 **Focus files (draft):**  
 `stage_engine_startup.py`, `omni_coordinator.py`, `runtime.py`, `stage_runtime.py`, `membership_controller.py`, `omni_coord_client_for_hub.py`, `stage_pool.py`, `load_balancer.py`, `_build_load_balancer_factory` (`stage_runtime.py`／CLI validation), headless startup.

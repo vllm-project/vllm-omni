@@ -2,7 +2,9 @@
 
 > 简体中文。英文对照：[`omni_coordinator_analysis.md`](omni_coordinator_analysis.md)  
 > 逐函数审计：[`omni_coordinator_code_audit.zh.md`](omni_coordinator_code_audit.zh.md)  
-> 层级：**analysis**（现状与风险）；不是最终 design。
+> 讲稿（内部）：[`omni_coordinator_talk.zh.md`](omni_coordinator_talk.zh.md)  
+> 层级：**analysis**（现状与风险）；不是最终 design。  
+> **PR2 定案 B：** `OmniCoordClientForStage` 兼 `register`＋`update`／`heartbeat`；删除 `OmniCoordClientForHub`／`MembershipController`。
 
 **审查范围：** `vllm_omni/distributed/omni_coordinator/` 全部 7 个文件  
 **代码基准：** `main` @ `c27623c2`
@@ -203,7 +205,7 @@ sequenceDiagram
 
 | # | 问题 | 后果 | 建议方向 |
 |---|------|------|----------|
-| M1 | `OmniMasterServer` 与 `OmniCoordinator` 并列 | 两套入口、地址回传与 registry 分裂 | 并入 Coord；Stage register／update 同一 owner |
+| M1 | `OmniMasterServer` 与 `OmniCoordinator` 并列 | 两套入口、地址回传与 registry 分裂 | 并入 Coord；Stage 侧经 `ClientForStage` 做 register／update（同一 client＋同一 Coord owner） |
 | M2 | Hub＋`MembershipController` 间接层 | Head 侧 ownership 碎 | Pool 直读 Coord（随合并落地） |
 
 > P0 =「只有一个 Coord」；P1 可靠性 =「路径不够可靠」；P1 重构 =「Master／Coord 双 owner 必须收束」（refactor 主线）。
@@ -306,29 +308,30 @@ sequenceDiagram
 
 ### PR2 — 将 OmniMasterServer 并入 OmniCoordinator，并支持自定义 LB
 
-**目标形态：** 不再并行独立的 `OmniMasterServer`。由 `OmniCoordinator` 同时负责：**分配 handshake／I／O 地址**与 **membership registry**；`StagePool` 直读 Coord；支持用户注入自定义 `LoadBalancer`。
+**目标形态：** 不再并行独立的 `OmniMasterServer`。由 `OmniCoordinator` 同时负责：**分配 handshake／I／O 地址**与 **membership registry**；Stage 侧由 **`OmniCoordClientForStage`（可改名）兼做 `register`＋`update`／`heartbeat`**；Head 侧 **删除 Hub／MembershipController**，`StagePool` 直读 Coord；支持用户注入自定义 `LoadBalancer`。
 
 | 块 | 内容 |
 |----|------|
 | 合并 | `OmniMasterServer` 职责并入 `OmniCoordinator` |
-| 简化 Head | 删除 `OmniCoordClientForHub`、`MembershipController`；`StagePool` 直读 Coord |
+| Stage client | `OmniCoordClientForStage` 扩展：`register`（派 HS／IO）＋既有 `update`／`heartbeat`；启动时已知 Coord 地址（Head／env／CLI，不再靠 Master reply 回传 router） |
+| 简化 Head | **删除** `OmniCoordClientForHub`、`MembershipController`（无 PUB／SUB 中转）；`StagePool` 直读 Coord |
 | Startup | `DistStageRuntime`／headless 只对接 Coord |
 | **自定义 LB** | `--omni-lb-policy=mypkg:MyBalancer` dotted path（见下）；`StagePool.pick` 仍只调 `LoadBalancer.select` |
 
-**不做：** 完整 HA（合并后仍可以是单点内存 registry）。**依赖：** PR1 先合并。现状对照见 §1.1。
+**不做：** 完整 HA（合并后仍可以是单点内存 registry）。**依赖：** PR1 先落地。现状对照见 §1.1。
 
-#### 删除／合并对照（沿用现有类名）
+#### 删除／合并对照（沿用现有类名；Stage client 可后续改名）
 
 | 现状 | PR2 之后 |
 |------|----------|
 | `OmniMasterServer` | **并入** `OmniCoordinator` |
-| `OmniCoordinator` | **保留**：registry＋heartbeat；兼做 register |
+| `OmniCoordinator` | **保留**：registry＋heartbeat；兼做 register（对端） |
 | `OmniCoordinatorRuntime` | **保留** |
-| `OmniCoordClientForHub` | **删除** |
+| `OmniCoordClientForHub` | **删除**（Pool 不再经 SUB 缓存） |
 | `MembershipController` | **删除** |
 | `StagePool` | **保留**；改为直读 Coord |
 | `LoadBalancer` | **保留**；增加自定义策略注入 |
-| `OmniCoordClientForStage` | **保留** |
+| `OmniCoordClientForStage` | **保留并扩展**：`register`＋`update`／`heartbeat`（类名可再收敛） |
 
 #### 目标静态结构
 
@@ -350,7 +353,7 @@ flowchart LR
   end
 
   subgraph R["Stage"]
-    SC[OmniCoordClientForStage]
+    SC["OmniCoordClientForStage\nregister plus update HB"]
   end
 
   RT -->|starts| OC
@@ -359,6 +362,9 @@ flowchart LR
 
   L ~~~ C ~~~ R
 ```
+
+> **定案 B：** Stage 对 Coord **只经** `OmniCoordClientForStage`（或改名后的同一 client）：先 `register` 取 handshake／input／output／replica_id，再同一连接做 `update`／`heartbeat`。  
+> **`OmniCoordClientForHub` 目标中删除**——不再 PUB→SUB→Hub cache；`StagePool` 直读 Coord。
 
 #### 目标建立时序
 
@@ -375,16 +381,17 @@ sequenceDiagram
   Head->>RT: new
   RT->>OC: start
   OC-->>RT: ready
-  RT-->>Head: addresses
+  RT-->>Head: coord addresses
 
-  Note over Head,Stage: init 后向 Coord register
+  Note over Head,Stage: Stage 已知 Coord 地址；经 ClientForStage 注册
   Head->>Stage: init local or wait headless
-  Stage->>OC: register
-  OC-->>Stage: handshake input output replica_id
+  Stage->>SC: new with coord addr
+  SC->>OC: register
+  OC-->>SC: handshake input output replica_id
+  SC-->>Stage: addresses
   Note over Head,Stage: Head bind HS/IO；engine connect
 
-  Note over Stage,Pool: membership 直连
-  Stage->>SC: new
+  Note over Stage,Pool: 同一 client 继续 membership；无 Hub
   SC->>OC: DEALER update
   Head->>Pool: ready
   Pool->>OC: direct query
@@ -396,7 +403,7 @@ sequenceDiagram
 |------|--------|------|
 | 心跳 | `OmniCoordClientForStage` | DEALER heartbeat → Coord |
 | 注册表 | `OmniCoordinator` | 更新存活与 queue |
-| 选路 | `StagePool` + `LoadBalancer` | 直读 snapshot → `select`（可自定义） |
+| 选路 | `StagePool` + `LoadBalancer` | **直读 Coord** snapshot → `select`（可自定义；**无 Hub**） |
 
 ```mermaid
 sequenceDiagram
@@ -455,9 +462,9 @@ vllm serve ... --omni-lb-policy=mypkg.lb:MyBalancer
 
 **验收（草案）：**
 
-- Headless／本地 register 仍能完成握手与 HELLO／READY  
+- Headless／本地经 `OmniCoordClientForStage.register` 仍能完成握手与 HELLO／READY  
 - pick 不低于 PR1 基线；`--omni-lb-policy=mypkg:MyBalancer` 可加载并选中  
-- 生产路径不再依赖独立 `OmniMasterServer`／Hub／`MembershipController`  
+- 生产路径不再依赖独立 `OmniMasterServer`／`OmniCoordClientForHub`／`MembershipController`  
 
 **涉及文件（草案）：**  
 `stage_engine_startup.py`、`omni_coordinator.py`、`runtime.py`、`stage_runtime.py`、`membership_controller.py`、`omni_coord_client_for_hub.py`、`stage_pool.py`、`load_balancer.py`、`_build_load_balancer_factory`（`stage_runtime.py`／CLI 校验）、headless startup。
