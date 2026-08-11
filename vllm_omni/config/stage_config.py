@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable
@@ -347,6 +348,14 @@ class StageDeployConfig:
     tensor_parallel_size: int | None = None
     enable_expert_parallel: bool | None = None
     gpu_memory_utilization: float | None = None
+    # Per-replica, per-GPU-rank hard limit for this stage's KV-cache HBM.
+    # The value is normalized to ``kv_cache_memory_bytes`` before vLLM
+    # profiles and allocates the cache.
+    hbm_limit_gb: float | None = None
+    # Optional independent switch used to compare the scheduler guard against
+    # the native KV allocator under the same hard cache budget. ``None`` means
+    # enable the guard whenever hbm_limit_gb is configured.
+    hbm_admission_guard: bool | None = None
     max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
@@ -427,6 +436,27 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.hbm_admission_guard is not None and not isinstance(
+            self.hbm_admission_guard, bool
+        ):
+            raise ValueError(
+                "hbm_admission_guard must be a boolean or null, "
+                f"got {self.hbm_admission_guard!r}"
+            )
+        if self.hbm_limit_gb is None:
+            return
+        if (
+            isinstance(self.hbm_limit_gb, bool)
+            or not isinstance(self.hbm_limit_gb, (int, float))
+            or not math.isfinite(self.hbm_limit_gb)
+            or self.hbm_limit_gb <= 0
+        ):
+            raise ValueError(
+                "hbm_limit_gb must be a finite positive number, "
+                f"got {self.hbm_limit_gb!r}"
+            )
 
 
 @dataclass(frozen=True)

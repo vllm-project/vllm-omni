@@ -122,6 +122,7 @@ class _LoadEngineOverrides(TypedDict, total=False):
 class _CacheEngineOverrides(TypedDict, total=False):
     kv_cache_memory_bytes: int
     gpu_memory_utilization: float
+    hbm_limit_gb: float
     enable_prefix_caching: bool
     disable_hybrid_kv_cache_manager: bool
     mm_processor_cache_gb: float
@@ -133,6 +134,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
     max_model_len: int
     enable_chunked_prefill: bool
     async_scheduling: bool
+    hbm_admission_guard: bool
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
@@ -368,6 +370,9 @@ class OmniStageCacheConfig:
     kv_cache_memory_bytes: int | None = Field(default=None, ge=0)
     # None preserves backend-owned defaults; explicit values still project.
     gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
+    # Static per-stage KV-cache budget, interpreted per replica and GPU rank.
+    # OmniEngineArgs converts this GiB value into a hard byte limit.
+    hbm_limit_gb: float | None = Field(default=None, gt=0.0)
     enable_prefix_caching: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
@@ -382,6 +387,7 @@ class OmniStageSchedulerConfig:
     max_model_len: int | None = Field(default=None, ge=-1)
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = None
+    hbm_admission_guard: bool | None = None
 
     def __post_init__(self) -> None:
         if (

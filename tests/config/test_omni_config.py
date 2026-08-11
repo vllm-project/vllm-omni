@@ -36,14 +36,67 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.arg_utils import _effective_kv_cache_memory_bytes
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), float("nan"), "1"])
+def test_stage_hbm_limit_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="hbm_limit_gb"):
+        StageDeployConfig(stage_id=0, hbm_limit_gb=value)
+
+
+def test_stage_hbm_limit_projects_to_legacy_and_structured_configs():
+    pipeline = PipelineConfig(
+        model_type="hbm-test",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="thinker"),),
+    )
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, hbm_limit_gb=1.5)],
+    )
+
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    structured = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+    )
+
+    assert legacy[0].yaml_engine_args["hbm_limit_gb"] == 1.5
+    structured_stage = structured.stage_by_id(0)
+    assert structured_stage.cache_config.hbm_limit_gb == 1.5
+    assert (
+        build_engine_args_dict_from_omni_stage_config(
+            structured_stage,
+            model="/tmp/hbm-test-model",
+        )["hbm_limit_gb"]
+        == 1.5
+    )
+
+
+def test_hbm_limit_becomes_hard_kv_cache_byte_limit():
+    gib = 1024**3
+
+    assert _effective_kv_cache_memory_bytes(2.0, None) == 2 * gib
+    assert _effective_kv_cache_memory_bytes(2.0, 3 * gib) == 2 * gib
+    assert _effective_kv_cache_memory_bytes(2.0, gib) == gib
+    assert _effective_kv_cache_memory_bytes(None, gib) == gib
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), float("nan"), "1"])
+def test_hbm_limit_byte_normalization_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="hbm_limit_gb"):
+        _effective_kv_cache_memory_bytes(value, None)
 
 
 @pytest.fixture(autouse=True)
@@ -507,6 +560,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageCacheConfig)} == {
         "kv_cache_memory_bytes",
         "gpu_memory_utilization",
+        "hbm_limit_gb",
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
@@ -517,6 +571,7 @@ def test_sub_config_fields_match_structured_scopes():
         "max_model_len",
         "enable_chunked_prefill",
         "async_scheduling",
+        "hbm_admission_guard",
     }
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "async_chunk",

@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass, field, fields
@@ -14,6 +15,37 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
+
+_GIB = 1024**3
+
+
+def _effective_kv_cache_memory_bytes(
+    hbm_limit_gb: float | None,
+    kv_cache_memory_bytes: int | None,
+) -> int | None:
+    """Validate and combine Omni's GiB budget with vLLM's byte budget."""
+    if hbm_limit_gb is None:
+        return kv_cache_memory_bytes
+    if (
+        isinstance(hbm_limit_gb, bool)
+        or not isinstance(hbm_limit_gb, (int, float))
+        or not math.isfinite(hbm_limit_gb)
+        or hbm_limit_gb <= 0
+    ):
+        raise ValueError(
+            "hbm_limit_gb must be a finite positive number, "
+            f"got {hbm_limit_gb!r}"
+        )
+
+    hbm_limit_bytes = int(hbm_limit_gb * _GIB)
+    if hbm_limit_bytes <= 0:
+        raise ValueError(
+            "hbm_limit_gb is too small to represent as bytes, "
+            f"got {hbm_limit_gb!r}"
+        )
+    if kv_cache_memory_bytes is None:
+        return hbm_limit_bytes
+    return min(kv_cache_memory_bytes, hbm_limit_bytes)
 
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
@@ -178,6 +210,10 @@ class OmniEngineArgs(EngineArgs):
     # model-owned streaming state (codec, decoder, and similar resources).
     duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
+    # Per-stage-replica, per-GPU-rank KV-cache HBM budget. This is an Omni
+    # admission knob rather than a limit on weights, graphs, or activations.
+    hbm_limit_gb: float | None = None
+    hbm_admission_guard: bool | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
@@ -217,6 +253,19 @@ class OmniEngineArgs(EngineArgs):
     has_sampling_extra_args: bool = False
 
     def __post_init__(self) -> None:
+        if self.hbm_admission_guard is not None and not isinstance(
+            self.hbm_admission_guard, bool
+        ):
+            raise ValueError(
+                "hbm_admission_guard must be a boolean or null, "
+                f"got {self.hbm_admission_guard!r}"
+            )
+        # This makes the budget a hard capacity limit in vLLM's native KV
+        # block allocator. If both knobs are set, the stricter one wins.
+        self.kv_cache_memory_bytes = _effective_kv_cache_memory_bytes(
+            self.hbm_limit_gb,
+            self.kv_cache_memory_bytes,
+        )
         if self.worker_cls is None:
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
@@ -368,6 +417,8 @@ class OmniEngineArgs(EngineArgs):
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
+            hbm_limit_gb=self.hbm_limit_gb,
+            hbm_admission_guard=self.hbm_admission_guard,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
         )
