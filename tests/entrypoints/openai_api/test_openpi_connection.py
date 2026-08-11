@@ -68,7 +68,7 @@ def test_pack_and_unpack_round_trip_numpy_values():
     assert decoded["nested"][0]["done"] == np.bool_(True)
 
 
-def test_unpack_accepts_msgpack_numpy_marker_dicts():
+def test_unpack_accepts_vllm_native_marker_dicts():
     action = np.asarray([[1.0, 2.0]], dtype=np.float32)
     payload = {
         b"actions": {
@@ -86,6 +86,58 @@ def test_unpack_accepts_msgpack_numpy_marker_dicts():
     assert decoded[b"actions"].flags.writeable is True
     decoded[b"actions"][:, -1] = 0.0
     np.testing.assert_allclose(decoded[b"actions"], np.asarray([[1.0, 0.0]], dtype=np.float32))
+
+
+def test_unpack_accepts_msgpack_numpy_marker_dicts():
+    action = np.asarray([[1.0, 2.0]], dtype=np.float32)
+    payload = {
+        b"actions": {
+            b"nd": True,
+            b"type": action.dtype.str,
+            b"kind": b"",
+            b"shape": action.shape,
+            b"data": action.tobytes(),
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    np.testing.assert_allclose(decoded[b"actions"], action)
+    assert decoded[b"actions"].dtype == np.float32
+
+
+def test_unpack_rejects_msgpack_numpy_structured_array_markers():
+    values = np.zeros(2, dtype=[("a", "<i4"), ("b", "<f4")])
+    payload = {
+        b"nd": True,
+        b"type": values.dtype.descr,
+        b"kind": b"V",
+        b"shape": values.shape,
+        b"data": values.tobytes(),
+    }
+
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        openpi_connection._unpack_numpy(payload)
+
+
+def test_unpack_msgpack_numpy_packed_observation():
+    msgpack_numpy = pytest.importorskip("msgpack_numpy")
+    obs = {
+        "observation/exterior_image_0_left": np.zeros((180, 320, 3), dtype=np.uint8),
+        "observation/joint_position": np.arange(7, dtype=np.float32),
+    }
+
+    decoded = openpi_connection._unpack(msgpack_numpy.packb(obs))
+
+    np.testing.assert_array_equal(
+        decoded["observation/exterior_image_0_left"],
+        obs["observation/exterior_image_0_left"],
+    )
+    np.testing.assert_allclose(
+        decoded["observation/joint_position"],
+        obs["observation/joint_position"],
+    )
+    assert decoded["observation/joint_position"].dtype == np.float32
 
 
 def test_unpack_accepts_openpi_client_ndarray_markers():
