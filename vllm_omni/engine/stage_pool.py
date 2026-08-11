@@ -44,6 +44,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class StageUnavailableError(RuntimeError):
+    """Raised when dispatch cannot reach a live replica of a stage.
+
+    Deliberately a ``RuntimeError`` subclass (not ``EngineDeadError``): no
+    engine died at the raise site — the stage's replica set is empty or the
+    chosen slot was evicted, which is a routing/capacity condition and, in
+    distributed mode, recoverable. Dispatch guards catch exactly this type so
+    unrelated ``RuntimeError``s keep failing fast, and existing
+    ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
+    not silently enrolled.
+    """
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -329,7 +342,9 @@ class StagePool:
 
             now = _time.monotonic()
             if now >= deadline:
-                raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
+                raise StageUnavailableError(
+                    f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s"
+                )
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
     def preselect_replica_id(
@@ -555,7 +570,7 @@ class StagePool:
             # Prefer replicas that are both live (client up) and available.
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
-                raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+                raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
@@ -570,13 +585,13 @@ class StagePool:
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolLLMClient, client)
 
     def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolDiffusionClient, client)
 
     # ---- Metrics ----
@@ -961,7 +976,7 @@ class StagePool:
         )
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1010,7 +1025,7 @@ class StagePool:
 
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1246,3 +1261,21 @@ class StagePool:
                 replica_id,
                 e,
             )
+
+    def evict_replica(self, replica_id: int) -> None:
+        """Shut down a replica and remove it from the live set.
+
+        After eviction ``live_replica_ids`` / ``live_num_replicas`` no longer
+        include this slot, so the orchestrator stops polling and dispatching to
+        it (per-replica fault isolation). The slot is left as a ``None`` hole,
+        consistent with ``num_replicas``.
+        """
+        # replica_id should always come from live_replica_ids() (a valid, live
+        # index). Fail loud on an out-of-range id rather than letting a negative
+        # index wrap or IndexError on the next line; an ``assert`` would be
+        # stripped under ``python -O``, silently leaving a dead replica in the
+        # live set and breaking isolation.
+        if not 0 <= replica_id < len(self.clients):
+            raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
+        self.shutdown_replica(replica_id)
+        self.clients[replica_id] = None

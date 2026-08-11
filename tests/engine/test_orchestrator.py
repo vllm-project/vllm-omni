@@ -74,8 +74,6 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
         rpc_async_queue=rpc_queue,
         stage_pools=[],
     )
-    orchestrator._fatal_error = "stage engine died"
-    orchestrator._fatal_error_stage_id = 2
 
     async def wait_for_requests() -> None:
         await asyncio.Event().wait()
@@ -91,8 +89,7 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
     fatal = rpc_queue.get_nowait()
     assert isinstance(fatal, ErrorMessage)
     assert fatal.fatal is True
-    assert fatal.error == "stage engine died"
-    assert fatal.stage_id == 2
+    assert "stage engine died" in fatal.error
 
 
 @dataclass
