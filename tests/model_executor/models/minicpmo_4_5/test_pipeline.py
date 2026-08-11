@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -39,6 +40,7 @@ _DEPLOY_LAYOUTS = {
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
+    "minicpmo_4_5_cudagraph.yaml": ["0", "1", "1"],
 }
 
 
@@ -183,6 +185,16 @@ class TestDeployTopology:
                 0.55,
                 0.35,
             ]
+        elif filename == "minicpmo_4_5_cudagraph.yaml":
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [1, 1, 1]
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "video": {"count": 1, "num_frames": 32},
+            }
+            assert stages[0].yaml_engine_args["compilation_config"] == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+                "cudagraph_num_of_warmups": 2,
+            }
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
@@ -257,3 +269,67 @@ class TestHfConfigPredicate:
 
     def test_rejects_empty_version(self, predicate) -> None:
         assert predicate(SimpleNamespace(version="")) is False
+
+
+class TestCudaGraphDeployProfile:
+    """The CUDA Graph profile opts in only the Stage 0 thinker decode path."""
+
+    def test_default_profile_uses_general_graph_defaults(self) -> None:
+        default = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        stage0 = next(stage for stage in default.stages if stage.stage_id == 0)
+        assert stage0.enforce_eager is False
+        assert stage0.compilation_config is None
+
+    def test_profile_preserves_stage_routing_and_graph_settings(self) -> None:
+        deploy_path = _DEPLOY_DIR / "minicpmo_4_5_cudagraph.yaml"
+        deploy = load_deploy_config(deploy_path)
+        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 3
+        stage0, stage1, stage2 = stages
+        assert stage0.model_stage == "llm"
+        assert stage1.model_stage == "tts"
+        assert stage2.model_stage == "code2wav"
+        assert stage0.yaml_engine_args["model_arch"] == "MiniCPMO45OmniForConditionalGeneration"
+        assert stage1.yaml_engine_args["model_arch"] == "MiniCPMO45OmniForConditionalGeneration"
+        assert stage2.yaml_engine_args["model_arch"] == "MiniCPMO45Code2Wav"
+        assert stage0.yaml_engine_args["enforce_eager"] is False
+        assert stage0.yaml_engine_args["compilation_config"] == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+            "cudagraph_num_of_warmups": 2,
+        }
+        assert stage0.yaml_engine_args["attention_config"] == {
+            "flash_attn_max_num_splits_for_cuda_graph": 1,
+        }
+        assert stage1.yaml_engine_args["enforce_eager"] is True
+        assert stage2.yaml_engine_args["enforce_eager"] is True
+        assert stage1.yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
+        assert stage2.yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
+
+    def test_structured_config_keeps_graph_on_thinker_only(self) -> None:
+        config = VllmOmniConfig.from_pipeline_config(
+            OMNI_PIPELINES[_PIPELINE_KEY],
+            deploy_config_path="minicpmo_4_5_cudagraph",
+        )
+
+        stage0 = config.stage_by_id(0)
+        stage1 = config.stage_by_id(1)
+        stage2 = config.stage_by_id(2)
+        assert stage0.model_stage == "llm"
+        assert stage1.model_stage == "tts"
+        assert stage2.model_stage == "code2wav"
+        assert stage0.model_config.enforce_eager is False
+        assert stage0.model_config.compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+            "cudagraph_num_of_warmups": 2,
+        }
+        assert stage0.model_config.attention_config == {
+            "flash_attn_max_num_splits_for_cuda_graph": 1,
+        }
+        assert stage1.model_config.enforce_eager is True
+        assert stage1.model_config.compilation_config is None
+        assert stage2.model_config.enforce_eager is True
+        assert stage2.model_config.compilation_config is None

@@ -36,6 +36,8 @@ also provided.
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
+  - Experimental Stage 0 full-decode CUDA Graph validation layout:
+    [`vllm_omni/deploy/minicpmo_4_5_cudagraph.yaml`](../../vllm_omni/deploy/minicpmo_4_5_cudagraph.yaml)
 - Online example + Gradio demo:
   [`examples/online_serving/minicpmo/`](../../examples/online_serving/minicpmo/)
 - Offline end-to-end example:
@@ -108,6 +110,23 @@ For the recommended two-GPU layout, add:
 ```bash
 --deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
+
+#### Experimental full-decode CUDA Graph profile
+
+For isolated Stage 0 Thinker CUDA Graph validation, use:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_cudagraph.yaml \
+    --trust-remote-code
+```
+
+This opt-in profile captures `FULL_DECODE_ONLY` at batch size 1 and fixes all
+three stages to `max_num_seqs: 1`. It is intended for graph correctness and
+single-request performance checks, not throughput testing: greedy-output parity
+has not been validated at `max_num_seqs > 1`. It also fixes FlashAttention's
+CUDA-Graph split count to one, which preserves the eager greedy-decoding result
+for the validated batch-size-one path.
 
 #### Performance comparison
 

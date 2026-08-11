@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -134,6 +135,26 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
     }
 
     assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
+
+
+def test_extract_multimodal_outputs_preserves_cudagraph_replay_tuple():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+
+    text_hidden_states = torch.randn(2, 4)
+    latent = torch.randn(2, 4)
+    replay_output = tuple(
+        OmniOutput(
+            text_hidden_states=text_hidden_states,
+            multimodal_outputs={"latent": latent},
+        )
+    )
+
+    extracted_hidden_states, multimodal_outputs = runner.extract_multimodal_outputs(replay_output)
+
+    assert extracted_hidden_states is text_hidden_states
+    assert multimodal_outputs is replay_output[1]
+    assert multimodal_outputs["latent"] is latent
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
