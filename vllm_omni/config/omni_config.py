@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
@@ -93,6 +94,8 @@ class _ModelEngineOverrides(TypedDict, total=False):
     moe_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
+    interleave_mm_strings: bool
+    media_io_kwargs: dict[str, Any]
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
@@ -321,6 +324,9 @@ class OmniStageModelConfig:
     moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
+    # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
+    interleave_mm_strings: bool | None = None
+    media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
@@ -549,6 +555,7 @@ class _DiffusionConfigProjection:
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
@@ -623,6 +630,7 @@ class _DiffusionConfigProjection:
             build_attention_config,
             parse_kv_cache_skip_selector,
         )
+        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
         if self.tf_model_config is None:
@@ -684,6 +692,7 @@ class _DiffusionConfigProjection:
                 f"got {type(self.diffusion_attention_config)!r}"
             )
 
+        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 

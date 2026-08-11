@@ -224,6 +224,17 @@ def test_client(mock_async_diffusion):
 
 
 @pytest.fixture
+def lingbot_test_client(test_client):
+    test_client.app.state.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args={"model_class_name": "LingBotVideoPipeline"},
+        )
+    ]
+    return test_client
+
+
+@pytest.fixture
 def async_omni_test_client():
     """Create test client with mocked AsyncOmni engine."""
     from fastapi import FastAPI

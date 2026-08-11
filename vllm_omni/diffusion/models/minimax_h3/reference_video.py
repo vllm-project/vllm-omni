@@ -272,6 +272,7 @@ def _transcode_reference_video(
     *,
     target_width: int,
     target_height: int,
+    target_frame_count: int,
     workdir: str,
     start_time_seconds: float = 0.0,
     duration_seconds: float | None = None,
@@ -294,12 +295,22 @@ def _transcode_reference_video(
             "-vf",
             (f"fps={MINIMAX_H3_FPS:g},scale={target_width}:{target_height}:flags=lanczos,setsar=1"),
             *duration_args,
+            "-frames:v",
+            str(int(target_frame_count)),
             "-metadata:s:v:0",
             "rotate=0",
+            # Keep the transformed RGB pixels lossless. The same prepared
+            # stream is decoded by Qwen3VL and the video VAE; a yuv420p
+            # intermediate would make the two consumers see different
+            # pixels from the model-card reference recipe.
             "-c:v",
-            "libx264",
+            "libx264rgb",
+            "-crf",
+            "0",
+            "-preset",
+            "veryfast",
             "-pix_fmt",
-            "yuv420p",
+            "rgb24",
             output,
         ],
         check=True,
@@ -314,10 +325,6 @@ def prepare_reference_videos(
     workdir: str,
     start_time_seconds: Any = None,
 ) -> list[dict[str, Any]]:
-    # Keep this argument for compatibility with existing pipeline callers;
-    # reference inputs are now bounded by their source/segment durations, not
-    # clipped to the generated frame count.
-    del target_frame_count
     if isinstance(values, (str, os.PathLike)):
         values = [values]
     if not isinstance(values, (list, tuple)) or not values:
@@ -366,6 +373,7 @@ def prepare_reference_videos(
             source,
             target_width=width,
             target_height=height,
+            target_frame_count=target_frame_count,
             workdir=str(item_workdir),
             start_time_seconds=start,
             duration_seconds=duration,
@@ -379,6 +387,14 @@ def prepare_reference_videos(
                 "height": height,
                 "start_time_seconds": start,
                 "duration_seconds": duration,
+                # Reference video frames and their soundtrack are conditioned
+                # only for the generated temporal extent. Keep the source
+                # segment duration for metadata/validation, and expose the
+                # bounded duration separately for audio extraction.
+                "audio_duration_seconds": min(
+                    duration,
+                    float(target_frame_count) / MINIMAX_H3_FPS,
+                ),
             }
         )
     return prepared
@@ -403,13 +419,7 @@ def load_video_frames(path: str) -> np.ndarray:
     return frames.asnumpy() if hasattr(frames, "asnumpy") else np.asarray(frames)
 
 
-def sample_reference_video_frames(
-    prepared_path: str,
-    *,
-    workdir: str,
-) -> dict[str, Any]:
-    from PIL import Image
-
+def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
     meta = _probe_video(prepared_path)
     ratio = MINIMAX_H3_FPS / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS
     indices: list[int] = []
@@ -424,30 +434,11 @@ def sample_reference_video_frames(
     if not indices:
         raise OmniClientError(f"no frames sampled from {prepared_path}")
 
-    frame_dir = Path(workdir)
-    frame_dir.mkdir(parents=True, exist_ok=True)
-    frames = []
-    for output_index, source_index in enumerate(indices, start=1):
-        output = frame_dir / f"frame_{output_index:06d}.png"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                prepared_path,
-                "-vf",
-                f"select=eq(n\\,{source_index})",
-                "-vsync",
-                "vfr",
-                "-frames:v",
-                "1",
-                str(output),
-            ],
-            check=True,
-        )
-        frames.append(np.asarray(Image.open(output).convert("RGB")))
+    # The preparation step emits a lossless RGB stream. Decode it once and
+    # sample from that array so Qwen3VL sees exactly the same pixels as the
+    # video VAE, without starting one full-video ffmpeg decode per sample.
+    decoded_frames = load_video_frames(prepared_path)
+    frames = [np.asarray(decoded_frames[source_index]) for source_index in indices]
 
     timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]
     timestamps += [timestamps[-1]] * ((-len(timestamps)) % MINIMAX_H3_QWEN_TEMPORAL_PATCH)

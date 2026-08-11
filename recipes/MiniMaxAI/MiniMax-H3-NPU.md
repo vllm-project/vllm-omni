@@ -79,7 +79,8 @@ sharing the tokenizer, processor, text encoder, and VAEs from `FL2VA`.
 ### Multi-NPU: 768P combined-service configuration
 
 Use Ulysses sequence parallelism degree 8, text-encoder tensor parallelism
-degree 8, native tiled VAE patch parallelism degree 8, and layerwise offload:
+degree 8, native tiled VAE patch parallelism degree 8, and distributed
+layerwise offload:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -98,7 +99,7 @@ vllm serve "${MODEL}" \
   --usp 8 \
   --ring 1 \
   --text-encoder-tp-size 8 \
-  --enable-layerwise-offload \
+  --enable-distributed-layerwise-offload \
   --vae-parallel-mode tile \
   --vae-use-tiling \
   --vae-patch-parallel-size 8 \
@@ -111,6 +112,11 @@ H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
 The same endpoint accepts `task=t2va`, `task=fl2va`, and `task=ref2va`; no
 partition restart is required. Layerwise offload applies to both DiTs.
+
+On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
+768P without offloading or sharding: use distributed layerwise offload (as
+above) or HSDP — see
+[§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
 
 ### Optional optimizations
 
@@ -134,6 +140,63 @@ Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
 over the whole sequence, so ring parallelism would split away the keys it
 needs. Scale with `--usp` instead.
 
+## Memory and attention optimizations (A3)
+
+### Fitting 768P into 64 GB HBM: distributed layerwise offload or HSDP
+
+Each Atlas 800I A3 NPU has 64 GB of HBM, which is not enough for the
+combined MiniMax-H3 service at 768P. Enable **one** of the following at
+server startup:
+
+**Distributed layerwise offload** — DiT layers are offloaded with parameters
+gathered across the parallel group instead of replicated per rank:
+
+```bash
+  --enable-distributed-layerwise-offload
+```
+
+Measured peak NPU memory is about 45 GB per device for Ref2VA with a 13.88 s
+input video generating a 15 s 768P (1344x768) output video. Host (CPU) memory
+usage is high with this option.
+
+**HSDP** — hybrid sharded data parallelism for the DiT parameters. The
+multi-stream memory-reuse knob is mandatory with this flag:
+
+```bash
+export MULTI_STREAM_MEMORY_REUSE=2
+```
+
+```bash
+  --use-hsdp
+```
+
+Host memory usage is small, but large shapes may still OOM; HBM usage
+optimizations for this path are ongoing.
+
+### FLASH_ATTN backend with MindIE-SD
+
+Keep `--diffusion-attention-backend FLASH_ATTN` and install MindIE-SD (see
+[§ Environment](#environment)). On NPU this backend carries most of the
+memory-reduction and performance work: a mask-free packed varlen path that
+never materializes the quadratic `full_qk` padding mask, and K/V prefix
+slicing, both driven by the packed `cu_seqlens` metadata emitted by the H3
+transformer.
+
+### Optional: LaserAttention fused kernel
+
+For an additional attention speedup, select the Ascend LaserAttention fused
+kernel before starting the server:
+
+```bash
+export MINDIE_SD_FA_TYPE="ascend_laser_attention"
+```
+
+This requires the FLASH_ATTN backend and MindIE-SD. H3 automatically applies
+exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
+kernel's fp16 workspace cannot overflow on outlier activations. Measured
+speedup numbers will be added here.
+
+
 ## HTTP API examples
 
 The request format is identical to the GPU recipe; see
@@ -154,8 +217,8 @@ configuration above:
 
 | Workload | Configuration |
 |----------|---------------|
-| T2VA, 209 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
-| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
+| T2VA, 209 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
+| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
 
 These measurements describe the validated shapes rather than a general
 throughput guarantee.

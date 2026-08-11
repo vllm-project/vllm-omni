@@ -1172,6 +1172,7 @@ class OmniDuplexSessionHandler(
         return (
             session.capabilities.implementation_level == "model_native_duplex"
             and session.capabilities.supports_input_append
+            and session.config.extra_body.get("minicpmo45_native_duplex") is not False
         )
 
     @staticmethod

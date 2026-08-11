@@ -29,6 +29,15 @@ class AudexAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audex_thinker", "audex_omni"})
     name = "audex"
 
+    @classmethod
+    def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
+        """``audex_omni`` covers the audex_s2s deployment, whose TTS pass uses
+        the same ``/v1/audio/speech`` surface. Without the speech decoder the
+        same thinker is text-final and must not accept speech requests."""
+        if model_stage == "audex_omni":
+            return "audex_code2wav" in all_stage_keys
+        return True
+
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():
             return "Audex TTS requires non-empty input text"

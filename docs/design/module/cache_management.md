@@ -5,6 +5,7 @@ status: draft
 owners:
   - "@Isotr0py"
   - "@princepride"
+  - "@SamitHuang"
 primary_code_paths:
   - vllm_omni/diffusion/cache/**
 related_code_paths:

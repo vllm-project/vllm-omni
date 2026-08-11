@@ -6,9 +6,13 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -26,6 +30,16 @@ class DiffusionRequestStatus(enum.IntEnum):
     @staticmethod
     def is_finished(status: DiffusionRequestStatus) -> bool:
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
+
+
+@dataclass(frozen=True)
+class _AdmissionWaitDecision:
+    """Internal scheduler policy for delaying the next admission wave."""
+
+    should_wait: bool
+    deadline: float | None = None
+    stable_window_s: float = 0.0
+    max_batch: int = 1
 
 
 @dataclass(frozen=True, eq=True)
@@ -129,6 +143,7 @@ class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -147,10 +162,39 @@ class NewRequestData:
 
     request_id: str
     req: OmniDiffusionRequest
+    diffusion_kv_metadata: DiffusionKVMetadata | None = None
 
     @classmethod
-    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
-        return cls(request_id=state.request_id, req=state.req)
+    def from_state(
+        cls,
+        state: SchedulerRequestState,
+        *,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
+    ) -> NewRequestData:
+        return cls(
+            request_id=state.request_id,
+            req=state.req,
+            diffusion_kv_metadata=diffusion_kv_metadata,
+        )
+
+
+def validate_new_request_data_identity(new_req: NewRequestData) -> None:
+    """Ensure an envelope and its forwarded request describe the same request."""
+    forwarded_request_id = new_req.req.request_id
+    if new_req.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"envelope request_id={new_req.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
+
+    metadata = new_req.diffusion_kv_metadata
+    if metadata is not None and metadata.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"metadata request_id={metadata.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
 
 
 @dataclass

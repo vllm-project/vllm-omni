@@ -389,6 +389,24 @@ def test_serve_cli_accepts_request_batch_max_wait_ms():
     assert stage_cfg["engine_args"]["request_batch_max_wait_ms"] == 250.0
 
 
+@pytest.mark.parametrize("bad_wait", ["nan", "inf", "-inf", "-1"])
+def test_serve_cli_rejects_invalid_request_batch_max_wait_ms(bad_wait: str):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "serve",
+                "Qwen/Qwen-Image",
+                "--omni",
+                "--request-batch-max-wait-ms",
+                bad_wait,
+            ]
+        )
+
+
 def test_serve_cli_accepts_additional_config():
     """Ensure diffusion serve CLI exposes additional_config and forwards it to stage config."""
     parser = TrackingArgumentParser()

@@ -28,10 +28,13 @@ if _MODULE_NAME not in sys.modules:
     _spec.loader.exec_module(_mod)
 
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
+    SeedTTSDataset,
     SeedTTSDesignDataset,
     SeedTTSDesignSampleRequest,
+    SeedTTSSampleRequest,
     SeedTTSTextDataset,
     SeedTTSTextSampleRequest,
+    SeedTTSTurn,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,94 @@ def mock_tokenizer(mocker):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_seed_tts_dataset_groups_four_turns_with_one_reference(seed_tts_root, mock_tokenizer):
+    ds = SeedTTSDataset(
+        dataset_path=str(seed_tts_root),
+        random_seed=0,
+        locale="en",
+        disable_shuffle=True,
+    )
+
+    requests = ds.sample(
+        mock_tokenizer,
+        num_requests=1,
+        turns_per_session=4,
+        no_oversample=True,
+    )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert [turn.utterance_id for turn in request.seed_tts_turns] == [
+        "utt000",
+        "utt001",
+        "utt002",
+        "utt003",
+    ]
+    assert [turn.target_text for turn in request.seed_tts_turns] == [
+        "target text 0",
+        "target text 1",
+        "target text 2",
+        "target text 3",
+    ]
+    assert request.seed_tts_speech_extra["ref_text"] == "ref text 0"
+    assert request.seed_tts_ref_wav_path.endswith("utt000.wav")
+
+
+def test_seed_tts_eval_expands_grouped_pcm_by_turn():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
+        _expand_seed_tts_turn_outputs,
+    )
+
+    request = SeedTTSSampleRequest(
+        prompt="target 0",
+        prompt_len=4,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="session-0",
+        seed_tts_turns=tuple(
+            SeedTTSTurn(utterance_id=f"utt-{index}", target_text=f"target {index}") for index in range(4)
+        ),
+    )
+    output = types.SimpleNamespace(
+        success=True,
+        tts_turn_pcm_bytes=[bytes([index]) for index in range(4)],
+    )
+
+    requests, outputs = _expand_seed_tts_turn_outputs([request], [output])
+
+    assert [item.prompt for item in requests] == [f"target {index}" for index in range(4)]
+    assert [item.seed_tts_utterance_id for item in requests] == [f"utt-{index}" for index in range(4)]
+    assert [item.tts_output_pcm_bytes for item in outputs] == [bytes([index]) for index in range(4)]
+
+
+def test_seed_tts_eval_keeps_session_pcm_for_single_turn_chat():
+    """Chat-omni Seed-TTS sets session PCM only; expand must not wipe it."""
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
+        _expand_seed_tts_turn_outputs,
+    )
+
+    request = SeedTTSSampleRequest(
+        prompt="target 0",
+        prompt_len=4,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="session-0",
+        seed_tts_turns=(SeedTTSTurn(utterance_id="utt-0", target_text="target 0"),),
+    )
+    pcm = b"\x01\x02\x03\x04"
+    output = types.SimpleNamespace(
+        success=True,
+        tts_output_pcm_bytes=pcm,
+        tts_turn_pcm_bytes=None,
+    )
+
+    requests, outputs = _expand_seed_tts_turn_outputs([request], [output])
+
+    assert len(requests) == 1
+    assert requests[0].prompt == "target 0"
+    assert outputs[0].tts_output_pcm_bytes == pcm
 
 
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):

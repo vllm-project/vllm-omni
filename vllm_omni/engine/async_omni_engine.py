@@ -69,6 +69,7 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
+    is_new_format_deploy_config,
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
@@ -1193,7 +1194,12 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
-        if stage_configs_path is not None:
+        # Legacy ``stage_args`` YAMLs own per-stage EngineArgs completely, so
+        # strip parent CLI fields. New-format deploy YAMLs (also accepted via
+        # ``--stage-configs-path``) merge CLI overrides the same way as
+        # ``--deploy-config`` — do not strip, or flags like
+        # ``interleave_mm_strings`` / ``media_io_kwargs`` are silently dropped.
+        if stage_configs_path is not None and not is_new_format_deploy_config(stage_configs_path):
             base_kwargs = self._strip_single_engine_args(kwargs)
         else:
             base_kwargs = kwargs
@@ -1405,6 +1411,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1417,6 +1424,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
             message_type="streaming_update",
         )
@@ -1431,6 +1439,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1443,6 +1452,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
         )
 

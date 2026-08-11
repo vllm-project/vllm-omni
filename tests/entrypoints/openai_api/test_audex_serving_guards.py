@@ -20,6 +20,10 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
 )
 
+# Serving-layer only: the engine is stubbed, so these run on the CPU lane
+# alongside the other tests/entrypoints/openai_api suites.
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _serving(model_type: str = "audex") -> OmniOpenAIServingSpeech:
     serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
