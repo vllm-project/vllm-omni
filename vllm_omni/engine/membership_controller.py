@@ -6,7 +6,7 @@
 Extracted from Orchestrator to keep request-flow code free of distributed
 concerns. Owns the OmniCoordClientForHub, watches for replica
 disappearances, and handles register/unregister by building head-side
-clients via an injected factory and mutating StagePool membership.
+clients via an injected factory and mutating StageReplicaPool membership.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from vllm_omni.distributed.omni_coordinator import (
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
 from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
 
 logger = init_logger(__name__)
 
@@ -41,7 +41,7 @@ class MembershipController:
 
     def __init__(
         self,
-        stage_pools: list[StagePool],
+        stage_pools: list[StageReplicaPool],
         coordinator_pub_address: str,
         load_balancer_factory: Callable[[], LoadBalancer],
         remote_replica_factory: RemoteReplicaFactory,
@@ -154,7 +154,7 @@ class MembershipController:
             logger.warning("[MembershipController] register: stage_id %d out of range", stage_id)
             return
         client = await asyncio.to_thread(self._remote_replica_factory, stage_id, replica_id)
-        input_addr = StagePool._client_input_addr(client)
+        input_addr = StageReplicaPool._client_input_addr(client)
         if input_addr is None:
             raise RuntimeError(f"remote replica factory for stage {stage_id} produced a client without input address")
         pool.add_client(input_addr, client, replica_id=replica_id)
@@ -188,7 +188,7 @@ class MembershipController:
         self._output_queue = output_queue
         self._cleanup_callback = cleanup_callback
 
-    def _pool_for_stage_id(self, stage_id: int) -> StagePool | None:
+    def _pool_for_stage_id(self, stage_id: int) -> StageReplicaPool | None:
         if not (0 <= stage_id < len(self._stage_pools)):
             return None
         return self._stage_pools[stage_id]

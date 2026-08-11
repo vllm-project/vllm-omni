@@ -19,8 +19,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
-from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreOutput
 
 logger = init_logger(__name__)
 
@@ -300,7 +300,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     req = self.requests.get(req_id)
                     if req is not None and not req.is_finished():
                         outputs[req.client_index].append(
-                            OmniEngineCoreOutput(
+                            StageLLMCoreOutput(
                                 request_id=req_id,
                                 new_token_ids=[],
                                 kv_transfer_params={"kv_ready": True},

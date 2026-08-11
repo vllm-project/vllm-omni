@@ -18,7 +18,11 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine.stage.stage_core_types import (
+    StageLLMCoreOutput,
+    StageLLMCoreOutputs,
+    StageLLMCoreRequest,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
@@ -299,9 +303,9 @@ for module_name, module in list(sys.modules.items()):
     if "vllm" not in module_name:
         continue
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
-        module.EngineCoreOutput = OmniEngineCoreOutput
+        module.EngineCoreOutput = StageLLMCoreOutput
     if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
-        module.EngineCoreOutputs = OmniEngineCoreOutputs
+        module.EngineCoreOutputs = StageLLMCoreOutputs
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
         module.TokensPrompt = OmniTokensPrompt
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
@@ -311,7 +315,7 @@ for module_name, module in list(sys.modules.items()):
     if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
         module.StreamingUpdate = OmniStreamingUpdate
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
-        module.EngineCoreRequest = OmniEngineCoreRequest
+        module.EngineCoreRequest = StageLLMCoreRequest
 
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.

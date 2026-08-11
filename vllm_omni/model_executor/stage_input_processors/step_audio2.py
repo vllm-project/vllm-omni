@@ -8,7 +8,7 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_STREAM_CONFIG,
@@ -37,7 +37,7 @@ def _ensure_list(x):
 def thinker2token2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """

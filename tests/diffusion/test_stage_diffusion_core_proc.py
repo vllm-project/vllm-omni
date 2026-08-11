@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 
 import pytest
 
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.stage.stage_diffusion_core_proc import StageDiffusionCoreProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -42,7 +42,7 @@ class MockDiffusionEngine:
 
 @pytest.mark.asyncio
 async def test_proc_streaming_request_yields_each_engine_chunk():
-    """Ensure that the streaming output chunks from DiffusionEngine reaches StageDiffusionProc"""
+    """Ensure that the streaming output chunks from DiffusionEngine reaches StageDiffusionCoreProc"""
     captured = {}
     chunks = [
         OmniRequestOutput.from_diffusion(request_id="", images=[], finished=False),
@@ -55,7 +55,7 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
             for chunk in chunks:
                 yield [chunk]
 
-    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc = object.__new__(StageDiffusionCoreProc)
     stage_proc._engine = _StreamingEngine()
 
     outputs = [
@@ -76,7 +76,7 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
 
 @pytest.mark.asyncio
 async def test_proc_process_request_with_batching_async_output():
-    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc = object.__new__(StageDiffusionCoreProc)
     stage_proc._engine = MockDiffusionEngine()
 
     test_requests = [

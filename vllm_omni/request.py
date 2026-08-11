@@ -11,7 +11,8 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
 
 
 class OmniRequest(Request):
@@ -66,13 +67,13 @@ class OmniRequest(Request):
     @classmethod
     def from_engine_core_request(
         cls,
-        request: OmniEngineCoreRequest,
+        request: StageLLMCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        """Create an OmniRequest from an OmniEngineCoreRequest.
+        """Create an OmniRequest from a StageLLMCoreRequest.
 
         Args:
-            request: The OmniEngineCoreRequest to convert
+            request: The StageLLMCoreRequest to convert
             block_hasher: Optional function to compute block hashes for
                 prefix caching
 

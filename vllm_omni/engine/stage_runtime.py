@@ -32,8 +32,9 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
 )
-from vllm_omni.engine.stage_client import StageClient, StagePoolClient
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
+from vllm_omni.engine.stage.stage_core_client import StageCoreClientBase
+from vllm_omni.engine.stage.stage_llm_core_client import StageLLMCoreClientBase
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool as StagePool
 from vllm_omni.engine.stage_engine_startup import (
     OmniMasterServer,
     StageReplicaResources,
@@ -59,7 +60,6 @@ from vllm_omni.engine.stage_init_utils import (
     prepare_engine_environment,
     release_device_locks,
 )
-from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
@@ -190,13 +190,13 @@ class StageRuntime:
     @staticmethod
     def _collect_initialized_clients_for_cleanup(
         stage_pools: Sequence[StagePool],
-        initialized_clients_by_stage: Mapping[int, Sequence[StagePoolClient | None]],
-    ) -> list[StageClient]:
+        initialized_clients_by_stage: Mapping[int, Sequence[StageCoreClientBase | None]],
+    ) -> list[StageCoreClientBase]:
         """Collect initialized clients exactly once for failure cleanup."""
-        collected: list[StageClient] = []
+        collected: list[StageCoreClientBase] = []
         seen: set[int] = set()
 
-        def _add_client(client: StageClient | None) -> None:
+        def _add_client(client: StageCoreClientBase | None) -> None:
             if client is None:
                 return
             client_id = id(client)
@@ -216,7 +216,7 @@ class StageRuntime:
         return collected
 
     @staticmethod
-    def _shutdown_initialized_clients(clients: Sequence[StageClient]) -> None:
+    def _shutdown_initialized_clients(clients: Sequence[StageCoreClientBase]) -> None:
         """Best-effort shutdown for attached clients after init failure."""
         for client in reversed(list(clients)):
             if client is None:
@@ -232,7 +232,7 @@ class StageRuntime:
     def initialize(self) -> None:
         """Run the full stage initialization sequence."""
         stage_plans = self._prepare_stage_plans()
-        initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
+        initialized_clients_by_stage: dict[int, list[StageCoreClientBase | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
         try:
@@ -289,7 +289,7 @@ class StageRuntime:
     def _finalize_initialized_stages(
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
-        initialized_clients: Mapping[int, Sequence[StagePoolClient | None]],
+        initialized_clients: Mapping[int, Sequence[StageCoreClientBase | None]],
     ) -> None:
         """Populate runtime fields after replica initialization succeeds."""
         self.stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients)
@@ -438,14 +438,14 @@ class StageRuntime:
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
         stage_init_timeout: int,
-    ) -> dict[int, list[StagePoolClient | None]]:
+    ) -> dict[int, list[StageCoreClientBase | None]]:
         """Initialize all stage replicas.
 
         Stages sharing the same GPU are initialized sequentially to avoid
         memory profiling interference. Stages on different GPUs are
         initialized in parallel.
         """
-        initialized_clients_by_stage: dict[int, list[StagePoolClient | None]] = {
+        initialized_clients_by_stage: dict[int, list[StageCoreClientBase | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
         primary_exc: Exception | None = None
@@ -525,7 +525,7 @@ class StageRuntime:
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StagePoolClient:
+    ) -> StageCoreClientBase:
         if plan.launch_mode == "remote":
             return self._initialize_remote_replica(plan, stage_init_timeout)
         if plan.metadata.stage_type == "diffusion":
@@ -536,7 +536,7 @@ class StageRuntime:
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StagePoolClient:
+    ) -> StageCoreClientBase:
         """Initialize a remote replica. Only distributed runtime implements this."""
         raise NotImplementedError("Remote replicas require DistStageRuntime")
 
@@ -544,7 +544,7 @@ class StageRuntime:
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StageEngineCoreClientBase:
+    ) -> StageLLMCoreClientBase:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
         resources: StageReplicaResources | None = None
         stage_client = None
@@ -585,7 +585,7 @@ class StageRuntime:
                     replica_id=plan.replica_id,
                     stage_config=plan.stage_cfg,
                     omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
+                    omni_coord_address=self._get_coordinator_address(),
                     stage_visible_devices=physical_devices,
                     spawn_device_lock=self._spawn_device_lock,
                 ) as resources:
@@ -596,13 +596,13 @@ class StageRuntime:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no resources")
             if resources.addresses is None:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} launcher returned no addresses")
-            stage_client = StageEngineCoreClientBase.make_async_mp_client(
+            stage_client = StageLLMCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=self._log_stats,
                 metadata=plan.metadata,
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
-                engine_manager=resources.manager,
+                proc_manager=resources.manager,
                 coordinator=resources.coordinator,
             )
 
@@ -659,7 +659,7 @@ class StageRuntime:
                     use_inline=self._num_stages == 1 and plan.num_replicas == 1,
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
+                    omni_coord_address=self._get_coordinator_address(),
                 )
 
             logger.info(
@@ -692,7 +692,7 @@ class StageRuntime:
     def _assemble_stage_pools(
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
-        initialized_clients_by_stage: Mapping[int, Sequence[StagePoolClient | None]],
+        initialized_clients_by_stage: Mapping[int, Sequence[StageCoreClientBase | None]],
     ) -> list[StagePool]:
         """Assemble logical stage pools."""
         stage_pools: list[StagePool] = []
@@ -703,7 +703,7 @@ class StageRuntime:
             if first_client is None:
                 raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
 
-            clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
+            clients: list[StageCoreClientBase] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
             if plan.replicas[0].metadata.stage_type != "diffusion":
@@ -869,7 +869,7 @@ class DistStageRuntime(StageRuntime):
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StagePoolClient:
+    ) -> StageCoreClientBase:
         """Wait for a configured remote replica and create its head-side client."""
         if self._omni_master_server is None:
             raise RuntimeError("OmniMasterServer is not running; cannot initialize remote replica")
@@ -975,7 +975,7 @@ class DistStageRuntime(StageRuntime):
         except Exception:
             logger.exception("[DistStageRuntime] Failed to enqueue register message")
 
-    def _build_remote_replica(self, stage_id: int, replica_id: int) -> StagePoolClient:
+    def _build_remote_replica(self, stage_id: int, replica_id: int) -> StageCoreClientBase:
         ctx = self._stage_remote_factory_contexts.get(stage_id)
         if ctx is None:
             raise ValueError(f"No factory context for stage {stage_id}")
@@ -985,7 +985,7 @@ class DistStageRuntime(StageRuntime):
         self,
         ctx: StageRemoteFactoryContext,
         replica_id: int,
-    ) -> StagePoolClient:
+    ) -> StageCoreClientBase:
         """Create the head-side client for a remote replica.
 
         Used by both initial remote slots and dynamic headless registrations.
@@ -997,7 +997,9 @@ class DistStageRuntime(StageRuntime):
         metadata.replica_id = replica_id
 
         if ctx.stage_type == "diffusion":
-            from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+            from vllm_omni.diffusion.stage.stage_diffusion_core_client import (
+                StageDiffusionCoreClient as StageDiffusionClient,
+            )
 
             resources = None
             try:
@@ -1060,13 +1062,13 @@ class DistStageRuntime(StageRuntime):
             replica_host = self._omni_master_server.get_replica_host(stage_id, replica_id)
             if replica_host:
                 client_addresses["replica_host"] = replica_host
-            client = StageEngineCoreClientBase.make_async_mp_client(
+            client = StageLLMCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=ctx.executor_class,
                 log_stats=self._log_stats,
                 metadata=metadata,
                 client_addresses=client_addresses,
-                engine_manager=resources.manager,
+                proc_manager=resources.manager,
                 coordinator=resources.coordinator,
             )
             logger.info("[DistStageRuntime] Remote LLM replica attached stage=%d replica=%d", stage_id, replica_id)

@@ -163,12 +163,12 @@ def _make_diffusion_plan(
 
 def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
-    import vllm_omni.engine.stage_engine_core_client as client_mod
+    import vllm_omni.engine.stage.stage_llm_core_client as client_mod
 
     importlib.reload(client_mod)
 
-    assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
-        "StageEngineCoreClient | DPLBStageEngineCoreClient"
+    assert client_mod.StageLLMCoreClientBase.make_async_mp_client.__annotations__["return"] == (
+        "StageLLMCoreClient | DPLBStageLLMCoreClient"
     )
 
 
@@ -706,7 +706,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
 
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
     monkeypatch.setattr(
-        runtime_mod.StageEngineCoreClientBase,
+        runtime_mod.StageLLMCoreClientBase,
         "make_async_mp_client",
         staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
     )

@@ -26,7 +26,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage.stage_replica_pool import StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -160,10 +160,10 @@ class _DieOnDemandLLMStageClient(FakeStageClient):
         super().__init__(*args, **kwargs)
         self.die = False
 
-    async def get_output_async(self):
+    async def get_outputs_async(self):
         if self.die:
             raise EngineDeadError(f"Stage-{self.stage_id} replica-{self.replica_id} is dead")
-        return await super().get_output_async()
+        return await super().get_outputs_async()
 
 
 class _DieOnDemandDiffusionStageClient(FakeStageClient):
@@ -173,10 +173,10 @@ class _DieOnDemandDiffusionStageClient(FakeStageClient):
         super().__init__(*args, **kwargs)
         self.die = False
 
-    def get_diffusion_output_nowait(self):
+    def get_outputs_nowait(self):
         if self.die:
             raise EngineDeadError(f"Stage-{self.stage_id} diffusion replica-{self.replica_id} is dead")
-        return super().get_diffusion_output_nowait()
+        return super().get_outputs_nowait()
 
 
 class _UnavailableDiffusionStageClient(FakeStageClient):

@@ -25,11 +25,14 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     NewRequestData,
 )
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.stage.stage_diffusion_core_proc import StageDiffusionCoreProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.engine.stage.stage_core_types import (
+    StageDiffusionCoreOutput,
+    StageDiffusionCoreRequest,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -963,18 +966,19 @@ class TestDiffusionEngineDeadErrorPassthrough:
         assert "gpu fault" in out.error
 
 
-class TestStageDiffusionClientErrorPropagation:
-    """Error surface behaviour of ``StageDiffusionClient``.
+class TestStageDiffusionCoreClientErrorPropagation:
+    """Error surface behaviour of ``StageDiffusionCoreClient``.
 
     Uses ``object.__new__`` to construct a client without spawning a real
     subprocess, then manually sets the fields needed for each test.
     """
 
     def _make_client(self, *, engine_dead=False, proc_alive=True):
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+        from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
 
-        client = object.__new__(StageDiffusionClient)
+        client = object.__new__(StageDiffusionCoreClient)
         client.stage_id = 0
+        client.replica_id = 0
         client.final_output = True
         client.final_output_type = "image"
         client.default_sampling_params = None
@@ -1004,7 +1008,9 @@ class TestStageDiffusionClientErrorPropagation:
         client = self._make_client(engine_dead=True)
 
         with pytest.raises(EngineDeadError):
-            await client.add_request_async("req-3", "test prompt", None)
+            await client.add_request_async(
+                StageDiffusionCoreRequest(request_id="req-3", prompt="test prompt", sampling_params={})
+            )
 
     def test_check_health_raises_when_dead(self):
         client = self._make_client(engine_dead=True)
@@ -1018,20 +1024,20 @@ class TestStageDiffusionClientErrorPropagation:
 
     def test_get_output_raises_engine_dead_when_dead(self):
         """When ``_engine_dead`` is True and the output queue is empty,
-        ``get_diffusion_output_nowait`` must raise ``EngineDeadError``."""
+        ``get_outputs_nowait`` must raise ``EngineDeadError``."""
         client = self._make_client(engine_dead=True)
         # Simulate _drain_responses as a no-op (no ZMQ socket)
         client._response_socket.recv.side_effect = zmq.Again
 
         with pytest.raises(EngineDeadError):
-            client.get_diffusion_output_nowait()
+            client.get_outputs_nowait()
 
     def test_get_output_returns_none_when_alive_and_empty(self):
         """When the engine is alive and the queue is empty, return None."""
         client = self._make_client()
         client._response_socket.recv.side_effect = zmq.Again
 
-        assert client.get_diffusion_output_nowait() is None
+        assert client.get_outputs_nowait() is None
 
     def test_check_health_raises_when_proc_dead(self):
         """``check_health`` detects a dead subprocess via the manager's proc
@@ -1046,34 +1052,36 @@ class TestStageDiffusionClientErrorPropagation:
 
     def test_get_output_raises_when_proc_dead(self):
         """When the subprocess has died (non-signal exit) and the output
-        queue is empty, ``get_diffusion_output_nowait`` must raise
+        queue is empty, ``get_outputs_nowait`` must raise
         ``EngineDeadError`` with the exit code."""
         client = self._make_client(proc_alive=False)
         client._response_socket.recv.side_effect = zmq.Again
 
         with pytest.raises(EngineDeadError, match="exit code"):
-            client.get_diffusion_output_nowait()
+            client.get_outputs_nowait()
 
         assert client._engine_dead is True
 
     def test_get_output_returns_none_on_signal_death(self):
         """When the subprocess was killed by a signal (exit code > 128),
-        ``get_diffusion_output_nowait`` returns ``None`` and sets
+        ``get_outputs_nowait`` returns ``None`` and sets
         ``_shutting_down`` instead of raising."""
         client = self._make_client(proc_alive=False)
         client._proc_manager.proc.exitcode = 137  # SIGKILL (128 + 9)
         client._response_socket.recv.side_effect = zmq.Again
 
-        result = client.get_diffusion_output_nowait()
+        result = client.get_outputs_nowait()
 
         assert result is None
         assert client._shutting_down is True
         assert client._engine_dead is True
 
     def test_initialize_client_requires_replica_id(self):
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+        from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
 
-        client = object.__new__(StageDiffusionClient)
+        # Metadata is now consumed by ``StageCoreClientBase.__init__`` (invoked
+        # from the constructor) rather than ``_initialize_client``; a metadata
+        # object missing ``replica_id`` must fail before any transport setup.
         metadata = SimpleNamespace(
             stage_id=0,
             final_output=True,
@@ -1085,7 +1093,7 @@ class TestStageDiffusionClientErrorPropagation:
         )
 
         with pytest.raises(AttributeError, match="replica_id"):
-            client._initialize_client(
+            StageDiffusionCoreClient(
                 metadata,
                 "tcp://req",
                 "tcp://resp",
@@ -1106,7 +1114,7 @@ class TestStageDiffusionClientErrorPropagation:
 
         rpc_id = "rpc-none"
         monkeypatch.setattr(
-            "vllm_omni.diffusion.stage_diffusion_client.uuid.uuid4",
+            "vllm_omni.diffusion.stage.stage_diffusion_core_client.uuid.uuid4",
             lambda: SimpleNamespace(hex=rpc_id),
         )
 
@@ -1259,8 +1267,8 @@ class TestMultiprocExecutorWorkerMonitor:
         assert executor.is_dead
 
 
-class TestStageDiffusionClientProcMonitor:
-    """Integration test for ``StageDiffusionClient._start_proc_monitor``.
+class TestStageDiffusionCoreClientProcMonitor:
+    """Integration test for ``StageDiffusionCoreClient._start_proc_monitor``.
 
     Uses a real short-lived subprocess to verify the sentinel-based
     detection pipeline.
@@ -1269,10 +1277,11 @@ class TestStageDiffusionClientProcMonitor:
     def test_proc_monitor_sets_engine_dead_on_process_death(self):
         """When the subprocess dies, the monitor thread must set
         ``_engine_dead = True``."""
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+        from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
 
-        client = object.__new__(StageDiffusionClient)
+        client = object.__new__(StageDiffusionCoreClient)
         client.stage_id = 0
+        client.replica_id = 0
         client._shutting_down = False
         client._engine_dead = False
 
@@ -1287,14 +1296,15 @@ class TestStageDiffusionClientProcMonitor:
 
 class TestDrainResponsesDeathSentinel:
     """Tests for death sentinel and error routing in
-    ``StageDiffusionClient._drain_responses()``.
+    ``StageDiffusionCoreClient._drain_responses()``.
     """
 
     def _make_client(self):
-        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+        from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
 
-        client = object.__new__(StageDiffusionClient)
+        client = object.__new__(StageDiffusionCoreClient)
         client.stage_id = 0
+        client.replica_id = 0
         client._engine_dead = False
         client._shutting_down = False
         client._output_queue = asyncio.Queue()
@@ -1313,7 +1323,7 @@ class TestDrainResponsesDeathSentinel:
         # First recv returns the death sentinel, second would be a normal
         # message but should never be reached.
         client._response_socket.recv.side_effect = [
-            StageDiffusionProc.DIFFUSION_PROC_DEAD,
+            StageDiffusionCoreProc.DIFFUSION_PROC_DEAD,
             b"should-not-be-reached",
         ]
 
@@ -1324,8 +1334,9 @@ class TestDrainResponsesDeathSentinel:
 
     def test_drain_responses_routes_error_as_omni_request_output(self):
         """When ``_drain_responses`` receives a ``{"type": "error"}`` message
-        with a ``request_id``, it must place an ``OmniRequestOutput`` with
-        the error on ``_output_queue``."""
+        with a ``request_id``, it must place a ``StageDiffusionCoreOutput`` with
+        the error on ``_output_queue`` (the consumer materializes the error
+        ``OmniRequestOutput``)."""
         client = self._make_client()
 
         error_msg = {
@@ -1341,7 +1352,7 @@ class TestDrainResponsesDeathSentinel:
 
         assert not client._output_queue.empty()
         output = client._output_queue.get_nowait()
-        assert isinstance(output, OmniRequestOutput)
+        assert isinstance(output, StageDiffusionCoreOutput)
         assert output.request_id == "req-fail"
         assert output.error == "gpu fault"
         assert output.finished is True

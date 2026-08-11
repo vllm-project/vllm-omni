@@ -20,8 +20,8 @@ from tests.engine.test_orchestrator import (
     _wait_for,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
+from vllm_omni.diffusion.stage.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -33,9 +33,9 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_client import StagePoolClient
+from vllm_omni.engine.stage.stage_core_client import StageCoreClientBase
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool as StagePool
 from vllm_omni.engine.stage_init_utils import StageMetadata
-from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.async_omni import AsyncEventResolver, AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -278,7 +278,7 @@ class TestPromptUpdateIntegration:
         output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
         orchestrator = object.__new__(Orchestrator)
         orchestrator.stage_pools = [  # pyright: ignore[reportAttributeAccessIssue]
-            StagePool(0, cast(StagePoolClient, inline_client))
+            StagePool(0, cast(StageCoreClientBase, inline_client))
         ]
         orchestrator.output_async_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
         orchestrator.request_states = {"req-1": OrchestratorRequestState(request_id="req-1")}
@@ -378,7 +378,7 @@ class TestPromptUpdateIntegration:
         )
         with patch.object(InlineStageDiffusionClient, "_enrich_config"):
             with patch(
-                "vllm_omni.diffusion.inline_stage_diffusion_client.DiffusionEngine.make_engine",
+                "vllm_omni.diffusion.stage.inline_stage_diffusion_client.DiffusionEngine.make_engine",
                 return_value=engine,
             ):
                 od_config = MagicMock(spec=OmniDiffusionConfig)

@@ -1406,7 +1406,7 @@ def initialize_diffusion_stage(
             and ultimately to ``AsyncOmni``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
-    from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
+    from vllm_omni.diffusion.stage.stage_diffusion_core_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)

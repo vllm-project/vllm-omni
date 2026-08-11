@@ -1,7 +1,7 @@
 import pytest
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.stage.stage_diffusion_core_proc import StageDiffusionCoreProc
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model, resolve_model_config_path
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -56,7 +56,7 @@ def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch
         model="GEAR-Dreams/DreamZero-DROID",
         model_class_name="DreamZeroPipeline",
     )
-    proc = StageDiffusionProc(od_config.model, od_config)
+    proc = StageDiffusionCoreProc(od_config.model, od_config)
 
     proc._enrich_config()
 

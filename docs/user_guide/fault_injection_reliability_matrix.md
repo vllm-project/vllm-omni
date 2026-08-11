@@ -77,9 +77,9 @@ Server ready on 127.0.0.1:60675 (OmniServer startup took 206.023s)
 OmniServer started successfully
 [reliability][process-kill] current_server_proc pid=556855 name=python3 cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --deploy-config vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
 [reliability][process-kill] current_server_proc pid=557118 name=python3 cmdline=/workspace/.venv/bin/python3 -c from multiprocessing.resource_tracker import main;main(57)
-[reliability][process-kill] current_server_proc pid=557119 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
-[reliability][process-kill] current_server_proc pid=557122 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
-[reliability][process-kill] current_server_proc pid=558201 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
+[reliability][process-kill] current_server_proc pid=557119 name=VLLM::StageLLMCoreProc_noid_replica0_DP0 cmdline=VLLM::StageLLMCoreProc_noid_replica0_DP0
+[reliability][process-kill] current_server_proc pid=557122 name=VLLM::StageLLMCoreProc_noid_replica0_DP0 cmdline=VLLM::StageLLMCoreProc_noid_replica0_DP0
+[reliability][process-kill] current_server_proc pid=558201 name=VLLM::StageLLMCoreProc_noid_replica0_DP0 cmdline=VLLM::StageLLMCoreProc_noid_replica0_DP0
 
 [reliability][process-kill] root-kill pid=556855 name=python3 signal=SIGTERM cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --deploy-config vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [omni_base.py:463] [AsyncOmni] Shutting down
@@ -87,21 +87,21 @@ OmniServer started successfully
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [orchestrator.py:351] [Orchestrator] Received shutdown signal
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [orchestrator.py:1359] [Orchestrator] Shutting down all 3 client(s)
 
-[0;36m(StageEngineCoreProc pid=557119)[0;0m [32mINFO[0m [90m05-19 12:24:51[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
-[0;36m(StageEngineCoreProc pid=557119)[0;0m [32mINFO[0m [90m05-19 12:24:51[0m [90m[core.py:1265][0m Shutdown complete
+[0;36m(StageLLMCoreProc pid=557119)[0;0m [32mINFO[0m [90m05-19 12:24:51[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
+[0;36m(StageLLMCoreProc pid=557119)[0;0m [32mINFO[0m [90m05-19 12:24:51[0m [90m[core.py:1265][0m Shutdown complete
 [0;36m(APIServer pid=556855)[0;0m INFO:     Shutting down
 [0;36m(APIServer pid=556855)[0;0m INFO:     Waiting for application shutdown.
 [0;36m(APIServer pid=556855)[0;0m INFO:     Application shutdown complete.
 [0;36m(APIServer pid=556855)[0;0m INFO:     Finished server process [556855]
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [omni_base.py:463] [AsyncOmni] Shutting down
 [rank0]:[W519 12:24:53.427894833 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
-[0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:56 [stage_pool.py:731] [StagePool] Stage 0 replica 0 shut down
-[0;36m(StageEngineCoreProc pid=557122)[0;0m [32mINFO[0m [90m05-19 12:24:56[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
-[0;36m(StageEngineCoreProc pid=557122)[0;0m [32mINFO[0m [90m05-19 12:24:56[0m [90m[core.py:1265][0m Shutdown complete
+[0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:56 [stage_replica_pool.py:731] [StageReplicaPool] Stage 0 replica 0 shut down
+[0;36m(StageLLMCoreProc pid=557122)[0;0m [32mINFO[0m [90m05-19 12:24:56[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
+[0;36m(StageLLMCoreProc pid=557122)[0;0m [32mINFO[0m [90m05-19 12:24:56[0m [90m[core.py:1265][0m Shutdown complete
 [rank0]:[W519 12:24:57.569425065 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
-[0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:25:00 [stage_pool.py:731] [StagePool] Stage 1 replica 0 shut down
-[0;36m(StageEngineCoreProc pid=558201)[0;0m [32mINFO[0m [90m05-19 12:25:00[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
-[0;36m(StageEngineCoreProc pid=558201)[0;0m [32mINFO[0m [90m05-19 12:25:00[0m [90m[core.py:1265][0m Shutdown complete
+[0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:25:00 [stage_replica_pool.py:731] [StageReplicaPool] Stage 1 replica 0 shut down
+[0;36m(StageLLMCoreProc pid=558201)[0;0m [32mINFO[0m [90m05-19 12:25:00[0m [90m[core.py:1242][0m Shutdown initiated (timeout=0)
+[0;36m(StageLLMCoreProc pid=558201)[0;0m [32mINFO[0m [90m05-19 12:25:00[0m [90m[core.py:1265][0m Shutdown complete
 [0;36m(APIServer pid=556855)[0;0m WARNING 05-19 12:25:01 [async_omni_engine.py:2406] [AsyncOmniEngine] Orchestrator thread did not exit in time
 [rank0]:[W519 12:25:01.867242016 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
 ```

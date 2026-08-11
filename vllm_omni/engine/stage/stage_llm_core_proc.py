@@ -1,8 +1,8 @@
 """
-Stage Core Process for vLLM-Omni V1 architecture.
+Stage LLM Core Process for vLLM-Omni V1 architecture.
 
-StageEngineCoreProc inherits from vLLM's EngineCoreProc and runs the engine core
-busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
+``StageLLMCoreProc`` inherits from vLLM's ``EngineCoreProc`` and runs the engine
+core busy loop in a subprocess, communicating with ``StageLLMCoreClient`` via ZMQ.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
-from typing import Any
+from types import FrameType
+from typing import TYPE_CHECKING, Any
 
-import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
@@ -29,11 +29,15 @@ from vllm.v1.engine.utils import (
 )
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
-from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
     maybe_apply_audex_cfg_patches,
     set_death_signal,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
+
+    from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
 
 logger = init_logger(__name__)
 
@@ -46,15 +50,15 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
-class StageEngineCoreProc(EngineCoreProc):
-    """Stage-specific engine core process for vLLM-Omni.
+class StageLLMCoreProc(EngineCoreProc):
+    """Stage-specific engine core process for vLLM-Omni (LLM backend).
 
-    Inherits from EngineCoreProc and provides its own ``run_stage_core``
-    entry point for launching in a subprocess.  Does **not** delegate to
+    Inherits from ``EngineCoreProc`` and provides its own ``run_stage_core``
+    entry point for launching in a subprocess. Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
 
-    def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
+    def preprocess_add_request(self, request: StageLLMCoreRequest) -> tuple[Request, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
@@ -66,90 +70,70 @@ class StageEngineCoreProc(EngineCoreProc):
         *args: Any,
         dp_rank: int = 0,
         local_dp_rank: int = 0,
-        omni_coordinator_address: str | None = None,
+        omni_coord_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
         **kwargs: Any,
     ) -> None:
-        """Launch StageEngineCoreProc busy loop in background process.
+        """Launch the ``StageLLMCoreProc`` busy loop in a background process.
 
         Omni-specific kwargs:
-          - ``omni_coordinator_address``: ROUTER address of the head-side
+          - ``omni_coord_address``: ROUTER address of the head-side
             :class:`OmniCoordinator`. When provided, this subprocess
             instantiates an :class:`OmniCoordClientForStage` after the
             HELLO/INIT/READY handshake completes and reports its status +
-            queue length via heartbeats. The hook is wired so each
-            heartbeat refreshes ``queue_length`` from the live scheduler.
+            queue length via heartbeats.
           - ``omni_stage_id``: logical stage id this replica belongs to.
-            Required when ``omni_coordinator_address`` is provided.
-          - ``omni_replica_id``: cluster-unique replica id within the
-            stage (assigned by :class:`OmniMasterServer`). Used for
-            logging / metrics only.
+            Required when ``omni_coord_address`` is provided.
+          - ``omni_replica_id``: cluster-unique replica id within the stage
+            (assigned by :class:`OmniMasterServer`). Used for logging /
+            metrics only.
         """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves
-        # ``--reasoning-parser``.  The main process already registered them
-        # at import time, but the forked subprocess starts with a fresh
+        # ``--reasoning-parser``. The forked subprocess starts with a fresh
         # ReasoningParserManager.
         try:
             import vllm_omni.reasoning  # noqa: F401
         except ImportError:
             logger.warning(
-                "Failed to import vllm_omni.reasoning in subprocess; "
-                "custom reasoning parsers (e.g. step_audio) will not be "
-                "available."
+                "Failed to import vllm_omni.reasoning in subprocess; custom "
+                "reasoning parsers (e.g. step_audio) will not be available."
             )
 
-        engine_core: StageEngineCoreProc | None = None
+        engine_core: StageLLMCoreProc | None = None
         coord_client = None
         try:
-            # NOTE: previous revisions hardcoded data_parallel_size=1 here
-            # (TODO referencing issue #984). The hardcoding has been removed
-            # so the DP fields propagate through from the caller exactly
-            # like upstream vLLM.
-
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
             set_death_signal(signal.SIGTERM)
-            set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
+            set_process_title(f"StageLLMCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
             # Workaround for flashinfer/jit-cache version mismatch in CI.
-            # The parent process handles this gracefully via ring_globals.py,
-            # but the subprocess hits an unprotected import in TopKTopPSampler.
-            # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
-            # Patch the decoder type so process_input_sockets (started
-            # during __init__) decodes OmniEngineCoreRequest (which
-            # carries additional_information) instead of the base
-            # EngineCoreRequest.  Must happen BEFORE __init__ because
-            # the IO thread creates MsgpackDecoder(EngineCoreRequest)
-            # during __init__.
-            _vllm_engine_core_module.EngineCoreRequest = OmniEngineCoreRequest
-            logger.debug(
-                "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
-                _vllm_engine_core_module.EngineCoreRequest,
-            )
-
             # Audex CFG scheduler patches must land before EngineCore builds
             # its Scheduler; gated on the stage's logits_processors config.
+            # (The decoder-type rebinding OmniEngineCoreRequest formerly patched
+            # inline here is now handled globally by vllm_omni.patch, which binds
+            # vLLM's EngineCoreRequest to StageLLMCoreRequest.)
             maybe_apply_audex_cfg_patches(kwargs.get("vllm_config"))
 
-            engine_core = StageEngineCoreProc(
+            engine_core = StageLLMCoreProc(
                 *args,
                 engine_index=dp_rank,
                 **kwargs,
             )
 
-            # Each subprocess corresponds to exactly one omni replica with
-            # its own OmniMasterServer allocation, so the heartbeat client
-            # runs unconditionally — there is no dp_rank-based gating.
-            if omni_coordinator_address is not None:
+            # Each subprocess corresponds to exactly one omni replica with its
+            # own OmniMasterServer allocation, so the heartbeat client runs
+            # unconditionally — there is no dp_rank-based gating.
+            if omni_coord_address is not None:
                 if omni_stage_id is None:
-                    raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
+                    raise ValueError("omni_stage_id must be provided when omni_coord_address is set")
                 addresses: EngineZmqAddresses = engine_core.addresses
                 if not addresses.inputs or not addresses.outputs:
                     raise RuntimeError(
@@ -160,7 +144,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 if scheduler is None:
                     raise RuntimeError("EngineCore scheduler is not initialized")
                 coord_client = create_stage_coord_client(
-                    coord_zmq_addr=omni_coordinator_address,
+                    coord_zmq_addr=omni_coord_address,
                     input_addr=addresses.inputs[0],
                     output_addr=addresses.outputs[0],
                     stage_id=int(omni_stage_id),
@@ -172,7 +156,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
             signal_callback = SignalCallback(wakeup_engine)
 
-            def signal_handler(signum: int, frame: Any) -> None:
+            def signal_handler(signum: int, frame: FrameType | None) -> None:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
                 raise SystemExit(_signal_exit_code(signum))
@@ -183,13 +167,13 @@ class StageEngineCoreProc(EngineCoreProc):
             engine_core.run_busy_loop()
 
         except SystemExit:
-            logger.debug("StageEngineCoreProc exiting.")
+            logger.debug("StageLLMCoreProc exiting.")
             raise
         except Exception:
             if engine_core is None:
-                logger.exception("StageEngineCoreProc failed to start.")
+                logger.exception("StageLLMCoreProc failed to start.")
             else:
-                logger.exception("StageEngineCoreProc encountered a fatal error.")
+                logger.exception("StageLLMCoreProc encountered a fatal error.")
                 engine_core._send_engine_dead()
             raise
         finally:

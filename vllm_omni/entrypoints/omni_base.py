@@ -32,7 +32,8 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 if TYPE_CHECKING:
-    from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
+    from vllm_omni.engine.stage.stage_core_client import StageCoreClientBase as StagePoolClient
+    from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool as StagePool
 
 logger = init_logger(__name__)
 

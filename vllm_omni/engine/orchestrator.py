@@ -30,7 +30,6 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -50,7 +49,11 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
+from vllm_omni.engine.stage.stage_replica_pool import (
+    StageReplicaPool as StagePool,
+)
+from vllm_omni.engine.stage.stage_replica_pool import StageUnavailableError
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -114,8 +117,8 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
-) -> OmniEngineCoreRequest:
-    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
+) -> StageLLMCoreRequest:
+    """Build a StageLLMCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
         arrival_time = _time.time()
 
@@ -141,7 +144,7 @@ def build_engine_core_request_from_tokens(
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
-    return OmniEngineCoreRequest(
+    return StageLLMCoreRequest(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=mm_features,
@@ -928,12 +931,12 @@ class Orchestrator:
                     # evicted rather than tearing down every stage (#4285).
                     try:
                         if pool.stage_type == "diffusion":
-                            diffusion_output = pool.poll_diffusion_output(replica_id)
-                            if diffusion_output is None:
+                            outputs = pool.poll_diffusion_output(replica_id)
+                            if not outputs:
                                 continue
 
-                            pool.record_output_timestamps([diffusion_output])
-                            processed = [diffusion_output]
+                            pool.record_output_timestamps(outputs)
+                            processed = outputs
                         else:
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
@@ -1510,7 +1513,7 @@ class Orchestrator:
         if prompt_embeds is None and additional_information is None:
             return request
 
-        return OmniEngineCoreRequest.from_request(
+        return StageLLMCoreRequest.from_vllm_request(
             request,
             prompt_embeds=prompt_embeds,
             additional_information=additional_information,
@@ -2109,14 +2112,14 @@ class Orchestrator:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            next_inputs = next_client.process_core_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
         except Exception:
             logger.exception(
-                "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
+                "[Orchestrator] req=%s process_core_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )

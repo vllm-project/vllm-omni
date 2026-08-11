@@ -5,10 +5,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.stage.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
+from vllm_omni.engine.stage.stage_core_types import StageDiffusionCoreOutput, StageDiffusionCoreRequest
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -18,7 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def mock_engine():
-    with patch("vllm_omni.diffusion.inline_stage_diffusion_client.DiffusionEngine") as mock:
+    with patch("vllm_omni.diffusion.stage.inline_stage_diffusion_client.DiffusionEngine") as mock:
         engine_instance = MagicMock()
         engine_instance.executor = SimpleNamespace(
             register_failure_callback=MagicMock(),
@@ -61,18 +64,138 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     mock_engine.step_streaming = _step_streaming
 
-    sampling_params = OmniDiffusionSamplingParams()
-    await client.add_request_async("req-1", "A test prompt", sampling_params)
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-1", prompt="A test prompt", sampling_params={})
+    )
 
     # Wait for the task to be processed
+    batch = None
     for _ in range(10):
-        output = client.get_diffusion_output_nowait()
-        if output is not None:
+        batch = client.get_outputs_nowait()
+        if batch is not None:
             break
         await asyncio.sleep(0.01)
 
-    assert output is not None
-    assert output.request_id == "req-1"
+    assert batch is not None
+    assert len(batch.outputs) == 1
+    core_output = batch.outputs[0]
+    assert core_output.request_id == "req-1"
+    assert core_output.output is mock_result
+
+
+@pytest.mark.asyncio
+async def test_inline_preserves_advanced_generators(client, mock_engine):
+    """Regression: inline single-stage requests must keep the original
+    ``OmniDiffusionSamplingParams`` (per-output generator list + advanced
+    generator state + ``modules``), not the lossy dict the wire path uses.
+
+    The pool routes the dataclass straight through for inline clients, so
+    ``add_request_async`` receives it in ``StageDiffusionCoreRequest`` and hands
+    it to the engine unchanged.
+    """
+    # Two distinct per-output generators; advance the first so it carries state
+    # beyond its initial seed (what a single-seed collapse would discard).
+    gen0 = torch.Generator().manual_seed(111)
+    gen1 = torch.Generator().manual_seed(222)
+    torch.randn(4, generator=gen0)  # advance gen0 past its initial seed
+    modules = {"vae": object()}
+    params = OmniDiffusionSamplingParams(
+        seed=None,
+        generator=[gen0, gen1],
+        modules=modules,
+    )
+
+    # Sanity-check the wire conversion IS lossy (why inline must bypass it):
+    # the generator list collapses to a single seed and ``modules`` is dropped.
+    wire = StageDiffusionCoreClient.sampling_params_to_dict(params)
+    assert "generator" not in wire
+    assert "modules" not in wire
+    assert wire["seed"] == 111  # first generator's initial seed only
+
+    captured: dict[str, object] = {}
+
+    async def _step_streaming(request):
+        captured["request"] = request
+        yield [OmniRequestOutput.from_diffusion(request_id="req-gen", images=[MagicMock()])]
+
+    mock_engine.step_streaming = _step_streaming
+
+    # Inline path: the pool passes the dataclass object (not a dict) through.
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-gen", prompt="A test prompt", sampling_params=params)
+    )
+
+    for _ in range(10):
+        if client.get_outputs_nowait() is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    engine_params = captured["request"].sampling_params
+    # The full per-output generator list survived, in order, with state intact.
+    assert engine_params.generator == [gen0, gen1]
+    assert engine_params.generator[0] is gen0
+    assert engine_params.generator[1] is gen1
+    # And the subprocess-local ``modules`` were preserved, not stripped.
+    assert engine_params.modules is modules
+
+
+@pytest.mark.asyncio
+async def test_pool_routes_object_to_inline_and_dict_to_wire(client):
+    """The fix point: ``StageReplicaPool._diffusion_add_request`` must pass the
+    original sampling-params object to inline clients and the serialized dict to
+    the out-of-process client."""
+    from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
+
+    params = OmniDiffusionSamplingParams(seed=None, generator=[torch.Generator().manual_seed(5)])
+    fake_pool = SimpleNamespace(stage_id=0)
+
+    # Inline branch (real InlineStageDiffusionClient): dataclass passes straight through.
+    captured_inline: dict[str, object] = {}
+
+    async def _inline_add(request):
+        captured_inline["sp"] = request.sampling_params
+
+    client.add_request_async = _inline_add
+    await StageReplicaPool._diffusion_add_request(fake_pool, client, "r1", "p", params, None)
+    assert captured_inline["sp"] is params
+
+    # Out-of-process branch: serialized to a plain dict (generator stripped).
+    wire_client = MagicMock(spec=StageDiffusionCoreClient)
+    captured_wire: dict[str, object] = {}
+
+    async def _wire_add(request):
+        captured_wire["sp"] = request.sampling_params
+
+    wire_client.add_request_async = _wire_add
+    await StageReplicaPool._diffusion_add_request(fake_pool, wire_client, "r2", "p", params, None)
+    assert isinstance(captured_wire["sp"], dict)
+    assert "generator" not in captured_wire["sp"]
+
+
+@pytest.mark.asyncio
+async def test_inline_accepts_plain_dict_sampling_params(client, mock_engine):
+    """Robustness: the inline client still accepts the plain-dict wire form and
+    reconstructs the dataclass in-process (out-of-process path compatibility)."""
+    captured: dict[str, object] = {}
+
+    async def _step_streaming(request):
+        captured["request"] = request
+        yield [OmniRequestOutput.from_diffusion(request_id="req-dict", images=[MagicMock()])]
+
+    mock_engine.step_streaming = _step_streaming
+
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-dict", prompt="A test prompt", sampling_params={"seed": 7})
+    )
+
+    for _ in range(10):
+        if client.get_outputs_nowait() is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    engine_params = captured["request"].sampling_params
+    assert isinstance(engine_params, OmniDiffusionSamplingParams)
+    assert engine_params.seed == 7
 
 
 @pytest.mark.asyncio
@@ -86,8 +209,12 @@ async def test_inline_requests_clone_shared_sampling_params(client, mock_engine)
     mock_engine.step_streaming = _step_streaming
 
     shared = OmniDiffusionSamplingParams()
-    await client.add_request_async("req-1", "First prompt", shared)
-    await client.add_request_async("req-2", "Second prompt", shared)
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-1", prompt="First prompt", sampling_params=shared)
+    )
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-2", prompt="Second prompt", sampling_params=shared)
+    )
 
     for _ in range(10):
         if len(requests) == 2:
@@ -116,18 +243,20 @@ async def test_inline_dispatch_request_streaming_success(client, mock_engine):
     client.od_config.streaming_output = True
     mock_engine.step_streaming = _step_streaming
 
-    await client.add_request_async("req-stream", "A test prompt", OmniDiffusionSamplingParams())
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-stream", prompt="A test prompt", sampling_params={})
+    )
 
-    outputs = []
+    collected: list[StageDiffusionCoreOutput] = []
     for _ in range(20):
-        output = client.get_diffusion_output_nowait()
-        if output is not None:
-            outputs.append(output)
-            if output.finished:
+        batch = client.get_outputs_nowait()
+        if batch is not None:
+            collected.extend(batch.outputs)
+            if any(o.finished for o in batch.outputs):
                 break
         await asyncio.sleep(0.01)
 
-    assert outputs == chunks
+    assert [o.output for o in collected] == chunks
 
 
 @pytest.mark.asyncio
@@ -138,19 +267,22 @@ async def test_inline_dispatch_request_error(client, mock_engine):
 
     mock_engine.step_streaming = _step_streaming
 
-    sampling_params = OmniDiffusionSamplingParams()
-    await client.add_request_async("req-err", "A test prompt", sampling_params)
+    await client.add_request_async(
+        StageDiffusionCoreRequest(request_id="req-err", prompt="A test prompt", sampling_params={})
+    )
 
+    batch = None
     for _ in range(10):
-        output = client.get_diffusion_output_nowait()
-        if output is not None:
+        batch = client.get_outputs_nowait()
+        if batch is not None:
             break
         await asyncio.sleep(0.01)
 
-    assert output is not None
-    assert output.request_id == "req-err"
-    assert output.error == "Engine failure"
-    assert not output.images
+    assert batch is not None
+    core_output = batch.outputs[0]
+    assert core_output.request_id == "req-err"
+    assert core_output.error == "Engine failure"
+    assert core_output.output is None
 
 
 def test_inline_shutdown(client, mock_engine):
@@ -188,19 +320,25 @@ def test_inline_executor_failure_marks_engine_dead(client, mock_engine):
 
     assert client._engine_dead is True
     with pytest.raises(EngineDeadError, match="inline diffusion engine is dead"):
-        client.get_diffusion_output_nowait()
+        client.get_outputs_nowait()
 
 
 def test_inline_returns_queued_output_before_engine_dead(client, mock_engine):
     callback = mock_engine.executor.register_failure_callback.call_args.args[0]
-    output = OmniRequestOutput.from_diffusion(request_id="req-queued", images=[])
-    client._output_queue.put_nowait(output)
+    core_output = StageDiffusionCoreOutput(
+        request_id="req-queued",
+        finished=True,
+        output=OmniRequestOutput.from_diffusion(request_id="req-queued", images=[]),
+    )
+    client._output_queue.put_nowait(core_output)
 
     callback()
 
-    assert client.get_diffusion_output_nowait() is output
+    batch = client.get_outputs_nowait()
+    assert batch is not None
+    assert batch.outputs == [core_output]
     with pytest.raises(EngineDeadError, match="inline diffusion engine is dead"):
-        client.get_diffusion_output_nowait()
+        client.get_outputs_nowait()
 
 
 def test_inline_check_health_marks_engine_dead(client, mock_engine):

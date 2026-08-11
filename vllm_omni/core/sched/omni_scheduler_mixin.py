@@ -34,7 +34,7 @@ from vllm_omni.core.sched.output import (
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreOutput
 
 logger = init_logger(__name__)
 
@@ -283,9 +283,9 @@ class OmniSchedulerMixin:
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
         new_prompt_len_snapshot: int | None = None,
-    ) -> OmniEngineCoreOutput:
+    ) -> StageLLMCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
-        return OmniEngineCoreOutput(
+        return StageLLMCoreOutput(
             request_id=request.request_id,
             new_token_ids=new_token_ids,
             finish_reason=finish_reason,

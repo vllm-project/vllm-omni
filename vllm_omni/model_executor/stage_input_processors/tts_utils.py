@@ -51,7 +51,7 @@ def extract_speaker_from_request(request: Any) -> str | None:
     field used by the engine serialization layer.
 
     Args:
-        request: An OmniEngineCoreRequest (or compatible object) with an
+        request: An StageLLMCoreRequest (or compatible object) with an
             ``additional_information`` attribute.
 
     Returns:
@@ -136,7 +136,7 @@ def extract_language_from_request(request: Any) -> str | None:
     """Extract language from a request's additional_information field.
 
     Args:
-        request: An OmniEngineCoreRequest (or compatible object) with an
+        request: An StageLLMCoreRequest (or compatible object) with an
             ``additional_information`` attribute.
 
     Returns:

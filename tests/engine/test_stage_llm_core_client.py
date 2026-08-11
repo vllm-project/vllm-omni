@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for StageEngineCoreClient.check_health()."""
+"""Tests for StageLLMCoreClient.check_health()."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage.stage_llm_core_client import StageLLMCoreClient
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_client(*, engine_dead=False):
-    client = object.__new__(StageEngineCoreClient)
+    client = object.__new__(StageLLMCoreClient)
     client.stage_id = 0
     client.resources = SimpleNamespace(engine_dead=engine_dead)
     return client

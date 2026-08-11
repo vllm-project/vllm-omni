@@ -3,7 +3,7 @@
 """Integration tests for diffusion pipeline streaming output mode.
 
 Covers:
-- Mock pipeline -> StageDiffusionClient (ZMQ subprocess path)
+- Mock pipeline -> StageDiffusionCoreClient (ZMQ subprocess path)
 - Mock pipeline -> InlineStageDiffusionClient -> Orchestrator -> AsyncOmni
 - Mock pipeline -> InlineStageDiffusionClient -> Orchestrator -> AsyncOmni -> `/v1/realtime/video`
 """
@@ -28,9 +28,9 @@ from vllm.utils.network_utils import get_open_zmq_ipc_path
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.engine.test_orchestrator import OrchestratorFixture, _build_harness, _wait_for
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.diffusion.stage.inline_stage_diffusion_client import InlineStageDiffusionClient
+from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
+from vllm_omni.diffusion.stage.stage_diffusion_core_proc import StageDiffusionCoreProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
@@ -38,6 +38,10 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 )
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ShutdownRequestMessage, StageSubmissionMessage
+from vllm_omni.engine.stage.stage_core_types import (
+    StageDiffusionCoreOutput,
+    StageDiffusionCoreRequest,
+)
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.entrypoints.async_omni import AsyncEventResolver, AsyncOmni
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
@@ -131,12 +135,12 @@ def _streaming_payload_and_metadata(output: DiffusionOutput) -> tuple[dict, dict
     return payload, metadata
 
 
-class TestPipelineStreamingOutputToStageDiffusionClient:
-    """Streaming pipeline output over ZMQ into ``StageDiffusionClient``."""
+class TestPipelineStreamingOutputToStageDiffusionCoreClient:
+    """Streaming pipeline output over ZMQ into ``StageDiffusionCoreClient``."""
 
     @pytest.mark.asyncio
     async def test_streaming_output_reaches_stage_client_from_mock_pipeline(self) -> None:
-        """Mock pipeline chunks over ZMQ reach StageDiffusionClient with correct finished flags."""
+        """Mock pipeline chunks over ZMQ reach StageDiffusionCoreClient with correct finished flags."""
         pipeline = _StepStreamingPipeline(
             [
                 _streaming_diffusion_output(chunk=0, finished=False),
@@ -148,7 +152,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
 
         assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
         assert [output.finished for output in outputs] == [False, True]
-        assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
+        assert [output.output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
         assert pipeline.requests[0].request_id == "req-stream"
 
     @pytest.mark.asyncio
@@ -161,11 +165,14 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         assert len(outputs) == 2
         assert outputs[0].request_id == "req-error"
         assert outputs[0].finished is False
-        assert outputs[0].multimodal_output["metadata"]["stream"]["chunk"] == 0
+        assert outputs[0].output.multimodal_output["metadata"]["stream"]["chunk"] == 0
         assert outputs[1].request_id == "req-error"
         assert outputs[1].finished is True
-        assert outputs[1].error is not None
-        assert "stream failed midway" in outputs[1].error
+        # The pipeline error is surfaced as an error ``OmniRequestOutput`` through
+        # the streaming path, so it rides inside ``StageDiffusionCoreOutput.output``
+        # (the struct-level ``error`` field is only set for control error frames).
+        assert outputs[1].output.error is not None
+        assert "stream failed midway" in outputs[1].output.error
 
     @classmethod
     async def _run_streaming_client_proc(
@@ -173,10 +180,10 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         pipeline: _StepStreamingPipeline | _FailingStreamingPipeline,
         *,
         request_id: str,
-    ) -> list[OmniRequestOutput]:
+    ) -> list[StageDiffusionCoreOutput]:
         request_address = get_open_zmq_ipc_path()
         response_address = get_open_zmq_ipc_path()
-        proc = object.__new__(StageDiffusionProc)
+        proc = object.__new__(StageDiffusionCoreProc)
         proc._od_config = SimpleNamespace(streaming_output=True)
         proc._engine = _PipelineBackedEngine(pipeline)
         proc._closed = False
@@ -185,16 +192,18 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         try:
             await asyncio.sleep(0.05)
             await client.add_request_async(
-                request_id,
-                "prompt",
-                OmniDiffusionSamplingParams(),
+                StageDiffusionCoreRequest(
+                    request_id=request_id,
+                    prompt="prompt",
+                    sampling_params=StageDiffusionCoreClient.sampling_params_to_dict(OmniDiffusionSamplingParams()),
+                )
             )
             deadline = asyncio.get_running_loop().time() + 2.0
-            outputs: list[OmniRequestOutput] = []
+            outputs: list[StageDiffusionCoreOutput] = []
             while (not outputs or not outputs[-1].finished) and asyncio.get_running_loop().time() < deadline:
-                output = client.get_diffusion_output_nowait()
-                if output is not None:
-                    outputs.append(output)
+                batch = client.get_outputs_nowait()
+                if batch is not None:
+                    outputs.extend(batch.outputs)
                 else:
                     await asyncio.sleep(0.01)
             return outputs
@@ -209,19 +218,11 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
                 cls._close_client(client)
 
     @staticmethod
-    def _make_client(request_address: str, response_address: str) -> StageDiffusionClient:
-        client = object.__new__(StageDiffusionClient)
+    def _make_client(request_address: str, response_address: str) -> StageDiffusionCoreClient:
+        client = object.__new__(StageDiffusionCoreClient)
         client.stage_id = 0
         client.replica_id = 0
-        client.final_output = True
-        client.final_output_type = "image"
-        client.default_sampling_params = {}
-        client.requires_multimodal_data = False
-        client.custom_process_input_func = None
-        client.engine_input_source = []
-        client._proc = None
         client._proc_manager = None
-        client._owns_process = False
         client._zmq_ctx = zmq.Context()
         client._request_socket = client._zmq_ctx.socket(zmq.PUSH)
         client._request_socket.bind(request_address)
@@ -229,7 +230,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         client._response_socket.bind(response_address)
         client._encoder = OmniMsgpackEncoder()
         client._decoder = OmniMsgpackDecoder()
-        client._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        client._output_queue: asyncio.Queue[StageDiffusionCoreOutput] = asyncio.Queue()
         client._rpc_results = {}
         client._pending_rpcs = set()
         client._tasks = {}
@@ -238,7 +239,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         return client
 
     @staticmethod
-    def _close_client(client: StageDiffusionClient) -> None:
+    def _close_client(client: StageDiffusionCoreClient) -> None:
         client._request_socket.close(linger=0)
         client._response_socket.close(linger=0)
         client._zmq_ctx.term()
@@ -432,7 +433,7 @@ class TestPipelineStreamingOutputToEntrypoint:
         pipeline_engine = _PipelineBackedEngine(pipeline)
         with patch.object(InlineStageDiffusionClient, "_enrich_config"):
             with patch(
-                "vllm_omni.diffusion.inline_stage_diffusion_client.DiffusionEngine.make_engine",
+                "vllm_omni.diffusion.stage.inline_stage_diffusion_client.DiffusionEngine.make_engine",
                 return_value=pipeline_engine,
             ):
                 od_config = MagicMock(spec=OmniDiffusionConfig)

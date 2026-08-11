@@ -127,7 +127,7 @@ Effective `OmniParallelConfig` per stage after the overlay (see `OmniParallelCon
 
 ### Example 2 — `strategy_stage_replica.yaml`
 
-Replicate the `thinker` stage across two independent engines and let omni's StagePool round-robin requests across them.
+Replicate the `thinker` stage across two independent engines and let omni's StageReplicaPool round-robin requests across them.
 
 ```yaml
 # examples/offline_inference/qwen2_5_omni/strategy_stage_replica.yaml
@@ -184,7 +184,7 @@ Overrides which layer owns request routing along this axis. `engine` means vLLM 
 
 ### `stage_replica` and `omni_lb_policy`
 
-`stage_replica` is *not* a vLLM world dimension; it spins up `size` independent engine replicas of one stage, coordinated by the omni `StagePool` load balancer. The axis writes both:
+`stage_replica` is *not* a vLLM world dimension; it spins up `size` independent engine replicas of one stage, coordinated by the omni `StageReplicaPool` load balancer. The axis writes both:
 
 - The stage's `num_replicas` (a per-stage deploy knob).
 - The pipeline-wide `omni_lb_policy` string (an orchestrator-level knob).

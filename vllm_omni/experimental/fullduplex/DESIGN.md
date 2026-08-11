@@ -82,7 +82,7 @@ WebSocket
   -> DuplexControlClient over the engine-owned correlated RPC transport
   -> DuplexControlPlane + DuplexSessionRuntimeManager
   -> experimental DuplexRuntimeExtension + engine session/stage bindings
-  -> StagePool
+  -> StageReplicaPool
   -> resumable scheduler request
   -> MiniCPM Stage0
   -> Stage1 TTS / Token2Wav

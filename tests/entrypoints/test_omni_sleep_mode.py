@@ -391,7 +391,7 @@ class TestOmniCoordinatedSleepMode:
     @pytest.mark.skip(
         reason=(
             "Flaky/CI: dual AsyncOmni can fail with "
-            "RuntimeError: Orchestrator init failed, StageDiffusionProc died during handshake. "
+            "RuntimeError: Orchestrator init failed, StageDiffusionCoreProc died during handshake. "
             "Re-enable when stable (no OOM on coordinated talker+diffusion). "
             "Note: this test is fixture-free so skip does not init llm/diffusion engines."
         )

@@ -61,7 +61,7 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     Non-tensor scalars (int, float, bool) are wrapped with ``torch.tensor()``.
     Values that cannot be safely converted are dropped with a warning.
     This enforces the tensor-only invariant required by the
-    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
+    ``StageLLMCoreOutput.multimodal_output`` wire field and msgspec
     serialization. Mirrors ``gpu_ar_model_runner._ensure_tensor_values``.
     """
     result: dict[str, torch.Tensor] = {}

@@ -1,13 +1,16 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from vllm.v1.engine.core import EngineCoreProc
 
-from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.engine.stage.stage_llm_core_proc import StageLLMCoreProc
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_preprocess_add_request_preserves_omni_fields():
-    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine = StageLLMCoreProc.__new__(StageLLMCoreProc)
     request = SimpleNamespace(
         request_id="internal",
         external_req_id="external",

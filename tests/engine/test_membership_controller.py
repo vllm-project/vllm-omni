@@ -11,7 +11,7 @@ import pytest
 
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.engine.membership_controller import MembershipController
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -171,7 +171,7 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
 
     old_clients = [Client("tcp://old-0"), Client("tcp://old-1")]
     replacement = Client("tcp://new-1")
-    pool = StagePool(0, old_clients)
+    pool = StageReplicaPool(0, old_clients)
 
     def factory(stage_id: int, replica_id: int):
         assert (stage_id, replica_id) == (0, 1)

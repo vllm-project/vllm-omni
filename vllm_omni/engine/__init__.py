@@ -2,15 +2,10 @@
 Engine components for vLLM-Omni.
 """
 
+import warnings
 from typing import Any
 
 import msgspec
-import torch
-from vllm.v1.engine import (
-    EngineCoreOutput,
-    EngineCoreOutputs,
-    EngineCoreRequest,
-)
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -57,83 +52,36 @@ class AdditionalInformationPayload(msgspec.Struct):
     entries: dict[str, AdditionalInformationEntry]
 
 
-class OmniEngineCoreRequest(EngineCoreRequest):
-    """Engine core request for omni models with embeddings support.
-
-    Extends the base EngineCoreRequest with support for additional
-    information payloads, enabling direct transfer of pre-computed data
-    between pipeline stages.
-
-    Note: prompt_embeds is inherited from EngineCoreRequest
-    (torch.Tensor | None). PromptEmbedsPayload should be decoded to
-    torch.Tensor before constructing this request.
-
-    Attributes:
-        additional_information: Optional serialized additional information
-            dictionary containing tensors or lists to pass along with the request
-    """
-
-    # Optional additional information dictionary (serialized)
-    additional_information: AdditionalInformationPayload | None = None
-    # Runner-owned runtime payload. This is materialized directly into
-    # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
-    # additional_information request transport.
-    model_intermediate_buffer: dict[str, Any] | None = None
-
-    @classmethod
-    def from_request(
-        cls,
-        request: EngineCoreRequest,
-        *,
-        prompt_embeds: torch.Tensor | None = None,
-        additional_information: AdditionalInformationPayload | None = None,
-        model_intermediate_buffer: dict[str, Any] | None = None,
-    ) -> "OmniEngineCoreRequest":
-        """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
-
-        if prompt_embeds is None:
-            prompt_embeds = request.prompt_embeds
-        if additional_information is None:
-            additional_information = getattr(request, "additional_information", None)
-        if model_intermediate_buffer is None:
-            model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
-
-        return cls(
-            request_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt_is_token_ids=request.prompt_is_token_ids,
-            mm_features=request.mm_features,
-            sampling_params=request.sampling_params,
-            pooling_params=request.pooling_params,
-            arrival_time=request.arrival_time,
-            lora_request=request.lora_request,
-            cache_salt=request.cache_salt,
-            data_parallel_rank=request.data_parallel_rank,
-            prompt_embeds=prompt_embeds,
-            client_index=request.client_index,
-            current_wave=request.current_wave,
-            priority=request.priority,
-            trace_headers=request.trace_headers,
-            resumable=request.resumable,
-            external_req_id=request.external_req_id,
-            reasoning_ended=request.reasoning_ended,
-            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
-            abort_immediately=request.abort_immediately,
-            additional_information=additional_information,
-            model_intermediate_buffer=model_intermediate_buffer,
-        )
+# ---------------------------------------------------------------------------
+# Deprecated compatibility aliases (remove no earlier than one release out)
+# ---------------------------------------------------------------------------
+# The ``OmniEngineCore*`` wire structs formerly defined here were renamed and
+# relocated to ``vllm_omni.engine.stage.stage_core_types.StageLLMCore*``. These
+# names were part of the documented API (docs/api/README.md), so we keep lazy
+# deprecated aliases for at least one release to avoid breaking imports on
+# upgrade. Resolved via PEP 562 ``__getattr__`` so the (circular) import of the
+# stage subpackage happens only on access, after this package is initialized.
+_DEPRECATED_ALIASES = {
+    "OmniEngineCoreRequest": "StageLLMCoreRequest",
+    "OmniEngineCoreOutput": "StageLLMCoreOutput",
+    "OmniEngineCoreOutputs": "StageLLMCoreOutputs",
+}
 
 
-class OmniEngineCoreOutput(EngineCoreOutput):
-    # Dedicated channel for multimodal outputs (image/audio/latent).
-    # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
-    # and retains its original vLLM semantics for pooling/embedding tasks.
-    multimodal_output: dict[str, torch.Tensor] | None = None
-    # Finished flag for streaming input segment
-    is_segment_finished: bool | None = False
-    # Streaming update prompt length
-    new_prompt_len_snapshot: int | None = None
+def __getattr__(name: str) -> Any:
+    new_name = _DEPRECATED_ALIASES.get(name)
+    if new_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from vllm_omni.engine.stage import stage_core_types
+
+    warnings.warn(
+        f"vllm_omni.engine.{name} is deprecated and will be removed in a future "
+        f"release; use vllm_omni.engine.stage.stage_core_types.{new_name} instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return getattr(stage_core_types, new_name)
 
 
-class OmniEngineCoreOutputs(EngineCoreOutputs):
-    outputs: list[OmniEngineCoreOutput] = []
+def __dir__() -> list[str]:
+    return sorted([*globals().keys(), *_DEPRECATED_ALIASES.keys()])

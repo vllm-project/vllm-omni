@@ -19,7 +19,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _OrchestratorDuplexStagePort,
 )
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexStageRequestContext,
     DuplexStageSubmission,
@@ -61,7 +61,7 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
-    def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
+    def process_core_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         decoder = getattr(streaming_context, "source_token_decoder", None)
         if callable(decoder):
             self.decoded_source_tokens = decoder([11, 12], skip_special_tokens=True)
@@ -195,13 +195,13 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         next_inputs=[{"prompt": "hello", "multi_modal_data": {"video": ["frame"]}}],
     )
     stage_pools = [
-        StagePool(
+        StageReplicaPool(
             0,
             [stage0],
             output_processor=FakeOutputProcessor(tokenizer=SourceTokenizer()),
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
         ),
-        StagePool(
+        StageReplicaPool(
             1,
             [stage1],
             output_processor=FakeOutputProcessor(),

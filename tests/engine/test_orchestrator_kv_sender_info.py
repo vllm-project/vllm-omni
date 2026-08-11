@@ -7,8 +7,8 @@ from vllm import SamplingParams
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_llm_core_client import StageLLMCoreClient
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -34,19 +34,19 @@ class _DummyDiffusionStage:
         self.engine_input_source = engine_input_source or [0]
         self.calls = []
 
-    async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
+    async def add_request_async(self, request):
         self.calls.append(
             {
-                "request_id": request_id,
-                "prompt": prompt,
-                "sampling_params": sampling_params,
-                "kv_sender_info": kv_sender_info,
+                "request_id": request.request_id,
+                "prompt": request.prompt,
+                "sampling_params": request.sampling_params,
+                "kv_sender_info": request.kv_sender_info,
             }
         )
 
 
-def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePool:
-    return StagePool(
+def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StageReplicaPool:
+    return StageReplicaPool(
         stage_id,
         _DummySenderStage(sender_info),
         output_processor=object(),
@@ -55,13 +55,14 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
-    client = object.__new__(StageEngineCoreClient)
+    client = object.__new__(StageLLMCoreClient)
     client.stage_id = 0
+    client.replica_id = 0
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
     client._omni_kv_config = None
     client._kv_sender_info = None
     client._kv_sender_initialized = False
-    client._kv_sender_host = client._resolve_contact_host()
+    client._core_host = client._resolve_core_host()
     client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
@@ -71,14 +72,15 @@ def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
 
 
 def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeypatch):
-    client = object.__new__(StageEngineCoreClient)
+    client = object.__new__(StageLLMCoreClient)
     client.stage_id = 1
+    client.replica_id = 0
     client.client_addresses = {"input_address": "tcp://127.0.0.1:1234"}
     client._omni_kv_config = None
     client._kv_sender_info = None
     client._kv_sender_initialized = False
     monkeypatch.setattr(client, "_detect_local_ip", lambda: "192.168.0.12")
-    client._kv_sender_host = client._resolve_contact_host()
+    client._core_host = client._resolve_core_host()
     client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
@@ -88,8 +90,9 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
 
 
 def test_stage_engine_core_client_uses_connector_config_for_sender_port():
-    client = object.__new__(StageEngineCoreClient)
+    client = object.__new__(StageLLMCoreClient)
     client.stage_id = 3
+    client.replica_id = 0
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
     client._kv_sender_info = None
     client._kv_sender_initialized = False
@@ -102,7 +105,7 @@ def test_stage_engine_core_client_uses_connector_config_for_sender_port():
             "zmq_port": 51000,
         },
     }
-    client._kv_sender_host = client._resolve_contact_host()
+    client._core_host = client._resolve_core_host()
     client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
@@ -112,8 +115,9 @@ def test_stage_engine_core_client_uses_connector_config_for_sender_port():
 
 
 def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
-    client = object.__new__(StageEngineCoreClient)
+    client = object.__new__(StageLLMCoreClient)
     client.stage_id = 2
+    client.replica_id = 0
     client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
     client._kv_sender_info = None
     client._kv_sender_initialized = False
@@ -126,7 +130,7 @@ def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
             "zmq_port": 51000,
         },
     }
-    client._kv_sender_host = client._resolve_contact_host()
+    client._core_host = client._resolve_core_host()
     client._initialize_kv_sender_endpoint()
 
     assert client.get_kv_sender_info() == {
@@ -139,7 +143,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StageReplicaPool(1, diffusion_stage)
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
@@ -168,7 +172,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     source_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     previous_pool = _build_sender_pool(1, {"host": "10.0.0.9", "zmq_port": 59999})
-    diffusion_pool = StagePool(2, diffusion_stage)
+    diffusion_pool = StageReplicaPool(2, diffusion_stage)
 
     orchestrator.num_stages = 3
     orchestrator.stage_pools = [source_pool, previous_pool, diffusion_pool]
@@ -195,7 +199,7 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     diffusion_stage.custom_process_input_func = lambda *_args, **_kwargs: []
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StageReplicaPool(1, diffusion_stage)
 
     class _AsyncQueue:
         def __init__(self):
@@ -239,7 +243,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.3", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StageReplicaPool(1, diffusion_stage)
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2

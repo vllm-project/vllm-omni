@@ -251,7 +251,7 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
 def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
-    ``StageEngineCoreProcManager`` per local replica."""
+    ``StageLLMCoreProcManager`` per local replica."""
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
@@ -295,7 +295,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         ),
     )
     mock_manager_cls = mocker.patch(
-        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
+        "vllm_omni.engine.stage.stage_llm_core_proc_manager.StageLLMCoreProcManager",
         return_value=engine_manager,
     )
     mocker.patch("signal.signal")
@@ -322,7 +322,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert mgr_kwargs["local_client"] is False
     assert mgr_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
     assert mgr_kwargs["omni_stage_id"] == 0
-    assert mgr_kwargs["omni_coordinator_address"] == "tcp://127.0.0.1:26100"
+    assert mgr_kwargs["omni_coord_address"] == "tcp://127.0.0.1:26100"
     assert mgr_kwargs["omni_replica_base_id"] == 0
 
     engine_manager.monitor_engine_liveness.assert_called_once_with()
@@ -375,7 +375,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
         ],
     )
     mock_manager_cls = mocker.patch(
-        "vllm_omni.engine.stage_engine_core_proc_manager.StageEngineCoreProcManager",
+        "vllm_omni.engine.stage.stage_llm_core_proc_manager.StageLLMCoreProcManager",
         side_effect=[manager_a, manager_b],
     )
     mocker.patch("signal.signal")
@@ -439,7 +439,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         shutdown=mocker.Mock(),
     )
     mock_manager = mocker.patch(
-        "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager.launch_headless",
+        "vllm_omni.diffusion.stage.stage_diffusion_core_proc_manager.StageDiffusionCoreProcManager.launch_headless",
         return_value=fake_manager,
     )
     # Replace the blocking wait with one that returns the only proc's sentinel
@@ -469,7 +469,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
     assert manager_kwargs["addresses"].inputs == ["tcp://127.0.0.1:26002"]
     assert manager_kwargs["addresses"].outputs == ["tcp://127.0.0.1:26003"]
-    assert manager_kwargs["omni_coordinator_address"] == "tcp://127.0.0.1:26100"
+    assert manager_kwargs["omni_coord_address"] == "tcp://127.0.0.1:26100"
     assert manager_kwargs["omni_stage_id"] == 1
     assert manager_kwargs["omni_replica_id"] == 0
 
@@ -511,7 +511,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         ),
     )
     mocker.patch(
-        "vllm_omni.diffusion.stage_diffusion_proc.StageDiffusionProcManager.launch_headless",
+        "vllm_omni.diffusion.stage.stage_diffusion_core_proc_manager.StageDiffusionCoreProcManager.launch_headless",
         return_value=SimpleNamespace(proc=proc, shutdown=mocker.Mock()),
     )
     mocker.patch(

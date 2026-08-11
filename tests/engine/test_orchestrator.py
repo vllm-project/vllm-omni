@@ -32,7 +32,8 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_core_types import StageDiffusionCoreOutput, StageDiffusionCoreOutputs
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool as StagePool
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexInputMode,
@@ -139,22 +140,30 @@ class FakeStageClient:
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
-    async def get_output_async(self):
+    async def get_outputs_async(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
             return SimpleNamespace(outputs=[], scheduler_stats=None, finished_requests=None)
 
-    def get_diffusion_output_nowait(self):
+    def get_outputs_nowait(self):
+        if self.stage_type == "diffusion":
+            collected: list[StageDiffusionCoreOutput] = []
+            while True:
+                try:
+                    collected.append(self._diffusion_outputs.get_nowait())
+                except queue.Empty:
+                    break
+            return StageDiffusionCoreOutputs(outputs=collected) if collected else None
         try:
-            return self._diffusion_outputs.get_nowait()
+            return self._engine_core_outputs.get_nowait()
         except queue.Empty:
             return None
 
     def set_engine_outputs(self, outputs) -> None:
         return None
 
-    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+    def process_core_inputs(self, source_outputs, prompt=None, streaming_context=None):
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -192,7 +201,13 @@ class FakeStageClient:
         self._engine_core_outputs.put_nowait(outputs)
 
     def push_diffusion_output(self, output) -> None:
-        self._diffusion_outputs.put_nowait(output)
+        self._diffusion_outputs.put_nowait(
+            StageDiffusionCoreOutput(
+                request_id=getattr(output, "request_id", ""),
+                finished=bool(getattr(output, "finished", True)),
+                output=output,
+            )
+        )
 
 
 def test_terminal_empty_audio_output_uses_stage_sample_rate() -> None:
@@ -696,7 +711,13 @@ async def test_run_llm_to_diffusion(orchestrator_factory) -> None:
         stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
-        assert stage1.add_request_calls[0] == ("req-img", original_prompt, params)
+        # The diffusion stage now receives a single typed StageDiffusionCoreRequest
+        # (sampling params in plain-dict form), not unpacked positional args.
+        (diffusion_request,) = stage1.add_request_calls[0]
+        assert diffusion_request.request_id == "req-img"
+        assert diffusion_request.prompt == original_prompt
+        assert isinstance(diffusion_request.sampling_params, dict)
+        assert diffusion_request.kv_sender_info is None
 
         stage1.push_diffusion_output(
             OmniRequestOutput.from_diffusion(
@@ -2048,7 +2069,7 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
 
-    target_logger = logging.getLogger("vllm_omni.engine.stage_pool")
+    target_logger = logging.getLogger("vllm_omni.engine.stage.stage_replica_pool")
     target_logger.addHandler(caplog.handler)
     prev_level = target_logger.level
     target_logger.setLevel(logging.DEBUG)

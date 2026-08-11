@@ -21,7 +21,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -434,7 +434,7 @@ def _get_streaming_codec_delta_len(
 def thinker2talker_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
@@ -530,7 +530,7 @@ def thinker2talker_async_chunk(
 def thinker2talker_full_payload(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
 ) -> dict[str, Any] | None:
     """Pack complete thinker output for the non-async connector path."""
     rid = getattr(request, "request_id", None)
@@ -679,7 +679,7 @@ def thinker2talker_token_only(
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
@@ -763,7 +763,7 @@ def talker2code2wav_async_chunk(
 def talker2code2wav_full_payload(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
 ) -> dict[str, Any] | None:
     """Pack complete talker codec output for the non-async connector path."""
     rid = getattr(request, "request_id", None)

@@ -1,4 +1,4 @@
-"""Unified stage-local runtime abstraction for vLLM-Omni."""
+"""Replica pool for one logical stage in the vLLM-Omni runtime."""
 
 from __future__ import annotations
 
@@ -19,11 +19,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine.stage_client import (
-    StagePoolClient,
-    StagePoolDiffusionClient,
-    StagePoolLLMClient,
-)
+from vllm_omni.engine.stage.stage_core_client import StageCoreClientBase
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -39,9 +35,28 @@ from vllm_omni.metrics.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm import PoolingParams, SamplingParams
+    from vllm.config import VllmConfig
+    from vllm.outputs import RequestOutput
+
+    from vllm_omni.diffusion.stage.stage_diffusion_core_client import StageDiffusionCoreClient
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
+    from vllm_omni.engine.stage.stage_core_types import (
+        StageDiffusionCoreOutput,
+        StageDiffusionCoreOutputs,
+        StageLLMCoreRequest,
+    )
+    from vllm_omni.engine.stage.stage_llm_core_client import StageLLMCoreClientBase
+    from vllm_omni.inputs.data import OmniPromptType
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 logger = init_logger(__name__)
+
+# A pool slot holds either an LLM stage client (:class:`StageLLMCoreClientBase`)
+# or a diffusion client (:class:`StageDiffusionCoreClient`). Both subclass
+# :class:`StageCoreClientBase`, so slots are typed as the base; backend-specific
+# calls go through the ``_llm_client`` / ``_diffusion_client`` narrowing helpers.
 
 
 class StageUnavailableError(RuntimeError):
@@ -66,7 +81,7 @@ class _ReplicaMetrics:
     agg_total_gen_time_ms: float = 0.0
 
 
-class StagePool:
+class StageReplicaPool:
     """Replicas of one logical stage + per-stage routing (LB + affinity).
 
     The pool owns the head-side stage clients for one logical stage. It also
@@ -98,13 +113,13 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: StagePoolClient | list[StagePoolClient],
+        clients: StageCoreClientBase | list[StageCoreClientBase],
         *,
-        output_processor: Any = None,
-        stage_vllm_config: Any = None,
+        output_processor: MultimodalOutputProcessor | None = None,
+        stage_vllm_config: VllmConfig | None = None,
     ) -> None:
         if isinstance(clients, list):
-            normalized_clients: list[StagePoolClient] = list(clients)
+            normalized_clients: list[StageCoreClientBase] = list(clients)
         else:
             normalized_clients = [clients]
 
@@ -113,7 +128,7 @@ class StagePool:
         self.stage_id = stage_id
         # Slots can become None after a dynamic remove_client (distributed mode);
         # iterate via live_replica_ids() to skip holes.
-        self.clients: list[StagePoolClient | None] = list(normalized_clients)
+        self.clients: list[StageCoreClientBase | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
@@ -171,22 +186,22 @@ class StagePool:
         return False if client is None else bool(client.final_output)
 
     @property
-    def stage_client(self) -> StagePoolClient | None:
+    def stage_client(self) -> StageCoreClientBase | None:
         for client in self.clients:
             if client is not None:
                 return client
         return None
 
     @property
-    def llm_stage_client(self) -> StagePoolLLMClient:
-        return cast(StagePoolLLMClient, self.stage_client)
+    def llm_stage_client(self) -> StageLLMCoreClientBase:
+        return cast("StageLLMCoreClientBase", self.stage_client)
 
     @property
-    def stage_vllm_config(self) -> Any:
+    def stage_vllm_config(self) -> VllmConfig | None:
         return self._stage_vllm_config
 
     @property
-    def output_processor(self) -> Any:
+    def output_processor(self) -> MultimodalOutputProcessor | None:
         return self._output_processor
 
     @property
@@ -208,27 +223,13 @@ class StagePool:
         """Inject the per-pool :class:`LoadBalancer` for distributed-mode pick."""
         self._lb = lb
 
-    # ---- Dynamic membership (distributed mode) ----
-
-    @staticmethod
-    def _client_input_addr(client: Any) -> str | None:
-        """Return the input ZMQ address advertised by ``client`` if any.
-
-        LLM clients expose ``client_addresses["input_address"]``; diffusion
-        clients expose ``request_address``. Both are stable strings used by
-        :class:`OmniCoordinator` to key replicas.
-        """
-        request_address = getattr(client, "request_address", None)
-        if isinstance(request_address, str) and request_address:
-            return request_address
-        addrs = getattr(client, "client_addresses", None)
-        if isinstance(addrs, dict):
-            addr = addrs.get("input_address")
-            if isinstance(addr, str) and addr:
-                return addr
-        return None
-
-    def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
+    def add_client(
+        self,
+        input_addr: str,
+        client: StageCoreClientBase,
+        *,
+        replica_id: int | None = None,
+    ) -> int:
         """Register a head-side client for ``input_addr``.
 
         Returns the assigned ``replica_id`` (index into :attr:`clients`).
@@ -265,7 +266,7 @@ class StagePool:
         self._unavailable_replicas.discard(replica_id)
         return replica_id
 
-    def remove_client(self, input_addr: str) -> Any | None:
+    def remove_client(self, input_addr: str) -> StageCoreClientBase | None:
         """Remove the client at ``input_addr``. Returns the removed client or ``None``.
 
         Slot is marked ``None`` to preserve indices for outstanding bindings.
@@ -277,7 +278,7 @@ class StagePool:
         self.clients[replica_id] = None
         return client
 
-    def get_client_by_addr(self, input_addr: str) -> Any | None:
+    def get_client_by_addr(self, input_addr: str) -> StageCoreClientBase | None:
         """Return the live client for ``input_addr`` if present."""
         replica_id = self._addr_to_replica_id.get(input_addr)
         if replica_id is None:
@@ -392,36 +393,6 @@ class StagePool:
         self._affinity[request_id] = replica_info.input_addr
         return replica_id
 
-    def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
-        """Return list of ``(ReplicaInfo, replica_id)`` for UP, attached replicas."""
-        if self._hub is None:
-            return []
-        snap = self._hub.get_replicas_for_stage(self.stage_id)
-        out: list[tuple[ReplicaInfo, int]] = []
-        for rep in snap.replicas:
-            if rep.status != ReplicaStatus.UP:
-                continue
-            replica_id = self._addr_to_replica_id.get(rep.input_addr)
-            if replica_id is None:
-                continue  # Hub knows about it but head-side client not attached yet.
-            if self.clients[replica_id] is None:
-                continue
-            out.append((rep, replica_id))
-        return out
-
-    def _serviceable_replica_id_for_addr(self, input_addr: str) -> int | None:
-        """Return ``replica_id`` for ``input_addr`` iff currently UP + attached."""
-        if self._hub is None:
-            return None
-        replica_id = self._addr_to_replica_id.get(input_addr)
-        if replica_id is None or self.clients[replica_id] is None:
-            return None
-        snap = self._hub.get_replicas_for_stage(self.stage_id)
-        for rep in snap.replicas:
-            if rep.input_addr == input_addr and rep.status == ReplicaStatus.UP:
-                return replica_id
-        return None
-
     def bind(self, request_id: str, input_addr: str) -> None:
         """Explicitly record affinity (distributed mode)."""
         self._affinity[request_id] = input_addr
@@ -454,19 +425,19 @@ class StagePool:
             return None
         return self._addr_to_replica_id.get(addr)
 
-    def get_bound_client(self, request_id: str) -> StagePoolClient | None:
+    def get_bound_client(self, request_id: str) -> StageCoreClientBase | None:
         """Return the currently bound client for *request_id* if present."""
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None:
             return None
         return self.clients[replica_id]
 
-    def get_bound_llm_client(self, request_id: str) -> StagePoolLLMClient | None:
+    def get_bound_llm_client(self, request_id: str) -> StageLLMCoreClientBase | None:
         """Return the currently bound LLM client for *request_id* if present."""
         client = self.get_bound_client(request_id)
         if client is None:
             return None
-        return cast(StagePoolLLMClient, client)
+        return cast("StageLLMCoreClientBase", client)
 
     def replica_monitor_sample(self, replica_id: int) -> tuple[int, int]:
         """Return (outputs_queue_size, inflight) for orchestrator load diagnostics."""
@@ -582,28 +553,16 @@ class StagePool:
         self._request_bindings[request_id] = chosen
         return chosen
 
-    def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
-        client = self.clients[replica_id]
-        if client is None:
-            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        return cast(StagePoolLLMClient, client)
-
-    def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
-        client = self.clients[replica_id]
-        if client is None:
-            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        return cast(StagePoolDiffusionClient, client)
-
     # ---- Metrics ----
 
     def build_stage_metrics(
         self,
-        request_outputs: list[Any],
+        request_outputs: list[RequestOutput | OmniRequestOutput],
         *,
         submit_ts: float,
         request_timestamp: float,
         replica_id: int,
-        sampling_params: Any | None = None,
+        sampling_params: SamplingParams | PoolingParams | OmniDiffusionSamplingParams | None = None,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
@@ -684,8 +643,6 @@ class StagePool:
             num_tokens_out=num_tokens_out,
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
-            # This event summarizes one completed request. Execution batching
-            # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
             rx_decode_time_ms=0.0,
@@ -712,7 +669,396 @@ class StagePool:
             vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
         )
 
-    def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
+    def has_non_empty_output(self, request_output: RequestOutput | OmniRequestOutput) -> bool:
+        return self._has_non_empty_output(request_output)
+
+    def record_output_timestamps(
+        self,
+        request_outputs: list[RequestOutput | OmniRequestOutput],
+        *,
+        output_ts: float | None = None,
+    ) -> None:
+        """Record all output timestamps and the first non-empty output timestamp."""
+        output_ts = _time.time() if output_ts is None else output_ts
+        for request_output in request_outputs:
+            request_id = getattr(request_output, "request_id", None)
+            if request_id is None:
+                continue
+            rid = str(request_id)
+            self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
+            if self._has_non_empty_output(request_output):
+                self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
+            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics(
+                [request_output],
+                use_default_sample_rate=False,
+            )
+            if audio_frames > 0:
+                self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+            if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
+                self._audio_sample_rate_by_request[rid] = audio_sample_rate
+
+    # ---- Stage-local admission ----
+
+    async def submit_initial(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        request: StageLLMCoreRequest | OmniPromptType,
+        *,
+        prompt_text: str | None = None,
+        affinity_request_id: str | None = None,
+        submit_kwargs: dict[str, Any] | None = None,
+        params_override: SamplingParams | OmniDiffusionSamplingParams | None = None,
+    ) -> int:
+        """Submit a stage-entry request into this pool."""
+        params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
+        # Direct engine callers may provide plain vLLM SamplingParams.
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
+        submit_kwargs = dict(submit_kwargs or {})
+        if self.stage_type == "diffusion":
+            if isinstance(request, list):
+                raise ValueError(
+                    "Diffusion list-prompt batch requests are no longer supported. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
+            replica_id = await self._pick_or_select(
+                request_id,
+                affinity_request_id=affinity_request_id,
+            )
+            client = self._diffusion_client(replica_id)
+            await self._diffusion_add_request(client, request_id, request, params, submit_kwargs)
+            return replica_id
+
+        replica_id = await self._pick_or_select(
+            request_id,
+            affinity_request_id=affinity_request_id,
+        )
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        try:
+            self.output_processor.add_request(
+                request=request,
+                prompt=prompt_text,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
+        except Exception:
+            self.release_binding(request_id)
+            raise
+
+        try:
+            await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+        except Exception:
+            self.release_binding(request_id)
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                try:
+                    rollback(request_id)
+                except Exception as rollback_error:
+                    logger.warning(
+                        "[StageReplicaPool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                        request_id,
+                        self.stage_id,
+                        rollback_error,
+                    )
+            raise
+        return replica_id
+
+    async def submit_update(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        request: StageLLMCoreRequest | OmniPromptType,
+        *,
+        prompt_text: str | None = None,
+    ) -> int:
+        """Submit a streaming update to an already admitted request."""
+        params = req_state.sampling_params_list[self.stage_id]
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            replica_id = await self._pick_or_select(request_id)
+
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+
+        if self.stage_type == "diffusion":
+            if isinstance(request, list):
+                raise ValueError(
+                    "Diffusion list-prompt batch requests are no longer supported. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
+            await self._diffusion_add_request(self._diffusion_client(replica_id), request_id, request, params, None)
+        else:
+            # Refresh the shared output-processor state before yielding to the
+            # stage client so streaming segments are merged against the latest
+            # prompt/token metadata.
+            try:
+                self.output_processor.add_request(
+                    request=request,
+                    prompt=prompt_text,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                await self._llm_client(replica_id).add_request_async(request)
+            except Exception:
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor update for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
+                raise
+        return replica_id
+
+    async def process_llm_raw_outputs(
+        self,
+        replica_id: int,
+        raw_outputs: EngineCoreOutputs,
+        iteration_stats: IterationStats | None = None,
+    ) -> list[RequestOutput]:
+        """Run the shared LLM output processor on one raw poll result."""
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return []
+        client = cast("StageLLMCoreClientBase", raw_client)
+        processor = self.output_processor
+        processed = processor.process_outputs(
+            raw_outputs.outputs,
+            raw_outputs.timestamp,
+            iteration_stats,
+        )
+        # Use the same wall-clock source as OrchestratorRequestState.stage_submit_ts.
+        # EngineCoreOutputs.timestamp may use a different clock base, which would
+        # make TTFO negative and get clamped to 0.
+        self.record_output_timestamps(processed.request_outputs, output_ts=_time.time())
+
+        if processed.reqs_to_abort:
+            await client.abort_requests_async(processed.reqs_to_abort)
+
+        if raw_outputs.scheduler_stats is not None:
+            processor.update_scheduler_stats(raw_outputs.scheduler_stats)
+
+        return processed.request_outputs
+
+    async def poll_llm_raw_output(
+        self,
+        replica_id: int,
+        *,
+        timeout_s: float = 0.001,
+    ) -> EngineCoreOutputs | None:
+        """Poll raw EngineCore outputs from one LLM replica once."""
+        if not self.is_replica_available(replica_id):
+            return None
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        client = cast("StageLLMCoreClientBase", raw_client)
+        try:
+            return await asyncio.wait_for(
+                self._poll_stage_raw(client),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "[StageReplicaPool] _poll_stage_raw failed for stage-%s replica-%s",
+                self.stage_id,
+                replica_id,
+            )
+            raise
+
+    def poll_diffusion_output(self, replica_id: int) -> list[OmniRequestOutput]:
+        """Drain ready diffusion outputs from the given replica.
+
+        Both the out-of-process ``StageDiffusionCoreClient`` and the in-process
+        ``InlineStageDiffusionClient`` return a typed ``StageDiffusionCoreOutputs``
+        batch, unwrapped here into ``OmniRequestOutput`` results (an error item
+        becomes an error output).
+        """
+        if not self.is_replica_available(replica_id):
+            return []
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return []
+        batch = cast("StageDiffusionCoreOutputs | None", raw_client.get_outputs_nowait())
+        if batch is None:
+            return []
+        return [self._diffusion_core_output_to_omni(o) for o in batch.outputs]
+
+    # ---- Stage-local control plane ----
+
+    async def abort_requests(self, request_ids: list[str]) -> None:
+        """Abort the given requests in this stage pool.
+
+        Request-bound abort routing stays inside the pool because route affinity
+        (``request_id -> replica_id``) is pool-owned.
+        """
+        if not request_ids:
+            return
+
+        request_ids_by_replica: dict[int, list[str]] = {}
+        for request_id in request_ids:
+            replica_id = self.get_bound_replica_id(request_id)
+            if replica_id is None or self.clients[replica_id] is None:
+                logger.debug(
+                    "[StageReplicaPool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id
+                )
+                continue
+            request_ids_by_replica.setdefault(replica_id, []).append(request_id)
+
+        for replica_id, replica_request_ids in request_ids_by_replica.items():
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            await client.abort_requests_async(replica_request_ids)
+
+        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
+        # would otherwise leak — aborted requests never produce a final
+        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
+        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
+        if all_aborted and self._output_processor is not None:
+            self._output_processor.abort_requests(all_aborted, internal=True)
+
+    async def collective_rpc(
+        self,
+        replica_id: int,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        kwargs = dict(kwargs or {})
+        client = self.clients[replica_id]
+        if client is None:
+            return {
+                "supported": False,
+                "error": f"stage {self.stage_id} replica {replica_id} is not attached",
+            }
+        try:
+            return await client.collective_rpc_async(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[StageReplicaPool] collective_rpc failed: stage=%s replica=%s method=%s",
+                self.stage_id,
+                replica_id,
+                method,
+            )
+            return {
+                "supported": False,
+                "error": str(exc),
+            }
+
+    def shutdown_replica(self, replica_id: int) -> None:
+        """Shutdown one backend handle in this stage pool."""
+        if replica_id >= len(self.clients):
+            return
+        client = self.clients[replica_id]
+        if client is None:
+            return
+        try:
+            client.shutdown()
+            logger.info(
+                "[StageReplicaPool] Stage %d replica %d shut down",
+                self.stage_id,
+                replica_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[StageReplicaPool] Failed to shutdown stage %d replica %d: %s",
+                self.stage_id,
+                replica_id,
+                e,
+            )
+
+    # ---- Dynamic membership (distributed mode) ----
+
+    @staticmethod
+    def _client_input_addr(client: StageCoreClientBase) -> str | None:
+        """Return the input ZMQ address advertised by ``client`` if any.
+
+        LLM clients expose ``client_addresses["input_address"]``; diffusion
+        clients expose ``request_address``. Both are stable strings used by
+        :class:`OmniCoordinator` to key replicas.
+        """
+        request_address = getattr(client, "request_address", None)
+        if isinstance(request_address, str) and request_address:
+            return request_address
+        addrs = getattr(client, "client_addresses", None)
+        if isinstance(addrs, dict):
+            addr = addrs.get("input_address")
+            if isinstance(addr, str) and addr:
+                return addr
+        return None
+
+    def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
+        """Return list of ``(ReplicaInfo, replica_id)`` for UP, attached replicas."""
+        if self._hub is None:
+            return []
+        snap = self._hub.get_replicas_for_stage(self.stage_id)
+        out: list[tuple[ReplicaInfo, int]] = []
+        for rep in snap.replicas:
+            if rep.status != ReplicaStatus.UP:
+                continue
+            replica_id = self._addr_to_replica_id.get(rep.input_addr)
+            if replica_id is None:
+                continue  # Hub knows about it but head-side client not attached yet.
+            if self.clients[replica_id] is None:
+                continue
+            out.append((rep, replica_id))
+        return out
+
+    def _serviceable_replica_id_for_addr(self, input_addr: str) -> int | None:
+        """Return ``replica_id`` for ``input_addr`` iff currently UP + attached."""
+        if self._hub is None:
+            return None
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is None or self.clients[replica_id] is None:
+            return None
+        snap = self._hub.get_replicas_for_stage(self.stage_id)
+        for rep in snap.replicas:
+            if rep.input_addr == input_addr and rep.status == ReplicaStatus.UP:
+                return replica_id
+        return None
+
+    def _llm_client(self, replica_id: int) -> StageLLMCoreClientBase:
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        return cast("StageLLMCoreClientBase", client)
+
+    def _diffusion_client(self, replica_id: int) -> StageDiffusionCoreClient:
+        client = self.clients[replica_id]
+        if client is None:
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        return cast("StageDiffusionCoreClient", client)
+
+    def _infer_output_unit_type(
+        self,
+        request_outputs: list[RequestOutput | OmniRequestOutput],
+        *,
+        token_count: int,
+    ) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
 
         if self._has_image_output(request_outputs) or final_output_type in {"image", "images"}:
@@ -737,7 +1083,7 @@ class StagePool:
 
     def _count_output_units(
         self,
-        request_outputs: list[Any],
+        request_outputs: list[RequestOutput | OmniRequestOutput],
         *,
         unit_type: str,
         fallback_token_count: int,
@@ -764,7 +1110,7 @@ class StagePool:
                 return total_latents
         return int(fallback_token_count)
 
-    def _has_audio_output(self, request_outputs: list[Any]) -> bool:
+    def _has_audio_output(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> bool:
         for ro in request_outputs:
             for mm_output in iter_mm_outputs(ro):
                 if isinstance(mm_output, Mapping) and mm_output.get("audio") is not None:
@@ -773,7 +1119,7 @@ class StagePool:
 
     def _collect_audio_metrics(
         self,
-        request_outputs: list[Any],
+        request_outputs: list[RequestOutput | OmniRequestOutput],
         *,
         use_default_sample_rate: bool = False,
     ) -> tuple[int, int, float]:
@@ -801,25 +1147,25 @@ class StagePool:
             return defs.resolve_audio_sample_rate(sources)
         return defs.resolve_audio_sample_rate_or_none(sources) or 0
 
-    def _has_image_output(self, request_outputs: list[Any]) -> bool:
+    def _has_image_output(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> bool:
         for ro in request_outputs:
             if self._count_images(ro) > 0:
                 return True
         return False
 
-    def _has_video_output(self, request_outputs: list[Any]) -> bool:
+    def _has_video_output(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> bool:
         for ro in request_outputs:
             if self._count_videos(ro) > 0:
                 return True
         return False
 
-    def _has_trajectory_latent_output(self, request_outputs: list[Any]) -> bool:
+    def _has_trajectory_latent_output(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> bool:
         return any(self._is_non_empty_value(getattr(ro, "trajectory_latents", None)) for ro in request_outputs)
 
-    def _has_latent_output(self, request_outputs: list[Any]) -> bool:
+    def _has_latent_output(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> bool:
         return any(self._is_non_empty_value(getattr(ro, "latents", None)) for ro in request_outputs)
 
-    def _count_images(self, request_output: Any) -> int:
+    def _count_images(self, request_output: RequestOutput | OmniRequestOutput) -> int:
         total_images = self._count_value_units(getattr(request_output, "images", None))
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping):
@@ -827,7 +1173,7 @@ class StagePool:
                 total_images += self._count_value_units(mm_output.get("images"))
         return total_images
 
-    def _count_image_pixels(self, request_outputs: list[Any]) -> int:
+    def _count_image_pixels(self, request_outputs: list[RequestOutput | OmniRequestOutput]) -> int:
         total_pixels = 0
         for ro in request_outputs:
             total_pixels += count_image_pixels(getattr(ro, "images", None))
@@ -837,7 +1183,7 @@ class StagePool:
                     total_pixels += count_image_pixels(mm_output.get("images"))
         return total_pixels
 
-    def _count_videos(self, request_output: Any) -> int:
+    def _count_videos(self, request_output: RequestOutput | OmniRequestOutput) -> int:
         total_videos = self._count_video_units(getattr(request_output, "video", None))
         total_videos += self._count_video_units(getattr(request_output, "videos", None))
         for mm_output in iter_mm_outputs(request_output):
@@ -846,10 +1192,7 @@ class StagePool:
                 total_videos += self._count_video_units(mm_output.get("videos"))
         return total_videos
 
-    def has_non_empty_output(self, request_output: Any) -> bool:
-        return self._has_non_empty_output(request_output)
-
-    def _has_non_empty_output(self, request_output: Any) -> bool:
+    def _has_non_empty_output(self, request_output: RequestOutput | OmniRequestOutput) -> bool:
         final_output_type = getattr(request_output, "final_output_type", None)
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -917,150 +1260,61 @@ class StagePool:
         except TypeError:
             return 1
 
-    def record_output_timestamps(self, request_outputs: list[Any], *, output_ts: float | None = None) -> None:
-        """Record all output timestamps and the first non-empty output timestamp."""
-        output_ts = _time.time() if output_ts is None else output_ts
-        for request_output in request_outputs:
-            request_id = getattr(request_output, "request_id", None)
-            if request_id is None:
-                continue
-            rid = str(request_id)
-            self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
-            if self._has_non_empty_output(request_output):
-                self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
-            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics(
-                [request_output],
-                use_default_sample_rate=False,
-            )
-            if audio_frames > 0:
-                self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
-            if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
-                self._audio_sample_rate_by_request[rid] = audio_sample_rate
-
-    # ---- Stage-local admission ----
-
-    async def submit_initial(
+    async def _diffusion_add_request(
         self,
+        client: StageCoreClientBase,
         request_id: str,
-        req_state: OrchestratorRequestState,
-        request: Any,
-        *,
-        prompt_text: Any = None,
-        affinity_request_id: str | None = None,
-        submit_kwargs: dict[str, Any] | None = None,
-        params_override: Any = None,
-    ) -> int:
-        """Submit a stage-entry request into this pool."""
-        params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
-        # Direct engine callers may provide plain vLLM SamplingParams.
-        if self.stage_type == "diffusion":
-            params = OmniDiffusionSamplingParams.from_params(params)
-        submit_kwargs = dict(submit_kwargs or {})
-        if self.stage_type == "diffusion":
-            if isinstance(request, list):
-                raise ValueError(
-                    "Diffusion list-prompt batch requests are no longer supported. "
-                    "Submit multiple independent requests to use scheduler batching."
-                )
-            replica_id = await self._pick_or_select(
-                request_id,
-                affinity_request_id=affinity_request_id,
-            )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
-            return replica_id
+        prompt: OmniPromptType,
+        params: OmniDiffusionSamplingParams,
+        submit_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """Dispatch a diffusion add-request.
 
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
+        Both diffusion client shapes — the out-of-process
+        ``StageDiffusionCoreClient`` and the in-process
+        ``InlineStageDiffusionClient`` — accept the typed
+        ``StageDiffusionCoreRequest``, so a single path serves both.
+
+        Only the out-of-process client crosses a ZMQ boundary, so only it
+        needs its sampling params flattened to a plain dict via
+        ``sampling_params_to_dict`` — a lossy step that drops the
+        non-serializable ``generator``/``modules`` fields and collapses a
+        per-output generator *list* to a single initial seed. The inline
+        client runs in-process, so it receives the original
+        ``OmniDiffusionSamplingParams`` untouched, preserving per-output
+        generators and other advanced generator state.
+        """
+        from vllm_omni.diffusion.stage.inline_stage_diffusion_client import (
+            InlineStageDiffusionClient,
         )
-        client = self.clients[replica_id]
-        if client is None:
-            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-        except Exception:
-            self.release_binding(request_id)
-            raise
+        from vllm_omni.diffusion.stage.stage_diffusion_core_client import (
+            StageDiffusionCoreClient,
+        )
+        from vllm_omni.engine.stage.stage_core_types import StageDiffusionCoreRequest
 
-        try:
-            await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
-            raise
-        return replica_id
-
-    async def submit_update(
-        self,
-        request_id: str,
-        req_state: OrchestratorRequestState,
-        request: Any,
-        *,
-        prompt_text: Any = None,
-    ) -> int:
-        """Submit a streaming update to an already admitted request."""
-        params = req_state.sampling_params_list[self.stage_id]
-        if self.stage_type == "diffusion":
-            params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
-
-        client = self.clients[replica_id]
-        if client is None:
-            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
-
-        if self.stage_type == "diffusion":
-            if isinstance(request, list):
-                raise ValueError(
-                    "Diffusion list-prompt batch requests are no longer supported. "
-                    "Submit multiple independent requests to use scheduler batching."
-                )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+        # ``Any`` so the inline branch (original dataclass) and the wire branch
+        # (plain dict) share one field without a mypy complaint on the struct.
+        sampling_params: Any
+        if isinstance(client, InlineStageDiffusionClient):
+            sampling_params = params
         else:
-            # Refresh the shared output-processor state before yielding to the
-            # stage client so streaming segments are merged against the latest
-            # prompt/token metadata.
-            try:
-                self.output_processor.add_request(
-                    request=request,
-                    prompt=prompt_text,
-                    parent_req=None,
-                    request_index=0,
-                    queue=None,
-                )
-                await self._llm_client(replica_id).add_request_async(request)
-            except Exception:
-                rollback = getattr(self.output_processor, "remove_request", None)
-                if callable(rollback):
-                    try:
-                        rollback(request_id)
-                    except Exception as rollback_error:
-                        logger.warning(
-                            "[StagePool] Failed to rollback output processor update for req=%s stage-%s: %s",
-                            request_id,
-                            self.stage_id,
-                            rollback_error,
-                        )
-                raise
-        return replica_id
+            sampling_params = StageDiffusionCoreClient.sampling_params_to_dict(params)
+
+        kwargs = dict(submit_kwargs or {})
+        await client.add_request_async(
+            StageDiffusionCoreRequest(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=sampling_params,
+                kv_sender_info=kwargs.pop("kv_sender_info", None),
+            )
+        )
+        if kwargs:
+            logger.warning(
+                "[StageReplicaPool] stage-%s ignoring unsupported diffusion submit kwargs: %s",
+                self.stage_id,
+                sorted(kwargs),
+            )
 
     async def submit_interaction(
         self,
@@ -1093,9 +1347,13 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
+    async def _poll_stage_raw(self, client: StageLLMCoreClientBase) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
-        outputs = await client.get_output_async()
+        # ``StageLLMCoreClientBase.get_outputs_async`` is typed to the field-free marker
+        # ``StageCoreOutputs``; the concrete LLM client returns a
+        # ``StageLLMCoreOutputs`` (an ``EngineCoreOutputs`` subclass), so narrow
+        # back to the batch type the output processor consumes.
+        outputs = cast(EngineCoreOutputs, await client.get_outputs_async())
         # Keep scheduler-only / finished-only batches. Omni schedulers mirror
         # upstream by emitting SchedulerStats on throttled ticks even when no
         # request output is produced, and dropping those batches loses KV/queue
@@ -1104,163 +1362,19 @@ class StagePool:
             return None
         return outputs
 
-    async def process_llm_raw_outputs(
-        self,
-        replica_id: int,
-        raw_outputs: EngineCoreOutputs,
-        iteration_stats: IterationStats | None = None,
-    ) -> list[Any]:
-        """Run the shared LLM output processor on one raw poll result."""
-        raw_client = self.clients[replica_id]
-        if raw_client is None:
-            return []
-        client = cast(StagePoolLLMClient, raw_client)
-        processor = self.output_processor
-        processed = processor.process_outputs(
-            raw_outputs.outputs,
-            raw_outputs.timestamp,
-            iteration_stats,
-        )
-        # Use the same wall-clock source as OrchestratorRequestState.stage_submit_ts.
-        # EngineCoreOutputs.timestamp may use a different clock base, which would
-        # make TTFO negative and get clamped to 0.
-        self.record_output_timestamps(processed.request_outputs, output_ts=_time.time())
+    @staticmethod
+    def _diffusion_core_output_to_omni(core_output: StageDiffusionCoreOutput) -> OmniRequestOutput:
+        """Unwrap one diffusion wire output into an ``OmniRequestOutput``."""
+        from vllm_omni.outputs import OmniRequestOutput
 
-        if processed.reqs_to_abort:
-            await client.abort_requests_async(processed.reqs_to_abort)
-
-        if raw_outputs.scheduler_stats is not None:
-            processor.update_scheduler_stats(raw_outputs.scheduler_stats)
-
-        return processed.request_outputs
-
-    async def poll_llm_raw_output(
-        self,
-        replica_id: int,
-        *,
-        timeout_s: float = 0.001,
-    ) -> EngineCoreOutputs | None:
-        """Poll raw EngineCore outputs from one LLM replica once."""
-        if not self.is_replica_available(replica_id):
-            return None
-        raw_client = self.clients[replica_id]
-        if raw_client is None:
-            return None
-        client = cast(StagePoolLLMClient, raw_client)
-        try:
-            return await asyncio.wait_for(
-                self._poll_stage_raw(client),
-                timeout=timeout_s,
+        if core_output.error is not None:
+            return OmniRequestOutput.from_error(
+                request_id=core_output.request_id,
+                error_message=core_output.error,
+                status_code=core_output.status_code,
+                error_type=core_output.error_type,
             )
-        except asyncio.TimeoutError:
-            return None
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
-                self.stage_id,
-                replica_id,
-            )
-            raise
-
-    def poll_diffusion_output(self, replica_id: int) -> Any | None:
-        """Drain one ready diffusion output from the given replica if present."""
-        if not self.is_replica_available(replica_id):
-            return None
-        raw_client = self.clients[replica_id]
-        if raw_client is None:
-            return None
-        return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
-
-    # ---- Stage-local control plane ----
-
-    async def abort_requests(self, request_ids: list[str]) -> None:
-        """Abort the given requests in this stage pool.
-
-        Request-bound abort routing stays inside the pool because route affinity
-        (``request_id -> replica_id``) is pool-owned.
-        """
-        if not request_ids:
-            return
-
-        request_ids_by_replica: dict[int, list[str]] = {}
-        for request_id in request_ids:
-            replica_id = self.get_bound_replica_id(request_id)
-            if replica_id is None or self.clients[replica_id] is None:
-                logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
-                continue
-            request_ids_by_replica.setdefault(replica_id, []).append(request_id)
-
-        for replica_id, replica_request_ids in request_ids_by_replica.items():
-            client = self.clients[replica_id]
-            if client is None:
-                continue
-            await client.abort_requests_async(replica_request_ids)
-
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
-
-    async def collective_rpc(
-        self,
-        replica_id: int,
-        method: str,
-        timeout: float | None = None,
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
-        kwargs = dict(kwargs or {})
-        client = self.clients[replica_id]
-        if client is None:
-            return {
-                "supported": False,
-                "error": f"stage {self.stage_id} replica {replica_id} is not attached",
-            }
-        try:
-            return await client.collective_rpc_async(
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=kwargs,
-            )
-        except Exception as exc:
-            logger.exception(
-                "[StagePool] collective_rpc failed: stage=%s replica=%s method=%s",
-                self.stage_id,
-                replica_id,
-                method,
-            )
-            return {
-                "supported": False,
-                "error": str(exc),
-            }
-
-    def shutdown_replica(self, replica_id: int) -> None:
-        """Shutdown one backend handle in this stage pool."""
-        if replica_id >= len(self.clients):
-            return
-        client = self.clients[replica_id]
-        if client is None:
-            return
-        try:
-            client.shutdown()
-            logger.info(
-                "[StagePool] Stage %d replica %d shut down",
-                self.stage_id,
-                replica_id,
-            )
-        except Exception as e:
-            logger.warning(
-                "[StagePool] Failed to shutdown stage %d replica %d: %s",
-                self.stage_id,
-                replica_id,
-                e,
-            )
+        return core_output.output
 
     def evict_replica(self, replica_id: int) -> None:
         """Shut down a replica and remove it from the live set.

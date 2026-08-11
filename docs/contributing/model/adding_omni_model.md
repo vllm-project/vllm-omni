@@ -341,69 +341,67 @@ Stage transitions happen automatically in the runtime orchestrator. Here's the d
 2. **Trigger**: When a stage completes processing and produces outputs
 3. **Execution Flow**:
    ```python
-   # In orchestrator.py
+   # In orchestrator.py (_forward_to_next_stage)
    next_stage_id = stage_id + 1
    next_client = self.stage_clients[next_stage_id]
+   next_pool = self.stage_pools[next_stage_id]
    params = req_state.sampling_params_list[next_stage_id]
 
-   # Save current stage outputs so stage_input_processors can consume them.
-   self.stage_clients[stage_id].set_engine_outputs([output])
-
    # THIS IS WHERE STAGE TRANSITION HAPPENS
-   next_inputs = next_client.process_engine_inputs(
-       stage_list=self.stage_clients,
-       prompt=req_state.prompt,
+   # The completed stage's outputs are passed straight into the next stage's
+   # input processor (there is no stored state on the client to read back).
+   next_inputs = next_client.process_core_inputs(
+       source_outputs,
+       req_state.prompt,
+       streaming_context=req_state.streaming,
    )
 
-   # Build and submit request(s) to the next stage.
+   # Build and submit request(s) to the next stage via its replica pool.
    for next_input in next_inputs:
        request = build_engine_core_request_from_tokens(
            request_id=req_id,
            prompt=next_input,
            params=params,
-           model_config=self.stage_vllm_configs[next_stage_id].model_config,
+           model_config=next_pool.stage_vllm_config.model_config,
        )
-       await next_client.add_request_async(request)
+       await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
    ```
 
 ### How Stage Transitions Work
 
 The stage transition process follows these steps:
 
-1. **Stage Completion**: When a stage finishes processing a request, the orchestrator stores outputs via `stage_client.set_engine_outputs(...)`
+1. **Stage Completion**: When a stage finishes processing a request, the orchestrator passes the completed stage's outputs straight into the next stage's `process_core_inputs(...)`
 
-2. **Transition Detection**: The orchestrator checks if there's a next stage and calls `process_engine_inputs()` on it
+2. **Transition Detection**: The orchestrator checks if there's a next stage and calls `process_core_inputs()` on it
 
 3. **Input Processing**: The stage input processor configured in stage YAML (under `vllm_omni/model_executor/stage_input_processors/`) handles the transition:
    ```python
-   def process_engine_inputs(
-       self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
-   ) -> list[OmniTokensPrompt | TextPrompt]:
-       """Process engine inputs for this stage from upstream stage outputs."""
+   def process_core_inputs(
+       self, source_outputs: list[Any], prompt: Any = None, streaming_context: Any | None = None
+   ) -> list[OmniTokensPrompt]:
+       """Process this stage's inputs from the upstream stage outputs."""
 
        if self.custom_process_input_func is None:
-           # Default behavior: pass token IDs directly
-           # Extract outputs from source stage
-           source_stage_id = self.engine_input_source[0]
-           source_outputs = stage_list[source_stage_id].engine_outputs
-           # ... create OmniTokensPrompt from token_ids ...
+           # Default behavior: pass token IDs directly from source_outputs
+           # ... create OmniTokensPrompt from source_outputs token_ids ...
        else:
            # Custom transition function (YOUR CODE HERE)
            return self.custom_process_input_func(
-               stage_list,
-               self.engine_input_source,
+               source_outputs,
                prompt,
-               self.requires_multimodal_data
+               self.requires_multimodal_data,
+               streaming_context,
            )
    ```
    - If `custom_process_input_func` is configured, it calls that function
    - Otherwise, it uses default behavior (passing token IDs directly)
 
 4. **Custom Function Execution**: Your custom function receives:
-   - `stage_list`: List of all stage objects (to access upstream stage outputs)
-   - `engine_input_source`: List of source stage IDs (e.g., `[0]` for stage 0)
+   - `source_outputs`: The upstream stage's outputs (already extracted for you)
    - `prompt`: Original prompt data (for preserving multimodal data)
    - `requires_multimodal_data`: Whether multimodal data is required
+   - `streaming_context`: Streaming state for the request (passed only when the function accepts 4+ parameters)
 
 5. **Output Format**: The function must return a list of `OmniTokensPrompt` objects ready for the next stage
 
@@ -412,12 +410,12 @@ The stage transition process follows these steps:
 Understanding the data structures is crucial for implementing stage transitions:
 
 **Input to your function:**
-- `stage_list[source_stage_id].engine_outputs`: List of `EngineCoreOutput` objects
--   -  Each contains `outputs`: List of `RequestOutput` objects
-    - Each `RequestOutput` has:
--   -  - `token_ids`: Generated token IDs
-       - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.These are the hidden states or intermediate outputs from the model's forward pass
-       - `prompt_token_ids`: Original prompt token IDs
+- `source_outputs`: the upstream stage's output objects, already extracted for you (one entry per request in the batch, plus any CFG companion outputs). You iterate this list directly — there is no `stage_list`/`engine_outputs` lookup anymore. Each entry has:
+    - `request_id`: The request this output belongs to
+    - `outputs`: List of per-sequence outputs (typically `source_output.outputs[0]`). Each has:
+        - `token_ids` / `cumulative_token_ids`: Generated token IDs
+        - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc. — the hidden states or intermediate outputs from the model's forward pass
+        - `prompt_token_ids`: Original prompt token IDs
 
 **Output from your function:**
 - Must return `list[OmniTokensPrompt]` where each `OmniTokensPrompt` contains:
@@ -462,7 +460,7 @@ thinker_hidden_states = output.multimodal_output["24"]
 
 ### Key Points
 
-1. **Accessing Upstream Outputs**: Use `stage_list[source_stage_id].engine_outputs` to get outputs from the source stage
+1. **Accessing Upstream Outputs**: Iterate `source_outputs` directly — it already holds the source stage's outputs (the runtime extracts them for you; no `stage_list[source_stage_id].engine_outputs` lookup needed)
 2. **Extracting Data**: Access `output.multimodal_output[key]` to get specific hidden states or intermediate results
    - Keys are defined by your model's `forward()` method when it creates `multimodal_outputs`
 3. **Device Management**: Move tensors to appropriate devices (CPU for serialization, GPU for processing)
@@ -504,7 +502,7 @@ def thinker2talker_token_only(
 def thinker2talker_full_payload(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
 ) -> dict[str, Any] | None:
     """Pack accumulated thinker hidden states into OmniPayload for stage-1."""
     ...
@@ -513,7 +511,7 @@ def thinker2talker_full_payload(
 def thinker2talker_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
-    request: OmniEngineCoreRequest,
+    request: StageLLMCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """Stream thinker rows to talker while async_chunk is enabled."""

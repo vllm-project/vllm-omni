@@ -101,7 +101,7 @@ classDiagram
 - **Scheduler**: `OmniARScheduler` extends `vllm.v1.core.sched.scheduler.Scheduler` to enrich scheduled requests with omni-specific payloads
 - **Worker**: `GPUARWorker` extends `vllm.v1.worker.gpu_worker.Worker` to initialize AR-specific model runners
 - **ModelRunner**: `GPUARModelRunner` extends `OmniGPUModelRunner` → `vllm.v1.worker.gpu_model_runner.GPUModelRunner` to expose hidden states and handle multimodal outputs
-- **InputProcessor**: Stage-0 uses upstream `vllm.v1.engine.input_processor.InputProcessor`; `AsyncOmniEngine` then restores omni-specific payloads (for example `additional_information` and `prompt_embeds`) when building `OmniEngineCoreRequest`
+- **InputProcessor**: Stage-0 uses upstream `vllm.v1.engine.input_processor.InputProcessor`; `AsyncOmniEngine` then restores omni-specific payloads (for example `additional_information` and `prompt_embeds`) when building `StageLLMCoreRequest`
 - **OutputProcessor**: `MultimodalOutputProcessor` extends `vllm.v1.engine.output_processor.OutputProcessor` to route and accumulate multimodal outputs
 
 ## 3. Scheduler Design
@@ -114,7 +114,7 @@ The following diagram illustrates the request flow through the AR module compone
 
 ```mermaid
 flowchart TD
-    A[InputProcessor stage-0 in AsyncOmniEngine] -->|EngineCoreRequest then upgraded to OmniEngineCoreRequest| B[OmniARScheduler]
+    A[InputProcessor stage-0 in AsyncOmniEngine] -->|EngineCoreRequest then upgraded to StageLLMCoreRequest| B[OmniARScheduler]
     B -->|schedule: OmniNewRequestData| C[GPUARWorker]
     C -->|SchedulerOutput| D[GPUARModelRunner]
     D -->|execute_model: None| E[Model Forward Pass]
@@ -318,7 +318,7 @@ sequenceDiagram
 
 ### Stage-0 Input Processing
 
-Stage-0 now uses upstream `InputProcessor` directly, and `AsyncOmniEngine` upgrades the request to `OmniEngineCoreRequest` while restoring omni-specific payloads.
+Stage-0 now uses upstream `InputProcessor` directly, and `AsyncOmniEngine` upgrades the request to `StageLLMCoreRequest` while restoring omni-specific payloads.
 
 ```python
 request = self.input_processor.process_inputs(

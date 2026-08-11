@@ -10,13 +10,13 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import EngineQueueMessage, ShutdownRequestMessage
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 logger = init_logger(__name__)
@@ -66,7 +66,7 @@ def upgrade_to_omni_request(
     if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
         return request
 
-    return OmniEngineCoreRequest.from_request(
+    return StageLLMCoreRequest.from_vllm_request(
         request,
         prompt_embeds=prompt_embeds,
         additional_information=additional_information,
@@ -82,14 +82,14 @@ def apply_omni_final_stage_metadata(
 ) -> EngineCoreRequest:
     """Tag a request with its final stage and optional KV-transfer override."""
     merged: dict[str, Any] = {}
-    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
+    if isinstance(request, StageLLMCoreRequest) and request.additional_information is not None:
         merged = deserialize_additional_information(request.additional_information)
     merged["omni_final_stage_id"] = final_stage_id
     merged.pop("omni_force_kv_transfer", None)
     if force_kv_transfer:
         merged["omni_force_kv_transfer"] = True
     payload = serialize_additional_information(merged)
-    return OmniEngineCoreRequest.from_request(
+    return StageLLMCoreRequest.from_vllm_request(
         request,
         additional_information=payload,
     )

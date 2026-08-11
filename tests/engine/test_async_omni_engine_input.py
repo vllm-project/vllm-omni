@@ -5,10 +5,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
-from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage.stage_core_types import StageLLMCoreRequest
+from vllm_omni.engine.stage.stage_replica_pool import StageReplicaPool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -59,7 +59,7 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     )
 
     request = msg.prompt
-    assert isinstance(request, OmniEngineCoreRequest)
+    assert isinstance(request, StageLLMCoreRequest)
     assert request.external_req_id == "req-1"
     assert request.additional_information is not None
     assert request.additional_information.entries["text"].list_data == ["hello world"]
@@ -99,7 +99,7 @@ def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: M
     )
 
     request = msg.prompt
-    assert isinstance(request, OmniEngineCoreRequest)
+    assert isinstance(request, StageLLMCoreRequest)
     assert request.additional_information is not None
     assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
     assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
@@ -215,7 +215,7 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
-    engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
+    engine.stage_pools = [StageReplicaPool(0, [_FakeStageClient(), _FakeStageClient()])]
 
     seen_uuids: list[str] = []
 
@@ -255,7 +255,7 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
 
     addr0 = "tcp://host-a:1000/input"
     addr1 = "tcp://host-b:1000/input"
-    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool = StageReplicaPool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
     stage_pool.attach_hub(_FakeHub([_replica(addr0), _replica(addr1)]))
     stage_pool.attach_load_balancer(_RoundRobinLB())
     engine.stage_pools = [stage_pool]
@@ -300,7 +300,7 @@ def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mo
 
     addr0 = "tcp://host-a:1000/input"
     addr1 = "tcp://host-b:1000/input"
-    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool = StageReplicaPool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
     stage_pool.attach_hub(_FakeHub([]))
     stage_pool.attach_load_balancer(_RoundRobinLB())
     engine.stage_pools = [stage_pool]
@@ -352,7 +352,7 @@ def test_build_add_request_message_releases_preselected_replica_on_preprocess_er
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
-    stage_pool = StagePool(0, [_FakeStageClient(), _FakeStageClient()])
+    stage_pool = StageReplicaPool(0, [_FakeStageClient(), _FakeStageClient()])
     engine.stage_pools = [stage_pool]
 
     input_processor = mocker.Mock()
