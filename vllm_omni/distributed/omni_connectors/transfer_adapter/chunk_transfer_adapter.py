@@ -487,7 +487,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
-                request.status = RequestStatus.PREEMPTED
+                # Align with vLLM RECOMPUTE preemption semantics: marking the
+                # request PREEMPTED without resetting progress makes vLLM
+                # resume it via the cached-resume path with new_block_ids=None
+                # (KV not re-allocated), which crashes the runner's resumed
+                # branch (EngineDead). Reset to a fresh prefill (WAITING +
+                # num_computed_tokens=0 + is_prefill_chunk=True) so the
+                # scheduler re-allocates KV blocks on the next tick.
+                request.status = RequestStatus.WAITING
+                request.num_computed_tokens = 0
+                request.is_prefill_chunk = True
                 waiting_queue.prepend_requests([request])
             return
 
