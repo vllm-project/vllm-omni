@@ -7,8 +7,10 @@
 # Usage: cleanup-nightly-builds.sh [TAG_PREFIX] [REPO]
 # Example: cleanup-nightly-builds.sh
 # Example: cleanup-nightly-builds.sh "nightly-"
-# Example: cleanup-nightly-builds.sh "cu129-nightly-"
 # Example: cleanup-nightly-builds.sh "nightly-" "vllm/vllm-omni"
+#
+# Reserved (no current callers): non-default TAG_PREFIX such as "cu129-nightly-".
+# Keep for when publish-release-images.sh is invoked with a TAG_VARIANT.
 
 set -ex
 

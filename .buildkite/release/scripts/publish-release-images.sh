@@ -11,17 +11,22 @@
 # Release mode tags: latest, v<version>
 # Nightly mode tags: nightly (or <variant>-nightly), plus commit-pinned manifest
 #
-# TAG_VARIANT (nightly only) moves the floating tag to "<variant>-nightly"
-# so cleanup can retain per-variant history independently.
+# Reserved (no current callers): TAG_VARIANT / ECR_SUFFIX. Pipeline today only
+# builds the default CUDA image and invokes `nightly` with no second arg.
+# Keep this path for future multi-variant builds (e.g. cu129): it retags ECR
+# `$COMMIT-*-<variant>` to DockerHub `<variant>-nightly` so cleanup can retain
+# per-variant history independently.
 
 set -euo pipefail
 
 MODE="${1:-release}"
+# Reserved: unused by current pipeline; see header comment.
 TAG_VARIANT="${2:-}"
 
 DOCKERHUB_REPO="vllm/vllm-omni"
 ECR_REPO="public.ecr.aws/q9t5s3a7/vllm-omni-release-repo"
 COMMIT="$BUILDKITE_COMMIT"
+# Reserved: only set when TAG_VARIANT is provided; empty for current callers.
 ECR_SUFFIX=""
 # Primary floating tags that each get their own per-arch DockerHub tags.
 PRIMARY_TAGS=()
@@ -38,6 +43,7 @@ case "${MODE}" in
     PRIMARY_TAGS=("latest" "v${RELEASE_VERSION}")
     ;;
   nightly)
+    # Reserved branch: TAG_VARIANT path has no pipeline caller yet.
     if [ -n "${TAG_VARIANT}" ]; then
       ECR_SUFFIX="-${TAG_VARIANT}"
       PRIMARY_TAG="${TAG_VARIANT}-nightly"
@@ -45,7 +51,7 @@ case "${MODE}" in
       PRIMARY_TAG="nightly"
     fi
     # Per-arch tags only for the floating nightly name; commit-pinned is
-    # a multi-arch manifest alias (matches upstream push-nightly-builds.sh).
+    # a multi-arch manifest alias reusing those same arch images.
     PRIMARY_TAGS=("${PRIMARY_TAG}")
     EXTRA_MANIFEST_TAGS=("${PRIMARY_TAG}-${COMMIT}")
     ;;
