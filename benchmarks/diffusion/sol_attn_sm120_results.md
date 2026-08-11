@@ -89,22 +89,11 @@ passed all configured quality gates in this sweep.
 - PSNR >= 20.0 dB
 - LPIPS <= 0.20
 
-## Reproduction
+## Benchmark artifacts
 
-Run from the directory containing the model checkout after installing
-`lpips==0.1.4` and making `ffmpeg` and `ffprobe` visible in `PATH`:
-
-```bash
-python benchmarks/diffusion/sol_attn_offline_sweep.py \
-  --model /path/to/MiniMax-H3/FL2VA \
-  --gpus 4,6,5,7 \
-  --suite full \
-  --output-dir results/sol-sm120-offline-sweep \
-  --lpips-device cpu
-```
-
-The sweep is resumable. Recompute only visual metrics and the report with
-`--phase quality`.
+The benchmark harness, raw tables, and generated report are archived in the
+[vLLM-Omni rankings repository](https://github.com/lishunyang12/vllm-omni-rankings/tree/main/scripts/minimax_h3_sol_attn_sm120).
+They are intentionally not part of the runtime feature patch.
 
 ## Limitations and incomplete cases
 
@@ -115,5 +104,8 @@ The sweep is resumable. Recompute only visual metrics and the report with
   audio quality.
 - `sol_kv_splits_2` and `sol_kv_splits_4` failed and are excluded from the
   table. `sol_kv_splits_auto` completed successfully.
+- These measurements predate the review follow-up that recomputes sink query
+  rows densely. Rebenchmark the final PR head before treating the reported
+  latency and quality values as release claims.
 - The report demonstrates the measured latency/quality tradeoff on this
   hardware and workload; it is not a cross-model or cross-hardware claim.

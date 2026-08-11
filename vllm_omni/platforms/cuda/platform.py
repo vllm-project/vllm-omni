@@ -305,6 +305,12 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "provide trtllm_ragged_attention_deepseek. Install a compatible build."
                     )
             if backend_upper == "SOL_ATTN":
+                if not compute_supported:
+                    raise ValueError(
+                        "SOL_ATTN diffusion attention backend requires an SM80+ CUDA GPU. "
+                        f"Detected {sm_str or 'an unknown compute capability'}. Select a "
+                        "different --diffusion-attention-backend."
+                    )
                 if head_size != 128:
                     raise ValueError(
                         "SOL_ATTN diffusion attention backend requires head_dim=128 "

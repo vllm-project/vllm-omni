@@ -263,7 +263,8 @@ is sequence-bound (e.g. MiniMax-H3, ~50 layers over tens of thousands of packed
 tokens per denoise step), that block sparsification is a nearly free latency
 win at high fidelity.
 
-The kernel requires CUDA, BF16 activations, and `head_dim=128`. It has no
+The kernel requires an SM80+ CUDA GPU, BF16 activations, and `head_dim=128`.
+It implements noncausal attention with equal query and KV head counts. It has no
 `cu_seqlens` support, so the packed varlen layout is sliced to its real length
 first (the alignment-padding document is excluded and its output rows are
 masked by the model). Dense layers and early denoise steps use the packed dense
@@ -281,11 +282,11 @@ Enable it through the typed `sol_attn` block on the attention spec:
 |---|---|---|
 | `tau` | finite, `>= 0` | Routing threshold scale. Higher selects fewer exact KV blocks. Defaults to `1.0`. |
 | `thresh_type` | `diag`, `exact` | Threshold mode. `diag` is the fast approximate path. Defaults to `diag`. |
-| `sink_tokens` | `>= 0` | Exact-KV sink length for prefix tokens such as the text/audio rows of a packed layout. Defaults to `0`. |
+| `sink_tokens` | `>= 0` | Exact-KV sink length for prefix tokens; their query rows are also recomputed densely. Defaults to `0`. |
 | `sink_start` | `>= 0` or `null` | Start index of the exact-KV sink range. Defaults to `0`. |
 | `dense_steps` | `>= 0` | Keep the first N denoise steps dense. Defaults to `10`. |
 | `dense_layers` | index selector, e.g. `"0,1"` or `"3-5"` | DiT blocks that always stay dense. Defaults to `"0,1"`. |
-| `kv_splits` | `auto` or `>= 1` | Number of KV splits used by the kernel. Defaults to `auto`. |
+| `kv_splits` | `auto`, `1`, `2`, or `4` | Number of KV splits used by the kernel. `2` and `4` are SM90-only; other architectures must use `1` or `auto`. Defaults to `auto`. |
 
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \

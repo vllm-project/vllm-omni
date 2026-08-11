@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -29,6 +30,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -105,6 +107,7 @@ class SolAttnConfig:
 class SolAttnBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
+    supported_platforms: tuple[str, ...] = ("cuda",)
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -142,9 +145,17 @@ class SolAttnImpl(AttentionImpl):
         del qkv_layout, extra_impl_args
         if head_size != _SOL_ATTN_HEAD_DIM:
             raise ValueError(f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}")
+        if causal:
+            raise ValueError("SOL_ATTN does not support causal attention; select a dense backend for causal roles")
+        if num_kv_heads is not None and num_kv_heads != num_heads:
+            raise ValueError(
+                f"SOL_ATTN does not support GQA/MQA; num_kv_heads ({num_kv_heads}) must equal num_heads ({num_heads})"
+            )
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.config = SolAttnConfig.from_backend_kwargs(backend_kwargs)
+        self._validate_parallel_config()
+        self._validate_kv_splits()
         self.layer_idx = self._parse_layer_idx(prefix)
         self._cudnn_dense_fallback = CuDNNAttentionImpl(
             num_heads=num_heads,
@@ -154,6 +165,28 @@ class SolAttnImpl(AttentionImpl):
             num_kv_heads=num_kv_heads,
             prefix=prefix,
         )
+
+    @staticmethod
+    def _validate_parallel_config() -> None:
+        config = get_current_diffusion_config_or_none()
+        parallel_config = getattr(config, "parallel_config", None)
+        ring_degree = getattr(parallel_config, "ring_degree", 1)
+        if ring_degree > 1:
+            raise ValueError(
+                "SOL_ATTN is not compatible with ring sequence parallelism "
+                f"(ring_degree={ring_degree}): the sparse kernel needs the whole key sequence. "
+                "Use Ulysses SP (ring_degree=1) instead."
+            )
+
+    def _validate_kv_splits(self) -> None:
+        if self.config.kv_splits not in (2, 4):
+            return
+        capability = tuple(torch.cuda.get_device_capability())
+        if capability != (9, 0):
+            raise ValueError(
+                f"SOL_ATTN kv_splits={self.config.kv_splits} is supported on SM90 only; "
+                f"current device is SM{capability[0]}{capability[1]}. Use kv_splits=1 or 'auto'."
+            )
 
     @staticmethod
     def _parse_layer_idx(prefix: str) -> int | None:
@@ -274,6 +307,25 @@ class SolAttnImpl(AttentionImpl):
         )
         return out.reshape(batch_size, seq_len, *out.shape[2:])
 
+    def _forward_dense_queries(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        start: int,
+        tokens: int,
+    ) -> torch.Tensor:
+        """Recompute selected query rows densely against every key/value row."""
+        return F.scaled_dot_product_attention(
+            query[:, start : start + tokens].transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.softmax_scale,
+        ).transpose(1, 2)
+
     def _forward_sol_attn(
         self,
         query: torch.Tensor,
@@ -310,12 +362,21 @@ class SolAttnImpl(AttentionImpl):
             q,
             k,
             v,
+            scale=self.softmax_scale,
             tau=self.config.tau,
             thresh_type=self.config.thresh_type,
             kv_splits=_resolve_kv_splits(q, self.config.kv_splits),
             sink_start=sink_start,
             sink_tokens=sink_tokens,
         )
+        if sink_tokens:
+            out[:, sink_start : sink_start + sink_tokens] = self._forward_dense_queries(
+                q,
+                k,
+                v,
+                start=sink_start,
+                tokens=sink_tokens,
+            )
         if out.shape[1] < seq_len:
             padded = torch.zeros_like(query)
             padded[:, :used] = out
