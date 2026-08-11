@@ -1,0 +1,33 @@
+# Forced aligner sized for co-location with an ASR stage.
+#
+#   vllm-omni serve Qwen/Qwen3-ASR-1.7B --omni --trust-remote-code \
+#       --deploy-config vllm_omni/deploy/qwen3_asr.yaml \
+#       --forced-aligner-config vllm_omni/deploy/qwen3_asr_forced_aligner.yaml
+#
+# Same model as qwen3_tts_forced_aligner.yaml, but 0.10 rather than 0.30.
+#
+# The aligner runs as a pooling model (token_classify): one forward pass, no
+# autoregressive decode, so it has no use for a KV cache. At 0.30 on an H100 it
+# was reserving 17.9 GiB of KV cache it cannot fill, starving the co-located ASR
+# stage. At 0.10 it reserves 2.0 GiB, and word timestamps are unchanged.
+#
+# Measured, 1xH100, 30s clips, no prefix/mm caching, 3 runs median:
+#   ASR 0.55 / aligner 0.30    47.9 req/s   (alignment costs 16%)
+#   ASR 0.80 / aligner 0.10    52.0 req/s   (alignment costs  9%)
+#
+# CAVEAT: gpu_memory_utilization is a *fraction*, but what this model needs is
+# absolute -- roughly 1.2 GiB of weights plus activation headroom. 0.10 is 8 GiB
+# on an 80 GB card and 1 GiB on a 10 GB MIG slice, i.e. below its own weights.
+# On a smaller device raise this fraction rather than copying 0.10.
+
+forced_aligner:
+  model: Qwen/Qwen3-ForcedAligner-0.6B
+  runner: pooling
+  architecture: Qwen3ASRForcedAlignerForTokenClassification
+  pooling_task: token_classify
+
+  gpu_memory_utilization: 0.10
+
+  dtype: bfloat16
+  max_model_len: 4096
+  trust_remote_code: true

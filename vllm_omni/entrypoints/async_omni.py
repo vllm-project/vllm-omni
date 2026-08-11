@@ -157,6 +157,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
         self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.audio_decode_procs = self.engine.audio_decode_procs
         self.duplex_session_config = self.engine.duplex_session_config
         self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
 

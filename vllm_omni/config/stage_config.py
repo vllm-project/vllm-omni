@@ -498,6 +498,16 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+    # Frontend audio-decode parallelism: >0 decodes uploaded clips in that many
+    # worker processes instead of upstream's thread pool. A resource knob, so it
+    # lives with the other resource knobs rather than in the environment.
+    #
+    # Decode is GIL-bound, so without this it serialises and caps a
+    # speech-to-text deployment below what the GPU can consume: 19.9 req/s
+    # against 52.6 for the qwen3_asr profile on H100. Clients sending 16 kHz
+    # mono avoid the same cost by a different route, and the two do not
+    # compound.
+    audio_decode_procs: int = 0
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -678,6 +688,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "audio_decode_procs": int(raw_dict.get("audio_decode_procs", 0) or 0),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.

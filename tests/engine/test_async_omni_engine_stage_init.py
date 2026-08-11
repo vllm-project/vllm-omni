@@ -412,7 +412,7 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     monkeypatch.setattr(
         runtime_mod.StageEngineCoreClientBase,
         "make_async_mp_client",
-        lambda **kwargs: (captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client),
+        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
     )
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client

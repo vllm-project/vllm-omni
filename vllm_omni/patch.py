@@ -328,8 +328,8 @@ def _patch_chat_template_registry():
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
-                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = lambda _: (
+                CHAT_TEMPLATES_DIR / "template_chatml.jinja"
             )
     except ImportError:
         pass
