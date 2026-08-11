@@ -389,7 +389,7 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
-    def test_deploy_config_does_not_expand_replicas(self, tmp_path, mocker: MockerFixture):
+    def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"
         deploy_path.write_text(
             'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
@@ -410,10 +410,15 @@ class TestLoadAndResolveStageConfigs:
             "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
             return_value=(returned_stage_configs, None),
         )
+        cli_overrides = {
+            "interleave_mm_strings": True,
+            "media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}},
+            "gpu_memory_utilization": 0.55,
+        }
 
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="dummy-model",
-            kwargs={},
+            kwargs=cli_overrides,
             trust_remote_code=True,
             deploy_config_path=str(deploy_path),
         )
@@ -421,7 +426,7 @@ class TestLoadAndResolveStageConfigs:
         load_stage_configs.assert_called_once_with(
             "dummy-model",
             trust_remote_code=True,
-            base_engine_args={},
+            base_engine_args=cli_overrides,
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
             strategy_config_path=None,

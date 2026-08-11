@@ -89,6 +89,14 @@ local = [
     "FlagEmbedding",
 ]
 
+# LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
+# separation and loudness normalization.
+longcat-video-avatar = [
+    "audio-separator==0.44.2",
+    "pyloudnorm==0.1.1",
+    "soundfile>=0.13.1",
+]
+
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [
