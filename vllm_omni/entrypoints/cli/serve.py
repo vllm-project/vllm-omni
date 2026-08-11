@@ -753,7 +753,8 @@ class OmniServeCommand(CLISubcommand):
             default="auto",
             choices=["auto", "tile", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
-            "'auto' (default) selects the longer spatial-shard axis for validated Wan tiled decodes "
+            "'auto' (default) selects the longer spatial-shard axis for validated Wan and distributed QwenImage "
+            "tiled decodes "
             "on a full DiT group, then falls back to patch/tile decode; 'tile' always uses patch/tile decode; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "

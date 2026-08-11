@@ -790,7 +790,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
     monkeypatch.setattr(
         model_runner_module,
-        "prepare_pipeline_wan_spatial_shard_decode",
+        "prepare_pipeline_spatial_shard_decode",
         lambda pipeline: preparation_pool_states.append(memory_pool_active),
     )
     monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)

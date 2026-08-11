@@ -4,15 +4,22 @@
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.autoencoders import qwenimage_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
     GridSpec,
     TileTask,
+)
+from vllm_omni.diffusion.distributed.autoencoders.spatial_shard import (
+    prepare_spatial_shard_decode,
+    resolve_spatial_shard_split_dim,
+    spatial_shard_decode_enabled,
 )
 
 logger = init_logger(__name__)
@@ -104,9 +111,38 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         ]
         return dec
 
+    def _spatial_shard_decode_split_dim(
+        self,
+        z: torch.Tensor | None = None,
+        world_size: int | None = None,
+    ) -> str | None:
+        return resolve_spatial_shard_split_dim(self.distributed_executor.parallel_mode, z, world_size)
+
+    def _spatial_shard_decode_enabled(self, z: torch.Tensor) -> bool:
+        return spatial_shard_decode_enabled(self, z, model_name="QwenImage")
+
+    def _prepare_spatial_shard_decode(self) -> None:
+        prepare_spatial_shard_decode(
+            self,
+            install=qwenimage_spatial_shard.install_qwenimage_spatial_shard_decode,
+        )
+
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
+
+        if self._spatial_shard_decode_enabled(z):
+            world_size = dist.get_world_size(group=self.distributed_executor.group)
+            split_dim = self._spatial_shard_decode_split_dim(z, world_size)
+            assert split_dim is not None
+            logger.debug("Decode running with QwenImage VAE spatial_shard_%s mode", split_dim)
+            return qwenimage_spatial_shard.spatial_shard_decode(
+                self,
+                z,
+                group=self.distributed_executor.group,
+                return_dict=return_dict,
+                split_dim=split_dim,
+            )
 
         logger.debug("Decode running with distributed executor")
         result = self.distributed_executor.execute(

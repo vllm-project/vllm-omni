@@ -155,9 +155,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         parallel_size: int,
         mode: str = "tile",
     ) -> None:
-        # ``auto`` is the cross-model default. Spatial selection is Wan-only,
-        # so preserve MiniMax H3's native tile path for that default while
-        # continuing to reject explicitly requested Wan spatial modes.
+        # ``auto`` is the cross-model default. MiniMax H3 has no spatial-shard
+        # capability, so preserve its native tile path for that default while
+        # continuing to reject explicitly requested spatial modes.
         if mode == "auto":
             mode = "tile"
         if mode != "tile":

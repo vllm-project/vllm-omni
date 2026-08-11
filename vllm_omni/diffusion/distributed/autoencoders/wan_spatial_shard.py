@@ -7,19 +7,21 @@
 #   (python/sglang/multimodal_gen/runtime/layers/parallel_conv.py)
 # which is in turn adapted from FastVideo (https://github.com/hao-ai-lab/FastVideo).
 # This version generalizes the height-only sharding to shard along height or
-# width and adds the Wan causal-conv ``feat_cache`` handling.
-"""Spatially-sharded Wan VAE decode.
+# width and supports the causal-conv ``feat_cache`` handling used by Wan and
+# QwenImage.
+"""Shared spatial-shard kernels plus the Wan VAE adapter.
 
-The existing distributed Wan VAE path shards *tiles*.  This module adds an
-opt-in decode backend that shards decoder feature maps along height or width and
-exchanges boundary rows/columns before spatial convolutions.  It is
-intentionally decode-only and keeps checkpoint loading unchanged by patching the
-already-loaded decoder.
+The halo, padding, stride-trim, attention-gather, and decode-lifecycle helpers
+are also reused by QwenImage's thin adapter. The backend shards decoder feature
+maps along height or width and exchanges boundary rows/columns before spatial
+convolutions. It is decode-only and keeps checkpoint loading unchanged by
+patching the already-loaded decoder.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.distributed.autoencoders.spatial_shard import SpatialShardVAE
 
 logger = init_logger(__name__)
 
@@ -62,7 +66,7 @@ def _spatial_dim(split_dim: str) -> int:
         return -2
     if split_dim == "width":
         return -1
-    raise ValueError(f"Unsupported Wan VAE split_dim={split_dim!r}; expected 'height' or 'width'.")
+    raise ValueError(f"Unsupported VAE split_dim={split_dim!r}; expected 'height' or 'width'.")
 
 
 def _narrow_along_dim(x: torch.Tensor, dim: int, start: int, length: int) -> torch.Tensor:
@@ -160,9 +164,9 @@ def split_for_parallel_decode(
     rank = 0 if rank is None else int(rank)
     world_size = 1 if world_size is None else int(world_size)
     if world_size < 1:
-        raise ValueError(f"Wan VAE world_size must be >= 1, got {world_size}.")
+        raise ValueError(f"VAE world_size must be >= 1, got {world_size}.")
     if not 0 <= rank < world_size:
-        raise ValueError(f"Wan VAE rank must satisfy 0 <= rank < world_size, got rank={rank}, world_size={world_size}.")
+        raise ValueError(f"VAE rank must satisfy 0 <= rank < world_size, got rank={rank}, world_size={world_size}.")
 
     dim = _spatial_dim(split_dim)
     expected_extent = x.shape[dim] * (2**upsample_count)
@@ -385,7 +389,7 @@ class WanDistConv2d(nn.Conv2d):
         self._deferred_padding = deferred_padding
         source_padding = source.padding if isinstance(source.padding, tuple) else (source.padding, source.padding)
         if len(source_padding) != 2 or not all(isinstance(value, int) for value in source_padding):
-            raise ValueError(f"Wan spatial-shard Conv2d requires integer padding, got {source.padding!r}.")
+            raise ValueError(f"Spatial-shard Conv2d requires integer padding, got {source.padding!r}.")
         self._spatial_pad_h = int(source_padding[-2])
         self._spatial_pad_w = int(source_padding[-1])
         self.register_buffer("_halo_recv_top_buf", None, persistent=False)
@@ -480,30 +484,20 @@ class WanDistConv2d(nn.Conv2d):
         return trim_params
 
 
-class WanDistCausalConv3d(nn.Conv3d):
-    # Cross-PR compatibility contract for the lossless Wan data-movement
-    # installer: it may fuse the no-context direct path, but must leave this
-    # wrapper in control whenever a spatial-shard context is active.
-    _vllm_omni_dynamic_spatial_shard_conv = True
+# Model-neutral aliases let other causal VAEs reuse the implementation while
+# preserving the original Wan class identities for stacked PRs and downstreams.
+SpatialShardZeroPad2d = WanDistZeroPad2d
+SpatialShardConv2d = WanDistConv2d
 
-    def __init__(
+
+class SpatialShardCausalConv3dMixin:
+    """Shared causal-convolution behavior for supported Diffusers VAE classes."""
+
+    def _init_spatial_shard_causal_conv(
         self,
         source: nn.Conv3d,
         group: dist.ProcessGroup,
-    ):
-        super().__init__(
-            source.in_channels,
-            source.out_channels,
-            source.kernel_size,
-            stride=source.stride,
-            padding=0,
-            dilation=source.dilation,
-            groups=source.groups,
-            bias=source.bias is not None,
-            padding_mode=source.padding_mode,
-            device=source.weight.device,
-            dtype=source.weight.dtype,
-        )
+    ) -> None:
         self.load_state_dict(source.state_dict())
         self.group = group
         source_padding = getattr(source, "_padding", None)
@@ -511,11 +505,16 @@ class WanDistCausalConv3d(nn.Conv3d):
             p_t, p_h, p_w = source.padding
             source_padding = (p_w, p_w, p_h, p_h, 2 * p_t, 0)
         self._source_padding = tuple(source_padding)
+        self._padding = tuple(source_padding)
         self.register_buffer("_halo_recv_top_buf", None, persistent=False)
         self.register_buffer("_halo_recv_bottom_buf", None, persistent=False)
         self._trim_cache: dict[tuple[str, int], tuple[int, int, int]] = {}
 
-    def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+    def _spatial_shard_causal_conv_forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         split_dim = _active_spatial_shard_split_dim()
         padding = list(self._source_padding)
         if cache_x is not None and padding[4] > 0:
@@ -524,7 +523,7 @@ class WanDistCausalConv3d(nn.Conv3d):
             padding[4] -= cache_x.shape[2]
 
         if split_dim is None:
-            return super().forward(F.pad(x, padding))
+            return nn.Conv3d.forward(self, F.pad(x, padding))
 
         split_tensor_dim = _spatial_dim(split_dim)
         if split_dim == "height":
@@ -568,7 +567,7 @@ class WanDistCausalConv3d(nn.Conv3d):
                 shift,
                 x_padded.shape[split_tensor_dim] - shift,
             )
-        out = super().forward(x_padded)
+        out = nn.Conv3d.forward(self, x_padded)
         out = _trim_local_conv_output(out, halo_size, start, upper_bound, split_dim=split_dim)
         return _zero_invalid_extent(out, split_dim=split_dim)
 
@@ -599,6 +598,36 @@ class WanDistCausalConv3d(nn.Conv3d):
             )
             self._trim_cache[cache_key] = trim_params
         return trim_params
+
+
+class WanDistCausalConv3d(SpatialShardCausalConv3dMixin, nn.Conv3d):
+    # Cross-PR compatibility contract for the lossless Wan data-movement
+    # installer: it may fuse the no-context direct path, but must leave this
+    # wrapper in control whenever a spatial-shard context is active.
+    _vllm_omni_dynamic_spatial_shard_conv = True
+
+    def __init__(
+        self,
+        source: nn.Conv3d,
+        group: dist.ProcessGroup,
+    ):
+        super().__init__(
+            source.in_channels,
+            source.out_channels,
+            source.kernel_size,
+            stride=source.stride,
+            padding=0,
+            dilation=source.dilation,
+            groups=source.groups,
+            bias=source.bias is not None,
+            padding_mode=source.padding_mode,
+            device=source.weight.device,
+            dtype=source.weight.dtype,
+        )
+        self._init_spatial_shard_causal_conv(source, group)
+
+    def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+        return self._spatial_shard_causal_conv_forward(x, cache_x)
 
 
 def _compute_conv_trim_params(
@@ -674,23 +703,19 @@ def _replace_child(
     name: str,
     child: nn.Module,
     group: dist.ProcessGroup,
+    *,
+    causal_conv_class_name: str,
+    causal_conv_factory: Callable[[nn.Conv3d, dist.ProcessGroup], nn.Module],
 ) -> None:
-    if child.__class__.__name__ == "WanCausalConv3d":
-        setattr(
-            parent,
-            name,
-            WanDistCausalConv3d(
-                child,
-                group,
-            ),
-        )
+    if child.__class__.__name__ == causal_conv_class_name:
+        setattr(parent, name, causal_conv_factory(child, group))
         return
     if isinstance(child, nn.ZeroPad2d):
         padding = tuple(int(p) for p in child.padding)
         setattr(
             parent,
             name,
-            WanDistZeroPad2d(
+            SpatialShardZeroPad2d(
                 padding,
                 group,
                 defer_split_after_padding=parent.__class__.__name__ == "Sequential",
@@ -700,18 +725,18 @@ def _replace_child(
     if isinstance(child, nn.Conv2d):
         deferred_padding = None
         if name == "1" and parent.__class__.__name__ == "Sequential":
-            # WanResample downsample uses ZeroPad2d((0, 1, 0, 1)) before a
+            # Wan/QwenImage downsampling uses ZeroPad2d((0, 1, 0, 1)) before a
             # stride-2 conv with padding=0.  Only the last rank should see the
             # bottom/right global padding, which is approximated by split_padding.
             prev = getattr(parent, "0", None)
-            if isinstance(prev, WanDistZeroPad2d):
+            if isinstance(prev, SpatialShardZeroPad2d):
                 deferred_padding = prev.padding
             elif isinstance(prev, nn.ZeroPad2d):
                 deferred_padding = tuple(int(value) for value in prev.padding)
         setattr(
             parent,
             name,
-            WanDistConv2d(
+            SpatialShardConv2d(
                 child,
                 group,
                 deferred_padding=deferred_padding,
@@ -722,20 +747,45 @@ def _replace_child(
 def _patch_decoder_modules(
     module: nn.Module,
     group: dist.ProcessGroup,
+    *,
+    causal_conv_class_name: str,
+    causal_conv_factory: Callable[[nn.Conv3d, dist.ProcessGroup], nn.Module],
+    attention_block_class_name: str,
     inside_attention: bool = False,
 ) -> None:
-    if module.__class__.__name__ == "WanAttentionBlock":
+    if module.__class__.__name__ == attention_block_class_name:
         _patch_attention_block(module, group)
         inside_attention = True
 
     for name, child in list(module.named_children()):
-        if child.__class__.__name__ == "WanCausalConv3d":
-            _replace_child(module, name, child, group)
+        if child.__class__.__name__ == causal_conv_class_name:
+            _replace_child(
+                module,
+                name,
+                child,
+                group,
+                causal_conv_class_name=causal_conv_class_name,
+                causal_conv_factory=causal_conv_factory,
+            )
             continue
         if isinstance(child, nn.Conv2d) and not inside_attention:
-            _replace_child(module, name, child, group)
+            _replace_child(
+                module,
+                name,
+                child,
+                group,
+                causal_conv_class_name=causal_conv_class_name,
+                causal_conv_factory=causal_conv_factory,
+            )
             continue
-        _patch_decoder_modules(child, group, inside_attention=inside_attention)
+        _patch_decoder_modules(
+            child,
+            group,
+            causal_conv_class_name=causal_conv_class_name,
+            causal_conv_factory=causal_conv_factory,
+            attention_block_class_name=attention_block_class_name,
+            inside_attention=inside_attention,
+        )
 
 
 def _decoder_upsample_count(decoder: nn.Module) -> int:
@@ -746,7 +796,7 @@ def _decoder_upsample_count(decoder: nn.Module) -> int:
     return count
 
 
-def _clear_wan_spatial_shard_runtime_buffers(vae: Any) -> None:
+def clear_spatial_shard_runtime_buffers(vae: SpatialShardVAE) -> None:
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
         return
@@ -757,7 +807,17 @@ def _clear_wan_spatial_shard_runtime_buffers(vae: Any) -> None:
             module._halo_recv_bottom_buf = None
 
 
-def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> None:
+def install_spatial_shard_decode(
+    vae: SpatialShardVAE,
+    group: dist.ProcessGroup,
+    split_dim: str,
+    *,
+    causal_conv_class_name: str,
+    causal_conv_factory: Callable[[nn.Conv3d, dist.ProcessGroup], nn.Module],
+    attention_block_class_name: str,
+    installed_attr: str,
+    model_name: str,
+) -> None:
     """Patch ``vae.decoder`` once for spatially-sharded decode.
 
     This mutates the already-loaded decoder in place by swapping its spatial
@@ -766,32 +826,28 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
     local PyTorch behavior, so a later auto-selected tile request remains safe.
     The same installed decoder can alternate height and width sharding.
 
-    Only group-relative rank 0 assembles the final decoded frame, mirroring the
-    distributed tiled-decode ``broadcast_result=False`` contract; the other ranks
-    take part in the collectives but return an empty placeholder.
+    Group-relative rank 0 assembles the final decoded frame. The model adapter
+    then preserves its prior contract: Wan keeps the result on rank 0, while
+    QwenImage broadcasts it to every rank.
     """
     _spatial_dim(split_dim)
-    if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
+    if getattr(vae, installed_attr, False):
         return
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
-        raise ValueError("Wan spatial-shard VAE decode requires a decoder module.")
+        raise ValueError(f"{model_name} spatial-shard VAE decode requires a decoder module.")
 
-    _patch_decoder_modules(decoder, group)
+    _patch_decoder_modules(
+        decoder,
+        group,
+        causal_conv_class_name=causal_conv_class_name,
+        causal_conv_factory=causal_conv_factory,
+        attention_block_class_name=attention_block_class_name,
+    )
     upsample_count = _decoder_upsample_count(decoder)
     orig_forward = decoder.forward
 
-    def _forward(
-        self: nn.Module,
-        x: torch.Tensor,
-        feat_cache: list[torch.Tensor] | None = None,
-        feat_idx: list[int] | None = None,
-        first_chunk: bool = False,
-        *,
-        split_dim: str,
-    ) -> torch.Tensor:
-        if feat_idx is None:
-            feat_idx = [0]
+    def _forward(self: nn.Module, x: torch.Tensor, *args: object, split_dim: str, **kwargs: object) -> torch.Tensor:
         tensor_dim = _spatial_dim(split_dim)
         input_extent = x.shape[tensor_dim]
         x, expected_extent = split_for_parallel_decode(
@@ -811,28 +867,50 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
             )
         )
         try:
-            out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+            out = orig_forward(x, *args, **kwargs)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
         return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
 
     decoder._vllm_omni_spatial_shard_forward = MethodType(_forward, decoder)
-    vae._vllm_omni_wan_spatial_shard_installed = True
-    logger.info("Installed Wan VAE dynamic-axis spatial-shard decode.")
+    setattr(vae, installed_attr, True)
+    logger.info("Installed %s VAE dynamic-axis spatial-shard decode.", model_name)
 
 
-def spatial_shard_decode(
-    vae: Any,
+def install_wan_spatial_shard_decode(
+    vae: SpatialShardVAE,
+    group: dist.ProcessGroup,
+    split_dim: str = "height",
+) -> None:
+    install_spatial_shard_decode(
+        vae,
+        group,
+        split_dim,
+        causal_conv_class_name="WanCausalConv3d",
+        causal_conv_factory=WanDistCausalConv3d,
+        attention_block_class_name="WanAttentionBlock",
+        installed_attr="_vllm_omni_wan_spatial_shard_installed",
+        model_name="Wan",
+    )
+
+
+def spatial_shard_decode_impl(
+    vae: SpatialShardVAE,
     z: torch.Tensor,
     *,
     group: dist.ProcessGroup,
+    install: Callable[[SpatialShardVAE, dist.ProcessGroup, str], None],
+    model_name: str,
+    pass_first_chunk: bool,
+    broadcast_result: bool,
+    unpatchify_patch_size: int | None,
     return_dict: bool = True,
     split_dim: str = "height",
 ) -> DecoderOutput | tuple[torch.Tensor]:
-    install_wan_spatial_shard_decode(vae, group, split_dim=split_dim)
+    install(vae, group, split_dim)
 
     if z.shape[2] == 0:
-        raise ValueError("Wan spatial-shard VAE decode expects at least one latent frame.")
+        raise ValueError(f"{model_name} spatial-shard VAE decode expects at least one latent frame.")
 
     # Non-rank-0 ranks must still run the decoder every chunk to stay in lockstep with
     # the halo/all-gather collectives; they just skip keeping/assembling the output.
@@ -841,26 +919,36 @@ def spatial_shard_decode(
 
     vae.clear_cache()
     try:
-        context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
+        context_factory = getattr(vae, "_execution_context", None)
+        context = context_factory() if callable(context_factory) else nullcontext()
         with context:
             x = vae.post_quant_conv(z)
             decoded_chunks = []
+            spatial_forward = getattr(vae.decoder, "_vllm_omni_spatial_shard_forward")
             for i in range(z.shape[2]):
                 vae._conv_idx = [0]
-                chunk = vae.decoder._vllm_omni_spatial_shard_forward(
-                    x[:, :, i : i + 1, :, :],
-                    feat_cache=vae._feat_map,
-                    feat_idx=vae._conv_idx,
-                    first_chunk=(i == 0),
-                    split_dim=split_dim,
-                )
+                if pass_first_chunk:
+                    chunk = spatial_forward(
+                        x[:, :, i : i + 1, :, :],
+                        feat_cache=vae._feat_map,
+                        feat_idx=vae._conv_idx,
+                        first_chunk=i == 0,
+                        split_dim=split_dim,
+                    )
+                else:
+                    chunk = spatial_forward(
+                        x[:, :, i : i + 1, :, :],
+                        feat_cache=vae._feat_map,
+                        feat_idx=vae._conv_idx,
+                        split_dim=split_dim,
+                    )
                 if produce_output:
                     decoded_chunks.append(chunk)
 
             if produce_output:
                 out = torch.cat(decoded_chunks, dim=2)
-                if vae.config.patch_size is not None:
-                    out = unpatchify(out, patch_size=vae.config.patch_size)
+                if unpatchify_patch_size is not None:
+                    out = unpatchify(out, patch_size=unpatchify_patch_size)
                 out = torch.clamp(out, min=-1.0, max=1.0)
             else:
                 out = z.new_zeros(0)
@@ -869,8 +957,34 @@ def spatial_shard_decode(
         # Halo buffers are request-shape scratch space allocated outside the
         # tagged weight pool. Drop live references so sleep/offload never has
         # to preserve or discard them as model state.
-        _clear_wan_spatial_shard_runtime_buffers(vae)
+        clear_spatial_shard_runtime_buffers(vae)
+
+    if broadcast_result:
+        out = vae.distributed_executor._sync_final_result(out, z.ndim, z.device, vae.dtype)
 
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)
+
+
+def spatial_shard_decode(
+    vae: SpatialShardVAE,
+    z: torch.Tensor,
+    *,
+    group: dist.ProcessGroup,
+    return_dict: bool = True,
+    split_dim: str = "height",
+) -> DecoderOutput | tuple[torch.Tensor]:
+    """Decode a Wan latent with spatial activation sharding."""
+    return spatial_shard_decode_impl(
+        vae,
+        z,
+        group=group,
+        install=install_wan_spatial_shard_decode,
+        model_name="Wan",
+        pass_first_chunk=True,
+        broadcast_result=False,
+        unpatchify_patch_size=vae.config.patch_size,
+        return_dict=return_dict,
+        split_dim=split_dim,
+    )

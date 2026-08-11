@@ -449,9 +449,9 @@ Complete examples in the codebase:
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode (Wan and QwenImage)
 
-The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded decode** backend. `DiffusionParallelConfig.vae_parallel_mode="auto"` is the default; explicit `"tile"`, `"spatial_shard_height"`, and `"spatial_shard_width"` modes remain available.
+The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE and distributed QwenImage backend additionally support a **spatially-sharded decode** backend. `DiffusionParallelConfig.vae_parallel_mode="auto"` is the default; explicit `"tile"`, `"spatial_shard_height"`, and `"spatial_shard_width"` modes remain available.
 
 ### How it differs from tile parallel
 
@@ -459,10 +459,11 @@ The tile-parallel executor above assigns independent spatial **tiles** to ranks.
 |--------|--------------------------|----------------------|-----------------------------------------------|
 | Unit of work | Independent overlapping tiles | Chooses tile or a spatial shard per request | A single global feature map sharded along H or W |
 | Cross-rank communication | Gather tiles to rank 0, stitch + blend | Depends on the selected path | Per-conv **halo exchange** of boundary rows/cols (P2P) |
-| Output assembly | Blend overlapping tiles | Depends on the selected path | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
-| Scope | Decode + encode | Wan decode selection; encode remains tiled | Decode only |
+| Output assembly | Blend overlapping tiles | Depends on the selected path | All-gather shards on rank 0 and trim padding; QwenImage then broadcasts |
+| Activation memory | Bounded by tile size | Depends on the selected path | Grows with full output area divided across ranks |
+| Scope | Decode + encode | Wan/QwenImage decode selection; encode remains tiled | Decode only |
 
-Spatial-shard decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_spatial_shard.py`.
+Spatial-shard decode swaps the decoder's spatial convolutions/padding for context-aware halo-exchanging variants so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Wan and QwenImage share the padding, 2D convolution, attention, halo, and trim primitives in `wan_spatial_shard.py`; `qwenimage_spatial_shard.py` supplies a causal-convolution subclass that remains discoverable by Diffusers' QwenImage cache accounting.
 
 ### Wiring
 
@@ -473,15 +474,17 @@ serve.py (--vae-parallel-mode) / OmniEngineArgs
   -> DiffusionParallelConfig.vae_parallel_mode
   -> registry.py: model.vae.set_parallel_size(vae_pp_size, mode=...)
   -> DistributedVaeExecutor.parallel_mode
-  -> DistributedAutoencoderKLWan.tiled_decode dispatch
+  -> capability-based pipeline preparation
+  -> DistributedAutoencoderKLWan/DistributedAutoencoderKLQwenImage.tiled_decode dispatch
 ```
 
-`DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. The method is reached only after Diffusers has selected tiled decode for the request. In `auto` mode the longer axis that can cover every rank is selected, with width winning ties. This policy is cached only through normal kernel shape caches; it is reevaluated for every request.
+The shared spatial policy gates the path: it requires distributed decode to be enabled, a 5D latent, a supported VAE capability, and `vae_patch_parallel_size == DiT group size`. The method is reached only after Diffusers has selected tiled decode for the request. In `auto` mode the longer axis that can cover every rank is selected, with width winning ties. This policy is cached only through normal kernel shape caches; it is reevaluated for every request.
 
 ### Notes
 
 - The decoder is patched **in place** the first time spatial-shard decode runs. Its wrappers consult a context-local split dimension and retain an exact direct fallback, allowing later requests to select tile, height, or width safely.
 - Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `distributed_cuda`).
+- QwenImage additionally covers cache discovery, compile compatibility, mixed tile/spatial requests, both axes, and all-rank result broadcast in `tests/diffusion/distributed/test_qwenimage_spatial_shard.py`.
 
 ---
 

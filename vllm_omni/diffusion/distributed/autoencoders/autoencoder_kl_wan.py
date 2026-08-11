@@ -18,54 +18,23 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.spatial_shard import (
+    prepare_pipeline_spatial_shard_decode,
+    prepare_spatial_shard_decode,
+    resolve_spatial_shard_split_dim,
+    spatial_shard_decode_enabled,
+)
+from vllm_omni.diffusion.distributed.autoencoders.spatial_shard import (
+    select_auto_spatial_shard_split_dim as select_auto_spatial_shard_split_dim,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
-def select_auto_spatial_shard_split_dim(
-    z_shape: tuple[int, ...],
-    world_size: int,
-) -> str | None:
-    """Select a profitable Wan spatial-shard axis for one latent shape.
-
-    This selector runs only after Diffusers has already chosen ``tiled_decode``
-    for a spatially large request. Splitting the longer eligible axis reduces
-    halo traffic for rectangular requests and improves per-rank balance.
-    """
-    if len(z_shape) != 5 or world_size <= 1:
-        return None
-
-    _, _, _, height, width = z_shape
-    candidates = [
-        (extent, split_dim) for extent, split_dim in ((height, "height"), (width, "width")) if extent >= world_size
-    ]
-    if not candidates:
-        return None
-    # Prefer width for square latents: it was modestly faster in the existing
-    # four-GPU Wan benchmark and keeps the choice deterministic.
-    return max(candidates, key=lambda candidate: (candidate[0], candidate[1] == "width"))[1]
-
-
 def prepare_pipeline_wan_spatial_shard_decode(pipeline: torch.nn.Module) -> None:
-    """Install eligible Wan wrappers while weight allocations are still tagged."""
-    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
-
-    if not dist.is_initialized():
-        return
-    for vae in ModuleDiscovery.discover(pipeline).vaes:
-        if not isinstance(vae, DistributedAutoencoderKLWan):
-            continue
-        executor = vae.distributed_executor
-        mode = executor.parallel_mode
-        if mode not in {"auto", "spatial_shard_height", "spatial_shard_width"}:
-            continue
-        requested_size = int(executor.parallel_size)
-        world_size = dist.get_world_size(group=executor.group)
-        if requested_size <= 1 or requested_size != world_size:
-            continue
-        split_dim = "width" if mode == "spatial_shard_width" else "height"
-        wan_spatial_shard.install_wan_spatial_shard_decode(vae, executor.group, split_dim=split_dim)
+    """Backward-compatible alias for the model-agnostic pipeline dispatcher."""
+    prepare_pipeline_spatial_shard_decode(pipeline)
 
 
 class OmniAutoencoderKLWan(AutoencoderKLWan):
@@ -320,46 +289,16 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         z: torch.Tensor | None = None,
         world_size: int | None = None,
     ) -> str | None:
-        mode = self.distributed_executor.parallel_mode
-        if mode == "spatial_shard_width":
-            return "width"
-        if mode == "spatial_shard_height":
-            return "height"
-        if mode == "auto" and z is not None and world_size is not None:
-            return select_auto_spatial_shard_split_dim(tuple(z.shape), world_size)
-        return None
+        return resolve_spatial_shard_split_dim(self.distributed_executor.parallel_mode, z, world_size)
 
     def _spatial_shard_decode_enabled(self, z: torch.Tensor) -> bool:
-        if self.distributed_executor.parallel_mode == "tile":
-            return False
-        if z.ndim != 5:
-            if self.distributed_executor.parallel_mode != "tile":
-                logger.warning("Wan VAE spatial sharded decode expects 5D latent input; falling back to tiled decode.")
-            return False
-        if not self.is_distributed_enabled():
-            return False
+        return spatial_shard_decode_enabled(self, z, model_name="Wan")
 
-        group = self.distributed_executor.group
-        world_size = dist.get_world_size(group=group)
-        requested_size = int(self.distributed_executor.parallel_size)
-        if requested_size != world_size:
-            if self.distributed_executor.parallel_mode == "auto":
-                logger.debug(
-                    "Wan VAE auto decode selected tile mode for a partial DiT group (requested=%s dit_group=%s)",
-                    requested_size,
-                    world_size,
-                )
-            elif self._spatial_shard_decode_split_dim() is not None:
-                logger.warning(
-                    "Wan VAE spatial sharded decode currently requires vae_patch_parallel_size "
-                    "to match the DIT group size; falling back to tiled decode. "
-                    "requested=%s dit_group=%s split_dim=%s",
-                    requested_size,
-                    world_size,
-                    self._spatial_shard_decode_split_dim(),
-                )
-            return False
-        return self._spatial_shard_decode_split_dim(z, world_size) is not None
+    def _prepare_spatial_shard_decode(self) -> None:
+        prepare_spatial_shard_decode(
+            self,
+            install=wan_spatial_shard.install_wan_spatial_shard_decode,
+        )
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():

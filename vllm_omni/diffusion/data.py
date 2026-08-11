@@ -209,9 +209,9 @@ class DiffusionParallelConfig:
     vae_parallel_mode: str = "auto"
     """VAE parallel decode strategy.
 
-    - "auto": Select the longer spatial-shard axis for validated Wan tiled
-      decodes on a full DiT-group topology; otherwise use patch/tile parallel
-      decode.
+    - "auto": Select the longer spatial-shard axis for validated Wan and
+      distributed QwenImage tiled decodes on a full DiT-group topology;
+      otherwise use patch/tile parallel decode.
     - "tile": Patch/tile parallel decode. Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder

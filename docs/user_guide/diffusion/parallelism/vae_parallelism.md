@@ -15,7 +15,7 @@
 
 ## Overview
 
-VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers VAE patch/tile parallelism, which splits latent space into spatial tiles or patches, and Wan spatial-shard decode, which shards decoder feature maps along height or width.
+VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers VAE patch/tile parallelism, which splits latent space into spatial tiles or patches, and Wan/QwenImage spatial-shard decode, which shards decoder feature maps along height or width.
 
 This is particularly useful for:
 - **High-resolution image generation** where VAE decode can become a memory bottleneck
@@ -113,7 +113,7 @@ In `DiffusionParallelConfig`:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. Should typically match `tensor_parallel_size` as they share the same process group. |
-| `vae_parallel_mode` | str | `"auto"` | VAE parallel decode strategy: `"auto"` (shape/model/topology-aware selection), `"tile"`, `"spatial_shard_height"`, or `"spatial_shard_width"`. Spatial sharding is currently Wan-only. See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
+| `vae_parallel_mode` | str | `"auto"` | VAE parallel decode strategy: `"auto"` (shape/model/topology-aware selection), `"tile"`, `"spatial_shard_height"`, or `"spatial_shard_width"`. Spatial sharding supports Wan and the distributed QwenImage backend. See [Spatially-Sharded Decode](#spatially-sharded-decode-wan-and-qwenimage). |
 
 Additional requirements:
 
@@ -126,9 +126,9 @@ Additional requirements:
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode (Wan and QwenImage)
 
-The default `vae_parallel_mode="auto"` selects spatial-shard decode only after a Wan request is already large enough to enter Diffusers' tiled-decode path and the VAE uses the full DiT decode group. It splits the longer eligible spatial axis to reduce halo traffic. Direct-decode requests, partial groups, and other VAE families keep their existing path. Set `vae_parallel_mode="tile"` to force the previous behavior, or `"spatial_shard_height"` / `"spatial_shard_width"` to force an axis.
+The default `vae_parallel_mode="auto"` selects spatial-shard decode only after a Wan or distributed QwenImage request is already large enough to enter Diffusers' tiled-decode path and the VAE uses the full DiT decode group. It splits the longer eligible spatial axis to reduce halo traffic. Direct-decode requests, partial groups, and other VAE families keep their existing path. Set `vae_parallel_mode="tile"` to force the previous behavior, or `"spatial_shard_height"` / `"spatial_shard_width"` to force an axis.
 
 Instead of assigning independent tiles to ranks, spatial-shard decode shards the decoder feature maps along the height (`spatial_shard_height`) or width (`spatial_shard_width`) dimension and exchanges halo rows/columns between neighboring ranks around the spatial convolutions. This keeps the receptive field correct across shard boundaries, so the result matches the single-GPU decode within numerical tolerance.
 
@@ -157,11 +157,13 @@ vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
 
 **Constraints and behavior:**
 
-- Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
+- Spatial-shard decode is **decode-only** and implemented for the **Wan** VAE and the distributed **QwenImage** backend used by Qwen-Image and Krea2. Pipelines using a different VAE backend keep their existing behavior.
 - It requires `vae_patch_parallel_size` to **match the DiT process group size**. `auto` quietly falls back to tile decode for a partial group; an explicitly forced spatial mode logs a warning.
 - The decoder's context-aware wrappers retain the direct path, so one process can alternate small/large and portrait/landscape requests safely.
+- Wan preserves its rank-0-only decode result, while QwenImage preserves its existing all-rank result by broadcasting after rank-0 assembly.
+- Spatial sharding trades activation memory for latency as resolution grows. Use `vae_parallel_mode="tile"` when bounded VAE memory is more important than decode speed.
 
-The automatic policy is adapted from [SGLang #28071](https://github.com/sgl-project/sglang/pull/28071) and narrowed to vLLM-Omni's parity-tested Wan backend.
+The automatic policy is adapted from [SGLang #28071](https://github.com/sgl-project/sglang/pull/28071) and narrowed to vLLM-Omni's parity-tested Wan and QwenImage backends.
 
 For end-to-end latency/throughput, launch serving with the desired `vae_parallel_mode` and use the existing diffusion serving benchmark:
 
