@@ -301,6 +301,17 @@ _OMNI_MODELS = {
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
     ),
+    ## TADA TTS (HumeAI/tada-1b, HumeAI/tada-3b-ml)
+    "TadaARStageForConditionalGeneration": (
+        "tada_tts",
+        "tada_tts_ar_stage",
+        "TadaARStageForConditionalGeneration",
+    ),
+    "TadaVocoder": (
+        "tada_tts",
+        "tada_tts_vocoder",
+        "TadaVocoder",
+    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",

@@ -1,0 +1,109 @@
+# TADA TTS -- async-chunk mode.
+#
+# Same two-stage pipeline as tada_tts.yaml but using async streaming transport.
+# Because TadaVocoder decodes the full acoustic feature sequence in one shot,
+# it still waits for the AR stage to finish before running the codec decoder.
+# Async-chunk mode reduces inter-stage latency when multiple requests are
+# in flight by overlapping AR generation of later requests with vocoder
+# decoding of earlier ones.
+#
+# Prerequisites:
+#   HuggingFace model: HumeAI/tada-1b  or  HumeAI/tada-3b-ml
+#   Codec decoder is loaded from HumeAI/tada-codec.
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: tada_tts
+      max_num_seqs: 4
+      model_arch: TadaARStageForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.5
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 4096
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.tada_tts.ar2vocoder_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      # See tada_tts.yaml: TADA walks the text (fixed length), sampled token discarded.
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
+      max_tokens: 4096
+      ignore_eos: true
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: tada_vocoder
+      max_num_seqs: 4
+      model_arch: TadaVocoder
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.3
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 8192
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # Chunked audio streaming geometry (frames @ 50 Hz), read by
+        # ar2vocoder_async_chunk. Overlap verified offline: a windowed codec
+        # decode with this left context + right lookahead matches a full decode
+        # to rel ~0.003 (inaudible). Right lookahead is required (TADA's codec is
+        # non-causal) and sets the first-audio latency floor (~RCTX*20 ms).
+        codec_streaming: true
+        tada_chunk_frames: 50
+        tada_left_context_frames: 128
+        tada_right_context_frames: 32
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

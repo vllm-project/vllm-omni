@@ -1,0 +1,75 @@
+# TADA TTS -- batch (non-streaming) mode.
+#
+# Stage 0: TadaARStageForConditionalGeneration (AR + per-token flow-matching diffusion)
+# Stage 1: TadaVocoder  (codec decoder: acoustic features → waveform @ 24 kHz)
+#
+# Prerequisites:
+#   HuggingFace model: HumeAI/tada-1b  or  HumeAI/tada-3b-ml
+#   Codec decoder is loaded from HumeAI/tada-codec.
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: tada_tts
+      max_num_seqs: 1
+      model_arch: TadaARStageForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.6
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 4096
+    default_sampling_params:
+      # TADA walks the input text (fixed length); the LM's sampled token is discarded.
+      # temperature=0 makes the unused sample deterministic; ignore_eos so the discarded
+      # token can't stop generation early. max_tokens is overridden per-request (= walk
+      # length) by the example; this is only a fallback cap.
+      temperature: 0.0
+      top_k: -1
+      top_p: 1.0
+      max_tokens: 4096
+      ignore_eos: true
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: tada_vocoder
+      max_num_seqs: 1
+      model_arch: TadaVocoder
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.3
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.tada_tts.ar2vocoder
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 8192
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
