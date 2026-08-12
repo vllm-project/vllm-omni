@@ -17,14 +17,13 @@ from transformers.utils.hub import cached_file
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
 
-from .spk_embedding import SpkembExtractor
 from .talker_module import resample
 
 if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
     from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
-
-    from .talker_module import Aggregator
 
 logger = init_logger(__name__)
 
