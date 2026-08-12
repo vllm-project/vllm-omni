@@ -27,6 +27,8 @@ stages:
   - stage_id: 1
     max_num_seqs: 2
     async_scheduling: false
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
     # The split Talker exposes a binary continue/stop vocabulary; native
     # segment and turn boundaries travel as explicit output metadata.
     default_sampling_params:

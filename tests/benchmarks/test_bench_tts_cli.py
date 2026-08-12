@@ -51,6 +51,14 @@ def test_load_model_configs(model_configs_path: Path) -> None:
     assert configs["test/ModelA"]["supported_tasks"] == ["voice_clone", "default_voice"]
 
 
+def test_indextts25_is_registered_in_shared_model_configs() -> None:
+    config_path = Path(bench_tts.__file__).with_name("model_configs.yaml")
+    config = bench_tts.load_model_configs(config_path)["IndexTeam/IndexTTS-2.5"]
+
+    assert config["supported_tasks"] == ["voice_clone"]
+    assert config["task_extra_body"]["voice_clone"]["extra_params"]["lang"] == "en"
+
+
 def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
     configs = bench_tts.load_model_configs(model_configs_path)
     cmd = bench_tts.build_bench_args(
@@ -118,6 +126,34 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
         extra_cli_args=[],
     )
     assert "--seed-tts-wer-eval" in cmd
+
+
+def test_build_bench_args_supports_local_model_and_shared_sweep_options(model_configs_path: Path) -> None:
+    configs = bench_tts.load_model_configs(model_configs_path)
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8092,
+        model="test/ModelA",
+        served_model_name="/models/indextts25",
+        task="voice_clone",
+        model_cfg=configs["test/ModelA"],
+        locale="en",
+        num_prompts=500,
+        num_warmups=5,
+        request_seed=42,
+        concurrency=8,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=["--", "--tokenizer", "/models/indextts25/qwen0.6bemo4-merge"],
+    )
+
+    assert cmd[cmd.index("--model") + 1] == "/models/indextts25"
+    assert cmd[cmd.index("--num-warmups") + 1] == "5"
+    assert cmd[-2:] == ["--tokenizer", "/models/indextts25/qwen0.6bemo4-merge"]
+    extra_body = json.loads(cmd[cmd.index("--extra-body") + 1])
+    assert extra_body == {"task_type": "Base", "seed": 42}
 
 
 def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture, mocker) -> None:
