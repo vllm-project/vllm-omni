@@ -338,6 +338,89 @@ def _patch_chat_template_registry():
 _patch_chat_template_registry()
 
 
+# =============================================================================
+# Compat: transformers >= 5.3 auto-registration wants config classes, not str
+# =============================================================================
+# transformers 5.3+ changed the Auto* `register()` signature from
+# ``register(str_name, cls)`` to ``register(config_class, cls, ...)``. The
+# new implementations look up ``config_class.__module__``, so remote model
+# files written against the old signature (e.g. MiniCPM-o 4.5's
+# ``processing_minicpmo.py``, which calls
+# ``AutoImageProcessor.register("MiniCPMVImageProcessor", ...)``) raise
+# ``AttributeError: 'str' object has no attribute '__module__'``.
+#
+# Under vLLM, that crash surfaces during model-architecture inspection:
+# ``ModelRegistry`` imports the remote model module in a subprocess
+# (``python -m vllm.model_executor.models.registry``), the uncaught
+# AttributeError aborts that subprocess, and the parent turns it into a
+# serve startup failure (SIGABRT on some platforms / glibc builds).
+#
+# AutoProcessor.from_pretrained() still resolves the class from the
+# checkpoint's ``preprocessor_config.json`` ``auto_map`` regardless of the
+# registry, so these registrations are informational. The wrapper therefore
+# forwards every call unchanged and only drops a legacy ``(str, cls)`` call
+# when the installed transformers rejects it (AttributeError on
+# ``__module__``). On older transformers, where str-keyed registration is
+# still accepted, behavior is byte-identical to upstream. The new
+# ``(config_class, cls)`` signature (used by vLLM-Omni's own vendored
+# processors, e.g. minicpmo_4_5_omni_llm.py) is forwarded unchanged.
+_AUTO_REGISTER_COMPAT_PATCHED = set()
+
+
+def _patch_auto_register_compat():
+    from transformers import (
+        AutoFeatureExtractor,
+        AutoImageProcessor,
+        AutoProcessor,
+        AutoTokenizer,
+    )
+
+    for auto_cls in (
+        AutoProcessor,
+        AutoImageProcessor,
+        AutoFeatureExtractor,
+        AutoTokenizer,
+    ):
+        if auto_cls in _AUTO_REGISTER_COMPAT_PATCHED:
+            continue
+        original_register = auto_cls.register
+        if getattr(original_register, "_omni_str_register_compat", False):
+            _AUTO_REGISTER_COMPAT_PATCHED.add(auto_cls)
+            continue
+
+        def _make_patched(original):
+            def _patched_register(config_class, *args, **kwargs):
+                if isinstance(config_class, str):
+                    try:
+                        return original(config_class, *args, **kwargs)
+                    except AttributeError as exc:
+                        # transformers >= 5.3 rejects str-keyed registration
+                        # with "'str' object has no attribute '__module__'".
+                        # The class is resolved via preprocessor auto_map at
+                        # load time, so the registration is redundant — drop
+                        # it instead of crashing model-architecture
+                        # inspection subprocesses.
+                        if "__module__" not in str(exc):
+                            raise
+                        _PATCH_LOGGER.debug(
+                            "[auto-register] dropping legacy str registration %r "
+                            "(transformers >= 5.3 requires a config class); "
+                            "resolved via preprocessor auto_map at load time",
+                            config_class,
+                        )
+                        return None
+                return original(config_class, *args, **kwargs)
+
+            _patched_register._omni_str_register_compat = True
+            return _patched_register
+
+        auto_cls.register = staticmethod(_make_patched(original_register))
+        _AUTO_REGISTER_COMPAT_PATCHED.add(auto_cls)
+
+
+_patch_auto_register_compat()
+
+
 def _patch_scaled_mm_fp8_contiguous_activation():
     """Support batched diffusion activations on the ModelOpt FP8 (ScaledMM) path.
 
