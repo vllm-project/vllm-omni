@@ -116,7 +116,11 @@ class GepardTalkerForConditionalGeneration(nn.Module):
             # hf_overrides re-routes the model class but patches the loaded
             # config instance rather than re-classing it, so we get the
             # checkpoint's backbone config. Rebuild the real GepardConfig.
-            cfg = GepardConfig.from_checkpoint(vllm_config.model_config.model, backbone_config=cfg.to_dict())
+            cfg = GepardConfig.from_checkpoint(
+                vllm_config.model_config.model,
+                backbone_config=cfg.to_dict(),
+                revision=vllm_config.model_config.revision,
+            )
         self.config = cfg
         self._device = current_omni_platform.get_torch_device()
         # Deterministic argmax sampling, for reproducible comparisons.
@@ -408,7 +412,44 @@ class GepardTalkerForConditionalGeneration(nn.Module):
 
         if is_prefill:
             state = self._get_or_create_state(req_id)
-            # Reset generation state — a preempted request re-prefills here.
+            # An aborted id can be resubmitted, and the runner treats the two
+            # as distinct requests (gpu_model_runner: "There could be an edge
+            # case where finished_req_ids and scheduled_req_ids overlap").
+            # Drop the pending free, or the cleanup at the end of THIS forward
+            # takes the new request's state with it and every later decode
+            # falls back to a zero embedding.
+            resubmitted = req_id in self._deferred_cleanup_ids
+            self._deferred_cleanup_ids.discard(req_id)
+            if resubmitted:
+                # Stand in for the cleanup just cancelled, on its terms: same
+                # count, same claim. Silent when the first request happened to
+                # end on a chunk boundary with nothing left over.
+                undelivered = state.frame_count - state.emitted_frames
+                if undelivered > 0:
+                    logger.warning(
+                        "Gepard request %s ended with %d undelivered frame(s) and its id has been "
+                        "resubmitted; the first request's audio is truncated.",
+                        req_id,
+                        undelivered,
+                    )
+            elif state.frame_count:
+                # Not a resubmit, so vLLM preempted this request and is
+                # recomputing it — and nothing here can recover that. The
+                # recomputed ids are the prompt plus the head0 codes sampled so
+                # far, which go through the TEXT embedding table, and each
+                # frame's other 31 codes are not in the token stream at all, so
+                # the rebuilt KV does not describe the audio already delivered.
+                # Generation restarts from frame 0 either way: the caller
+                # receives its earlier chunks followed by an unrelated stream.
+                logger.warning(
+                    "Gepard request %s was preempted after %d frame(s) and is being recomputed; "
+                    "its audio will not continue from where it stopped. Raise the stage's "
+                    "gpu_memory_utilization or lower max_num_seqs to keep requests from being "
+                    "preempted.",
+                    req_id,
+                    state.frame_count,
+                )
+            # Reset generation state — the request starts over from frame 0.
             state.curr_embed_for_next = None
             state.last_head0 = None
             state.last_heads_1_31 = None
@@ -419,8 +460,9 @@ class GepardTalkerForConditionalGeneration(nn.Module):
             state.is_stopping = False
             # The 32 heads are sampled in-model, so SamplingParams.seed — which
             # only reaches vLLM's sampler — never touches the audio unless it is
-            # threaded into a generator here. Re-seeded on every prefill so a
-            # preempted request replays its own stream.
+            # threaded into a generator here. Re-seeded on every prefill: a
+            # recomputed request draws the same noise sequence from frame 0
+            # again, which is all a seed can promise once its KV is wrong.
             state.generator = None
             if info.seed is not None:
                 state.generator = torch.Generator(device=dev)
@@ -488,6 +530,18 @@ class GepardTalkerForConditionalGeneration(nn.Module):
                     self._results_queue.append((req_id, -1, False))
                     continue
                 state = self._get_or_create_state(req_id)
+                if state.is_stopping:
+                    # Async scheduling runs one more step for a request that
+                    # ended on a stop token: vLLM's guard against the extra
+                    # step covers only the max_tokens finish (v1 scheduler,
+                    # "Avoid scheduling an extra step when we are sure that the
+                    # previous step has reached request.max_tokens"). This
+                    # step's output is discarded, so committing a frame here
+                    # would only strand it — and make the cleanup warning fire
+                    # on a request that shipped everything it produced. Same
+                    # guard as voxcpm2's commit_mask.
+                    self._results_queue.append((req_id, int(head0_l[i]), True))
+                    continue
                 # Stop may only fire past the first audio frame (the reference
                 # gates with `& was_audio`); the prefill-sampled frame and the
                 # frame right after it always commit.

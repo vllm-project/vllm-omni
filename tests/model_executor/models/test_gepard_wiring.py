@@ -106,6 +106,14 @@ class _MiniEngine:
       ``req_ids_output_copy`` and from that step's routing;
     * with nothing left to schedule there is no step at all, so no further
       ``forward`` runs.
+
+    It also reproduces the one asymmetry between the two ways a request ends.
+    Under async scheduling the next step is already scheduled before this
+    step's tokens are known, and vLLM's guard against running it covers only
+    the budget finish -- ``Scheduler.schedule``: "Avoid scheduling an extra
+    step when we are sure that the previous step has reached
+    request.max_tokens". A stop-token finish gets no such guard, so the model
+    runs one more time on a request that is already over.
     """
 
     def __init__(self, talker: GepardTalkerForConditionalGeneration, *, max_model_len: int) -> None:
@@ -117,6 +125,7 @@ class _MiniEngine:
         self.delivered: dict[str, list[torch.Tensor]] = {}
         self.committed_frames: dict[str, int] = {}
         self.steps = 0
+        self._tags_handed_out = 0
 
     def add_request(
         self,
@@ -127,20 +136,30 @@ class _MiniEngine:
         text_len: int = 3,
         seed: int | None = None,
     ) -> None:
+        """Submit a request. An id already seen is a resubmit of that id.
+
+        Tags come from a counter rather than the position in ``order`` so a
+        resubmitted id gets frames the previous request could not have
+        produced, which is what makes its audio attributable.
+        """
         prompt_ids = build_gepard_prompt_ids(list(range(10, 10 + text_len)), config=self.talker.config)
+        self._tags_handed_out += 1
         self.reqs[req_id] = {
             "prompt_ids": torch.tensor(prompt_ids, dtype=torch.long),
             "prompt_len": len(prompt_ids),
             "max_tokens": max_tokens,
             "stop_after": stop_after,
+            "stop_fired": False,
             "seed": seed,
             "computed": 0,
             "generated": 0,
             "finished": False,
+            "ghost_step_pending": False,
             "next_token": None,
-            "tag_base": _TAG_STRIDE * (len(self.order) + 1),
+            "tag_base": _TAG_STRIDE * self._tags_handed_out,
         }
-        self.order.append(req_id)
+        if req_id not in self.order:
+            self.order.append(req_id)
         self.delivered[req_id] = []
         self.committed_frames[req_id] = 0
 
@@ -225,7 +244,16 @@ class _MiniEngine:
             r["generated"] = r["computed"] - r["prompt_len"] + 1
             r["next_token"] = 0
             length_cap = min(r["max_tokens"], self.max_model_len - r["prompt_len"])
-            if req_id in stopped or r["generated"] >= length_cap:
+            if r["ghost_step_pending"]:
+                # This step WAS the extra one. The engine finished the request
+                # on the stop token last step and discards whatever came back
+                # here, whether or not the model chose to stop again.
+                r["finished"] = True
+                self._finished_last_step.append(req_id)
+            elif req_id in stopped:
+                # Ends on the stop token: one more step is already scheduled.
+                r["ghost_step_pending"] = True
+            elif r["generated"] >= length_cap:
                 r["finished"] = True
                 self._finished_last_step.append(req_id)
         return True
@@ -279,7 +307,12 @@ def _install_scripted_sampling(talker: GepardTalkerForConditionalGeneration, eng
     """Replace the 32-head sampler with a scripted one.
 
     Frames carry a per-request, per-step tag so the caller's audio is
-    self-describing, and STOP fires on the request's configured frame.
+    self-describing, and STOP fires once, on the request's configured frame.
+
+    Firing only once is the honest script for the extra step the engine runs
+    after a stop token. The stop head is a sigmoid over that step's hidden
+    state, and the request's own frame history did not advance, but its KV did
+    -- so re-firing is likely, not guaranteed, and the model may not assume it.
     """
     head0_vocab = talker.config.head0_vocab_size
 
@@ -297,8 +330,10 @@ def _install_scripted_sampling(talker: GepardTalkerForConditionalGeneration, eng
             tag = engine.reqs[req_id]["tag_base"] + frame_index
             head0[i] = tag % head0_vocab
             heads[i] = tag
-            stop_after = engine.reqs[req_id]["stop_after"]
-            stop[i] = stop_after is not None and frame_index >= stop_after
+            r = engine.reqs[req_id]
+            if r["stop_after"] is not None and frame_index >= r["stop_after"] and not r["stop_fired"]:
+                r["stop_fired"] = True
+                stop[i] = True
         return head0, heads, stop
 
     talker._sample_frame = _sample_frame
@@ -406,6 +441,129 @@ def test_stop_head_path_still_delivers_every_committed_frame() -> None:
         engine.audio_for("req-0"),
         _expected_samples(engine.reqs["req-0"]["tag_base"], frames),
     )
+
+
+def test_the_step_after_a_stop_token_commits_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    """Async scheduling runs one more step on a request that already stopped.
+
+    Committing its frame would strand it — nothing ships after the stop step —
+    and would make the truncation warning fire on a request that delivered
+    everything it produced, which is the one thing that warning must not do.
+    """
+    talker, _codec, engine = _build()
+    stop_after = FIRST_CHUNK_FRAMES + 6
+    engine.add_request("req-0", max_tokens=4000, stop_after=stop_after)
+
+    target = logging.getLogger(LOGGER_NAME)
+    target.addHandler(caplog.handler)
+    prev = target.level
+    target.setLevel(logging.WARNING)
+    try:
+        engine.run()
+        # The cleanup that would warn runs on the step after the request
+        # leaves, and here there is none. Drive it the way the runner would.
+        talker.on_requests_finished({"req-0"})
+        talker._flush_deferred_cleanup()
+    finally:
+        target.removeHandler(caplog.handler)
+        target.setLevel(prev)
+
+    assert engine.reqs["req-0"]["ghost_step_pending"], "the harness did not run the extra step"
+    frames = engine.committed_frames["req-0"]
+    assert frames == stop_after, f"the extra step committed a frame: {frames} > {stop_after}"
+    torch.testing.assert_close(
+        engine.audio_for("req-0"),
+        _expected_samples(engine.reqs["req-0"]["tag_base"], frames),
+    )
+    assert not [m for m in caplog.messages if "undelivered frame" in m], (
+        f"a fully delivered request was reported as truncated; saw {caplog.messages}"
+    )
+
+
+def test_a_resubmitted_request_id_keeps_its_new_state(caplog: pytest.LogCaptureFixture) -> None:
+    """An aborted id can come back before its cleanup has run.
+
+    The runner treats the two as distinct requests, so the pending free must
+    not take the second one's state: without that, the state is popped at the
+    end of the very forward that created it and every later decode falls back
+    to the zero-embedding path — the request keeps producing frames, so only
+    the audio is wrong.
+    """
+    _talker, _codec, engine = _build()
+    engine.add_request("req-0", max_tokens=4000)
+    for _ in range(FIRST_CHUNK_FRAMES + 2):
+        engine.step()
+    engine.abort("req-0")
+
+    # Same id, resubmitted before the model has been told about the abort.
+    engine.add_request("req-0", max_tokens=FIRST_CHUNK_FRAMES + CHUNK_FRAMES + 5)
+
+    target = logging.getLogger(LOGGER_NAME)
+    target.addHandler(caplog.handler)
+    prev = target.level
+    target.setLevel(logging.WARNING)
+    try:
+        engine.run()
+    finally:
+        target.removeHandler(caplog.handler)
+        target.setLevel(prev)
+
+    frames = engine.committed_frames["req-0"]
+    assert frames == engine.reqs["req-0"]["max_tokens"], "the second request lost frames"
+    torch.testing.assert_close(
+        engine.audio_for("req-0"),
+        _expected_samples(engine.reqs["req-0"]["tag_base"], frames),
+        msg="the second request did not receive its own audio",
+    )
+    # The abort still gets reported: the cleanup that would have said so is the
+    # one this cancelled.
+    assert any("resubmitted" in m for m in caplog.messages), (
+        f"the aborted request's truncation went unreported; saw {caplog.messages}"
+    )
+
+
+def test_a_preempted_request_is_reported_rather_than_resumed(caplog: pytest.LogCaptureFixture) -> None:
+    """Recompute preemption re-prefills a request that was mid-generation.
+
+    This model cannot survive that, and the point of the test is that it says
+    so. The recomputed ids are the prompt plus the head0 codes sampled so far,
+    which go through the text embedding table, and each frame's other 31 codes
+    are never in the token stream at all — there is nothing to stitch the two
+    halves back together with, so generation restarts from frame 0.
+
+    The harness re-prefills with the bare prompt rather than prompt + sampled
+    head0 codes. That understates the damage and is deliberate: what is under
+    test is the report and the reset, not the corruption, which cannot be
+    asserted on without a real backbone.
+    """
+    _talker, _codec, engine = _build()
+    engine.add_request("req-0", max_tokens=4000)
+    for _ in range(FIRST_CHUNK_FRAMES + 2):
+        engine.step()
+    assert engine.committed_frames["req-0"] > 0
+
+    # Preemption the way the scheduler does it (Scheduler._preempt_request:
+    # `request.num_computed_tokens = 0`), so the next step re-prefills. The
+    # request never finished, so no id reaches on_requests_finished.
+    engine.reqs["req-0"]["computed"] = 0
+
+    target = logging.getLogger(LOGGER_NAME)
+    target.addHandler(caplog.handler)
+    prev = target.level
+    target.setLevel(logging.WARNING)
+    try:
+        engine.step()
+    finally:
+        target.removeHandler(caplog.handler)
+        target.setLevel(prev)
+
+    assert any("preempted" in m for m in caplog.messages), (
+        f"a preempted request restarted its audio silently; saw {caplog.messages}"
+    )
+    assert not any("resubmitted" in m for m in caplog.messages), (
+        "a preemption was reported as an id resubmit; the two need different words"
+    )
+    assert engine.committed_frames["req-0"] == 1, "the re-prefill must start the frame history over"
 
 
 def test_concurrent_requests_each_receive_their_own_full_audio() -> None:
