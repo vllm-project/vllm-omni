@@ -18,7 +18,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 
 from .packed_tokens import minimax_h3_patchify_video_latent
@@ -157,7 +157,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     ) -> None:
         if mode != "tile":
             raise ValueError(f"MiniMax H3 VAE supports its native tile parallel mode only, got {mode!r}")
-        group = get_dit_group()
+        group = get_world_group().device_group
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
         parallel_size = int(parallel_size)
