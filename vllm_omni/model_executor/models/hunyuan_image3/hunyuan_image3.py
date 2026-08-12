@@ -1451,6 +1451,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     prefer_model_sampler = True
     logitsprocs_need_output_token_ids = True
+    # Ask the AR model runner to pass each row's SamplingParams.extra_args to
+    # sample(), so per-request task modes (ar_task_mode) can reach the sampler.
+    model_sampler_wants_extra_args = True
 
     # Siglip2 ViT supports data-parallel encoding (mm_encoder_tp_mode="data"):
     # weights are replicated and the image batch is sharded across TP ranks.
@@ -1567,24 +1570,37 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             self._all_ratio_ids.update(range(s, e))
 
         # Determine mode: comprehension (I2T/T2T) vs generation (IT2I/T2I).
+        # ``engine_output_type`` is a per-engine static (from the pipeline
+        # registry), but a generation deployment (e.g. the AR+DiT
+        # hunyuan_image_3_moe pipeline, engine_output_type="latent") also
+        # serves plain chat completions whose answer is text (I2T/T2T).
+        # Those requests are marked per-request via
+        # ``SamplingParams.extra_args["ar_task_mode"] == "comprehension"``
+        # by the serving layer and must not go through the image-generation
+        # stage transitions below (#6088).
         engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
         self._is_comprehension = engine_output_type in (None, "text")
 
-        # For comprehension mode, block image generation tokens but allow
+        # For comprehension requests, block image generation tokens but allow
         # text structure tokens (<think>, <answer>, etc.) so the model can
         # follow its natural generation pattern. Runtime sampling params
         # decide stop tokens from the active bot_task, matching the official
         # HunyuanImage3 generation path without hard-coded YAML token ids.
-        self._blocked_token_ids: set[int] = set()
-        if self._is_comprehension:
-            self._blocked_token_ids.update(
-                [
-                    self._mrope_boi_token_id,  # <boi>
-                    self._mrope_eoi_token_id,  # <eoi>
-                    self._size_token_id,  # <img_size_*>
-                ]
-            )
-            self._blocked_token_ids.update(self._all_ratio_ids)
+        # <cfg>, <img>, <timestep> and <joint_img_sep> are DiT-side scaffold
+        # tokens that are never valid in a text answer; without them in the
+        # blocklist an I2T request can degenerate into a stream of <cfg>
+        # tokens (#6088).
+        self._cfg_token_id = tokenizer.convert_tokens_to_ids("<cfg>")
+        self._blocked_token_ids: set[int] = {
+            self._mrope_boi_token_id,  # <boi>
+            self._mrope_eoi_token_id,  # <eoi>
+            self._size_token_id,  # <img_size_*>
+            self._cfg_token_id,  # <cfg>
+            self._mrope_img_token_id,  # <img>
+            self._timestep_token_id,  # <timestep>
+            self._mrope_joint_img_sep_token_id,  # <joint_img_sep>
+        }
+        self._blocked_token_ids.update(self._all_ratio_ids)
 
         # For generation mode, build stage transition map.
         # Official logic: </think> → [<recaption>],
@@ -2057,6 +2073,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        per_req_extra_args: Sequence[Mapping[str, Any] | None] | None = None,
     ) -> SamplerOutput | None:
         if logits is None or logits.numel() == 0:
             return None
@@ -2066,25 +2083,34 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         min_score = torch.finfo(logits.dtype).min
 
+        if self._blocked_token_ids_tensor is None and self._blocked_token_ids:
+            self._blocked_token_ids_tensor = torch.tensor(
+                sorted(self._blocked_token_ids),
+                dtype=torch.long,
+                device=logits.device,
+            )
+
         if self._is_comprehension:
             # Comprehension path is stateless: we only need to mask a fixed
             # set of blocked token ids on every step. Do it in one batched
             # index_fill_ instead of a per-(req, id) Python loop of scalar
             # GPU writes, and skip reading `output_token_ids` from CPU
             # (unused here) so this branch never forces a D2H sync.
-            if self._blocked_token_ids_tensor is None and self._blocked_token_ids:
-                self._blocked_token_ids_tensor = torch.tensor(
-                    sorted(self._blocked_token_ids),
-                    dtype=torch.long,
-                    device=logits.device,
-                )
             if self._blocked_token_ids_tensor is not None:
                 logits.index_fill_(-1, self._blocked_token_ids_tensor, min_score)
             return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 
-        # Generation path retains the per-request stateful logic for forced
-        # stage-transition tokens and ratio-restriction.
+        # Generation-mode engine. Individual requests can still be
+        # comprehension (I2T/T2T chat served by an AR+DiT deployment); the
+        # serving layer marks those with extra_args["ar_task_mode"] ==
+        # "comprehension", and they get the stateless blocking above instead
+        # of stage-transition forcing (#6088).
         for req_idx in range(logits.shape[0]):
+            if self._row_is_comprehension(per_req_extra_args, req_idx):
+                if self._blocked_token_ids_tensor is not None:
+                    logits[req_idx].index_fill_(-1, self._blocked_token_ids_tensor, min_score)
+                continue
+
             decoded_tokens: list[int] = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
@@ -2101,6 +2127,24 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 logits[req_idx, self._eos_token_id] = 0
 
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    @staticmethod
+    def _row_is_comprehension(
+        per_req_extra_args: Sequence[Mapping[str, Any] | None] | None,
+        req_idx: int,
+    ) -> bool:
+        """Whether this batch row is a per-request comprehension override.
+
+        Defaults to False (generation) when no extra_args reached the
+        sampler, so offline ``Omni.generate`` image-generation flows keep
+        the stage-transition behavior unchanged.
+        """
+        if per_req_extra_args is None or req_idx >= len(per_req_extra_args):
+            return False
+        extra_args = per_req_extra_args[req_idx]
+        if not extra_args:
+            return False
+        return extra_args.get("ar_task_mode") == "comprehension"
 
     def _get_forced_token(self, decoded_tokens: list[int]) -> int | None:
         """Derive the next forced token from output history (stateless).

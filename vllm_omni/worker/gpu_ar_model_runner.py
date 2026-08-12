@@ -447,6 +447,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
+    def _build_model_sampler_extra_args(self) -> list[dict | None]:
+        """Per-row ``SamplingParams.extra_args`` for custom model samplers.
+
+        Rows follow ``input_batch.req_ids`` order — the same order
+        ``_build_model_sampler_output_token_ids`` uses — so models that set
+        ``model_sampler_wants_extra_args = True`` can key per-request
+        behavior (e.g. HunyuanImage3's ``ar_task_mode``) off the row index.
+        """
+        requests = getattr(self, "requests", {}) or {}
+        per_req_extra_args: list[dict | None] = []
+        for req_id in getattr(self.input_batch, "req_ids", []):
+            state = requests.get(req_id)
+            params = getattr(state, "sampling_params", None)
+            per_req_extra_args.append(getattr(params, "extra_args", None))
+        return per_req_extra_args
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         if self._resolve_duplex_sampling_hook() is None:
@@ -1509,7 +1525,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
                     if helper is not None:
                         helper.hook_active = bool(rows)
-                sampler_output = model_sample(logits, prepared_sampling_metadata)
+                if getattr(self.model, "model_sampler_wants_extra_args", False):
+                    sampler_output = model_sample(
+                        logits,
+                        prepared_sampling_metadata,
+                        per_req_extra_args=self._build_model_sampler_extra_args(),
+                    )
+                else:
+                    sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(
