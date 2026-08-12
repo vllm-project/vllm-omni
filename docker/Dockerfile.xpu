@@ -16,6 +16,17 @@ RUN apt clean && apt-get update -y && \
     curl \
     ffmpeg \
     git \
+    build-essential \
+    cmake \
+    ninja-build \
+    autotools-dev \
+    automake \
+    libtool \
+    libtool-bin \
+    pkg-config \
+    patchelf \
+    libibverbs-dev \
+    librdmacm-dev \
     libsndfile1 \
     libsm6 \
     libxext6 \
@@ -82,6 +93,26 @@ WORKDIR /workspace/
 
 ENV UV_HTTP_TIMEOUT=500
 
+ARG UCX_VERSION=v1.21.0
+COPY docker/build_ucx_wheel.sh /tmp/build_ucx_wheel.sh
+COPY docker/ucx-wheelhouse/ /tmp/ucx-wheelhouse/
+RUN set -euxo pipefail; \
+    package_version="${UCX_VERSION#v}"; \
+    local_wheel="$(find /tmp/ucx-wheelhouse -maxdepth 1 -type f \
+        -name "ucx_runtime-${package_version}-*.whl" -print -quit)"; \
+    if [[ -n "${local_wheel}" ]] && uv pip install --no-cache "${local_wheel}"; then \
+        echo "Installed UCX ${UCX_VERSION} from local wheel ${local_wheel}"; \
+    else \
+        mkdir -p /tmp/ucx-built; \
+        bash /tmp/build_ucx_wheel.sh "${UCX_VERSION}" /tmp/ucx-built "${VIRTUAL_ENV}"; \
+        uv pip install --no-cache /tmp/ucx-built/ucx_runtime-${package_version}-*.whl; \
+    fi; \
+    ldconfig; \
+    rm -rf /tmp/build_ucx_wheel.sh /tmp/ucx-wheelhouse /tmp/ucx-built
+
+ENV PKG_CONFIG_PATH="/opt/venv/lib/pkgconfig:$PKG_CONFIG_PATH"
+ENV LD_LIBRARY_PATH="/opt/venv/lib:/opt/venv/lib/ucx:$LD_LIBRARY_PATH"
+
 # Configure package index for XPU
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
@@ -111,12 +142,34 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install triton-xpu==3.7.2 && \
     uv pip install --no-build-isolation --no-deps .
 
+ARG NIXL_VERSION=v1.3.0
+COPY docker/build_nixl_wheels.sh /tmp/build_nixl_wheels.sh
+COPY docker/nixl-wheelhouse/ /tmp/nixl-wheelhouse/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -euxo pipefail; \
+    local_wheel_dir="/tmp/nixl-wheelhouse/${NIXL_VERSION}"; \
+    native_wheel="$(find "${local_wheel_dir}" -maxdepth 1 -type f \
+        -name 'nixl_cu12-*.whl' -print -quit 2>/dev/null || true)"; \
+    meta_wheel="$(find "${local_wheel_dir}" -maxdepth 1 -type f \
+        -name 'nixl-*.whl' ! -name 'nixl_cu12-*.whl' -print -quit \
+        2>/dev/null || true)"; \
+    if [[ -n "${native_wheel}" && -n "${meta_wheel}" ]] && \
+        uv pip install --no-cache "${native_wheel}" "${meta_wheel}"; then \
+        echo "Installed NIXL ${NIXL_VERSION} from local wheels in ${local_wheel_dir}"; \
+    else \
+        mkdir -p /tmp/nixl-built; \
+        bash /tmp/build_nixl_wheels.sh \
+            "${NIXL_VERSION}" /tmp/nixl-built "${VIRTUAL_ENV}"; \
+        uv pip install --no-cache \
+            /tmp/nixl-built/nixl_cu12-*.whl \
+            /tmp/nixl-built/nixl-*.whl; \
+    fi; \
+    python -c "import nixl; agent = nixl.nixl_agent('agent1')" && \
+    rm -rf /tmp/build_nixl_wheels.sh /tmp/nixl-wheelhouse /tmp/nixl-built
+
 CMD ["/bin/bash"]
 
 FROM vllm-base AS vllm-openai
-
-# install nixl from source code
-RUN uv pip install nixl
 
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -146,6 +199,8 @@ COPY . .
 ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # Keep the upstream oneCCL packages paired with the XPU torch runtime.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    echo "triton @ https://example.com/blocked" > /tmp/vllm_omni_constraints.txt && \
+    PIP_CONSTRAINT=/tmp/vllm_omni_constraints.txt \
     uv pip install --no-build-isolation \
     --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
     ".[dev]" && \
