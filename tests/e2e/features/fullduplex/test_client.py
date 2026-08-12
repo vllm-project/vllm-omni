@@ -283,6 +283,58 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.last_received_at("response.audio.delta") is not None
 
 
+def test_realtime_event_collector_reports_global_metrics_across_responses():
+    collector = RealtimeEventCollector()
+    for response_id, created_at_s, text_at_s, audio_times, durations in (
+        ("resp-a", 10.1, 10.2, (10.3, 10.4), (100, 200)),
+        ("resp-b", 12.1, 12.2, (12.3, 12.5), (150, 300)),
+    ):
+        collector.add(
+            {"type": "response.created", "response": {"id": response_id}},
+            received_at_s=created_at_s,
+        )
+        collector.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": response_id,
+            },
+            received_at_s=text_at_s,
+        )
+        for received_at_s, duration_ms in zip(audio_times, durations, strict=True):
+            collector.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"audio").decode("ascii"),
+                    "sample_rate_hz": 16_000,
+                    "metadata": {"audio_duration_ms": duration_ms},
+                },
+                received_at_s=received_at_s,
+            )
+
+    metrics = collector.global_timing_summary(
+        after_s=10.0,
+        input_committed_at_s=10.0,
+        response_ids=["resp-a", "resp-b"],
+    )
+
+    assert metrics == {
+        "source": "client_monotonic_receive",
+        "response_ids": ["resp-a", "resp-b"],
+        "measurement_origin": {
+            "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+            "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+            "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+        },
+        "ttft_ms": 200.0,
+        "ttfp_ms": 300.0,
+        "rtf": 5.0,
+        "audio_generation_ms": 2500.0,
+        "audio_duration_ms": 500.0,
+    }
+
+
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     collector = RealtimeEventCollector()
     collector.add(

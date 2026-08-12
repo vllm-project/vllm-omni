@@ -155,6 +155,115 @@ def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):
     args = demo.parse_args()
 
     assert args.ref_audio == "ref.wav"
+    assert args.chunk_ms == 1000
+
+
+def test_realtime_duplex_demo_latency_matches_timing_summary_request_metrics(monkeypatch, tmp_path):
+    demo = _load_demo_module()
+    input_wav = tmp_path / "input.wav"
+    ref_wav = tmp_path / "ref.wav"
+    with wave.open(str(input_wav), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 1600)
+    ref_wav.write_bytes(b"RIFFref")
+
+    class FakeClient:
+        last_instance = None
+
+        def __init__(self, url):
+            assert "minicpmo45_native_duplex=1" in url
+            self.events = demo.RealtimeEventCollector()
+            self.configure_kwargs = None
+            type(self).last_instance = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def configure(self, model, **kwargs):
+            self.configure_kwargs = kwargs
+            self.events.add({"type": "session.created"})
+
+        async def stream_pcm16(self, pcm16, **kwargs):
+            assert kwargs["chunk_ms"] == 1000
+            assert len(pcm16) == 3200
+
+        async def commit(self):
+            now = self.events.event_received_at_s[-1]
+            self.events.add({"type": "input_audio_buffer.committed"}, received_at_s=now + 0.01)
+            self.events.add(
+                {"type": "response.created", "response": {"id": "resp-1"}},
+                received_at_s=now + 0.02,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": "resp-1",
+                    "delta": "hello",
+                },
+                received_at_s=now + 0.03,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-1",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode("ascii"),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {
+                        "audio_duration_ms": 100,
+                        "vllm_omni": {
+                            "stage_metrics": {
+                                "0": {
+                                    "num_tokens_out": 4,
+                                    "vllm_tpot_ms": 11.0,
+                                }
+                            }
+                        },
+                    },
+                },
+                received_at_s=now + 0.04,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": "resp-1"}},
+                received_at_s=now + 0.05,
+            )
+
+        async def acknowledge_playback(self):
+            return None
+
+        async def close_session(self, **_kwargs):
+            self.events.add({"type": "session.closed"})
+
+    monkeypatch.setattr(demo, "RealtimeDuplexClient", FakeClient)
+    args = demo.argparse.Namespace(
+        url="ws://localhost:8099/v1/realtime?duplex=1",
+        model="openbmb/MiniCPM-o-4_5",
+        session_id=None,
+        input_wav=str(input_wav),
+        ref_audio=str(ref_wav),
+        output_dir=str(tmp_path / "out"),
+        chunk_ms=1000,
+        timeout_s=1.0,
+        temperature=None,
+        no_realtime_pacing=True,
+        require_audio=True,
+    )
+
+    result = demo.asyncio.run(demo.run_demo(args))
+
+    assert result["ok"] is True
+    assert result["input_chunk_ms"] == 1000
+    assert FakeClient.last_instance.configure_kwargs["extra_body"] == {"return_stage_metrics": True}
+    assert result["latency"]["tpot_ms"] == 11.0
+    assert result["latency"]["ttft_ms"] == result["global_metrics"]["ttft_ms"]
+    assert result["latency"]["ttfp_ms"] == result["global_metrics"]["ttfp_ms"]
+    assert result["latency"]["rtf"] == result["global_metrics"]["rtf"]
+    assert result["latency"]["measurement_origin"]["ttft"].startswith("first input_audio_buffer.commit")
+    assert result["request_metrics"]["tpot_ms"] == 11.0
 
 
 def test_open_streaming_response_requires_post_commit_drain():

@@ -181,6 +181,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             ref_audio=_ref_audio_data_url(args.ref_audio),
             session_id=args.session_id,
             temperature=args.temperature,
+            extra_body={"return_stage_metrics": True},
             timeout_s=args.timeout_s,
         )
         stream_event_cursor = len(client.events.events)
@@ -234,24 +235,11 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "response.output_text.delta",
             after_s=commit_sent_at_s,
         )
-        first_audio_at_s = client.events.first_received_at(
-            "response.audio.delta",
-            after_s=commit_sent_at_s,
-        )
-        response_created_at_s = client.events.first_received_at(
-            "response.created",
-            after_s=commit_sent_at_s,
-        )
         response_done_at_s = client.events.first_received_at(
             "response.done",
             after_s=commit_sent_at_s,
         )
-        audio_duration_s = len(audio) / (client.events.output_sample_rate_hz * 2)
-        response_generation_s = (
-            response_done_at_s - response_created_at_s
-            if response_done_at_s is not None and response_created_at_s is not None
-            else None
-        )
+        audio_duration_s = len(audio) / (client.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
         transcript_deltas = [
             str(event.get("delta", ""))
             for event in client.events.events
@@ -261,11 +249,24 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "response.output_text.delta",
             }
         ]
-        response_id = client.events.response_ids[0] if client.events.response_ids else None
+        audio_response_ids = [
+            response_id for response_id in client.events.response_ids if client.events.audio_bytes(response_id)
+        ]
+        response_id = audio_response_ids[0] if audio_response_ids else None
+        # TPOT remains response-owned. Global TTFT/TTFP/RTF use the same
+        # commit-to-all-selected-responses definition as native Seed-TTS PERF.
         timing = client.events.timing_summary(
             after_s=commit_sent_at_s,
             input_committed_at_s=commit_sent_at_s,
             response_id=response_id,
+        )
+        request_metrics = timing.get("request_metrics")
+        if not isinstance(request_metrics, dict):
+            request_metrics = {}
+        global_metrics = client.events.global_timing_summary(
+            after_s=commit_sent_at_s,
+            input_committed_at_s=commit_sent_at_s,
+            response_ids=audio_response_ids,
         )
         errors = client.events.errors()
         if wait_error:
@@ -294,6 +295,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "input_chunk_ms": args.chunk_ms,
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
@@ -315,29 +317,23 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "audio_chunk_files": [str(path) for path in stream_writer.audio_chunk_paths],
             "output_sample_rate_hz": client.events.output_sample_rate_hz,
             "latency": {
-                "ttft_ms": (
-                    round((first_text_at_s - commit_sent_at_s) * 1000, 2) if first_text_at_s is not None else None
-                ),
-                "ttfp_ms": (
-                    round((first_audio_at_s - commit_sent_at_s) * 1000, 2) if first_audio_at_s is not None else None
-                ),
-                "rtf": (
-                    round(response_generation_s / audio_duration_s, 4)
-                    if response_generation_s is not None and audio_duration_s > 0
-                    else None
-                ),
-                "response_generation_ms": (
-                    round(response_generation_s * 1000, 2) if response_generation_s is not None else None
-                ),
+                "ttft_ms": global_metrics.get("ttft_ms"),
+                "tpot_ms": request_metrics.get("tpot_ms"),
+                "ttfp_ms": global_metrics.get("ttfp_ms"),
+                "rtf": global_metrics.get("rtf"),
+                "audio_generation_ms": global_metrics.get("audio_generation_ms"),
+                "audio_duration_ms": global_metrics.get("audio_duration_ms"),
+                "audio_duration_s": round(audio_duration_s, 3),
                 "text_stream_ms": (
                     round((response_done_at_s - first_text_at_s) * 1000, 2)
                     if response_done_at_s is not None and first_text_at_s is not None
                     else None
                 ),
                 "transcript_delta_count": len(transcript_deltas),
-                "audio_duration_s": round(audio_duration_s, 3),
-                "measurement_origin": "input_audio_buffer.commit send",
+                "measurement_origin": global_metrics.get("measurement_origin"),
             },
+            "global_metrics": global_metrics,
+            "request_metrics": request_metrics,
             "timing": timing,
             "response_ids": client.events.response_ids,
             "transcript": "".join(transcript_deltas),
@@ -366,7 +362,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
-    parser.add_argument("--chunk-ms", type=int, default=200)
+    parser.add_argument(
+        "--chunk-ms",
+        type=int,
+        default=1000,
+        help="PCM append chunk size in ms. Default 1000 matches paper Omni-Flow / "
+        "native PERF; use 200 for the previous fine-grained demo cadence.",
+    )
     parser.add_argument("--timeout-s", type=float, default=60.0)
     parser.add_argument(
         "--temperature",
@@ -374,7 +376,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Stage0 sampling temperature; response-required soft-interrupt uses 0.0.",
     )
-    parser.add_argument("--no-realtime-pacing", action="store_true")
+    parser.add_argument(
+        "--no-realtime-pacing",
+        action="store_true",
+        help="Send PCM chunks without wall-clock pacing (matches --no-realtime-duplex-pacing).",
+    )
     parser.add_argument("--require-audio", action="store_true")
     return parser.parse_args()
 

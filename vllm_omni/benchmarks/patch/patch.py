@@ -1848,6 +1848,8 @@ async def async_request_openai_realtime_duplex(
             turn_timings: list[dict[str, object]] = []
             turn_pcm_bytes: list[bytes] = []
             turn_transcripts: list[str] = []
+            turn_response_ids: list[str] = []
+            first_commit_at_s: float | None = None
             measurement_origin = {
                 "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
                 "tpot": "Stage-0 engine mean time per output token",
@@ -1867,6 +1869,8 @@ async def async_request_openai_realtime_duplex(
                     hints={"transcript": transcript_hint} if transcript_hint else None,
                 )
                 commit_at_s = time.monotonic()
+                if first_commit_at_s is None:
+                    first_commit_at_s = commit_at_s
                 await client.commit()
                 await wait_for(
                     lambda: client.events.count("response.done") > done_before
@@ -1888,6 +1892,7 @@ async def async_request_openai_realtime_duplex(
                         f"got {len(new_audio_response_ids)}"
                     )
                 response_id = new_audio_response_ids[0]
+                turn_response_ids.append(response_id)
                 timing = client.events.timing_summary(
                     after_s=turn_started_at_s,
                     input_committed_at_s=commit_at_s,
@@ -1934,6 +1939,25 @@ async def async_request_openai_realtime_duplex(
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(turn_metrics, session_id=session_id)
             session_metrics["input_chunk_ms"] = chunk_ms
+            if first_commit_at_s is None:
+                raise RuntimeError("Seed-TTS native duplex session did not commit input audio")
+            global_metrics = client.events.global_timing_summary(
+                after_s=first_commit_at_s,
+                input_committed_at_s=first_commit_at_s,
+                response_ids=turn_response_ids,
+            )
+            if not global_metrics:
+                raise RuntimeError("Seed-TTS native duplex session omitted global audio metrics")
+            session_metrics.update(
+                {
+                    "global_ttft_ms": global_metrics.get("ttft_ms"),
+                    "global_ttfp_ms": global_metrics.get("ttfp_ms"),
+                    "global_rtf": global_metrics.get("rtf"),
+                    "global_audio_generation_ms": global_metrics.get("audio_generation_ms"),
+                    "global_audio_duration_ms": global_metrics.get("audio_duration_ms"),
+                    "global_measurement_origin": global_metrics.get("measurement_origin"),
+                }
+            )
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
@@ -2390,6 +2414,18 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+        for session_key, result_key in (
+            ("global_ttft_ms", "mean_duplex_global_ttft_ms"),
+            ("global_ttfp_ms", "mean_duplex_global_ttfp_ms"),
+            ("global_rtf", "mean_duplex_global_rtf"),
+        ):
+            values = [
+                float(metric[session_key])
+                for metric in duplex_session_metrics
+                if isinstance(metric.get(session_key), int | float)
+            ]
+            if values:
+                result[result_key] = sum(values) / len(values)
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
 

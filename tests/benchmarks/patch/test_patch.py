@@ -361,6 +361,15 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     assert output.duplex_session_metrics["audio_turn_count"] == 2
     assert output.duplex_session_metrics["mean_tpot_ms"] == 9.5
     assert output.duplex_session_metrics["input_chunk_ms"] == 200
+    assert output.duplex_session_metrics["global_ttft_ms"] >= 0
+    assert output.duplex_session_metrics["global_ttfp_ms"] >= 0
+    assert output.duplex_session_metrics["global_rtf"] >= 0
+    assert output.duplex_session_metrics["global_audio_duration_ms"] == 200.0
+    assert output.duplex_session_metrics["global_measurement_origin"] == {
+        "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+        "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+        "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+    }
     assert [metric["input_chunk_ms"] for metric in output.duplex_request_metrics] == [200, 200]
     assert output.duplex_request_metrics[0]["measurement_origin"] == {
         "ttft": "input_audio_buffer.commit client send to first non-empty text delta",

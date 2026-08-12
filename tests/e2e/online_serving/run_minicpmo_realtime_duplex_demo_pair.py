@@ -367,7 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir-a", required=True)
     parser.add_argument("--output-dir-b", required=True)
     parser.add_argument("--summary-output")
-    parser.add_argument("--chunk-ms", type=int, default=200)
+    parser.add_argument("--chunk-ms", type=int, default=1000)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument("--require-audio", action="store_true")

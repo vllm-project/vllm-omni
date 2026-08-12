@@ -279,6 +279,96 @@ class RealtimeEventCollector:
                 return received_at_s
         return None
 
+    def global_timing_summary(
+        self,
+        *,
+        after_s: float,
+        input_committed_at_s: float,
+        response_ids: list[str],
+        measurement_origin: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """Summarize one commit-anchored window across selected responses."""
+        selected_response_ids = set(response_ids)
+        first_text_received_at_s: float | None = None
+        audio_received_at_s: list[float] = []
+        response_audio_duration_ms: dict[str, float] = {}
+
+        for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
+            if received_at_s < after_s:
+                continue
+            response_id = self.response_id(event)
+            if response_id not in selected_response_ids:
+                continue
+            if (
+                event.get("type")
+                in {
+                    "response.audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
+            if event.get("type") != "response.audio.delta":
+                continue
+            delta = event.get("delta") or event.get("audio")
+            if not isinstance(delta, str) or not delta:
+                continue
+            audio_received_at_s.append(received_at_s)
+            metadata = event.get("metadata")
+            duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
+            if isinstance(duration_ms, int | float) and math.isfinite(float(duration_ms)):
+                response_audio_duration_ms[response_id] = max(
+                    response_audio_duration_ms.get(response_id, 0.0),
+                    max(0.0, float(duration_ms)),
+                )
+
+        if not audio_received_at_s:
+            return {}
+
+        audio_duration_ms = sum(
+            response_audio_duration_ms.get(
+                response_id,
+                len(self.audio_bytes(response_id)) * 1000.0 / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE),
+            )
+            for response_id in response_ids
+        )
+        audio_generation_ms = max(
+            0.0,
+            (audio_received_at_s[-1] - input_committed_at_s) * 1000.0,
+        )
+        return {
+            "source": "client_monotonic_receive",
+            "response_ids": response_ids,
+            "measurement_origin": measurement_origin
+            or {
+                "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+                "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+            },
+            "ttft_ms": (
+                _rounded_ms((first_text_received_at_s - input_committed_at_s) * 1000.0)
+                if first_text_received_at_s is not None
+                else None
+            ),
+            "ttfp_ms": _rounded_ms((audio_received_at_s[0] - input_committed_at_s) * 1000.0),
+            "rtf": (
+                round(
+                    compute_audio_rtf(
+                        audio_generation_ms / 1000.0,
+                        audio_duration_ms / 1000.0,
+                    ),
+                    6,
+                )
+                if audio_duration_ms > 0
+                else None
+            ),
+            "audio_generation_ms": _rounded_ms(audio_generation_ms),
+            "audio_duration_ms": _rounded_ms(audio_duration_ms),
+        }
+
     def timing_summary(
         self,
         *,
