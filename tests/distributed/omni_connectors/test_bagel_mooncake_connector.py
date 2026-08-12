@@ -25,6 +25,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
@@ -95,8 +96,8 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
     for req_output in omni_outputs:
         if images := getattr(req_output, "images", None):
             return images[0]
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            stage_out = req_output.request_output
+        if isinstance(req_output, OmniRequestOutput) and req_output:
+            stage_out = req_output
             if hasattr(stage_out, "images") and stage_out.images:
                 return stage_out.images[0]
     return None

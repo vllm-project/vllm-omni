@@ -14,15 +14,16 @@ The full set of backends and their platform defaults is in the **Backend Options
 
 | Value | Notes |
 |---|---|
-| `TRTLLM_ATTN` | FlashInfer's trtllm-gen FMHA (TensorRT-LLM's generated kernels, vendored by FlashInfer). BF16, GQA native, `head_dim=128`. Datacenter Blackwell only (sm_100 / sm_103). Supports **Skip-Softmax** sparse attention — see below. Requires `flashinfer`. |
-| `FLASH_ATTN` | Wraps FlashAttention 2. Default on Hopper / Ada / Ampere when `flash-attn` is installed. |
+| `TRTLLM_ATTN` | FlashInfer's trtllm-gen FMHA (TensorRT-LLM's generated kernels, vendored by FlashInfer). Dense BF16, GQA native, `head_dim=128`. Datacenter Blackwell only (sm_100 / sm_103). Packed paths can provide `cu_seqlens` directly. Supports optional **Skip-Softmax** sparse attention — see below. Requires `flashinfer`. |
+| `FLASH_ATTN` | Wraps FlashAttention 4 on Blackwell when `flash-attn-4` is installed, then falls back to FlashAttention 3/2. Default on Hopper / Ada / Ampere when a compatible FlashAttention package is installed. |
 | `CUDNN_ATTN` | Pins `sdpa_kernel([CUDNN_ATTENTION])`. Default on Blackwell (sm_10x / sm_12x) with cuDNN ≥ 9.5. Wins on mask-heavy DiTs (HunyuanVideo-1.5: 2× e2e vs SDPA). |
-| `FLASHINFER_ATTN` | Calls FlashInfer's dense `single_prefill_with_kv_cache` directly with `custom_mask` for non-causal masked attention. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer`. |
+| `FLASHINFER_ATTN` | Uses FlashInfer's batch-prefill wrapper and supports mixed Q/K and V input dtypes through backend-specific configuration. Used as Blackwell fallback when cuDNN is unavailable. Requires `flashinfer` >= 0.6.16rc1 for mixed-dtype configurations. |
 | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention` with the default backend dispatcher. Most conservative; always available. |
 | `SAGE_ATTN` | SageAttention 2.2 — INT8-quantized attention with FP16 accumulation. Lossy but typically visually indistinguishable on diffusion outputs. Requires `sageattention`. |
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
 | `FLASH_ATTN_HUB` | FlashAttention 2 from HuggingFace `kernels` library. Useful for train/rollout alignment. |
 | `FLASH_ATTN_3_HUB` | FlashAttention 3 from HuggingFace `kernels` library. CUDA Hopper (sm_90+) only; falls back to `FLASH_ATTN_HUB` on older GPUs. |
+| `RAINFUSION_ATTN` | MindIE-SD **RainFusion** block-sparse video attention — see [below](#rainfusion_attn-backend-and-block-sparse-video-attention). Ascend NPU only; requires `mindiesd`. Delegates to `FLASH_ATTN` for anything that is not a packed video sequence. |
 
 
 ## Configuration
@@ -69,8 +70,9 @@ vllm-omni serve <model> \
     --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN"},"per_role":{"cross":{"backend":"TORCH_SDPA"}}}'
 ```
 
-A backend that needs configuration exposes it as a typed field on the spec. Today the only
-one is `TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-softmax)):
+A backend that needs configuration exposes it as a typed field on the spec:
+`TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-softmax)) and
+`RAINFUSION_ATTN`'s RainFusion block (see [below](#rainfusion_attn-backend-and-block-sparse-video-attention)):
 
 ```bash
 --diffusion-attention-config.default.backend TRTLLM_ATTN \
@@ -82,7 +84,7 @@ one is `TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-s
 When constructing `OmniDiffusionConfig` directly:
 
 ```python
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, AttnQuantSpec, OmniDiffusionConfig
 
 config = OmniDiffusionConfig(
     diffusion_attention_config=AttentionConfig(
@@ -97,13 +99,34 @@ config = OmniDiffusionConfig(
 
 A plain dict is also accepted and normalized to `AttentionConfig`.
 
+#### FlashInfer QK16/V8 quantized attention
+
+`FLASHINFER_ATTN` accepts quantization options through `AttentionSpec.quant`. For QK16/V8:
+
+```python
+config = OmniDiffusionConfig(
+    diffusion_attention_config=AttentionConfig(
+        default=AttentionSpec(
+            backend="FLASHINFER_ATTN",
+            quant=AttnQuantSpec(
+                dtype_qk="bfloat16",
+                dtype_vo="fp8_e4m3",
+            ),
+        ),
+    ),
+    ...,
+)
+```
+
+`dtype_qk` configures the Q and K input dtypes. `dtype_vo` configures the V input dtype.
+
 ## Platform Defaults
 
 ### Blackwell (sm_100 / sm_103 / sm_120 / sm_121)
 
 Auto-route preference, in order:
 
-1. `TRTLLM_ATTN` — on **datacenter** Blackwell (sm_100 / sm_103) when `flashinfer` is installed, the model's `head_dim` is 128, **and the model is mask-free** (see below)
+1. `TRTLLM_ATTN` — on **datacenter** Blackwell (sm_100 / sm_103) when `flashinfer` is installed, the model's `head_dim` is 128, **and the model declares a compatible packed/mask-free path**
 2. `CUDNN_ATTN` — when cuDNN ≥ 9.5 is available (ships in PyTorch 2.5+ wheels)
 3. `FLASHINFER_ATTN` — when `flashinfer` is installed but cuDNN < 9.5
 4. `FLASH_ATTN` — when `flash-attn` is installed with the Blackwell CUTE kernel
@@ -111,7 +134,7 @@ Auto-route preference, in order:
 
 `TRTLLM_ATTN` is skipped on workstation Blackwell (sm_120 / sm_121) and for any `head_dim != 128`, so those GPUs keep the `CUDNN_ATTN` route described below.
 
-`TRTLLM_ATTN` outranks `CUDNN_ATTN` on datacenter Blackwell because it is the only backend that can enable Skip-Softmax, not because its dense kernel is faster — dense, the two are comparable. It cannot honor an attention mask, so the auto-default only applies to pipelines verified mask-free (the Wan family); mask-using pipelines keep `CUDNN_ATTN`. `TRTLLM_ATTN` stays available everywhere via explicit `--diffusion-attention-backend TRTLLM_ATTN` (which raises clearly if a mask is received).
+`TRTLLM_ATTN` outranks `CUDNN_ATTN` on datacenter Blackwell for compatible packed/mask-free pipelines. Workstation Blackwell (sm_120 / sm_121) and pipelines that require attention masks retain their normal fallback.
 
 The startup log line `Defaulting to diffusion attention backend CUDNN_ATTN (Blackwell sm_120, cuDNN 91002)` confirms the route.
 
@@ -167,6 +190,114 @@ sequence length, since Skip-Softmax only accelerates attention. Dense BF16 is `T
 Requires datacenter Blackwell with `head_dim == 128`; elsewhere, or without FlashInfer, selecting
 `TRTLLM_ATTN` raises rather than silently degrading.
 
+## TRTLLM_ATTN SAGE Quantization
+
+On top of dense/Skip-Softmax, `TRTLLM_ATTN` can run **SAGE** (SageAttention) — the trtllm-gen
+FMHA kernel with per-block quantized Q/K and per-channel fp8 V, so the two attention matmuls run
+in low precision. Enable it through the typed `quant` block on the attention spec:
+
+| Key | Valid values | Meaning |
+|---|---|---|
+| `dtype_qk` | `int8`, `fp8_e4m3` | Quantization dtype for Q and K. Absent ⇒ dense (SAGE off). |
+| `q_block_size` | `1`, `4`, `16` | Per-token block size for Q scales (default `1`). |
+| `k_block_size` | `1`, `4`, `16` | Per-token block size for K scales (default `16`). |
+
+V is always quantized per-channel to fp8_e4m3 and K-smoothing is applied inside the routine, so
+neither is a user knob. Only block sizes `1`, `4`, `16` have compiled kernels.
+
+The `quant` block is a shared `AttnQuantSpec` consumed by more than one backend; each reads the
+fields that apply and rejects the rest. `TRTLLM_ATTN` (SAGE) reads `dtype_qk` (`int8` / `fp8_e4m3`),
+`q_block_size`, and `k_block_size`; `FLASHINFER_ATTN` reads `dtype_qk` (`float16` / `bfloat16`),
+`dtype_vo`, and `flashinfer_backend` (see its section). A `dtype_qk` from the wrong set raises.
+
+```bash
+vllm-omni serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --diffusion-attention-config '{"default": {"backend": "TRTLLM_ATTN",
+      "quant": {"dtype_qk": "fp8_e4m3", "q_block_size": 1, "k_block_size": 16}}}'
+```
+
+```python
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, AttnQuantSpec
+
+AttentionConfig(
+    default=AttentionSpec(
+        backend="TRTLLM_ATTN",
+        quant=AttnQuantSpec(dtype_qk="fp8_e4m3", q_block_size=1, k_block_size=16),
+    ),
+)
+```
+
+**Requirements.** Needs FlashInfer ≥ 0.6.16rc1. Kernel
+availability is arch-dependent: `fp8_e4m3` QK has kernels on both **SM100** (B200) and **SM103**
+(B300); `int8` QK kernels are compiled for **SM100 only**.
+
+## RAINFUSION_ATTN Backend and Block-Sparse Video Attention
+
+`RAINFUSION_ATTN` runs MindIE-SD's RainFusion (`rf_v2`) kernel on Ascend NPU. It pools each
+128-token block of keys, ranks them per query block, and computes attention against only the
+top-scoring ones. Video tokens are rearranged into `(t, h, w)` order first, so the kept blocks are
+spatiotemporal neighbours rather than arbitrary rows of the packed sequence.
+
+Only the video segment is sparsified. The prefix rows (text, visual conditions, audio) and the
+first-frame blocks are always kept dense, which is why the realized sparsity is lower than the
+nominal `sparsity` you configure. Anything the kernel cannot handle — a warmup denoise step, an
+exempt layer, a sequence with no published video geometry, a video segment under 32 blocks —
+delegates to `FLASH_ATTN`, so a model can select this backend unconditionally.
+
+Enable it through the typed `block_sparse` block on the attention spec, shared by every
+block-sparse backend:
+
+| Key | Valid values | Meaning |
+|---|---|---|
+| `sparsity` | finite, `[0, 1]` | Nominal fraction of key blocks dropped per query block. `0` disables sparsity. Defaults to `0.8`. |
+| `start_step` | `≥ 0` | Keep the first N denoise steps dense. Layout is decided early, so these steps dominate structural fidelity. |
+| `skip_layers` | index selector, e.g. `"0-3,38"` | DiT blocks that always stay dense. |
+
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --diffusion-attention-config '{"default": {"backend": "RAINFUSION_ATTN",
+      "block_sparse": {"sparsity": 0.8, "start_step": 0}}}'
+```
+
+Programmatically the same block is a typed `BlockSparseSpec` (values validated at construction):
+
+```python
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, BlockSparseSpec
+
+AttentionConfig(
+    default=AttentionSpec(
+        backend="RAINFUSION_ATTN",
+        block_sparse=BlockSparseSpec(sparsity=0.8, start_step=0, skip_layers="0-1"),
+    ),
+)
+```
+
+**Tune in the order `start_step` → `sparsity` → `skip_layers`.** Raise `start_step` first: it is the
+cheapest way to recover structure, because the early high-noise steps decide global layout while the
+later steps only refine texture. Then walk `sparsity` up to your quality bar. Reach for
+`skip_layers` last, once an A/B against dense at the same seed points at specific blocks.
+
+Requires Ascend NPU with `mindiesd`; selecting it on any other platform raises. It is also
+incompatible with ring sequence parallelism, since `rf_v2` needs the whole key sequence to rank
+blocks — use Ulysses SP (`ring_degree=1`).
+
+### Which geometries run sparse
+
+MindIE-SD rf_v2 handles arbitrary video grids by spatially rearranging video first and, when
+necessary, promoting a real-video suffix to its always-kept prefix segment. It never pads: rf_v2
+does not consume an attention mask for padded keys. The remaining video rows stay sparse, while the
+promoted rows remain visible to every query and key.
+
+For example, MiniMax-H3 at 1344x768 has grid `(62, 24, 42)`: its 62496 video rows leave a 32-row
+128-block residue, and its two non-8-wide latent columns form a 2928-row rearranged suffix.
+MindIE-SD promotes 2976 rows, leaving 59520 sparse rows (`465 × 128`). This keeps the block mask
+and kernel tiling aligned, at the cost of retaining more blocks.
+
+8x8-aligned spatial grids remain preferable for performance. A latent `h` or `w` not divisible by 8
+creates an always-kept residual suffix and lowers realized sparsity. "Multiple of 8" on the latent
+grid means **width and height that are multiples of 256**. This path requires a MindIE-SD release
+that implements protected video tails for rf_v2.
+
 ## End-to-End Benchmark (BF16, sm_120 RTX Pro 6000 Blackwell)
 
 Same prompt and seed across runs. `Total generation time` from `text_to_video.py` / `text_to_image.py`.
@@ -193,9 +324,17 @@ DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN python examples/offline_inference/te
     --model Lightricks/LTX-2 ...
 ```
 
-### FA4 not yet integrated
+### FlashAttention-4 on Blackwell
 
-FlashAttention-4 (released March 2026) targets Blackwell natively and reportedly beats cuDNN by ~20% on B200. As of this writing the `flash-attn-4 4.0.0b10` wheel crashes with `AttributeError: 'NoneType' object has no attribute '_trait'` during JIT on sm_120. Not yet wired into vLLM-Omni; revisit when stable lands.
+Install the optional CUDA 13 extra to use the CuTe-based FA4 path:
+
+```bash
+pip install 'vllm-omni[fa4]'
+```
+
+`FLASH_ATTN` prefers `flash_attn.cute` on Blackwell and falls back to FA3/FA2
+when it is unavailable. Version `4.0.0b18` is required; earlier beta
+wheels had known JIT failures on Blackwell.
 
 ## Choosing a Backend Manually
 
@@ -353,64 +492,3 @@ DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN_3 python examples/offline_inference/text_t
     --tensor-parallel-size 2 \
     --output outputs/hv15_sage3.mp4
 ```
-
-### Mixed backends across roles
-
-Use `FLASH_ATTN` for self-attention and `TORCH_SDPA` for cross-attention:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A dog running across a field of golden wheat." \
-    --diffusion-attention-config.per_role.self.backend FLASH_ATTN \
-    --diffusion-attention-config.per_role.cross.backend TORCH_SDPA \
-    --tensor-parallel-size 2 \
-    --output outputs/wan22_mixed.mp4
-```
-
-### Compare against FlashAttention
-
-Unset the backend override, or explicitly use `FLASH_ATTN`:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A dog running across a field of golden wheat." \
-    --height 704 --width 1280 --num-frames 49 \
-    --num-inference-steps 30 --seed 42 --guidance-scale 5.0 \
-    --tensor-parallel-size 2 \
-    --output outputs/wan22_fa3.mp4
-```
-
-## Validation Guidance
-
-Don't assume a faster attention backend is numerically interchangeable with `TORCH_SDPA`.
-
-Always compare:
-
-- End-to-end runtime
-- Diffusion-stage runtime (`add_req_and_wait` line in DiffusionEngine.step breakdown)
-- Output quality against a known-good baseline (CLIP similarity, frame-level diff, or visual review)
-
-At minimum, keep the same:
-
-- model
-- prompt
-- seed
-- resolution
-- frame count / step count
-- parallel config (TP / CFG-parallel / Ulysses degrees)
-
-## Reproducing the Benchmark Table
-
-The end-to-end numbers above were collected by running `text_to_video.py` /
-`text_to_image.py` with the same prompt and seed while varying
-`DIFFUSION_ATTENTION_BACKEND`. For a quick kernel-level comparison of the
-backends without loading a model:
-
-```bash
-python benchmarks/diffusion/bench_attention_backends.py --preset hv15
-```
-
-It runs all three BF16 backends on representative DiT attention shapes and
-prints a ranking table at the end.

@@ -50,7 +50,7 @@ async def generate(
         output_modalities=["text"],
     ):
         stage_id = omni_output.stage_id
-        out = omni_output.request_output
+        out = omni_output
         if stage_id == 0:
             num_tokens = sum(len(output.token_ids) for output in out.outputs)
             count = num_tokens

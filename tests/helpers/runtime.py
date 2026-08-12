@@ -41,6 +41,7 @@ from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_images_generations_response,
     assert_omni_response,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
@@ -598,7 +599,7 @@ class OmniServerStageCli(OmniServer):
             "serve",
             self.model,
             "--omni",
-            "--stage-configs-path",
+            "--deploy-config",
             self.stage_config_path,
             "--stage-id",
             str(stage_id),
@@ -1252,6 +1253,28 @@ class OpenAIClientHandler:
         )
         return [resp]
 
+    def send_batched_chat_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """Post to batched chat completions."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/chat/completions/batch", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
     def send_completions_http_request(
         self,
         request_config: dict[str, Any],
@@ -1482,6 +1505,11 @@ class OpenAIClientHandler:
             err_code=cfg.get("err_code"),
             err_message=cfg.get("err_message"),
         )
+        if cfg.get("err_code") is None:
+            assert resp.success, resp.error_message
+            payload = resp.json_body
+            assert isinstance(payload, dict)
+            assert_images_generations_response(payload, cfg, run_level=self.run_level)
         return [resp]
 
     def send_images_edits_http_request(
@@ -2910,9 +2938,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output.outputs[0].text
+                    text_content = stage_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.outputs[0].multimodal_output["audio"]
             result.audio_content = audio_content
             result.text_content = text_content
             result.success = True
@@ -3052,7 +3080,7 @@ class OmniRunnerHandler:
         mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                mm_out = stage_out.outputs[0].multimodal_output
                 break
         if mm_out is None:
             raise AssertionError("No audio output from pipeline")
@@ -3135,7 +3163,7 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
+            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -3151,7 +3179,12 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
+                from vllm_omni.entrypoints.utils import is_new_format_deploy_config
+
+                if is_new_format_deploy_config(stage_config_path):
+                    server_args += ["--deploy-config", stage_config_path]
+                else:
+                    server_args += ["--stage-configs-path", stage_config_path]
 
             with (
                 OmniServer(

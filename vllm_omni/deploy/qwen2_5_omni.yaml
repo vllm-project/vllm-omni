@@ -13,8 +13,8 @@
 #     the custom generation loop — set explicitly everywhere).
 #   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs eager
 #     on CUDA (thinker uses custom ops that don't trace cleanly); NPU / XPU
-#     platform overrides flip back to false where cudagraph is verified.
-#     Qwen3-Omni / Qwen3-TTS AR stages use the default (false = cudagraph on).
+#     overrides are documented below. Qwen3-Omni / Qwen3-TTS AR stages use the
+#     default (false = cudagraph on).
 async_chunk: false
 
 stages:
@@ -82,13 +82,15 @@ platforms:
 
   xpu:
     stages:
-      # Verified on 2x Intel Arc Pro B60. Both AR stages use cudagraphs.
+      # PyTorch 2.13 XPU Dynamo raises duplicate-handler assertions while
+      # compiling both Qwen2.5 AR stages. Keep them eager until that toolchain
+      # issue is fixed; stage 2 already inherits enforce_eager: true above.
       - stage_id: 0
         gpu_memory_utilization: 0.9
-        enforce_eager: false
+        enforce_eager: true
       - stage_id: 1
         gpu_memory_utilization: 0.5
-        enforce_eager: false
+        enforce_eager: true
       - stage_id: 2
         gpu_memory_utilization: 0.3
         # Stage 2 colocates with stage 1's device on XPU.

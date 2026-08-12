@@ -123,6 +123,47 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     assert engine.scheduler is custom_scheduler
 
 
+def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    od_config = SimpleNamespace(
+        custom_pipeline_args=None,
+        model_class_name="SchedulerInitializationFailurePipeline",
+        streaming_output=False,
+    )
+    initialization_error = RuntimeError("Scheduler initialization failed")
+    custom_scheduler = SimpleNamespace(
+        initialize=Mock(side_effect=initialization_error),
+        close=Mock(),
+    )
+    fake_executor = SimpleNamespace(
+        shutdown=Mock(),
+    )
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+        lambda *args, **kwargs: Mock(return_value=fake_executor),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_request_batch",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        DiffusionEngine(od_config, scheduler=custom_scheduler)
+
+    assert exc_info.value is initialization_error
+    custom_scheduler.initialize.assert_called_once_with(od_config)
+    custom_scheduler.close.assert_called_once_with()
+    fake_executor.shutdown.assert_called_once_with()
+
+
 @pytest.mark.asyncio
 async def test_step_compatibility_wrapper_returns_final_batch() -> None:
     engine = _make_engine()

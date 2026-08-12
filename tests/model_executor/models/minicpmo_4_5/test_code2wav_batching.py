@@ -105,6 +105,9 @@ class _FakeHiFT(nn.Module):
         generated_source = speech[:, None]
         return speech, generated_source
 
+    def inference(self, mel, source):
+        return self.forward(mel, source)
+
 
 class _FakeToken2Wav:
     def __init__(self):

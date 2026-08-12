@@ -55,6 +55,21 @@ python text_to_video.py \
   --output vace_t2v_output.mp4
 ```
 
+### LingBot-Video
+
+The dedicated LingBot example explicitly selects the video output modality:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --output lingbot_t2v.mp4
+```
+
+Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
+checkpoint. Requested frame counts are rounded upward to the causal
+VAE's `4n+1` grid.
+
 ### LTX-2
 
 ```bash
@@ -203,6 +218,9 @@ python text_to_video.py \
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
+- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
+- `--lora-scale`: scale factor for LoRA weights.
+- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
 ### Wan2.2-specific

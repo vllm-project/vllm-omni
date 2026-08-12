@@ -34,3 +34,5 @@ pydantic-settings>=2.0.0
 # base image does not ship it, so declare it explicitly. The loader also guards
 # this import so a missing gguf no longer breaks all diffusion model loading.
 gguf>=0.10.0
+# Required for running the Cosmos3 model with guardrails enabled (default behavior).
+cosmos-guardrail>=0.3.1

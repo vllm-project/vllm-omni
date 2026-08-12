@@ -13,8 +13,13 @@ from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
-from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+from vllm_omni.diffusion.utils.hf_utils import (
+    _looks_like_dreamzero,
+    get_diffusion_model_index,
+)
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -23,6 +28,15 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+
+def is_new_format_deploy_config(path: str | None) -> bool:
+    """Return True when *path* is a deploy YAML (``stages:`` without legacy ``stage_args:``)."""
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        peek = yaml.safe_load(f) or {}
+    return isinstance(peek, dict) and "stages" in peek and "stage_args" not in peek
 
 
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
@@ -72,9 +86,9 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     Returns:
         Model type string if found, None otherwise
     """
-    model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+    model_index = get_diffusion_model_index(model)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
-        logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
+        logger.debug(f"Found Diffusers model type '{model_index['_class_name']}'")
         return model_index["_class_name"]
 
     return None
@@ -226,22 +240,49 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
-def resolve_model_config_path(model: str) -> str:
-    """Resolve the stage config file path from the model name.
+def _registry_default_deploy_path(model: str) -> str | None:
+    """Return the registered pipeline's default deploy YAML path, if any.
 
-    Resolves stage configuration path based on the model type and device type.
-    First tries to find a device-specific YAML file from stage_configs/{device_type}/
-    directory. If not found, falls back to the default config file.
+    A checkpoint's HF ``model_type`` is not always the registered Omni pipeline
+    key. MiniCPM-o 4.5, for example, reports ``minicpmo`` while its
+    predicate-selected pipeline is ``minicpmo_4_5``. Stage construction already
+    loads that pipeline's default deploy config, so connector discovery must
+    resolve the same path.
+    """
+    pipeline_config = StageConfigFactory.get_pipeline_config(
+        model=model,
+        trust_remote_code=True,
+    )
+    if pipeline_config is None or pipeline_config.default_deploy_config_name is None:
+        return None
+    default_deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+    if default_deploy_path.is_file():
+        return str(default_deploy_path)
+    return None
+
+
+def resolve_model_config_path(model: str) -> str | None:
+    """Resolve the stage/deploy config file path from the model name.
+
+    Resolves configuration path based on the model type and device type.
+    Order:
+    1. Device-specific stage config under ``stage_configs/{device_type}/``
+    2. If HF ``model_type`` is not an ``OMNI_PIPELINES`` key, the registered
+       pipeline's ``default_deploy_config_name`` (keeps connectors aligned with
+       stage construction when HF type and pipeline key differ)
+    3. ``deploy/{model_type}.yaml``
+    4. Legacy ``stage_configs/{model_type}.yaml``
+    5. Registered pipeline default deploy config (final fallthrough)
 
     Args:
         model: Model name or path (used to determine model_type)
 
     Returns:
-        String path to the stage configuration file
+        String path to the stage/deploy configuration file, or ``None`` if no
+        matching config file exists.
 
     Raises:
         ValueError: If model_type cannot be determined
-        FileNotFoundError: If no stage config file exists for the model type
     """
     # Try to get config from standard transformers format first
     try:
@@ -249,12 +290,12 @@ def resolve_model_config_path(model: str) -> str:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if file_or_path_exists(model, "model_index.json", revision=None):
+        if get_diffusion_model_index(model) is not None:
             model_type = _try_get_class_name_from_diffusers_config(model)
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
-                    f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
+                    "Please ensure its Diffusers pipeline index contains '_class_name'"
                 )
         elif file_or_path_exists(model, "config.json", revision=None):
             # Try to read config.json manually for custom models like Bagel that fail get_config
@@ -279,7 +320,7 @@ def resolve_model_config_path(model: str) -> str:
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for model: {model}. "
-                    f"Model is not in standard transformers format and does not have model_index.json. "
+                    "Model is not in standard transformers or Diffusers format. "
                     f"Please ensure the model has proper configuration files with 'model_type' field"
                 )
 
@@ -296,15 +337,24 @@ def resolve_model_config_path(model: str) -> str:
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    deploy_config_path = PROJECT_ROOT / "vllm_omni" / "deploy" / model_type_str
+    # Prefer the registry default before deploy/<hf_model_type>.yaml when the
+    # HF type is not itself a pipeline key. Otherwise a future
+    # deploy/minicpmo.yaml would desync connectors from stages for MiniCPM-o 4.5.
+    if normalized_model_type not in OMNI_PIPELINES:
+        registry_path = _registry_default_deploy_path(model)
+        if registry_path is not None:
+            return registry_path
+
+    deploy_config_path = _DEPLOY_DIR / model_type_str
     if os.path.exists(deploy_config_path):
         return str(deploy_config_path)
 
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
-    if not os.path.exists(stage_config_path):
-        return None
-    return str(stage_config_path)
+    if os.path.exists(stage_config_path):
+        return str(stage_config_path)
+
+    return _registry_default_deploy_path(model)
 
 
 def load_stage_configs_from_model(
@@ -601,9 +651,7 @@ def load_and_resolve_stage_configs(
                 "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
                 "use --deploy-config. See docs/configuration/stage_configs.md."
             )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
+        if is_new_format_deploy_config(stage_configs_path):
             deploy_config_path = stage_configs_path
             stage_configs_path = None
         else:
@@ -857,3 +905,31 @@ def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
         params.skip_clone = True
     params.output_kind = target_type
     return params
+
+
+class PureDiffusionLauncherAdapter:
+    """vLLM launcher compatibility shim for pure-diffusion mode.
+
+    The upstream launcher's shutdown path reads
+    ``app.state.engine_client.vllm_config.shutdown_timeout``
+    (vllm/entrypoints/launcher.py), but ``AsyncOmni.vllm_config`` returns
+    ``None`` when the pipeline has no comprehension stage (pure diffusion),
+    which crashes ``handle_shutdown`` with AttributeError and hangs server
+    teardown (workers force-killed, spurious resource_tracker noise).
+
+    This adapter only overrides the ``vllm_config`` property with a minimal
+    fallback carrying ``shutdown_timeout`` and forwards every other attribute
+    to the wrapped engine client, so the pure-diffusion detection
+    (``get_vllm_config()`` still returns ``None``) is unaffected.
+    """
+
+    def __init__(self, engine_client: Any, shutdown_timeout: float) -> None:
+        object.__setattr__(self, "_wrapped", engine_client)
+        object.__setattr__(self, "_shutdown_timeout", float(shutdown_timeout))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    @property
+    def vllm_config(self) -> Any:
+        return types.SimpleNamespace(shutdown_timeout=self._shutdown_timeout)

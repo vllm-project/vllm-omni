@@ -14,6 +14,8 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -55,6 +57,19 @@ _MODEL_PRESETS = {
         "fps": 24,
         "flow_shift": 10.0,
         "output": "cosmos3_t2v_output.mp4",
+    },
+    # Cosmos3-Edge is a compact checkpoint with its own native resolution / guidance /
+    # flow_shift. It must NOT inherit the Nano/Super "cosmos" numbers above (720p / gs 6.0 /
+    # flow_shift 10.0), which produce degenerate output on Edge.
+    "cosmos3_edge": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 189,
+        "num_inference_steps": 35,
+        "guidance_scale": 5.0,
+        "fps": 24,
+        "flow_shift": 3.0,
+        "output": "cosmos3_edge_t2v_output.mp4",
     },
     "helios": {
         "height": 384,
@@ -103,6 +118,10 @@ def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
         return _MODEL_PRESETS["ltx2"]
     if "vace" in model_lower:
         return _MODEL_PRESETS["vace"]
+    # Edge must be matched before the generic cosmos branch (its "cosmos" substring would
+    # otherwise pick up the Nano/Super 720p / gs 6.0 / flow_shift 10.0 preset).
+    if ("cosmos" in model_lower or "cosmos" in class_lower) and ("edge" in model_lower or "edge" in class_lower):
+        return _MODEL_PRESETS["cosmos3_edge"]
     if "cosmos" in model_lower:
         return _MODEL_PRESETS["cosmos"]
     if "hunyuan" in model_lower:
@@ -318,6 +337,29 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--lora-path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path to LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. Loaded at initialization and used for generation."
+        "Note: for Wan2.2 MoE models, two checkpoints positionally mapped to high-noise and low-noise modules.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help="LoRA backend for loading LoRA adapters. Default: peft"
+        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
+        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
+    )
+    parser.add_argument(
         "--use-hsdp",
         action="store_true",
         help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
@@ -348,7 +390,7 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
     val = getattr(result, "peak_memory_mb", 0.0)
     if not val:
-        inner = getattr(result, "request_output", None)
+        inner = result
         if isinstance(inner, list):
             inner = inner[0] if inner else None
         val = getattr(inner, "peak_memory_mb", 0.0)
@@ -423,6 +465,12 @@ def main():
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
+    if args.lora_path is not None:
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        omni_kwargs["lora_path"] = lora_path
+        omni_kwargs["lora_backend"] = args.lora_backend
 
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
@@ -452,12 +500,30 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    lora_request = None
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request_id = stable_lora_int_id(lora_path)
+        lora_request = LoRARequest(
+            lora_name=Path(lora_path).stem,
+            lora_int_id=lora_request_id,
+            lora_path=lora_path,
+        )
+
     prompt_dict = {"prompt": args.prompt}
     if args.negative_prompt is not None:
         prompt_dict["negative_prompt"] = args.negative_prompt
     elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         prompt_dict["negative_prompt"] = ""
+
+    extra_args = {}
+    if lora_request:
+        extra_args["lora_request"] = lora_request
+        extra_args["lora_scale"] = args.lora_scale
 
     sampling_kwargs = dict(
         height=args.height,
@@ -466,6 +532,7 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        extra_args=extra_args,
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
@@ -508,8 +575,8 @@ def main():
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

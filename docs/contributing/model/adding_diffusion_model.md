@@ -653,7 +653,7 @@ python end2end.py --model your-org/your-model-name --modality text2img --prompts
 Mirror BAGEL’s online serving setup:
 
 - Server launcher: `examples/online_serving/your_model_name/run_server.sh`
-  - Wrap `vllm serve ... --omni --port ...` (and `--stage-configs-path ...` if needed)
+  - Wrap `vllm serve ... --omni --port ...` (and `--deploy-config ...` if needed)
 - Client: `examples/online_serving/your_model_name/openai_chat_client.py`
   - Send requests to `POST /v1/chat/completions`
   - Support multimodal inputs (e.g., base64 image) if your model needs it
@@ -755,7 +755,8 @@ omni = Omni(model="your-model", ulysses_degree=2, ring_degree=2)
 
 ### Step Execution
 
-See detailed design guide: [How to add step execution support](../../design/feature/diffusion_step_execution.md)
+See the detailed
+[Diffusion Continuous Batching design guide](../../design/feature/diffusion_continuous_batching.md).
 
 Use this only when your pipeline can be split into stable request-scoped and
 step-scoped phases. The reference implementation is
@@ -769,9 +770,8 @@ step-scoped phases. The reference implementation is
 Do not enable `step_execution=True` until those four methods are implemented
 and validated against the request-level path.
 
-If you want the pipeline to work with the experimental batched step-wise path
-(`max_num_seqs > 1`), also see:
-[Continuous Batching for Step-Wise Diffusion](../../design/feature/diffusion_continuous_batching.md).
+The same design guide covers the experimental batched step-wise path used when
+`max_num_seqs > 1`.
 
 If you expose this in example scripts or recipes, keep it opt-in. Surface
 runtime features like `step_execution` as optional flags instead of silently
@@ -824,7 +824,7 @@ omni = Omni(model="your-model",
 
 ### CPU Offload
 
-See detailed guide: [CPU Offloading for Diffusion Models](../../user_guide/diffusion/cpu_offload_diffusion.md)
+See detailed guide: [CPU Offloading for Diffusion Models](../../user_guide/diffusion/cpu_offload.md)
 
 vLLM-Omni provides two offloading strategies to reduce GPU memory usage:
 
