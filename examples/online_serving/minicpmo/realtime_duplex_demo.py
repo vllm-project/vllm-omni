@@ -196,6 +196,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             args.model,
             ref_audio=_ref_audio_data_url(args.ref_audio),
             session_id=args.session_id,
+            temperature=args.temperature,
             timeout_s=args.timeout_s,
         )
         stream_event_cursor = len(client.events.events)
@@ -383,6 +384,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Stage0 sampling temperature; response-required soft-interrupt uses 0.0.",
+    )
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument("--require-audio", action="store_true")
     return parser.parse_args()

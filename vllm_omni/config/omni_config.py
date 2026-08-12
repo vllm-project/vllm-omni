@@ -94,6 +94,8 @@ class _ModelEngineOverrides(TypedDict, total=False):
     moe_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
+    interleave_mm_strings: bool
+    media_io_kwargs: dict[str, Any]
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
@@ -322,6 +324,9 @@ class OmniStageModelConfig:
     moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
+    # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
+    interleave_mm_strings: bool | None = None
+    media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
@@ -558,8 +563,9 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | None = None
+    lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
+    lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False

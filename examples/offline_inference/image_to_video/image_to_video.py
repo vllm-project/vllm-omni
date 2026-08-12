@@ -60,8 +60,12 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
-    build_image_to_video_prompt,
+    build_image_to_video_prompt as build_model_image_to_video_prompt,
+)
+from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
 )
@@ -81,6 +85,22 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
+def build_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared I2V example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["video"],
+        "multi_modal_data": media_inputs,
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -295,6 +315,30 @@ def parse_args() -> argparse.Namespace:
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
+        "--lora-path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path to a LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. "
+        "For Wan2.2 MoE models, pass the high-noise checkpoint first and the low-noise checkpoint second.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for PEFT LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help=(
+            "LoRA backend. 'peft' loads a PEFT-format adapter for request-time activation; "
+            "'distill' fuses one or more concrete LoRA checkpoint files at initialization."
+        ),
+    )
+    parser.add_argument(
         "--extra-body",
         type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
@@ -487,6 +531,12 @@ def main():
         omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    if args.lora_path is not None:
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        omni_kwargs["lora_path"] = lora_path
+        omni_kwargs["lora_backend"] = args.lora_backend
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
@@ -517,19 +567,39 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
+    lora_request = None
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request = LoRARequest(
+            lora_name=Path(lora_path).stem,
+            lora_int_id=stable_lora_int_id(lora_path),
+            lora_path=lora_path,
+        )
+
     negative_prompt = args.negative_prompt
     if negative_prompt is None and not is_ltx2:
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         negative_prompt = ""
     prompt_dict = build_image_to_video_prompt(
-        model_class_name=model_class_name,
         prompt=args.prompt,
         negative_prompt=negative_prompt,
         media_inputs=media_inputs,
+    )
+    prompt_dict = build_model_image_to_video_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
         height=height,
         width=width,
         num_frames=num_frames,
     )
+    sampling_extra_args = {"sample_solver": args.sample_solver}
+    if lora_request is not None:
+        sampling_extra_args["lora_request"] = lora_request
+        sampling_extra_args["lora_scale"] = args.lora_scale
+
     sampling_params = OmniDiffusionSamplingParams(
         height=height,
         width=width,
@@ -540,7 +610,7 @@ def main():
         num_inference_steps=num_inference_steps,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        extra_args={"sample_solver": args.sample_solver},
+        extra_args=sampling_extra_args,
     )
     if flow_shift is not None:
         sampling_params.extra_args["flow_shift"] = flow_shift

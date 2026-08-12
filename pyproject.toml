@@ -84,9 +84,24 @@ forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
+indextts2 = [
+    "fugashi>=1.2.0",
+    "unidic-lite>=1.0.0",
+    "wetext>=0.0.9; sys_platform != 'linux'",
+    "WeTextProcessing; sys_platform == 'linux'",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
+]
+
+# LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
+# separation and loudness normalization.
+longcat-video-avatar = [
+    "audio-separator==0.44.2",
+    "pyloudnorm==0.1.1",
+    "soundfile>=0.13.1",
 ]
 
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
@@ -319,3 +334,7 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# IndexTTS 2.5 language codes and speech-emotion-recognition event token.
+fo = "fo"
+ba = "ba"
+SER = "SER"

@@ -27,6 +27,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
 )
+from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -682,8 +683,9 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    lora_path: str | None = None
-    lora_scale: float = 1.0
+    lora_path: str | list[str] | None = None
+    lora_scale: float | list[float] = 1.0
+    lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
