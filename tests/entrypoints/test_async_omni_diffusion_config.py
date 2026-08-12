@@ -58,6 +58,23 @@ def test_default_stage_devices_from_sequence_parallel():
     assert stage_cfg["runtime"]["devices"] == "0,1,2,3"
 
 
+def test_default_stage_devices_and_dp_from_num_gpus():
+    """Resolve omitted DP before deriving devices from an explicit GPU count."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "num_gpus": 8,
+            "tensor_parallel_size": 2,
+            "ulysses_degree": 2,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.data_parallel_size == 2
+    assert parallel_config.world_size == 8
+    assert stage_cfg["engine_args"]["num_gpus"] == 8
+    assert stage_cfg["runtime"]["devices"] == "0,1,2,3,4,5,6,7"
+
+
 def test_default_stage_config_uses_parallel_size_kwargs():
     """Ensure default diffusion parallel_config uses CLI/API parallel sizes."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
