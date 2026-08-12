@@ -146,7 +146,7 @@ class StableDiffusionXLPipeline(
         )
         text_input_ids = text_inputs.input_ids
 
-        text_encoder_device = next(text_encoder.parameters()).device
+        text_encoder_device = self.device
         outputs = text_encoder(text_input_ids.to(text_encoder_device), output_hidden_states=True)
         prompt_embeds = outputs.hidden_states[-2].to(dtype=self.od_config.dtype, device=self.device)
 
