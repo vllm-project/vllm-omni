@@ -62,7 +62,13 @@ class MockVideoResult:
 
 class FakeAsyncOmni:
     def __init__(self):
-        self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+        self.stage_configs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                final_output=True,
+                final_output_type="video",
+            )
+        ]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None

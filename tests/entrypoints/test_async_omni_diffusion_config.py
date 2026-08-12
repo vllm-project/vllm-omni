@@ -462,6 +462,36 @@ def test_serve_cli_accepts_additional_config():
     assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
 
 
+def test_default_stage_resolves_video_output_from_checkpoint(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    resolver = mocker.patch(
+        "vllm_omni.engine.async_omni_engine.resolve_model_class_name",
+        return_value="MiniMaxH3Pipeline",
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/MiniMax-H3/FL2VA",
+        {},
+        trust_remote_code=False,
+    )
+
+    resolver.assert_called_once_with("/models/MiniMax-H3/FL2VA", "default")
+    assert captured["final_output_type"] == "video"
+
+
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
     """Ensure YAML/deploy stage resolution forwards top-level additional_config."""
     fake_diffusion_stage = SimpleNamespace(

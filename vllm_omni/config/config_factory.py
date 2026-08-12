@@ -30,6 +30,7 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -579,6 +580,7 @@ class StageConfigFactory:
             engine_args["dtype"] = str(engine_args["dtype"])
 
         engine_args.setdefault("max_num_seqs", 1)
+        model_class_name = engine_args.get("model_class_name")
 
         config_dict: dict[str, Any] = {
             "stage_id": 0,
@@ -589,7 +591,7 @@ class StageConfigFactory:
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
-            "final_output_type": "image",
+            "final_output_type": get_diffusion_output_type(model_class_name),
         }
 
         return [config_dict]
