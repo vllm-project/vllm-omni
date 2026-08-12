@@ -449,6 +449,19 @@ def _maybe_enable_tf32() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _additive_float_mask(mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Convert a boolean attention mask to its additive float form.
+
+    ``True`` (attend) maps to ``0.0`` and ``False`` (masked) to ``-inf``. A bool
+    mask must never be copied straight into a float buffer: the implicit cast
+    maps True/False to 1.0/0.0, which leaves masked positions at 0.0 and so
+    silently *unmasks* them.
+    """
+    if mask.dtype != torch.bool:
+        return mask
+    return torch.zeros_like(mask, dtype=dtype).masked_fill_(~mask, float("-inf"))
+
+
 class _OmniVoiceCUDAGraphForward:
     """Pre-captures CUDA graphs for predefined sequence-length buckets.
 
@@ -500,16 +513,13 @@ class _OmniVoiceCUDAGraphForward:
         mask_padded[:, :S] = audio_mask
 
         if attention_mask is not None:
-            # Float masks pad with -inf, bool masks with False; both mean "masked".
-            if attention_mask.dtype == torch.bool:
-                attn_padded = torch.zeros(two_b, 1, bucket, bucket, dtype=torch.bool, device=attention_mask.device)
-            else:
-                attn_padded = torch.full(
-                    (two_b, 1, bucket, bucket),
-                    float("-inf"),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
+            # Callers normalize to the additive float form first, so pad with -inf.
+            attn_padded = torch.full(
+                (two_b, 1, bucket, bucket),
+                float("-inf"),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
             attn_padded[:, :, :S, :S] = attention_mask
         else:
             attn_padded = None
@@ -612,6 +622,11 @@ class _OmniVoiceCUDAGraphForward:
         seq_len = input_ids.shape[-1]
         two_b = input_ids.shape[0]
         bucket = self._find_bucket(seq_len) if two_b == 2 else None
+
+        # Graphs are captured with (and their static buffers hold) the additive
+        # float mask, so normalize here, before padding or any copy_ into them.
+        if attention_mask is not None:
+            attention_mask = _additive_float_mask(attention_mask)
 
         if bucket is None:
             # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
