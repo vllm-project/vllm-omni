@@ -737,6 +737,19 @@ class TestTTSMethods:
         yield server
         server.shutdown()
 
+    def test_diffusion_audio_encode_speed_skips_ar_adapter(self, mocker: MockerFixture):
+        """Pure-diffusion speech keeps generic speed handling outside AR adapters."""
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+        )
+        resolve_adapter = mocker.patch.object(serving_speech_module, "resolve_adapter")
+
+        speed = server._audio_encode_speed(OpenAICreateSpeechRequest(input="Hello", speed=1.25))
+
+        assert speed == 1.25
+        resolve_adapter.assert_not_called()
+
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
         # Fixture creates server with stage_configs = [] -> _is_tts should be False
