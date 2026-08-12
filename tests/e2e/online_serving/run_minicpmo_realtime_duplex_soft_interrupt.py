@@ -314,6 +314,14 @@ def summarize_artifacts(
         and event["response"].get("status") == "cancelled"
     )
     result_ok = result.get("ok") is True
+    # response-required keeps the full listen sandwich around commit. model-policy
+    # only requires a completed audio response that started before final commit:
+    # single-GPU co-location often still drains speak after the WAV ends.
+    commit_listen_contract_ok = (
+        listen_after_response_before_commit and final_listen_after_commit
+        if validation_mode == "response-required"
+        else response_before_final_commit
+    )
     common_contract_ok = bool(
         result_ok
         and not error_events
@@ -323,8 +331,7 @@ def summarize_artifacts(
         and multi_delta_ok
         and response_audio_contract_ok
         and response_before_final_commit
-        and listen_after_response_before_commit
-        and final_listen_after_commit
+        and commit_listen_contract_ok
     )
     mode_contract_ok = validation_mode == "model-policy" or (
         second_response_before_final_commit
@@ -393,6 +400,11 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         f"duplex-soft-interrupt-{uuid.uuid4().hex}",
     ]
     command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
+    temperature = getattr(args, "temperature", None)
+    if temperature is None and args.validation_mode == "response-required":
+        temperature = 0.0
+    if temperature is not None:
+        command.extend(["--temperature", str(temperature)])
     if args.require_audio:
         command.append("--require-audio")
     if args.no_realtime_pacing:
@@ -453,6 +465,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-output")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=120.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Stage0 sampling temperature; response-required defaults to 0.0.",
+    )
     parser.add_argument("--require-audio", action="store_true")
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument(

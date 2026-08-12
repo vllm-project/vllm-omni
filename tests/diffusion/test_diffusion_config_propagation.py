@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
@@ -123,6 +124,11 @@ class TestCreateDefaultDiffusion:
         ea = stages[0]["engine_args"]
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
+
+    def test_diffusion_kv_mode_roundtrip(self):
+        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+
+        assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():

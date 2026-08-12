@@ -6,6 +6,8 @@ architecture_state: current
 owners:
   - "@Sy0307"
   - "@amy-why-3459"
+  - "@Gaohan123"
+  - "@alex-jw-brooks"
 document_stewards:
   - "@hsliuustc0106"
   - "@Gaohan123"

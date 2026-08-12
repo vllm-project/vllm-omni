@@ -1094,6 +1094,12 @@ class _HashableRequest(SimpleNamespace):
     # request; real Requests initialise it to 0 (vllm/v1/request.py).
     num_in_flight_tokens = 0
 
+    # vLLM 0.27 (a0c092ee72): the stale-output counter that replaced
+    # async_tokens_to_discard. update_from_output reads it for every scheduled
+    # request, and real Requests initialise it to 0 (vllm/v1/request.py), so the
+    # double needs it too.
+    num_stale_output_tokens = 0
+
     def __hash__(self):
         return hash(self.request_id)
 

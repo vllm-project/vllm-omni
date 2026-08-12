@@ -51,15 +51,20 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("MiniCPMO45Code2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # nemotron_voicechat: talker (Stage 1) -> code2wav (Stage 2). Stage 2
+        # waits for the talker's full-payload code stacks; the thinker (Stage 0)
+        # -> talker (Stage 1) hop is token-path only and must NOT be listed.
+        ("NemotronVoiceChatCode2Wav", "code2wav"),
         # audex TTS sync path: thinker (Stage 0) -> streaming decoder (Stage 1).
         # The default deploy is async_chunk; this covers async_chunk: false.
         ("AudexCode2Wav", "audex_code2wav"),
         # audex TTA: tta thinker (Stage 0) -> XCodec1 (Stage 1, always sync
         # full-payload — CNN codec decoded over the full sequence).
         ("AudexXCodec1", "audex_xcodec"),
-        # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
-        # (Stage 1). Stage 1 consumes the complete mel/latent payload.
+        # indextts2 / indextts2_5: talker (Stage 0) -> s2mel decoder
+        # (Stage 1). Stage 1 consumes the complete mel/optional-latent payload.
         ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
+        ("IndexTTS25S2MelDecoder", "indextts2_5_s2mel_decoder"),
         # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
         # token2audio (Stage 2).  Producer wires via
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.

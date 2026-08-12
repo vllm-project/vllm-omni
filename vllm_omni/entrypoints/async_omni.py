@@ -599,6 +599,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             else:
                 await self.engine.add_request_async(
@@ -608,6 +609,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -659,6 +661,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        lora_request: Any = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -696,6 +699,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -708,6 +712,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
             except (asyncio.CancelledError, GeneratorExit):
@@ -739,6 +744,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
                     else:
@@ -750,6 +756,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
 
@@ -899,17 +906,27 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.duplex_lifecycle_events.put(msg)
                         continue
 
-                    if isinstance(msg, ErrorMessage) and not msg.fatal:
-                        req_state = self.request_states.get(msg.request_id)
-                        if req_state is not None:
-                            await req_state.queue.put(msg)
-                        else:
-                            logger.warning(
-                                "[%s] dropping non-fatal error for unknown req %s",
-                                self._name,
-                                msg.request_id,
-                            )
-                        continue
+                    if isinstance(msg, ErrorMessage):
+                        # Route request-scoped errors to that request's queue and
+                        # keep the loop alive. A request whose stage replica died
+                        # and was evicted gets a fatal error delivered here; only
+                        # that request fails (its consumer raises), the server
+                        # stays up for other stages/requests (#4285). A fatal
+                        # error without a request_id is a genuine engine-wide
+                        # death and falls through to the except handler below.
+                        if msg.request_id is not None:
+                            req_state = self.request_states.get(msg.request_id)
+                            if req_state is not None:
+                                await req_state.queue.put(msg)
+                            else:
+                                logger.warning(
+                                    "[%s] dropping error for unknown req %s",
+                                    self._name,
+                                    msg.request_id,
+                                )
+                            continue
+                        if not msg.fatal:
+                            continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:
@@ -1310,10 +1327,11 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        Delegates to ``OmniBase.errored`` which checks the orchestrator
-        thread and all stage clients.  Redeclared here to satisfy the
+        Delegates to ``OmniBase.errored``, which is true only when the
+        orchestrator thread is dead; per-stage liveness is reported via
+        ``check_health`` instead.  Redeclared here to satisfy the
         ``EngineClient`` abstract-property requirement (Python's ABC
         mechanism does not resolve abstract methods from sibling MRO
         entries).

@@ -39,6 +39,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -473,6 +474,8 @@ def test_sub_config_fields_match_structured_scopes():
         "moe_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
+        "interleave_mm_strings",
+        "media_io_kwargs",
         "active_stream_window",
         "duplex_max_sessions",
         "enable_sleep_mode",
@@ -510,6 +513,7 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
+        "mamba_ssm_cache_dtype",
     }
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {
         "max_num_seqs",
@@ -966,20 +970,24 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
 
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
+        fa_deterministic=True,
         kv_cache_dtype="fp8",
         kv_cache_skip_steps="0-1",
         kv_cache_skip_layers=[2],
         static_lora_scale=0.25,
+        diffusion_kv_mode="paged_scheduler",
         diffusers_load_kwargs=None,
         diffusers_call_kwargs=None,
     )
 
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
+    assert cfg.fa_deterministic is True
     assert cfg.diffusion_kv_cache_dtype == "fp8"
     assert cfg.diffusion_kv_cache_skip_step_indices == {0, 1}
     assert cfg.diffusion_kv_cache_skip_layer_indices == {2}
     assert cfg.lora_scale == 0.25
     assert cfg.cache_backend == "tea_cache"
+    assert cfg.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert cfg.diffusers_load_kwargs == {}
     assert cfg.diffusers_call_kwargs == {}
 
@@ -994,6 +1002,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "stages:",
                 "  - stage_id: 0",
                 "    diffusion_attention_backend: flash_attn",
+                "    fa_deterministic: true",
+                "    diffusion_kv_mode: paged_scheduler",
             ]
         )
     )
@@ -1005,6 +1015,29 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
+    assert stage.diffusion_config.fa_deterministic is True
+    assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+
+def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
+    deploy_path = tmp_path / "dreamzero_reserved_diffusion_kv.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_kv_mode: paged_worker_local",
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="reserved but not implemented"):
+        _from_pipeline_key(
+            "dreamzero",
+            deploy_config_path=str(deploy_path),
+        )
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
@@ -1025,6 +1058,7 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "enable_session_state_manager",
         "prompt_embed_cache_size",
         "diffusion_kv_cache_dtype",
+        "diffusion_kv_mode",
     } <= omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS
     assert {
         "revision",

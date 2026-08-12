@@ -41,6 +41,7 @@ from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_images_generations_response,
     assert_omni_response,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
@@ -1504,6 +1505,11 @@ class OpenAIClientHandler:
             err_code=cfg.get("err_code"),
             err_message=cfg.get("err_message"),
         )
+        if cfg.get("err_code") is None:
+            assert resp.success, resp.error_message
+            payload = resp.json_body
+            assert isinstance(payload, dict)
+            assert_images_generations_response(payload, cfg, run_level=self.run_level)
         return [resp]
 
     def send_images_edits_http_request(
@@ -3173,7 +3179,12 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--deploy-config", stage_config_path]
+                from vllm_omni.entrypoints.utils import is_new_format_deploy_config
+
+                if is_new_format_deploy_config(stage_config_path):
+                    server_args += ["--deploy-config", stage_config_path]
+                else:
+                    server_args += ["--stage-configs-path", stage_config_path]
 
             with (
                 OmniServer(

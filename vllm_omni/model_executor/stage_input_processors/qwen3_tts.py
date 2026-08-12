@@ -164,21 +164,31 @@ def talker2code2wav_async_chunk(
         if finished:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
             )
         return None
 
     if ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        first_chunk = chunk_index <= 0
         emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
         if not emit:
             return None
         if context_length == 0:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
             )
     else:
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
         if use_first_chunk and length <= initial_chunk_size:
@@ -193,15 +203,18 @@ def talker2code2wav_async_chunk(
             chunk_length = adjusted % chunk_size
             context_length = chunk_length if chunk_length != 0 else chunk_size
 
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    if finished and first_chunk:
+        context_length = length
 
-    # Prepend the bounded ref_code tail to the first emitted chunk so Code2Wav
-    # can cache the same reference context that mainline would otherwise send on
-    # every chunk. Follow-up chunks send only a metadata handle; Code2Wav restores
-    # this context locally before decode.
+    # Code2Wav keeps the quantizer/conv/Transformer context per request. Ship
+    # only the newly completed codec frames after the first chunk.
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][-context_length:]
+    left_context_size = 0
+
+    # ICL reference codes are part of the first decoder initialization only.
+    # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
+    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -231,13 +244,12 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            ref_context_request_id = request_id
-            emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
+                ref_context_request_id = request_id
                 ref_frames = ref_context.tolist()
                 window_frames = ref_frames + window_frames
                 ref_context_included = True
-            left_context_size += ref_context_size
+                left_context_size = ref_context_size
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
@@ -247,6 +259,7 @@ def talker2code2wav_async_chunk(
     )
 
     meta = MetaStruct(
+        request_id=request_id,
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
     )

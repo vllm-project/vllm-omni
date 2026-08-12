@@ -16,7 +16,12 @@ class VoxCPM2Adapter(ARTTSAdapter):
     stage is present (and/or via ``model_arch``)."""
 
     stage_keys = frozenset({"latent_generator"})
+    model_archs = frozenset({"VoxCPM2TalkerForConditionalGeneration"})
     name = "voxcpm2"
+    # The talker architecture is authoritative and is tested ahead of every
+    # stage key, so a VoxCPM2 talker deployed under a stage key another model
+    # claims still resolves to VoxCPM2.
+    detect_priority = 10
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate VoxCPM2 request parameters. Returns error message or None."""
