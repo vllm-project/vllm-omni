@@ -211,3 +211,95 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
+
+
+def test_text_encoder_online_fp8_env_is_explicit(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        _TEXT_ENCODER_QUANT_ENV,
+        minimax_h3_text_encoder_quantization,
+    )
+
+    monkeypatch.delenv(_TEXT_ENCODER_QUANT_ENV, raising=False)
+    assert not minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "bf16")
+    assert not minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "FP8")
+    assert minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "int8")
+    with pytest.raises(ValueError, match="bf16 or fp8"):
+        minimax_h3_text_encoder_quantization()
+
+
+@pytest.mark.parametrize(
+    ("enable_cpu_offload", "enable_distributed_layerwise_offload", "match"),
+    [
+        (True, False, "model-level CPU offload"),
+        (False, True, "distributed layerwise offload"),
+        (True, True, "model-level CPU offload.*distributed layerwise offload"),
+    ],
+)
+def test_text_encoder_online_fp8_rejects_incompatible_offload(
+    enable_cpu_offload,
+    enable_distributed_layerwise_offload,
+    match,
+):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _validate_text_encoder_online_fp8_offload,
+    )
+
+    od_config = SimpleNamespace(
+        enable_cpu_offload=enable_cpu_offload,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=enable_distributed_layerwise_offload,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _validate_text_encoder_online_fp8_offload(True, od_config)
+
+
+@pytest.mark.parametrize(
+    ("online_fp8", "enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload"),
+    [
+        (True, False, False, False),
+        (True, False, True, False),
+        (False, True, False, False),
+        (False, False, False, True),
+        (False, True, True, True),
+    ],
+)
+def test_text_encoder_online_fp8_accepts_compatible_offload(
+    online_fp8,
+    enable_cpu_offload,
+    enable_layerwise_offload,
+    enable_distributed_layerwise_offload,
+):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _validate_text_encoder_online_fp8_offload,
+    )
+
+    od_config = SimpleNamespace(
+        enable_cpu_offload=enable_cpu_offload,
+        enable_layerwise_offload=enable_layerwise_offload,
+        enable_distributed_layerwise_offload=enable_distributed_layerwise_offload,
+    )
+
+    _validate_text_encoder_online_fp8_offload(online_fp8, od_config)
+
+
+def test_text_encoder_online_fp8_offload_is_rejected_before_model_loading(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        _TEXT_ENCODER_QUANT_ENV,
+    )
+
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "fp8")
+    od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(cfg_parallel_size=1),
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        model="/definitely/nonexistent/minimax-h3",
+    )
+
+    with pytest.raises(ValueError, match="model-level CPU offload"):
+        MiniMaxH3Pipeline(od_config=od_config)

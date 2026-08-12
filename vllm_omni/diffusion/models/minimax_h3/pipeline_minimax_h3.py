@@ -60,7 +60,7 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_aug_rows,
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
-from .encoder import MiniMaxH3Qwen3VLEncoder
+from .encoder import MiniMaxH3Qwen3VLEncoder, minimax_h3_text_encoder_quantization
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -179,6 +179,28 @@ def _resolve_component_quant_config(quant_config, component: str):
     if hasattr(quant_config, "resolve"):
         return quant_config.resolve(component)
     return quant_config
+
+
+def _validate_text_encoder_online_fp8_offload(
+    online_fp8: bool,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    if not online_fp8:
+        return
+
+    incompatible_modes = []
+    if getattr(od_config, "enable_cpu_offload", False):
+        incompatible_modes.append("model-level CPU offload")
+    if getattr(od_config, "enable_distributed_layerwise_offload", False):
+        incompatible_modes.append("distributed layerwise offload")
+    if not incompatible_modes:
+        return
+
+    modes = " and ".join(incompatible_modes)
+    raise ValueError(
+        f"MiniMax H3 text-encoder online FP8 is incompatible with {modes}. "
+        "Disable the incompatible offload mode(s) or disable text-encoder online FP8."
+    )
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -578,6 +600,8 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
+        text_encoder_online_fp8 = minimax_h3_text_encoder_quantization()
+        _validate_text_encoder_online_fp8_offload(text_encoder_online_fp8, od_config)
         self.device = get_local_device()
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
@@ -693,6 +717,7 @@ class MiniMaxH3Pipeline(
             device=self.device,
             load_model=rank < text_encoder_tp_size,
             encoder_group=self.text_encoder_group,
+            online_fp8=text_encoder_online_fp8,
         )
         stage_components = bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
