@@ -22,8 +22,6 @@ too small for a 5 s clip. Start the container with `--shm-size=8g` (or
 
 ## Environment
 
-## Environment
-
 - Host architecture: x86_64
 - Ascend driver: 25.7.rc1.6 (ascendhal 7.35.23)
 - Ascend firmware: 9.0.0.105.229
@@ -34,7 +32,7 @@ too small for a 5 s clip. Start the container with `--shm-size=8g` (or
 - torch_npu: 2.10.0.post2
 - vLLM: 0.26.0
 - vLLM-Omni: 0.26.1.dev103+g584d78c67.npu (commit `584d78c6`)
-- 
+
 Install vLLM-Omni from a checkout with MiniMax-H3 support:
 
 ​```bash
