@@ -11,16 +11,26 @@ class MiniCPMO45DuplexPolicy:
     MiniCPM-o 4.5 remote-code contract, not a general vLLM-Omni duplex schema.
     """
 
-    # Audio framing contract shared by serving, orchestrator, and worker.
-    # MiniCPM-o consumes 1 s units at 16 kHz and pools audio to one embedding
-    # per 100 ms, so a unit contributes exactly 10 audio embeddings plus the
-    # <unit> open (and a </unit> closure for every unit after the first).
+    # Audio framing contract shared by serving, orchestrator, and worker. The
+    # released checkpoint uses 50 streaming frames at 50 fps (one second) and
+    # pools audio to one embedding per 100 ms. Runtime keys carry the derived
+    # period so custom checkpoints do not leave serving and Stage0 out of sync.
     # Scheduler token budgets must match the worker-built embeddings exactly:
     # surplus slots become pad embeddings inside the KV and measurably corrupt
     # the model's listen/speak behavior.
     SAMPLE_RATE_HZ = 16000
     CHUNK_SAMPLES = 16000
     SAMPLES_PER_AUDIO_TOKEN = 1600
+    DEFAULT_STREAMING_AUDIO_CHUNK_SIZE = 50
+    DEFAULT_STREAMING_AUDIO_FRAME_RATE = 50
+    DEFAULT_STREAMING_AUDIO_CHUNK_MS = 1000
+    DEFAULT_STREAMING_AUDIO_FIRST_CHUNK_MS = 1035
+    FIRST_CHUNK_ALIGNMENT_MS = 35
+    RUNTIME_STREAMING_AUDIO_CHUNK_SIZE = "streaming_audio_chunk_size"
+    RUNTIME_STREAMING_AUDIO_FRAME_RATE = "streaming_audio_frame_rate"
+    RUNTIME_STREAMING_AUDIO_CHUNK_MS = "streaming_audio_chunk_ms"
+    RUNTIME_STREAMING_AUDIO_FIRST_CHUNK_MS = "streaming_audio_first_chunk_ms"
+    RUNTIME_STREAMING_AUDIO_CHUNK_SAMPLES = "streaming_audio_chunk_samples"
     # Vision framing contract (omni duplex). Official streaming_prefill feeds
     # each frame as <image> + 64 resampler embeddings + </image> inside the
     # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in

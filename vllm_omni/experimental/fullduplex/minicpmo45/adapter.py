@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -38,6 +39,11 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
             "initial_user_text",
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_SIZE,
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_FRAME_RATE,
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_MS,
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_FIRST_CHUNK_MS,
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_SAMPLES,
         }
     )
 
@@ -91,9 +97,11 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+<<<<<<< HEAD
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
+        cls._apply_streaming_audio_config(runtime_config, model_config=model_config)
         cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
 
         ref_audio = config.ref_audio
@@ -141,6 +149,65 @@ class MiniCPMO45NativeDuplexServingAdapter:
         config.extra_body = extra_body
         config.ref_audio = None
         return runtime_config
+
+    @classmethod
+    def _apply_streaming_audio_config(
+        cls,
+        runtime_config: dict[str, object],
+        *,
+        model_config: Any,
+    ) -> None:
+        hf_config = cls._config_value(model_config, "hf_config") or model_config
+        tts_config = cls._config_value(hf_config, "tts_config")
+        chunk_size = cls._positive_int(
+            cls._config_value(tts_config, "streaming_audio_chunk_size"),
+            MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_CHUNK_SIZE,
+        )
+        frame_rate = cls._positive_int(
+            cls._config_value(hf_config, "streaming_sliding_window_audio_frame_rate"),
+            MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_FRAME_RATE,
+        )
+        chunk_ms = max(1, (chunk_size * 1000 + frame_rate // 2) // frame_rate)
+        chunk_samples = chunk_ms * MiniCPMO45DuplexPolicy.SAMPLE_RATE_HZ // 1000
+        if chunk_samples < MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN or (
+            chunk_samples % MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
+        ):
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "MiniCPM-o streaming_audio_chunk_size must resolve to whole 100 ms audio encoder frames",
+                code="invalid_streaming_audio_chunk_size",
+            )
+        runtime_config.update(
+            {
+                MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_SIZE: chunk_size,
+                MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_FRAME_RATE: frame_rate,
+                MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_MS: chunk_ms,
+                MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_FIRST_CHUNK_MS: (
+                    chunk_ms + MiniCPMO45DuplexPolicy.FIRST_CHUNK_ALIGNMENT_MS
+                ),
+                MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_SAMPLES: chunk_samples,
+            }
+        )
+
+    @classmethod
+    def runtime_streaming_audio_chunk_ms(cls, runtime_config: Mapping[str, object] | None) -> int:
+        value = None
+        if runtime_config is not None:
+            value = runtime_config.get(MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_MS)
+        return cls._positive_int(value, MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_CHUNK_MS)
+
+    @staticmethod
+    def _config_value(config: object, name: str) -> object | None:
+        if isinstance(config, Mapping):
+            return config.get(name)
+        return getattr(config, name, None)
+
+    @staticmethod
+    def _positive_int(value: object, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
 
     @classmethod
     def _apply_default_scheduler_policy(

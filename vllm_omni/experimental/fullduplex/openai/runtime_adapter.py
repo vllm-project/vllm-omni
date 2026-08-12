@@ -120,7 +120,12 @@ class ServingRuntimeAdapter(Protocol):
 
     def is_enabled(self, config: object) -> bool: ...
 
-    def capabilities(self, *, max_sessions: int) -> object: ...
+    def capabilities(
+        self,
+        *,
+        max_sessions: int,
+        runtime_config: Mapping[str, object] | None = None,
+    ) -> object: ...
 
     def validate_client_extra_body(self, extra_body: object) -> None: ...
 

@@ -105,7 +105,12 @@ class PersonaPlexServingRuntimeAdapter:
         return True
 
     @staticmethod
-    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+    def capabilities(
+        *,
+        max_sessions: int,
+        runtime_config: Mapping[str, object] | None = None,
+    ) -> DuplexCapabilities:
+        del runtime_config
         supports_multi_session = max_sessions > 1
         return DuplexCapabilities(
             supports_model_native_turn_policy=True,

@@ -48,8 +48,16 @@ class MiniCPMO45ServingRuntimeAdapter:
         return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)  # type: ignore[arg-type]
 
     @staticmethod
-    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
-        return DuplexCapabilities.minicpmo45_native(max_sessions=max_sessions)
+    def capabilities(
+        *,
+        max_sessions: int,
+        runtime_config: Mapping[str, object] | None = None,
+    ) -> DuplexCapabilities:
+        chunk_period_ms = MiniCPMO45NativeDuplexServingAdapter.runtime_streaming_audio_chunk_ms(runtime_config)
+        return DuplexCapabilities.minicpmo45_native(
+            max_sessions=max_sessions,
+            chunk_period_ms=chunk_period_ms,
+        )
 
     @staticmethod
     def validate_client_extra_body(extra_body: object) -> None:

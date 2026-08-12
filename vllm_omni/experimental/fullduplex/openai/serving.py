@@ -914,6 +914,7 @@ class OmniDuplexSessionHandler(
             session.replace_capabilities(
                 self._serving_runtime_adapter.capabilities(
                     max_sessions=self._duplex_session_config.max_sessions,
+                    runtime_config=runtime_config,
                 )
             )
             session.replace_runtime_config(runtime_config)
