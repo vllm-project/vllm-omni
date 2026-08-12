@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
-from transformers import T5Config, UMT5Config
+from transformers import T5Config, UMT5Config, UMT5EncoderModel
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
 from vllm_omni.diffusion.models.t5_encoder.t5_encoder import (
@@ -159,6 +159,51 @@ class TestRelativePositionBiasReuse:
         assert compute_bias.call_count == expected_compute_calls
         expected_bias = computed_bias if expected_compute_calls else supplied_bias
         assert returned_bias is expected_bias
+
+    def test_umt5_checkpoint_and_output_parity_tp1(self, umt5_config, monkeypatch):
+        """Native UMT5 loading should match Transformers for a small checkpoint."""
+        # The module fixture initializes a TP=2 test environment.  Use TP=1
+        # here to cover the pipeline's non-sharded path as well.
+        monkeypatch.setattr(f"{_T5_MODULE}.get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(f"{_T5_MODULE}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
+            lambda: 0,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_rank",
+            lambda: 0,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.linear.tensor_model_parallel_all_reduce",
+            lambda value: value,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.vocab_parallel_embedding.tensor_model_parallel_all_reduce",
+            lambda value: value,
+        )
+        monkeypatch.setattr(f"{_T5_MODULE}.get_act_fn", lambda _: torch.nn.GELU(approximate="tanh"))
+
+        torch.manual_seed(1234)
+        hf_model = UMT5EncoderModel(umt5_config).eval()
+        native_model = T5EncoderModel(umt5_config, prefix="text_encoder").eval()
+        native_model.load_weights(list(hf_model.state_dict().items()))
+
+        input_ids = torch.tensor([[1, 7, 13, 0, 0], [4, 9, 2, 8, 0]])
+        attention_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
+        with torch.no_grad():
+            expected = hf_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            actual = native_model(input_ids, attention_mask)[0]
+
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
 class TestT5EncoderModelWeightLoading:
