@@ -163,7 +163,18 @@ class DiT(torch.nn.Module):
     def setup_caches(self, max_batch_size, max_seq_length):
         self.transformer.setup_caches(max_batch_size, max_seq_length, use_kv_cache=False)
 
-    def forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False, pre_mask=None):
+    def forward(
+        self,
+        x,
+        prompt_x,
+        x_lens,
+        t,
+        style,
+        cond,
+        mask_content=False,
+        pre_mask=None,
+        unpad_data: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         """
         x (torch.Tensor): random noise
         prompt_x (torch.Tensor): reference mel + zero mel
@@ -226,10 +237,16 @@ class DiT(torch.nn.Module):
         input_pos = self.input_pos[: x_in.size(1)]  # (T,) range（0，1863）
         # Route through per-shape CUDA graph runner if enabled.
         graph_runner = getattr(self, "_cuda_graph_runner", None)
-        if graph_runner is not None:
+        if graph_runner is not None and unpad_data is None:
             x_res = graph_runner(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)
         else:
-            x_res = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)  # [2, 1863, 512]
+            x_res = self.transformer(
+                x_in,
+                t1.unsqueeze(1),
+                input_pos,
+                x_mask_expanded,
+                unpad_data=unpad_data,
+            )  # [2, 1863, 512]
         x_res = x_res[:, 1:] if self.time_as_token else x_res
         x_res = x_res[:, 1:] if self.style_as_token else x_res
 

@@ -3,9 +3,10 @@ title: Diffusion Model Integration
 kind: module
 status: draft
 owners:
-  - "@Isotr0py"
+  - "@fhfuih"
+  - "@Bounty-hunter"
   - "@wtomin"
-  - "@ZJY0516"
+  - "@RuixiangMa"
 primary_code_paths:
   - vllm_omni/diffusion/models/**
   - vllm_omni/diffusion/model_loader/**

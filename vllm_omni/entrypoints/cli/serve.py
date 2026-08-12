@@ -164,6 +164,13 @@ class OmniServeCommand(CLISubcommand):
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
+        lora_backend = getattr(args, "lora_backend", None)
+        lora_path = getattr(args, "lora_path", None)
+        if lora_backend == "distill" and not lora_path:
+            raise ValueError("--lora-backend distill requires --lora-path")
+        if (lora_backend or "peft") == "peft" and isinstance(lora_path, list) and len(lora_path) > 1:
+            raise ValueError("--lora-backend peft accepts only one startup LoRA path")
+
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
         omni_lb_policy = getattr(args, "omni_lb_policy", None)
         if omni_lb_policy is not None:
@@ -426,6 +433,32 @@ class OmniServeCommand(CLISubcommand):
                 "How to load the diffusion pipeline: native/registry (default), "
                 "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
             ),
+        )
+        omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            nargs="+",
+            default=None,
+            help=(
+                "LoRA checkpoint path(s) loaded when the diffusion server starts. "
+                "The distill backend accepts one file per pipeline transformer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=["peft", "distill"],
+            default=None,
+            help=(
+                "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
+                "into the base model at server startup; 'peft' uses the adapter manager."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",

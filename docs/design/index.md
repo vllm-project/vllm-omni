@@ -11,6 +11,10 @@ in the active navigation.
 
 ## Feature Design Documents
 
+For user-facing configuration and current compatibility, see the
+[Features overview](../features/README.md). A design document defines an
+implementation contract; it is not, by itself, a general support claim.
+
 ### Runtime and stage execution
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
@@ -30,6 +34,10 @@ in the active navigation.
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)
 
+### Quantization
+
+- [Quantization](feature/quantization.md)
+
 ### Diffusion acceleration
 
 #### Parallelism
@@ -42,13 +50,13 @@ in the active navigation.
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
 
-#### Attention Backends
+#### Attention optimization
+
+The [Diffusion Attention Backends](../user_guide/diffusion/attention_backends.md)
+guide lists all selectable backends and their platform defaults. Skip-Softmax
+is the backend-related optimization with a standalone feature-design contract:
 
 - [Skip-Softmax](feature/skip_softmax.md)
-
-#### Quantization
-
-- [Quantization](feature/quantization.md)
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)

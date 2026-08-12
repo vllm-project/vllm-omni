@@ -8,7 +8,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from diffusers.utils import numpy_to_pil
 
 from vllm_omni.diffusion.data import logger
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
@@ -19,7 +21,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
-    build_text_to_image_prompt,
+    build_text_to_image_prompt as build_model_text_to_image_prompt,
+)
+from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
@@ -52,6 +56,28 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
+def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared T2I example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["image"],
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
+def _normalize_images_for_save(images: list[Any]) -> list[Any]:
+    """Convert NumPy diffusion outputs to PIL images before saving."""
+    normalized = []
+    for image in images:
+        if isinstance(image, np.ndarray):
+            normalized.extend(numpy_to_pil(image))
+        else:
+            normalized.append(image)
+    return normalized
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,6 +273,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-path",
         type=str,
+        nargs="+",
         default=None,
         help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
     )
@@ -255,6 +282,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help="LoRA backend for loading LoRA adapters. Default: peft"
+        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
+        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -391,8 +427,12 @@ def main():
     # Prepare LoRA kwargs for Omni initialization
     lora_args: dict[str, Any] = {}
     if args.lora_path:
-        lora_args["lora_path"] = args.lora_path
-        print(f"Using LoRA from: {args.lora_path}")
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        lora_args["lora_path"] = lora_path
+        lora_args["lora_backend"] = args.lora_backend
+        print(f"Using LoRA from: {lora_path} with backend: {args.lora_backend}")
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
@@ -481,20 +521,27 @@ def main():
 
     # Build LoRA request when --lora-path is set
     lora_request = None
-    if args.lora_path:
-        lora_request_id = stable_lora_int_id(args.lora_path)
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request_id = stable_lora_int_id(lora_path)
         lora_request = LoRARequest(
-            lora_name=Path(args.lora_path).stem,
+            lora_name=Path(lora_path).stem,
             lora_int_id=lora_request_id,
-            lora_path=args.lora_path,
+            lora_path=lora_path,
         )
 
     generation_start = time.perf_counter()
 
     prompt_dict = build_text_to_image_prompt(
-        model_class_name=model_class_name,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
+    )
+    prompt_dict = build_model_text_to_image_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
         height=args.height,
         width=args.width,
     )
@@ -619,6 +666,7 @@ def main():
 
     if not images:
         raise ValueError("No images found in request_output")
+    images = _normalize_images_for_save(images)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

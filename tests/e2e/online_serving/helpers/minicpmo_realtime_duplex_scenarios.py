@@ -14,7 +14,7 @@ not a separate model-level barge-in contract.
 
 Run only after a MiniCPM-o 4.5 vLLM-Omni server is up:
 
-  python tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py \
+  python tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py \
       --url ws://localhost:8099/v1/realtime?duplex=1 \
       --model openbmb/MiniCPM-o-4_5 \
       --input-wav input_16k_mono_pcm16.wav \
@@ -37,7 +37,7 @@ import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -53,6 +53,7 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    summarize_session_request_metrics,
 )
 
 _url_with_model = build_realtime_url
@@ -193,6 +194,38 @@ class DemoState:
             }
             summaries[response_id] = timing
         return summaries
+
+    def session_request_metrics(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Return benchmark-style metrics for every response in this session."""
+        requests: list[dict[str, object]] = []
+        for request_index, (response_id, timing) in enumerate(self.response_timing_summaries().items()):
+            metrics = timing.get("request_metrics")
+            if not isinstance(metrics, dict):
+                continue
+            requests.append(
+                {
+                    "session_id": session_id,
+                    "request_index": request_index,
+                    "response_id": response_id,
+                    **metrics,
+                }
+            )
+        return requests
+
+    def session_metric_summary(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Average TTFT, TTFP, and RTF across responses that emitted audio."""
+        return summarize_session_request_metrics(
+            self.session_request_metrics(session_id=session_id),
+            session_id=session_id,
+        )
 
     def first_index(self, event_type: str, predicate=None) -> int | None:
         for index, event in enumerate(self.events):
@@ -1538,6 +1571,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
+        "request_metrics": state.session_request_metrics(session_id=args.session_id),
+        "session_metrics": state.session_metric_summary(session_id=args.session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,

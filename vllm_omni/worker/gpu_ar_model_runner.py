@@ -46,7 +46,12 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     stage_sends_async_output,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    partition_payload_list,
+    snapshot_mm_payload,
+    to_payload_element,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
@@ -1715,6 +1720,35 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
 
+    def _should_defer_full_payload_d2h(self) -> bool:
+        """Keep opted-in full payloads on device until request completion."""
+        return (
+            getattr(self, "omni_prefix_cache", None) is None
+            and self._runner_model_omni_flag("omni_payload_at_request_end")
+            and self._should_accumulate_full_payload_output()
+        )
+
+    def _build_omni_step_outputs(
+        self,
+        pooler_inter: list[dict[str, object]],
+        pooler_client: list[dict[str, object]],
+        *,
+        defer_full_payload_d2h: bool,
+    ) -> tuple[
+        list[dict[str, torch.Tensor] | None] | None,
+        list[dict[str, torch.Tensor] | None] | None,
+    ]:
+        if defer_full_payload_d2h:
+            # The connector-side full-payload accumulator owns the snapshots.
+            # Nothing from an intermediate stage needs to cross the worker/core
+            # boundary on each decode step.
+            return None, None
+        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        multimodal_outputs = (
+            inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+        )
+        return inter_stage_outputs, multimodal_outputs
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1879,6 +1913,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        defer_full_payload_d2h = needs_pooler_payload and self._should_defer_full_payload_d2h()
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
@@ -1933,10 +1968,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                 )
             if combined_multimodal_outputs is None:
-                with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
-                    mm_cpu = build_mm_cpu(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                    )
+                flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                if defer_full_payload_d2h:
+                    with record_function_or_nullcontext("omni_output_builder:snapshot_mm_payload"):
+                        mm_cpu = snapshot_mm_payload(flat_mm)
+                else:
+                    with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
+                        mm_cpu = build_mm_cpu(flat_mm)
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
                 if not postprocess_already_applied:
@@ -1995,9 +2033,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
-            inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-            multimodal_outputs = (
-                inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
+                pooler_inter,
+                pooler_client,
+                defer_full_payload_d2h=defer_full_payload_d2h,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):

@@ -2206,6 +2206,24 @@ class TestBaseConfigInheritance:
 class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
+    def test_qwen3_omni_musa_clears_parent_quantization_for_audio_stages(self):
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+
+        base_stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
+        assert "hf_overrides" not in base_stages[1].yaml_engine_args
+        assert "hf_overrides" not in base_stages[2].yaml_engine_args
+
+        musa = _apply_platform_overrides(load_deploy_config(deploy_path), platform="musa")
+        musa_stages = merge_pipeline_deploy(pipeline, musa)
+        expected = {"quantization_config": None}
+        assert musa_stages[1].yaml_engine_args["hf_overrides"] == expected
+        assert musa_stages[2].yaml_engine_args["hf_overrides"] == expected
+
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
 
@@ -2241,7 +2259,8 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            assert replica_stages[1].yaml_engine_args["kv_cache_memory_bytes"] is None
+            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -2256,6 +2275,16 @@ class TestPlatformOverrides:
         assert deploy.stages[0].devices == "0,1"
         # Stage 2 unaffected fields stay at base
         assert deploy.stages[2].enforce_eager is False
+
+    def test_qwen2_5_omni_xpu_uses_eager_ar_stages(self):
+        deploy_path = Path(get_deploy_config_path("qwen2_5_omni.yaml"))
+
+        deploy = load_deploy_config(deploy_path)
+        deploy = _apply_platform_overrides(deploy, platform="xpu")
+
+        assert deploy.stages[0].enforce_eager is True
+        assert deploy.stages[1].enforce_eager is True
+        assert deploy.stages[2].enforce_eager is True
 
     def test_xpu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

@@ -92,6 +92,9 @@ class _Request:
         self.num_computed_tokens = 0
         self.num_in_flight_tokens = 0
         self.num_output_placeholders = 0
+        # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
+        # track in-flight outputs discarded at preemption/streaming-stop.
+        self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
         self.pooling_params = None
         self.resumable = True

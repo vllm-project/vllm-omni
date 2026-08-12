@@ -9,6 +9,14 @@ primary_code_paths:
   - vllm_omni/model_executor/**
   - vllm_omni/model_extras/**
   - vllm_omni/plugins/**
+primary_code_path_owners:
+  # Additional owners scoped to a sub-path of model_executor/**
+  - paths:
+      - vllm_omni/model_executor/models/**
+    owners:
+      - "@Sy0307"
+      - "@amy-why-3459"
+      - "@linyueqian"
 related_code_paths:
   - vllm_omni/transformers_utils/**
   - vllm_omni/tokenizers/**

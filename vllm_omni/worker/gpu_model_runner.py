@@ -206,8 +206,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
-        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+        talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", None)
+        # Preserve the legacy separate-talker default only when the model has
+        # not declared graph safety. An explicit False must disable wrapping.
+        if talker_mtp_graph_safe is None:
+            talker_mtp_graph_safe = has_separate_talker
+        if cudagraph_mode.has_full_cudagraphs() and talker_mtp_graph_safe:
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
             self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
@@ -878,6 +882,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -905,6 +910,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            randomize_inputs: If True, randomize dummy input ids to balance
+                expert selection. vLLM's kernel_warmup passes this when
+                autotuning flashinfer.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -1127,7 +1135,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                self.maybe_randomize_inputs(input_ids, inputs_embeds, randomize_inputs=randomize_inputs),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,

@@ -47,6 +47,7 @@ from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -167,6 +168,11 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
+
+def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
+    """Read a partition's distilled schedule. An absent key means legacy uniform."""
+    return DMD2SigmaSchedule.from_metadata(release)
 
 
 def _resolve_component_quant_config(quant_config, component: str):
@@ -538,10 +544,14 @@ class MiniMaxH3Pipeline(
         "encode_prompt",
         "_encode_video_conditions",
         "_encode_video_audio_conditions",
+        "_encode_audio_conditions",
         "diffuse",
         "decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    # Only distilled releases pin a schedule, so the default keeps the legacy
+    # uniform path available to partially constructed pipelines.
+    _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -605,6 +615,13 @@ class MiniMaxH3Pipeline(
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
+        # Distilled releases pin their own few-step rectified-flow positions; the
+        # uniform schedule derived from num_inference_steps does not match what
+        # such a checkpoint was trained on. Each partition carries its own
+        # contract, so a distilled FL2VA must not drag Ref2VA onto its schedule.
+        self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        if ref2va_model_path is not None:
+            self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -737,6 +754,11 @@ class MiniMaxH3Pipeline(
         if task == "ref2va" and hasattr(self, "transformers_ref"):
             return self.transformers_ref
         return self.transformer
+
+    def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
+        """Return the distilled schedule of the partition that serves ``task``."""
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._base_schedule_by_partition.get(partition)
 
     def _resolve_task(
         self,
@@ -877,10 +899,7 @@ class MiniMaxH3Pipeline(
                     videos = []
                     sampled_videos = []
                     for index, item in enumerate(prepared_videos):
-                        sampled = sample_reference_video_frames(
-                            item["prepared_path"],
-                            workdir=str(Path(item["prepared_path"]).parent / f"qwen_frames_{index}"),
-                        )
+                        sampled = sample_reference_video_frames(item["prepared_path"])
                         videos.append(np.stack(sampled["frames"]))
                         sampled_videos.append(sampled)
                     vision = self.processor.video_processor(
@@ -1204,14 +1223,26 @@ class MiniMaxH3Pipeline(
     def _encode_audio_conditions(
         self,
         audios: list[tuple[torch.Tensor, int]],
+        *,
+        max_duration_seconds: float | None = None,
     ) -> tuple[torch.Tensor | None, list[int]]:
         if not audios:
             return None, []
+        if max_duration_seconds is not None:
+            max_duration_seconds = float(max_duration_seconds)
+            if max_duration_seconds <= 0:
+                raise ValueError("max_duration_seconds must be positive")
         _, rank, _ = _dit_rank_world()
         rows = None
         lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
         if rank == 0:
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in audios]
+            bounded_audios = []
+            for waveform, sample_rate in audios:
+                if max_duration_seconds is not None:
+                    max_samples = int(round(max_duration_seconds * int(sample_rate)))
+                    waveform = waveform[..., :max_samples]
+                bounded_audios.append((waveform, sample_rate))
+            encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
             rows = torch.cat([item[0] for item in encoded])
             lengths = torch.tensor(
                 [int(item[1]) for item in encoded],
@@ -1311,7 +1342,10 @@ class MiniMaxH3Pipeline(
                     *load_video_audio(
                         item["original_path"],
                         start_time_seconds=float(item.get("start_time_seconds", 0.0)),
-                        duration_seconds=item.get("duration_seconds"),
+                        duration_seconds=item.get(
+                            "audio_duration_seconds",
+                            item.get("duration_seconds"),
+                        ),
                     )
                 )
                 for item in prepared_videos
@@ -1389,6 +1423,7 @@ class MiniMaxH3Pipeline(
         num_steps: int,
         video_shift: float,
         audio_shift: float,
+        base_schedule: Sequence[float] | None,
         visual_condition: torch.Tensor | None,
         visual_condition_shape: tuple[int, int, int] | None,
         audio_condition: torch.Tensor | None,
@@ -1490,10 +1525,12 @@ class MiniMaxH3Pipeline(
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
+            base_schedule=base_schedule,
         )
         audio_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=audio_shift,
+            base_schedule=base_schedule,
         )
         transformer = self._transformer_for_task(task)
         # The static DLO plan keeps leading blocks resident only for the
@@ -1710,7 +1747,10 @@ class MiniMaxH3Pipeline(
                     prepared_videos,
                     has_audio=has_audio,
                 )
-                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(standalone_audios)
+                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(
+                    standalone_audios,
+                    max_duration_seconds=float(num_frames) / float(sampling.fps or MINIMAX_H3_FPS),
+                )
                 audio_parts = [
                     item for item in (embedded_audio_condition, external_audio_condition) if item is not None
                 ]
@@ -1755,7 +1795,22 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        num_steps = int(sampling.num_inference_steps or 50)
+        sigma_schedule = self._base_schedule_for_task(task)
+        if sigma_schedule is None:
+            base_schedule = None
+            num_steps = int(sampling.num_inference_steps or 50)
+        else:
+            # The schedule lists sigma boundaries; the denoise loop runs one
+            # step per interval, and that count is what requests and Cache-DiT
+            # speak in.
+            base_schedule = sigma_schedule.base_schedule
+            num_steps = sigma_schedule.num_inference_steps
+            requested_steps = sampling.num_inference_steps
+            if requested_steps is not None and int(requested_steps) != num_steps:
+                raise OmniClientError(
+                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; num_inference_steps "
+                    f"must be {num_steps} or omitted, got {int(requested_steps)}"
+                )
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         quality_plan = self._quality_policy.resolve(
@@ -1781,6 +1836,7 @@ class MiniMaxH3Pipeline(
                 num_steps=num_steps,
                 video_shift=video_shift,
                 audio_shift=audio_shift,
+                base_schedule=base_schedule,
                 visual_condition=visual_condition,
                 visual_condition_shape=visual_shape,
                 audio_condition=audio_condition,
