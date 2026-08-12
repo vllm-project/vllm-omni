@@ -13,8 +13,8 @@ from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     create_transformer_from_config,
-    load_wan_vae_scale_factors,
     load_transformer_config,
+    load_wan_vae_scale_factors,
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID

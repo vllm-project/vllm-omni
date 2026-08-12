@@ -125,9 +125,7 @@ class BaseScheduler(ABC):
                 prompt = getattr(nxt.req, "prompt", None)
                 stage_payload_handle = None
                 if isinstance(prompt, dict):
-                    stage_payload_handle = prompt.get("_stage_payload_transfer") or prompt.get(
-                        "_encode_transfer"
-                    )
+                    stage_payload_handle = prompt.get("_stage_payload_transfer") or prompt.get("_encode_transfer")
                 if (self._prefetch_enabled and sender_info) or isinstance(stage_payload_handle, dict):
                     kv_prefetch_job = {"request_id": nxt.request_id}
                     if self._prefetch_enabled and sender_info:
