@@ -150,7 +150,7 @@ class BatchedToken2Wav(nn.Module):
             else:
                 logger.info(
                     "CFM CUDA Graph is disabled on device type %s",
-                    flow_parameter.device.type if flow_parameter else "unknown",
+                    flow_parameter.device.type if flow_parameter is not None else "unknown",
                 )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
 
