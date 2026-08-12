@@ -84,6 +84,7 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:1
           # Video-MME needs no repo override here: the NPU runners pre-stage the dataset under
           # the lmms-eval mirror, which is now VIDEOMME_DEFAULT_HF_REPO, so snapshot_download

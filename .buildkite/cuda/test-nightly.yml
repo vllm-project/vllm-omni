@@ -41,6 +41,7 @@ steps:
   #       timeout_in_minutes: 180
   #       commands:
   #         - export SEED_TTS_WER_EVAL=1
+  #         - export SEED_TTS_SIM_EVAL=1
   #         - export SEED_TTS_EVAL_DEVICE=cuda:1
   #         - |
   #           set +e
@@ -54,6 +55,7 @@ steps:
         timeout_in_minutes: 180
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - |
             set +e
