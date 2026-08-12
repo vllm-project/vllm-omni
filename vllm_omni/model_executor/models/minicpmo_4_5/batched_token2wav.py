@@ -148,7 +148,10 @@ class BatchedToken2Wav(nn.Module):
                 )
                 logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
             else:
-                logger.info("CFM CUDA Graph is disabled on device type %s", flow_parameter.device.type if flow_parameter else "unknown")
+                logger.info(
+                    "CFM CUDA Graph is disabled on device type %s",
+                    flow_parameter.device.type if flow_parameter else "unknown",
+                )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
 
     def _hift_inference(
@@ -285,7 +288,12 @@ class BatchedToken2Wav(nn.Module):
             if att_cache is None:
                 att_cache = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
             return self._cfm_graph_wrapper.replay(
-                estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out,
+                estimator_input,
+                time_embedding,
+                cnn_cache,
+                att_cache,
+                cnn_out,
+                att_out,
             )
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
