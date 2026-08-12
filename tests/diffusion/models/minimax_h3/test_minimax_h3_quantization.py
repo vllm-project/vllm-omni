@@ -211,3 +211,20 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
+
+
+def test_text_encoder_online_nvfp4_env_is_explicit(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        _TEXT_ENCODER_QUANT_ENV,
+        minimax_h3_text_encoder_quantization,
+    )
+
+    monkeypatch.delenv(_TEXT_ENCODER_QUANT_ENV, raising=False)
+    assert not minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "bf16")
+    assert not minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "online_nvfp4_w4a16")
+    assert minimax_h3_text_encoder_quantization()
+    monkeypatch.setenv(_TEXT_ENCODER_QUANT_ENV, "fp8")
+    with pytest.raises(ValueError, match="bf16 or online_nvfp4_w4a16"):
+        minimax_h3_text_encoder_quantization()

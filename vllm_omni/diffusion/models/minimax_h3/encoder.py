@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 from typing import Any
 
@@ -44,6 +45,20 @@ MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
 logger = init_logger(__name__)
 
+_TEXT_ENCODER_QUANT_ENV = "VLLM_OMNI_H3_TEXT_ENCODER_QUANTIZATION"
+
+
+def minimax_h3_text_encoder_quantization() -> bool:
+    """Return whether opt-in online W4A16 NVFP4 is requested."""
+    value = os.getenv(_TEXT_ENCODER_QUANT_ENV, "").strip().lower()
+    if not value or value in {"none", "bf16"}:
+        return False
+    if value in {"online_nvfp4", "online_nvfp4_w4a16", "nvfp4_online"}:
+        return True
+    raise ValueError(
+        f"{_TEXT_ENCODER_QUANT_ENV} must be bf16 or online_nvfp4_w4a16; got {value!r}"
+    )
+
 
 def _default_weight_loader(
     param: nn.Parameter,
@@ -56,6 +71,85 @@ def _default_weight_loader(
 
 def _tp_range(group: Any) -> tuple[int, int]:
     return group.rank_in_group, group.world_size
+
+
+class _MiniMaxH3OnlineNvFp4Linear:
+    """Convert a CUDA-resident BF16 TP linear to ModelOpt W4A16 NVFP4.
+
+    vLLM's ModelOpt method intentionally rejects dynamic conversion at its
+    public checkpoint loader.  This experiment explicitly performs ModelOpt's
+    in-memory packing at load time, then feeds those serialized tensors to the
+    same W4A16 Marlin method.  It neither reads an offline artifact nor uses
+    FP8 as a fallback.
+    """
+
+    _online_nvfp4_method: Any | None
+    _online_nvfp4_layer: nn.Module | None
+
+    def _init_online_nvfp4(self, enabled: bool) -> None:
+        self._online_nvfp4_enabled = enabled
+        self._online_nvfp4_method = None
+        self._online_nvfp4_layer = None
+
+    @property
+    def is_online_nvfp4_quantized(self) -> bool:
+        return self._online_nvfp4_layer is not None
+
+    def _quantize_online_nvfp4(
+        self,
+        *,
+        input_size: int,
+        output_partition_sizes: list[int],
+    ) -> tuple[int, int]:
+        if not self._online_nvfp4_enabled or self._online_nvfp4_layer is not None:
+            return 0, 0
+        if not self.weight.is_cuda:
+            raise RuntimeError("MiniMax H3 online NVFP4 conversion requires CUDA-resident BF16 weights")
+
+        from modelopt.torch.quantization.qtensor import NVFP4QTensor
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptNvFp4Config,
+            ModelOptNvFp4W4A16LinearMethod,
+        )
+
+        source_nbytes = self.weight.numel() * self.weight.element_size()
+        packed, weight_scale, weight_scale_2 = NVFP4QTensor.quantize(self.weight.detach(), 16)
+        config = ModelOptNvFp4Config(
+            quant_method="W4A16_NVFP4",
+            # This is an in-memory serialized representation created above;
+            # the method otherwise correctly rejects unsupported dynamic I/O.
+            is_checkpoint_nvfp4_serialized=True,
+            exclude_modules=[],
+            group_size=16,
+        )
+        method = ModelOptNvFp4W4A16LinearMethod(config)
+        layer = nn.Module()
+        layer.params_dtype = torch.bfloat16
+        method.create_weights(
+            layer,
+            input_size_per_partition=self.weight.shape[1],
+            output_partition_sizes=output_partition_sizes,
+            input_size=input_size,
+            output_size=sum(output_partition_sizes),
+            params_dtype=torch.bfloat16,
+        )
+        layer.to(self.weight.device)
+        layer.weight.data.copy_(packed._quantized_data)
+        layer.weight_scale.data.copy_(weight_scale)
+        # ModelOpt's public quantizer returns a scalar global scale. vLLM's
+        # fused QKV/gate-up loader stores one equal value per logical part.
+        layer.weight_scale_2.data.copy_(weight_scale_2.reshape(1).repeat(len(output_partition_sizes)))
+        method.process_weights_after_loading(layer)
+        self._online_nvfp4_method = method
+        self._online_nvfp4_layer = layer
+        del self._parameters["weight"]
+        state_nbytes = sum(parameter.numel() * parameter.element_size() for parameter in layer.parameters())
+        return source_nbytes, state_nbytes
+
+    def _linear(self, input_: torch.Tensor) -> torch.Tensor:
+        if self._online_nvfp4_layer is None:
+            return F.linear(input_, self.weight)
+        return self._online_nvfp4_method.apply(self._online_nvfp4_layer, input_)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +206,7 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         param.data.copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLMergedColumnParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn.Module):
     """Packed gate/up projection sharded along the output dimension."""
 
     def __init__(
@@ -121,6 +215,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
         input_size: int,
         intermediate_size: int,
         dtype: torch.dtype,
+        online_nvfp4: bool = False,
     ) -> None:
         super().__init__()
         self.group = group
@@ -135,9 +230,16 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        self._init_online_nvfp4(online_nvfp4)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return self._linear(input_)
+
+    def quantize_for_inference(self) -> tuple[int, int]:
+        return self._quantize_online_nvfp4(
+            input_size=self.input_size,
+            output_partition_sizes=[self.intermediate_size_per_partition] * 2,
+        )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -150,7 +252,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
             param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLQKVParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn.Module):
     """QKV projection with GQA head sharding along the output dimension."""
 
     def __init__(
@@ -161,6 +263,7 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        online_nvfp4: bool = False,
     ) -> None:
         super().__init__()
         self.group = group
@@ -183,9 +286,18 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        self._init_online_nvfp4(online_nvfp4)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return self._linear(input_)
+
+    def quantize_for_inference(self) -> tuple[int, int]:
+        q_local = self.local_num_heads * self.head_dim
+        kv_local = self.local_num_kv_heads * self.head_dim
+        return self._quantize_online_nvfp4(
+            input_size=self.hidden_size,
+            output_partition_sizes=[q_local, kv_local, kv_local],
+        )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -238,7 +350,39 @@ def _verify_fused_shards_complete(
     raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
 
 
-class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
+# A fused weight is filled from several checkpoint tensors, so a partial load leaves
+# uninitialized `torch.empty` rows that no later check would catch. Keyed by the class
+# owning the multi-shard `weight_loader`; each entry is the source name reported to the
+# user paired with the shard id that loader expects, in projection order.
+_FUSED_SOURCE_SHARDS: dict[type[nn.Module], tuple[tuple[str, str | int], ...]] = {
+    MiniMaxH3Qwen3VLQKVParallelLinear: (("q", "q"), ("k", "k"), ("v", "v")),
+    MiniMaxH3Qwen3VLMergedColumnParallelLinear: (("gate", 0), ("up", 1)),
+}
+
+
+def _fused_source_shards(module: nn.Module) -> tuple[tuple[str, str | int], ...] | None:
+    for cls, sources in _FUSED_SOURCE_SHARDS.items():
+        if isinstance(module, cls):
+            return sources
+    return None
+
+
+def _verify_fused_shards_complete(
+    expected: dict[str, tuple[tuple[str, str | int], ...]],
+    loaded: dict[str, set[str | int]],
+) -> None:
+    missing = {
+        name: [source for source, shard_id in sources if shard_id not in loaded[name]]
+        for name, sources in expected.items()
+    }
+    missing = {name: sources for name, sources in missing.items() if sources}
+    if not missing:
+        return
+    details = "; ".join(f"{name}: {sources}" for name, sources in sorted(missing.items()))
+    raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
+
+
+class MiniMaxH3Qwen3VLRowParallelLinear(_MiniMaxH3OnlineNvFp4Linear, nn.Module):
     def __init__(
         self,
         group: Any,
@@ -246,6 +390,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         output_size: int,
         dtype: torch.dtype,
         input_is_parallel: bool = True,
+        online_nvfp4: bool = False,
     ) -> None:
         super().__init__()
         self.group = group
@@ -259,6 +404,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        self._init_online_nvfp4(online_nvfp4)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.input_is_parallel:
@@ -266,7 +412,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         else:
             split_input = input_.split(self.input_size_per_partition, dim=-1)
             input_parallel = split_input[self._tp_rank].contiguous()
-        output_parallel = F.linear(input_parallel, self.weight)
+        output_parallel = self._linear(input_parallel)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
@@ -274,8 +420,17 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
             # and amplify error on this model's large-magnitude activations.
             output_parallel = output_parallel.float()
             self.group.all_reduce(output_parallel)
-            output_parallel = output_parallel.to(self.weight.dtype)
+            # Online W4A16 conversion releases the BF16 source weight, while
+            # the text encoder's externally visible row-parallel contract
+            # remains BF16.
+            output_parallel = output_parallel.to(torch.bfloat16)
         return output_parallel
+
+    def quantize_for_inference(self) -> tuple[int, int]:
+        return self._quantize_online_nvfp4(
+            input_size=self.input_size,
+            output_partition_sizes=[self.output_size],
+        )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -659,7 +814,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextAttention(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
         super().__init__()
         self.group = group
         self.config = config
@@ -677,6 +832,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             dtype=dtype,
+            online_nvfp4=online_nvfp4,
         )
         self.o_proj = MiniMaxH3Qwen3VLRowParallelLinear(
             group,
@@ -684,6 +840,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             output_size=self.hidden_size,
             dtype=dtype,
             input_is_parallel=True,
+            online_nvfp4=online_nvfp4,
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -697,14 +854,23 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_local = self.qkv_proj.local_num_heads * self.head_dim
         kv_local = self.qkv_proj.local_num_kv_heads * self.head_dim
-        q_weight = self.qkv_proj.weight[0:q_local]
-        k_weight = self.qkv_proj.weight[q_local : q_local + kv_local]
-        v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
-        # Three separate GEMMs keep the numerics identical to the reference
-        # path (packed QKV changes cuBLAS tiling and shifts bf16 rounding).
-        query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape)).transpose(1, 2)
-        value_states = F.linear(hidden_states, v_weight).view(hidden_shape).transpose(1, 2)
+        if self.qkv_proj.is_online_nvfp4_quantized:
+            packed_qkv = self.qkv_proj(hidden_states)
+            query_states = self.q_norm(packed_qkv[..., :q_local].view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(packed_qkv[..., q_local : q_local + kv_local].view(hidden_shape)).transpose(1, 2)
+            value_states = (
+                packed_qkv[..., q_local + kv_local : q_local + 2 * kv_local]
+                .view(hidden_shape)
+                .transpose(1, 2)
+            )
+        else:
+            q_weight = self.qkv_proj.weight[0:q_local]
+            k_weight = self.qkv_proj.weight[q_local : q_local + kv_local]
+            v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
+            # Three separate GEMMs keep BF16 numerics identical to the reference.
+            query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape)).transpose(1, 2)
+            value_states = F.linear(hidden_states, v_weight).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -728,7 +894,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextMLP(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -737,6 +903,7 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
             input_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             dtype=dtype,
+            online_nvfp4=online_nvfp4,
         )
         self.down_proj = MiniMaxH3Qwen3VLRowParallelLinear(
             group,
@@ -744,22 +911,26 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
             output_size=self.hidden_size,
             dtype=dtype,
             input_is_parallel=True,
+            online_nvfp4=online_nvfp4,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ip_local = self.gate_up_proj.intermediate_size_per_partition
-        gate = F.linear(x, self.gate_up_proj.weight[0:ip_local])
-        up = F.linear(x, self.gate_up_proj.weight[ip_local : 2 * ip_local])
+        if self.gate_up_proj.is_online_nvfp4_quantized:
+            gate, up = self.gate_up_proj(x).split(ip_local, dim=-1)
+        else:
+            gate = F.linear(x, self.gate_up_proj.weight[0:ip_local])
+            up = F.linear(x, self.gate_up_proj.weight[ip_local : 2 * ip_local])
         x = F.silu(gate) * up
         return self.down_proj(x)
 
 
 class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(self, group: Any, config: Any, dtype: torch.dtype, *, online_nvfp4: bool = False) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
-        self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
+        self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype, online_nvfp4=online_nvfp4)
+        self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype, online_nvfp4=online_nvfp4)
         self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -783,7 +954,15 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
 class MiniMaxH3Qwen3VLTextModel(nn.Module):
     """TP-sharded Qwen3-VL text model returning unnormalized layer-50 states."""
 
-    def __init__(self, group: Any, config: Any, selected_layer: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        group: Any,
+        config: Any,
+        selected_layer: int,
+        dtype: torch.dtype,
+        *,
+        online_nvfp4: bool = False,
+    ) -> None:
         super().__init__()
         self.group = group
         self.config = config
@@ -796,8 +975,28 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         )
         self.rotary_emb = MiniMaxH3Qwen3VLTextRotaryEmbedding(config)
         self.layers = nn.ModuleList(
-            [MiniMaxH3Qwen3VLTextDecoderLayer(group, config, dtype) for _ in range(self.num_layers)]
+            [
+                MiniMaxH3Qwen3VLTextDecoderLayer(group, config, dtype, online_nvfp4=online_nvfp4)
+                for _ in range(self.num_layers)
+            ]
         )
+
+    def quantize_linears_for_inference(self) -> tuple[int, int, int]:
+        """Online-convert every retained custom TP linear exactly once."""
+        converted = source_nbytes = state_nbytes = 0
+        for decoder in self.layers:
+            for linear in (
+                decoder.self_attn.qkv_proj,
+                decoder.self_attn.o_proj,
+                decoder.mlp.gate_up_proj,
+                decoder.mlp.down_proj,
+            ):
+                source, state = linear.quantize_for_inference()
+                if source:
+                    converted += 1
+                    source_nbytes += source
+                    state_nbytes += state
+        return converted, source_nbytes, state_nbytes
 
     def _deepstack_process(
         self,
@@ -943,6 +1142,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         device: torch.device,
         load_model: bool,
         encoder_group: Any | None = None,
+        online_nvfp4: bool = False,
     ) -> None:
         super().__init__()
         self.device_target = device
@@ -950,6 +1150,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.image_token_id = 151655
         self.video_token_id = 151656
         self._tp_size = 1
+        self.online_nvfp4 = online_nvfp4
+        self._online_nvfp4_loaded = False
         if not load_model:
             return
 
@@ -967,13 +1169,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             config.text_config,
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             dtype,
+            online_nvfp4=online_nvfp4,
         )
         self.text_model.to(dtype=dtype)
         self._load_weights(model_path)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, "
+            "vision replicated, online_nvfp4=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            online_nvfp4,
         )
 
     @property
@@ -1080,10 +1285,42 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
+        if self.online_nvfp4 and not self._online_nvfp4_loaded:
+            started = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            started.record()
+            converted, source_nbytes, state_nbytes = self.text_model.quantize_linears_for_inference()
+            finished.record()
+            finished.synchronize()
+            expected = MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER * 4
+            if converted != expected:
+                raise RuntimeError(
+                    f"MiniMax H3 online NVFP4 converted {converted} TP linears; expected {expected}"
+                )
+            self._online_nvfp4_loaded = True
+            # The BF16 source parameters were released by each linear, but
+            # their blocks remain reserved in the CUDA caching allocator until
+            # explicitly returned. Online conversion would otherwise retain
+            # roughly the original text-linear footprint at process level.
+            torch.accelerator.empty_cache()
+            gib = 1024**3
+            logger.info(
+                "MiniMax H3 text encoder online W4A16_NVFP4 converted %d TP linears in %.3f ms: "
+                "%.2f GiB BF16 -> %.2f GiB post-Marlin state (%.2f GiB released)",
+                converted,
+                started.elapsed_time(finished),
+                source_nbytes / gib,
+                state_nbytes / gib,
+                (source_nbytes - state_nbytes) / gib,
+            )
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
             return
+        if self.online_nvfp4:
+            raise RuntimeError(
+                "MiniMax H3 online NVFP4 is GPU-resident after Marlin packing and does not support CPU offload"
+            )
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:
                 hook.offload_layer()
@@ -1320,4 +1557,4 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self.encode_ids(input_ids, **kwargs)
 
 
-__all__ = ["MiniMaxH3Qwen3VLEncoder"]
+__all__ = ["MiniMaxH3Qwen3VLEncoder", "minimax_h3_text_encoder_quantization"]
