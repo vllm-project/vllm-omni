@@ -299,16 +299,21 @@ def resolve_lingbot_output_dimensions(
     sampling_width: Any = None,
     sampling_height: Any = None,
     prompt_fields: Mapping[str, Any] | None = None,
+    extra_fields: Mapping[str, Any] | None = None,
     default_width: int = 480,
     default_height: int = 480,
 ) -> tuple[int, int]:
     """Resolve the ``(width, height)`` that LingBot will use for generation."""
     prompt_fields = prompt_fields or {}
-    requested_width = _pick(prompt_fields, "width")
-    requested_height = _pick(prompt_fields, "height")
-    size = _pick(prompt_fields, "size")
-    resolution = _pick(prompt_fields, "resolution")
-    ratio = _pick(prompt_fields, "ratio")
+    extra_fields = extra_fields or {}
+    # Online requests deliver `extra_params` through sampling.extra_args; the
+    # offline path embeds the same fields in the prompt dict. Consult both,
+    # extra_args first — the same precedence fps and num_frames use.
+    requested_width = _first_not_none(_pick(extra_fields, "width"), _pick(prompt_fields, "width"))
+    requested_height = _first_not_none(_pick(extra_fields, "height"), _pick(prompt_fields, "height"))
+    size = _first_not_none(_pick(extra_fields, "size"), _pick(prompt_fields, "size"))
+    resolution = _first_not_none(_pick(extra_fields, "resolution"), _pick(prompt_fields, "resolution"))
+    ratio = _first_not_none(_pick(extra_fields, "ratio"), _pick(prompt_fields, "ratio"))
     if requested_width is not None or requested_height is not None:
         width, height = requested_width, requested_height
     elif size is not None or resolution is not None or ratio is not None:
@@ -414,6 +419,7 @@ def normalize_lingbot_request(
         sampling_width=sampling.width,
         sampling_height=sampling.height,
         prompt_fields=prompt_fields,
+        extra_fields=extra_args,
         default_width=default_width,
         default_height=default_height,
     )

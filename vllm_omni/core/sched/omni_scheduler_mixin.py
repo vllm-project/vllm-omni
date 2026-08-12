@@ -5,10 +5,12 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
@@ -80,6 +82,29 @@ class OmniSchedulerMixin:
             else None
         )
         self._latest_omni_connector_output = None
+        # Optional per-stage pooling-output decoder hook (dotted path in
+        # model_config); applied worker-side before IPC.
+        self._pooling_output_decoder = None
+        _decoder_path = getattr(model_config, "pooling_output_decoder", None)
+        if _decoder_path:
+            self._pooling_output_decoder = resolve_obj_by_qualname(str(_decoder_path))
+
+    def _maybe_decode_pooling_output(self, request: Request, pooler_output: Any) -> Any:
+        """Apply the stage's pooling-output decoder hook to the pooler tensor
+        before IPC, or pass it through unchanged when none is configured.
+        Decoder exceptions propagate; callers fail the request with
+        FinishReason.ERROR rather than emitting an empty success."""
+        if self._pooling_output_decoder is None:
+            return pooler_output
+        if pooler_output is None or getattr(request, "pooling_params", None) is None:
+            return pooler_output
+        if not isinstance(pooler_output, torch.Tensor):
+            return pooler_output
+        return self._pooling_output_decoder(
+            pooler_output,
+            request,
+            self.vllm_config.model_config.hf_config,
+        )
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -94,6 +119,17 @@ class OmniSchedulerMixin:
             adapter.segment_finished_requests.discard(session.request_id)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
+        # In-flight outputs from the previous segment were optimistically
+        # scheduled (async lookahead). Mark them stale so update_from_output
+        # drops them instead of underflowing num_output_placeholders
+        # (vLLM 0.27 a0c092ee72 removed async_tokens_to_discard). Seed in
+        # SCHEDULED-token units — num_in_flight_tokens matches what each
+        # pre-replacement frame will drain, so the counter reaches exactly
+        # zero; a placeholder-based seed swallowed valid new-segment frames
+        # whenever placeholder counts diverged from scheduled counts.
+        session.num_stale_output_tokens += int(getattr(session, "num_in_flight_tokens", 0) or 0)
+        session.num_output_placeholders = 0
+        session.spec_token_ids = []
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0

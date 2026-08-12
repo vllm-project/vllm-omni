@@ -59,6 +59,16 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_flux_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
     ),
+    "FluxKontextPipeline": DiffusionModelTestOpts(
+        model="black-forest-labs/FLUX.1-Kontext-dev",
+        builder=diff_model_builders.tiny_flux_kontext_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE, DiffusionTasks.IMAGE_TO_IMAGE],
+        extra_test_groups=[
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD, DiffusionAccs.CACHE_DIT],
+        ],
+    ),
     "Flux2Pipeline": DiffusionModelTestOpts(
         model="black-forest-labs/FLUX.2-dev",
         builder=diff_model_builders.tiny_flux2_builder,
