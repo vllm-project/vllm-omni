@@ -51,7 +51,12 @@ def build_request(text: str) -> dict:
     from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
     from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
 
-    cfg = GepardConfig()  # defaults match the trained checkpoint
+    # From the checkpoint's own gepard_config.json, which is what the worker
+    # builds its config from too. The class defaults match today's checkpoint,
+    # but reading them here would make this the second source of truth for the
+    # layout — and a layout that disagrees with the one the model was trained
+    # on does not fail, it just degrades the speech.
+    cfg = GepardConfig.from_checkpoint(MODEL)
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     prompt_token_ids = build_gepard_prompt_ids(
         tokenizer(text, add_special_tokens=False)["input_ids"],

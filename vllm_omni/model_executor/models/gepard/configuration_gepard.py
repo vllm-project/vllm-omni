@@ -64,10 +64,12 @@ class GepardConfig(PretrainedConfig):
         stop_threshold: float = 0.5,
         stop_loss_weight: float = 2.0,  # training-only, kept for fidelity
         stop_pos_weight: float = 25.0,  # training-only, kept for fidelity
-        # -- head0 sampling defaults (applied via vLLM SamplingParams; the
-        #    31 side-channel heads use the same temperature in-model) --
+        # -- Sampling temperature. Applies to head0 through vLLM's
+        #    SamplingParams and to the 31 side-channel heads in-model. The
+        #    sidecar's ``top_p`` is deliberately not surfaced: the 32 heads are
+        #    sampled by Gumbel-max, which has no nucleus step, so a top_p
+        #    attribute here would read as a knob that does nothing. --
         temperature: float = 0.3,
-        top_p: float = 0.95,
         **kwargs,
     ):
         # WARNING: every attribute below is assigned before super().__init__()
@@ -127,7 +129,6 @@ class GepardConfig(PretrainedConfig):
 
         # ---- Sampling / generation --------------------------------------
         self.temperature = temperature
-        self.top_p = top_p
 
         # ---- Voice cloning (carried for the follow-up cloning PR) --------
         vc = voice_cloning or {}
@@ -148,7 +149,12 @@ class GepardConfig(PretrainedConfig):
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_checkpoint(cls, model: str, backbone_config: dict | None = None) -> GepardConfig:
+    def from_checkpoint(
+        cls,
+        model: str,
+        backbone_config: dict | None = None,
+        revision: str | None = None,
+    ) -> GepardConfig:
         """Build the full config for a checkpoint whose ``config.json``
         self-identifies as the bare backbone (``qwen3_5_text``).
 
@@ -159,14 +165,18 @@ class GepardConfig(PretrainedConfig):
         fields from the ``gepard_config.json`` sidecar, backbone fields from
         the loaded checkpoint config (authoritative — it is what vLLM's
         ``hf_text_config`` already runs the backbone on).
+
+        ``revision`` must be the one the weights were loaded from: a revision
+        that moves the audio-head cardinalities or the special tokens moves the
+        prompt layout and the STOP sentinel with them.
         """
         sidecar: dict = {}
         try:
             # vLLM util: resolves both local snapshot dirs and hub ids.
             from vllm.transformers_utils.config import get_hf_file_to_dict
 
-            sidecar = dict(get_hf_file_to_dict("gepard_config.json", model, revision=None) or {})
-        except (OSError, ValueError, TypeError) as e:
+            sidecar = dict(get_hf_file_to_dict("gepard_config.json", model, revision=revision) or {})
+        except (OSError, ValueError) as e:
             # A missing/unreadable/malformed sidecar is expected — the defaults
             # match the trained checkpoint. Anything else (an import error, a
             # signature change in the vLLM util) is a real bug and must surface.

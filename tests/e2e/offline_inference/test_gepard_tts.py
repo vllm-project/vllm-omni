@@ -10,6 +10,7 @@ is covered on CPU in ``tests/model_executor/models/test_gepard_window.py``.
 
 from __future__ import annotations
 
+import functools
 import tempfile
 from pathlib import Path
 from typing import NamedTuple
@@ -42,9 +43,19 @@ SAMPLE_RATE = 22050
 # NanoCodec upsamples one FSQ frame to exactly this many samples; the advertised
 # 21.5 fps is 22050 / 1024 rounded.
 SAMPLES_PER_FRAME = 1024
-# The sentinel compute_logits emits instead of a head0 to end a request. It sits
-# just past head0's range, so a token equal to it is never a committed frame.
-STOP_TOKEN = GepardConfig().stop_token
+
+
+@functools.cache
+def _config() -> GepardConfig:
+    """The checkpoint's own layout, not the class defaults.
+
+    The worker builds its config from the ``gepard_config.json`` sidecar, so a
+    prompt assembled from the defaults would silently use a different layout
+    the day the sidecar moves — and a mismatched layout degrades the speech
+    rather than failing, which is the hardest way for this to be found.
+    """
+    return GepardConfig.from_checkpoint(MODEL_NAME)
+
 
 # Prompt -> a word that appears in no other prompt. Concurrency is only
 # testable if a clip can be traced back to the request that asked for it.
@@ -111,11 +122,10 @@ pytestmark = [
 
 def _build_request(text: str) -> dict:
     """Assemble the [speaker slots, SOT, text, EOT, SOS] prompt."""
-    cfg = GepardConfig()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     prompt_token_ids = build_gepard_prompt_ids(
         tokenizer(text, add_special_tokens=False)["input_ids"],
-        config=cfg,
+        config=_config(),
     )
     return {
         "prompt_token_ids": prompt_token_ids,
@@ -145,23 +155,30 @@ class _Clip(NamedTuple):
 
 
 def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
-    """Submit every text in one call and return one clip per request.
+    """Submit every text in one call and return one clip per request, in
+    submission order — ``clips[i]`` is what the engine produced for ``texts[i]``.
 
-    Clips come back in COMPLETION order, not submission order: ``Omni.generate``
-    yields each request as the engine finishes it and never sorts, unlike
-    vLLM's ``LLM.generate``. So callers must not pair ``clips[i]`` with
-    ``texts[i]`` — identify a clip by what it contains, or recover the index
-    from the request id, which is prefixed with it.
+    The engine does not deliver them that way. ``Omni.generate`` yields each
+    request as it finishes and never sorts, unlike vLLM's ``LLM.generate``, so
+    they arrive in COMPLETION order. Restoring the pairing here is what lets a
+    caller assert that a clip says what *its own* prompt asked for; without it
+    the only testable claim is that the batch as a whole looks plausible, and a
+    stable swap between two requests satisfies that.
 
-    No SamplingParams on purpose: a caller-supplied object replaces the stage
-    defaults rather than merging over them, dropping the pipeline's
-    stop_token_ids.
+    The pairing comes from the request id, which ``Omni.generate`` builds as
+    ``f"{i}_{uuid4()}"`` over the submitted prompts (``entrypoints/omni.py``).
+
+    Nothing here authors a SamplingParams: ``OmniRunner.generate`` forwards the
+    engine's own stage defaults. A freshly built one would replace those
+    defaults rather than merge over them, dropping the pipeline's
+    stop_token_ids and leaving every request to run to ``max_tokens``.
     """
     outputs = omni.generate([_build_request(t) for t in texts])
     assert len(outputs) == len(texts), f"expected {len(texts)} outputs, got {len(outputs)}"
 
-    clips = []
+    by_index: dict[int, _Clip] = {}
     for stage_outputs in outputs:
+        index = int(str(stage_outputs.request_id).split("_", 1)[0])
         # OmniRequestOutput.request_output is a single RequestOutput, not a list.
         req_output = stage_outputs.request_output
         assert req_output is not None, "request produced no output"
@@ -171,7 +188,10 @@ def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
             # Explicit None check: token_ids is not necessarily a plain list,
             # and `x or []` would ask an array for a truth value.
             token_ids = out.token_ids if out.token_ids is not None else []
-            frames += sum(1 for t in token_ids if int(t) != STOP_TOKEN)
+            # The sentinel compute_logits emits instead of a head0 to end a
+            # request. It sits just past head0's range, so a token equal to it
+            # is never a committed frame.
+            frames += sum(1 for t in token_ids if int(t) != _config().stop_token)
             mm = out.multimodal_output
             if mm is None:
                 continue
@@ -183,8 +203,12 @@ def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
                 assert int(sr_t.item()) == SAMPLE_RATE
             waveform = audio.cpu().float()
         assert waveform is not None, "no audio output produced"
-        clips.append(_Clip(wav=waveform, committed_frames=frames))
-    return clips
+        by_index[index] = _Clip(wav=waveform, committed_frames=frames)
+
+    assert sorted(by_index) == list(range(len(texts))), (
+        f"request ids did not cover every submitted prompt exactly once: got {sorted(by_index)}"
+    )
+    return [by_index[i] for i in range(len(texts))]
 
 
 def _synthesize(omni: Omni, text: str) -> _Clip:
@@ -302,8 +326,7 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
     back under the threshold it would silently retest the repeated path.
     """
     prompt_ids = _build_request(_LONG_TEXT)["prompt_token_ids"]
-    cfg = GepardConfig()
-    assert prompt_ids.count(cfg.start_of_text) == 1, "_LONG_TEXT is no longer above apply_below"
+    assert prompt_ids.count(_config().start_of_text) == 1, "_LONG_TEXT is no longer above apply_below"
 
     clip = _synthesize(omni_runner, _LONG_TEXT)
     _assert_clip_is_sane(clip)
@@ -325,9 +348,11 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
     The prompts are deliberately unlike each other: cross-talk between the
     per-request frame history, the codec window or the output routing shows up
     as a transcript matching the wrong prompt, which similar prompts would
-    hide. ``max_num_seqs`` is 4 in the deploy config, so these run together
-    rather than back to back. All four are submitted for that reason even
-    though only ``_TRANSCRIBED_CLIPS`` of them are read back as speech.
+    hide. Reading that requires knowing which prompt each clip belongs to, so
+    ``_synthesize_all`` restores submission order from the request ids first.
+    ``max_num_seqs`` is 4 in the deploy config, so these run together rather
+    than back to back. All four are submitted for that reason even though only
+    ``_TRANSCRIBED_CLIPS`` of them are read back as speech.
     """
     texts = list(_DISTINGUISHABLE_PROMPTS)
     clips = _synthesize_all(omni_runner, texts)
@@ -350,18 +375,19 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
                 f"clips {i} and {j} are the same waveform — one request's audio was delivered for another"
             )
 
+    # Each clip must say what ITS OWN prompt asked for. Asserting only that
+    # every clip says one of the four would pass a stable permutation, which is
+    # exactly what a per-request state or routing mix-up produces.
     keywords = set(_DISTINGUISHABLE_PROMPTS.values())
-    spoken: dict[str, str] = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, clip in enumerate(clips[:_TRANSCRIBED_CLIPS]):
-            transcript = _transcribe_for(clip.wav, tmp_dir, f"concurrent_{i}", lambda t: any(k in t for k in keywords))
+            expected = _DISTINGUISHABLE_PROMPTS[texts[i]]
+            # Escalate on the expected word being absent, not on "no keyword at
+            # all": a clip carrying a neighbour's word is precisely the failure
+            # under test, and must not be waved through by the fast ASR.
+            transcript = _transcribe_for(clip.wav, tmp_dir, f"concurrent_{i}", lambda t: expected in t)
             present = sorted(k for k in keywords if k in transcript)
-            assert len(present) == 1, (
-                f"clip {i} transcribed as {transcript!r}: expected exactly one of "
-                f"{sorted(keywords)}, found {present} — requests bled into each other"
+            assert present == [expected], (
+                f"clip for {texts[i]!r} transcribed as {transcript!r}: expected {expected!r} and "
+                f"no other prompt's keyword, found {present} — requests bled into each other"
             )
-            assert present[0] not in spoken, (
-                f"{present[0]!r} was spoken twice ({spoken.get(present[0])!r} and {transcript!r}); "
-                "one request's audio was delivered for another"
-            )
-            spoken[present[0]] = transcript
