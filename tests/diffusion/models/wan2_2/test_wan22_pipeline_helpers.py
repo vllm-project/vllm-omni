@@ -12,6 +12,7 @@ from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     create_transformer_from_config,
+    load_wan_vae_scale_factors,
     load_transformer_config,
     retrieve_latents,
 )
@@ -50,6 +51,46 @@ def test_load_transformer_config_reads_local_subfolder_config(tmp_path) -> None:
 
     assert load_transformer_config(str(tmp_path), "transformer_2") == {"patch_size": [1, 2, 2], "num_layers": 2}
     assert load_transformer_config(str(tmp_path), "missing") == {}
+
+
+def test_wan_ti2v_denoise_uses_vae_scale_for_latent_resolution(monkeypatch) -> None:
+    def fake_load_config(model, *, subfolder, local_files_only):
+        assert model == "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+        assert subfolder == "vae"
+        assert local_files_only is False
+        return {"scale_factor_temporal": 4, "scale_factor_spatial": 16}
+
+    monkeypatch.setattr(wan22_module.DistributedAutoencoderKLWan, "load_config", fake_load_config)
+    temporal_scale, spatial_scale = load_wan_vae_scale_factors(
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers", local_files_only=False
+    )
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.vae_scale_factor_temporal = temporal_scale
+    pipeline.vae_scale_factor_spatial = spatial_scale
+
+    latents = pipeline.prepare_latents(
+        batch_size=1,
+        num_channels_latents=48,
+        height=384,
+        width=384,
+        num_frames=17,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=torch.Generator(device="cpu"),
+    )
+
+    assert latents.shape == (1, 48, 5, 24, 24)
+
+
+def test_wan_legacy_vae_config_uses_default_scale_factors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        wan22_module.DistributedAutoencoderKLWan,
+        "load_config",
+        lambda *args, **kwargs: {"temperal_downsample": [False, True, True]},
+    )
+
+    assert load_wan_vae_scale_factors("legacy-wan", local_files_only=False) == (4, 8)
 
 
 def test_create_transformer_from_config_maps_supported_keys(monkeypatch) -> None:
@@ -134,6 +175,38 @@ def test_wan_decode_batch_consumes_latents_with_vae_only() -> None:
     torch.testing.assert_close(outputs[0].output, latents + 1)
 
 
+def test_wan_decode_batch_fuses_requests_and_splits_outputs() -> None:
+    class FakeVAE:
+        dtype = torch.float32
+        config = SimpleNamespace(latents_mean=[0.0, 0.0], latents_std=[1.0, 1.0], z_dim=2)
+
+        def __init__(self) -> None:
+            self.inputs = []
+
+        def decode(self, latents, return_dict=False):
+            assert return_dict is False
+            self.inputs.append(latents)
+            return (latents + 1,)
+
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.vae = FakeVAE()
+    first = torch.zeros(1, 2, 1, 1, 1)
+    second = torch.full((2, 2, 1, 1, 1), 2.0)
+    requests = [
+        SimpleNamespace(prompt={"latents": latents}, sampling_params=SimpleNamespace(output_type="np"))
+        for latents in (first, second)
+    ]
+
+    outputs = pipeline.decode_batch(DiffusionRequestBatch(requests=requests))
+
+    assert len(pipeline.vae.inputs) == 1
+    assert pipeline.vae.inputs[0].shape == (3, 2, 1, 1, 1)
+    torch.testing.assert_close(outputs[0].output, first + 1)
+    torch.testing.assert_close(outputs[1].output, second + 1)
+
+
 def test_wan_decode_batch_requires_latent_payload() -> None:
     pipeline = object.__new__(Wan22Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -143,10 +216,14 @@ def test_wan_decode_batch_requires_latent_payload() -> None:
         pipeline.decode_batch(DiffusionRequestBatch(requests=[request]))
 
 
-def test_wan_denoise_dummy_run_synthesizes_prompt_embeds() -> None:
+@pytest.mark.parametrize(
+    "stage_role",
+    [DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE],
+)
+def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionStageRole) -> None:
     pipeline = object.__new__(Wan22Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.stage_role = DiffusionStageRole.DENOISE
+    pipeline.stage_role = stage_role
     pipeline.device = torch.device("cpu")
     pipeline.transformer = SimpleNamespace(dtype=torch.float32)
     pipeline.transformer_config = SimpleNamespace(text_dim=8)

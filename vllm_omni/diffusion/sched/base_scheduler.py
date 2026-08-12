@@ -109,20 +109,24 @@ class BaseScheduler(ABC):
                 scheduled_cached_request_ids.append(request_id)
 
         # Expose the next waiting request (serial mode) so the runner can
-        # prefetch its KV during this forward.  Skip a request without
-        # kv_sender_info (would target the wrong sender under multi-replica) or
-        # one already finished/aborted (would consume its sender buffer for
-        # nothing).
+        # prefetch its KV or diffusion stage payload during this forward.
         kv_prefetch_job: KVPrefetchJob | None = None
-        if self._prefetch_enabled and self._waiting:
+        if self._waiting:
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None and not nxt.is_finished():
                 sender_info = getattr(nxt.req, "kv_sender_info", None)
-                if sender_info:
-                    kv_prefetch_job = {
-                        "request_id": nxt.request_id,
-                        "kv_sender_info": sender_info,
-                    }
+                prompt = getattr(nxt.req, "prompt", None)
+                stage_payload_handle = None
+                if isinstance(prompt, dict):
+                    stage_payload_handle = prompt.get("_stage_payload_transfer") or prompt.get(
+                        "_encode_transfer"
+                    )
+                if (self._prefetch_enabled and sender_info) or isinstance(stage_payload_handle, dict):
+                    kv_prefetch_job = {"request_id": nxt.request_id}
+                    if self._prefetch_enabled and sender_info:
+                        kv_prefetch_job["kv_sender_info"] = sender_info
+                    if isinstance(stage_payload_handle, dict):
+                        kv_prefetch_job["stage_payload_handle"] = stage_payload_handle
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,

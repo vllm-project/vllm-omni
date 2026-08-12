@@ -46,6 +46,15 @@ DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
 
 
+def load_wan_vae_scale_factors(model: str, local_files_only: bool) -> tuple[int, int]:
+    vae_config = DistributedAutoencoderKLWan.load_config(
+        model,
+        subfolder="vae",
+        local_files_only=local_files_only,
+    )
+    return vae_config.get("scale_factor_temporal", 4), vae_config.get("scale_factor_spatial", 8)
+
+
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     if sample_solver == "unipc":
         return FlowUniPCMultistepScheduler(
@@ -445,8 +454,9 @@ class Wan22Pipeline(
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
+        self.vae_scale_factor_temporal, self.vae_scale_factor_spatial = load_wan_vae_scale_factors(
+            model, local_files_only
+        )
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -596,7 +606,7 @@ class Wan22Pipeline(
 
     def _prepare_dummy_stage_payload(self, batch: DiffusionRequestBatch) -> None:
         """Supply the upstream payload omitted by the engine's local warmup."""
-        if self.stage_role == DiffusionStageRole.DENOISE:
+        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
             sequence_length = batch.sampling_params.max_sequence_length or 512
             text_dim = self.transformer_config.text_dim
             for req in batch.requests:
@@ -648,20 +658,39 @@ class Wan22Pipeline(
         return self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        outputs: list[DiffusionOutput] = []
+        latents_per_request: list[torch.Tensor] = []
+        output_types: list[str] = []
         for req in batch.requests:
             prompt = req.prompt
             latents = prompt.get("latents") if isinstance(prompt, dict) else None
             if not isinstance(latents, torch.Tensor):
                 raise ValueError("Wan decode stage requires a tensor 'latents' payload.")
-            output_type = getattr(req.sampling_params, "output_type", None) or "np"
-            outputs.append(
-                DiffusionOutput(
-                    output=self._decode_latents(latents, output_type),
-                    stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-                )
+            if latents.ndim != 5:
+                raise ValueError(f"Wan decode expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
+            latents_per_request.append(latents)
+            output_types.append(getattr(req.sampling_params, "output_type", None) or "np")
+
+        if not latents_per_request:
+            return []
+        if len(set(output_types)) != 1:
+            raise ValueError("Wan decode request batch requires the same output_type for all requests.")
+        latent_shape = latents_per_request[0].shape[1:]
+        if any(latents.shape[1:] != latent_shape for latents in latents_per_request[1:]):
+            raise ValueError("Wan decode request batch requires matching latent CTHW shapes.")
+
+        batch_sizes = [latents.shape[0] for latents in latents_per_request]
+        decoded = self._decode_latents(torch.cat(latents_per_request, dim=0), output_types[0])
+        if decoded.shape[0] != sum(batch_sizes):
+            raise RuntimeError(
+                f"Wan VAE decode produced batch size {decoded.shape[0]}; expected {sum(batch_sizes)}."
             )
-        return outputs
+        return [
+            DiffusionOutput(
+                output=output,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+            for output in torch.split(decoded, batch_sizes, dim=0)
+        ]
 
     @staticmethod
     def _denoise_outputs(

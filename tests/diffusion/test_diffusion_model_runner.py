@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -270,6 +271,46 @@ def test_middle_diffusion_stage_receives_then_sends_payload():
     assert output.custom_output["_stage_payload_transfer"]["from_stage"] == "1"
     assert output.custom_output["_stage_payload_transfer"]["to_stage"] == "2"
     assert output.custom_output["_stage_payload_transfer"]["size_bytes"] == latents.nbytes
+    assert "latents" not in output.custom_output
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_stage_payload_prefetch_starts_early_and_is_consumed_once():
+    started = threading.Event()
+    release = threading.Event()
+    prompt_embeds = torch.ones(1, 2, 3)
+
+    class BlockingConnector(_FakeStageConnector):
+        def get(self, from_stage, to_stage, key, metadata=None):
+            started.set()
+            assert release.wait(timeout=2)
+            return super().get(from_stage, to_stage, key, metadata)
+
+    connector = BlockingConnector(recv_payload=({"prompt_embeds": prompt_embeds}, prompt_embeds.nbytes))
+    runner = _make_stage_payload_runner(connector)
+    handle = {
+        "key": "req-next:encode",
+        "from_stage": "0",
+        "to_stage": "1",
+        "metadata": {"edge": "encode"},
+        "payload_keys": ["prompt_embeds"],
+    }
+    request = SimpleNamespace(
+        request_id="req-next",
+        prompt={"_stage_payload_transfer": handle},
+    )
+
+    runner._start_stage_payload_prefetch(
+        {"request_id": "req-next", "stage_payload_handle": handle}
+    )
+    assert started.wait(timeout=2)
+    release.set()
+    runner._maybe_recv_stage_payload(request)
+    runner._stage_payload_prefetch_executor.shutdown(wait=True)
+
+    assert connector.get_calls == [("0", "1", "req-next:encode", {"edge": "encode"})]
+    torch.testing.assert_close(request.prompt["prompt_embeds"], prompt_embeds)
 
 
 @pytest.mark.core_model

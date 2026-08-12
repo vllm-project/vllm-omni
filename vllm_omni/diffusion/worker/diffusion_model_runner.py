@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -414,6 +415,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
                 # Back-compat alias for encode -> denoise edges.
                 custom[self._LEGACY_ENCODE_HANDLE_KEY] = handle
+                for payload_key in payload:
+                    custom.pop(payload_key, None)
                 logger.info(
                     "[diffusion-disagg] connector put req=%s key=%s size=%d keys=%s",
                     req.request_id,
@@ -436,23 +439,57 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         handle = prompt.get(self._STAGE_PAYLOAD_HANDLE_KEY) or prompt.get(self._LEGACY_ENCODE_HANDLE_KEY)
         if not isinstance(handle, dict):
             return
-        connector = self._stage_payload_connector()
-        if connector is None:
-            return
-        from_stage = str(handle.get("from_stage", "0"))
-        to_stage = str(handle.get("to_stage", "1"))
-        key = handle.get("key", f"{req.request_id}:stage_payload")
-        try:
-            result = connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
-        except Exception:
-            logger.exception("[diffusion-disagg] connector get failed for %s", getattr(req, "request_id", "?"))
-            return
+        prefetched = getattr(self, "_stage_payload_prefetch_futures", {}).pop(req.request_id, None)
+        result = None
+        if prefetched is not None:
+            try:
+                result = prefetched.result()
+            except Exception:
+                logger.exception("[diffusion-disagg] prefetched connector get failed for %s", req.request_id)
+        if result is None:
+            result = self._get_stage_payload(req.request_id, handle)
         if not result:
-            logger.warning("[diffusion-disagg] connector get returned no payload for key=%s", key)
             return
         payload, size = result
         if not isinstance(payload, dict):
-            logger.warning("[diffusion-disagg] connector get unexpected payload %s for key=%s", type(payload), key)
+            logger.warning(
+                "[diffusion-disagg] connector get unexpected payload %s for req=%s",
+                type(payload),
+                req.request_id,
+            )
+            return
+        self._apply_stage_payload(req, handle, payload, size)
+
+    def _get_stage_payload(
+        self,
+        request_id: str,
+        handle: dict[str, Any],
+    ) -> tuple[Any, int] | None:
+        connector = self._stage_payload_connector()
+        if connector is None:
+            return None
+        from_stage = str(handle.get("from_stage", "0"))
+        to_stage = str(handle.get("to_stage", "1"))
+        key = handle.get("key", f"{request_id}:stage_payload")
+        try:
+            return connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
+        except Exception:
+            logger.exception("[diffusion-disagg] connector get failed for %s", request_id)
+            return None
+
+    def _apply_stage_payload(
+        self,
+        req: OmniDiffusionRequest,
+        handle: dict[str, Any],
+        payload: dict[str, Any],
+        size: int,
+    ) -> None:
+        prompt = req.prompt
+        if not isinstance(prompt, dict):
+            return
+        key = handle.get("key", f"{req.request_id}:stage_payload")
+        if not payload:
+            logger.warning("[diffusion-disagg] connector get returned no payload for key=%s", key)
             return
         # Prefer the keys recorded on the handle; fall back to whatever the
         # payload carries so the schema stays declarative end-to-end.
@@ -467,6 +504,31 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             key,
             size,
             recv_keys,
+        )
+
+    def _start_stage_payload_prefetch(self, kv_prefetch_job: KVPrefetchJob | None) -> None:
+        if not kv_prefetch_job:
+            return
+        request_id = kv_prefetch_job.get("request_id")
+        handle = kv_prefetch_job.get("stage_payload_handle")
+        if not request_id or not isinstance(handle, dict):
+            return
+        futures: dict[str, Future[tuple[Any, int] | None]] | None = getattr(
+            self, "_stage_payload_prefetch_futures", None
+        )
+        if futures is None:
+            futures = {}
+            self._stage_payload_prefetch_futures = futures
+            self._stage_payload_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="diffusion-stage-payload-prefetch",
+            )
+        if request_id in futures:
+            return
+        futures[request_id] = self._stage_payload_prefetch_executor.submit(
+            self._get_stage_payload,
+            request_id,
+            handle,
         )
 
     def _prepare_request_for_forward(
@@ -501,6 +563,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
         if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_job is not None:
             self.kv_transfer_manager.start_prefetch(kv_prefetch_job, self._target_device)
+        if use_prefetch:
+            self._start_stage_payload_prefetch(kv_prefetch_job)
 
         self._initialize_generator(req.sampling_params)
 
@@ -597,6 +661,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     kv_prefetch_job=kv_prefetch_job,
                     use_prefetch=allow_single_output,
                 )
+            if not allow_single_output:
+                self._start_stage_payload_prefetch(kv_prefetch_job)
 
             self._refresh_cache_for_requests(reqs, od_config=od_config)
 
@@ -706,6 +772,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             od_config=od_config,
             allow_single_output=False,
             require_request_batch_support=True,
+            kv_prefetch_job=getattr(scheduler_output, "kv_prefetch_job", None),
             record_name="pipeline_forward_batch",
         )
 

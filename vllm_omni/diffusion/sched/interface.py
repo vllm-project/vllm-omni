@@ -6,7 +6,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -156,10 +156,11 @@ class CachedRequestData:
 
 
 class KVPrefetchJob(TypedDict):
-    """Descriptor for prefetching the next request's received KV cache."""
+    """Descriptor for prefetching the next request's received data."""
 
     request_id: str
-    kv_sender_info: dict[str, Any]
+    kv_sender_info: NotRequired[dict[str, Any]]
+    stage_payload_handle: NotRequired[dict[str, Any]]
 
 
 @dataclass
@@ -175,7 +176,7 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
-    # next request to background-prefetch KV
+    # Next request data to background-prefetch while the current request runs.
     kv_prefetch_job: KVPrefetchJob | None = None
 
     @cached_property

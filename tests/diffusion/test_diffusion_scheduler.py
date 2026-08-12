@@ -336,6 +336,21 @@ class TestRequestScheduler:
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
+    def test_exposes_next_stage_payload_for_background_prefetch(self) -> None:
+        first_request = _make_request("first")
+        next_request = _make_request("next")
+        handle = {"key": "next:stage_payload", "metadata": {"edge": "0-1"}}
+        next_request.prompt = {"_stage_payload_transfer": handle}
+        self.scheduler.add_request(first_request)
+        self.scheduler.add_request(next_request)
+
+        sched_output = self.scheduler.schedule()
+
+        assert sched_output.kv_prefetch_job == {
+            "request_id": "next",
+            "stage_payload_handle": handle,
+        }
+
     def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
