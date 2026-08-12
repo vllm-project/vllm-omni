@@ -27,6 +27,7 @@ from vllm_omni.distributed.omni_coordinator import (
     LoadBalancingPolicy,
     RandomBalancer,
     RoundRobinBalancer,
+    TopologyAwareBalancer,
 )
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -101,6 +102,8 @@ def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
         return RoundRobinBalancer
     if normalized is LoadBalancingPolicy.LEAST_QUEUE_LENGTH:
         return LeastQueueLengthBalancer
+    if normalized is LoadBalancingPolicy.TOPOLOGY_AWARE:
+        return TopologyAwareBalancer
     raise ValueError(f"unhandled load balancing policy {normalized!r}")
 
 
