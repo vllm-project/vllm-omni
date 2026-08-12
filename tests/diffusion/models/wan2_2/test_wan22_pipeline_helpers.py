@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +145,59 @@ def test_wan_denoise_outputs_reject_mismatched_batch() -> None:
 
     with pytest.raises(ValueError, match="expected 2"):
         Wan22Pipeline._denoise_outputs(batch, torch.zeros(1, 2, 1, 1, 1), num_outputs_per_prompt=2)
+
+
+def test_wan_diffuse_batches_transformer_once_per_denoise_step() -> None:
+    class FakeTransformer(torch.nn.Module):
+        dtype = torch.float32
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = []
+
+        def forward(self, **kwargs):
+            self.calls.append(kwargs)
+            return (kwargs["hidden_states"],)
+
+    @contextmanager
+    def progress_bar(total):
+        yield SimpleNamespace(update=lambda: None)
+
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = FakeTransformer()
+    pipeline.transformer_2 = None
+    pipeline.expand_timesteps = False
+    pipeline.progress_bar = progress_bar
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise, timestep, latents, do_true_cfg: noise
+
+    def predict_noise_maybe_with_cfg(**kwargs):
+        positive_kwargs = dict(kwargs["positive_kwargs"])
+        current_model = positive_kwargs.pop("current_model")
+        return current_model(**positive_kwargs)[0]
+
+    pipeline.predict_noise_maybe_with_cfg = predict_noise_maybe_with_cfg
+
+    latents = torch.zeros(2, 4, 1, 2, 2)
+    prompt_embeds = torch.zeros(2, 8, 16)
+    result = pipeline.diffuse(
+        latents=latents,
+        timesteps=torch.tensor([2.0, 1.0]),
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+    )
+
+    assert len(pipeline.transformer.calls) == 2
+    for call in pipeline.transformer.calls:
+        assert call["hidden_states"].shape[0] == 2
+        assert call["timestep"].shape == (2,)
+        assert call["encoder_hidden_states"].shape[0] == 2
+    torch.testing.assert_close(result, latents)
 
 
 def test_wan_decode_batch_consumes_latents_with_vae_only() -> None:

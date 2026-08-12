@@ -1076,6 +1076,15 @@ class Wan22Pipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
 
+        if req.num_reqs > 1:
+            logger.info(
+                "[WanRequestBatch] denoise requests=%d latent_batch=%d steps=%d shape=%s",
+                req.num_reqs,
+                latents.shape[0],
+                len(timesteps),
+                tuple(latents.shape[1:]),
+            )
+
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
         latents = self.diffuse(
