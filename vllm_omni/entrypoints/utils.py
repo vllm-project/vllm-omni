@@ -30,6 +30,15 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = init_logger(__name__)
 
 
+def is_new_format_deploy_config(path: str | None) -> bool:
+    """Return True when *path* is a deploy YAML (``stages:`` without legacy ``stage_args:``)."""
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        peek = yaml.safe_load(f) or {}
+    return isinstance(peek, dict) and "stages" in peek and "stage_args" not in peek
+
+
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
@@ -642,9 +651,7 @@ def load_and_resolve_stage_configs(
                 "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
                 "use --deploy-config. See docs/configuration/stage_configs.md."
             )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
+        if is_new_format_deploy_config(stage_configs_path):
             deploy_config_path = stage_configs_path
             stage_configs_path = None
         else:
@@ -898,3 +905,31 @@ def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
         params.skip_clone = True
     params.output_kind = target_type
     return params
+
+
+class PureDiffusionLauncherAdapter:
+    """vLLM launcher compatibility shim for pure-diffusion mode.
+
+    The upstream launcher's shutdown path reads
+    ``app.state.engine_client.vllm_config.shutdown_timeout``
+    (vllm/entrypoints/launcher.py), but ``AsyncOmni.vllm_config`` returns
+    ``None`` when the pipeline has no comprehension stage (pure diffusion),
+    which crashes ``handle_shutdown`` with AttributeError and hangs server
+    teardown (workers force-killed, spurious resource_tracker noise).
+
+    This adapter only overrides the ``vllm_config`` property with a minimal
+    fallback carrying ``shutdown_timeout`` and forwards every other attribute
+    to the wrapped engine client, so the pure-diffusion detection
+    (``get_vllm_config()`` still returns ``None``) is unaffected.
+    """
+
+    def __init__(self, engine_client: Any, shutdown_timeout: float) -> None:
+        object.__setattr__(self, "_wrapped", engine_client)
+        object.__setattr__(self, "_shutdown_timeout", float(shutdown_timeout))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    @property
+    def vllm_config(self) -> Any:
+        return types.SimpleNamespace(shutdown_timeout=self._shutdown_timeout)

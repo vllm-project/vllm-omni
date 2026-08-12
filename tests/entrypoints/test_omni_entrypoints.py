@@ -104,6 +104,9 @@ class FakeAsyncOmniEngine:
         ]
         self.supported_tasks = ("generate",)
         self.stage_clients = [SimpleNamespace(is_comprehension=False) for _ in range(self.num_stages)]
+        # One replica per stage, sharing the stage_clients objects so a test that
+        # marks stage_clients[i] dead is reflected in the pool's liveness.
+        self.stage_pools = [_FakeStagePool([client], stage_id=i) for i, client in enumerate(self.stage_clients)]
         self.stage_vllm_configs = [None for _ in range(self.num_stages)]
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
@@ -969,11 +972,17 @@ async def test_async_omni_propagates_non_400_client_error_status(
     assert str(exc_info.value) == error_text
 
 
+class _FakeStagePool:
+    def __init__(self, clients: list, stage_id: int = 0):
+        self.clients = clients
+        self.stage_id = stage_id
+
+
 def test_async_omni_errored_property_alive():
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
         is_alive=lambda: True,
-        stage_clients=[SimpleNamespace(is_comprehension=False)],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace()])],
     )
 
     assert omni.errored is False
@@ -983,21 +992,47 @@ def test_async_omni_errored_property_dead_engine():
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
         is_alive=lambda: False,
-        stage_clients=[SimpleNamespace(is_comprehension=False)],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace()])],
     )
 
     assert omni.errored is True
 
 
-def test_async_omni_errored_property_dead_stage():
+def test_async_omni_errored_false_when_stage_dead():
+    # errored is process-fatal only: a dead stage must not trip the serving
+    # precheck, or requests that never touch that stage would be rejected too.
+    # Stage liveness surfaces via check_health / per-request dispatch failures.
     omni = object.__new__(AsyncOmni)
-    dead_stage = SimpleNamespace(is_comprehension=False, _engine_dead=True)
     omni.engine = SimpleNamespace(
         is_alive=lambda: True,
-        stage_clients=[dead_stage],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace(_engine_dead=True)])],
     )
 
-    assert omni.errored is True
+    assert omni.errored is False
+
+
+def test_async_omni_errored_false_when_a_replica_survives():
+    # Per-replica fault isolation (#4285): one replica dies, another lives →
+    # the stage is still serving, so the engine is not errored.
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        is_alive=lambda: True,
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace(_engine_dead=True), SimpleNamespace()])],
+    )
+
+    assert omni.errored is False
+
+
+def test_async_omni_errored_false_when_evicted_replica_leaves_stage_empty():
+    # Even a fully evicted stage (all slots None/dead) is not process-fatal;
+    # only orchestrator death makes errored True.
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        is_alive=lambda: True,
+        stage_pools=[_FakeStagePool(clients=[None, SimpleNamespace(_engine_dead=True)])],
+    )
+
+    assert omni.errored is False
 
 
 def _enqueue_stage_error(
@@ -1067,20 +1102,22 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
 
 def test_check_health_passes_when_all_healthy():
     base = _make_base()
-    healthy_stage = MagicMock()
-    healthy_stage.check_health = MagicMock()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [healthy_stage]
+    healthy_stage = SimpleNamespace(check_health=lambda: None)
+    base.engine.stage_pools = [_FakeStagePool([healthy_stage])]
     base.check_health()  # should not raise
 
 
 def test_check_health_raises_when_stage_dead():
     base = _make_base()
-    dead_stage = MagicMock()
-    dead_stage.check_health = MagicMock(side_effect=EngineDeadError("Stage-1 dead"))
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [dead_stage]
-    with pytest.raises(EngineDeadError, match="Stage-1 dead"):
+
+    def _raise_dead() -> None:
+        raise EngineDeadError("Stage-1 engine core is dead")
+
+    dead_stage = SimpleNamespace(check_health=_raise_dead)
+    base.engine.stage_pools = [_FakeStagePool([dead_stage], stage_id=1)]
+    with pytest.raises(EngineDeadError, match="Stage-1"):
         base.check_health()
 
 
@@ -1098,22 +1135,25 @@ def test_check_health_raises_when_orchestrator_dead():
 def test_omni_base_errored_false_when_alive():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace()]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace()])]
     assert base.errored is False
 
 
-def test_omni_base_is_running_false_when_stage_engine_dead():
+def test_omni_base_is_running_true_when_stage_engine_dead():
+    # is_running tracks the orchestrator only; a dead stage must not make
+    # `errored and not is_running` true, which would let terminate_if_errored
+    # kill the server on a partial failure.
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace(_engine_dead=True)]
-    assert base.is_running is False
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(_engine_dead=True)])]
+    assert base.is_running is True
 
 
-def test_omni_base_is_running_false_when_stage_resources_engine_dead():
+def test_omni_base_is_running_true_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace(resources=SimpleNamespace(engine_dead=True))]
-    assert base.is_running is False
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(resources=SimpleNamespace(engine_dead=True))])]
+    assert base.is_running is True
 
 
 def test_omni_base_errored_true_when_orchestrator_dead():
@@ -1123,20 +1163,22 @@ def test_omni_base_errored_true_when_orchestrator_dead():
     assert base.errored is True
 
 
-def test_omni_base_errored_true_when_stage_engine_dead():
+def test_omni_base_errored_false_when_stage_engine_dead():
+    # Process-fatal only: the serving precheck reads errored before routing,
+    # so a dead stage here would reject requests that never touch it.
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(_engine_dead=True)
-    base.engine.stage_clients = [dead_stage]
-    assert base.errored is True
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
+    assert base.errored is False
 
 
-def test_omni_base_errored_true_when_stage_resources_engine_dead():
+def test_omni_base_errored_false_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(resources=SimpleNamespace(engine_dead=True))
-    base.engine.stage_clients = [dead_stage]
-    assert base.errored is True
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
+    assert base.errored is False
 
 
 # ───────── Omni (sync) EngineDeadError / EngineGenerateError ─────────
@@ -1202,13 +1244,14 @@ def test_omni_errored_property_dead_engine(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_omni_errored_property_dead_stage(monkeypatch: pytest.MonkeyPatch):
-    """Omni.errored returns True when a stage client is marked dead."""
+    """Omni.errored stays False when only a stage client dies (process-fatal
+    semantics): the request-level failure and check_health carry the signal."""
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
     _patch_engine(monkeypatch, engine)
 
     app = Omni("dummy-model")
     try:
         engine.stage_clients[0]._engine_dead = True
-        assert app.errored is True
+        assert app.errored is False
     finally:
         app.shutdown()

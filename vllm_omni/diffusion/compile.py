@@ -60,7 +60,10 @@ def regionally_compile(
     for name, submod in model.named_modules():
         if _matches_repeated_block(name, submod, repeated_blocks, repeated_block_attrs):
             # Compile the block compute while keeping nn.Module.__call__ hooks
-            # outside the compiled graph.
+            # outside the compiled graph. NOTE: anything that wraps this
+            # callable must stay signature-transparent — cache-dit's
+            # BlockAdapter matches blocks by inspecting forward's parameter
+            # names and return annotation, which torch.compile preserves.
             compiled_forwards.append(
                 (
                     submod,

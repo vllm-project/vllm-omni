@@ -66,7 +66,10 @@ repos:
       entry: python tools/pre_commit/check_tts_adapter.py
       language: python
       pass_filenames: false
-      files: ^vllm_omni/entrypoints/openai/(serving_speech\.py|tts_adapters/__init__\.py)$
+      files: ^(vllm_omni/entrypoints/openai/(serving_speech\.py|tts_adapters/__init__\.py)|tools/pre_commit/check_tts_adapter\.py)$
+      # The budget-is-now-slack reminder is printed on a PASSING run, and
+      # pre-commit hides output from passing hooks unless the hook is verbose.
+      verbose: true
 
     # Keep `suggestion` last
     - id: suggestion
