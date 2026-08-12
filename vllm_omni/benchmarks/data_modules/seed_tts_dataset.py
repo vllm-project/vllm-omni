@@ -61,10 +61,12 @@ class SeedTTSSampleRequest(SampleRequest):
 
 @dataclass(frozen=True)
 class SeedTTSTurn:
-    """One target utterance within a grouped Realtime Seed-TTS session."""
+    """One Seed-TTS row within a grouped Realtime session."""
 
     utterance_id: str
     target_text: str
+    ref_text: str = ""
+    prompt_wav_path: str = ""
 
 
 @dataclass
@@ -250,8 +252,10 @@ class SeedTTSDataset(BenchmarkDataset):
                 SeedTTSTurn(
                     utterance_id=row.utterance_id,
                     target_text=row.target_text,
+                    ref_text=row.ref_text,
+                    prompt_wav_path=str(wav_path),
                 )
-                for row, _ in group
+                for row, wav_path in group
             )
             prompt_len = sum(len(tok.encode(f"{self._system_prompt}\n{turn.target_text}")) for turn in turns)
             lang = "English" if self.locale == "en" else "Chinese"

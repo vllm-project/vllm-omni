@@ -172,6 +172,24 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
             {"bot_task": "vanilla"},
             {"extra_body"},
         ),
+        (
+            [
+                "--backend",
+                "openai-realtime-duplex",
+                "--realtime-duplex-chunk-ms",
+                "200",
+                "--no-realtime-duplex-pacing",
+            ],
+            {
+                "realtime_duplex_chunk_ms": 200,
+                "realtime_duplex_pacing": False,
+            },
+            {
+                "backend",
+                "realtime_duplex_chunk_ms",
+                "no_realtime_duplex_pacing",
+            },
+        ),
     ],
 )
 def test_omni_args_parse_and_preprocess(

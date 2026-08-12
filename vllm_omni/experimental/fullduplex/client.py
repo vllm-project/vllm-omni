@@ -561,6 +561,7 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
+        hints: dict[str, object] | None = None,
     ) -> None:
         chunk_bytes = max(
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
@@ -569,6 +570,7 @@ class RealtimeDuplexClient:
         await self.stream_av_units(
             ((pcm16[offset : offset + chunk_bytes], None) for offset in range(0, len(pcm16), chunk_bytes)),
             realtime=realtime,
+            hints=hints,
         )
 
     async def stream_av_units(
@@ -576,9 +578,11 @@ class RealtimeDuplexClient:
         units: Any,
         *,
         realtime: bool = True,
+        hints: dict[str, object] | None = None,
     ) -> None:
         """Stream PCM16 units, optionally attaching a JPEG to each unit."""
         audio_end_ms = 0
+        chunk_hints = dict(hints or {})
         for chunk, frame in units:
             if not chunk:
                 continue
@@ -595,6 +599,7 @@ class RealtimeDuplexClient:
             }
             if frame is not None:
                 event["video_frames"] = [base64.b64encode(frame).decode("ascii") if isinstance(frame, bytes) else frame]
+            event.update(chunk_hints)
             await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
