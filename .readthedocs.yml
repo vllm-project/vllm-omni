@@ -21,7 +21,9 @@ build:
       # 1 GB memory cap and time out the mkdocs build. `--index-url` replaces
       # PyPI rather than adding to it, so keep the resolve wheel-only: an sdist
       # fallback cannot reach its build dependencies from the PyTorch index.
-      - python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch
+      # Quoted: `--only-binary=:all:` ends in a colon, which YAML would
+      # otherwise read as a mapping key rather than part of the command.
+      - "python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch"
 
 mkdocs:
   configuration: mkdocs.yml
