@@ -68,6 +68,19 @@ response = client.chat.completions.create(
     `ChatCompletionRequest` schema. The fields are still stored internally
     and correctly forwarded to the diffusion pipeline.
 
+!!! note "About the `Ignoring unrecognized diffusion request fields` warning"
+    Unlike the warning above, this one is **actionable**. It is emitted when a
+    field in `extra_body` (or at the request root) is neither a declared
+    diffusion parameter nor a registered extra argument:
+
+    ```
+    Ignoring unrecognized diffusion request fields request.extra_body: cfg_tex_scale.
+    ```
+
+    The listed fields are **not** forwarded to the diffusion pipeline, so they
+    had no effect — check for a typo against the parameters documented for your
+    model. The warning is emitted at most once per process to avoid log spam.
+
 ## Model-Specific Examples
 
 For complete examples with full request/response details, see the model-specific
