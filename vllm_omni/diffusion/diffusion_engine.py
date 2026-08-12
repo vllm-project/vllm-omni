@@ -188,10 +188,24 @@ class DiffusionEngine:
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
-        self._init_scheduler(od_config, scheduler)
-        self._init_runtime_state()
-        self._init_execute_fn()
-        self._log_execution_mode(od_config)
+        try:
+            self._init_scheduler(od_config, scheduler)
+            self._init_runtime_state()
+            self._init_execute_fn()
+            self._log_execution_mode(od_config)
+        except Exception:
+            # close() cannot be used because runtime synchronization state may not exist yet.
+            scheduler_to_close = getattr(self, "scheduler", None)
+            if scheduler_to_close is not None:
+                try:
+                    scheduler_to_close.close()
+                except Exception:
+                    logger.exception("Failed to close Scheduler after DiffusionEngine initialization failed")
+            try:
+                self.executor.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down Executor after DiffusionEngine initialization failed")
+            raise
 
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)

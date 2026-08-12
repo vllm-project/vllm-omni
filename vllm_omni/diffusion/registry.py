@@ -126,6 +126,11 @@ _DIFFUSION_MODELS = {
         "pipeline_longcat_image",
         "LongCatImagePipeline",
     ),
+    "LongCatVideoAvatarPipeline": (
+        "longcat_video",
+        "pipeline_longcat_video_avatar",
+        "LongCatVideoAvatarPipeline",
+    ),
     "BagelPipeline": (
         "bagel",
         "pipeline_bagel",
@@ -525,6 +530,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
@@ -575,6 +581,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",

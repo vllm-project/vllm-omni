@@ -37,6 +37,19 @@ def tiny_ltx2_builder() -> str:
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
 
 
+def _shrink_flux_clip_text_encoder(config: dict) -> dict:
+    config["num_hidden_layers"] = 2
+    return config
+
+
+def _shrink_flux_t5_text_encoder(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["num_decoder_layers"] = 2
+    config["d_ff"] = 64
+    config["num_heads"] = 4
+    return config
+
+
 def tiny_qwen_image_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
         config["num_hidden_layers"] = 2
@@ -57,23 +70,24 @@ def tiny_qwen_image_builder() -> str:
 
 
 def tiny_flux_builder() -> str:
-    def shrink_clip_text_encoder(config: dict) -> dict:
-        config["num_hidden_layers"] = 2
-        return config
-
-    def shrink_t5_text_encoder(config: dict) -> dict:
-        config["num_layers"] = 2
-        config["num_decoder_layers"] = 2
-        config["d_ff"] = 64
-        config["num_heads"] = 4
-        return config
-
     return build_tiny_from_configs(
         "FluxPipeline",
         "black-forest-labs/FLUX.1-schnell",
         transform={
-            "text_encoder": shrink_clip_text_encoder,
-            "text_encoder_2": shrink_t5_text_encoder,
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_t5_text_encoder,
+            "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, default_axes_dims_rope=[16, 56, 56]),
+        },
+    )
+
+
+def tiny_flux_kontext_builder() -> str:
+    return build_tiny_from_configs(
+        "FluxKontextPipeline",
+        "black-forest-labs/FLUX.1-Kontext-dev",
+        transform={
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_t5_text_encoder,
             "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, default_axes_dims_rope=[16, 56, 56]),
         },
     )

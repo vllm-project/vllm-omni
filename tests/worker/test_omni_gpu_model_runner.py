@@ -3,11 +3,87 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_model_runner import (
+    OmniGPUModelRunner,
+    _filter_mrope_kwargs_for_model,
+)
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _runner_for_talker_graph_init(
+    *,
+    talker_mtp_graph_safe: bool | None,
+    has_separate_talker: bool = True,
+    model_stage: str = "talker",
+) -> OmniGPUModelRunner:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(
+        talker=object() if has_separate_talker else None,
+        talker_mtp=object(),
+        model_stage=model_stage,
+    )
+    if talker_mtp_graph_safe is not None:
+        runner.model.talker_mtp_graph_safe = talker_mtp_graph_safe
+    runner.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=4))
+    runner.compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL,
+        max_cudagraph_capture_size=1,
+    )
+    runner.vllm_config = object()
+    runner.max_num_reqs = 1
+    runner.dtype = torch.float32
+    runner._make_buffer = lambda *args, **kwargs: SimpleNamespace(args=args, kwargs=kwargs)
+    return runner
+
+
+def test_talker_mtp_skips_graph_when_model_declares_unsafe(monkeypatch):
+    runner = _runner_for_talker_graph_init(talker_mtp_graph_safe=False)
+    talker_mtp = runner.model.talker_mtp
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: pytest.fail("graph wrapper must not be selected"),
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is talker_mtp
+
+
+@pytest.mark.parametrize("model_stage", ["thinker", "code2wav"])
+def test_non_talker_stage_does_not_use_talker_mtp_graph(monkeypatch, model_stage: str):
+    runner = _runner_for_talker_graph_init(
+        talker_mtp_graph_safe=None,
+        has_separate_talker=False,
+        model_stage=model_stage,
+    )
+    talker_mtp = runner.model.talker_mtp
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: pytest.fail("graph wrapper must not be selected"),
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is talker_mtp
+
+
+@pytest.mark.parametrize("talker_mtp_graph_safe", [None, True])
+def test_talker_mtp_uses_graph_for_legacy_or_explicit_safe_model(monkeypatch, talker_mtp_graph_safe):
+    runner = _runner_for_talker_graph_init(talker_mtp_graph_safe=talker_mtp_graph_safe)
+    wrapped = object()
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_model_runner.current_omni_platform.get_graph_wrapper_cls",
+        lambda: lambda *args, **kwargs: wrapped,
+    )
+
+    OmniGPUModelRunner._init_talker_mtp(runner)
+
+    assert runner.talker_mtp is wrapped
 
 
 class DummyBuffer:
@@ -614,6 +690,49 @@ def test_full_payload_output_accumulation_hook_matrix():
         runner = _make_full_payload_accumulation_runner(model_arch=model_arch)
         runner._custom_process_func = None
         assert not runner._should_accumulate_full_payload_output()
+
+
+def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
+    runner.omni_prefix_cache = prefix_cache
+    runner.model_config = SimpleNamespace(
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+        model_stage="indextts2_5_talker",
+        async_chunk=False,
+        final_output=False,
+        custom_process_next_stage_input_func="module.full_payload",
+    )
+    runner._custom_process_func = object()
+    runner._pending_full_payload_send = {}
+    runner._stage_id = 0
+    runner._omni_connector = object()
+    return runner
+
+
+def test_request_end_payload_d2h_gate_requires_opt_in_and_no_prefix_cache():
+    assert _make_request_end_payload_runner()._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(enabled=False)._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(prefix_cache=object())._should_defer_full_payload_d2h()
+
+
+def test_request_end_payload_suppresses_per_step_multimodal_outputs():
+    runner = _make_request_end_payload_runner()
+
+    def unexpected_build(_payload):
+        raise AssertionError("request-end payloads must stay inside the GPU accumulator")
+
+    runner._build_multimodal_outputs = unexpected_build
+    pooler_inter = [{"codes.mel": torch.tensor([[7]])}]
+
+    inter_stage, client = runner._build_omni_step_outputs(
+        pooler_inter,
+        pooler_inter,
+        defer_full_payload_d2h=True,
+    )
+
+    assert inter_stage is None
+    assert client is None
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():
