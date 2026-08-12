@@ -13,9 +13,12 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from flashcosyvoice.modules.hifigan import HiFTGenerator
-from flashcosyvoice.utils.audio import mel_spectrogram
 from hyperpyyaml import load_hyperpyyaml
+
+try:
+    from torch.nn.utils.parametrizations import weight_norm
+except ImportError:
+    from torch.nn.utils import weight_norm
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
@@ -25,6 +28,8 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_STREAM_CONFIG,
@@ -64,6 +69,30 @@ class _StreamState:
     stream_cache: dict | None = None
     hift_cache_dict: dict = field(default_factory=dict)
     finished: bool = False
+
+
+class _ConvRNNF0Predictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        layers: list[nn.Module] = []
+        for in_channels in [80, 512, 512, 512, 512]:
+            layers.extend([weight_norm(nn.Conv1d(in_channels, 512, 3, padding=1)), nn.ELU()])
+        self.condnet = nn.Sequential(*layers)
+        self.classifier = nn.Linear(512, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
+
+
+def _build_hift() -> HiFTGenerator:
+    return HiFTGenerator(
+        sampling_rate=24000,
+        upsample_rates=[8, 5, 3],
+        upsample_kernel_sizes=[16, 11, 7],
+        source_resblock_kernel_sizes=[7, 7, 11],
+        source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+        f0_predictor=_ConvRNNF0Predictor(),
+    )
 
 
 class StepAudio2Token2WavCore(nn.Module):
@@ -142,8 +171,8 @@ class StepAudio2Token2WavCore(nn.Module):
             torch.load(f"{self.model_path}/flow.pt", map_location="cpu", weights_only=True), strict=True
         )
         self._flow.to(self.device).eval()
+        self._hift = _build_hift()
 
-        self._hift = HiFTGenerator()
         hift_state_dict = {
             k.replace("generator.", ""): v
             for k, v in torch.load(f"{self.model_path}/hift.pt", map_location="cpu", weights_only=True).items()
@@ -178,6 +207,28 @@ class StepAudio2Token2WavCore(nn.Module):
         self._ensure_models_loaded()
         return self._hift
 
+    def _forward_spk_embedding(self, spk_feat: torch.Tensor) -> torch.Tensor:
+        """Run campplus on ``[T, 80]`` fbank features; returns ``[1, 192]`` on ``self.device``."""
+        spk_model = self.spk_model
+        if isinstance(spk_model, onnxruntime.InferenceSession):
+            return torch.tensor(
+                spk_model.run(None, {spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
+                device=self.device,
+            )
+        # CampplusTRT (or any callable taking [T, 80] and returning [1, 192]).
+        return spk_model(spk_feat).to(self.device)
+
+    def enable_trt_spk_embedding(self) -> None:
+        """Swap the onnxruntime campplus session for the shared TensorRT engine.
+
+        Reuses the CosyVoice3 CAM++ engine wrapper — MiniCPM-o / Step-Audio2
+        ship the same campplus.onnx architecture and I/O contract.
+        """
+        from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import get_campplus_trt
+
+        self._ensure_models_loaded()
+        self._spk_model = get_campplus_trt(f"{self.model_path}/campplus.onnx", device=self.device)
+
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
         # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
@@ -202,10 +253,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-        spk_emb = torch.tensor(
-            self.spk_model.run(None, {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
-            device=self.device,
-        )
+        spk_emb = self._forward_spk_embedding(spk_feat)
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
@@ -213,7 +261,21 @@ class StepAudio2Token2WavCore(nn.Module):
         if sample_rate != 24000:
             audio_24k = librosa.resample(y=audio_24k, orig_sr=sample_rate, target_sr=24000)
         audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
-        prompt_mel = mel_spectrogram(audio_24k_t).transpose(1, 2).squeeze(0)  # [T, num_mels]
+        prompt_mel = (
+            mel_spectrogram(
+                audio_24k_t,
+                n_fft=1920,
+                num_mels=80,
+                sampling_rate=24000,
+                hop_size=480,
+                win_size=1920,
+                fmin=0,
+                fmax=8000,
+                center=False,
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )  # [T, num_mels]
         prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
         prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
         prompt_mels = torch.nn.functional.pad(
@@ -259,7 +321,7 @@ class StepAudio2Token2WavCore(nn.Module):
                 self.n_timesteps,
             )
 
-        wav, _ = self.hift(speech_feat=mel)
+        wav, _ = self.hift.inference(speech_feat=mel)
 
         if return_bytes:
             output = io.BytesIO()
@@ -347,7 +409,7 @@ class StepAudio2Token2WavCore(nn.Module):
         hift_cache_speech = state.hift_cache_dict["speech"]
 
         mel = torch.cat([hift_cache_mel, chunk_mel], dim=2)
-        speech, source = self.hift(mel, hift_cache_source)
+        speech, source = self.hift.inference(mel, hift_cache_source)
 
         if hift_cache_speech.shape[-1] > 0:
             speech = fade_in_out(speech, hift_cache_speech, self.speech_window)

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import os
-import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -278,16 +276,16 @@ def test_minicpmo_model_hook_same_speech_row_second_step_does_not_rearm_pending_
     next_logits[0, 7] = 30.0
     next_logits[0, 8] = -2.0
     next_logits[0, 10] = 20.0
+    original_next_logits = next_logits.clone()
 
     model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (row,))
 
     assert state.pending_speech_context is False
     assert state.current_turn_ended is False
-    assert torch.isneginf(next_logits[0, 7])
-    assert next_logits[0, 8].item() == 30.0
+    assert torch.equal(next_logits, original_next_logits)
 
 
-def test_minicpmo_model_hook_mid_turn_speech_redirects_listen_to_tts_bos():
+def test_minicpmo_model_hook_mid_turn_speech_preserves_logits_for_post_sample_redirect():
     state = SimpleNamespace(
         current_turn_ended=False,
         last_terminator_token=None,
@@ -298,12 +296,11 @@ def test_minicpmo_model_hook_mid_turn_speech_redirects_listen_to_tts_bos():
     logits[0, 7] = 30.0
     logits[0, 8] = -2.0
     logits[0, 10] = 20.0
+    original_logits = logits.clone()
 
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
-    assert torch.isneginf(logits[0, 7])
-    assert logits[0, 8].item() == 30.0
-    assert logits[0, 10].item() == 20.0
+    assert torch.equal(logits, original_logits)
 
 
 def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
@@ -319,12 +316,12 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     logits = torch.zeros((1, 16), dtype=torch.float32)
     logits[0, 7] = 5.0
     logits[0, 10] = 20.0
+    original_logits = logits.clone()
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
     assert state.current_turn_ended is False
     assert state.last_terminator_token is None
-    assert torch.isneginf(logits[0, 7])
-    assert logits[0, 8].item() == 5.0
+    assert torch.equal(logits, original_logits)
 
 
 def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
@@ -544,220 +541,6 @@ def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
         )
 
 
-def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_condition_text():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        _ar_last_chunk_flags = [False]
-        _ar_last_emitted_text = "你好，你有什莫想聊的吗？"
-
-        def __call__(self, **kwargs):
-            del kwargs
-            return None, torch.zeros(8, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.zeros(1, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "native_duplex": True,
-                "llm_output_text": ["你好，你有什莫想聊的吗？你好，你有什莫想聊的吗？"],
-                "meta": {
-                    "native_duplex_segment_text": "你好，你有什莫想聊的吗？",
-                },
-            }
-        ],
-    )
-
-    text_bytes = output.multimodal_outputs["meta.llm_output_text_utf8"].detach().cpu().tolist()
-    assert bytes(text_bytes).decode("utf-8") == "你好，你有什莫想聊的吗？"
-    assert int(output.multimodal_outputs["meta.audio_text_total_chars"].item()) == len("你好，你有什莫想聊的吗？")
-
-
-def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        _ar_last_chunk_flags = [True]
-        _ar_turn_end_flags = [True]
-
-        def __call__(self, **kwargs):
-            del kwargs
-            return None, torch.zeros(0, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.zeros(1, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "native_duplex": True,
-                "meta": {"native_duplex_segment_text": ""},
-            }
-        ],
-    )
-
-    assert int(output.multimodal_outputs["meta.turn_end"].item()) == 1
-
-
-def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        def __init__(self):
-            self.calls = []
-            self._ar_last_chunk_flags = [True]
-            self._ar_turn_end_flags = [False]
-            self._ar_last_emitted_text = ""
-
-        def __call__(self, **kwargs):
-            info = kwargs["additional_information"]
-            request_id = info["global_request_id"][0]
-            self.calls.append(request_id)
-            is_last = request_id == "req-b"
-            self._ar_last_chunk_flags = [is_last]
-            self._ar_turn_end_flags = [is_last]
-            self._ar_last_emitted_text = request_id
-            value = 1.0 if request_id == "req-a" else 2.0
-            return None, torch.full((2,), value, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(3, dtype=torch.long),
-        positions=torch.zeros(3, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "global_request_id": ["req-a"],
-                "native_duplex": True,
-                "duplex": {"epoch": 3, "turn_id": 7},
-                "meta": {"native_duplex_segment_text": "first"},
-            },
-            {
-                "global_request_id": ["req-idle"],
-                "native_duplex": True,
-                "duplex": {"epoch": 3, "turn_id": 9},
-                "meta": {"native_duplex_segment_text": "idle"},
-            },
-            {
-                "global_request_id": ["req-b"],
-                "native_duplex": True,
-                "duplex": {"epoch": 4, "turn_id": 8},
-                "meta": {"native_duplex_segment_text": "second"},
-            },
-        ],
-        request_token_spans=[(0, 2), (2, 2), (2, 3)],
-    )
-
-    assert model.talker.calls == ["req-a", "req-b"]
-    assert model.talker._ar_last_chunk_flags == [False, False, True]
-    assert model.talker._ar_turn_end_flags == [False, False, True]
-    assert output.multimodal_outputs["meta.req_id"] == ["req-a", "req-b"]
-    assert output.multimodal_outputs["meta.sparse_audio"] == ["1"]
-    assert [waveform.tolist() for waveform in output.multimodal_outputs["model_outputs"]] == [
-        [1.0, 1.0],
-        [2.0, 2.0],
-    ]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.tts_is_last_chunk"]] == [0, 1]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.turn_end"]] == [0, 1]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_epoch"]] == [3, 4]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_turn_id"]] == [7, 8]
-
-
-@pytest.mark.parametrize(
-    ("runtime_info", "request_token_spans", "expected_rows", "expected_ids"),
-    [
-        (
-            [
-                {
-                    "global_request_id": ["req-a"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 3, "turn_id": 7},
-                    "meta": {"native_duplex_segment_text": "first"},
-                }
-            ],
-            [(0, 3)],
-            [3],
-            ["req-a"],
-        ),
-        (
-            [
-                {
-                    "global_request_id": ["req-a"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 3, "turn_id": 7},
-                    "meta": {"native_duplex_segment_text": "first"},
-                },
-                {
-                    "global_request_id": ["req-b"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 4, "turn_id": 8},
-                    "meta": {"native_duplex_segment_text": "second"},
-                },
-            ],
-            [(0, 2), (2, 3)],
-            [2, 1],
-            ["req-a", "req-b"],
-        ),
-    ],
-    ids=["single-request", "batched-requests"],
-)
-def test_minicpmo_tts_ignores_cuda_graph_padding_after_request_spans(
-    runtime_info,
-    request_token_spans,
-    expected_rows,
-    expected_ids,
-):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        def __init__(self):
-            self.input_rows = []
-            self._ar_last_chunk_flags = [True]
-            self._ar_turn_end_flags = [False]
-            self._ar_last_emitted_text = ""
-
-        def __call__(self, **kwargs):
-            self.input_rows.append(int(kwargs["input_ids"].shape[0]))
-            return None, torch.ones(2, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(4, dtype=torch.long),
-        positions=torch.zeros(4, dtype=torch.long),
-        runtime_additional_information=runtime_info,
-        request_token_spans=request_token_spans,
-    )
-
-    assert model.talker.input_rows == expected_rows
-    assert output.text_hidden_states.shape == (4, 4)
-    assert output.multimodal_outputs["meta.req_id"] == expected_ids
-
-
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
@@ -827,6 +610,180 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
 
     with pytest.raises(ValueError, match=r"<\|tts_bos\|>"):
         runtime._require_special_token_ids()
+
+
+def _minicpmo45_tokenizer_stub():
+    token_ids = {
+        token: index
+        for index, token in enumerate(
+            (
+                "<unit>",
+                "</unit>",
+                "<|listen|>",
+                "<|speak|>",
+                "<|tts_bos|>",
+                "<|tts_eos|>",
+                "<|tts_pad|>",
+                "<|chunk_eos|>",
+                "<|chunk_tts_eos|>",
+                "<|turn_eos|>",
+            ),
+            start=101,
+        )
+    }
+    return SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: token_ids.get(token, 0),
+        encode=lambda token, add_special_tokens=False: (
+            [token_ids[token]] if not add_special_tokens and token in token_ids else [0]
+        ),
+    )
+
+
+def _transformers_processor_stub(auto_processor):
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(*_args, **_kwargs):
+            return None
+
+    return SimpleNamespace(
+        AutoImageProcessor=_AutoImageProcessor,
+        AutoProcessor=auto_processor,
+    )
+
+
+def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    model_id = "openbmb/MiniCPM-o-4_5"
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+    load_calls = []
+
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(config_class, image_processor_class):
+            del image_processor_class
+            if isinstance(config_class, str):
+                raise AttributeError("'str' object has no attribute '__module__'")
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            load_calls.append((model_path, trust_remote_code))
+            _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
+            return processor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoImageProcessor=_AutoImageProcessor,
+            AutoProcessor=_AutoProcessor,
+        ),
+    )
+
+    loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
+
+    assert loaded is processor
+    assert load_calls == [(model_id, True)]
+    with pytest.raises(AttributeError, match="__module__"):
+        _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
+
+
+def test_minicpmo_stage0_processor_load_preserves_original_exception(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    original = ValueError("invalid processor config")
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            raise original
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to load MiniCPM-o duplex processor") as exc_info:
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_minicpmo_stage0_processor_requires_tokenizer(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="does not expose a tokenizer"):
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+
+def test_minicpmo_stage0_loaded_processor_validates_special_tokens(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return processor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime(
+        SimpleNamespace(),
+        model_path="openbmb/MiniCPM-o-4_5",
+        device="cpu",
+    )
+
+    assert runtime.processor is processor
+    assert set(runtime._special_token_ids()) == {
+        "unit_token_id",
+        "unit_end_token_id",
+        "listen_token_id",
+        "speak_token_id",
+        "tts_bos_token_id",
+        "tts_eos_token_id",
+        "tts_pad_token_id",
+        "chunk_eos_token_id",
+        "chunk_tts_eos_token_id",
+        "turn_eos_token_id",
+    }
 
 
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
@@ -1366,6 +1323,88 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
     )
 
 
+def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_unit():
+    import torch
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _StageModel(torch.nn.Module):
+        first_chunk_ms = 10
+        chunk_ms = 8
+        sample_rate = 1000
+
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(256, 2)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_audio_hidden_states(self, _data):
+            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
+
+    class _MelProcessor:
+        sample_rate = 1000
+        is_first = True
+
+        def get_config(self):
+            return {"effective_first_chunk_ms": 9}
+
+    class _Processor:
+        def __init__(self):
+            self._streaming_mel_processor = _MelProcessor()
+
+        def get_streaming_chunk_size(self):
+            return 9 if self._streaming_mel_processor.is_first else 8
+
+        def process_audio_streaming(self, audio, **_kwargs):
+            self._streaming_mel_processor.is_first = False
+            return {"audio_features": audio, "audio_feature_lens": [[len(audio)]]}
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.stage_model = _StageModel()
+    runtime.thinker = runtime.stage_model
+    runtime.tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: {
+            "<unit>": 1,
+            "</unit>": 2,
+            "<|listen|>": 3,
+            "<|speak|>": 4,
+            "<|tts_bos|>": 5,
+            "<|tts_eos|>": 6,
+            "<|tts_pad|>": 7,
+            "<|chunk_eos|>": 8,
+            "<|chunk_tts_eos|>": 9,
+            "<|turn_eos|>": 10,
+            "<|audio|>": 11,
+        }.get(token, 0),
+        encode=lambda text, add_special_tokens=False: [],
+    )
+    runtime.processor = _Processor()
+    runtime.device = "cpu"
+    runtime._init_token_ids()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-first-chunk-alignment-tail")
+
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), seq=1)
+    second = runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), seq=2)
+    final = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(8, dtype=np.float32),
+        seq=3,
+        final=True,
+    )
+
+    assert first["input_token_ids"].count(1) == 1
+    assert second["input_token_ids"].count(1) == 1
+    assert final["input_token_ids"].count(1) == 1
+    assert state.audio_chunk_idx == 3
+    assert len(state.audio_buffer) == 1
+
+
 def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken():
     import torch
 
@@ -1535,7 +1574,7 @@ def test_minicpmo_stage0_native_sampler_penalizes_text_from_prior_chunk():
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
     session_key = ("sid-cross-chunk-repetition", 0)
     state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
-    state.generated_text_tokens = [198] * 8
+    state.generated_tokens = [198] * 8
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     model._minicpmo45_duplex_row_sessions = {0: session_key}
 
@@ -1597,7 +1636,7 @@ def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty(
     state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
     repeated = 198
     alternative = 1234
-    state.generated_text_tokens = [repeated]
+    state.generated_tokens = [repeated]
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     model._minicpmo45_duplex_row_sessions = {0: session_key}
 
@@ -1621,7 +1660,7 @@ def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty(
     assert sampled.sampled_token_ids.tolist() == [[repeated]]
 
 
-def test_minicpmo_stage0_records_only_bounded_text_repetition_history():
+def test_minicpmo_stage0_records_bounded_model_policy_history():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         _MiniCPMO45Stage0SessionState,
     )
@@ -1648,15 +1687,15 @@ def test_minicpmo_stage0_records_only_bounded_text_repetition_history():
     }
 
     for sampled in range(1000, 1520):
-        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+        model._record_minicpmo45_duplex_generation_token(0, sampled)
 
     expected_history = list(range(1008, 1520))
-    assert state.generated_text_tokens == expected_history
+    assert state.generated_tokens == expected_history
 
     for sampled in token_ids.values():
-        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+        model._record_minicpmo45_duplex_generation_token(0, sampled)
 
-    assert state.generated_text_tokens == expected_history
+    assert state.generated_tokens == [*expected_history[len(token_ids) :], *token_ids.values()]
 
 
 def test_minicpmo_stage0_native_sampler_does_not_override_model_at_punctuation():
@@ -2427,150 +2466,3 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
-
-
-def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        MiniCPMO45TTSRuntimeConfig,
-    )
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._runtime_config = MiniCPMO45TTSRuntimeConfig(ref_audio_file_cache_size=1)
-    model._t2w_base_caches = {}
-    model._token2wav_state_lock = threading.RLock()
-    first_path = model._write_ref_audio_prompt_wav(np.array([0.1, -0.1], dtype=np.float32), 16_000)
-    assert first_path is not None
-    model._t2w_base_caches[first_path] = (torch.tensor([1]), {"cache": torch.tensor([2])})
-
-    second_path = model._write_ref_audio_prompt_wav(np.array([0.2, -0.2], dtype=np.float32), 16_000)
-
-    assert second_path is not None
-    assert second_path != first_path
-    assert first_path not in model._t2w_base_caches
-    assert not os.path.exists(first_path)
-
-
-def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-    )
-
-    model_dir = tmp_path / "MiniCPM-o-4_5"
-    assets_dir = model_dir / "assets"
-    assets_dir.mkdir(parents=True)
-    (assets_dir / "HT_ref_audio.wav").write_bytes(b"placeholder")
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model=str(model_dir)))
-    model._write_ref_audio_prompt_wav = lambda ref_audio, ref_audio_sr: None
-
-    assert model._resolve_prompt_wav_path(None, None) == (None, None)
-
-
-def test_minicpmo_tts_stream_turn_id_prefers_duplex_identity():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-    )
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-
-    assert (
-        model._stream_turn_id(
-            {
-                "duplex": {"turn_id": 0, "model_turn_id": 4},
-                "meta": {"turn_id": 3},
-            }
-        )
-        == 4
-    )
-    assert (
-        model._stream_turn_id(
-            {
-                "duplex": {"turn_id": 0},
-                "meta": {"turn_id": 3},
-            }
-        )
-        == 0
-    )
-    assert model._stream_turn_id({"meta": {"turn_id": 3}, "turn_id": 2}) == 3
-    assert model._stream_turn_id({"turn_id": 2}) == 2
-
-
-def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
-
-    class AudioTokenizer:
-        def set_stream_cache(self, prompt_wav_path):
-            raise AssertionError(f"unexpected reference-audio cache load: {prompt_wav_path!r}")
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._t2w_base_caches = {}
-    model._token2wav_state_lock = threading.RLock()
-    model.audio_tokenizer = AudioTokenizer()
-    state = _TalkerTurnState(None, None)
-
-    model._begin_turn_vocoder_cache(None, state=state)
-
-    assert state.stream_cache is None
-    assert state.hift_cache_dict == {}
-    assert state.vocoder_initialized is True
-    assert model._t2w_base_caches[""] == (None, {})
-
-
-def test_minicpmo_tts_native_duplex_merges_and_left_pads_nonfinal_unit_audio():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _native_duplex_unit_waveform,
-    )
-
-    waveform = _native_duplex_unit_waveform(
-        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
-        turn_end=False,
-        target_samples=6,
-    )
-
-    assert waveform is not None
-    assert waveform.tolist() == [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
-
-
-def test_minicpmo_tts_native_duplex_does_not_pad_final_unit_audio():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _native_duplex_unit_waveform,
-    )
-
-    waveform = _native_duplex_unit_waveform(
-        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
-        turn_end=True,
-        target_samples=6,
-    )
-
-    assert waveform is not None
-    assert waveform.tolist() == [1.0, 2.0, 3.0]
-
-
-def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
-
-    prompt_path = tmp_path / "session-ref.wav"
-    prompt_path.write_bytes(b"wav")
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._talker_turn_states = {
-        "request": _TalkerTurnState(str(prompt_path), str(prompt_path)),
-    }
-    model._talker_consumed_tokens = {"request": 1}
-    model._talker_request_keys = {}
-    model._t2w_base_caches = {
-        str(prompt_path): (torch.tensor([1]), {"cache": torch.tensor([2])}),
-    }
-    model._token2wav_state_lock = threading.RLock()
-    model.audio_tokenizer = None
-
-    assert model._close_turn_state("request") is True
-    assert str(prompt_path) not in model._t2w_base_caches
-    assert not prompt_path.exists()

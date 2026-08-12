@@ -48,8 +48,8 @@ vllm_omni/deploy/
 ```
 
 New in-tree models should register their `PipelineConfig` in
-`vllm_omni/config/pipeline_registry.py`; use `--stage-configs-path` only for
-custom legacy `stage_args` YAMLs.
+`vllm_omni/config/pipeline_registry.py`; use `--deploy-config` for custom
+deployment YAMLs.
 
 ## Step-by-Step Implementation
 
@@ -540,7 +540,7 @@ Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is 
 
 ## Testing
 
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
+For comprehensive testing guidelines, please refer to the [Test Writing Guide](../ci/test_writing_guide.md).
 
 ## Adding a Model Recipe
 

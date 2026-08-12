@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +29,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
@@ -39,6 +40,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
+    InteractionMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
@@ -81,6 +83,7 @@ def _diffusion_transfer_size_bytes(prompt: Any) -> int:
                 seen.add(fingerprint)
                 total += size_bytes
     return total
+
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -129,37 +132,6 @@ def _build_terminal_empty_output(
         outputs=[completion],
         finished=True,
     )
-
-
-def _coerce_int_scalar(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            coerced = _coerce_int_scalar(item)
-            if coerced > 0:
-                return coerced
-        return 0
-    if hasattr(value, "item"):
-        value = value.item()
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return coerced if coerced > 0 else 0
-
-
-def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) -> int:
-    """Infer the final audio stage sample rate from stage metadata when possible."""
-    sample_rate_attrs = ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate", "sr")
-    stage_client = getattr(stage_pool, "stage_client", None)
-    stage_config = getattr(stage_pool, "_stage_vllm_config", None)
-    for source in (stage_client, stage_config):
-        for attr in sample_rate_attrs:
-            sample_rate = _coerce_int_scalar(getattr(source, attr, None))
-            if sample_rate > 0:
-                return sample_rate
-    return default
 
 
 def build_engine_core_request_from_tokens(
@@ -274,11 +246,18 @@ class _OrchestratorDuplexStagePort:
         request_states: dict[str, OrchestratorRequestState],
         running_counter: OmniRequestCounter | None,
         cleanup_request_ids: Callable[..., Any],
+        async_chunk: bool,
+        prewarm_async_chunk_stages: Callable[
+            [str, Any, OrchestratorRequestState],
+            Awaitable[None],
+        ],
     ) -> None:
         self._stage_pools = stage_pools
         self._request_states = request_states
         self._running_counter = running_counter
         self._cleanup_request_ids = cleanup_request_ids
+        self._async_chunk = async_chunk
+        self._prewarm_async_chunk_stages = prewarm_async_chunk_stages
 
     @property
     def stage_count(self) -> int:
@@ -355,6 +334,12 @@ class _OrchestratorDuplexStagePort:
             replica_id = await pool.submit_update(context.request_id, request_state, request)
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
+            if self._async_chunk and context.stage_id == 0:
+                await self._prewarm_async_chunk_stages(
+                    context.request_id,
+                    request,
+                    request_state,
+                )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
         if not request_state.running_counter_registered and self._running_counter is not None:
@@ -452,6 +437,8 @@ class Orchestrator:
                     request_states=self.request_states,
                     running_counter=self._running_counter,
                     cleanup_request_ids=self._cleanup_request_ids,
+                    async_chunk=self.async_chunk,
+                    prewarm_async_chunk_stages=self._prewarm_async_chunk_stages,
                 ),
                 result_sink=self.rpc_async_queue,
                 lifecycle_sink=self.output_async_queue,
@@ -496,7 +483,10 @@ class Orchestrator:
         already no-ops on ``scheduler_stats is None`` (which is what
         the upstream scheduler returns when its own log_stats is False),
         so this gate is mainly to keep the ``/metrics`` surface clean
-        when the user did not request stats.
+        when the user did not request stats. When stats are enabled, record()
+        must still receive IterationStats even on ticks where scheduler_stats
+        is None; upstream PrometheusStatLogger records token/request metrics
+        from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
         self._transfer_emitter = transfer_emitter
@@ -647,6 +637,8 @@ class Orchestrator:
                 self.duplex_control_plane.dispatch(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
+            elif msg_type == "interaction":
+                await self._handle_interaction(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
@@ -748,24 +740,16 @@ class Orchestrator:
         final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
         if req_state is None:
+            # Streaming updates always follow the first-chunk add_request
+            # through the same ordered submission queue, so an unknown id
+            # here can only mean the request already finished or was
+            # aborted (e.g. the client disconnected). Re-adding it would
+            # resurrect a headless session that keeps cycling through the
+            # stages with nobody consuming its outputs (issue #4271).
             logger.warning(
-                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
-            fallback_msg = StageSubmissionMessage(
-                type="add_request",
-                request_id=msg.request_id,
-                prompt=msg.prompt,
-                original_prompt=msg.original_prompt,
-                output_prompt_text=msg.output_prompt_text,
-                sampling_params_list=msg.sampling_params_list,
-                final_stage_id=msg.final_stage_id,
-                final_output_stage_ids=msg.final_output_stage_ids,
-                preprocess_ms=msg.preprocess_ms,
-                request_timestamp=msg.request_timestamp,
-                enqueue_ts=msg.enqueue_ts,
-            )
-            await self._handle_add_request(fallback_msg)
             return
 
         if msg.sampling_params_list:
@@ -832,11 +816,49 @@ class Orchestrator:
     async def _handle_abort(self, msg: AbortRequestMessage) -> None:
         """Handle an abort message from the main thread."""
         request_ids = msg.request_ids
-        await self._cleanup_request_ids(
-            self._cfg_tracker.abort_parents(request_ids),
-            abort=True,
-        )
+        # _cleanup_request_ids is CFG-aware: it expands aborted parents to
+        # their companions and fails a deferred parent whose companion is
+        # aborted before its output arrived.
+        await self._cleanup_request_ids(list(request_ids), abort=True)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    async def _handle_interaction(self, msg: InteractionMessage) -> None:
+        """Handle a midway interaction for an active streaming diffusion request."""
+        stage_id = 0
+        request_id = msg.request_id
+        event_id = msg.interaction.get("event_id")
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"No active request for interaction: {request_id}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
+            return
+
+        try:
+            await self.stage_pools[stage_id].submit_interaction(request_id, msg.interaction)
+        except Exception as exc:
+            logger.info(
+                "[Orchestrator] Failed interaction for req %s: %s",
+                request_id,
+                exc,
+                exc_info=True,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=f"Failed interaction for request {request_id}: {exc}",
+                    fatal=False,
+                    request_id=request_id,
+                    event_id=event_id,
+                    stage_id=stage_id,
+                )
+            )
 
     async def _abort_request_ids(self, request_ids: list[str]) -> None:
         """Forward abort requests to all stage pools."""
@@ -959,19 +981,17 @@ class Orchestrator:
                                 )
                                 if req_state.streaming.enabled:
                                     await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            # OmniSchedulerMixin.make_stats() already throttles
-                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
-                            # being non-None means this replica passed its own gate.
-                            # A second global throttle here would drop stats for
-                            # other (stage, replica) pairs in the same 1s window.
-                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
-                            iteration_stats = IterationStats() if record_stats else None
+                            iteration_stats = (
+                                IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
+                            )
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
                                 iteration_stats=iteration_stats,
                             )
-                            if record_stats:
+                            if self._stat_logger is not None and (
+                                raw_outputs.scheduler_stats is not None or iteration_stats is not None
+                            ):
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
@@ -1120,11 +1140,41 @@ class Orchestrator:
         abort: bool = False,
         close_duplex_sessions: bool = False,
     ) -> None:
-        """Release pool bindings and logical request state for the given ids."""
+        """Release pool bindings and logical request state for the given ids.
+
+        CFG-aware: cleaning a parent releases its tracker state and pulls its
+        companions into the batch; cleaning a companion whose parent is NOT in
+        the batch and whose output never arrived fails that parent (its bundle
+        can never complete). Every teardown path (stage error, abort, replica
+        loss, membership unregister) funnels through here, so tracker state
+        cannot outlive its requests.
+        """
         if not request_ids:
             return
 
         cleanup_ids = list(dict.fromkeys(request_ids))
+        batch = set(cleanup_ids)
+        orphaned_parents: dict[str, str] = {}
+        for rid in cleanup_ids:
+            pid = self._cfg_tracker.get_parent_id(rid)
+            if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
+                orphaned_parents.setdefault(pid, rid)
+        for pid, cid in orphaned_parents.items():
+            deferred = self._cfg_tracker.pop_pending_parent(pid)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=pid,
+                    stage_id=deferred["stage_id"] if deferred is not None else None,
+                    error=f"CFG companion {cid} was aborted or lost before its outputs arrived",
+                )
+            )
+            batch.add(pid)
+            cleanup_ids.append(pid)
+        for rid in list(cleanup_ids):
+            for cid in self._cfg_tracker.cleanup_parent(rid):
+                if cid not in batch:
+                    batch.add(cid)
+                    cleanup_ids.append(cid)
         closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
             closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(
@@ -1253,7 +1303,11 @@ class Orchestrator:
             return
 
         request_finished = False
-        if finished and self.stage_pools[stage_id].final_output:
+        if (
+            finished
+            and self.stage_pools[stage_id].final_output
+            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
+        ):
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -1314,7 +1368,7 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
+            and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -1361,6 +1415,12 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs."""
+        pool = self.stage_pools[stage_id]
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return stage_receives_chunks(model_config)
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1608,7 +1668,12 @@ class Orchestrator:
             if req_state is None:
                 continue
             if self._cfg_tracker.is_companion(req_id):
-                await self._handle_cfg_companion_ready(req_id)
+                # kv_ready only says the companion's KV hit the connector; its
+                # processed output has not been stashed yet. Counting it as
+                # done here let the parent pass the all_companions_done gate
+                # and dispatch with 0/N companion outputs (degraded CFG).
+                # Done-marking now happens solely on the processed-output path
+                # in _route_output, after set_companion_output.
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
@@ -1729,16 +1794,48 @@ class Orchestrator:
         _t_submit_start = _time.perf_counter()
 
         if next_pool.stage_type == "diffusion":
-            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            # Gate: never dispatch with an incomplete CFG bundle. Checked
+            # non-destructively BEFORE popping — a pop-then-redefer would lose
+            # the partial outputs. all_companions_done is trustworthy here
+            # because done-marking happens only after set_companion_output.
+            if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
+                self._cfg_tracker.defer_parent(req_id, output, src_stage_id)
+                logger.info(
+                    "[Orchestrator] req=%s: CFG companion outputs not all stashed yet; re-deferring parent",
+                    req_id,
+                )
+                return
+            # Peek, don't pop: outputs stay stashed until cleanup_parent so a
+            # streaming re-submission bundles the complete set again rather
+            # than an empty one.
+            companion_outputs = self._cfg_tracker.get_companion_outputs(req_id)
             expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
             if expected > len(companion_outputs):
-                logger.warning(
-                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
-                    "downstream CFG conditioning may degrade",
+                # Companions are done but outputs are missing — inconsistent
+                # tracker state (should be unreachable with peek semantics).
+                # Fail the request rather than degrade CFG conditioning.
+                logger.error(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs available; "
+                    "failing the request instead of dispatching degraded CFG",
                     req_id,
                     len(companion_outputs),
                     expected,
                 )
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=req_id,
+                        stage_id=src_stage_id,
+                        error=(
+                            f"CFG companion outputs incomplete ({len(companion_outputs)}/{expected}); "
+                            "request aborted to avoid degraded CFG conditioning"
+                        ),
+                    )
+                )
+                await self._cleanup_request_ids(
+                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    abort=True,
+                )
+                return
             diffusion_source_outputs = [output, *companion_outputs]
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
@@ -1958,7 +2055,7 @@ class Orchestrator:
             terminal_output = _build_terminal_empty_output(
                 req_id,
                 final_output_type=final_output_type,
-                audio_sample_rate=_infer_stage_audio_sample_rate(final_pool),
+                audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
             submit_ts = _time.time()
             req_state.stage_submit_ts[final_stage_id] = submit_ts
@@ -2043,12 +2140,17 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            if not self._stage_receives_async_chunks(next_stage_id):
+                # Outgoing-only stages receive their first real input from the
+                # orchestrator. Pre-submitting a placeholder lets it race and
+                # execute before that conditioning payload arrives.
+                continue
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
                     req_state.prompt,
@@ -2087,12 +2189,18 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                await next_pool.submit_initial(
+                replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
                     request,
                     prompt_text=None,
                 )
+            self._record_duplex_stage_submission(
+                next_stage_id,
+                request_id,
+                replica_id,
+                req_state,
+            )
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in

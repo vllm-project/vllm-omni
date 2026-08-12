@@ -309,7 +309,7 @@ For Omni or custom models, create:
 
 Required updates:
 1. `docs/user_guide/diffusion/parallelism/overview.md` — parallelism support overview/table
-2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
+2. `docs/user_guide/diffusion/cpu_offload.md` — if CPU offload supported (add to supported models table)
 3. `docs/user_guide/diffusion/cache_acceleration/teacache.md` — if TeaCache supported
 4. `docs/user_guide/diffusion/cache_acceleration/cache_dit.md` — if Cache-DiT supported
 5. Offline example docs under `examples/offline_inference/<name>/` (`README.md` or category-specific `.md`)
@@ -317,7 +317,7 @@ Required updates:
 
 ### Step 8: Add E2E Tests
 
-**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md) and [CI_5levels.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/CI_5levels.md).
+**Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md), [test_system_overview.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_system_overview.md), and [test_writing_guide.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_writing_guide.md).
 
 Classify the model's **CI priority** first:
 
@@ -418,7 +418,8 @@ def enable_cache_for_your_model(pipeline, cache_config):
 
 #### 9d. Register the custom enabler
 
-Add your enabler to `CUSTOM_DIT_ENABLERS` in `vllm_omni/diffusion/cache/cache_dit_backend.py`:
+Add your enabler to `CUSTOM_DIT_ENABLERS` in
+`vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
 CUSTOM_DIT_ENABLERS = {

@@ -89,7 +89,7 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - pytest -s -v tests/diffusion/distributed/test_zimage_parallelism.py
+        - pytest -s -v tests/diffusion/distributed/test_tensor_parallel.py
 
     - label: "Diffusion Model Test"
       agent_pool: mi325_1

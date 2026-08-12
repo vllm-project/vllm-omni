@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -122,6 +122,15 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
+class _CompileTrackingModel:
+    def __init__(self):
+        self.compile_calls = []
+
+    def compile(self, *args, **kwargs):
+        self.compile_calls.append((args, kwargs))
+        return self
+
+
 def _make_request():
     sampling_params = SimpleNamespace(
         generator=None,
@@ -154,6 +163,21 @@ def _fake_platform_for_peak_memory():
     )
 
 
+def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
+    events = []
+    plain_pipeline = object()
+    request_scoped_pipeline = SimpleNamespace(
+        adopt_cache_dit_backend=lambda backend: events.append(backend),
+        is_cache_dit_enabled=lambda: True,
+    )
+    backend = object()
+
+    assert not model_runner_module.adopt_request_scoped_cache_dit(plain_pipeline, backend)
+    assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
+    assert model_runner_module.is_request_scoped_cache_dit_enabled(request_scoped_pipeline)
+    assert events == [backend]
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -178,10 +202,20 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     return runner
 
 
-def _make_compile_runner(*, use_hsdp: bool):
+def _make_compile_runner(
+    model=None,
+    *,
+    compile_granularity: str = "regional",
+    compile_dynamic: bool = True,
+    use_hsdp: bool = False,
+):
     runner = object.__new__(DiffusionModelRunner)
-    runner.pipeline = SimpleNamespace(transformer=SimpleNamespace())
-    runner.od_config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
+    runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
+    runner.od_config = SimpleNamespace(
+        diffusion_compile_granularity=compile_granularity,
+        diffusion_compile_dynamic=compile_dynamic,
+        parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+    )
     return runner
 
 
@@ -212,6 +246,25 @@ def _make_stage_payload_runner(connector, payload_keys=("latents",)):
         config=SimpleNamespace(from_stage="1", to_stage="2"),
     )
     return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_carries_prepared_layout() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    request = _make_request()
+    prepared_layout = object()
+    request.prepared_layout = prepared_layout
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert new_request_ids == [request.request_id]
+    assert states[0].prepared_layout is prepared_layout
 
 
 @pytest.mark.core_model
@@ -276,6 +329,27 @@ def test_middle_diffusion_stage_receives_then_sends_payload():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_dynamic=False)
+    compiled_model = object()
+    regional_calls = []
+
+    def _regionally_compile(target, **kwargs):
+        regional_calls.append((target, kwargs))
+        return compiled_model
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert regional_calls == [(model, {"dynamic": False})]
+    assert model.compile_calls == []
+    assert runner.pipeline.transformer is compiled_model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_stage_payload_prefetch_starts_early_and_is_consumed_once():
     started = threading.Event()
     release = threading.Event()
@@ -301,9 +375,7 @@ def test_stage_payload_prefetch_starts_early_and_is_consumed_once():
         prompt={"_stage_payload_transfer": handle},
     )
 
-    runner._start_stage_payload_prefetch(
-        {"request_id": "req-next", "stage_payload_handle": handle}
-    )
+    runner._start_stage_payload_prefetch({"request_id": "req-next", "stage_payload_handle": handle})
     assert started.wait(timeout=2)
     release.set()
     runner._maybe_recv_stage_payload(request)
@@ -311,6 +383,26 @@ def test_stage_payload_prefetch_starts_early_and_is_consumed_once():
 
     assert connector.get_calls == [("0", "1", "req-next:encode", {"edge": "encode"})]
     torch.testing.assert_close(request.prompt["prompt_embeds"], prompt_embeds)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_full_granularity(monkeypatch):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False)
+    regional_calls = []
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "regionally_compile",
+        lambda *args, **kwargs: regional_calls.append((args, kwargs)),
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False})]
+    assert regional_calls == []
+    assert runner.pipeline.transformer is model
 
 
 @pytest.mark.core_model
@@ -326,6 +418,24 @@ def test_stage_payload_put_failure_preserves_inline_fallback():
 
     torch.testing.assert_close(output.custom_output["latents"], latents)
     assert "_stage_payload_transfer" not in output.custom_output
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model)
+
+    def _regionally_compile(*args, **kwargs):
+        raise RuntimeError("compile setup failed")
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert runner.pipeline.transformer is model
+    assert "failed before activation" in caplog.text
+    assert "lazy compilation errors" in caplog.text
 
 
 @pytest.mark.core_model
@@ -459,6 +569,33 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
     assert cache_backend.refresh_calls == [(runner.pipeline, 4, True)]
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("cache_dit_enabled", [False, True])
+def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monkeypatch, cache_dit_enabled):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    runner.pipeline.adopt_cache_dit_backend = lambda backend: None
+    runner.pipeline.is_cache_dit_enabled = lambda: cache_dit_enabled
+    req = _make_request()
+
+    cache_summary_calls = []
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(
+        model_runner_module,
+        "cache_summary",
+        lambda pipeline, details: cache_summary_calls.append((pipeline, details)),
+    )
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "ok"
+    assert cache_summary_calls == ([(runner.pipeline, True)] if cache_dit_enabled else [])
 
 
 @pytest.mark.core_model

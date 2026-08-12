@@ -50,7 +50,7 @@ if TYPE_CHECKING:
         DuplexSessionLifecycleMessage,
     )
     from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
-    from vllm_omni.inputs.data import OmniPromptType
+    from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -599,6 +599,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             else:
                 await self.engine.add_request_async(
@@ -608,6 +609,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    lora_request=lora_request,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -627,6 +629,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 yield output
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
+
+            # The input pump can outlive a normally-completed generation
+            # (e.g. a realtime client that keeps streaming after the final
+            # output); a live pump keeps issuing streaming updates for a
+            # request the orchestrator no longer tracks.
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
 
             self._log_summary_and_cleanup(request_id)
 
@@ -652,6 +661,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        lora_request: Any = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -689,6 +699,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
@@ -701,6 +712,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=True,
                         )
             except (asyncio.CancelledError, GeneratorExit):
@@ -732,6 +744,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
                     else:
@@ -743,6 +756,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
+                            lora_request=lora_request,
                             resumable=False,
                         )
 
@@ -1006,6 +1020,46 @@ class AsyncOmni(EngineClient, OmniBase):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
 
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        *,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Apply a midway interaction to an active streaming diffusion request.
+
+        ``request_id`` is the external id created by the server-side session,
+        matching the value passed to :meth:`generate`.
+        """
+        event = interaction.get("event")
+        prompt = event.get("prompt") if isinstance(event, dict) else None
+        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("prompt must be non-empty")
+        transition_chunks = interaction.get("transition_chunks")
+        if transition_chunks is not None and transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+
+        if self.num_stages != 1:
+            raise ValueError("interaction requires single-stage diffusion")
+        stage_meta = self.engine.get_stage_metadata(0)
+        if stage_meta.stage_type != "diffusion":
+            raise ValueError("interaction requires a diffusion stage")
+
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if not internal_ids:
+            raise ValueError(f"No active request for interaction: {request_id!r}")
+        if len(internal_ids) > 1:
+            raise ValueError(
+                f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
+            )
+
+        await self.engine.submit_interaction_async(
+            internal_ids[0],
+            interaction=interaction,
+        )
+        if self.log_stats:
+            logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
+
     async def _abort_internal_requests(self, request_id: str | Iterable[str]):
         """Abort request(s) via the Orchestrator given internal request IDs,
         which take the format <external_request_id>-<UUID>.
@@ -1019,7 +1073,10 @@ class AsyncOmni(EngineClient, OmniBase):
         """Submit request IDs to be aborted to the engine."""
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
-            self.request_states.pop(rid, None)
+            state = self.request_states.pop(rid, None)
+            input_stream_task = getattr(state, "input_stream_task", None)
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

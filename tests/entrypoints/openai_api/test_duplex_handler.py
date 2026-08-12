@@ -2520,6 +2520,52 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback():
     assert results[0]["abort_data_plane_request"] is True
 
 
+def test_duplex_auto_response_rearms_tts_boundary_for_next_segment_in_same_turn():
+    data_plane = _test_data_plane()
+    request_id = "duplex-sid-next-segment-same-turn-e0-stage0"
+    session = DuplexSession(
+        session_id="sid-next-segment-same-turn",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.bind_response_turn(0)
+    data_plane.begin_request(request_id)
+
+    first_segment = _duplex_tts_output(
+        request_id=request_id,
+        samples=24000,
+        finished=False,
+        tts_is_last_chunk=True,
+        turn_id=0,
+    )
+    first_results = _project_data_plane(
+        data_plane,
+        {"data_plane_outputs": [first_segment]},
+        session=session,
+    )
+
+    assert len(first_results) == 1
+    assert first_results[0]["abort_data_plane_request"] is True
+
+    data_plane.begin_request(request_id)
+    second_segment = _duplex_tts_output(
+        request_id=request_id,
+        samples=48000,
+        finished=False,
+        text="hello again",
+        tts_is_last_chunk=True,
+        turn_id=0,
+    )
+    second_results = _project_data_plane(
+        data_plane,
+        {"data_plane_outputs": [second_segment]},
+        session=session,
+    )
+
+    assert len(second_results) == 1
+    assert second_results[0]["audio_data"] == "wav-24000"
+    assert second_results[0]["abort_data_plane_request"] is True
+
+
 def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-turn-end-after-segment-e0-stage0"
@@ -6202,19 +6248,27 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
         config_timeout_s=0.1,
         idle_timeout_s=1,
     )
-    ws = TimedWebSocket()
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        session = handler._registry.get("sid-native-auto-continuation")
+        assert session is not None
+        session.capabilities.chunk_period_ms = 50
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(800),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+
+    ws = TimedWebSocket(on_send=on_send)
     event = _native_session_create("sid-native-auto-continuation")
     event["session"]["extra_body"]["auto_response"] = True
     ws.put(event)
-    ws.put(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": _pcm_f32_b64(16000),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        }
-    )
-    ws.put({"type": "input_audio_buffer.commit", "final": True})
 
     await handler.handle_session(ws)
 
@@ -6223,6 +6277,112 @@ async def test_minicpmo_native_auto_response_keeps_request_bound_for_segment_con
     assert mode == "append_audio_chunk"
     assert payload["duplex_turn_id"] == 0
     assert final is False
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_auto_response_real_input_preempts_unsent_silence():
+    request_id = "duplex-sid-native-real-before-silence-e0-stage0"
+
+    class SequencedAppendEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            control_result = {
+                "operation": "append",
+                "session_id": "sid-native-real-before-silence",
+                "ok": True,
+                "unsupported_count": 0,
+                "error_count": 0,
+                "stage_results": [
+                    {
+                        "result": {
+                            "data_plane_append": True,
+                            "request_id": request_id,
+                            "response_stage_id": 1,
+                        }
+                    }
+                ],
+            }
+            terminal_segment = _duplex_tts_output(
+                request_id=request_id,
+                samples=0,
+                finished=True,
+                tts_is_last_chunk=True,
+                token_ids=[151645],
+            )
+            super().__init__(
+                control_result=control_result,
+                collect_outputs=[[terminal_segment], [], []],
+                collect_delay_s=0.01,
+            )
+            self.append_sequence: list[str] = []
+            self.first_real_started = asyncio.Event()
+            self.second_real_started = asyncio.Event()
+            self.real_count = 0
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            payload = kwargs.get("payload")
+            is_silence = (
+                isinstance(payload, dict)
+                and payload.get("audio") == OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+            )
+            if is_silence:
+                self.append_sequence.append("silence")
+            else:
+                self.real_count += 1
+                self.append_sequence.append(f"real-{self.real_count}")
+                if self.real_count == 1:
+                    self.first_real_started.set()
+                elif self.real_count == 2:
+                    self.second_real_started.set()
+            return result
+
+    session_created = asyncio.Event()
+    engine = SequencedAppendEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        session = handler._registry.get("sid-native-real-before-silence")
+        assert session is not None
+        session.capabilities.chunk_period_ms = 50
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(800),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+        session_created.set()
+
+    ws = TimedWebSocket(on_send=on_send, receive_timeout_s=2.0)
+    event = _native_session_create("sid-native-real-before-silence")
+    event["session"]["extra_body"]["auto_response"] = True
+    ws.put(event)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    await asyncio.wait_for(session_created.wait(), timeout=1)
+    await asyncio.wait_for(engine.first_real_started.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(800, value=0.07),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+    )
+    await asyncio.wait_for(engine.second_real_started.wait(), timeout=1)
+    ws.put({"type": "session.close"})
+    await asyncio.wait_for(handler_task, timeout=2)
+
+    assert engine.append_sequence[:2] == ["real-1", "real-2"]
 
 
 @pytest.mark.asyncio
@@ -6294,18 +6454,26 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
         config_timeout_s=0.1,
         idle_timeout_s=1,
     )
-    ws = TimedWebSocket(receive_timeout_s=2.0)
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        session = handler._registry.get("sid-native-silence-tail")
+        assert session is not None
+        session.capabilities.chunk_period_ms = 50
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(800, value=0.05),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+
+    ws = TimedWebSocket(on_send=on_send, receive_timeout_s=2.0)
     event = _native_session_create("sid-native-silence-tail")
     event["session"]["extra_body"]["auto_response"] = True
     ws.put(event)
-    ws.put(
-        {
-            "type": "input_audio_buffer.append",
-            "audio": _pcm_f32_b64(16000, value=0.05),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        }
-    )
     handler_task = asyncio.create_task(handler.handle_session(ws))
 
     await asyncio.wait_for(engine.silence_append_started.wait(), timeout=1)
@@ -6328,6 +6496,135 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
 
     assert engine.real_append_count == 2
     assert engine.append_sequence == ["real-1", "silence-started", "silence-returned", "real-2"]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_auto_response_preserves_silence_continuations_across_append_tails():
+    request_id = "duplex-sid-native-continuation-tails-e0-stage0"
+
+    class SequencedAppendEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            control_result = {
+                "operation": "append",
+                "session_id": "sid-native-continuation-tails",
+                "ok": True,
+                "unsupported_count": 0,
+                "error_count": 0,
+                "stage_results": [
+                    {
+                        "result": {
+                            "data_plane_append": True,
+                            "request_id": request_id,
+                            "response_stage_id": 1,
+                        }
+                    }
+                ],
+            }
+            super().__init__(control_result=control_result)
+            self.real_append_started = asyncio.Event()
+            self.release_real_append = asyncio.Event()
+            self.first_silence_started = asyncio.Event()
+            self.release_first_silence = asyncio.Event()
+            self.second_silence_started = asyncio.Event()
+            self.release_collect = asyncio.Event()
+            self.silence_count = 0
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            payload = kwargs.get("payload")
+            assert isinstance(payload, dict)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            if payload.get("audio") != OmniDuplexSessionHandler._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO:
+                self.real_append_started.set()
+                await self.release_real_append.wait()
+                return result
+
+            self.silence_count += 1
+            if self.silence_count == 1:
+                self.first_silence_started.set()
+                await self.release_first_silence.wait()
+            else:
+                self.second_silence_started.set()
+            return result
+
+        async def collect_duplex_data_plane_outputs_async(
+            self,
+            request_id: str,
+            *,
+            response_stage_id: int | None = None,
+            timeout: float | None = None,
+        ) -> list[object]:
+            del timeout
+            self.collected.append((request_id, response_stage_id))
+            await self.release_collect.wait()
+            return []
+
+    session_created = asyncio.Event()
+
+    def on_send(_ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") == "session.created":
+            session_created.set()
+
+    engine = SequencedAppendEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket(on_send=on_send, receive_timeout_s=2.0)
+    event = _native_session_create("sid-native-continuation-tails")
+    event["session"]["extra_body"]["auto_response"] = True
+    ws.put(event)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+    )
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    await asyncio.wait_for(session_created.wait(), timeout=1)
+    await asyncio.wait_for(engine.real_append_started.wait(), timeout=1)
+    session = handler._registry.get("sid-native-continuation-tails")
+    assert session is not None
+    session.capabilities.chunk_period_ms = 50
+    session.bind_request(request_id)
+    response_id = session.begin_response(turn_id=session.turn_id)
+    native = handler._minicpmo_session_state(session)
+    scheduler = native.silence_continuation_scheduler
+    assert scheduler is not None
+
+    payload = handler._native_silence_unit_payload()
+    payload["duplex_turn_id"] = session.turn_id
+    kwargs = {
+        "request_id": request_id,
+        "owner_id": f"response:{response_id}",
+        "response_id": response_id,
+        "response_owned": True,
+        "expected_epoch": session.epoch,
+        "expected_incarnation": session.incarnation,
+        "expected_model_turn_id": None,
+        "send_json": ws.send_json,
+    }
+    assert await scheduler(payload, **kwargs) is True
+
+    next_schedule = asyncio.create_task(scheduler(payload, **kwargs))
+    await asyncio.sleep(0.05)
+    assert not next_schedule.done()
+
+    engine.release_real_append.set()
+    await asyncio.wait_for(engine.first_silence_started.wait(), timeout=1)
+    assert not next_schedule.done()
+
+    engine.release_first_silence.set()
+    assert await asyncio.wait_for(next_schedule, timeout=1) is True
+    await asyncio.wait_for(engine.second_silence_started.wait(), timeout=1)
+    ws.put({"type": "session.close"})
+    await asyncio.wait_for(handler_task, timeout=2)
+
+    assert engine.silence_count == 2
 
 
 @pytest.mark.asyncio

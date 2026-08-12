@@ -84,6 +84,7 @@ class _CpuFusedMoE3DWithLoRA(FusedMoE3DWithLoRA):
         self.tp_size = 1
         self.tp_rank = 0
         self._w13_slices = 1
+        self.enable_moe_shared_loras = False
 
 
 def _save_peft_adapter(tmp_path: Path) -> Path:

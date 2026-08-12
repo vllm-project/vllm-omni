@@ -24,11 +24,19 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
+from vllm_omni.metrics import (
+    count_audio_frames,
+    count_image_pixels,
+    count_tokens_from_outputs,
+)
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
-from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.metrics.utils import (
+    coerce_positive_int_scalar,
+    iter_mm_outputs,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -619,7 +627,7 @@ class StagePool:
             else 0.0
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
-        num_inference_steps = self._coerce_int_scalar(getattr(sampling_params, "num_inference_steps", None))
+        num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
         denoise_step_latency_ms = (
             defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
             if output_unit_type == "image"
@@ -661,6 +669,8 @@ class StagePool:
             num_tokens_out=num_tokens_out,
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
+            # This event summarizes one completed request. Execution batching
+            # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
             rx_decode_time_ms=0.0,
@@ -741,78 +751,40 @@ class StagePool:
 
     def _has_audio_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
-            for mm_output in self._iter_multimodal_outputs(ro):
+            for mm_output in iter_mm_outputs(ro):
                 if isinstance(mm_output, Mapping) and mm_output.get("audio") is not None:
                     return True
         return False
 
-    def _collect_audio_metrics(self, request_outputs: list[Any]) -> tuple[int, int, float]:
+    def _collect_audio_metrics(
+        self,
+        request_outputs: list[Any],
+        *,
+        use_default_sample_rate: bool = False,
+    ) -> tuple[int, int, float]:
         total_frames = 0
         sample_rate = 0
         for ro in request_outputs:
-            for mm_output in self._iter_multimodal_outputs(ro):
-                if not isinstance(mm_output, Mapping):
-                    continue
+            for mm_output in iter_mm_outputs(ro):
                 if sample_rate <= 0:
-                    sample_rate = self._infer_audio_sample_rate(mm_output)
-                audio_output = mm_output.get("audio")
-                if audio_output is None:
-                    continue
-                items = audio_output if isinstance(audio_output, list) else [audio_output]
-                for item in items:
-                    total_frames += self._count_audio_frames(item)
+                    sample_rate = self._infer_audio_sample_rate(mm_output, use_default=use_default_sample_rate)
+                total_frames += count_audio_frames(mm_output)
         duration_s = (float(total_frames) / float(sample_rate)) if total_frames > 0 and sample_rate > 0 else 0.0
         return int(total_frames), int(sample_rate), duration_s
 
-    @staticmethod
-    def _count_audio_frames(audio_output: Any) -> int:
-        shape = getattr(audio_output, "shape", None)
-        if shape is not None and len(shape) > 0:
-            # Audio chunks are concatenated on dim=-1 in the output processor,
-            # so the frame/sample axis is the last dim (e.g. [channels, frames]).
-            # Keep this aligned with serving_chat.py: audio tensors are consumed
-            # as (T,), (C, T), or (B, C, T). Flattening would corrupt
-            # multi-channel audio.
-            return int(shape[-1])
-        try:
-            return len(audio_output)
-        except TypeError:
-            return 1
-
-    def _infer_audio_sample_rate(self, mm_output: dict[str, Any]) -> int:
-        for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
-            rate = self._coerce_int_scalar(mm_output.get(key))
-            if rate > 0:
-                return rate
-        for attr in ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate"):
-            rate = self._coerce_int_scalar(getattr(self.stage_client, attr, None))
-            if rate > 0:
-                return rate
-            rate = self._coerce_int_scalar(getattr(self._stage_vllm_config, attr, None))
-            if rate > 0:
-                return rate
-        return 0
-
-    @classmethod
-    def _coerce_int_scalar(cls, value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                coerced = cls._coerce_int_scalar(item)
-                if coerced > 0:
-                    return coerced
-            return 0
-        item = getattr(value, "item", None)
-        if callable(item):
-            try:
-                return int(item())
-            except Exception:
-                return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+    def _infer_audio_sample_rate(
+        self,
+        mm_output: dict[str, Any] | None = None,
+        *,
+        use_default: bool = True,
+    ) -> int:
+        sources: list[Any] = []
+        if mm_output is not None:
+            sources.append(mm_output)
+        sources.extend([self.stage_client, self._stage_vllm_config])
+        if use_default:
+            return defs.resolve_audio_sample_rate(sources)
+        return defs.resolve_audio_sample_rate_or_none(sources) or 0
 
     def _has_image_output(self, request_outputs: list[Any]) -> bool:
         for ro in request_outputs:
@@ -834,7 +806,7 @@ class StagePool:
 
     def _count_images(self, request_output: Any) -> int:
         total_images = self._count_value_units(getattr(request_output, "images", None))
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping):
                 total_images += self._count_value_units(mm_output.get("image"))
                 total_images += self._count_value_units(mm_output.get("images"))
@@ -843,43 +815,17 @@ class StagePool:
     def _count_image_pixels(self, request_outputs: list[Any]) -> int:
         total_pixels = 0
         for ro in request_outputs:
-            total_pixels += self._count_image_value_pixels(getattr(ro, "images", None))
-            for mm_output in self._iter_multimodal_outputs(ro):
+            total_pixels += count_image_pixels(getattr(ro, "images", None))
+            for mm_output in iter_mm_outputs(ro):
                 if isinstance(mm_output, Mapping):
-                    total_pixels += self._count_image_value_pixels(mm_output.get("image"))
-                    total_pixels += self._count_image_value_pixels(mm_output.get("images"))
+                    total_pixels += count_image_pixels(mm_output.get("image"))
+                    total_pixels += count_image_pixels(mm_output.get("images"))
         return total_pixels
-
-    @classmethod
-    def _count_image_value_pixels(cls, value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, (list, tuple)):
-            return sum(cls._count_image_value_pixels(item) for item in value)
-
-        size = getattr(value, "size", None)
-        if isinstance(size, tuple) and len(size) >= 2:
-            try:
-                return int(size[0]) * int(size[1])
-            except (TypeError, ValueError):
-                return 0
-
-        shape = getattr(value, "shape", None)
-        if shape is None or len(shape) < 2:
-            return 0
-        dims = [int(dim) for dim in shape]
-        if len(dims) >= 4:
-            return dims[0] * dims[-2] * dims[-1]
-        if len(dims) == 3 and dims[0] in (1, 3, 4):
-            return dims[1] * dims[2]
-        if len(dims) == 3 and dims[-1] in (1, 3, 4):
-            return dims[0] * dims[1]
-        return dims[-2] * dims[-1]
 
     def _count_videos(self, request_output: Any) -> int:
         total_videos = self._count_video_units(getattr(request_output, "video", None))
         total_videos += self._count_video_units(getattr(request_output, "videos", None))
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping):
                 total_videos += self._count_video_units(mm_output.get("video"))
                 total_videos += self._count_video_units(mm_output.get("videos"))
@@ -904,7 +850,7 @@ class StagePool:
         custom_output = getattr(request_output, "_custom_output", None)
         if isinstance(custom_output, dict) and custom_output:
             return True
-        for mm_output in self._iter_multimodal_outputs(request_output):
+        for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
         for output in getattr(request_output, "outputs", None) or []:
@@ -967,22 +913,14 @@ class StagePool:
             self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
             if self._has_non_empty_output(request_output):
                 self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
-            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics([request_output])
+            audio_frames, audio_sample_rate, _ = self._collect_audio_metrics(
+                [request_output],
+                use_default_sample_rate=False,
+            )
             if audio_frames > 0:
                 self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
-
-    def _iter_multimodal_outputs(self, request_output: object) -> list[Mapping[str, Any]]:
-        multimodal_outputs: list[Mapping[str, Any]] = []
-        outer_mm = getattr(request_output, "multimodal_output", None)
-        if isinstance(outer_mm, Mapping) and outer_mm:
-            multimodal_outputs.append(outer_mm)
-        for output in getattr(request_output, "outputs", None) or []:
-            inner_mm = getattr(output, "multimodal_output", None)
-            if isinstance(inner_mm, Mapping) and inner_mm:
-                multimodal_outputs.append(inner_mm)
-        return multimodal_outputs
 
     # ---- Stage-local admission ----
 
@@ -999,10 +937,9 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
-        # Convert plain vllm SamplingParams for single-stage diffusion models
-        # that receive sampling params from the user/caller directly.
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        # Direct engine callers may provide plain vLLM SamplingParams.
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1065,8 +1002,8 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
-        if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams()
+        if self.stage_type == "diffusion":
+            params = OmniDiffusionSamplingParams.from_params(params)
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
@@ -1110,6 +1047,24 @@ class StagePool:
                 raise
         return replica_id
 
+    async def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> int:
+        """Submit a midway interaction to an active diffusion (typically video generation) request."""
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            replica_id = await self._pick_or_select(request_id)
+
+        client = self._diffusion_client(replica_id)
+        result = await client.submit_interaction_async(request_id, interaction)
+        # Interaction may raise error if underlying check against ODConfig fails.
+        if isinstance(result, dict) and result.get("error"):
+            reason = result.get("reason") or "Unknown interaction RPC error"
+            raise ValueError(str(reason))
+        return replica_id
+
     async def _pick_or_select(
         self,
         request_id: str,
@@ -1126,7 +1081,11 @@ class StagePool:
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
         outputs = await client.get_output_async()
-        if not outputs.outputs:
+        # Keep scheduler-only / finished-only batches. Omni schedulers mirror
+        # upstream by emitting SchedulerStats on throttled ticks even when no
+        # request output is produced, and dropping those batches loses KV/queue
+        # gauges for that interval.
+        if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
             return None
         return outputs
 
@@ -1142,7 +1101,6 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
-        iteration_stats = IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,

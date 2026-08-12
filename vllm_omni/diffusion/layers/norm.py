@@ -65,9 +65,10 @@ class LayerNorm(nn.LayerNorm, CustomOp):
 
 
 class RMSNorm(CustomOp):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6, dtype: torch.dtype = torch.float32) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.hidden_size = hidden_size
         self.variance_epsilon = eps
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
@@ -106,6 +107,19 @@ class RMSNorm(CustomOp):
             return self._forward_fused(x)
         except Exception:
             return self.forward_native(x)
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        # Preserve the aten::rms_norm graph so dynamic Inductor can fuse the
+        # H3 Q/K norm with its inline RoPE path on MUSA.
+        return F.rms_norm(
+            x,
+            (self.hidden_size,),
+            self.weight,
+            self.variance_epsilon,
+        )
 
     def forward_npu(
         self,

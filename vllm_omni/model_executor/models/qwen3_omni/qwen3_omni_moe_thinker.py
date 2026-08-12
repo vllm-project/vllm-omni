@@ -114,6 +114,7 @@ from vllm.multimodal.processing.processor import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 
@@ -1420,6 +1421,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     visual_dim = embeddings.shape[-1] // (multiscale_len + 1)
                     multi_dim = visual_dim * multiscale_len
                     embeddings_main, embeddings_multiscale = torch.split(embeddings, [visual_dim, multi_dim], dim=-1)
+                    # torch.split returns fresh views, so the `modality` tag the
+                    # encoder gather attached (gpu_model_runner._gather_mm_embeddings)
+                    # does not survive. merge_interleaved_embeddings groups by that
+                    # tag since vLLM #46213, so carry it across the split.
+                    modality = getattr(embeddings, "modality", None)
+                    if modality is not None:
+                        set_mm_embedding_modality(embeddings_main, modality)
                     multimodal_embeddings[index] = embeddings_main
                     multimodal_embeddings_multiscale.append(embeddings_multiscale)
                     if not is_interleaved:
@@ -1457,8 +1465,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 is_video,
                 is_audio,
                 is_mm_device,
-                num_video,
-                num_audio,
             )
 
         # Default: standard merge (no interleaving), same as parent class.

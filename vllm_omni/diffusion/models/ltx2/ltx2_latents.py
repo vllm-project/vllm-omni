@@ -120,45 +120,14 @@ def create_noised_state(
     return noise_scale * noise + (1 - noise_scale) * latents
 
 
-def pack_audio_latents(
-    latents: torch.Tensor,
-    patch_size: int | None = None,
-    patch_size_t: int | None = None,
-) -> torch.Tensor:
-    if patch_size is not None and patch_size_t is not None:
-        batch_size, _, latent_length, latent_mel_bins = latents.shape
-        post_patch_latent_length = latent_length / patch_size_t
-        post_patch_mel_bins = latent_mel_bins / patch_size
-        latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_latent_length,
-            patch_size_t,
-            post_patch_mel_bins,
-            patch_size,
-        )
-        return latents.permute(0, 2, 4, 1, 3, 5).flatten(3, 5).flatten(1, 2)
+def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
     return latents.transpose(1, 2).flatten(2, 3)
 
 
 def unpack_audio_latents(
     latents: torch.Tensor,
-    latent_length: int,
     num_mel_bins: int,
-    patch_size: int | None = None,
-    patch_size_t: int | None = None,
 ) -> torch.Tensor:
-    if patch_size is not None and patch_size_t is not None:
-        batch_size = latents.size(0)
-        latents = latents.reshape(
-            batch_size,
-            latent_length,
-            num_mel_bins,
-            -1,
-            patch_size_t,
-            patch_size,
-        )
-        return latents.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
     return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
 
 
@@ -224,18 +193,19 @@ def prepare_video_latents(
         vae_spatial_compression_ratio=pipeline.vae_spatial_compression_ratio,
         vae_temporal_compression_ratio=pipeline.vae_temporal_compression_ratio,
     )
-    shape = (batch_size, num_channels_latents, num_frames, height, width)
+    spatial_patch_size = pipeline.transformer_spatial_patch_size
+    temporal_patch_size = pipeline.transformer_temporal_patch_size
+    shape = (
+        batch_size,
+        (num_frames // temporal_patch_size) * (height // spatial_patch_size) * (width // spatial_patch_size),
+        num_channels_latents * temporal_patch_size * spatial_patch_size * spatial_patch_size,
+    )
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    return pack_latents(
-        latents,
-        pipeline.transformer_spatial_patch_size,
-        pipeline.transformer_temporal_patch_size,
-    )
+    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
 
 def prepare_audio_latents(
@@ -249,6 +219,7 @@ def prepare_audio_latents(
     device: torch.device | None = None,
     generator: torch.Generator | list[torch.Generator] | None = None,
     latents: torch.Tensor | None = None,
+    latents_normalized: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     original_latent_length = audio_latent_length
     latent_mel_bins = num_mel_bins // pipeline.audio_vae_mel_compression_ratio
@@ -260,11 +231,12 @@ def prepare_audio_latents(
             latents = pack_audio_latents(latents)
         if latents.ndim != 3:
             raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
-        latents = normalize_audio_latents(
-            latents,
-            pipeline.audio_vae.latents_mean,
-            pipeline.audio_vae.latents_std,
-        )
+        if not latents_normalized:
+            latents = normalize_audio_latents(
+                latents,
+                pipeline.audio_vae.latents_mean,
+                pipeline.audio_vae.latents_std,
+            )
         latents = create_noised_state(latents, noise_scale, generator)
 
         if latents.shape[1] not in {original_latent_length, padded_latent_length}:
@@ -283,11 +255,11 @@ def prepare_audio_latents(
             latents = torch.cat([latents, padding], dim=1)
         return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
-    shape = (batch_size, num_channels_latents, padded_latent_length, latent_mel_bins)
+    shape = (batch_size, padded_latent_length, num_channels_latents * latent_mel_bins)
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
     latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    return pack_audio_latents(latents), original_latent_length, padded_latent_length
+    return latents, original_latent_length, padded_latent_length

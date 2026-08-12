@@ -411,7 +411,6 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5248")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_client) -> None:
@@ -469,6 +468,10 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["london"]},
+        # A one-word English clip is too short for whisper's language detection to
+        # be stable; unpinned it renders "London" as 런던 / ランデ / 梁敦 and the
+        # containment check then fails on correct audio.
+        "transcript_language": "en",
     }
 
     # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).

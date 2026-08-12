@@ -6,6 +6,7 @@ Coverage:
 - Layerwise CPU offload
 - Ulysses sequence parallelism
 - Ring sequence parallelism
+- VAE patch parallel encode/decode
 
 This test verifies that FLUX.2-dev can be launched with CPU offload enabled,
 accepts text-to-image requests through the OpenAI-compatible API, and returns
@@ -90,6 +91,21 @@ def _get_flux_2_dev_feature_cases(model: str):
             id="ring_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--tensor-parallel-size",
+                    "2",
+                    "--vae-patch-parallel-size",
+                    "2",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="vae_patch_parallel_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -120,3 +136,36 @@ def test_flux_2_dev(
     }
 
     openai_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_flux_2_dev_feature_cases(MODEL),
+    indirect=True,
+)
+def test_flux_2_dev_batched_chat_completions(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    """Validate batched chat completions for diffusion models."""
+    messages = [
+        [{"role": "user", "content": PROMPT}],
+        [{"role": "user", "content": "A sunset over the ocean."}],
+    ]
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                "num_inference_steps": 2,
+                "height": 512,
+                "width": 512,
+                "seed": 42,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert resp.success
+    choices = resp.json_body["choices"]
+    assert len(choices) == len(messages)
