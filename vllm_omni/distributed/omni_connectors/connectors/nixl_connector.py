@@ -547,15 +547,20 @@ class NixlConnector(OmniConnectorBase):
     def _cleanup_expired_pending(self) -> None:
         now = time.monotonic()
         with self._state_lock:
-            expired = [key for key, (_, _, deadline) in self._pending.items() if now >= deadline]
-        for request_id in expired:
+            expired = [
+                (key, sum(t.numel() * t.element_size() for t in tensors))
+                for key, (tensors, _, deadline) in self._pending.items()
+                if now >= deadline
+            ]
+        for request_id, size in expired:
             logger.warning(
-                "NixlConnector lease expired for request %s after %.0fs; its buffer is "
-                "being reclaimed while a consumer may still read it, which yields "
+                "NixlConnector lease expired for request %s after %.0fs; its %d bytes are "
+                "being reclaimed while a consumer may still read them, which yields "
                 "corrupt data. Raise VLLM_OMNI_NIXL_LEASE_S above the maximum "
                 "producer-to-consumer queueing delay.",
                 request_id,
                 self._lease_seconds,
+                size,
             )
             self.cleanup(request_id)
 
@@ -646,12 +651,20 @@ class NixlConnector(OmniConnectorBase):
         dtype = getattr(torch, dtype_name, None)
         if dtype is None:
             raise RuntimeError(f"Unsupported NIXL tensor dtype: {spec.get('dtype')!r}")
-        device = (
-            torch.device("cpu")
-            if kind == _KIND_OBJECT
-            else self._receive_device or self._parse_device(spec.get("device")) or torch.device("cpu")
-        )
+        device = torch.device("cpu") if kind == _KIND_OBJECT else self._resolve_receive_device(spec.get("device"))
         return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype, device=device)
+
+    def _resolve_receive_device(self, spec_device: Any) -> torch.device:
+        if self._receive_device is not None:
+            return self._receive_device
+        device = self._parse_device(spec_device)
+        if device is None or device.type == "cpu":
+            return torch.device("cpu")
+        # The producer's device index is meaningless in this process, so keep
+        # only its type and land the buffer on this stage's own card.
+        backend = getattr(torch, device.type, None)
+        index = backend.current_device() if hasattr(backend, "current_device") else 0
+        return torch.device(device.type, index)
 
     @staticmethod
     def _parse_device(device_like: Any) -> torch.device | None:
