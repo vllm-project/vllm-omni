@@ -1304,6 +1304,10 @@ class MiniMaxH3Pipeline(
                     else None,
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
+                quant_config=_resolve_component_quant_config(
+                    od_config.quantization_config,
+                    "video_vae",
+                ),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
