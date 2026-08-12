@@ -136,20 +136,43 @@ def test_unknown_root_extra_does_not_claim_canonical_extra(serving_chat):
     assert "pipeline_option" not in diffusion_request_args
 
 
-def test_misspelled_declared_root_extra_warns_and_is_not_routed(serving_chat, caplog):
+def test_misspelled_declared_root_extra_warns_and_is_not_routed(serving_chat, mocker):
     serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
     request = ChatCompletionRequest(
         model="test",
         messages=[],
         cfg_text_sclae=7.0,
     )
+    # warning_once dedups per process, so assert through the mock rather
+    # than caplog to stay independent of test order.
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
 
-    with caplog.at_level(logging.WARNING):
-        normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+    normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
 
     assert normalized_extra_args == {}
     assert "cfg_text_sclae" not in diffusion_request_args
-    assert any("cfg_text_sclae" in record.message for record in caplog.records)
+    warning.assert_called_once()
+    assert warning.call_args.args[1] == "request"
+    assert "cfg_text_sclae" in warning.call_args.args[2]
+
+
+def test_directly_consumed_flag_does_not_warn(serving_chat, mocker):
+    # return_stage_metrics is read directly from the raw request by the
+    # serving layer (_truthy_extra_body_flag) without routing; it must not
+    # be reported as ignored.
+    serving_chat._diffusion_extra_body_params = frozenset({"cfg_text_scale"})
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        extra_body={"return_stage_metrics": True},
+    )
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+
+    normalized_extra_args, diffusion_request_args = serving_chat._normalize_diffusion_request_args(request)
+
+    assert normalized_extra_args == {}
+    assert "return_stage_metrics" not in diffusion_request_args
+    warning.assert_not_called()
 
 
 def test_unknown_extra_args_keys_still_pass_through(serving_chat, caplog):

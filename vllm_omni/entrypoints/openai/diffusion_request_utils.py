@@ -60,7 +60,7 @@ def _warn_for_unknown_fields(
     allowed = set(allowed_fields) | _EXTRA_ARG_CONTAINER_FIELDS
     unknown = sorted(key for key in args if key not in allowed)
     if unknown:
-        logger.warning(
+        logger.warning_once(
             "Ignoring unrecognized diffusion request fields %s: %s.",
             source,
             ", ".join(unknown),
@@ -73,8 +73,19 @@ def normalize_diffusion_request_args(
     nested: object | None = None,
     explicit_root_args: object | None = None,
     request_options: DiffusionRequestOptionSpec,
+    warning_exempt_fields: Collection[str] = (),
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Validate request sources and project diffusion consumer arguments."""
+    """Validate request sources and project diffusion consumer arguments.
+
+    Args:
+        root: Free-form (``model_extra``) request-root fields.
+        nested: Request ``extra_body`` mapping.
+        explicit_root_args: Pydantic fields explicitly set on the request.
+        request_options: Typed declaration of routed request-option fields.
+        warning_exempt_fields: Fields consumed outside the normalized routing
+            (e.g. read directly from the raw request by the serving layer)
+            that must not be reported as ignored when unrecognized.
+    """
     serving_root_fields = request_options.serving_root_fields
     registered_extra_fields = request_options.registered_extra_fields
     root_field_aliases = request_options.root_field_aliases
@@ -91,15 +102,18 @@ def normalize_diffusion_request_args(
 
     # Warn about unrecognized fields from the free-form request sources only;
     # explicit pydantic fields (model, messages, etc.) are handled upstream.
+    # Fields consumed directly by the serving layer (warning_exempt_fields)
+    # are honored without routing, so they are allowed here as well.
+    allowed_request_fields = consumer_fields | set(aliases.values()) | set(warning_exempt_fields)
     _warn_for_unknown_fields(
         root_args,
         source="request",
-        allowed_fields=consumer_fields | set(aliases.values()),
+        allowed_fields=allowed_request_fields,
     )
     _warn_for_unknown_fields(
         nested_args,
         source="request.extra_body",
-        allowed_fields=consumer_fields | set(aliases.values()),
+        allowed_fields=allowed_request_fields,
     )
 
     root_args.update(explicit_root_args_mapping)

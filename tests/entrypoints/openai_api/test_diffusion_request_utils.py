@@ -163,7 +163,7 @@ def test_unknown_free_form_fields_warn_and_are_not_routed(
     kwargs: dict[str, object],
     mocker,
 ) -> None:
-    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
 
     normalized_extra_args, request_args = normalize_diffusion_request_args(
         request_options=DiffusionRequestOptionSpec(),
@@ -177,7 +177,7 @@ def test_unknown_free_form_fields_warn_and_are_not_routed(
 
 
 def test_registered_declared_fields_do_not_warn(mocker) -> None:
-    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
     request_options = DiffusionRequestOptionSpec.from_fields(
         serving_root_fields=set(),
         registered_extra_fields={"cfg_text_scale"},
@@ -190,4 +190,53 @@ def test_registered_declared_fields_do_not_warn(mocker) -> None:
     )
 
     assert normalized_extra_args == {"cfg_text_scale": 7.0}
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "source, kwargs",
+    [
+        ("request", {"root": {"seed": 1}}),
+        ("request", {"root": {"negative_prompt": "x"}}),
+        ("request.extra_body", {"nested": {"height": 512}}),
+        ("request.extra_body", {"nested": {"quality": "high"}}),
+    ],
+)
+def test_serving_root_fields_do_not_warn(source: str, kwargs: dict[str, object], mocker) -> None:
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+    request_options = DiffusionRequestOptionSpec.from_fields(
+        serving_root_fields={"seed", "negative_prompt", "height", "quality"},
+        registered_extra_fields=set(),
+        root_field_aliases=None,
+    )
+
+    normalize_diffusion_request_args(request_options=request_options, **kwargs)
+
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "source, kwargs",
+    [
+        ("request", {"root": {"return_stage_metrics": True}}),
+        ("request.extra_body", {"nested": {"return_stage_metrics": True}}),
+    ],
+)
+def test_warning_exempt_fields_do_not_warn(source: str, kwargs: dict[str, object], mocker) -> None:
+    warning = mocker.patch("vllm_omni.entrypoints.openai.diffusion_request_utils.logger.warning_once")
+    request_options = DiffusionRequestOptionSpec.from_fields(
+        serving_root_fields=set(),
+        registered_extra_fields=set(),
+        root_field_aliases=None,
+    )
+
+    normalized_extra_args, request_args = normalize_diffusion_request_args(
+        request_options=request_options,
+        warning_exempt_fields={"return_stage_metrics"},
+        **kwargs,
+    )
+
+    # Exempt fields stay unrouted but must not be reported as ignored.
+    assert "return_stage_metrics" not in normalized_extra_args
+    assert "return_stage_metrics" not in request_args
     warning.assert_not_called()

@@ -198,6 +198,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     )
     _diffusion_root_field_aliases = {"cfg_scale": "true_cfg_scale"}
     _diffusion_serving_root_fields = _diffusion_common_root_fields | _diffusion_existing_control_fields
+    # Fields the serving layer reads directly from the raw request (see
+    # _truthy_extra_body_flag) without routing them through
+    # diffusion_request_args; they must not be reported as ignored.
+    _diffusion_direct_consumed_fields = frozenset({"return_stage_metrics"})
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
@@ -362,6 +366,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             nested=nested,
             explicit_root_args=explicit_root_args,
             request_options=request_options,
+            warning_exempt_fields=self._diffusion_direct_consumed_fields,
         )
 
     def _get_diffusion_extra_output_params(
