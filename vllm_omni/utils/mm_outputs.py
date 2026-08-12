@@ -28,6 +28,7 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
 
 _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
     {
+        "audio_encoder_latency_ms",
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",

@@ -46,6 +46,7 @@ from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunne
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
+    partition_flat_payload,
     partition_payload_list,
     snapshot_mm_payload,
 )
@@ -450,6 +451,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
+    @staticmethod
+    def _merge_pending_multimodal_metadata(
+        multimodal_outputs: Any,
+        pending_metadata: object,
+    ) -> Any:
+        """Merge metadata finalized after forward into the current output."""
+        if not isinstance(pending_metadata, dict) or not pending_metadata:
+            return multimodal_outputs
+        merged = dict(multimodal_outputs) if isinstance(multimodal_outputs, dict) else {}
+        for key, value in pending_metadata.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        return merged
+
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
@@ -796,6 +813,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
+    @staticmethod
+    def _build_current_client_mm_cpu(multimodal_outputs: Any) -> dict[str, object] | None:
+        if not multimodal_outputs:
+            return None
+        _, client_payload = partition_flat_payload(flatten_payload(multimodal_outputs))
+        return build_mm_cpu(client_payload) or None
     def _build_omni_pooler_payload(
         self,
         *,
@@ -1185,6 +1208,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        pending_multimodal_metadata = None
         try:
             with (
                 nullcontext(),
@@ -1215,10 +1239,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     sampler=self.sampler,
                 )
 
-                # [Omni] Map pending ropes metadata to req_ids.
+                # [Omni] Finalize model metadata that depends on current-step
+                # CUDA work, then attach it to this step's output below.
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
                 if callable(flush_pending_metadata):
-                    flush_pending_metadata(req_ids[:num_reqs])
+                    pending_multimodal_metadata = flush_pending_metadata(req_ids[:num_reqs])
 
                 # [Omni] Hand the model the batch's req_ids in logits order, for
                 # models that gate logits per request. Only valid without spec
@@ -1247,6 +1272,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 multimodal_outputs = None
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                multimodal_outputs = self._merge_pending_multimodal_metadata(
+                    multimodal_outputs,
+                    pending_multimodal_metadata,
+                )
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
@@ -1544,6 +1573,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _build_multimodal_outputs(
         self,
         per_req_payloads: list[dict[str, object] | None] | None,
+        *,
+        allow_text_output: bool = False,
     ) -> list[dict[str, torch.Tensor] | None] | None:
         """Build per-request multimodal output payloads (dedicated channel).
 
@@ -1556,7 +1587,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         converted is dropped.
         """
         if self.vllm_config.model_config.engine_output_type == "text":
-            return None
+            if not allow_text_output:
+                return None
+            _, client_payloads = partition_payload_list([payload or {} for payload in per_req_payloads or []])
+            per_req_payloads = client_payloads
         if per_req_payloads is None:
             return None
         wire_payloads: list[dict[str, torch.Tensor] | None] = []
@@ -1640,9 +1674,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # Nothing from an intermediate stage needs to cross the worker/core
             # boundary on each decode step.
             return None, None
-        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        inter_stage_outputs = self._build_multimodal_outputs(
+            pooler_inter,
+            allow_text_output=pooler_client is pooler_inter,
+        )
         multimodal_outputs = (
-            inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            inter_stage_outputs
+            if pooler_client is pooler_inter
+            else self._build_multimodal_outputs(pooler_client, allow_text_output=True)
         )
         return inter_stage_outputs, multimodal_outputs
 
@@ -1852,7 +1891,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             hidden_seq_len = int(hidden_states.shape[0])
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
+            current_client_mm_cpu = None
             if self.omni_prefix_cache is not None:
+                current_client_mm_cpu = self._build_current_client_mm_cpu(multimodal_outputs)
                 (
                     hidden_states_cpu,
                     combined_hidden_states,
@@ -1912,6 +1953,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
                     )
+                    if current_client_mm_cpu:
+                        payload.update(
+                            build_omni_mm_payload(
+                                combined_multimodal_outputs=None,
+                                mm_cpu=current_client_mm_cpu,
+                                rid=rid,
+                                idx=idx,
+                                start=start,
+                                end=end,
+                                audio_sparse_output=audio_sparse_output,
+                                sparse_mm_index=sparse_mm_index,
+                                hidden_seq_len=hidden_seq_len,
+                                scheduled_seq_len=scheduled_seq_len,
+                            )
+                        )
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []

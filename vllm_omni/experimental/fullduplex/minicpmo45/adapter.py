@@ -97,7 +97,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
-<<<<<<< HEAD
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text

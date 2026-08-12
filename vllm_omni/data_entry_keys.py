@@ -59,6 +59,7 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
+    audio_encoder_latency_ms: torch.Tensor
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
@@ -165,6 +166,7 @@ class IdsStruct(_StructBase):
 
 
 class MetaStruct(_StructBase):
+    audio_encoder_latency_ms: torch.Tensor | None = None
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None
