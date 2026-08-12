@@ -131,7 +131,7 @@ def build_sampling_params() -> list[SamplingParams]:
 
 
 def save_stage_output(stage_outputs, output_dir: str) -> None:
-    output = stage_outputs.request_output
+    output = stage_outputs
     request_id = output.request_id
     if stage_outputs.final_output_type == "text":
         text_output = output.outputs[0].text

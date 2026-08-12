@@ -63,7 +63,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
-    build_image_to_video_prompt,
+    build_image_to_video_prompt as build_model_image_to_video_prompt,
+)
+from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
 )
@@ -83,6 +85,22 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
+def build_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared I2V example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["video"],
+        "multi_modal_data": media_inputs,
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -566,10 +584,13 @@ def main():
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         negative_prompt = ""
     prompt_dict = build_image_to_video_prompt(
-        model_class_name=model_class_name,
         prompt=args.prompt,
         negative_prompt=negative_prompt,
         media_inputs=media_inputs,
+    )
+    prompt_dict = build_model_image_to_video_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
         height=height,
         width=width,
         num_frames=num_frames,
@@ -625,8 +646,8 @@ def main():
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

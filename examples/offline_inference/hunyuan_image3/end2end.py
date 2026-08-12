@@ -303,7 +303,7 @@ def main():
     )
     img_idx = 0
     for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
+        ro = req_output
         stage_id = getattr(req_output, "stage_id", None)
 
         # AR stage text — each CompletionOutput.text is already a delta when

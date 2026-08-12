@@ -73,11 +73,9 @@ def test_run_summary_reports_worker_peak_memory():
     assert summary["per_run_peak_memory_mb"] == [100.0, 150.0]
 
 
-def test_request_peak_memory_prefers_inner_diffusion_output():
-    inner = type("InnerOutput", (), {"peak_memory_mb": 321.0})()
-    outer = type("OuterOutput", (), {"request_output": inner, "peak_memory_mb": 123.0})()
-
-    assert _request_peak_memory_mb(outer) == 321.0
+def test_request_peak_memory_reads_peak_memory_mb_directly():
+    result = type("Output", (), {"peak_memory_mb": 123.0})()
+    assert _request_peak_memory_mb(result) == 123.0
 
 
 def test_metric_guidance_describes_thresholds():

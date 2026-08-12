@@ -513,6 +513,7 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
+        "mamba_ssm_cache_dtype",
     }
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {
         "max_num_seqs",

@@ -21,7 +21,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
-    build_text_to_image_prompt,
+    build_text_to_image_prompt as build_model_text_to_image_prompt,
+)
+from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
@@ -54,6 +56,17 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
+def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared T2I example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["image"],
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
 
 
 def _normalize_images_for_save(images: list[Any]) -> list[Any]:
@@ -523,9 +536,12 @@ def main():
     generation_start = time.perf_counter()
 
     prompt_dict = build_text_to_image_prompt(
-        model_class_name=model_class_name,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
+    )
+    prompt_dict = build_model_text_to_image_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
         height=args.height,
         width=args.width,
     )
@@ -640,7 +656,7 @@ def main():
         images = getattr(output, "images", None)
         if images:
             break
-        req_out = getattr(output, "request_output", None)
+        req_out = output
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break

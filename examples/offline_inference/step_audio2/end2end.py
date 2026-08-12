@@ -345,7 +345,7 @@ def main(args):
     # Process outputs from each stage
     for stage_idx, stage_outputs in enumerate(omni_outputs):
         # request_output may be a single object or a list
-        raw_output = stage_outputs.request_output
+        raw_output = stage_outputs
         outputs_list = raw_output if isinstance(raw_output, list) else [raw_output]
 
         if stage_outputs.final_output_type == "text":

@@ -69,6 +69,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
+            # nemotron_voicechat: code2wav (stage 2) consumes the talker's
+            # full-payload code stacks.
+            "NemotronVoiceChatCode2Wav",
         }
         if (
             getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS

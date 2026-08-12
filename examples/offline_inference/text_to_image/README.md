@@ -57,8 +57,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output lingbot_t2i.png
 ```
 
-The LingBot prompt builder selects the `image` output modality and requests one
-frame. Passing an input image is not supported in LingBot T2I mode.
+The shared T2I entry point selects the `image` output modality. The LingBot
+pipeline validates that T2I requests produce one frame and do not include an
+input image.
 
 ## Quick Start
 
