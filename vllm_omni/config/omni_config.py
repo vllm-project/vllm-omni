@@ -562,8 +562,9 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | None = None
+    lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
+    lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False

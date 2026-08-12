@@ -299,6 +299,7 @@ class StageDeployConfig:
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
+    default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
 
     # === Generic stage engine fields ===
@@ -344,6 +345,9 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: str | list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
@@ -465,6 +469,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
+        "default_pooling_params",
         "engine_extras",
         "engine_args",
         "runtime",
@@ -518,11 +523,14 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
+    kwargs["default_pooling_params"] = stage_data.get("default_pooling_params")
     kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
-_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
+_DEEP_MERGE_KEYS = frozenset(
+    {"default_sampling_params", "default_pooling_params", "subtalker_sampling_params", "engine_extras", "engine_args"}
+)
 
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
@@ -842,6 +850,8 @@ def _build_extras(
     sampling.update(ps.sampling_constraints)
     if sampling:
         extras["default_sampling_params"] = sampling
+    if ds is not None and ds.default_pooling_params:
+        extras["default_pooling_params"] = dict(ds.default_pooling_params)
     if ds is not None and ds.output_connectors:
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
