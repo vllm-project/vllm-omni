@@ -128,6 +128,7 @@ class _CacheEngineOverrides(TypedDict, total=False):
     enable_prefix_caching: bool
     disable_hybrid_kv_cache_manager: bool
     mm_processor_cache_gb: float
+    mamba_ssm_cache_dtype: str
 
 
 class _SchedulerEngineOverrides(TypedDict, total=False):
@@ -377,6 +378,8 @@ class OmniStageCacheConfig:
     enable_prefix_caching: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
+    # Hybrid-mamba SSM state dtype ("auto"/"float32"); vLLM CacheConfig field.
+    mamba_ssm_cache_dtype: str | None = None
 
 
 @config
