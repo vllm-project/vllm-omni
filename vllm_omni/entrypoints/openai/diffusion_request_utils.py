@@ -72,23 +72,19 @@ def normalize_diffusion_request_args(
     root: object | None = None,
     nested: object | None = None,
     explicit_root_args: object | None = None,
-    request_options: DiffusionRequestOptionSpec | None = None,
-    serving_root_fields: Collection[str] = (),
-    registered_extra_fields: Collection[str] = (),
-    root_field_aliases: Mapping[str, str] | None = None,
+    request_options: DiffusionRequestOptionSpec,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Validate request sources and project diffusion consumer arguments."""
-    if request_options is not None:
-        serving_root_fields = request_options.serving_root_fields
-        registered_extra_fields = request_options.registered_extra_fields
-        root_field_aliases = request_options.root_field_aliases
+    serving_root_fields = request_options.serving_root_fields
+    registered_extra_fields = request_options.registered_extra_fields
+    root_field_aliases = request_options.root_field_aliases
 
     root_args = _request_mapping("request", root)
     explicit_root_args_mapping = _request_mapping("explicit_root_args", explicit_root_args)
     nested_args = _request_mapping("request.extra_body", nested)
 
     registered = set(registered_extra_fields)
-    aliases = {alias: canonical for alias, canonical in (root_field_aliases or {}).items() if alias not in registered}
+    aliases = {alias: canonical for alias, canonical in root_field_aliases.items() if alias not in registered}
     serving_fields = set(serving_root_fields) | aliases.keys()
     declared_fields = registered - serving_fields
     consumer_fields = serving_fields | declared_fields
