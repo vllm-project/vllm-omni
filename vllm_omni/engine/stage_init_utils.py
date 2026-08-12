@@ -20,6 +20,7 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -395,8 +396,19 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = stage_config.final_output_type
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage carries its task via default_pooling_params, set where the
+    # stage is declared.
+    default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
+    # is_pooling_model signal); pick params by that signal, not execution_type.
+    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+    default_params: OmniSamplingParams | PoolingParams
+    if stage_type == "diffusion":
+        default_params = OmniDiffusionSamplingParams(**default_sp)
+    elif is_pooling:
+        default_params = PoolingParams(**default_pp)
+    else:  # generative llm: ar / generation
+        default_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
@@ -428,7 +440,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_input_source=engine_input_source,
             final_output=final_output,
             final_output_type=final_output_type,
-            default_sampling_params=default_sampling_params,
+            default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
@@ -448,7 +460,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         engine_input_source=engine_input_source,
         final_output=final_output,
         final_output_type=final_output_type,
-        default_sampling_params=default_sampling_params,
+        default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
