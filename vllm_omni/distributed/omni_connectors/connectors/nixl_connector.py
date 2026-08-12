@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import os
+import socket
+import threading
 import time
 import uuid
 from typing import Any
 
+import msgspec
 import torch
+import zmq
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
@@ -23,6 +27,14 @@ _INIT_AGENT = "NIXL_INIT_AGENT"
 _TENSOR_MARKER = "__nixl_tensor_index__"
 _TUPLE_MARKER = "__nixl_tuple__"
 
+# Handshake control-plane messages. A ``put`` payload is only readable once the
+# consumer knows the producer's NIXL agent metadata and memory descriptors, so a
+# consumer that was not handed that metadata out-of-band asks for it here.
+_GET_META_MSG = b"nixl_get_meta"
+_XFER_DONE_MSG = b"nixl_xfer_done"
+_META_NOT_FOUND = b"nixl_meta_not_found"
+_ACK = b"nixl_ack"
+
 
 class NixlConnector(OmniConnectorBase):
     """OmniConnector backed by vLLM's native NIXL wrapper.
@@ -32,6 +44,15 @@ class NixlConnector(OmniConnectorBase):
     directly through NIXL READ operations. Non-tensor Python
     payloads are serialized with OmniSerializer, packed into a uint8 CPU tensor,
     and moved through the same NIXL path.
+
+    A NIXL READ needs the producer's agent metadata and memory descriptors,
+    which ``put`` returns to its caller. Callers that can forward that
+    dictionary to the consumer (for example the diffusion stage handle) keep
+    working unchanged. Callers that cannot -- notably the generic stage payload
+    path, which drops the ``put`` metadata and invokes ``get`` with
+    ``metadata=None`` -- rely on the ZMQ handshake enabled by setting
+    ``zmq_port``: the producer serves its metadata from a ROUTER socket and the
+    consumer fetches it by key.
     """
 
     supports_raw_data: bool = True
@@ -41,6 +62,8 @@ class NixlConnector(OmniConnectorBase):
         self._closed = True
         self._registered_descs: list[Any] = []
         self._pending: dict[str, tuple[list[torch.Tensor], list[Any], float]] = {}
+        self._published: dict[str, dict[str, Any]] = {}
+        self._state_lock = threading.RLock()
         self._remote_agents: list[str] = []
         self._metrics: dict[str, int] = {
             "puts": 0,
@@ -84,6 +107,59 @@ class NixlConnector(OmniConnectorBase):
         )
         self._poll_interval_s = float(self.config.get("poll_interval_s", 0.001))
         self._closed = False
+        self._init_handshake()
+
+    def _init_handshake(self) -> None:
+        """Set up the ZMQ control plane used when ``get`` receives no metadata.
+
+        The handshake stays off unless ``zmq_port`` is configured, so
+        deployments that forward the ``put`` metadata themselves keep their
+        current behaviour and open no extra sockets.
+        """
+        role = self.config.get("role")
+        self._role = str(role).lower() if role else None
+        self._zmq_port = self.config.get("zmq_port")
+        self._sender_host = self.config.get("sender_host")
+        self._sender_zmq_port = self.config.get("sender_zmq_port")
+        self._handshake_timeout_ms = int(self.config.get("handshake_timeout_ms", 5000))
+        self._handshake_max_wait_s = float(self.config.get("handshake_max_wait_s", 60.0))
+        self._handshake_retry_s = float(self.config.get("handshake_retry_s", 0.05))
+        self._zmq_ctx: zmq.Context | None = None
+        self._req_local = threading.local()
+        self._listener_thread: threading.Thread | None = None
+        self._listener_ready = threading.Event()
+        self._stop_event = threading.Event()
+        self._bind_error: BaseException | None = None
+        self.host: str | None = None
+        self._serving_handshake = False
+
+        self._handshake_enabled = self._zmq_port is not None or self._sender_host is not None
+        if not self._handshake_enabled:
+            return
+
+        self._zmq_ctx = zmq.Context()
+        # A receiver only dials out, so it never needs a port of its own.
+        if self._zmq_port is None or self._role == "receiver":
+            return
+
+        host_value = str(self.config.get("host", "auto"))
+        self.host = (
+            self._get_local_ip()
+            if host_value.lower() == "auto" or host_value in {"", "*", "0.0.0.0", "::"}
+            else host_value
+        )
+        self._zmq_port = int(self._zmq_port)
+        self._listener_thread = threading.Thread(
+            target=self._handshake_listener_loop, name="nixl-handshake", daemon=True
+        )
+        self._listener_thread.start()
+        self._listener_ready.wait(timeout=5.0)
+        if self._bind_error is not None:
+            raise RuntimeError(
+                f"NixlConnector failed to bind handshake socket on {self.host}:{self._zmq_port}"
+            ) from self._bind_error
+        self._serving_handshake = True
+        logger.info("NixlConnector handshake listener bound on %s:%s", self.host, self._zmq_port)
 
     def put(
         self,
@@ -118,7 +194,6 @@ class NixlConnector(OmniConnectorBase):
             self._agent.register_memory(reg_descs, backends=self._backends)
             self._registered_descs.append(reg_descs)
 
-            self._pending[put_key] = (tensors, [reg_descs], time.monotonic() + self._lease_seconds)
             size = sum(spec["size"] for spec in tensor_specs)
             metadata = {
                 "schema_version": _SCHEMA_VERSION,
@@ -129,6 +204,13 @@ class NixlConnector(OmniConnectorBase):
                 "tensor_specs": tensor_specs,
                 "size": size,
             }
+            if self._serving_handshake:
+                metadata["sender_host"] = self.host
+                metadata["sender_zmq_port"] = self._zmq_port
+            with self._state_lock:
+                self._pending[put_key] = (tensors, [reg_descs], time.monotonic() + self._lease_seconds)
+                if self._serving_handshake:
+                    self._published[put_key] = metadata
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector put %s->%s key=%s size=%d", from_stage, to_stage, put_key, size)
@@ -154,6 +236,7 @@ class NixlConnector(OmniConnectorBase):
         remote_dlist = None
         xfer_handle = None
         try:
+            metadata = self._resolve_metadata(get_key, metadata)
             if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
                 logger.error("NixlConnector get has invalid metadata for %s", get_key)
                 return None
@@ -207,6 +290,7 @@ class NixlConnector(OmniConnectorBase):
                 payload = self._restore_tensor_leaves(skeleton, local_tensors[1:])
             else:
                 payload = local_tensors[0] if len(local_tensors) == 1 else local_tensors
+            self._notify_transfer_done(get_key, metadata)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector get %s->%s key=%s size=%d", from_stage, to_stage, get_key, size)
@@ -230,7 +314,9 @@ class NixlConnector(OmniConnectorBase):
                 self._safe_call(self._agent.deregister_memory, local_reg_descs)
 
     def cleanup(self, request_id: str) -> None:
-        pending = self._pending.pop(request_id, None)
+        with self._state_lock:
+            self._published.pop(request_id, None)
+            pending = self._pending.pop(request_id, None)
         if pending is None:
             return
         _, reg_descs_list, _ = pending
@@ -243,6 +329,16 @@ class NixlConnector(OmniConnectorBase):
         if self._closed:
             return
         self._closed = True
+        self._stop_event.set()
+        if self._listener_thread is not None:
+            self._listener_thread.join(timeout=5.0)
+            self._listener_thread = None
+        if self._zmq_ctx is not None:
+            # destroy() rather than term(): REQ sockets live in thread-local
+            # caches this thread cannot reach, and term() blocks until every
+            # socket in the context is closed.
+            self._safe_call(self._zmq_ctx.destroy, 0)
+            self._zmq_ctx = None
         for request_id in list(self._pending):
             self.cleanup(request_id)
         for agent_name in list(self._remote_agents):
@@ -259,6 +355,183 @@ class NixlConnector(OmniConnectorBase):
             **self._metrics,
         }
 
+    def get_connection_info(self) -> dict[str, Any]:
+        """Endpoint a consumer needs to reach this producer's handshake socket."""
+        return {"host": self.host, "zmq_port": self._zmq_port}
+
+    def update_sender_info(self, sender_host: str, sender_zmq_port: int) -> None:
+        """Register the producer handshake endpoint on the consumer side.
+
+        Used when the endpoint is only known after both stages have started and
+        therefore cannot be baked into the connector config.
+        """
+        self._sender_host = sender_host
+        self._sender_zmq_port = int(sender_zmq_port)
+        if self._zmq_ctx is None:
+            self._zmq_ctx = zmq.Context()
+            self._handshake_enabled = True
+
+    def _resolve_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Return complete NIXL transfer metadata for ``get_key``.
+
+        Callers that forwarded the ``put`` metadata are served directly; the
+        remaining cases fall back to the handshake, either at the endpoint
+        named in a partial metadata dict or at the configured default producer.
+        """
+        if isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION:
+            return metadata
+
+        if isinstance(metadata, dict) and metadata.get("sender_host") and metadata.get("sender_zmq_port"):
+            endpoint = (str(metadata["sender_host"]), int(metadata["sender_zmq_port"]))
+        elif self._sender_host and self._sender_zmq_port:
+            endpoint = (str(self._sender_host), int(self._sender_zmq_port))
+        else:
+            logger.error(
+                "NixlConnector get(%s) received no usable metadata and no producer handshake "
+                "endpoint is configured. Set sender_host/sender_zmq_port on the consumer "
+                "connector, or forward the metadata returned by put().",
+                get_key,
+            )
+            return None
+        if self._zmq_ctx is None:
+            logger.error(
+                "NixlConnector get(%s) needs the handshake but no ZMQ context was created; "
+                "set zmq_port or sender_host in the connector config.",
+                get_key,
+            )
+            return None
+
+        return self._query_metadata_at(get_key, *endpoint)
+
+    def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
+        """Fetch transfer metadata for ``get_key`` from a producer's ROUTER socket.
+
+        A consumer can outrun its producer, so a missing key is retried until
+        ``handshake_max_wait_s`` instead of failing the request immediately.
+        """
+        zmq_addr = f"tcp://{host}:{port}"
+        deadline = time.monotonic() + self._handshake_max_wait_s
+        request = _GET_META_MSG + msgspec.msgpack.encode({"key": get_key})
+        while not self._stop_event.is_set():
+            sock = self._get_req_socket(zmq_addr)
+            try:
+                sock.send(request)
+                reply = sock.recv()
+            except Exception:
+                self._invalidate_req_socket(zmq_addr)
+                logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
+                reply = _META_NOT_FOUND
+            if reply != _META_NOT_FOUND:
+                return msgspec.msgpack.decode(reply)
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "NixlConnector handshake timed out after %.0fs waiting for key %s at %s",
+                    self._handshake_max_wait_s,
+                    get_key,
+                    zmq_addr,
+                )
+                return None
+            time.sleep(self._handshake_retry_s)
+        return None
+
+    def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> None:
+        """Tell the producer its buffer is drained so it can deregister now.
+
+        Without this the producer would hold the registration until the lease
+        expires, which for long-lived stages means unbounded growth.
+        """
+        host = metadata.get("sender_host")
+        port = metadata.get("sender_zmq_port")
+        if not host or not port or self._zmq_ctx is None:
+            return
+        zmq_addr = f"tcp://{host}:{int(port)}"
+        sock = self._get_req_socket(zmq_addr)
+        try:
+            sock.send(_XFER_DONE_MSG + msgspec.msgpack.encode({"key": get_key}))
+            sock.recv()
+        except Exception:
+            self._invalidate_req_socket(zmq_addr)
+            logger.debug("NixlConnector failed to notify completion for %s", get_key, exc_info=True)
+
+    def _handshake_listener_loop(self) -> None:
+        router = self._zmq_ctx.socket(zmq.ROUTER)
+        try:
+            router.bind(f"tcp://{self.host}:{self._zmq_port}")
+        except zmq.ZMQError as exc:
+            logger.error("NixlConnector handshake bind failed on %s:%s: %s", self.host, self._zmq_port, exc)
+            self._bind_error = exc
+            self._listener_ready.set()
+            router.close(linger=0)
+            return
+        self._listener_ready.set()
+
+        poller = zmq.Poller()
+        poller.register(router, zmq.POLLIN)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    if not dict(poller.poll(500)):
+                        self._cleanup_expired_pending()
+                        continue
+                    identity, _, payload = router.recv_multipart()
+                    router.send_multipart([identity, b"", self._handle_handshake_message(payload)])
+                except zmq.ContextTerminated:
+                    break
+                except Exception:
+                    logger.debug("NixlConnector handshake listener error", exc_info=True)
+        finally:
+            self._safe_call(router.close, 0)
+
+    def _handle_handshake_message(self, payload: bytes) -> bytes:
+        if payload.startswith(_GET_META_MSG):
+            key = msgspec.msgpack.decode(payload[len(_GET_META_MSG) :]).get("key")
+            with self._state_lock:
+                metadata = self._published.get(key)
+            return _META_NOT_FOUND if metadata is None else msgspec.msgpack.encode(metadata)
+        if payload.startswith(_XFER_DONE_MSG):
+            key = msgspec.msgpack.decode(payload[len(_XFER_DONE_MSG) :]).get("key")
+            self.cleanup(key)
+            return _ACK
+        logger.warning("NixlConnector handshake received an unknown message")
+        return _META_NOT_FOUND
+
+    def _get_req_socket(self, zmq_addr: str) -> zmq.Socket:
+        """Return a thread-local REQ socket so concurrent calls never interleave."""
+        cache: dict[str, zmq.Socket] | None = getattr(self._req_local, "cache", None)
+        if cache is None:
+            cache = {}
+            self._req_local.cache = cache
+        sock = cache.get(zmq_addr)
+        if sock is None:
+            sock = self._zmq_ctx.socket(zmq.REQ)
+            sock.connect(zmq_addr)
+            cache[zmq_addr] = sock
+        sock.setsockopt(zmq.SNDTIMEO, self._handshake_timeout_ms)
+        sock.setsockopt(zmq.RCVTIMEO, self._handshake_timeout_ms)
+        return sock
+
+    def _invalidate_req_socket(self, zmq_addr: str) -> None:
+        cache: dict[str, zmq.Socket] | None = getattr(self._req_local, "cache", None)
+        if cache is None:
+            return
+        sock = cache.pop(zmq_addr, None)
+        if sock is not None:
+            self._safe_call(sock.close, 0)
+
+    @staticmethod
+    def _get_local_ip() -> str:
+        """Resolve the externally routable local address for the handshake bind."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("8.8.8.8", 80))
+                return probe.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                logger.warning("NixlConnector could not resolve a local IP; binding loopback")
+                return "127.0.0.1"
+
     def _wait_for_transfer(self, handle: int, request_id: str) -> None:
         deadline = time.monotonic() + self._transfer_timeout_s
         while True:
@@ -273,17 +546,18 @@ class NixlConnector(OmniConnectorBase):
 
     def _cleanup_expired_pending(self) -> None:
         now = time.monotonic()
-        for request_id, (_, _, deadline) in list(self._pending.items()):
-            if now >= deadline:
-                logger.warning(
-                    "NixlConnector lease expired for request %s after %.0fs; its buffer is "
-                    "being reclaimed while a consumer may still read it, which yields "
-                    "corrupt data. Raise VLLM_OMNI_NIXL_LEASE_S above the maximum "
-                    "producer-to-consumer queueing delay.",
-                    request_id,
-                    self._lease_seconds,
-                )
-                self.cleanup(request_id)
+        with self._state_lock:
+            expired = [key for key, (_, _, deadline) in self._pending.items() if now >= deadline]
+        for request_id in expired:
+            logger.warning(
+                "NixlConnector lease expired for request %s after %.0fs; its buffer is "
+                "being reclaimed while a consumer may still read it, which yields "
+                "corrupt data. Raise VLLM_OMNI_NIXL_LEASE_S above the maximum "
+                "producer-to-consumer queueing delay.",
+                request_id,
+                self._lease_seconds,
+            )
+            self.cleanup(request_id)
 
     def _resolve_memory_type(self, tensor: torch.Tensor) -> str:
         if self._default_memory_type is not None:
