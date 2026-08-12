@@ -296,6 +296,41 @@ def _global_request_id(prompt: Mapping[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def _build_conditioning(hidden_states: Any, token_tags: Any) -> MiniMaxH3TextConditioning:
+    if isinstance(token_tags, torch.Tensor) and token_tags.ndim == 2 and token_tags.shape[-1] == 1:
+        token_tags = token_tags.squeeze(-1)
+    try:
+        return MiniMaxH3TextConditioning.from_payload(
+            {
+                "hidden_states": hidden_states,
+                "token_tags": token_tags,
+            }
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def text_encoder2diffusion_full_payload(
+    *,
+    pooling_output: Any = None,
+    **kwargs: Any,
+) -> dict[str, Any] | None:
+    """Pack Stage 0 conditioning for direct worker-to-worker transfer.
+
+    Returning the diffusion-ready structure here keeps the DiT worker free of
+    any H3-specific unpacking: the generic receive path merges this dict into
+    the request's ``additional_information``.
+    """
+    del kwargs
+    if not isinstance(pooling_output, Mapping):
+        return None
+    hidden_states = pooling_output.get("encoder_hidden_states")
+    token_tags = pooling_output.get("token_tags")
+    if not isinstance(hidden_states, torch.Tensor) or not isinstance(token_tags, torch.Tensor):
+        return None
+    return {"text_encoder_output": _build_conditioning(hidden_states, token_tags).to_payload()}
+
+
 def text_encoder2diffusion(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -330,6 +365,11 @@ def text_encoder2diffusion(
 
     completion = outputs[0]
     payload = completion.multimodal_output
+    if payload is None:
+        # The conditioning is travelling over the omni connector instead of
+        # riding along on the orchestrator hop; the diffusion worker fills
+        # ``text_encoder_output`` in before the forward.
+        return diffusion_prompt
     if not isinstance(payload, Mapping):
         raise RuntimeError("MiniMax H3 text encoder returned no conditioning payload")
     hidden_states = payload.get("hidden_states")
@@ -348,15 +388,7 @@ def text_encoder2diffusion(
         raise RuntimeError(
             f"MiniMax H3 stage-wire token_tags must have shape [tokens, 1], got {tuple(token_tags.shape)}"
         )
-    try:
-        conditioning = MiniMaxH3TextConditioning.from_payload(
-            {
-                "hidden_states": hidden,
-                "token_tags": token_tags.squeeze(-1),
-            }
-        )
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+    conditioning = _build_conditioning(hidden, token_tags)
 
     additional_information = dict(diffusion_prompt.get("additional_information") or {})
     additional_information["text_encoder_output"] = conditioning.to_payload()
