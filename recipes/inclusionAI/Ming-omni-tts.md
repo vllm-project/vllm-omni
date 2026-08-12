@@ -39,11 +39,7 @@ Other hardware is welcome as community validation lands.
 Launch the two-stage talker:
 
 ```bash
-vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
-    --deploy-config vllm_omni/deploy/ming_tts.yaml \
-    --omni \
-    --port 8091 \
-    --enforce-eager
+vllm-omni serve inclusionAI/Ming-omni-tts-16.8B-A3B --omni --port 8091
 ```
 
 #### Verification
@@ -54,7 +50,7 @@ Basic synthesis (save the WAV bytes):
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "inclusionAI/Ming-omni-tts-0.5B",
+      "model": "inclusionAI/Ming-omni-tts-16.8B-A3B",
       "input": "你好，这是 Ming 在线语音合成测试。",
       "response_format": "wav"
     }' --output ming_tts_basic.wav
@@ -74,7 +70,7 @@ Reference-audio zero-shot cloning:
 REF_AUDIO="$BASE/10002287-00000094.wav"
 jq -n --arg ref_audio "$REF_AUDIO" \
     '{
-       model: "inclusionAI/Ming-omni-tts-0.5B",
+       model: "inclusionAI/Ming-omni-tts-16.8B-A3B",
        input: "我们的愿景是构建未来服务业的数字化基础设施，为世界带来更多微小而美好的改变。",
        ref_audio: $ref_audio,
        ref_text: "在此奉劝大家别乱打美白针。",
@@ -107,7 +103,7 @@ jq -n \
     --arg a "$REF_A" \
     --arg b "$REF_B" \
     '{
-       model: "inclusionAI/Ming-omni-tts-0.5B",
+       model: "inclusionAI/Ming-omni-tts-16.8B-A3B",
        input: $input,
        ref_audio: [$a, $b],
        ref_text: $ref_text,
