@@ -963,6 +963,98 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
 
+    @pytest.mark.parametrize(
+        ("configured_variant", "requested_task"),
+        [
+            ("CustomVoice", "Base"),
+            ("VoiceDesign", "CustomVoice"),
+            ("Base", "VoiceDesign"),
+        ],
+    )
+    def test_task_type_must_match_loaded_qwen3_tts_variant(self, speech_server, configured_variant, requested_task):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model=f"Qwen/Qwen3-TTS-12Hz-1.7B-{configured_variant}",
+            hf_config=SimpleNamespace(
+                tts_model_type=configured_variant,
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type=requested_task,
+            ref_audio="data:audio/wav;base64,abc" if requested_task == "Base" else None,
+            x_vector_only_mode=True if requested_task == "Base" else None,
+            instructions="Warm voice" if requested_task == "VoiceDesign" else None,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert f"{configured_variant} checkpoint does not support task_type='{requested_task}'" in result
+
+    def test_task_type_variant_falls_back_to_model_path(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/models/Qwen3-TTS-12Hz-1.7B-CustomVoice/20260623_01",
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_matching_task_type_and_model_variant_is_accepted(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            hf_config=SimpleNamespace(
+                tts_model_type="Base",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_uploaded_voice_infers_base_then_checks_model_variant(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+        speech_server.uploaded_speakers = {
+            "alice": {
+                "file_path": "/tmp/alice.safetensors",
+                "embedding_source": "audio",
+            }
+        }
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="alice")
+        result = speech_server._validate_tts_request(req)
+
+        assert req.task_type == "Base"
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
 

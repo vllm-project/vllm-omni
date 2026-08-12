@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3-TTS serving adapter."""
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,24 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
 
+    def _get_model_variant(self) -> str | None:
+        """Return the task supported by the loaded Qwen3-TTS checkpoint."""
+        model_config = self.ctx.server.engine_client.model_config
+        configured_variant = getattr(model_config.hf_config, "tts_model_type", None)
+        candidates = [configured_variant, getattr(model_config, "model", None)]
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            normalized = re.sub(r"[^a-z]", "", candidate.lower())
+            for marker, task_type in (
+                ("customvoice", "CustomVoice"),
+                ("voicedesign", "VoiceDesign"),
+                ("base", "Base"),
+            ):
+                if marker in normalized:
+                    return task_type
+        return None
+
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
         performed inside ``validate`` today; kept fused for a strict behaviour
@@ -37,9 +56,17 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if request.task_type is None and request.voice in server.precomputed_speakers:
+            stored_voice = request.voice in server.uploaded_speakers or request.voice in server.precomputed_speakers
+            if stored_voice and request.task_type is None:
                 request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
+
+        model_variant = self._get_model_variant()
+        if model_variant is not None and task_type != model_variant:
+            return (
+                f"Qwen3-TTS {model_variant} checkpoint does not support task_type='{task_type}'. "
+                f"Use task_type='{model_variant}' or load the matching {task_type} checkpoint."
+            )
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
