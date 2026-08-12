@@ -412,7 +412,7 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     monkeypatch.setattr(
         runtime_mod.StageEngineCoreClientBase,
         "make_async_mp_client",
-        lambda **kwargs: (captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client),
+        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
     )
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
@@ -807,9 +807,9 @@ def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
     import vllm_omni.engine.stage_init_utils as init_mod
 
     class DummyInputProcessor:
-        def __init__(self, vllm_config):
+        def __init__(self, vllm_config, renderer=None):
             self.vllm_config = vllm_config
-            self.renderer = object()
+            self.renderer = renderer or object()
             self.input_preprocessor = None
 
     class DummyOmniInputPreprocessor:
@@ -826,6 +826,50 @@ def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
 
     assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
     assert input_processor.input_preprocessor.renderer is input_processor.renderer
+
+
+def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(
+    monkeypatch,
+):
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    token_only_renderer = object()
+    seen = {}
+
+    class DummyInputProcessor:
+        def __init__(self, vllm_config, renderer=None):
+            if renderer is None:
+                raise AssertionError("skip_tokenizer_init must supply a renderer")
+            seen["renderer"] = renderer
+            self.renderer = renderer
+            self.input_preprocessor = None
+
+    class DummyOmniInputPreprocessor:
+        def __init__(self, vllm_config, renderer=None):
+            seen["preprocessor_renderer"] = renderer
+
+    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(
+        init_mod,
+        "_build_token_only_renderer",
+        lambda _config: token_only_renderer,
+    )
+    monkeypatch.setattr(
+        init_mod,
+        "OmniInputPreprocessor",
+        DummyOmniInputPreprocessor,
+    )
+
+    config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(
+            skip_tokenizer_init=True,
+            try_get_generation_config=lambda: {},
+        )
+    )
+    build_stage0_input_processor(config)
+
+    assert seen["renderer"] is token_only_renderer
+    assert seen["preprocessor_renderer"] is token_only_renderer
 
 
 def test_inject_kv_stage_info_infers_sender_tp_topology():

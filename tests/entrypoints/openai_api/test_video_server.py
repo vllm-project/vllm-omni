@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import av
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -247,6 +248,25 @@ def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
         frames[idx, :, :, 1] = 128
         frames[idx, :, :, 2] = 255 - idx * 40
     return mux_video_audio_bytes(frames, fps=8, video_codec_options={"preset": "ultrafast", "threads": "0"})
+
+
+def test_mux_video_audio_marks_aac_priming_timestamp():
+    frames = np.zeros((2, 16, 16, 3), dtype=np.uint8)
+    audio = np.zeros((2, 2048), dtype=np.float32)
+
+    payload = mux_video_audio_bytes(
+        frames,
+        fps=24,
+        audio_waveform=audio,
+        audio_sample_rate=32000,
+        video_codec_options={"preset": "ultrafast", "threads": "0"},
+    )
+
+    with av.open(io.BytesIO(payload)) as container:
+        audio_stream = container.streams.audio[0]
+        first_packet = next(packet for packet in container.demux(audio_stream) if packet.pts is not None)
+
+    assert first_packet.pts < 0
 
 
 def _make_test_video_data_url(size=(32, 24), num_frames=3) -> str:

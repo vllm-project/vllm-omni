@@ -23,11 +23,19 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
+    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
+    # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
+    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
       image: 64
@@ -49,6 +57,8 @@ stages:
     gpu_memory_utilization: 0.15
     enforce_eager: false
     max_num_batched_tokens: 8192
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
@@ -66,7 +76,7 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 4
-    gpu_memory_utilization: 0.15
+    gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536

@@ -43,6 +43,11 @@ stages:
     max_model_len: 4096
     max_num_batched_tokens: 4096
     devices: "0,1,2,3"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       video: 1
     default_sampling_params:

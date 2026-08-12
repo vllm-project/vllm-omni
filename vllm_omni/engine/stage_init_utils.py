@@ -20,6 +20,8 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -394,8 +396,19 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = stage_config.final_output_type
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage carries its task via default_pooling_params, set where the
+    # stage is declared.
+    default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
+    # is_pooling_model signal); pick params by that signal, not execution_type.
+    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+    default_params: OmniSamplingParams | PoolingParams
+    if stage_type == "diffusion":
+        default_params = OmniDiffusionSamplingParams(**default_sp)
+    elif is_pooling:
+        default_params = PoolingParams(**default_pp)
+    else:  # generative llm: ar / generation
+        default_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
@@ -427,7 +440,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_input_source=engine_input_source,
             final_output=final_output,
             final_output_type=final_output_type,
-            default_sampling_params=default_sampling_params,
+            default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
@@ -447,7 +460,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         engine_input_source=engine_input_source,
         final_output=final_output,
         final_output_type=final_output_type,
-        default_sampling_params=default_sampling_params,
+        default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
@@ -1119,11 +1132,30 @@ def build_llm_stage_output_processor(
     )
 
 
+class _TokenOnlyRenderer(BaseRenderer):
+    """Renderer for stages that explicitly skip tokenizer initialization."""
+
+    def render_messages(self, messages, params):
+        raise ValueError(
+            "Chat messages are unavailable when skip_tokenizer_init=True; submit prompt_token_ids or prompt_embeds"
+        )
+
+
+def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
+    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+
+
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
+        input_processor = InputProcessor(
+            vllm_config=stage_vllm_config,
+            renderer=_build_token_only_renderer(stage_vllm_config),
+        )
+    else:
+        input_processor = InputProcessor(vllm_config=stage_vllm_config)
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
         renderer=input_processor.renderer,

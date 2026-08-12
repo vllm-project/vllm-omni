@@ -156,8 +156,9 @@ def test_streaming_phases(config, n_frames, finished, expected):
     else:
         exp_ctx, exp_window = expected
         assert payload is not None
-        assert payload.meta.left_context_size == exp_ctx
-        assert len(payload.codes.audio) == _Q * exp_window
+        assert payload.meta.left_context_size == 0
+        expected_delta = exp_window if finished else exp_window - exp_ctx
+        assert len(payload.codes.audio) == _Q * expected_delta
 
 
 def test_dynamic_ic_adapts_to_load():
@@ -202,7 +203,8 @@ def test_ic_load_change_mid_request():
     assert _call(tm, "r", n_frames=25) is None
     p3 = _call(tm, "r", n_frames=27)
     assert p3 is not None
-    assert p3.meta.left_context_size == 2
+    assert p3.meta.left_context_size == 0
+    assert len(p3.codes.audio) == _Q * 25
 
     # A *new* request under high load gets IC=16 (not IC=2).
     # Frame 2 would emit under IC=2 but must hold under IC=16.
@@ -227,7 +229,8 @@ def test_connector_initial_chunk_config_overrides_dynamic_ic():
     assert _call(tm, "r", n_frames=25) is None
     p2 = _call(tm, "r", n_frames=29)
     assert p2 is not None
-    assert p2.meta.left_context_size == 4
+    assert p2.meta.left_context_size == 0
+    assert len(p2.codes.audio) == _Q * 25
 
 
 @pytest.mark.parametrize(
@@ -282,8 +285,8 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     assert len(payload.codes.audio) == _Q * 12
 
 
-def test_followup_ref_code_context_is_sent_as_metadata_handle():
-    """Follow-up chunks keep full ref context semantically without resending it."""
+def test_followup_sends_only_codec_delta_without_ref_metadata():
+    """Follow-up chunks rely on decoder state and resend neither reference codes nor metadata."""
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
@@ -299,13 +302,11 @@ def test_followup_ref_code_context_is_sent_as_metadata_handle():
     )
 
     assert payload is not None
-    # ref_code (2 frames) is represented in metadata so Code2Wav can restore it
-    # from its request-local cache. It must not be resent in codes.audio.
-    assert payload.meta.left_context_size == 10 + 2
-    assert payload.meta.ref_context_size == 2
-    assert payload.meta.ref_context_request_id == rid
-    assert payload.meta.ref_context_included is False
-    assert len(payload.codes.audio) == _Q * 35
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.ref_context_size is None
+    assert payload.meta.ref_context_request_id is None
+    assert payload.meta.ref_context_included is None
+    assert len(payload.codes.audio) == _Q * 25
 
 
 def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
@@ -332,8 +333,8 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
     )
 
     assert payload is not None
-    assert payload.meta.left_context_size == 3 + 3
-    assert len(payload.codes.audio) == _Q * (3 + 3 + 4)
+    assert payload.meta.left_context_size == 3
+    assert len(payload.codes.audio) == _Q * (3 + 4)
     frames = payload.codes.audio.reshape(_Q, -1).transpose(0, 1)
     torch.testing.assert_close(frames[:3], ref_code[-3:])
 
@@ -700,36 +701,40 @@ class TestChunkRampEmission:
         assert self._emit(tm, rid, 4) is None
         p1 = self._emit(tm, rid, 5)
         assert p1 is not None
-        assert len(p1.codes.audio) == _Q * 5
-        assert p1.meta.left_context_size == 1
+        assert len(p1.codes.audio) == _Q * 4
+        assert p1.meta.left_context_size == 0
         tm.ramp_chunk_count[rid] = 2
 
         for n in range(6, 13):
             assert self._emit(tm, rid, n) is None
         p2 = self._emit(tm, rid, 13)
         assert p2 is not None
-        assert p2.meta.left_context_size == 5
+        assert p2.meta.left_context_size == 0
+        assert len(p2.codes.audio) == _Q * 8
         tm.ramp_chunk_count[rid] = 3
 
         for n in range(14, 29):
             assert self._emit(tm, rid, n) is None
         p3 = self._emit(tm, rid, 29)
         assert p3 is not None
-        assert p3.meta.left_context_size == 13
+        assert p3.meta.left_context_size == 0
+        assert len(p3.codes.audio) == _Q * 16
         tm.ramp_chunk_count[rid] = 4
 
         for n in range(30, 54):
             assert self._emit(tm, rid, n) is None
         p4 = self._emit(tm, rid, 54)
         assert p4 is not None
-        assert p4.meta.left_context_size == 25
+        assert p4.meta.left_context_size == 0
+        assert len(p4.codes.audio) == _Q * 25
         tm.ramp_chunk_count[rid] = 5
 
         for n in range(55, 79):
             assert self._emit(tm, rid, n) is None
         p5 = self._emit(tm, rid, 79)
         assert p5 is not None
-        assert p5.meta.left_context_size == 25
+        assert p5.meta.left_context_size == 0
+        assert len(p5.codes.audio) == _Q * 25
 
     def test_ramp_finished_flush_mid_chunk(self):
         tm = _tm(chunk_ramp=self.RAMP)
@@ -742,8 +747,8 @@ class TestChunkRampEmission:
         p_fin = self._emit(tm, rid, 3, finished=True)
         assert p_fin is not None
         assert p_fin.meta.finished.item() is True
-        assert len(p_fin.codes.audio) == _Q * (1 + 2)
-        assert p_fin.meta.left_context_size == 1
+        assert len(p_fin.codes.audio) == _Q * 2
+        assert p_fin.meta.left_context_size == 0
 
     def test_ramp_finished_no_new_frames(self):
         tm = _tm(chunk_ramp=self.RAMP)
@@ -783,7 +788,8 @@ class TestChunkRampEmission:
             assert self._emit(tm, rid, n) is None
         p1 = self._emit(tm, rid, 26)
         assert p1 is not None
-        assert p1.meta.left_context_size == 1
+        assert p1.meta.left_context_size == 0
+        assert len(p1.codes.audio) == _Q * 25
 
     def test_ramp_with_ref_code_first_chunk(self):
         tm = _tm(chunk_ramp=self.RAMP, left_context=25)
@@ -820,14 +826,16 @@ class TestChunkRampEmission:
             assert self._emit(tm, rid, n) is None
         p2 = self._emit(tm, rid, 30)
         assert p2 is not None
-        assert p2.meta.left_context_size == 5
+        assert p2.meta.left_context_size == 0
+        assert len(p2.codes.audio) == _Q * 25
         tm.ramp_chunk_count[rid] = 3
 
         for n in range(31, 55):
             assert self._emit(tm, rid, n) is None
         p3 = self._emit(tm, rid, 55)
         assert p3 is not None
-        assert p3.meta.left_context_size == 25
+        assert p3.meta.left_context_size == 0
+        assert len(p3.codes.audio) == _Q * 25
 
     def test_ramp_profile_4_4_8_16_25(self):
         """Ramp [4,4,8,16,25]: chunk 0=4 frames (320ms audio covers chunk 1
@@ -846,35 +854,40 @@ class TestChunkRampEmission:
             assert self._emit(tm, rid, n) is None
         p1 = self._emit(tm, rid, 8)
         assert p1 is not None
-        assert p1.meta.left_context_size == 4
+        assert p1.meta.left_context_size == 0
+        assert len(p1.codes.audio) == _Q * 4
         tm.ramp_chunk_count[rid] = 2
 
         for n in range(9, 16):
             assert self._emit(tm, rid, n) is None
         p2 = self._emit(tm, rid, 16)
         assert p2 is not None
-        assert p2.meta.left_context_size == 8
+        assert p2.meta.left_context_size == 0
+        assert len(p2.codes.audio) == _Q * 8
         tm.ramp_chunk_count[rid] = 3
 
         for n in range(17, 32):
             assert self._emit(tm, rid, n) is None
         p3 = self._emit(tm, rid, 32)
         assert p3 is not None
-        assert p3.meta.left_context_size == 16
+        assert p3.meta.left_context_size == 0
+        assert len(p3.codes.audio) == _Q * 16
         tm.ramp_chunk_count[rid] = 4
 
         for n in range(33, 57):
             assert self._emit(tm, rid, n) is None
         p4 = self._emit(tm, rid, 57)
         assert p4 is not None
-        assert p4.meta.left_context_size == 25
+        assert p4.meta.left_context_size == 0
+        assert len(p4.codes.audio) == _Q * 25
         tm.ramp_chunk_count[rid] = 5
 
         for n in range(58, 82):
             assert self._emit(tm, rid, n) is None
         p5 = self._emit(tm, rid, 82)
         assert p5 is not None
-        assert p5.meta.left_context_size == 25
+        assert p5.meta.left_context_size == 0
+        assert len(p5.codes.audio) == _Q * 25
 
     def test_ramp_resets_on_segment_boundary(self):
         """After segment 1 emits chunks, a segment boundary clears
