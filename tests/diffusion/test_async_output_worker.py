@@ -4,6 +4,7 @@
 
 import queue
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,7 +33,55 @@ def _make_worker_proc(step_execution=False):
     proc._async_output_thread = None
     proc._async_output_done = threading.Condition()
     proc._async_output_pending = 0
+    proc._result_mq_lock = threading.Lock()
     return proc
+
+
+class _OverlapDetectingQueue:
+    """Fails if two threads are inside enqueue() at the same time.
+
+    Mirrors vLLM's MessageQueue, whose acquire_write() reads current_idx,
+    writes that block, then advances it. Overlapping writers can target the
+    same ring block and silently drop a message.
+    """
+
+    def __init__(self):
+        self._active = 0
+        self._guard = threading.Lock()
+        self.overlaps = 0
+        self.messages = []
+
+    def enqueue(self, msg, timeout=None):
+        with self._guard:
+            self._active += 1
+            if self._active > 1:
+                self.overlaps += 1
+        time.sleep(0.001)  # widen the window a real ring-buffer write would have
+        with self._guard:
+            self.messages.append(msg)
+            self._active -= 1
+
+
+class TestResultQueueSingleWriter:
+    """Worker must serialize writes to the single-writer result queue."""
+
+    def test_concurrent_enqueues_do_not_overlap(self):
+        proc = _make_worker_proc(step_execution=False)
+        detector = _OverlapDetectingQueue()
+        proc.result_mq = detector
+
+        def writer(tag):
+            for i in range(20):
+                proc._enqueue_result(f"{tag}-{i}")
+
+        threads = [threading.Thread(target=writer, args=(tag,)) for tag in ("compute", "output")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert detector.overlaps == 0, f"{detector.overlaps} overlapping writes to result_mq"
+        assert len(detector.messages) == 40
 
 
 class TestGenerateAsyncOutputId:

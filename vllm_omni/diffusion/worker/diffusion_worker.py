@@ -857,6 +857,11 @@ class WorkerProc:
         self._async_output_thread: threading.Thread | None = None
         self._async_output_done = threading.Condition()
         self._async_output_pending = 0
+        # MessageQueue.acquire_write() is single-writer: it reads current_idx,
+        # writes that block, then advances the index. The async output thread
+        # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
+        # unsynchronized writers can target the same block and drop a message.
+        self._result_mq_lock = threading.Lock()
         if not self.od_config.step_execution:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
@@ -889,12 +894,17 @@ class WorkerProc:
         )
         return wrapper
 
+    def _enqueue_result(self, msg: Any) -> None:
+        """Serialize writes to the single-writer result queue."""
+        with self._result_mq_lock:
+            self.result_mq.enqueue(msg)
+
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
         if isinstance(output, OmniACK):
-            self.result_mq.enqueue(output)
+            self._enqueue_result(output)
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
@@ -909,7 +919,7 @@ class WorkerProc:
                 rpc_id=rpc_id,
                 async_output_id=async_output_id,
             )
-            self.result_mq.enqueue(msg)
+            self._enqueue_result(msg)
             return
 
         # Sync path (original, or async fallback).
@@ -918,7 +928,7 @@ class WorkerProc:
         except Exception as e:
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
-        self.result_mq.enqueue(output)
+        self._enqueue_result(output)
 
     def _async_output_loop(self):
         """Background thread: D2H + SHM packing for async diffusion output.
@@ -941,7 +951,7 @@ class WorkerProc:
                 pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
                 d2h_stream.synchronize()
 
-                self.result_mq.enqueue(
+                self._enqueue_result(
                     AsyncDiffusionOutput(
                         kind=AsyncOutputKind.OUTPUT_READY,
                         async_output_id=async_output_id,
@@ -953,7 +963,7 @@ class WorkerProc:
                     "Async output packing failed for id '%s'; sending error",
                     async_output_id,
                 )
-                self.result_mq.enqueue(
+                self._enqueue_result(
                     AsyncDiffusionOutput(
                         kind=AsyncOutputKind.OUTPUT_READY,
                         async_output_id=async_output_id,
@@ -1173,7 +1183,7 @@ class WorkerProc:
                         if rpc_id is not None:
                             # Async RPC: must complete the executor's pending
                             # future so collective_rpc() doesn't hang.
-                            self.result_mq.enqueue(
+                            self._enqueue_result(
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,

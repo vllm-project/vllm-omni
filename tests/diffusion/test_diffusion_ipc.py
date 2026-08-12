@@ -305,6 +305,49 @@ def test_batch_runner_output_round_trips_nested_results_through_shm() -> None:
     assert output["req-error"].result.error == "boom"
 
 
+def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None:
+    """Regression: per-request slices used to pickle the whole batch storage.
+
+    Each view is under the packing threshold, but pickle writes the entire
+    shared storage per view, so a batch's message grew by the full batch
+    tensor once per request and overflowed the ring buffer.
+    """
+    import pickle
+
+    num_requests = 16
+    # Each row stays under the threshold; the shared storage is well over it.
+    row_numel = _SHM_TENSOR_THRESHOLD // (2 * torch.empty((), dtype=torch.float32).element_size())
+    batch = torch.arange(num_requests * row_numel, dtype=torch.float32).reshape(num_requests, row_numel)
+    per_request = batch[0]
+    assert per_request.nelement() * per_request.element_size() <= _SHM_TENSOR_THRESHOLD
+    assert per_request.untyped_storage().nbytes() > _SHM_TENSOR_THRESHOLD
+
+    output = BatchRunnerOutput.from_list(
+        [
+            RunnerOutput(
+                request_id=f"req-{i}",
+                finished=True,
+                result=DiffusionOutput(trajectory_latents=batch[i]),
+            )
+            for i in range(num_requests)
+        ]
+    )
+    unpacked_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
+
+    pack_diffusion_output_shm(output)
+    packed_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
+
+    assert output.runner_outputs[0].result.trajectory_latents["__tensor_shm__"] is True
+    # Whole storage per request before; handles only after.
+    storage_bytes = per_request.untyped_storage().nbytes()
+    assert unpacked_size > num_requests * storage_bytes / 2
+    assert packed_size < _SHM_TENSOR_THRESHOLD
+
+    unpack_diffusion_output_shm(output)
+    for i in range(num_requests):
+        torch.testing.assert_close(output[f"req-{i}"].result.trajectory_latents, batch[i])
+
+
 def test_pack_value_keeps_tensor_at_threshold_inline() -> None:
     tensor = torch.arange(
         _SHM_TENSOR_THRESHOLD // torch.empty((), dtype=torch.float32).element_size(),
