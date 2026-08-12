@@ -127,7 +127,6 @@ GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 # ============================================================================
 AUDIO_TTFP_S = METRIC_PREFIX + AUDIO_TTFP + "_s"
 AUDIO_DURATION_S = METRIC_PREFIX + AUDIO_DURATION + "_s"
-AUDIO_RTF_METRIC = METRIC_PREFIX + AUDIO_RTF
 AUDIO_FRAMES_METRIC = METRIC_PREFIX + AUDIO_FRAMES
 AUDIO_UNDERRUN_S = METRIC_PREFIX + AUDIO_UNDERRUN + "_s"
 AUDIO_CONTINUITY_OK_METRIC = METRIC_PREFIX + AUDIO_CONTINUITY_OK
@@ -212,21 +211,6 @@ SECONDS_FAST_BUCKETS = (
     5.0,
     10.0,
     60.0,
-)
-
-# RTF SLO red line is 1.0 — TTS must generate faster than playback.
-RTF_BUCKETS = (
-    0.1,
-    0.25,
-    0.5,
-    0.75,
-    0.9,
-    1.0,
-    1.25,
-    1.5,
-    2.0,
-    5.0,
-    10.0,
 )
 
 # Bytes bucket for transfer payload size.

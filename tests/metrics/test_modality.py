@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pytest
+import torch
 from prometheus_client import REGISTRY, generate_latest
 
+from vllm_omni.engine.mm_outputs import MultimodalPayload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.modality import (
     OmniModalityMetrics,
@@ -37,7 +39,6 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 _EXPECTED_FAMILIES = [
     defs.AUDIO_TTFP_S,
     defs.AUDIO_DURATION_S,
-    defs.AUDIO_RTF_METRIC,
     defs.AUDIO_FRAMES_METRIC,
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
@@ -50,7 +51,6 @@ class TestRegistration:
         # Trigger at least one observation per family so the registry exposes them.
         mod.observe_audio_ttfp("s", "r", 0.1)
         mod.observe_audio_duration("s", "r", 1.0)
-        mod.observe_audio_rtf("s", "r", 0.5)
         mod.inc_audio_frames("s", "r", 1)
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
@@ -80,13 +80,6 @@ class TestAudio:
         out = generate_latest(REGISTRY).decode()
         prefix = f'{defs.AUDIO_DURATION_S}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 3.5
-
-    def test_audio_rtf_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "talker_rtf", "0"
-        mod.observe_audio_rtf(stage, replica, 0.45)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.AUDIO_RTF_METRIC}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 0.45
 
     def test_audio_frames_inc(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_frames", "0"
@@ -171,9 +164,6 @@ class _StubModMetrics:
     def observe_audio_duration(self, s, r, d):
         self.calls.append(("observe_audio_duration", s, r, d))
 
-    def observe_audio_rtf(self, s, r, rtf):
-        self.calls.append(("observe_audio_rtf", s, r, rtf))
-
     def observe_audio_underrun(self, s, r, u):
         self.calls.append(("observe_audio_underrun", s, r, u))
 
@@ -192,8 +182,9 @@ class _Bag:
 class TestObserveModalityAtFinalize:
     def test_audio_path_full(self):
         stub = _StubModMetrics()
-        stage_metrics = _Bag(stage_gen_time_ms=500.0, audio_generated_frames=24000)
-        engine_outputs = _Bag(multimodal_output={"audio_sample_rate": 24000})
+        stage_metrics = _Bag(stage_gen_time_ms=500.0, audio_generated_frames=0)
+        payload = MultimodalPayload(tensors={"audio": torch.zeros(24000)})
+        engine_outputs = _Bag(multimodal_output=payload)
 
         observe_modality_at_finalize(
             stub,
@@ -203,14 +194,32 @@ class TestObserveModalityAtFinalize:
             stage_metrics=stage_metrics,
             engine_outputs=engine_outputs,
         )
-        # 24000 frames / 24000 Hz = 1.0s duration; gen 0.5s → rtf 0.5
+        # 24000 frames / 24000 Hz = 1.0s duration
         assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
-        assert ("observe_audio_rtf", "1", "0", 0.5) in stub.calls
         # Continuity/underrun NOT emitted from finalize — they come from the
         # streaming hook because they need the per-chunk arrival timeline.
         assert not any(c[0] == "observe_audio_underrun" for c in stub.calls)
         assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
+
+    def test_audio_path_nested_multimodal_payload(self):
+        stub = _StubModMetrics()
+        payload = MultimodalPayload(tensors={"audio": torch.zeros(24000)})
+        engine_outputs = _Bag(
+            multimodal_output=MultimodalPayload(),
+            outputs=[_Bag(multimodal_output=payload)],
+        )
+
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=500.0, audio_generated_frames=0),
+            engine_outputs=engine_outputs,
+        )
+        assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
+        assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
 
     def test_audio_path_zero_frames_emits_skipped(self):
         stub = _StubModMetrics()
@@ -220,11 +229,10 @@ class TestObserveModalityAtFinalize:
             stage_id=1,
             replica_id=0,
             stage_metrics=_Bag(stage_gen_time_ms=300.0, audio_generated_frames=0),
-            engine_outputs=_Bag(multimodal_output={}),
+            engine_outputs=_Bag(multimodal_output=MultimodalPayload()),
         )
         assert ("inc_audio_frames", "1", "0", 0) in stub.calls
         assert not any(c[0] == "observe_audio_duration" for c in stub.calls)
-        assert not any(c[0] == "observe_audio_rtf" for c in stub.calls)
         assert ("inc_audio_skipped", "1", "0", "no_audio_data") in stub.calls
 
     def test_audio_uses_resolved_sample_rate_from_multimodal_output(self):
@@ -376,13 +384,6 @@ class TestObserveAudioStreamingFinalize:
 
 
 class TestBucketSelection:
-    def test_audio_rtf_uses_rtf_buckets(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "talker_buckets", "0"
-        mod.observe_audio_rtf(stage, replica, 0.5)
-        out = generate_latest(REGISTRY).decode()
-        rtf_marker = f'{defs.AUDIO_RTF_METRIC}_bucket{{le="0.9"'
-        assert rtf_marker in out, "audio_rtf should use RTF_BUCKETS containing le=0.9"
-
     def test_audio_ttfp_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_seconds", "0"
         mod.observe_audio_ttfp(stage, replica, 0.1)

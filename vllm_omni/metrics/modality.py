@@ -47,12 +47,6 @@ _audio_duration_family = Histogram(
     labelnames=_stage_labels,
     buckets=defs.SECONDS_BUCKETS,
 )
-_audio_rtf_family = Histogram(
-    defs.AUDIO_RTF_METRIC,
-    "Audio real-time factor (stage_gen_time_s / audio_duration_s); streaming TTS requires < 1.",
-    labelnames=_stage_labels,
-    buckets=defs.RTF_BUCKETS,
-)
 _audio_frames_family = Counter(
     defs.AUDIO_FRAMES_METRIC,
     "Cumulative audio frame count; per-model rate (not summable across models). Throughput recovered via rate().",
@@ -101,11 +95,6 @@ class OmniModalityMetrics:
         _audio_duration_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(
             duration_seconds
         )
-
-    def observe_audio_rtf(self, stage: str, replica: str, rtf: float) -> None:
-        if not self._log_stats:
-            return
-        _audio_rtf_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(rtf)
 
     def inc_audio_frames(self, stage: str, replica: str, n_frames: int) -> None:
         if not self._log_stats or n_frames <= 0:
@@ -166,7 +155,6 @@ def observe_modality_at_finalize(
 
     stage_label = str(stage_id)
     replica_label = str(replica_id)
-    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
     mm_out = extract_mm_output(engine_outputs)
 
     sample_rate = defs.resolve_audio_sample_rate(mm_out)
@@ -181,11 +169,6 @@ def observe_modality_at_finalize(
     duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
     if duration_s > 0:
         mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-        mod_metrics.observe_audio_rtf(
-            stage_label,
-            replica_label,
-            defs.compute_audio_rtf(gen_time_s, duration_s),
-        )
     else:
         # Request completed (finish_reason ∈ {stop, length} — error paths
         # don't reach finalize) but no audio samples were produced. Covers
