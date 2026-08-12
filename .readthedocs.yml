@@ -11,10 +11,17 @@ build:
     post_checkout:
       - git fetch --unshallow || true
     pre_install:
+      # RTD seeds the venv with pip 23.1 and upgrades it only in the step after
+      # `pre_install`. pip < 23.2 compares distribution names unnormalised when
+      # reading PEP 658 metadata, so it rejects the `typing_extensions` wheel
+      # that torch requires as `typing-extensions`.
+      - python -m pip install --upgrade pip
       # Pre-install CPU torch so the subsequent `pip install .[docs]` does not
       # pull ~2 GB of CUDA 13 libs (cuBLAS/cuDNN/NCCL/...) that exceed RTD's
-      # 1 GB memory cap and time out the mkdocs build.
-      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      # 1 GB memory cap and time out the mkdocs build. `--index-url` replaces
+      # PyPI rather than adding to it, so keep the resolve wheel-only: an sdist
+      # fallback cannot reach its build dependencies from the PyTorch index.
+      - python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch
 
 mkdocs:
   configuration: mkdocs.yml
