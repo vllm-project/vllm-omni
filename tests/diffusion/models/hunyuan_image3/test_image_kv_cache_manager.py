@@ -118,6 +118,14 @@ def _call_mgr(
     )
 
 
+def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
+    mgr = _make_cache_mgr()
+
+    assert isinstance(mgr, nn.Module)
+    assert dict(mgr.named_modules())["attn"] is mgr.attn
+    assert mgr.state_dict() == {}
+
+
 # ============================================================
 # Test 1: No AR KV — basic cache → reuse
 # ============================================================

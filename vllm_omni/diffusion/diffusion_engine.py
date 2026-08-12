@@ -17,15 +17,18 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import PIL.Image
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
@@ -189,7 +192,27 @@ class DiffusionEngine:
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
-            self._init_scheduler(od_config, scheduler)
+            kv_control_plane = initialize_diffusion_kv_control_plane(
+                self.executor,
+                od_config,
+            )
+            if kv_control_plane is None:
+                self._init_scheduler(od_config, scheduler)
+            else:
+                (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                ) = kv_control_plane
+                self._init_scheduler(
+                    od_config,
+                    scheduler,
+                    kv_cache_config,
+                    scheduler_block_size=scheduler_block_size,
+                    hash_block_size=hash_block_size,
+                    kv_vllm_config=kv_vllm_config,
+                )
             self._init_runtime_state()
             self._init_execute_fn()
             self._log_execution_mode(od_config)
@@ -242,6 +265,11 @@ class DiffusionEngine:
         self,
         od_config: OmniDiffusionConfig,
         scheduler: BaseScheduler | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         if scheduler is not None:
             self.scheduler = scheduler
@@ -249,7 +277,16 @@ class DiffusionEngine:
             self.scheduler = StepScheduler()
         else:
             self.scheduler = RequestScheduler()
-        self.scheduler.initialize(od_config)
+        if kv_cache_config is None:
+            self.scheduler.initialize(od_config)
+        else:
+            self.scheduler.initialize(
+                od_config,
+                kv_cache_config=kv_cache_config,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                kv_vllm_config=kv_vllm_config,
+            )
 
     def _init_runtime_state(self) -> None:
         # DP multi-concurrency: allow batching dp_size requests so each
@@ -1126,5 +1163,8 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.async_output_id is not None:
             return DiffusionOutput(async_output_id=runner_output.async_output_id)
+
+        if state.status == DiffusionRequestStatus.FINISHED_ERROR and state.error:
+            return DiffusionOutput(error=state.error)
 
         return DiffusionOutput(error=missing_result_error)

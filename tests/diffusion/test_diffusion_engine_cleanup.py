@@ -161,6 +161,29 @@ def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypa
     assert exc_info.value is initialization_error
     custom_scheduler.initialize.assert_called_once_with(od_config)
     custom_scheduler.close.assert_called_once_with()
+
+
+def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine, "_init_executor", lambda self, config: setattr(self, "executor", fake_executor)
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        Mock(side_effect=RuntimeError("KV initialization failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="KV initialization failed"):
+        DiffusionEngine(SimpleNamespace())
+
     fake_executor.shutdown.assert_called_once_with()
 
 
