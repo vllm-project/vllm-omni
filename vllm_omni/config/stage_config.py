@@ -238,6 +238,11 @@ class StagePipelineConfig:
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    # Payload keys this stage expects to receive from its upstream stage over
+    # the omni connector instead of through the orchestrator IPC hop. Declaring
+    # them is what enables the worker-side connector receive path, so an empty
+    # tuple leaves existing deployments untouched.
+    stage_input_payload_keys: tuple[str, ...] = ()
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -851,6 +856,8 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.stage_input_payload_keys:
+        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
