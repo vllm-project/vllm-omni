@@ -47,6 +47,19 @@ Diff-scoped sweep for five fragility patterns that are pervasive in the existing
 
 Roll the ⚠/✗ counts into the report as a single **Code quality** dimension row.
 
+---
+
+## All PRs: Examples Policy (run on every PR, quick & full)
+
+Inspect Python files introduced under `examples/` using
+[examples-policy.md](examples-policy.md). This is a diff-scoped ratchet: existing
+model-specific examples may be edited or removed without triggering the check.
+
+- [ ] **No new model-specific Python examples:** the diff adds, copies, or renames no Python file whose path or behavior is specific to one model, checkpoint, vendor, or model family. ✗ for any violation. Route inference through a shared task/protocol entrypoint, model request behavior through `vllm_omni/model_extras`, and commands through task docs or `recipes/`.
+- [ ] **New generic example code is justified:** any new task-neutral Python file under `examples/` is an actual user-facing entrypoint rather than reusable production logic, a benchmark, an app, a setup tool, or a reproducer. ⚠ when the placement is questionable.
+
+Roll the result into the report as a separate **Examples policy** dimension.
+
 ### Conventions (eyeball — no grep)
 
 Judgment calls that don't grep cleanly — apply them while reading the diff, not as a mechanical check:

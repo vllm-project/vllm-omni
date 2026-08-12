@@ -2,6 +2,9 @@
 
 These cover modality combinations, separate Code2Wav behavior, sequential
 request isolation, longer audio output, and Chinese speech.
+
+Like Qwen3-Omni expansion, ``default`` exercises ``--no-async-chunk`` and
+``async_chunk`` exercises ``--async-chunk``.
 """
 
 import os
@@ -20,18 +23,27 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 _MODEL = "openbmb/MiniCPM-o-4_5"
 _CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
+# Deploy YAML defaults to ``async_chunk: true``; keep sync and async as
+# separate parametrizations so both handoff paths are exercised.
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=False,
-            server_args=[
-                "--trust-remote-code",
-            ],
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="default",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code", "--async-chunk"],
+        ),
+        id="async_chunk",
+    ),
 ]
 
 

@@ -12,15 +12,15 @@
 """Qwen3 forced-aligner text/timestamp processor.
 
 This is the model-specific half of upstream's ``Qwen3ForceAlignProcessor``:
-it turns text into the aligner's word units and prompt, repairs the predicted
-timestamp bins, and resolves the marker token id. The generic "run a vLLM
-pooling model" half lives in :mod:`vllm_omni.utils.forced_aligner`, which
-calls into this module.
+it turns text into the aligner's word units and prompt, and repairs the
+predicted timestamp bins. It feeds the forced-aligner pipeline stage (input
+glue in :mod:`vllm_omni.model_executor.stage_input_processors.forced_aligner`,
+timestamp decoding in :mod:`vllm_omni.utils.forced_aligner`).
 
 Keeping the Qwen-specific pieces here marks the seam for the model-agnostic
 aligner the issue asks for: a different aligner family would supply its own
 processor exposing the same small surface — :func:`segment_words`,
-:func:`build_prompt`, :func:`fix_timestamp`, :func:`resolve_timestamp_token_id`.
+:func:`build_prompt`, :func:`fix_timestamp`.
 
 Word segmentation prefers qwen_asr's official ``Qwen3ForceAlignProcessor``
 when installed (full multilingual fidelity, incl. Japanese/Korean) and
@@ -260,26 +260,3 @@ def fix_timestamp(values: list[int]) -> list[int]:
         i = j
 
     return [int(r) for r in result]
-
-
-def resolve_timestamp_token_id(tokenizer: Any, timestamp_token: str = TIMESTAMP_TOKEN) -> int:
-    """Look up the integer id of the timestamp special token."""
-    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if not callable(convert):
-        raise RuntimeError("Aligner tokenizer has no convert_tokens_to_ids method.")
-    tid = convert(timestamp_token)
-    if isinstance(tid, list):
-        tid = tid[0] if tid else None
-    if tid is None or (isinstance(tid, int) and tid < 0):
-        raise RuntimeError(
-            f"Aligner tokenizer does not recognise {timestamp_token!r} (got id={tid}). "
-            "Check the model card; the marker token may use a different name."
-        )
-    return int(tid)
-
-
-def _reset_for_tests() -> None:
-    """Drop the cached official-processor probe so the next call re-checks."""
-    global _official_processor, _official_processor_unavailable
-    _official_processor = None
-    _official_processor_unavailable = False
