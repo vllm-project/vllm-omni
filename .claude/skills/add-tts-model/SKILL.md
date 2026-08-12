@@ -220,65 +220,70 @@ See `plan/voxcpm2_native_ar_design.md`.
 
 ### Steps
 
-1. **Register in `serving_speech.py`** — add all 5 points in a **single commit**;
-   partial integration causes hard-to-debug failures. This file is modified by every
-   model PR and is the most common source of rebase conflicts — see conflict note below.
+1. **Write one adapter** under `vllm_omni/entrypoints/openai/tts_adapters/`.
+   `serving_speech.py` should not need an edit — detection, stage discovery and
+   dispatch are all derived from what the adapter declares.
 
-   **Point 1** — stage constant (near the top, alongside the other `_*_TTS_MODEL_STAGES` sets):
+   Create `vllm_omni/entrypoints/openai/tts_adapters/your_model.py`:
    ```python
-   _YOUR_MODEL_TTS_MODEL_STAGES = {"your_stage_key"}
+   @register_tts_adapter
+   class YourModelAdapter(ARTTSAdapter):
+       name = "your_model"                              # registry key + log label
+       stage_keys = frozenset({"your_stage_key"})       # the deploy yaml's model_stage
+
+       def validate(self, request) -> str | None:
+           if not request.input or not request.input.strip():
+               return "Input text cannot be empty"
+           return None
+
+       async def build(self, request, sampling_params_list, has_inline_ref_audio):
+           params = {"text": [request.input]}
+           if request.voice is not None:
+               params["voice"] = [request.voice]
+           return PreparedRequest(
+               prompt={"prompt": request.input},
+               tts_params=params,
+               model_type=self.name,
+           )
    ```
 
-   **Point 2** — union into `_TTS_MODEL_STAGES`:
-   ```python
-   _TTS_MODEL_STAGES: set[str] = (
-       ...
-       | _YOUR_MODEL_TTS_MODEL_STAGES
-   )
-   ```
+   Then add the module to the import block at the bottom of
+   `tts_adapters/__init__.py` so it registers. That import line is the only shared
+   file a new model touches — which is also why the old rebase-conflict hotspot is
+   gone.
 
-   **Point 3** — model type detection in `_detect_tts_model_type()`:
-   ```python
-   if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
-       return "your_model"
-   ```
+   > **Pure-diffusion TTS does not go through adapters yet.** Under
+   > `for_diffusion()`, `create_speech()` routes straight to
+   > `_create_diffusion_speech()` and never calls `validate()`/`build()`.
+   > `DiffusionTTSAdapter` is scaffolding with no production subclass, so logic
+   > placed in one would silently never run. Diffusion-engine models follow the
+   > existing diffusion path; wiring it through adapters is open work (#4855).
 
-   **Point 4** — validation dispatch in `_validate_tts_request()`:
-   ```python
-   if self._tts_model_type == "your_model":
-       return self._validate_your_model_request(request)
-   ```
+   **If a stage key alone cannot identify the model**, declare
+   `model_archs = frozenset({"YourModelForConditionalGeneration"})`; add
+   `arch_identifies_entry_stage = True` when the model owns no stage key at all
+   (Ming dense). For a rule that is not set membership, override `matches()` (see
+   `covo_audio.py`). For a genuine overlap with another adapter, give one an
+   explicit `detect_priority` — `test_tts_detection.py` fails on an unordered
+   overlap. Models that only serve speech in some topologies override
+   `stage_serves_speech()` (see `audex.py`).
 
-   **Point 5** — validation + parameter-builder methods:
-   ```python
-   def _validate_your_model_request(self, request) -> str | None:
-       if not request.input or not request.input.strip():
-           return "Input text cannot be empty"
-       return None
+   **Reuse shared helpers via `self.ctx.server`** rather than reimplementing them:
+   `_resolve_ref_audio`, `_apply_uploaded_speaker`, `_validate_ref_audio_format`,
+   `_max_instructions_length`. Read a comparable adapter first — `fish_speech.py`
+   (voice cloning), `higgs_audio_v3.py` (parameter-heavy), `moss_tts.py` (family
+   sharing a base class).
 
-   def _build_your_model_params(self, request) -> dict:
-       params = {"text": [request.input]}
-       if request.voice is not None:
-           params["voice"] = [request.voice]
-       return params
-   ```
-   Wire `_build_your_model_params` into `_create_tts_request()` alongside the other
-   model-specific param builders.
+   > **Do not add `self._tts_model_type == ...` branches to `serving_speech.py`.**
+   > Older models predate the adapter framework and still have them; they are being
+   > migrated out (RFC #4327, #4855). `tools/pre_commit/check_tts_adapter.py` is a
+   > ratchet on the remaining count and fails the commit if it grows. Behaviour that
+   > no adapter hook can express is a missing hook — propose it on the RFC.
 
-   > **Two dispatch patterns coexist**: Fish Speech uses a `self._is_fish_speech` boolean
-   > instance attribute checked before `elif self._is_tts`, while all newer models
-   > (CosyVoice3, MOSS-TTS-Nano) use the `_tts_model_type` string returned by
-   > `_detect_tts_model_type()`. For new models, always use the `_tts_model_type` string
-   > pattern — do not add new `_is_*` flags.
-
-   > **Unused variable rule**: only extract fields in `_build_your_model_params` that
-   > are actually forwarded to the model. Unused extractions fail `ruff F841`.
-   > For voice-cloning fields (`ref_audio` → `prompt_audio_path`, `ref_text` →
-   > `prompt_text`), add them to the param builder and verify they reach the model call.
-
-   **Rebase conflict note**: when rebasing onto `main` after another model was merged,
-   `serving_speech.py` will conflict. Resolution: always keep *both* the upstream
-   model's additions and your own — never discard either side.
+   > **Unused variable rule**: only extract fields in `build()` that are actually
+   > forwarded to the model. Unused extractions fail `ruff F841`. For voice-cloning
+   > fields (`ref_audio` -> `prompt_audio_path`, `ref_text` -> `prompt_text`), add
+   > them to the params and verify they reach the model call.
 
 2. **Handle model-specific parameters**:
    - Voice cloning: `ref_audio` encoding and prompt injection
@@ -295,7 +300,7 @@ import base64
 from pathlib import Path
 
 def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
-    """Build prompt with reference audio for voice cloning in serving_speech.py."""
+    """Build prompt with reference audio for voice cloning, called from the adapter."""
     audio_bytes = Path(ref_audio_path).read_bytes()
     codes = codec.encode(audio_bytes)  # Encode on CPU using model's codec (e.g., DAC)
     token_ids = [code + codec.vocab_offset for code in codes.flatten().tolist()]
@@ -321,7 +326,7 @@ Classify the model's **CI priority** first (high / medium / low). High-priority 
 
 | Level | Location | Marker | CI pipeline | Notes |
 |-------|----------|--------|-------------|-------|
-| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, `serving_speech` validation — no GPU |
+| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, adapter validation — no GPU |
 | **L2** | `tests/e2e/online_serving/test_{slug}.py` | **`core_model` + `advanced_model`** (both on baseline smoke) + `tts` + `@hardware_test(...)` | `test-ready.yml` (`ready` label) | Default deploy smoke: single `/v1/audio/speech` or offline `OmniRunner` path |
 | **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `tts`) | `test-merge.yml` **or** merged into nightly TTS function job | Streaming, voice clone, batch/queue, async_chunk |
 | **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py`, optional offline expansion | `full_model` + `tts` | `test-nightly.yml` (`:full_moon: TTS · Function Test with L4`) | Feature matrix; perf → `tests/dfx/perf/tests/test_tts.json` |
@@ -366,7 +371,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 
 ### Deliverables
 
-- Updated `serving_speech.py` with all 5 integration points (single commit)
+- One adapter file under `tts_adapters/` plus its line in the package import block
 - Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
 - Gradio demo with streaming and voice cloning UI in the same dir
 - E2E tests per **Test Case Writing (CI Levels)** above (priority tier determines L1–L4 scope)
@@ -514,8 +519,8 @@ Use this checklist when integrating a new TTS model:
 - [ ] README.md written
 
 ### Phase 3: Online Serving
-- [ ] All 5 `serving_speech.py` integration points added in one commit
-- [ ] Only extract params in `_build_*_params` that are forwarded to the model call (ruff F841)
+- [ ] Adapter written under `tts_adapters/` and registered in the import block
+- [ ] Only extract params in `build()` that are forwarded to the model call (ruff F841)
 - [ ] Prompt builder handles text input correctly
 - [ ] Voice cloning works (if supported)
 - [ ] All response formats work (wav, mp3, flac, pcm)

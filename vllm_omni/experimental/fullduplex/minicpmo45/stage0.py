@@ -128,6 +128,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             session_config.get("instructions"),
             ref_audio is not None,
+            (runtime_config or {}).get("initial_user_text"),
         )
         for token_id in self._encode_text(prefix):
             state.context_embeds.append(self._embed_token(token_id))

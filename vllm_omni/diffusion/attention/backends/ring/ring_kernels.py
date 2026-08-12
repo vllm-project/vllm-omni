@@ -83,6 +83,19 @@ def pytorch_attn_forward(
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
+    # GQA/MQA support. Ring attention only ever *communicates* K/V with H_kv
+    # heads -- that is precisely the benefit of GQA -- so expanding here does
+    # not change communication volume. The expansion is needed because the aten
+    # SDPA ops below are required for the LSE output that ring accumulation
+    # consumes, and they do not accept `enable_gqa`.
+    if k.shape[1] != q.shape[1]:
+        num_heads, num_kv_heads = q.shape[1], k.shape[1]
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA/MQA.")
+        n_rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+
     if op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
             q,

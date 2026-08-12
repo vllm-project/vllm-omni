@@ -15,7 +15,11 @@ from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
-from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.model_metadata import (
+    HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+    QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -121,6 +125,11 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
+    def test_diffusion_kv_mode_roundtrip(self):
+        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+
+        assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(model="Qwen/Qwen-Image-Edit-2511", model_class_name="QwenImageEditPlusPipeline")
@@ -129,6 +138,35 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_task_type_roundtrip():
+    od = _roundtrip_diffusion_config(model="x", task_type="model-defined-task")
+    assert od.task_type == "model-defined-task"
+
+
+def test_architecture_name_resolves_via_pipeline_class_fallback():
+    # Direct hit: the architecture name itself is the metadata table key.
+    qwen_od_config = OmniDiffusionConfig(
+        model="Qwen/Qwen-Image-Edit-2511",
+        model_class_name="QwenImageEditPlusPipeline",
+    )
+    qwen_od_config.update_multimodal_support()
+
+    assert qwen_od_config.supports_multimodal_inputs is True
+    assert qwen_od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+    # Fallback: the HF architecture name differs from the internal pipeline class
+    # name, so ``get_diffusion_model_metadata`` must consult ``_DIFFUSION_MODELS``
+    # and resolve the metadata via the pipeline class name.
+    hunyuan_od_config = OmniDiffusionConfig(
+        model="tencent/HunyuanImage-3.0-Instruct",
+        model_class_name="HunyuanImage3ForCausalMM",
+    )
+    hunyuan_od_config.update_multimodal_support()
+
+    assert hunyuan_od_config.supports_multimodal_inputs is True
+    assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

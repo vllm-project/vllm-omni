@@ -385,6 +385,9 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: str | list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
@@ -394,6 +397,7 @@ class StageDeployConfig:
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
@@ -413,6 +417,9 @@ class StageDeployConfig:
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
+    enable_distributed_layerwise_offload: bool | None = None
+    dlo_use_allgather: bool | None = None
+    dlo_resident_layers: int | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
@@ -857,6 +864,11 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if deploy.session_mode == "duplex":
+        # The engine admission limit is also the authoritative capacity for
+        # model-owned streaming state. Propagate it to every stage instead of
+        # making individual models duplicate the value in connector extras.
+        engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args

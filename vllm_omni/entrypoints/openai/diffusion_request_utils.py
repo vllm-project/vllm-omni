@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from difflib import get_close_matches
 
 from vllm.logger import init_logger
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import (
+    DIFFUSION_QUALITY_LEVELS,
+    OmniDiffusionSamplingParams,
+)
 
 logger = init_logger(__name__)
 
@@ -28,9 +30,9 @@ class DiffusionRequestOptionSpec:
     def from_fields(
         cls,
         *,
-        serving_root_fields: Collection[str] = (),
-        registered_extra_fields: Collection[str] = (),
-        root_field_aliases: Mapping[str, str] | None = None,
+        serving_root_fields: Collection[str],
+        registered_extra_fields: Collection[str],
+        root_field_aliases: Mapping[str, str] | None,
     ) -> DiffusionRequestOptionSpec:
         return cls(
             serving_root_fields=frozenset(serving_root_fields),
@@ -49,25 +51,20 @@ def _request_mapping(name: str, value: object | None) -> dict[str, object]:
     return dict(value)
 
 
-def _warn_for_close_unknown_fields(
+def _warn_for_unknown_fields(
     args: Mapping[str, object],
     *,
     source: str,
     allowed_fields: Collection[str],
 ) -> None:
     allowed = set(allowed_fields) | _EXTRA_ARG_CONTAINER_FIELDS
-    choices = sorted(allowed)
-    for key in sorted(args):
-        if key in allowed:
-            continue
-        matches = get_close_matches(key, choices, n=1, cutoff=0.82)
-        if matches:
-            logger.warning(
-                "Ignoring unrecognized diffusion request field %s.%s. Did you mean %s?",
-                source,
-                key,
-                matches[0],
-            )
+    unknown = sorted(key for key in args if key not in allowed)
+    if unknown:
+        logger.warning(
+            "Ignoring unrecognized diffusion request fields %s: %s.",
+            source,
+            ", ".join(unknown),
+        )
 
 
 def normalize_diffusion_request_args(
@@ -87,7 +84,7 @@ def normalize_diffusion_request_args(
         root_field_aliases = request_options.root_field_aliases
 
     root_args = _request_mapping("request", root)
-    root_args.update(_request_mapping("explicit_root_args", explicit_root_args))
+    explicit_root_args_mapping = _request_mapping("explicit_root_args", explicit_root_args)
     nested_args = _request_mapping("request.extra_body", nested)
 
     registered = set(registered_extra_fields)
@@ -95,6 +92,21 @@ def normalize_diffusion_request_args(
     serving_fields = set(serving_root_fields) | aliases.keys()
     declared_fields = registered - serving_fields
     consumer_fields = serving_fields | declared_fields
+
+    # Warn about unrecognized fields from the free-form request sources only;
+    # explicit pydantic fields (model, messages, etc.) are handled upstream.
+    _warn_for_unknown_fields(
+        root_args,
+        source="request",
+        allowed_fields=consumer_fields | set(aliases.values()),
+    )
+    _warn_for_unknown_fields(
+        nested_args,
+        source="request.extra_body",
+        allowed_fields=consumer_fields | set(aliases.values()),
+    )
+
+    root_args.update(explicit_root_args_mapping)
 
     root_declared = {key: root_args[key] for key in declared_fields if key in root_args}
     nested_declared = {key: nested_args[key] for key in declared_fields if key in nested_args}
@@ -126,18 +138,6 @@ def normalize_diffusion_request_args(
             "extra_params is deprecated; use extra_args for model-specific diffusion request parameters."
         )
 
-    known_request_fields = consumer_fields | set(aliases.values())
-    _warn_for_close_unknown_fields(
-        root_args,
-        source="request",
-        allowed_fields=known_request_fields,
-    )
-    _warn_for_close_unknown_fields(
-        nested_args,
-        source="request.extra_body",
-        allowed_fields=known_request_fields,
-    )
-
     # Duplicate request keys were rejected above, so ordering is not precedence.
     normalized_extra_args = {
         **nested_declared,
@@ -156,6 +156,9 @@ def normalize_diffusion_request_args(
     for alias, canonical_name in aliases.items():
         if alias in request_args:
             request_args[canonical_name] = request_args.pop(alias)
+    quality = request_args.get("quality")
+    if quality is not None and quality not in DIFFUSION_QUALITY_LEVELS:
+        raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {quality!r}")
     return normalized_extra_args, request_args
 
 

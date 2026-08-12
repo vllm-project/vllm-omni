@@ -332,6 +332,6 @@ bundled offline CLI do not currently expose `sigmas`.
 - <https://huggingface.co/Lightricks/LTX-2.3>
 - <https://huggingface.co/diffusers/LTX-2.3-Diffusers>
 - [Online video generation](../../docs/user_guide/examples/online_serving/text_to_video.md)
-- [Request batching](../../docs/user_guide/diffusion/request_batching.md)
+- [Diffusion execution modes](../../docs/user_guide/diffusion/execution_modes.md)
 - [T2V offline example](../../examples/offline_inference/text_to_video/text_to_video.md)
 - [I2V offline example](../../examples/offline_inference/image_to_video/README.md)

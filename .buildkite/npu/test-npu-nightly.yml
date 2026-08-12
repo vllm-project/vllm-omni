@@ -39,7 +39,7 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-      - label: ":robot: Omni · MiniCPM-o 4.5 Test"
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 Test"
         mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -47,6 +47,34 @@ steps:
           HF_TOKEN: "${HF_TOKEN}"
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5.py tests/e2e/online_serving/test_minicpmo_4_5_expansion.py -m 'full_model' --run-level 'full_model'
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Test"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - >-
+            pytest -s -v
+            tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
+            tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
+            -m "npu and A3 and omni"
+            --run-level full_model
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - |
+            set +e
+            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
+            exit $$EXIT
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline
