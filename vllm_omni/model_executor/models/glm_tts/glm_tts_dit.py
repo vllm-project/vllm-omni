@@ -332,7 +332,7 @@ class DiTAttention(nn.Module):
         self,
         x: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -406,7 +406,7 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-norm & modulation for attention
@@ -576,7 +576,7 @@ class GLMTTSDiT(nn.Module):
         attn_mask: torch.Tensor | None = None,
         block_pattern: list[int] | None = None,
         text_embed: torch.Tensor | None = None,
-        rope=None,
+        rope: tuple[torch.Tensor, torch.Tensor | float] | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
