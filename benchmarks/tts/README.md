@@ -80,6 +80,25 @@ vllm bench serve --omni \
     --save-result --result-dir ./results
 ```
 
+#### Set the sample rate for models that are not 24 kHz
+
+Streamed PCM carries no header, so the harness derives `audio_duration` from the
+byte count and a **default 24000 Hz** assumption
+(`vllm_omni/metrics/definitions.py:DEFAULT_AUDIO_SAMPLE_RATE`). For a model that
+emits another rate, export the real one or every duration-derived metric is
+wrong by `real_sr / 24000`:
+
+```bash
+# Audio8 TTS, Fish Speech S2 Pro, Ming-omni-tts, ... all decode at 44.1 kHz
+export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100
+```
+
+Without it, a 44.1 kHz model reports `audio_duration` 1.84x too long, so
+`audio_rtf` looks 1.84x *better* than reality and `audio_underrun` /
+`Streaming continuity OK rate` are measured against inflated chunk budgets.
+A quick sanity check: compare `Mean AUDIO_DURATION (s)` against the actual
+length of a saved WAV for the same prompt.
+
 #### Streaming continuity (`audio_underrun`)
 
 `audio_underrun` (seconds) is the per-request worst-case buffer deficit
