@@ -1149,6 +1149,232 @@ class TestTTSMethods:
             cache_key
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
+    # ── ref-audio cache key tests (static helper) ──
+
+    def test_local_file_cache_key_invalidation(self):
+        """Modified file must produce a different cache key (mtime change)."""
+        import pathlib
+        import tempfile
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = pathlib.Path(tmp_dir) / "test_audio.wav"
+            test_file.write_text("dummy audio data 1")
+            file_uri = f"file://{test_file}"
+            key1 = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                file_uri,
+                allowed_local_media_path=tmp_dir,
+            )
+            _time.sleep(0.01)
+            test_file.write_text("dummy audio data 2")
+            key2 = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                file_uri,
+                allowed_local_media_path=tmp_dir,
+            )
+            assert key1 != key2, "Cache key should change when file is modified!"
+
+    def test_remote_url_cache_key(self):
+        """Remote URLs must produce a stable, repeatable cache key."""
+        url = "https://example.com/audio.wav"
+        key1 = OmniOpenAIServingSpeech._get_ref_audio_cache_key(url)
+        key2 = OmniOpenAIServingSpeech._get_ref_audio_cache_key(url)
+        assert key1 == key2, "Cache key for URLs should remain constant!"
+
+    def test_missing_file_cache_key(self, caplog):
+        """A missing file falls back to the URI-string hash and emits a log
+        so the stale-cache risk is visible."""
+        file_uri = "file:///path/to/nonexistent/file.wav"
+        target_logger = logging.getLogger("vllm_omni.entrypoints.openai.serving_speech")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.DEBUG)
+        try:
+            key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                file_uri,
+                allowed_local_media_path="/path/to/nonexistent",
+            )
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
+        expected_key = hashlib.sha1(file_uri.encode("utf-8")).hexdigest()
+        assert key == expected_key, "Missing files should fallback to the string hash."
+        assert any("stale cache" in r.getMessage() for r in caplog.records), (
+            "A log message about stale cache must be emitted when os.stat fails"
+        )
+
+    def test_percent_encoded_file_uri(self):
+        """Percent-encoded file:// URIs must be decoded so os.stat hits the real file."""
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = pathlib.Path(tmp_dir) / "my audio.wav"
+            test_file.write_text("dummy audio data")
+            encoded_uri = f"file://{str(test_file).replace(' ', '%20')}"
+            key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                encoded_uri,
+                allowed_local_media_path=tmp_dir,
+            )
+            string_only_key = hashlib.sha1(encoded_uri.encode("utf-8")).hexdigest()
+            assert key != string_only_key, (
+                "Percent-encoded URI should be decoded and stat'd, not fall back to string-only cache key!"
+            )
+
+    def test_no_allowlist_skips_stat_for_local_paths(self):
+        """When allowed_local_media_path is None, local paths must NOT be stat'd
+        — the key falls back to the string-only hash."""
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = pathlib.Path(tmp_dir) / "test.wav"
+            test_file.write_text("data")
+            file_uri = f"file://{test_file}"
+            key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                file_uri,
+                allowed_local_media_path=None,
+            )
+            # With no allowlist the stat is skipped, so the key is just sha1(uri)
+            expected = hashlib.sha1(file_uri.encode("utf-8")).hexdigest()
+            assert key == expected, "No allowlist should skip stat and use string-only key"
+
+    def test_empty_string_allowlist_skips_stat_for_local_paths(self):
+        """vLLM's default allowed_local_media_path is '' not None; that must
+        also skip stat rather than treating cwd as the allowlist."""
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = pathlib.Path(tmp_dir) / "test.wav"
+            test_file.write_text("data")
+            file_uri = f"file://{test_file}"
+            key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                file_uri,
+                allowed_local_media_path="",
+            )
+            expected = hashlib.sha1(file_uri.encode("utf-8")).hexdigest()
+            assert key == expected, "Empty-string allowlist should skip stat and use string-only key"
+
+    def test_conditioning_cache_salt_changes_with_ref_audio_cache_key(self):
+        """Prefix-cache salt must fold the content-aware resolve key so a
+        same-path file rewrite cannot reuse KV from the previous reference."""
+        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
+
+        req = OpenAICreateSpeechRequest(input="hello", ref_audio="file:///data/spk.wav")
+        salt_a = _conditioning_cache_salt(req, {"ref_audio_cache_key": "key_aaa"})
+        salt_b = _conditioning_cache_salt(req, {"ref_audio_cache_key": "key_bbb"})
+        salt_locator_only = _conditioning_cache_salt(req, {})
+        assert salt_a != salt_b
+        assert salt_a != salt_locator_only
+
+    # ── encode_reference_codes: speaker cache invalidation ──
+
+    @pytest.mark.asyncio
+    async def test_encode_reference_codes_reencodes_on_key_change(self):
+        """Changing the resolve_cache_key must trigger a fresh encode, not serve
+        the stale cached tensor.  This is the user-visible fix for delay-family
+        voice clones that were reproducing the old speaker."""
+        from unittest.mock import MagicMock
+
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+        speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
+
+        call_count = 0
+        codes_v1 = torch.arange(10, dtype=torch.int64)
+        codes_v2 = torch.arange(10, 20, dtype=torch.int64)
+
+        # Stub processor that tracks call count and returns different codes
+        processor = MagicMock()
+
+        def fake_encode(wavs, sampling_rate, n_vq):
+            nonlocal call_count
+            call_count += 1
+            return [codes_v1 if call_count == 1 else codes_v2]
+
+        processor.encode_audios_from_wav = fake_encode
+
+        # resolve_ref_audio returns different cache keys on successive calls
+        resolve_keys = iter(["key_aaa", "key_bbb"])
+
+        async def mock_resolve(ref_str):
+            return ([0.1, 0.2, 0.3], 24000, next(resolve_keys))
+
+        # First call: cold miss, encodes and stores
+        result1 = await encode_reference_codes(
+            "data:audio/wav;base64,fake",
+            processor=processor,
+            resolve_ref_audio=mock_resolve,
+            speaker_cache=speaker_cache,
+            variant="tts",
+            n_vq=32,
+            sr_target=24000,
+        )
+        assert call_count == 1
+        assert torch.equal(result1, codes_v1)
+
+        # Second call: different resolve key → must re-encode, not serve cached
+        result2 = await encode_reference_codes(
+            "data:audio/wav;base64,fake",
+            processor=processor,
+            resolve_ref_audio=mock_resolve,
+            speaker_cache=speaker_cache,
+            variant="tts",
+            n_vq=32,
+            sr_target=24000,
+        )
+        assert call_count == 2, "Different resolve key should trigger re-encode"
+        assert torch.equal(result2, codes_v2)
+
+    @pytest.mark.asyncio
+    async def test_encode_reference_codes_named_voice_skips_resolve_on_hit(self):
+        """Named-voice cache hit must NOT call resolve_ref_audio."""
+        from unittest.mock import MagicMock
+
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+        speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
+
+        processor = MagicMock()
+        processor.encode_audios_from_wav = lambda wavs, sampling_rate, n_vq: [torch.zeros(5)]
+
+        resolve_called = 0
+
+        async def mock_resolve(ref_str):
+            nonlocal resolve_called
+            resolve_called += 1
+            return ([0.1], 24000, "some_key")
+
+        # First call: cold miss, resolves + encodes
+        await encode_reference_codes(
+            "data:audio/wav;base64,fake",
+            processor=processor,
+            resolve_ref_audio=mock_resolve,
+            speaker_cache=speaker_cache,
+            variant="tts",
+            n_vq=32,
+            sr_target=24000,
+            voice_name="alice",
+            voice_created_at=100,
+        )
+        assert resolve_called == 1
+
+        # Second call: warm hit, must NOT resolve
+        await encode_reference_codes(
+            "data:audio/wav;base64,fake",
+            processor=processor,
+            resolve_ref_audio=mock_resolve,
+            speaker_cache=speaker_cache,
+            variant="tts",
+            n_vq=32,
+            sr_target=24000,
+            voice_name="alice",
+            voice_created_at=100,
+        )
+        assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
         speech_server._tts_model_type = "qwen3_tts"

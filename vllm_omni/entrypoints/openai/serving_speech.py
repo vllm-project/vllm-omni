@@ -251,6 +251,13 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
     must also be folded in. ``voice_created_at`` bumps on every (re-)upload,
     which uniquely identifies the resolved reference artifact together with
     the voice name; the decoded ref_audio array itself need not be hashed.
+
+    Local ``ref_audio`` locators are the same class of gap: the raw request
+    hashes the path/URI string, so an on-disk rewrite is invisible to the
+    salt. Callers stash the content-aware key from ``_resolve_ref_audio`` as
+    ``ref_audio_cache_key`` (and ``ref_audio_2_cache_key`` / emotion keys
+    when those clips exist) so a file edit cannot reuse KV from the previous
+    reference.
     """
     h = hashlib.sha256()
     for part in (
@@ -268,13 +275,15 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
         if part is not None:
             h.update(repr(part).encode("utf-8"))
     # Fold resolved conditioning that is auto-derived for uploaded voices and
-    # absent from the raw request.
+    # absent from the raw request (or that a locator string cannot see).
     for key in (
         "voice_created_at",
         "task_type",
         "speaker",
         "ref_text",
         "x_vector_only_mode",
+        "ref_audio_cache_key",
+        "ref_audio_2_cache_key",
     ):
         h.update(b"\x00")
         value = tts_params.get(key) if tts_params is not None else None
@@ -1549,7 +1558,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
-    async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+    async def _build_moss_tts_params(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool = False,
+    ) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
 
@@ -1577,8 +1591,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
             params["prompt_audio_array"] = [[wav_list, sr]]
+            params["ref_audio_cache_key"] = cache_key
             return params
 
         # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
@@ -1596,8 +1611,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
             params["prompt_audio_array"] = [[wav_list, sr]]
+            params["ref_audio_cache_key"] = cache_key
             return params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
@@ -1628,15 +1644,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # only pulls it on the delay-family path (alongside the upstream proc).
         from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
 
-        _voice = getattr(request, "voice", None)
-        _voice = _voice.strip() if isinstance(_voice, str) else ""
-        _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
+        # Named-voice speaker cache is only valid for uploaded speakers
+        # without an inline ref_audio. ``request.voice`` plus a file/URL
+        # otherwise keys on (name, created_at=0) and skips the content-aware
+        # resolve — the adapter already applies this guard when tagging
+        # ``voice_name`` on tts_params.
+        _raw_voice = getattr(request, "voice", None)
+        _raw_voice = _raw_voice.strip() if isinstance(_raw_voice, str) else ""
+        _voice_lower = _raw_voice.lower() if _raw_voice else ""
+        _use_named_voice = bool(_voice_lower) and _voice_lower in self.uploaded_speakers and not has_inline_ref_audio
+        _voice = _voice_lower if _use_named_voice else ""
+        _voice_created = self._voice_created_at(_voice) if _voice else 0
+        _resolve_keys: list[str] = []
+
+        async def _tracked_resolve(ref_str: str) -> tuple[list, int, str]:
+            wav_list, sr, cache_key = await self._resolve_ref_audio(ref_str)
+            _resolve_keys.append(cache_key)
+            return wav_list, sr, cache_key
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
             return await encode_reference_codes(
                 ref_str,
                 processor=proc,
-                resolve_ref_audio=self._resolve_ref_audio,
+                resolve_ref_audio=_tracked_resolve,
                 speaker_cache=self._speaker_cache,
                 variant=v,
                 n_vq=n_vq,
@@ -1685,6 +1715,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
+        if _resolve_keys:
+            params["ref_audio_cache_key"] = _resolve_keys[0]
+            if len(_resolve_keys) > 1:
+                params["ref_audio_2_cache_key"] = _resolve_keys[1]
         return params
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
@@ -1909,10 +1943,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         and ``data:`` URIs are keyed on the raw string alone — the server does
         not re-fetch them to check for changes.
 
-        When *allowed_local_media_path* is provided the ``os.stat`` call is
-        restricted to paths under that directory, preventing the server from
-        touching arbitrary client-supplied paths before ``MediaConnector``
-        validates the allowlist.
+        ``os.stat`` runs only when *allowed_local_media_path* is a non-empty
+        path. vLLM's default is ``""`` (not ``None``); both mean local media
+        is refused, so a stat would be exposure for a request that cannot
+        load the file.
 
         Note: when the key changes the *previous* entry stays in
         ``_ref_audio_resolve_cache`` until LRU eviction, so
@@ -1935,14 +1969,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         raise OSError(f"file:// URI with non-local authority {netloc!r} cannot be stat'd")
                 else:
                     path = ref_audio_str
-                # Only stat paths under the configured allowlist to avoid
-                # touching arbitrary client-supplied paths (NFS automounts,
-                # etc.) before MediaConnector validates the request.
-                if allowed_local_media_path is not None:
-                    resolved = os.path.realpath(path)
-                    allowed_base = os.path.realpath(allowed_local_media_path)
-                    if os.path.commonpath([resolved, allowed_base]) != allowed_base:
-                        raise OSError("path outside allowed_local_media_path; skipping stat")
+                # Only stat paths the server operator has explicitly permitted
+                # via --allowed-local-media-path.  The default is "" (and
+                # diffusion mode passes None); MediaConnector refuses local
+                # file loads in both cases, so a stat is exposure for zero
+                # benefit.  ``if not`` covers "" and None; ``is None`` would
+                # treat "" as an allowlist of the process cwd.
+                if not allowed_local_media_path:
+                    raise OSError("no allowed_local_media_path configured; skipping stat")
+                resolved = os.path.realpath(path)
+                allowed_base = os.path.realpath(allowed_local_media_path)
+                if os.path.commonpath([resolved, allowed_base]) != allowed_base:
+                    raise OSError("path outside allowed_local_media_path; skipping stat")
                 st = os.stat(path)
                 cache_key_source = f"{ref_audio_str}:{st.st_mtime_ns}:{st.st_size}"
             except (OSError, ValueError):
@@ -3172,6 +3210,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio_source = tts_params["ref_audio"][0]
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
             wav_list, sr, cache_key = await self._resolve_ref_audio(ref_audio_source)
+            tts_params["ref_audio_cache_key"] = cache_key
             artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
             if artifact_key:
                 tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]

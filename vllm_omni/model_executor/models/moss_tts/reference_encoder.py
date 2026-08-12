@@ -8,7 +8,7 @@ in ``serving_speech.py``. The serving layer just calls
 :func:`encode_reference_codes` with its generic helpers (the audio resolver and
 the process-wide speaker cache).
 
-Kept import-light (only ``asyncio`` / ``hashlib`` / ``torch`` plus the logger)
+Kept import-light (only ``asyncio`` / ``torch`` plus the logger)
 so importing it from the API-server process does not pull the talker/codec.
 """
 
@@ -61,6 +61,11 @@ async def encode_reference_codes(
     ``asyncio.to_thread`` so cold/anonymous encodes from concurrent requests
     overlap instead of serializing on the event loop.
 
+    For named voices the speaker cache is checked *before* resolving the audio,
+    avoiding the decode cost when the cache is warm.  For anonymous references
+    the audio is resolved first so the cache key incorporates mtime/size from
+    a single stat (no TOCTOU window).
+
     Args:
         ref_str: The raw reference audio (URL / path / data URL) as received.
         processor: Upstream MOSS processor exposing ``encode_audios_from_wav``.
@@ -75,27 +80,45 @@ async def encode_reference_codes(
     Returns:
         The reference RVQ codes tensor (CPU), ready to pass to the processor.
     """
-    # Resolve the audio first. This uses the serving layer's resolve cache,
-    # which correctly handles mtime/size invalidation for local files.
-    wav_list, sr, resolve_cache_key = await resolve_ref_audio(ref_str)
+    model_type = f"moss_tts_{variant}_nq{n_vq}"
 
+    # ---- Named-voice branch: check cache *before* resolving ----
+    # When voice_name is set, the cache key is (voice_name, created_at) which
+    # does not depend on the resolved audio content.  The serving layer only
+    # passes voice_name for uploaded speakers without an inline ref_audio;
+    # re-upload bumps created_at and clears the speaker-cache slot.
     if voice_name:
         speaker_name = voice_name
         created_at = int(voice_created_at)
+        cache_key = speaker_cache.make_cache_key(
+            speaker_name,
+            model_type=model_type,
+            created_at=created_at,
+        )
+        cached = speaker_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Speaker cache HIT for MOSS-TTS reference '%s'", speaker_name)
+            return cached["codes"].clone()
+        # Cache miss — resolve the audio for encoding.
+        wav_list, sr, _ = await resolve_ref_audio(ref_str)
     else:
+        # ---- Anonymous branch: resolve first for content-addressed key ----
+        # The resolve incorporates mtime/size from a single stat so the key
+        # and the waveform always come from the same filesystem snapshot.
+        wav_list, sr, resolve_cache_key = await resolve_ref_audio(ref_str)
         speaker_name = "ref:" + resolve_cache_key
         created_at = 0
+        cache_key = speaker_cache.make_cache_key(
+            speaker_name,
+            model_type=model_type,
+            created_at=created_at,
+        )
+        cached = speaker_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Speaker cache HIT for MOSS-TTS reference '%s'", speaker_name)
+            return cached["codes"].clone()
 
-    cache_key = speaker_cache.make_cache_key(
-        speaker_name,
-        model_type=f"moss_tts_{variant}_nq{n_vq}",
-        created_at=created_at,
-    )
-    cached = speaker_cache.get(cache_key)
-    if cached is not None:
-        logger.debug("Speaker cache HIT for MOSS-TTS reference '%s'", speaker_name)
-        return cached["codes"].clone()
-
+    # ---- Cold miss: encode in a worker thread and store ----
     codes = await asyncio.to_thread(_encode_wav_sync, processor, wav_list, sr, sr_target, n_vq)
     speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
     logger.debug("Speaker cache STORE for MOSS-TTS reference '%s'", speaker_name)

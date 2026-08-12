@@ -162,6 +162,13 @@ def test_indextts25_speed_does_not_change_conditioning_cache_salt():
     ) == indextts2_conditioning_cache_salt(slow_request, slow_params)
 
 
+def test_indextts2_conditioning_cache_salt_changes_with_ref_audio_cache_key():
+    request = SimpleNamespace(input="hello", ref_audio="file:///data/spk.wav")
+    salt_a = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_aaa"]})
+    salt_b = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_bbb"]})
+    assert salt_a != salt_b
+
+
 @pytest.mark.parametrize(
     ("hf_config", "expected_tokenizer_file"),
     [
