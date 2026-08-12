@@ -3179,7 +3179,12 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--deploy-config", stage_config_path]
+                from vllm_omni.entrypoints.utils import is_new_format_deploy_config
+
+                if is_new_format_deploy_config(stage_config_path):
+                    server_args += ["--deploy-config", stage_config_path]
+                else:
+                    server_args += ["--stage-configs-path", stage_config_path]
 
             with (
                 OmniServer(
