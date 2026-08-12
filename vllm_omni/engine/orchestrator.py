@@ -311,6 +311,7 @@ class _OrchestratorDuplexStagePort:
                     context.request_id,
                     request,
                     request_state,
+                    stage0_replica_id=replica_id,
                 )
         request_state.duplex_stage_fences[context.stage_id] = context.fence
         request_state.stage_submit_ts[context.stage_id] = _time.time()
@@ -682,7 +683,7 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        await self.stage_pools[stage_id].submit_initial(
+        stage0_replica_id = await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
             prompt,
@@ -690,7 +691,9 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            await self._prewarm_async_chunk_stages(
+                request_id, prompt, req_state, stage0_replica_id=stage0_replica_id
+            )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -725,7 +728,10 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+            stage0_replica_id = self.stage_pools[stage_id].get_bound_replica_id(request_id)
+            await self._prewarm_async_chunk_stages(
+                request_id, request, req_state, stage0_replica_id=stage0_replica_id
+            )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -1602,11 +1608,13 @@ class Orchestrator:
         if (stage_id + 1) in parent_state.stage_submit_ts:
             return
 
+        src_replica_id = self.stage_pools[stage_id].get_bound_replica_id(parent_id)
         await self._forward_to_next_stage(
             parent_id,
             stage_id,
             deferred["engine_outputs"],
             parent_state,
+            src_replica_id=src_replica_id,
         )
 
     async def _handle_kv_ready_raw_outputs(
@@ -1643,7 +1651,10 @@ class Orchestrator:
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, raw_output, stage_id)
             else:
-                await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
+                src_replica_id = self.stage_pools[stage_id].get_bound_replica_id(req_id)
+                await self._forward_to_next_stage(
+                    req_id, stage_id, raw_output, req_state, src_replica_id=src_replica_id
+                )
 
     def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
         """Build decode-side sampling params with KV transfer params for PD routing.
@@ -1746,6 +1757,16 @@ class Orchestrator:
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
+
+        # Topology-aware routing: prefer placing the consumer-stage replica in
+        # the same NVLink/NUMA/IB domain as the producer-stage replica so the
+        # KV-cache / hidden-state transfer stays on a fast local link.
+        src_pool = self.stage_pools[src_stage_id]
+        topology_domain = (
+            src_pool.get_replica_topology_domain(src_replica_id)
+            if src_replica_id is not None
+            else None
+        )
 
         if next_pool.stage_type == "diffusion":
             # Gate: never dispatch with an incomplete CFG bundle. Checked
@@ -1875,7 +1896,9 @@ class Orchestrator:
                 diffusion_prompt = req_state.prompt
 
             if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                replica_id = await next_pool.submit_update(
+                    req_id, req_state, diffusion_prompt, topology_domain=topology_domain
+                )
             else:
                 replica_id = await next_pool.submit_initial(
                     req_id,
@@ -1888,6 +1911,7 @@ class Orchestrator:
                         )
                     },
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    topology_domain=topology_domain,
                 )
             self._record_duplex_stage_submission(
                 next_logical,
@@ -1939,9 +1963,13 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(
+                        req_id, req_state, request, topology_domain=topology_domain
+                    )
                 else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(
+                        req_id, req_state, request, prompt_text=None, topology_domain=topology_domain
+                    )
                 self._record_duplex_stage_submission(
                     next_logical,
                     req_id,
@@ -2049,9 +2077,13 @@ class Orchestrator:
             )
 
             if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, request)
+                replica_id = await next_pool.submit_update(
+                    req_id, req_state, request, topology_domain=topology_domain
+                )
             else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(
+                    req_id, req_state, request, prompt_text=None, topology_domain=topology_domain
+                )
             self._record_duplex_stage_submission(
                 next_logical,
                 req_id,
@@ -2075,10 +2107,26 @@ class Orchestrator:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
+        *,
+        stage0_replica_id: int | None = None,
     ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
+        """Pre-submit downstream stages for async-chunk mode.
+
+        ``stage0_replica_id`` is used to seed topology-aware routing: each
+        downstream stage is prewarmed with the previous stage's replica
+        ``topology_domain`` as the hint, so the prewarm picks replicas in the
+        same NVLink/NUMA/IB domain as their producer.
+        """
         if req_state.final_stage_id <= 0:
             return
+
+        # Seed the topology hint chain from stage 0's chosen replica.
+        src_pool = self.stage_pools[0]
+        topology_domain = (
+            src_pool.get_replica_topology_domain(stage0_replica_id)
+            if stage0_replica_id is not None
+            else None
+        )
 
         prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
@@ -2111,6 +2159,7 @@ class Orchestrator:
                             request_id=request_id,
                         )
                     },
+                    topology_domain=topology_domain,
                 )
             else:
                 import copy
@@ -2145,6 +2194,7 @@ class Orchestrator:
                     req_state,
                     request,
                     prompt_text=None,
+                    topology_domain=topology_domain,
                 )
             self._record_duplex_stage_submission(
                 next_stage_id,
@@ -2152,6 +2202,10 @@ class Orchestrator:
                 replica_id,
                 req_state,
             )
+
+            # Chain the topology hint: the stage we just prewarmed becomes the
+            # producer for the next stage in the loop.
+            topology_domain = next_pool.get_replica_topology_domain(replica_id)
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in

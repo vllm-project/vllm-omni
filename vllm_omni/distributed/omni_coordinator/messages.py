@@ -29,6 +29,7 @@ class ReplicaEvent:
     event_type: str  # "update" | "heartbeat"
     status: ReplicaStatus  # Current status
     queue_length: int  # Current queue length
+    topology_domain: str | None = None  # NVLink/NUMA/IB domain for topology-aware routing
 
 
 @dataclass

@@ -32,7 +32,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
-from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage, detect_topology_domain
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -628,6 +628,7 @@ class StageDiffusionProc:
                     input_addr=request_address,
                     output_addr=response_address,
                     stage_id=int(omni_stage_id),
+                    topology_domain=detect_topology_domain(),
                 )
 
                 def _refresh_queue_length() -> None:

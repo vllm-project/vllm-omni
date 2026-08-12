@@ -29,12 +29,14 @@ class OmniCoordClientForStage:
         input_addr: str,
         output_addr: str,
         stage_id: int,
+        topology_domain: str | None = None,
     ) -> None:
         """Initialize client and send initial registration / status-up event."""
         self._coord_zmq_addr = coord_zmq_addr
         self._input_addr = input_addr
         self._output_addr = output_addr
         self._stage_id = stage_id
+        self._topology_domain = topology_domain
 
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
@@ -130,6 +132,7 @@ class OmniCoordClientForStage:
                 event_type=event_type,
                 status=self._status,
                 queue_length=self._queue_length,
+                topology_domain=self._topology_domain,
             )
             data = json.dumps(asdict(event)).encode("utf-8")
 
@@ -232,6 +235,30 @@ class OmniCoordClientForStage:
             self._closed = True
 
 
+
+def detect_topology_domain() -> str | None:
+    """Best-effort detection of the local NVLink/NUMA/IB topology domain.
+
+    Returns the value of the ``OMNI_TOPOLOGY_DOMAIN`` environment variable if
+    set, otherwise falls back to the hostname. Replicas that share a domain
+    can communicate over fast local links (NVLink/PCIe), while cross-domain
+    transfers traverse InfiniBand or TCP.
+
+    Returns ``None`` if the hostname cannot be determined, in which case the
+    topology-aware balancer falls back to ``least-queue-length``.
+    """
+    import os
+    import socket
+
+    env_domain = os.environ.get("OMNI_TOPOLOGY_DOMAIN")
+    if env_domain:
+        return env_domain
+    try:
+        return socket.gethostname()
+    except OSError:
+        return None
+
+
 def create_stage_coord_client(
     *,
     coord_zmq_addr: str,
@@ -239,6 +266,7 @@ def create_stage_coord_client(
     output_addr: str,
     stage_id: int,
     queue_length_getter: Callable[[], int] | None = None,
+    topology_domain: str | None = None,
 ) -> OmniCoordClientForStage:
     """Create a stage coordinator client with an optional heartbeat hook."""
     client = OmniCoordClientForStage(
@@ -246,6 +274,7 @@ def create_stage_coord_client(
         input_addr=input_addr,
         output_addr=output_addr,
         stage_id=stage_id,
+        topology_domain=topology_domain,
     )
     if queue_length_getter is not None:
 

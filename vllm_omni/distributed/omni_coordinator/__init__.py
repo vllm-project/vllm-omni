@@ -15,6 +15,7 @@ from .omni_coord_client_for_hub import OmniCoordClientForHub
 from .omni_coord_client_for_stage import (
     OmniCoordClientForStage,
     create_stage_coord_client,
+    detect_topology_domain,
 )
 from .omni_coordinator import OmniCoordinator
 from .runtime import OmniCoordinatorRuntime
@@ -28,6 +29,7 @@ __all__ = [
     "ReplicaList",
     "OmniCoordClientForStage",
     "create_stage_coord_client",
+    "detect_topology_domain",
     "OmniCoordClientForHub",
     "Task",
     "LoadBalancer",

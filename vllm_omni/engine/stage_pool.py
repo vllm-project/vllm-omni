@@ -275,6 +275,28 @@ class StagePool:
         """Return the stable replica_id for ``input_addr`` if registered."""
         return self._addr_to_replica_id.get(input_addr)
 
+    def get_replica_topology_domain(self, replica_id: int) -> str | None:
+        """Return the ``topology_domain`` advertised by ``replica_id``.
+
+        Looks up the replica's input address and resolves it against the
+        hub's cached :class:`ReplicaInfo` list. Returns ``None`` if the
+        pool is not in distributed mode, the replica is not attached, or
+        the hub has no record for it.
+        """
+        if self._hub is None:
+            return None
+        if replica_id < 0 or replica_id >= len(self.clients) or self.clients[replica_id] is None:
+            return None
+        input_addr = self._client_input_addr(self.clients[replica_id])
+        if input_addr is None:
+            return None
+        snap = self._hub.get_replicas_for_stage(self.stage_id)
+        for rep in snap.replicas:
+            if rep.input_addr == input_addr:
+                return rep.topology_domain
+        return None
+
+
     # ---- Per-request distributed dispatch ----
 
     async def pick(
@@ -283,6 +305,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        topology_domain: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -317,6 +340,8 @@ class StagePool:
 
         # 3. Fresh pick: poll hub + LB with bounded wait.
         task = task or Task(request_id=request_id)
+        if topology_domain is not None:
+            task["topology_domain"] = topology_domain
         deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
         while True:
             candidates = self._collect_serviceable_replicas()
@@ -338,6 +363,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        topology_domain: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -368,6 +394,8 @@ class StagePool:
                     return replica_id
 
         task = task or Task(request_id=request_id)
+        if topology_domain is not None:
+            task["topology_domain"] = topology_domain
         candidates = self._collect_serviceable_replicas()
         if not candidates:
             return None
@@ -934,6 +962,7 @@ class StagePool:
         affinity_request_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
+        topology_domain: str | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
@@ -950,6 +979,7 @@ class StagePool:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                topology_domain=topology_domain,
             )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
@@ -958,6 +988,7 @@ class StagePool:
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+            topology_domain=topology_domain,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -999,6 +1030,7 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        topology_domain: str | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
@@ -1006,7 +1038,7 @@ class StagePool:
             params = OmniDiffusionSamplingParams.from_params(params)
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+            replica_id = await self._pick_or_select(request_id, topology_domain=topology_domain)
 
         client = self.clients[replica_id]
         if client is None:
@@ -1070,10 +1102,15 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        topology_domain: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                topology_domain=topology_domain,
+            )
         return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
     # ---- Stage-local polling ----

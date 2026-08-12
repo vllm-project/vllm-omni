@@ -209,6 +209,7 @@ class OmniCoordinator:
                 event_type=str(data["event_type"]),
                 status=ReplicaStatus(data.get("status")),
                 queue_length=data.get("queue_length"),
+                topology_domain=data.get("topology_domain"),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -347,6 +348,7 @@ class OmniCoordinator:
             queue_length=event.queue_length,
             last_heartbeat=now,
             registered_at=now,
+            topology_domain=event.topology_domain,
         )
         self._replicas[input_addr] = info
 
