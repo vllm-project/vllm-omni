@@ -11,14 +11,14 @@ also works** on the same client (verified). Serve the model you want, then pass
 the same id to `--model`.
 
 Scripts, the required vLLM patch, and demo assets live in
-`examples/online_serving/cosmos3_fl2v/`.
+`tools/cosmos3_fl2v/`.
 `fl2v_generate_vllm.py` is a plain HTTP client for `POST /v1/videos/sync` — no
 vLLM-Omni source changes and no weight changes. FL2V is expressed entirely with
 documented request fields plus `extra_params`.
 
 Demo package: `testdata/fl2v_from_cosmos_v2v/` (robot pouring; mid-clip diversion
-into the left jar, then back to the right glass), self-contained in the example
-directory.
+into the left jar, then back to the right glass), self-contained in the
+`tools/cosmos3_fl2v/` directory.
 
 ## Summary
 
@@ -47,7 +47,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh      # once
 export PATH="$HOME/.local/bin:$PATH"
 export HF_TOKEN=hf_...                               # your Hugging Face token
 
-cd examples/online_serving/cosmos3_fl2v
+cd tools/cosmos3_fl2v
 uv venv --python 3.12 --seed --managed-python .venv-client
 source .venv-client/bin/activate
 uv pip install vllm==0.26.0 vllm-omni==0.26.0
@@ -118,7 +118,7 @@ gated `nvidia/Cosmos-1.0-Guardrail` repo.
 
 ## Run
 
-Run from `examples/online_serving/cosmos3_fl2v/`. `--url` defaults to
+Run from `tools/cosmos3_fl2v/`. `--url` defaults to
 `http://localhost:8000`, and every input path below is also a default, so a bare
 `python fl2v_generate_vllm.py` runs the frame+frame demo (against a **Super**
 server). Client defaults: `--steps 16 --guidance 8 --flow-shift 15`. Send **one

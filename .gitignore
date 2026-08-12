@@ -243,7 +243,7 @@ datasets/
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !tests/assets/soulxsinger/*.json
-!examples/online_serving/cosmos3_fl2v/testdata/**/*.json
+!tools/cosmos3_fl2v/testdata/**/*.json
 *.jsonl
 *.parquet
 
