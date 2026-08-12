@@ -103,15 +103,9 @@ steps:
             "
         mirror_hardwares: l4_1
 
-      # No Gepard-1.0 step here yet, deliberately. The NanoCodec decoder needs
-      # nemo_toolkit[tts], which this image does not carry, so
-      # test_gepard_tts.py skips at import. A step scoped to that one file
-      # would then collect nothing, and pytest exits 5 on an empty collection
-      # -- a red merge gate rather than a quiet pass (measured on pytest
-      # 9.1.1, the version pinned in pyproject.toml). The nightly and weekly
-      # TTS sweeps collect many files at once, so the same skip is silent
-      # there. Add the step once the dependency is in the image; where it
-      # should be declared is an open question -- see the PR description.
+      # TO CONFIRM: should we add Gepard-1.0 to nightly/weekly step? If yes,
+      # will need nemo_toolkit[tts] to the image. Currently no Gepard-1.0 step
+      # here
 
       - label: "TTS · Higgs-Audio-V3 Test"
         source_file_dependencies:

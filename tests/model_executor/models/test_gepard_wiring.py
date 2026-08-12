@@ -105,15 +105,9 @@ class _MiniEngine:
     * a finished request is not scheduled again, so it is absent from
       ``req_ids_output_copy`` and from that step's routing;
     * with nothing left to schedule there is no step at all, so no further
-      ``forward`` runs.
-
-    It also reproduces the one asymmetry between the two ways a request ends.
-    Under async scheduling the next step is already scheduled before this
-    step's tokens are known, and vLLM's guard against running it covers only
-    the budget finish -- ``Scheduler.schedule``: "Avoid scheduling an extra
-    step when we are sure that the previous step has reached
-    request.max_tokens". A stop-token finish gets no such guard, so the model
-    runs one more time on a request that is already over.
+      ``forward`` runs;
+    * a stop-token finish gets one more scheduled step, a budget finish does
+      not -- under async scheduling only the latter is guarded against it.
     """
 
     def __init__(self, talker: GepardTalkerForConditionalGeneration, *, max_model_len: int) -> None:
@@ -138,9 +132,8 @@ class _MiniEngine:
     ) -> None:
         """Submit a request. An id already seen is a resubmit of that id.
 
-        Tags come from a counter rather than the position in ``order`` so a
-        resubmitted id gets frames the previous request could not have
-        produced, which is what makes its audio attributable.
+        Tags come from a counter, so a resubmitted id gets frames the previous
+        request could not have produced.
         """
         prompt_ids = build_gepard_prompt_ids(list(range(10, 10 + text_len)), config=self.talker.config)
         self._tags_handed_out += 1
@@ -307,12 +300,9 @@ def _install_scripted_sampling(talker: GepardTalkerForConditionalGeneration, eng
     """Replace the 32-head sampler with a scripted one.
 
     Frames carry a per-request, per-step tag so the caller's audio is
-    self-describing, and STOP fires once, on the request's configured frame.
-
-    Firing only once is the honest script for the extra step the engine runs
-    after a stop token. The stop head is a sigmoid over that step's hidden
-    state, and the request's own frame history did not advance, but its KV did
-    -- so re-firing is likely, not guaranteed, and the model may not assume it.
+    self-describing. STOP fires once, on the request's configured frame: on the
+    extra step the engine then runs, re-firing is likely but not guaranteed,
+    and the model may not assume it.
     """
     head0_vocab = talker.config.head0_vocab_size
 
@@ -531,10 +521,9 @@ def test_a_preempted_request_is_reported_rather_than_resumed(caplog: pytest.LogC
     are never in the token stream at all — there is nothing to stitch the two
     halves back together with, so generation restarts from frame 0.
 
-    The harness re-prefills with the bare prompt rather than prompt + sampled
-    head0 codes. That understates the damage and is deliberate: what is under
-    test is the report and the reset, not the corruption, which cannot be
-    asserted on without a real backbone.
+    The harness re-prefills with the bare prompt, which understates the damage.
+    What is under test is the report and the reset, not the corruption, which
+    needs a real backbone to observe.
     """
     _talker, _codec, engine = _build()
     engine.add_request("req-0", max_tokens=4000)
@@ -542,9 +531,8 @@ def test_a_preempted_request_is_reported_rather_than_resumed(caplog: pytest.LogC
         engine.step()
     assert engine.committed_frames["req-0"] > 0
 
-    # Preemption the way the scheduler does it (Scheduler._preempt_request:
-    # `request.num_computed_tokens = 0`), so the next step re-prefills. The
-    # request never finished, so no id reaches on_requests_finished.
+    # Preemption the way the scheduler does it: computed tokens back to 0, so
+    # the next step re-prefills, and no id reaches on_requests_finished.
     engine.reqs["req-0"]["computed"] = 0
 
     target = logging.getLogger(LOGGER_NAME)

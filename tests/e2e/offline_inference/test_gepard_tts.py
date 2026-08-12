@@ -28,20 +28,16 @@ from vllm_omni import Omni
 from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
 from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
 
-# The codec decoder is an optional dependency; skip rather than fail the
-# engine inside the worker process when it is absent. The CI image does not
-# carry it today, so this skip is why the nightly and weekly TTS sweeps
-# report nothing for this model, and why test-merge.yml has no per-file step
-# for it: pytest exits 5 when a file-scoped run collects nothing, which would
-# turn the merge gate red rather than pass it quietly. The install recipe is
-# in examples/offline_inference/text_to_speech/README.md.
+# The codec decoder is an optional dependency; skip rather than fail the engine
+# inside the worker process when it is absent. The CI image does not carry it
+# today, so nothing here runs in CI yet -- see test-merge.yml. Install recipe:
+# examples/offline_inference/text_to_speech/README.md.
 pytest.importorskip("nemo.collections.tts.models")
 
 MODEL_NAME = "nineninesix/gepard-1.0"
 STAGE_CONFIG = get_deploy_config_path("gepard.yaml")
 SAMPLE_RATE = 22050
-# NanoCodec upsamples one FSQ frame to exactly this many samples; the advertised
-# 21.5 fps is 22050 / 1024 rounded.
+# NanoCodec upsamples one FSQ frame to exactly this many samples.
 SAMPLES_PER_FRAME = 1024
 
 
@@ -57,18 +53,13 @@ def _config() -> GepardConfig:
     return GepardConfig.from_checkpoint(MODEL_NAME)
 
 
-# Prompt -> a word that appears in no other prompt. Concurrency is only
-# testable if a clip can be traced back to the request that asked for it.
+# Prompt -> a word that appears in no other prompt, so a clip can be traced
+# back to the request that asked for it.
 #
-# These are not interchangeable, and swapping one is not free. Batched decoding
-# perturbs every request's sampling trajectory — bf16 matmuls are not row-wise
-# reproducible, and a request's codes here diverge from its solo run by frame 8,
-# long before any neighbour finishes — and on some trajectories this
-# checkpoint's stop head never fires, so the request runs to the token budget.
-# "The weather is sunny today." sat in the first slot until it was measured at
-# 0/10 runaways alone and 8/10 in this batch. Its replacement was screened over
-# 10 batched runs with no runaway on any row. Re-screen the whole set, not just
-# the row being changed: one different prompt changes all four trajectories.
+# These are not interchangeable. Batching perturbs every request's sampling
+# trajectory, and on some trajectories this checkpoint's stop head never fires;
+# this set was screened over 10 batched runs with no runaway. Re-screen the
+# whole set when changing one, not just the row changed.
 _DISTINGUISHABLE_PROMPTS = {
     "He drinks coffee every morning.": "coffee",
     "Machine learning is interesting.": "learning",
@@ -76,9 +67,8 @@ _DISTINGUISHABLE_PROMPTS = {
     "My favorite color is purple.": "purple",
 }
 
-# Longer than text_repetition.apply_below tokens, so the layout is voiced once
-# instead of repeated. Every other prompt here is short enough to be repeated,
-# so without this row the repeats == 1 branch never runs outside the CPU tests.
+# Above text_repetition.apply_below, so the layout is voiced once instead of
+# repeated. Every other prompt here takes the repeated branch.
 _LONG_TEXT = (
     "The morning train was late again, so I walked the last two miles along the "
     "river and reached the office just before nine."
@@ -90,30 +80,20 @@ _OMNI_RUNNER_PARAM = (
     {"trust_remote_code": True},
 )
 
-# These tests only ask whether a common word is present, which needs far less
-# ASR than the shared helper's ``small`` default. A miss re-runs that one clip
-# through the stronger model -- the escalation the shared speech assertion uses
-# -- so a weak-ASR mishear still cannot flake the gate while the average clip
-# pays for the fast one. Whisper pads every clip to 30 s whatever its length, so
-# the model is the only knob that moves the cost here.
+# Only a common word is checked, which needs less ASR than the shared helper's
+# ``small`` default; a miss escalates to it.
 _ASR_MODEL = "base"
 _ASR_ESCALATION_MODEL = "small"
 
-# Transcription dominates this file's runtime on a single-GPU runner, where
-# Whisper falls back to CPU. Two of the four concurrent clips carry the content
-# check; the pairwise waveform comparison covers all four for the cheaper
-# failure -- one request's audio delivered for another.
+# Transcription dominates this file's runtime -- Whisper runs on CPU on a
+# single-GPU runner -- so only two of the four concurrent clips are read as
+# speech. The pairwise waveform comparison covers all four.
 _TRANSCRIBED_CLIPS = 2
 
-# No level marker at module scope: each test below carries the one that matches
-# how often its claim needs re-checking, so the tiers do not all pay for all of
-# it. L3 (advanced_model, every merge) gets the one canonical path; L4
-# (full_model, nightly) gets the layout variants; L5 (slow, weekly) gets the
-# concurrency batch, the most expensive test here and the one covering code that
-# changes least. There is deliberately no L2 (core_model) row: under
-# ``load_format: dummy`` the stop head is random, so every request runs to
-# gepard.yaml's ``max_tokens`` -- 1000 frames, ~46 s of audio per request
-# through NanoCodec with ``enforce_eager``, far past what the L2 budget is for.
+# No level marker at module scope: each test carries the one matching how often
+# its claim needs re-checking. There is deliberately no core_model row -- under
+# dummy weights the stop head is random, so every request would run to
+# gepard.yaml's max_tokens, far past what that tier is for.
 pytestmark = [
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
@@ -134,9 +114,7 @@ def _build_request(text: str) -> dict:
 
 
 def _extract_audio(mm) -> torch.Tensor | None:
-    # make_omni_output queues the waveform under "model_outputs"; the
-    # consolidation path renames it to "audio". Explicit None checks — a
-    # multi-element tensor has no truth value.
+    # The consolidation path renames "model_outputs" to "audio".
     audio = mm.get("audio")
     if audio is None:
         audio = mm.get("model_outputs")
@@ -147,31 +125,22 @@ def _extract_audio(mm) -> torch.Tensor | None:
 
 class _Clip(NamedTuple):
     wav: torch.Tensor
-    # Output tokens that are not the STOP sentinel. compute_logits emits exactly
-    # one token per sampled step — the committed frame's head0, which lives in
-    # [0, stop_token), or STOP — so this counts the frames the codec was handed
-    # using only what the engine returned, never the model's internals.
+    # Counts the frames the codec was handed using only what the engine
+    # returned, never the model's internals.
     committed_frames: int
 
 
 def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
-    """Submit every text in one call and return one clip per request, in
-    submission order — ``clips[i]`` is what the engine produced for ``texts[i]``.
+    """Submit every text in one call; return one clip per request, in
+    submission order.
 
-    The engine does not deliver them that way. ``Omni.generate`` yields each
-    request as it finishes and never sorts, unlike vLLM's ``LLM.generate``, so
-    they arrive in COMPLETION order. Restoring the pairing here is what lets a
-    caller assert that a clip says what *its own* prompt asked for; without it
-    the only testable claim is that the batch as a whole looks plausible, and a
-    stable swap between two requests satisfies that.
+    ``Omni.generate`` yields in completion order and never sorts, so the pairing
+    is restored from the request id prefix it assigns (``f"{i}_{uuid4()}"``).
+    Without that, the only testable claim is that the batch as a whole looks
+    plausible, which a stable swap between two requests satisfies.
 
-    The pairing comes from the request id, which ``Omni.generate`` builds as
-    ``f"{i}_{uuid4()}"`` over the submitted prompts (``entrypoints/omni.py``).
-
-    Nothing here authors a SamplingParams: ``OmniRunner.generate`` forwards the
-    engine's own stage defaults. A freshly built one would replace those
-    defaults rather than merge over them, dropping the pipeline's
-    stop_token_ids and leaving every request to run to ``max_tokens``.
+    Nothing here authors a SamplingParams: a fresh one would replace the stage
+    defaults rather than merge over them, dropping the pipeline's stop token.
     """
     outputs = omni.generate([_build_request(t) for t in texts])
     assert len(outputs) == len(texts), f"expected {len(texts)} outputs, got {len(outputs)}"
@@ -185,12 +154,10 @@ def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
         waveform = None
         frames = 0
         for out in req_output.outputs:
-            # Explicit None check: token_ids is not necessarily a plain list,
-            # and `x or []` would ask an array for a truth value.
+            # Explicit None check: `x or []` would ask an array for a truth value.
             token_ids = out.token_ids if out.token_ids is not None else []
-            # The sentinel compute_logits emits instead of a head0 to end a
-            # request. It sits just past head0's range, so a token equal to it
-            # is never a committed frame.
+            # STOP sits just past head0's range, so a token equal to it is
+            # never a committed frame.
             frames += sum(1 for t in token_ids if int(t) != _config().stop_token)
             mm = out.multimodal_output
             if mm is None:
@@ -222,18 +189,15 @@ def _assert_clip_is_sane(clip: _Clip) -> None:
     assert wav.numel() > 0, "empty waveform"
     assert torch.isfinite(wav).all(), "non-finite samples"
 
-    # Frame conservation, reconciled against the engine's own token count rather
-    # than merely checked for divisibility. This is the assertion that catches a
-    # payload carrying non-audio data (per-step hidden states folded in under the
-    # same output key) or a dropped tail: both leave the sample count and the
-    # frame count disagreeing, and both pass every other check here.
+    # Frame conservation against the engine's own token count, not just
+    # divisibility. This is what catches a payload carrying non-audio data or a
+    # dropped tail; both pass every other check here.
     assert wav.numel() == clip.committed_frames * SAMPLES_PER_FRAME, (
         f"{wav.numel()} samples for {clip.committed_frames} committed frames — "
         f"expected exactly {clip.committed_frames * SAMPLES_PER_FRAME}"
     )
 
-    # Decoded speech sits inside the waveform range; anything far outside it is
-    # not codec output.
+    # Anything far outside the waveform range is not codec output.
     assert float(wav.abs().max()) <= 1.5, f"peak {float(wav.abs().max()):.2f} is out of range"
 
 
@@ -272,18 +236,16 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
 @pytest.mark.parametrize(
     ("text", "keyword"),
     [
-        # The canonical path, and the only row on the merge gate: one request,
-        # one transcript, the cheapest check that reads the audio as speech.
+        # The canonical path: one request, one transcript, the cheapest check
+        # that reads the audio as speech.
         pytest.param(
             "Hello, this is Gepard speaking.",
             "hello",
             marks=pytest.mark.advanced_model,
             id="canonical",
         ),
-        # No keyword: this row asserts the same thing about the audio as the one
-        # above it, so it carries the structural and stopping checks over a
-        # second text and leaves the transcript to the row that already makes
-        # that claim. A second text is worth a nightly run, not a merge one.
+        # No keyword: this row carries the structural and stopping checks over a
+        # second text and leaves the transcript to the row above.
         pytest.param(
             "The quick brown fox jumps over the lazy dog.",
             None,
@@ -348,11 +310,7 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
     The prompts are deliberately unlike each other: cross-talk between the
     per-request frame history, the codec window or the output routing shows up
     as a transcript matching the wrong prompt, which similar prompts would
-    hide. Reading that requires knowing which prompt each clip belongs to, so
-    ``_synthesize_all`` restores submission order from the request ids first.
-    ``max_num_seqs`` is 4 in the deploy config, so these run together rather
-    than back to back. All four are submitted for that reason even though only
-    ``_TRANSCRIBED_CLIPS`` of them are read back as speech.
+    hide. ``max_num_seqs`` is 4, so these really do run together.
     """
     texts = list(_DISTINGUISHABLE_PROMPTS)
     clips = _synthesize_all(omni_runner, texts)
@@ -366,25 +324,22 @@ def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level
     for clip in clips:
         _assert_stopped_on_its_own(clip)
 
-    # Covers all four clips, not just the transcribed ones: delivering one
-    # request's audio for another leaves two byte-identical waveforms, and this
-    # costs nothing next to an ASR pass.
+    # All four clips, not just the transcribed ones: delivering one request's
+    # audio for another leaves two byte-identical waveforms.
     for i in range(len(clips)):
         for j in range(i + 1, len(clips)):
             assert not torch.equal(clips[i].wav, clips[j].wav), (
                 f"clips {i} and {j} are the same waveform — one request's audio was delivered for another"
             )
 
-    # Each clip must say what ITS OWN prompt asked for. Asserting only that
-    # every clip says one of the four would pass a stable permutation, which is
-    # exactly what a per-request state or routing mix-up produces.
+    # Each clip must say what its own prompt asked for: accepting any of the
+    # four would pass a stable permutation, which is what a mix-up produces.
     keywords = set(_DISTINGUISHABLE_PROMPTS.values())
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, clip in enumerate(clips[:_TRANSCRIBED_CLIPS]):
             expected = _DISTINGUISHABLE_PROMPTS[texts[i]]
-            # Escalate on the expected word being absent, not on "no keyword at
-            # all": a clip carrying a neighbour's word is precisely the failure
-            # under test, and must not be waved through by the fast ASR.
+            # Escalate on the expected word being absent, not on "no keyword
+            # at all" -- a neighbour's word is the failure under test.
             transcript = _transcribe_for(clip.wav, tmp_dir, f"concurrent_{i}", lambda t: expected in t)
             present = sorted(k for k in keywords if k in transcript)
             assert present == [expected], (

@@ -4,14 +4,11 @@
 
 Single-stage native-AR pipeline: a Qwen3.5 backbone samples one 32-code FSQ
 frame per step; the NeMo NanoCodec decodes the frames to a 22.05 kHz mono
-waveform. PR1 is zero-shot (default learned voice) — no reference audio.
+waveform. Zero-shot: the default learned voice, no reference audio.
 
-Generation length and seed are stage settings, not flags here: one output
-token is one audio frame, so ``max_tokens`` in the deploy YAML is the frame
-budget, and ``seed`` there makes the in-model 32-head sampling reproducible.
-Pass a copy of the YAML via ``--deploy-config`` to change either — a
-SamplingParams object handed to ``generate()`` would replace the stage
-defaults wholesale rather than merge, dropping the pipeline's stop token.
+Generation length and seed are stage settings rather than flags here. One
+output token is one audio frame, so ``max_tokens`` in the deploy YAML is the
+frame budget; pass a copy of the YAML via ``--deploy-config`` to change it.
 
 Usage:
   python end2end.py --text "Hello, this is Gepard speaking."
@@ -42,20 +39,17 @@ DEFAULT_DEPLOY_CONFIG = str(Path(vllm_omni.__file__).resolve().parent / "deploy"
 def build_request(text: str) -> dict:
     """Build an Omni request payload for Gepard (zero-shot, no ref audio).
 
-    ``preprocess`` only consumes the [speaker slots, SOT, text, EOT, SOS]
-    layout; nothing on the offline path builds it, so a bare text prompt would
-    have no speaker slots and no SOS.
+    The model only consumes the [speaker slots, SOT, text, EOT, SOS] layout, so
+    a bare text prompt would have no speaker slots and no SOS.
     """
     from transformers import AutoTokenizer
 
     from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
     from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
 
-    # From the checkpoint's own gepard_config.json, which is what the worker
-    # builds its config from too. The class defaults match today's checkpoint,
-    # but reading them here would make this the second source of truth for the
-    # layout — and a layout that disagrees with the one the model was trained
-    # on does not fail, it just degrades the speech.
+    # From the checkpoint's own sidecar, which is what the worker builds its
+    # config from too. A layout that disagrees with the trained one does not
+    # fail, it just degrades the speech.
     cfg = GepardConfig.from_checkpoint(MODEL)
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     prompt_token_ids = build_gepard_prompt_ids(
@@ -85,9 +79,8 @@ def main(args) -> None:
         init_timeout=args.init_timeout,
     )
 
-    # No explicit SamplingParams: a caller-supplied object replaces the stage
-    # defaults rather than merging over them, which would drop the pipeline's
-    # stop_token_ids and leave the request running to max_tokens.
+    # No explicit SamplingParams: one supplied here would replace the stage
+    # defaults rather than merge over them, dropping the pipeline's stop token.
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -103,9 +96,7 @@ def main(args) -> None:
                 if mm is None:
                     print(f"  [req {i}] No audio output.")
                     continue
-                # The consolidation path renames "model_outputs" to "audio";
-                # accept either. Explicit None checks — a multi-element tensor
-                # has no truth value.
+                # The consolidation path renames "model_outputs" to "audio".
                 audio = mm.get("audio")
                 if audio is None:
                     audio = mm.get("model_outputs")
@@ -137,13 +128,11 @@ def parse_args():
         default=DEFAULT_DEPLOY_CONFIG,
         help=(
             "Path to the deploy YAML (default: the packaged vllm_omni/deploy/gepard.yaml). This must "
-            "stay set — the checkpoint self-identifies as qwen3_5_text, so without the YAML's "
-            "`pipeline: gepard` pin the architectures fallback routes Qwen3_5ForCausalLM to the "
-            "diffusion registry. Copy it to change max_tokens (the frame budget) or seed."
+            "stay set: without the YAML's `pipeline: gepard` pin the architectures fallback routes "
+            "Qwen3_5ForCausalLM to the diffusion registry. Copy it to change max_tokens or seed."
         ),
     )
-    # The upstream defaults are too tight for a cold start (backbone + codec
-    # load, then profile/KV-cache/warmup).
+    # The upstream defaults are too tight for a cold start.
     parser.add_argument("--stage-init-timeout", type=int, default=900)
     parser.add_argument("--init-timeout", type=int, default=1800)
     return parser.parse_args()

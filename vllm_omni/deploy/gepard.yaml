@@ -1,19 +1,10 @@
-# Gepard-1.0 deploy: single-stage native-AR FSQ/NanoCodec TTS (~0.5B).
-# Fits a small card — verified target 1x L4 24GB (AR LM + codec are light).
+# Gepard-1.0: single-stage native-AR FSQ/NanoCodec TTS (~0.5B).
+# Target 1x L4 24GB. Zero-shot only; enforce_eager until the perf PR.
 #
-# PR1 choices:
-#   * enforce_eager=true — CUDA-graph capture is deferred to the perf PR; the
-#     per-request state is a plain request_id-keyed dict (no slot manager).
-#   * null_prefix-only zero-shot (no ref-audio cloning); cloning is a follow-up
-#     PR, so no ref-audio ingestion here.
-#   * trust_remote_code=true — the checkpoint config is model_type
-#     "qwen3_5_text".
-# Explicit pipeline pin: the checkpoint's config.json self-identifies as
-# qwen3_5_text, so model_type inference can never reach the gepard registry
-# entry — and the architectures fallback matches Qwen3_5ForCausalLM against
-# the wrong (diffusion) pipeline. The top-level `pipeline:` key is the
-# highest-priority resolution path (see StageConfigFactory.get_pipeline_config)
-# and makes the routing deterministic.
+# The pipeline pin is required, not cosmetic: the checkpoint's config.json
+# self-identifies as qwen3_5_text, so model_type inference cannot reach the
+# gepard registry entry, and the architectures fallback would match
+# Qwen3_5ForCausalLM against the diffusion pipeline.
 pipeline: gepard
 async_chunk: false
 dtype: bfloat16
@@ -29,29 +20,21 @@ stages:
     max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"
-    # Routing: the checkpoint's config.json self-identifies
-    # as qwen3_5_text / Qwen3_5ForCausalLM; override architectures so vLLM
-    # resolves our talker instead of the native Qwen3.5 text model.
-    # Do NOT override model_type: the hf_config must stay qwen3_5_text for
-    # the Qwen3_5DecoderLayer model_type check inside the backbone
-    # (ValueError: Invalid model_type gepard). Same idiom as step_audio_2.yaml.
+    # Override architectures so vLLM resolves our talker rather than the native
+    # Qwen3.5 text model. Do NOT override model_type: the backbone's own
+    # model_type check needs it to stay qwen3_5_text.
     hf_overrides:
       architectures: ["GepardTalkerForConditionalGeneration"]
     default_sampling_params:
-      # head0 is sampled by vLLM over our one-hot logits; the real head0 +
-      # 31-head sampling is done in-model (Gumbel-max). Keep vLLM's sampler
-      # deterministic (temperature 0) so it just argmaxes what forward chose.
+      # All 32 heads are sampled in-model, so vLLM's sampler is pinned
+      # deterministic and just argmaxes what forward chose.
       temperature: 0.0
       top_p: 1.0
       top_k: -1
       # One output token is one frame, so this is the frame budget: 1000 frames
-      # is ~46 s at 21.5 fps, matching the reference server's TTS_MAX_TOKENS.
-      # It is a backstop, not a target -- a normal utterance here is 40-420
-      # frames. It matters because the checkpoint's stop head is not always
-      # reliable: batched decoding perturbs the sampling trajectory (bf16
-      # matmuls are not row-wise reproducible), and on some trajectories the
-      # head never fires, leaving the budget as the only thing that ends the
-      # request.
+      # is ~46 s at 21.5 fps. A backstop, not a target -- normal utterances are
+      # 40-420 frames -- but a load-bearing one, because this checkpoint's stop
+      # head does not fire on every batched trajectory.
       max_tokens: 1000
       seed: 42
       detokenize: false
