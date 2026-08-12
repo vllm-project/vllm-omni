@@ -4,6 +4,7 @@ kind: module
 status: draft
 owners:
   - "@alex-jw-brooks"
+  - "@Bounty-hunter"
 primary_code_paths:
   - vllm_omni/benchmarks/**
   - vllm_omni/entrypoints/cli/benchmark/**

@@ -16,17 +16,28 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.model_loader.hub_prefetch import _repo_prefetch_lock
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .configuration_indextts2 import IndexTTS2Config
-from .preprocess_utils import load_semantic_codec, resolve_model_file
+from .configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+    IndexTTS2Config,
+)
+from .preprocess_utils import (
+    load_semantic_codec,
+    resolve_model_directory,
+    resolve_model_file,
+)
 from .s2mel.modules.commons import AttrDict, MyModel
+from .s2mel.modules.flow_matching import build_cfm_unpad_data
 
 logger = init_logger(__name__)
 
@@ -36,6 +47,40 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _bigvgan_models: dict[tuple[str, str], nn.Module] = {}
+
+
+def _raise_if_cuda_runtime_error(error: BaseException) -> None:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        raise error
+    if not isinstance(error, RuntimeError):
+        return
+    message = str(error).lower()
+    cuda_markers = (
+        "cuda error",
+        "device-side assert",
+        "illegal memory access",
+        "out of memory",
+        "cublas",
+        "cudnn",
+        "cufft",
+    )
+    if any(marker in message for marker in cuda_markers):
+        raise error
+
+
+def _resolve_bigvgan_source(model_path: str, vocoder_name: str) -> str:
+    if os.path.isdir(vocoder_name):
+        return vocoder_name
+    local_dir = resolve_model_directory(
+        model_path,
+        "bigvgan",
+        os.path.join("hf_cache", "bigvgan"),
+    )
+    if local_dir is not None:
+        return local_dir
+    if os.path.isdir(model_path):
+        raise FileNotFoundError(f"IndexTTS BigVGAN assets are missing from local bundle {model_path!r}")
+    return vocoder_name
 
 
 def _patch_bigvgan_compat(cls):
@@ -78,6 +123,25 @@ def _strip_weight_norm(root: nn.Module) -> list[str]:
     return folded
 
 
+def _precast_cfm_estimator_bf16(
+    estimator: nn.Module,
+    *,
+    enabled: bool,
+) -> int:
+    """Pre-cast CFM GEMM/conv parameters while keeping other layers in fp32."""
+    if not enabled:
+        return 0
+
+    parameter_count = 0
+    for module in estimator.modules():
+        if not isinstance(module, (nn.Linear, nn.Conv1d)):
+            continue
+        for parameter in module.parameters(recurse=False):
+            parameter.data = parameter.data.to(dtype=torch.bfloat16)
+            parameter_count += parameter.numel()
+    return parameter_count
+
+
 def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = torch.float32):
     cache_key = (vocoder_name, str(device), str(dtype))
     if cache_key in _bigvgan_models:
@@ -87,23 +151,25 @@ def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = 
     if lock is not None:
         lock.__enter__()
     try:
-        try:
-            from .s2mel.modules import bigvgan as bigvgan_mod
+        with set_default_torch_dtype(torch.float32):
+            try:
+                from .s2mel.modules import bigvgan as bigvgan_mod
 
-            _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
-            bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)
-        except (ImportError, ModuleNotFoundError):
-            import bigvgan
+                _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
+                bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)
+            except (ImportError, ModuleNotFoundError):
+                import bigvgan
 
-            _patch_bigvgan_compat(bigvgan.BigVGAN)
-            bigvgan_model = bigvgan.BigVGAN.from_pretrained(vocoder_name)
+                _patch_bigvgan_compat(bigvgan.BigVGAN)
+                bigvgan_model = bigvgan.BigVGAN.from_pretrained(vocoder_name)
+            # Fold weight norm while its normalization is still computed in
+            # fp32. The vLLM model loader may otherwise leave the process-wide
+            # default dtype set to the stage's low-precision model dtype here.
+            bigvgan_model.remove_weight_norm()
     finally:
         if lock is not None:
             lock.__exit__(None, None, None)
-    # One-time weight cast (vs per-call autocast, which re-casts every conv's
-    # fp32 weights on each forward and is slower than fp32 on BigVGAN).
     bigvgan_model = bigvgan_model.to(device=device, dtype=dtype).eval()
-    bigvgan_model.remove_weight_norm()
     for p in bigvgan_model.parameters():
         p.requires_grad_(False)
     _bigvgan_models[cache_key] = bigvgan_model
@@ -131,6 +197,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
         self.config: IndexTTS2Config = vllm_config.model_config.hf_config  # type: ignore[assignment]
+        self._resolved_vocoder_source: str | None = None
+        self.use_gpt_latent = bool(getattr(self.config, "use_gpt_latent", True))
+        self.semantic_codec_type = str(getattr(self.config, "semantic_codec_type", "repcodec"))
 
         # --- Flags for vLLM-Omni framework ---
         self.have_multimodal_outputs = True
@@ -147,12 +216,19 @@ class IndexTTS2S2MelDecoder(nn.Module):
             if key in s2mel_args and isinstance(s2mel_args[key], dict):
                 s2mel_args[key] = AttrDict(s2mel_args[key])
 
-        self.s2mel = MyModel(s2mel_args, use_emovec=False, use_gpt_latent=True)
+        self.s2mel = MyModel(
+            s2mel_args,
+            use_emovec=False,
+            use_gpt_latent=self.use_gpt_latent,
+        )
 
         # Diffusion config — configurable via deploy YAML hf_overrides
         self.diffusion_steps: int = getattr(self.config, "diffusion_steps", 25)
         self.inference_cfg_rate: float = getattr(self.config, "inference_cfg_rate", 0.7)
         self.mel_code_to_frame_ratio: float = 1.72
+        self.s2mel_cfm_batch_size: int = int(getattr(self.config, "s2mel_cfm_batch_size", 1))
+        if self.s2mel_cfm_batch_size < 1:
+            raise ValueError("s2mel_cfm_batch_size must be at least 1")
 
         # Run the DiT estimator under bf16 autocast (flash attention + faster
         # GEMMs); the CFM Euler solver stays float32. Disable via deploy YAML
@@ -164,22 +240,47 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # Capture BigVGAN into bucketed CUDA graphs (collapses the Snake/conv
         # small-op launch storm). Enable via `s2mel_vocoder_cuda_graph: true`.
         self.s2mel_vocoder_cuda_graph: bool = getattr(self.config, "s2mel_vocoder_cuda_graph", False)
+        self.s2mel_vocoder_torch_compile: bool = getattr(
+            self.config,
+            "s2mel_vocoder_torch_compile",
+            False,
+        )
         self._vocoder_graph: Any = None
+        self._compiled_vocoder: Any = None
         # Capture the DiT transformer core into per-shape CUDA graphs.
         # Enable via `s2mel_dit_cuda_graph: true`.
         self.s2mel_dit_cuda_graph: bool = getattr(self.config, "s2mel_dit_cuda_graph", False)
+        self.s2mel_dit_torch_compile: bool = getattr(
+            self.config,
+            "s2mel_dit_torch_compile",
+            False,
+        )
+        self.s2mel_dit_torch_compile_mode: str = str(
+            getattr(
+                self.config,
+                "s2mel_dit_torch_compile_mode",
+                "default",
+            )
+        )
+        self._dit_runtime_configured = False
         self.s2mel_dit_cuda_graph_max_graphs: int = int(getattr(self.config, "s2mel_dit_cuda_graph_max_graphs", 8))
         self.s2mel_vocoder_capture_sizes: list[int] | None = getattr(self.config, "s2mel_vocoder_capture_sizes", None)
         self.s2mel_vocoder_compile_shapes: list[int] | None = getattr(self.config, "s2mel_vocoder_compile_shapes", None)
         logger.info(
             "[S2Mel] dit_bf16=%s, vocoder_bf16=%s, "
-            "vocoder_cuda_graph=%s, dit_cuda_graph=%s, dit_graph_lru=%d, vocoder_buckets=%s, "
+            "vocoder_cuda_graph=%s, vocoder_torch_compile=%s, "
+            "dit_cuda_graph=%s, dit_torch_compile=%s, dit_compile_mode=%s, "
+            "dit_graph_lru=%d, cfm_batch_size=%d, vocoder_buckets=%s, "
             "vocoder_compile_shapes=%s",
             self.s2mel_dit_bf16,
             self.s2mel_vocoder_bf16,
             self.s2mel_vocoder_cuda_graph,
+            self.s2mel_vocoder_torch_compile,
             self.s2mel_dit_cuda_graph,
+            self.s2mel_dit_torch_compile,
+            self.s2mel_dit_torch_compile_mode,
             self.s2mel_dit_cuda_graph_max_graphs,
+            self.s2mel_cfm_batch_size,
             self.s2mel_vocoder_capture_sizes,
             self.s2mel_vocoder_compile_shapes,
         )
@@ -214,9 +315,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if model_intermediate_buffer:
             request_infos = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         additional_information: dict[str, Any] = request_infos[0] if request_infos else {}
+        self._validate_payload_policy(request_infos)
+        self._validate_payload_contract(request_infos)
 
         device = input_ids.device
-        model_dtype = self.s2mel.models["gpt_layer"][0].weight.dtype
+        model_dtype = self._s2mel_model_dtype()
 
         logger.debug(
             "[S2Mel forward] model_intermediate_buffer len=%d, keys=%s",
@@ -231,7 +334,16 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # one S2Mel batch. The runner can split list-valued multimodal outputs
         # back to per-request payloads, so never silently drop batched items.
         if len(request_infos) > 1:
-            mel_codes, latent, code_lens, code_lens_list, s_ref, ref_mel, style = self._build_batched_inputs(
+            (
+                mel_codes,
+                latent,
+                code_lens,
+                code_lens_list,
+                s_ref,
+                ref_mel,
+                style,
+                ref_lengths_list,
+            ) = self._build_batched_inputs(
                 request_infos,
                 device=device,
                 model_dtype=model_dtype,
@@ -239,19 +351,25 @@ class IndexTTS2S2MelDecoder(nn.Module):
             code_lens_raw = code_lens
         else:
             # Extract Stage 0 outputs and cast to model dtype
-            latent = self._get_tensor(additional_information, "latent", device, model_dtype)
+            latent = (
+                self._get_tensor(additional_information, "latent", device, model_dtype) if self.use_gpt_latent else None
+            )
             mel_codes = self._get_tensor(additional_information, "mel_codes", device)
             code_lens_raw = additional_information.get("code_lens")
             s_ref = self._get_tensor(additional_information, "S_ref", device)
             ref_mel = self._get_tensor(additional_information, "ref_mel", device, model_dtype)
             style = self._get_tensor(additional_information, "style", device, model_dtype)
+            ref_lengths_list = self._ref_mel_lengths([ref_mel])
 
-        if mel_codes is None or latent is None:
-            logger.warning("S2Mel decoder received empty mel_codes or latent")
-            return OmniOutput(
-                text_hidden_states=torch.zeros(1, device=device),
-                multimodal_outputs={"audio": torch.zeros(1, device=device), "sr": 22050},
-            )
+        if mel_codes is None or (self.use_gpt_latent and latent is None):
+            if not request_infos:
+                # vLLM profiles generation stages once with synthetic token
+                # inputs and no upstream payload during engine initialization.
+                return OmniOutput(
+                    text_hidden_states=torch.zeros(1, device=device),
+                    multimodal_outputs={"audio": torch.zeros(1, device=device), "sr": 22050},
+                )
+            raise ValueError("S2Mel decoder requires mel_codes" + (" and latent" if self.use_gpt_latent else ""))
 
         logger.debug(
             "[S2Mel] extracted tensors — mel_codes=%s latent=%s code_lens=%s s_ref=%s ref_mel=%s style=%s",
@@ -266,7 +384,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # Ensure batch dimension
         if mel_codes.ndim == 1:
             mel_codes = mel_codes.unsqueeze(0)
-        if latent.ndim == 2:
+        if latent is not None and latent.ndim == 2:
             latent = latent.unsqueeze(0)
 
         # Compute code_lens
@@ -289,28 +407,34 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 else:
                     code_lens_list.append(mel_codes.shape[1])
             code_lens = torch.tensor(code_lens_list, device=device, dtype=torch.long)
+        duration_factors = self._duration_factors(request_infos, len(code_lens_list))
 
         # Trim to actual length
         max_len = max(code_lens_list)
         mel_codes = mel_codes[:, :max_len]
-        latent = latent[:, :max_len, :]
+        if latent is not None:
+            latent = latent[:, :max_len, :]
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[S2Mel] after trim — mel_codes=%s latent=%s code_lens=%s max_len=%d",
                 mel_codes.shape,
-                latent.shape,
+                latent.shape if latent is not None else None,
                 code_lens.tolist(),
                 max_len,
             )
 
         # --- S2Mel pipeline ---
-        # 1. Project GPT latent: 1280 → 1024
-        latent = latent.to(device=device, dtype=model_dtype)
-        latent = self.s2mel.forward_gpt(latent).to(dtype=model_dtype)  # [B, T, 1024]
-        logger.debug("[S2Mel] step1 forward_gpt → latent=%s dtype=%s", latent.shape, latent.dtype)
-
-        # 2. Embed mel codes via semantic codec vq2emb
-        semantic_codec = load_semantic_codec(self.model_path, self.config.semantic_codec, device)
+        semantic_codec = load_semantic_codec(
+            self.model_path,
+            self.config.semantic_codec,
+            device,
+            codec_type=self.semantic_codec_type,
+            checkpoint_name=getattr(
+                self.config,
+                "semantic_codec_checkpoint",
+                None,
+            ),
+        )
         codebook_size = self.config.semantic_codec.get("codebook_size", 8192)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -323,14 +447,30 @@ class IndexTTS2S2MelDecoder(nn.Module):
             (mel_codes < 0) | (mel_codes >= codebook_size)
         ):
             raise ValueError(f"IndexTTS2 generated mel code outside semantic codebook range [0, {codebook_size - 1}]")
-        with torch.no_grad():
-            S_infer = semantic_codec.quantizer.vq2emb(mel_codes.unsqueeze(1))  # [B, T, 1024]
-        S_infer = S_infer.transpose(1, 2).to(dtype=model_dtype)  # [B, T, 1024]
-        S_infer = S_infer + latent
-        logger.debug("[S2Mel] step2 vq2emb → S_infer=%s dtype=%s", S_infer.shape, S_infer.dtype)
+        S_infer = self._build_semantic_embedding(
+            codec=semantic_codec,
+            mel_codes=mel_codes,
+            latent=latent,
+            dtype=model_dtype,
+        )
+        logger.debug(
+            "[S2Mel] semantic decode → S_infer=%s dtype=%s codec=%s latent=%s",
+            S_infer.shape,
+            S_infer.dtype,
+            self.semantic_codec_type,
+            self.use_gpt_latent,
+        )
 
         # 3. Length regulate: codes → mel frames
-        target_lengths_list = [int(length * self.mel_code_to_frame_ratio) for length in code_lens_list]
+        semantic_time_scale = (
+            int(getattr(semantic_codec, "downsample_scale", 1) or 1) if self.semantic_codec_type == "enhanced" else 1
+        )
+        target_lengths_list = self._target_lengths(
+            code_lens_list,
+            semantic_time_scale=semantic_time_scale,
+            mel_code_to_frame_ratio=self.mel_code_to_frame_ratio,
+            duration_factors=duration_factors,
+        )
         target_lengths = torch.tensor(target_lengths_list, device=device, dtype=torch.long)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[S2Mel] step3 length_regulator target_lengths=%s", target_lengths_list)
@@ -364,11 +504,25 @@ class IndexTTS2S2MelDecoder(nn.Module):
                         codebook_size,
                     )
                 s_ref_codes = s_ref_codes.clamp(0, codebook_size - 1)
+                if self.semantic_codec_type != "repcodec":
+                    raise ValueError("IndexTTS 2.5 expects W2V-BERT reference embeddings, not semantic-code indices")
                 with torch.no_grad():
-                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(1))  # [B, 1024, T]
-                s_ref_emb = s_ref_emb.transpose(1, 2).to(dtype=model_dtype)  # [B, T, 1024]
+                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(1))
+                s_ref_emb = s_ref_emb.transpose(1, 2).to(dtype=model_dtype)
 
-            ref_target_lengths = self._infer_ref_lengths(ref_mel)
+            ref_batch_size = int(ref_mel.shape[0])
+            if len(ref_lengths_list) == 1 and ref_batch_size > 1:
+                ref_lengths_list = ref_lengths_list * ref_batch_size
+            if len(ref_lengths_list) != ref_batch_size:
+                raise ValueError(
+                    "IndexTTS reference-mel length/batch mismatch: "
+                    f"lengths={len(ref_lengths_list)} batch={ref_batch_size}"
+                )
+            ref_target_lengths = torch.tensor(
+                ref_lengths_list,
+                device=device,
+                dtype=torch.long,
+            )
             prompt_condition = self.s2mel.models["length_regulator"](
                 s_ref_emb, ylens=ref_target_lengths, n_quantizers=3, f0=None
             )[0]
@@ -380,12 +534,10 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 cat_condition.shape,
             )
         else:
-            prompt_condition = None
-            cat_condition = cond
-            ref_mel = torch.zeros(cond.shape[0], 80, 0, device=device, dtype=model_dtype)
+            raise RuntimeError("IndexTTS Stage 1 payload validation allowed missing S_ref or ref_mel")
 
         if style is None:
-            style = torch.zeros(cat_condition.shape[0], 192, device=device, dtype=model_dtype)
+            raise RuntimeError("IndexTTS Stage 1 payload validation allowed missing style")
         if style.ndim == 1:
             style = style.unsqueeze(0)
 
@@ -401,6 +553,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # 5. Flow matching inference (Euler ODE steps, CFG rate configurable)
         # CFM ODE solver runs in float32 — fp16 Euler steps diverge to noise.
         # The DiT estimator itself may run under bf16 autocast (see below).
+        self._configure_dit_runtime(device)
         cfm = self.s2mel.models["cfm"]
         cfm.estimator_autocast_dtype = torch.bfloat16 if self.s2mel_dit_bf16 else None
         cond = cond.float()
@@ -410,126 +563,51 @@ class IndexTTS2S2MelDecoder(nn.Module):
         ref_mel = ref_mel.float()
         style = style.float()
 
+        cfm_batch_size = int(cat_condition.shape[0])
         if prompt_condition is None:
-            ref_lengths = torch.zeros(cat_condition.shape[0], device=device, dtype=torch.long)
-        else:
-            ref_lengths = self._infer_ref_lengths(ref_mel)
-        ref_lengths_list = [int(length) for length in ref_lengths.tolist()]
-        if len(ref_lengths_list) == 1 and cat_condition.shape[0] > 1:
-            ref_lengths_list = ref_lengths_list * int(cat_condition.shape[0])
-            ref_lengths = ref_lengths.expand(int(cat_condition.shape[0]))
-        max_ref_len = int(ref_mel.size(-1))
-        ref_len = ref_lengths_list[0] if ref_lengths_list else max_ref_len
-        x_lens = target_lengths + ref_lengths
+            ref_lengths_list = [0] * cfm_batch_size
+        elif len(ref_lengths_list) != cfm_batch_size:
+            raise ValueError(
+                f"IndexTTS CFM reference-length/batch mismatch: lengths={len(ref_lengths_list)} batch={cfm_batch_size}"
+            )
 
         estimator = cfm.estimator
-        required_cache_batch = max(2, int(cat_condition.shape[0]) * (2 if self.inference_cfg_rate > 0 else 1))
+        max_cfm_group_size = min(cfm_batch_size, self.s2mel_cfm_batch_size)
+        required_cache_batch = max(2, max_cfm_group_size * (2 if self.inference_cfg_rate > 0 else 1))
         if (
             estimator.transformer.freqs_cis is None
             or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
         ):
             estimator.setup_caches(max_batch_size=required_cache_batch, max_seq_length=16384)
             logger.info("[S2Mel] DiT caches initialized (freqs_cis + causal_mask)")
-
-        cat_len = int(cat_condition.size(1))
-        x_lens_list = [target_len + ref_len_i for target_len, ref_len_i in zip(target_lengths_list, ref_lengths_list)]
-        same_ref_len = len(set(ref_lengths_list)) <= 1
-        same_target_len = len(set(target_lengths_list)) <= 1
-        dit_graph_full_mask = same_ref_len and same_target_len and all(length == cat_len for length in x_lens_list)
-        if dit_graph_full_mask:
-            self._enable_dit_cuda_graph(estimator)
-            with torch.no_grad():
-                mel = cfm.inference(
-                    cat_condition,
-                    x_lens,
-                    ref_mel,
-                    style,
-                    None,  # f0
-                    self.diffusion_steps,
-                    inference_cfg_rate=self.inference_cfg_rate,
-                )
-            # Strip reference portion
-            mel = mel[:, :, ref_len:]
-        else:
-            # Batched Stage-1 requests are padded to a shared length. The DiT
-            # CUDA graph fast path assumes a full mask, so rebuild each request
-            # with its exact reference/target lengths before enabling the graph.
-            mels_list: list[torch.Tensor] = []
-            for i in range(cat_condition.shape[0]):
-                self._enable_dit_cuda_graph(estimator)
-                ref_len_i = ref_lengths_list[i]
-                target_len_i = target_lengths_list[i]
-                if prompt_condition is not None:
-                    prompt_i = prompt_condition[i : i + 1, :ref_len_i]
-                    target_i = cond[i : i + 1, :target_len_i]
-                    cond_i = torch.cat([prompt_i, target_i], dim=1)
-                else:
-                    cond_i = cat_condition[i : i + 1, :target_len_i]
-                x_lens_i = torch.tensor([ref_len_i + target_len_i], device=device, dtype=torch.long)
-                ref_mel_i = ref_mel[i : i + 1, :, :ref_len_i] if ref_mel.ndim == 3 else ref_mel[:, :ref_len_i]
-                style_i = style[i : i + 1] if style.ndim == 2 else style
-                with torch.no_grad():
-                    mel_i = cfm.inference(
-                        cond_i,
-                        x_lens_i,
-                        ref_mel_i,
-                        style_i,
-                        None,
-                        self.diffusion_steps,
-                        inference_cfg_rate=self.inference_cfg_rate,
-                    )
-                mels_list.append(mel_i[0, :, ref_len_i:])
-            mel = mels_list
-        dit_graph_info = getattr(getattr(estimator, "_cuda_graph_runner", None), "last_call_info", None)
-        mel_shape = [tuple(m.shape) for m in mel] if isinstance(mel, list) else tuple(mel.shape)
-        logger.debug("[S2Mel] step5 CFM done → mel=%s (stripped ref %d frames)", mel_shape, ref_len)
+        cfm_seeds = self._cfm_request_seeds(
+            request_infos,
+            batch_size=int(cat_condition.shape[0]),
+        )
+        mel = self._run_cfm_groups(
+            cfm=cfm,
+            cond=cond,
+            prompt_condition=prompt_condition,
+            ref_mel=ref_mel,
+            style=style,
+            target_lengths=target_lengths_list,
+            ref_lengths=ref_lengths_list,
+            seeds=cfm_seeds,
+            max_group_size=self.s2mel_cfm_batch_size,
+        )
+        logger.debug("[S2Mel] step5 CFM done → mel=%s", [tuple(item.shape) for item in mel])
 
         # 6. BigVGAN vocoding
-        vocoder_cfg = self.config.vocoder
-        vocoder_name = vocoder_cfg.get("name", "nvidia/bigvgan_v2_22khz_80band_256x")
+        vocoder_name = self._get_resolved_vocoder_source()
         voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
         bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
-        vocode = self._get_vocoder_graph(bigvgan, device, voc_dtype)
-        upsample_factor = int(math.prod(bigvgan.h.upsample_rates))
+        vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
         with torch.no_grad():
-            wavs: list[torch.Tensor] = []
-            vocoder_infos: list[dict[str, Any]] = []
-            if isinstance(mel, list):
-                # Per-request CFM output: variable-length mels. Batch them
-                # for BigVGAN by padding to the max length.
-                batch_size = len(mel)
-                if batch_size == 1:
-                    mel_i = mel[0:1].to(voc_dtype) if mel[0].ndim == 3 else mel[0].unsqueeze(0).to(voc_dtype)
-                    wav_i = vocode(mel_i).float().squeeze(0).squeeze(0)
-                    wavs.append(torch.clamp(wav_i, -1.0, 1.0))
-                    last_call_info = getattr(vocode, "last_call_info", None)
-                    if isinstance(last_call_info, dict):
-                        vocoder_infos.append(dict(last_call_info))
-                else:
-                    for i in range(batch_size):
-                        mel_i = mel[i].unsqueeze(0).to(voc_dtype) if mel[i].ndim == 2 else mel[i : i + 1].to(voc_dtype)
-                        wav_i = vocode(mel_i).float().squeeze(0).squeeze(0)
-                        wavs.append(torch.clamp(wav_i, -1.0, 1.0))
-                        last_call_info = getattr(vocode, "last_call_info", None)
-                        if isinstance(last_call_info, dict):
-                            vocoder_infos.append(dict(last_call_info))
-            else:
-                batch_size = mel.shape[0]
-                if batch_size == 1:
-                    mel_i = mel[:, :, : target_lengths_list[0]].to(voc_dtype)
-                    wav_i = vocode(mel_i).float().squeeze(0).squeeze(0)
-                    wavs.append(torch.clamp(wav_i, -1.0, 1.0))
-                    last_call_info = getattr(vocode, "last_call_info", None)
-                    if isinstance(last_call_info, dict):
-                        vocoder_infos.append(dict(last_call_info))
-                else:
-                    for i in range(batch_size):
-                        mel_i = mel[i : i + 1, :, : target_lengths_list[i]].to(voc_dtype)
-                        wav_i = vocode(mel_i).float().squeeze(0).squeeze(0)
-                        wavs.append(torch.clamp(wav_i, -1.0, 1.0))
-                        last_call_info = getattr(vocode, "last_call_info", None)
-                        if isinstance(last_call_info, dict):
-                            vocoder_infos.append(dict(last_call_info))
+            wavs = self._vocode_mels(
+                mels=mel,
+                vocode=vocode,
+                voc_dtype=voc_dtype,
+            )
         wav: torch.Tensor | list[torch.Tensor] = wavs[0] if len(wavs) == 1 else wavs
 
         # Keep the public vLLM-Omni audio contract as normalized float. This is
@@ -563,6 +641,307 @@ class IndexTTS2S2MelDecoder(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _s2mel_model_dtype(self) -> torch.dtype:
+        if self.use_gpt_latent:
+            return self.s2mel.models["gpt_layer"][0].weight.dtype
+        return next(self.s2mel.models["length_regulator"].parameters()).dtype
+
+    def _validate_payload_policy(self, infos: list[dict[str, Any]]) -> None:
+        for index, info in enumerate(infos):
+            if "use_gpt_latent" not in info:
+                raise ValueError(f"IndexTTS Stage 1 input {index} is missing use_gpt_latent")
+            payload_value = info["use_gpt_latent"]
+            if bool(payload_value) != self.use_gpt_latent:
+                raise ValueError(
+                    "IndexTTS Stage 1 use_gpt_latent mismatch for input "
+                    f"{index}: payload={bool(payload_value)} "
+                    f"stage_config={self.use_gpt_latent}"
+                )
+
+    @staticmethod
+    def _validate_payload_contract(infos: list[dict[str, Any]]) -> None:
+        for index, info in enumerate(infos):
+            for key in ("mel_codes", "S_ref", "ref_mel", "style"):
+                value = info.get(key)
+                if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                    raise ValueError(f"IndexTTS Stage 1 input {index} is missing non-empty {key}")
+
+    @staticmethod
+    def _duration_factors(infos: list[dict[str, Any]], batch_size: int) -> list[float]:
+        factors = [float(info.get("duration_factor", 1.0)) for info in infos] if infos else [1.0] * batch_size
+        if len(factors) != batch_size:
+            raise ValueError(f"IndexTTS duration-factor batch mismatch: factors={len(factors)} batch={batch_size}")
+        if any(
+            not math.isfinite(factor) or not INDEXTTS25_MIN_DURATION_FACTOR <= factor <= INDEXTTS25_MAX_DURATION_FACTOR
+            for factor in factors
+        ):
+            raise ValueError("IndexTTS duration_factor values must be finite and between 0.5 and 2.0")
+        return factors
+
+    @staticmethod
+    def _target_lengths(
+        code_lens: list[int],
+        *,
+        semantic_time_scale: int,
+        mel_code_to_frame_ratio: float,
+        duration_factors: list[float],
+    ) -> list[int]:
+        if len(code_lens) != len(duration_factors):
+            raise ValueError(
+                f"IndexTTS target-length batch mismatch: codes={len(code_lens)} factors={len(duration_factors)}"
+            )
+        return [
+            int(length * semantic_time_scale * mel_code_to_frame_ratio * factor)
+            for length, factor in zip(code_lens, duration_factors)
+        ]
+
+    def _run_cfm_groups(
+        self,
+        *,
+        cfm: Any,
+        cond: torch.Tensor,
+        prompt_condition: torch.Tensor | None,
+        ref_mel: torch.Tensor,
+        style: torch.Tensor,
+        target_lengths: list[int],
+        ref_lengths: list[int],
+        seeds: list[int | None],
+        max_group_size: int,
+    ) -> list[torch.Tensor]:
+        """Run tightly packed CFM groups and restore original request order."""
+        batch_size = int(cond.shape[0])
+        if max_group_size < 1:
+            raise ValueError("IndexTTS CFM max_group_size must be at least 1")
+        if not (len(target_lengths) == len(ref_lengths) == len(seeds) == batch_size):
+            raise ValueError(
+                "IndexTTS CFM input batch mismatch: "
+                f"batch={batch_size} target={len(target_lengths)} "
+                f"ref={len(ref_lengths)} seeds={len(seeds)}"
+            )
+        if batch_size == 0:
+            return []
+
+        total_lengths = [ref_len + target_len for ref_len, target_len in zip(ref_lengths, target_lengths)]
+        # Python's sort is stable, so equal total lengths preserve arrival order.
+        sorted_indices = sorted(
+            range(batch_size),
+            key=total_lengths.__getitem__,
+        )
+        outputs: list[torch.Tensor | None] = [None] * batch_size
+        estimator = cfm.estimator
+        runtime_estimator = getattr(estimator, "_orig_mod", estimator)
+        wavenet = getattr(runtime_estimator, "wavenet", None)
+        min_ragged_length = int(getattr(wavenet, "ragged_min_length", 1))
+        groups = self._cfm_group_indices(
+            sorted_indices=sorted_indices,
+            total_lengths=total_lengths,
+            max_group_size=max_group_size,
+            min_ragged_length=min_ragged_length,
+        )
+
+        for group_indices in groups:
+            group_ref_lengths = [ref_lengths[index] for index in group_indices]
+            group_target_lengths = [target_lengths[index] for index in group_indices]
+            group_x_lengths = [
+                ref_len + target_len for ref_len, target_len in zip(group_ref_lengths, group_target_lengths)
+            ]
+            group_length = max(group_x_lengths)
+            group_prompt_length = max(group_ref_lengths)
+
+            packed_condition = cond.new_zeros(
+                len(group_indices),
+                group_length,
+                cond.shape[-1],
+            )
+            packed_prompt = ref_mel.new_zeros(
+                len(group_indices),
+                ref_mel.shape[1],
+                group_prompt_length,
+            )
+            for row, (index, ref_len, target_len) in enumerate(
+                zip(group_indices, group_ref_lengths, group_target_lengths)
+            ):
+                if ref_len:
+                    if prompt_condition is None:
+                        raise ValueError("IndexTTS CFM reference length requires prompt conditioning")
+                    packed_condition[row, :ref_len].copy_(prompt_condition[index, :ref_len])
+                    packed_prompt[row, :, :ref_len].copy_(ref_mel[index, :, :ref_len])
+                packed_condition[row, ref_len : ref_len + target_len].copy_(cond[index, :target_len])
+
+            group_index_tensor = torch.tensor(
+                group_indices,
+                device=style.device,
+                dtype=torch.long,
+            )
+            packed_style = style.index_select(0, group_index_tensor)
+            x_lens = torch.tensor(
+                group_x_lengths,
+                device=cond.device,
+                dtype=torch.long,
+            )
+            prompt_lens = torch.tensor(
+                group_ref_lengths,
+                device=cond.device,
+                dtype=torch.long,
+            )
+            full_mask = all(length == group_length for length in group_x_lengths)
+            self._set_dit_full_mask_fast_path(estimator, enabled=full_mask)
+            if full_mask:
+                self._enable_dit_cuda_graph(estimator)
+            unpad_data = None
+            if not full_mask:
+                token_offset = int(bool(getattr(runtime_estimator, "style_as_token", False))) + int(
+                    bool(getattr(runtime_estimator, "time_as_token", False))
+                )
+                unpad_data = build_cfm_unpad_data(
+                    group_x_lengths,
+                    padded_length=group_length,
+                    token_offset=token_offset,
+                    repeat_for_cfg=self.inference_cfg_rate > 0,
+                    device=cond.device,
+                )
+
+            initial_noise = self._sample_cfm_noise(
+                seeds=[seeds[index] for index in group_indices],
+                channels=cfm.in_channels,
+                length=group_length,
+                lengths=group_x_lengths,
+                device=cond.device,
+                dtype=cond.dtype,
+            )
+            with torch.no_grad():
+                group_mel = cfm.inference(
+                    packed_condition,
+                    x_lens,
+                    packed_prompt,
+                    packed_style,
+                    None,
+                    self.diffusion_steps,
+                    inference_cfg_rate=self.inference_cfg_rate,
+                    initial_noise=initial_noise,
+                    prompt_lens=prompt_lens,
+                    unpad_data=unpad_data,
+                )
+
+            for row, (index, ref_len, target_len) in enumerate(
+                zip(group_indices, group_ref_lengths, group_target_lengths)
+            ):
+                outputs[index] = group_mel[row, :, ref_len : ref_len + target_len]
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("IndexTTS CFM failed to produce every request output")
+        return [output for output in outputs if output is not None]
+
+    @staticmethod
+    def _cfm_group_indices(
+        *,
+        sorted_indices: list[int],
+        total_lengths: list[int],
+        max_group_size: int,
+        min_ragged_length: int,
+    ) -> list[list[int]]:
+        """Build packed groups while preserving exact short-input semantics."""
+        groups: list[list[int]] = []
+        start = 0
+        while start < len(sorted_indices):
+            index = sorted_indices[start]
+            group_size = 1 if total_lengths[index] < min_ragged_length else max_group_size
+            group = sorted_indices[start : start + group_size]
+            groups.append(group)
+            start += len(group)
+        return groups
+
+    @staticmethod
+    def _cfm_request_seeds(
+        infos: list[dict[str, Any]],
+        *,
+        batch_size: int,
+    ) -> list[int | None]:
+        seeds: list[int | None] = []
+        for info in infos:
+            seed = info.get("seed")
+            if isinstance(seed, torch.Tensor):
+                seed = seed.reshape(-1)[0].item() if seed.numel() else None
+            elif isinstance(seed, (list, tuple)):
+                seed = seed[0] if seed else None
+            seeds.append(int(seed) if seed is not None else None)
+
+        if not seeds:
+            return [None] * batch_size
+        if len(seeds) != batch_size:
+            raise ValueError(f"IndexTTS CFM seed/request batch mismatch: seeds={len(seeds)} batch={batch_size}")
+        return seeds
+
+    @staticmethod
+    def _sample_cfm_noise(
+        *,
+        seeds: list[int | None],
+        channels: int,
+        length: int,
+        lengths: list[int] | None = None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if not seeds or all(seed is None for seed in seeds):
+            return None
+        if lengths is not None and len(lengths) != len(seeds):
+            raise ValueError(f"IndexTTS CFM noise length/seed mismatch: lengths={len(lengths)} seeds={len(seeds)}")
+
+        rows: list[torch.Tensor] = []
+        for index, seed in enumerate(seeds):
+            row_length = lengths[index] if lengths is not None else length
+            if row_length < 0 or row_length > length:
+                raise ValueError(f"IndexTTS CFM noise length out of range: row={row_length} padded={length}")
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+            row = torch.randn(
+                (1, channels, row_length),
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            rows.append(F.pad(row, (0, length - row_length)))
+        return torch.cat(rows, dim=0)
+
+    def _build_semantic_embedding(
+        self,
+        *,
+        codec: Any,
+        mel_codes: torch.Tensor,
+        latent: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.semantic_codec_type == "enhanced":
+            semantic = codec.decode(mel_codes)
+        else:
+            semantic = codec.quantizer.vq2emb(mel_codes.unsqueeze(1))
+            semantic = semantic.transpose(1, 2)
+        semantic = semantic.to(device=mel_codes.device, dtype=dtype)
+
+        if not self.use_gpt_latent:
+            return semantic
+        if latent is None:
+            raise ValueError("IndexTTS GPT latent mode requires a latent tensor")
+
+        projected = self.s2mel.forward_gpt(latent.to(device=mel_codes.device, dtype=dtype)).to(dtype=dtype)
+        if projected.shape[1] != semantic.shape[1]:
+            # EnhancedCodec restores the encoder's temporal downsampling with
+            # nearest-neighbor upsampling. Mirror that time mapping for the
+            # optional GPT residual before addition.
+            projected = F.interpolate(
+                projected.transpose(1, 2),
+                size=semantic.shape[1],
+                mode="nearest",
+            ).transpose(1, 2)
+        if projected.shape != semantic.shape:
+            raise ValueError(
+                "IndexTTS semantic/GPT latent shape mismatch after alignment: "
+                f"semantic={tuple(semantic.shape)} latent={tuple(projected.shape)}"
+            )
+        return semantic + projected
+
     def _build_batched_inputs(
         self,
         infos: list[dict[str, Any]],
@@ -571,12 +950,13 @@ class IndexTTS2S2MelDecoder(nn.Module):
         model_dtype: torch.dtype,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
         list[int],
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        list[int],
     ]:
         stop_token = self.config.gpt.get("stop_mel_token", 8193)
         mel_items: list[torch.Tensor] = []
@@ -588,15 +968,18 @@ class IndexTTS2S2MelDecoder(nn.Module):
 
         for idx, info in enumerate(infos):
             mel = self._get_tensor(info, "mel_codes", device)
-            latent = self._get_tensor(info, "latent", device, model_dtype)
-            if mel is None or latent is None:
-                raise ValueError(f"S2Mel batched input {idx} is missing mel_codes or latent")
+            latent = self._get_tensor(info, "latent", device, model_dtype) if self.use_gpt_latent else None
+            if mel is None or (self.use_gpt_latent and latent is None):
+                raise ValueError(
+                    f"S2Mel batched input {idx} is missing mel_codes" + (" or latent" if self.use_gpt_latent else "")
+                )
 
             mel = mel.to(device=device, dtype=torch.long).reshape(-1)
-            if latent.ndim == 3 and latent.shape[0] == 1:
-                latent = latent[0]
-            elif latent.ndim != 2:
-                latent = latent.reshape(-1, latent.shape[-1])
+            if latent is not None:
+                if latent.ndim == 3 and latent.shape[0] == 1:
+                    latent = latent[0]
+                elif latent.ndim != 2:
+                    latent = latent.reshape(-1, latent.shape[-1])
 
             raw_len = info.get("code_lens")
             if isinstance(raw_len, torch.Tensor) and raw_len.numel() > 0:
@@ -606,9 +989,16 @@ class IndexTTS2S2MelDecoder(nn.Module):
             else:
                 stop_mask = (mel == stop_token).nonzero(as_tuple=False)
                 code_len = int(stop_mask[0].item()) if stop_mask.numel() > 0 else int(mel.shape[0])
-            code_len = max(0, min(code_len, int(mel.shape[0]), int(latent.shape[0])))
+            code_len = max(0, min(code_len, int(mel.shape[0])))
+            if latent is not None:
+                if int(latent.shape[0]) != int(mel.shape[0]):
+                    raise ValueError(
+                        f"S2Mel batched input {idx} mel/latent length mismatch: "
+                        f"mel={mel.shape[0]} latent={latent.shape[0]}"
+                    )
             mel_items.append(mel[:code_len])
-            latent_items.append(latent[:code_len])
+            if latent is not None:
+                latent_items.append(latent[:code_len])
             code_lens.append(code_len)
 
             s_ref = self._get_tensor(info, "S_ref", device)
@@ -627,17 +1017,28 @@ class IndexTTS2S2MelDecoder(nn.Module):
             style_items.append(style)
 
         max_code_len = max(code_lens) if code_lens else 0
-        latent_dim = latent_items[0].shape[-1]
         # Padding reaches vq2emb before length masking, so it must be a valid
         # semantic-code index. Actual sequence lengths are still carried by
         # code_lens/target_lengths; stop_token (8193) is outside the codebook.
         mel_batch = torch.zeros((len(mel_items), max_code_len), dtype=torch.long, device=device)
-        latent_batch = torch.zeros(len(latent_items), max_code_len, latent_dim, device=device, dtype=model_dtype)
-        for i, (mel, latent) in enumerate(zip(mel_items, latent_items)):
+        latent_batch: torch.Tensor | None = None
+        if self.use_gpt_latent:
+            latent_dim = latent_items[0].shape[-1]
+            latent_batch = torch.zeros(
+                len(latent_items),
+                max_code_len,
+                latent_dim,
+                device=device,
+                dtype=model_dtype,
+            )
+        for i, mel in enumerate(mel_items):
             mel_batch[i, : mel.shape[0]] = mel
-            latent_batch[i, : latent.shape[0]] = latent.to(dtype=model_dtype)
+            if latent_batch is not None:
+                latent = latent_items[i]
+                latent_batch[i, : latent.shape[0]] = latent.to(dtype=model_dtype)
 
         s_ref_batch = self._stack_optional_sequence(s_ref_items, device=device, dtype=model_dtype)
+        ref_lengths = self._ref_mel_lengths(ref_mel_items)
         ref_mel_batch = self._stack_optional_ref_mel(ref_mel_items, device=device, dtype=model_dtype)
         style_batch = self._stack_optional_style(style_items, device=device, dtype=model_dtype)
         return (
@@ -648,6 +1049,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             s_ref_batch,
             ref_mel_batch,
             style_batch,
+            ref_lengths,
         )
 
     @staticmethod
@@ -702,12 +1104,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
         )
 
     @staticmethod
-    def _infer_ref_lengths(ref_mel: torch.Tensor) -> torch.Tensor:
-        if ref_mel.ndim == 2:
-            return torch.tensor([ref_mel.size(-1)], device=ref_mel.device, dtype=torch.long)
-        nonzero = ref_mel.abs().sum(dim=1) > 0
-        lengths = nonzero.long().sum(dim=1)
-        return torch.clamp(lengths, min=1).to(device=ref_mel.device, dtype=torch.long)
+    def _ref_mel_lengths(items: list[torch.Tensor | None]) -> list[int]:
+        """Return unpadded reference lengths without inspecting CUDA values."""
+        if not items or any(item is None for item in items):
+            return []
+        return [int(item.shape[-1]) for item in items if item is not None]
 
     @staticmethod
     def _get_tensor(
@@ -794,8 +1195,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
         required_prefixes = [
             "s2mel.models.cfm.",
             "s2mel.models.length_regulator.",
-            "s2mel.models.gpt_layer.",
         ]
+        if self.use_gpt_latent:
+            required_prefixes.append("s2mel.models.gpt_layer.")
         missing_prefixes = [
             prefix for prefix in required_prefixes if not any(name.startswith(prefix) for name in loaded_params)
         ]
@@ -817,29 +1219,126 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # recursively re-casting the module on every request.
         cfm = self.s2mel.models["cfm"]
         cfm.float()
+        precast_parameter_count = _precast_cfm_estimator_bf16(
+            cfm.estimator,
+            enabled=self.s2mel_dit_bf16,
+        )
+        if self.s2mel_dit_bf16:
+            logger.info(
+                "Pre-cast %d CFM estimator Linear/Conv1d parameters to bfloat16",
+                precast_parameter_count,
+            )
         cfm.estimator_autocast_dtype = torch.bfloat16 if self.s2mel_dit_bf16 else None
 
         self._warmup_external_models()
         return loaded_params
 
+    def _configure_dit_runtime(self, device: torch.device) -> None:
+        if self._dit_runtime_configured:
+            return
+        if self.s2mel_dit_torch_compile and self.s2mel_dit_cuda_graph:
+            raise ValueError(
+                "s2mel_dit_torch_compile and s2mel_dit_cuda_graph are mutually exclusive",
+            )
+        if self.s2mel_dit_torch_compile:
+            if device.type == "cuda":
+                self.s2mel.enable_torch_compile(
+                    mode=self.s2mel_dit_torch_compile_mode,
+                )
+                logger.info(
+                    "S2Mel DiT torch.compile enabled with mode=%s",
+                    self.s2mel_dit_torch_compile_mode,
+                )
+            else:
+                logger.info(
+                    "S2Mel DiT torch.compile skipped on device type %s",
+                    device.type,
+                )
+        self._dit_runtime_configured = True
+
     def _warmup_external_models(self) -> None:
         """Preload vocoder + semantic codec to eliminate first-request latency."""
         device = next((p.device for p in self.s2mel.parameters()), torch.device("cpu"))
         try:
-            vocoder_name = self.config.vocoder.get("name", "nvidia/bigvgan_v2_22khz_80band_256x")
+            vocoder_name = self._get_resolved_vocoder_source()
             voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
             bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
-            load_semantic_codec(self.model_path, self.config.semantic_codec, device)
-            # Warm up the CUDA graph + torch.compile wrapper at load time so the
-            # ~95s compile cost is paid during startup rather than on the first
-            # request. Mirrors the Qwen3-TTS pattern (enable_cudagraph in
-            # load_weights). _get_vocoder_graph constructs the wrapper and calls
-            # warmup() on first access.
-            if self.s2mel_vocoder_cuda_graph and device.type == "cuda":
-                self._get_vocoder_graph(bigvgan, device, voc_dtype)
+            load_semantic_codec(
+                self.model_path,
+                self.config.semantic_codec,
+                device,
+                codec_type=self.semantic_codec_type,
+                checkpoint_name=getattr(
+                    self.config,
+                    "semantic_codec_checkpoint",
+                    None,
+                ),
+            )
+            if (self.s2mel_vocoder_cuda_graph or self.s2mel_vocoder_torch_compile) and device.type == "cuda":
+                self._get_vocoder_runner(bigvgan, device, voc_dtype)
             logger.info("BigVGAN + semantic codec preloaded")
         except Exception as e:
-            logger.warning("Failed to preload Stage 1 models: %s", e)
+            _raise_if_cuda_runtime_error(e)
+            raise RuntimeError("Failed to preload required IndexTTS Stage 1 models") from e
+
+    def _get_resolved_vocoder_source(self) -> str:
+        if self._resolved_vocoder_source is None:
+            vocoder_name = self.config.vocoder.get(
+                "name",
+                "nvidia/bigvgan_v2_22khz_80band_256x",
+            )
+            self._resolved_vocoder_source = _resolve_bigvgan_source(
+                self.model_path,
+                vocoder_name,
+            )
+        return self._resolved_vocoder_source
+
+    def _vocode_mels(
+        self,
+        *,
+        mels: list[torch.Tensor],
+        vocode: Any,
+        voc_dtype: torch.dtype,
+    ) -> list[torch.Tensor]:
+        """Vocode each already-cropped request at its exact mel length."""
+        wavs: list[torch.Tensor] = []
+        for mel in mels:
+            if mel.ndim == 2:
+                mel_input = mel.unsqueeze(0)
+            elif mel.ndim == 3 and mel.shape[0] == 1:
+                mel_input = mel
+            else:
+                raise ValueError(f"IndexTTS BigVGAN expects one mel per request, got {tuple(mel.shape)}")
+            wav = vocode(mel_input.to(voc_dtype)).float().squeeze(0).squeeze(0)
+            wavs.append(torch.clamp(wav, -1.0, 1.0))
+        return wavs
+
+    def _get_vocoder_runner(
+        self,
+        bigvgan: nn.Module,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        """Return the selected exact-length BigVGAN execution path."""
+        if self.s2mel_vocoder_torch_compile and self.s2mel_vocoder_cuda_graph:
+            raise ValueError(
+                "s2mel_vocoder_torch_compile and s2mel_vocoder_cuda_graph are mutually exclusive",
+            )
+        if self.s2mel_vocoder_cuda_graph:
+            return self._get_vocoder_graph(bigvgan, device, dtype)
+        if not self.s2mel_vocoder_torch_compile or device.type != "cuda":
+            return bigvgan
+        if self._compiled_vocoder is None:
+            self._compiled_vocoder = torch.compile(
+                bigvgan.forward,
+                mode="default",
+                fullgraph=False,
+                dynamic=True,
+            )
+            logger.info(
+                "BigVGAN dynamic torch.compile enabled with exact-length inputs",
+            )
+        return self._compiled_vocoder
 
     def _get_vocoder_graph(self, bigvgan: nn.Module, device: torch.device, dtype: torch.dtype):
         """Return the CUDA-graph vocoder wrapper, or the eager model when disabled.
@@ -867,23 +1366,41 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 self._vocoder_graph.enabled = False
         return self._vocoder_graph
 
+    @staticmethod
+    def _set_dit_full_mask_fast_path(
+        estimator: nn.Module,
+        *,
+        enabled: bool,
+    ) -> None:
+        """Select dense attention and physical WaveNet reflect boundaries."""
+        runtime_estimator = getattr(estimator, "_orig_mod", estimator)
+        for layer in runtime_estimator.transformer.layers:
+            layer.attention._assume_full_mask = enabled
+        if hasattr(runtime_estimator, "wavenet"):
+            runtime_estimator.wavenet._assume_full_mask = enabled
+
+        # A graph captured with the dense-attention branch must never replay
+        # for a padded input. Keep its cache resident, but route this call
+        # through eager execution until a later full-mask call re-enables it.
+        graph_runner = getattr(runtime_estimator, "_cuda_graph_runner", None)
+        if graph_runner is not None and not enabled:
+            graph_runner.enabled = False
+
     def _enable_dit_cuda_graph(self, estimator: nn.Module) -> None:
         """Attach a per-shape CUDA graph runner to the DiT transformer core.
 
-        Sets `_assume_full_mask` on the attention modules: this decoder
-        always passes x_lens == T, so the padding mask is all-True and
-        dense attention is identical — the flag removes the backend's
-        per-step ``torch.any(~mask)`` D2H sync, which is also a
-        stream-capture blocker.
+        Full-mask semantics are enabled independently by
+        ``_set_dit_full_mask_fast_path`` so eager execution also avoids
+        the per-layer ``torch.any(~mask)`` host synchronization.
         """
         if not self.s2mel_dit_cuda_graph:
             return
-        if getattr(estimator, "_cuda_graph_runner", None) is not None:
+        graph_runner = getattr(estimator, "_cuda_graph_runner", None)
+        if graph_runner is not None:
+            graph_runner.enabled = True
             return
         from vllm_omni.model_executor.models.indextts2.dit_cuda_graph import CUDAGraphDiTRunner
 
-        for layer in estimator.transformer.layers:
-            layer.attention._assume_full_mask = True
         estimator._cuda_graph_runner = CUDAGraphDiTRunner(
             estimator.transformer,
             max_graphs=self.s2mel_dit_cuda_graph_max_graphs,

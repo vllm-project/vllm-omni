@@ -31,6 +31,11 @@ stages:
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       video: 1
     default_sampling_params:

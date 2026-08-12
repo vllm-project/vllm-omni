@@ -57,9 +57,10 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         # audex TTA: tta thinker (Stage 0) -> XCodec1 (Stage 1, always sync
         # full-payload — CNN codec decoded over the full sequence).
         ("AudexXCodec1", "audex_xcodec"),
-        # indextts2: indextts2_talker (Stage 0) -> indextts2_s2mel_decoder
-        # (Stage 1). Stage 1 consumes the complete mel/latent payload.
+        # indextts2 / indextts2_5: talker (Stage 0) -> s2mel decoder
+        # (Stage 1). Stage 1 consumes the complete mel/optional-latent payload.
         ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
+        ("IndexTTS25S2MelDecoder", "indextts2_5_s2mel_decoder"),
         # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
         # token2audio (Stage 2).  Producer wires via
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.

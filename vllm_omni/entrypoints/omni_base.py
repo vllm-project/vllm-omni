@@ -4,7 +4,7 @@ import os
 import time
 import weakref
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 import vllm.envs as envs
@@ -30,6 +30,9 @@ from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
 
@@ -237,6 +240,42 @@ class OmniBase(PDDisaggregationMixin):
         """Expose engine stage configs for PD disaggregation detection and validation."""
         return self.engine.stage_configs
 
+    @staticmethod
+    def _replica_is_dead(client: StagePoolClient | None) -> bool:
+        """Whether a replica slot is evicted (``None``) or its engine is dead.
+
+        ``check_health()`` is the source of truth: it raises ``EngineDeadError``
+        when dead (inspecting the ``engine_dead`` flags internally), and the
+        diffusion client additionally runs a synchronous ``proc.is_alive()``
+        probe that catches a silent SIGKILL/segfault the monitor thread has not
+        flagged yet — so ``/health`` does not report 200 for a stage whose
+        subprocess is already dead. A client exposing no ``check_health`` cannot
+        confirm liveness, so it is treated as dead (fail closed).
+        """
+        if client is None:
+            return True
+        check_health = getattr(client, "check_health", None)
+        if not callable(check_health):
+            return True
+        try:
+            check_health()
+        except EngineDeadError:
+            return True
+        return False
+
+    def _live_replica_count(self, pool: StagePool) -> int:
+        """Number of replicas in ``pool`` that are neither evicted nor dead.
+
+        A dead replica is evicted from its pool (slot set to ``None`` in
+        ``StagePool.clients``); a replica that died but has not been evicted
+        yet still carries an ``engine_dead`` flag. Both are excluded.
+        """
+        return sum(1 for client in pool.clients if not self._replica_is_dead(client))
+
+    def _stage_has_no_live_replica(self, pool: StagePool) -> bool:
+        """True when a non-empty stage pool has lost all of its replicas."""
+        return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
+
     def _consumed_metric_message_ids(self, request_id: str) -> set[int]:
         consumed_by_request = getattr(self, "_consumed_metric_messages", None)
         if consumed_by_request is None:
@@ -244,38 +283,33 @@ class OmniBase(PDDisaggregationMixin):
             self._consumed_metric_messages = consumed_by_request
         return consumed_by_request.setdefault(request_id, set())
 
-    def _has_dead_stage(self) -> bool:
-        for stage_client in self.engine.stage_clients:
-            if getattr(stage_client, "_engine_dead", False):
-                return True
-            resources = getattr(stage_client, "resources", None)
-            if resources is not None and getattr(resources, "engine_dead", False):
-                return True
-        return False
-
     @property
     def is_running(self) -> bool:
-        return self.engine.is_alive() and not self._has_dead_stage()
+        return self.engine.is_alive()
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        True when the orchestrator thread is dead **or** any stage client
-        has been marked dead (e.g. diffusion worker OOM / process death).
-
-        Checks both ``_engine_dead`` (StageDiffusionClient) and
-        ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
-        since the two client types store the flag differently.
+        True only when the orchestrator thread is dead. Per-stage liveness is
+        deliberately excluded: the OpenAI serving paths precheck ``errored``
+        before request routing, so including it would reject requests that do
+        not touch the dead stage (e.g. text-only chat when the talker stage is
+        down). A fully dead stage instead fails only the requests routed
+        through it (dispatch guards) and flips readiness to 503 via
+        :meth:`check_health` (per-replica fault isolation, #4285).
         """
-        return not self.engine.is_alive() or self._has_dead_stage()
+        return not self.engine.is_alive()
 
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
-        for stage_client in self.engine.stage_clients:
-            if hasattr(stage_client, "check_health"):
-                stage_client.check_health()
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None:
+            return
+        for pool in pools:
+            if self._stage_has_no_live_replica(pool):
+                raise EngineDeadError(f"Stage-{pool.stage_id} has no live replica")
 
     def resolve_sampling_params_list(
         self,

@@ -6,6 +6,7 @@ architecture_state: current-plus-in-flight
 owners:
   - "@alex-jw-brooks"
   - "@linyueqian"
+  - "@NickCao"
 document_stewards:
   - "@hsliuustc0106"
   - "@Gaohan123"

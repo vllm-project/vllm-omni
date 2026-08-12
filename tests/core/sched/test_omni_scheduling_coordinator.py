@@ -126,6 +126,7 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             ("AudexCode2Wav", "audex_code2wav"),
             ("AudexXCodec1", "audex_xcodec"),
             ("IndexTTS2S2MelDecoder", "indextts2_s2mel_decoder"),
+            ("IndexTTS25S2MelDecoder", "indextts2_5_s2mel_decoder"),
             ("DyninOmniForConditionalGeneration", "token2image"),
             ("DyninOmniForConditionalGeneration", "token2audio"),
         }
