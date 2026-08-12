@@ -14,6 +14,8 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -335,6 +337,29 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--lora-path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path to LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. Loaded at initialization and used for generation."
+        "Note: for Wan2.2 MoE models, two checkpoints positionally mapped to high-noise and low-noise modules.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help="LoRA backend for loading LoRA adapters. Default: peft"
+        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
+        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
+    )
+    parser.add_argument(
         "--use-hsdp",
         action="store_true",
         help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
@@ -440,6 +465,12 @@ def main():
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config
         omni_kwargs["enable_cache_dit_summary"] = args.enable_cache_dit_summary
+    if args.lora_path is not None:
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        omni_kwargs["lora_path"] = lora_path
+        omni_kwargs["lora_backend"] = args.lora_backend
 
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
@@ -469,12 +500,30 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    lora_request = None
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request_id = stable_lora_int_id(lora_path)
+        lora_request = LoRARequest(
+            lora_name=Path(lora_path).stem,
+            lora_int_id=lora_request_id,
+            lora_path=lora_path,
+        )
+
     prompt_dict = {"prompt": args.prompt}
     if args.negative_prompt is not None:
         prompt_dict["negative_prompt"] = args.negative_prompt
     elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         prompt_dict["negative_prompt"] = ""
+
+    extra_args = {}
+    if lora_request:
+        extra_args["lora_request"] = lora_request
+        extra_args["lora_scale"] = args.lora_scale
 
     sampling_kwargs = dict(
         height=args.height,
@@ -483,6 +532,7 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        extra_args=extra_args,
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high

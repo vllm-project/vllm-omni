@@ -451,6 +451,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
 
+        # Validate every envelope before selecting a dispatch path. In
+        # particular, keep identity errors outside the RPC error wrapper so an
+        # invalid request cannot be forwarded or converted into a worker output.
+        from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
+
+        for new_req in new_reqs:
+            validate_new_request_data_identity(new_req)
+
+        has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
+
         # DP multi-concurrency: when DLO+AllGather is active and multiple
         # requests are scheduled, send ALL requests in one broadcast RPC.
         # Each rank picks req[rank % len(reqs)] and computes independently.
@@ -458,6 +468,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # responses and match by dp_rank.
         if (
             len(new_reqs) > 1
+            and not has_diffusion_kv_metadata
             and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
             and getattr(self.od_config, "dlo_use_allgather", True)
         ):
@@ -530,9 +541,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             req = new_req.req
             try:
+                args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
+                if new_req.diffusion_kv_metadata is not None:
+                    args += (new_req.diffusion_kv_metadata,)
                 result = self.collective_rpc(
                     "execute_model",
-                    args=(req, self.od_config, scheduler_output.kv_prefetch_job),
+                    args=args,
                     unique_reply_rank=0,
                     exec_all_ranks=True,
                 )

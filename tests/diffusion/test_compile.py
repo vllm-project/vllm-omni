@@ -74,3 +74,37 @@ def test_regionally_compile_does_not_partially_mutate_on_setup_failure(monkeypat
         regionally_compile(model, dynamic=True)
 
     assert [block.forward.__func__ for block in model.transformer_blocks] == original_forwards
+
+
+def test_compiled_block_preserves_forward_signature_for_inspection(monkeypatch):
+    """cache-dit matches blocks via inspect.signature(block.forward).
+
+    Whatever regionally_compile installs as the block forward must stay
+    signature-transparent: parameter names and the return annotation drive
+    cache-dit's ForwardPattern match (build 2954, Multi-GPU Layered job
+    failed when a bare *args/**kwargs wrapper hid them; torch.compile's own
+    wrapper preserves the signature).
+    """
+    import inspect
+
+    import torch
+
+    class _SignatureBlock(nn.Module):
+        def forward(self, hidden_states, encoder_hidden_states=None) -> "torch.Tensor":
+            return hidden_states
+
+    class _Model(nn.Module):
+        _repeated_blocks = ["_SignatureBlock"]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = nn.ModuleList([_SignatureBlock()])
+
+    model = _Model()
+    monkeypatch.setattr(compile_module.torch, "compile", lambda fn, *a, **k: fn)
+    regionally_compile(model)
+
+    sig = inspect.signature(model.blocks[0].forward)
+    assert set(sig.parameters.keys()) == {"hidden_states", "encoder_hidden_states"}
+    assert "torch.Tensor" in str(sig.return_annotation)
+    assert model.blocks[0].forward("x") == "x"

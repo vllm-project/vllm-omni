@@ -97,6 +97,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
 | [verification.md](references/checks/verification.md) | Hardware, a server, or a runnable affected path is available for active verification. |
+| [examples-policy.md](../precheck-pr/references/examples-policy.md) | The PR adds, copies, or renames Python under `examples/`; apply the canonical policy shared with `precheck-pr`. |
 
 ### Delivery and reviewer coordination
 
@@ -151,6 +152,13 @@ contract they protect or use only the applicable evidence checks.
 
 Apply every category in [general-checks.md](references/process/general-checks.md) before
 lower-priority comments.
+
+If the diff census contains an added, copied, or renamed Python path under
+`examples/`, read and apply the canonical
+[examples policy](../precheck-pr/references/examples-policy.md). Treat a new
+model-specific Python example as blocking. Do not flag model-specific example
+debt that the PR only modifies or removes, and do not run the rest of the
+author-oriented `precheck-pr` workflow.
 
 For each changed value or behavior, trace:
 

@@ -51,6 +51,19 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_native_input_append_supports_explicit_session_opt_out():
+    session = DuplexSession(
+        "sid-explicit-tts",
+        DuplexSessionConfig(model="test-model"),
+        capabilities=DuplexCapabilities.minicpmo45_native(),
+    )
+
+    assert OmniDuplexSessionHandler._uses_native_input_append(session) is True
+
+    session.config.extra_body["minicpmo45_native_duplex"] = False
+    assert OmniDuplexSessionHandler._uses_native_input_append(session) is False
+
+
 class _ModelConfig:
     model = "test-model"
 

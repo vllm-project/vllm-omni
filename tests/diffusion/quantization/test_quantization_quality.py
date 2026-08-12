@@ -515,8 +515,14 @@ def test_quantization_quality(config: QualityTestConfig):
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
 
+    # Run both arms eager: LPIPS must measure quantization only. With compile
+    # on, a compiler failure in one arm (e.g. inductor's CantSplit on fp8 FLUX)
+    # silently drops that arm to eager while the other stays compiled, and the
+    # metric then includes compile-state differences (fp8_ltx2 rose from ~0.09
+    # to 0.1291 that way in build 2954). Mirrors
+    # vllm_omni/quantization/tools/compare_diffusion_trajectory_similarity.py.
     # --- BF16 baseline ---
-    bl_kwargs: dict = {"model": config.baseline_ref()}
+    bl_kwargs: dict = {"model": config.baseline_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         bl_kwargs["enable_cpu_offload"] = True
     omni_bl = Omni(**bl_kwargs)
@@ -528,7 +534,7 @@ def test_quantization_quality(config: QualityTestConfig):
 
     # --- Quantized ---
     quantization = config.quantization_ref()
-    qt_kwargs: dict = {"model": config.quantized_ref()}
+    qt_kwargs: dict = {"model": config.quantized_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         qt_kwargs["enable_cpu_offload"] = True
     if quantization is None:

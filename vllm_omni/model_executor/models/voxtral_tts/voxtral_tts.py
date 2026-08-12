@@ -45,10 +45,12 @@ def parse_batched_audio_input(input_ids: torch.Tensor, num_codebooks: int) -> tu
     """
     all_audio_tokens: list[torch.Tensor] = []
     all_ctx_frames: list[int] = []
+    # One D2H copy up-front avoids 2 syncs per request inside the loop.
+    header_view = input_ids.cpu() if input_ids.is_cuda else input_ids
     offset = 0
     while offset < input_ids.numel():
-        ctx_frames = int(input_ids[offset].item())
-        context_length = int(input_ids[offset + 1].item())
+        ctx_frames = int(header_view[offset])
+        context_length = int(header_view[offset + 1])
         offset += 2
 
         req_input_ids_length = (ctx_frames + context_length) * num_codebooks
@@ -155,6 +157,9 @@ class VoxtralTTSForConditionalGeneration(
                 architectures=["VoxtralTTSAudioTokenizer"],
             )
             self.model = self.audio_tokenizer
+            # forward() returns a runtime-length per-request list; FULL CUDAGraphWrapper
+            # would freeze that length at capture.
+            self.supports_cudagraph_full = False
         else:
             raise ValueError("Invalid model stage")
 
