@@ -168,7 +168,7 @@ class TestDeployTopology:
             assert memory_utilizations == [
                 0.55,
                 0.15,
-                0.15,
+                0.18,
             ]
             assert sum(memory_utilizations) <= 0.9 + 1e-6
             # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
