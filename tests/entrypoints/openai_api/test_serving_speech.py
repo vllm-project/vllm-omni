@@ -1284,6 +1284,35 @@ class TestTTSMethods:
         assert salt_a != salt_b
         assert salt_a != salt_locator_only
 
+    @pytest.mark.asyncio
+    async def test_higgs_v3_cache_salt_changes_with_ref_audio_cache_key(self, speech_server, mocker):
+        """Higgs v3 voice clone uses placeholder prompt ids + prefix caching.
+        The salt must move when the resolve key moves, or a same-path rewrite
+        reuses KV from the previous reference."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        adapter = MagicMock()
+        adapter.build_prompt.return_value = [1, 1, 1, 1]
+        speech_server._resolve_higgs_audio_v3_adapter = AsyncMock(return_value=adapter)
+        codes = torch.arange(8, dtype=torch.long).view(8, 1)
+        speech_server._resolve_higgs_audio_v3_ref_codes = AsyncMock(return_value=(codes, False, False))
+        speech_server._get_resolved_ref_audio_artifact_key = MagicMock(return_value="art")
+
+        req = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="file:///data/spk.wav",
+            ref_text="transcript",
+        )
+        speech_server._resolve_ref_audio = AsyncMock(return_value=([0.1] * 48000, 24000, "key_aaa"))
+        prompt_a = await speech_server._build_higgs_audio_v3_params(req)
+        speech_server._resolve_ref_audio = AsyncMock(return_value=([0.9] * 48000, 24000, "key_bbb"))
+        prompt_b = await speech_server._build_higgs_audio_v3_params(req)
+
+        assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
+        assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
+        assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
+        assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
+
     # ── encode_reference_codes: speaker cache invalidation ──
 
     @pytest.mark.asyncio

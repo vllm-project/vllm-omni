@@ -1847,7 +1847,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt["additional_information"] = {
             "audio_input_ids": ref_codes_delayed.to(torch.long),
             "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
+            "ref_audio_cache_key": cache_key,
         }
+        # Placeholder prompt ids do not change when a same-path file is
+        # rewritten at the same duration; fold the content-aware resolve key
+        # into cache_salt so prefix caching cannot reuse the previous KV.
+        prompt["cache_salt"] = _conditioning_cache_salt(request, prompt["additional_information"])
         return prompt
 
     async def _resolve_higgs_audio_v3_ref_codes(
