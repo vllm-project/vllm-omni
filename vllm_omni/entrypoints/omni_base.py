@@ -568,6 +568,7 @@ class OmniBase(PDDisaggregationMixin):
             msg_id = id(result)
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
 

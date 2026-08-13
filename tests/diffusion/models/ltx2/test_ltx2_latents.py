@@ -23,7 +23,7 @@ def _make_pipeline(pipeline_cls, sequence_parallel_size: int = 1):
     return pipeline
 
 
-def test_prepare_video_latents_samples_directly_in_packed_token_space():
+def test_prepare_video_latents_matches_official_values_and_token_major_layout():
     pipeline = _make_pipeline(LTX2Pipeline)
     pipeline.vae_spatial_compression_ratio = 8
     pipeline.vae_temporal_compression_ratio = 8
@@ -44,6 +44,7 @@ def test_prepare_video_latents_samples_directly_in_packed_token_space():
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.stride()[1:] == (1, actual.shape[1])
 
 
 def test_prepare_audio_latents_samples_directly_in_packed_token_space():
@@ -81,6 +82,42 @@ def test_prepare_audio_latents_pads_generated_dummy_length_for_sp():
     assert original_num_frames == 1
     assert padded_num_frames == 2
     assert latents.shape == (1, 2, 128)
+    torch.testing.assert_close(latents[:, 1:], torch.zeros_like(latents[:, 1:]))
+
+
+def test_prepare_audio_latents_request_rng_is_invariant_to_sp_padding():
+    pipeline_sp1 = _make_pipeline(LTX2Pipeline, sequence_parallel_size=1)
+    pipeline_sp4 = _make_pipeline(LTX2Pipeline, sequence_parallel_size=4)
+    generator_sp1 = torch.Generator().manual_seed(42)
+    generator_sp4 = torch.Generator().manual_seed(42)
+
+    latents_sp1, _, _ = pipeline_sp1.prepare_audio_latents(
+        batch_size=1,
+        num_channels_latents=2,
+        num_mel_bins=8,
+        audio_latent_length=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=generator_sp1,
+    )
+    latents_sp4, _, _ = pipeline_sp4.prepare_audio_latents(
+        batch_size=1,
+        num_channels_latents=2,
+        num_mel_bins=8,
+        audio_latent_length=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        generator=generator_sp4,
+    )
+
+    torch.testing.assert_close(latents_sp4[:, :3], latents_sp1, rtol=0, atol=0)
+    torch.testing.assert_close(latents_sp4[:, 3:], torch.zeros_like(latents_sp4[:, 3:]))
+    torch.testing.assert_close(
+        torch.randn(8, generator=generator_sp4),
+        torch.randn(8, generator=generator_sp1),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_prepare_audio_latents_pads_packed_sequence_dim_for_provided_latents():
@@ -137,7 +174,9 @@ def test_prepare_audio_latents_accepts_already_padded_4d_latents_for_sp():
     assert original_num_frames == 10
     assert padded_num_frames == 12
     assert padded.shape == (1, 12, 8)
-    torch.testing.assert_close(padded, latent_ops.pack_audio_latents(latents))
+    packed = latent_ops.pack_audio_latents(latents)
+    torch.testing.assert_close(padded[:, :10], packed[:, :10])
+    torch.testing.assert_close(padded[:, 10:], torch.zeros_like(padded[:, 10:]))
 
 
 def test_resolve_audio_latent_length_preserves_legacy_4d_shape_inference():

@@ -478,12 +478,11 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._strip_single_engine_args = lambda kwargs: kwargs
 
     _, stage_configs = engine._resolve_stage_configs(
         "dummy-model",
         {
-            "stage_configs_path": "dummy.yaml",
+            "deploy_config": "dummy.yaml",
             "additional_config": {"torchair_graph_config": {"enabled": True}},
         },
         trust_remote_code=False,
@@ -516,12 +515,11 @@ def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._strip_single_engine_args = lambda kwargs: kwargs
 
     _, stage_configs = engine._resolve_stage_configs(
         "dummy-model",
         {
-            "stage_configs_path": "dummy.yaml",
+            "deploy_config": "dummy.yaml",
             "quantization_config": {"method": "bitsandbytes"},
         },
         trust_remote_code=False,

@@ -163,7 +163,8 @@ nav:
 - CLI Reference: cli
 - Community:
   - Governance: community/governance.md
-  - community/*
+  - Contact Us: community/contact_us.md
+  - Community Meetings: community/meetings.md
   - Slack: https://slack.vllm.ai
   - Blog: https://blog.vllm.ai
   - Forum: https://discuss.vllm.ai

@@ -53,7 +53,6 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model",
         "omni",
         "output_modalities",
-        "stage_configs_path",
         "stage_id",
         "tokenizer",
     }
@@ -91,6 +90,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     trust_remote_code: bool
     dtype: Any
     attention_backend: Any
+    attention_config: Any
     moe_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
@@ -322,6 +322,7 @@ class OmniStageModelConfig:
     trust_remote_code: bool = False
     dtype: Any = "auto"
     attention_backend: Any = None
+    attention_config: Any = None
     moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
