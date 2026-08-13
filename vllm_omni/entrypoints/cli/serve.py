@@ -55,6 +55,17 @@ def _nonneg_finite_float(value: str) -> float:
     return parsed
 
 
+def _json_object(value: str) -> dict[str, object]:
+    """Argparse type for JSON objects (rejects arrays and scalar values)."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(f"must be a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -499,7 +510,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
-            type=json.loads,
+            type=_json_object,
             default="{}",
             help=(
                 "JSON object passed to DiffusionPipeline.from_pretrained()."
@@ -510,7 +521,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--diffusers-call-kwargs",
             dest="diffusers_call_kwargs",
-            type=json.loads,
+            type=_json_object,
             default="{}",
             help=(
                 "JSON object passed to pipeline.__call__(). "

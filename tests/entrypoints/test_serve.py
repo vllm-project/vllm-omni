@@ -76,6 +76,37 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+@pytest.mark.parametrize("flag", ["--diffusers-load-kwargs", "--diffusers-call-kwargs"])
+def test_serve_parser_accepts_diffusers_json_object_kwargs(flag: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", flag, '{"nested": {"enabled": true}}'])
+
+    dest = flag.removeprefix("--").replace("-", "_")
+    assert getattr(args, dest) == {"nested": {"enabled": True}}
+    assert isinstance(args.diffusers_load_kwargs, dict)
+    assert isinstance(args.diffusers_call_kwargs, dict)
+
+
+@pytest.mark.parametrize("flag", ["--diffusers-load-kwargs", "--diffusers-call-kwargs"])
+@pytest.mark.parametrize("value", ["[]", "null", "42", '"scalar"'])
+def test_serve_parser_rejects_non_object_diffusers_json_kwargs(
+    flag: str,
+    value: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", flag, value])
+
+    assert "must be a JSON object" in capsys.readouterr().err
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
