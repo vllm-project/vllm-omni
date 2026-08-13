@@ -11,23 +11,19 @@ import torch
 import torchaudio
 from vllm.multimodal.media.audio import load_audio
 
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
-
-
-def resolve_model_to_local_path(model: str) -> str:
-    if os.path.isdir(model):
-        return model
-
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(model)
 
 
 class SpeakerEmbeddingExtractor:
     """CAM++ ONNX speaker embeddings, resampled to the extractor's rate."""
 
-    def __init__(self, model, target_sr=16000):
-        local_model_path = resolve_model_to_local_path(model)
+    def __init__(self, model, target_sr=16000, *, allow_download: bool = False):
+        local_model_path = resolve_model_to_local_path(
+            model,
+            allow_download=allow_download,
+            allow_patterns=["campplus.onnx"],
+        )
         campplus_path = os.path.join(local_model_path, "campplus.onnx")
         if not os.path.exists(campplus_path):
             raise RuntimeError(f"Missing Ming speaker extractor model: {campplus_path}")
@@ -57,7 +53,4 @@ class SpeakerEmbeddingExtractor:
         return [self.extract_from_file(path) for path in audio_paths]
 
 
-__all__ = [
-    "SpeakerEmbeddingExtractor",
-    "resolve_model_to_local_path",
-]
+__all__ = ["SpeakerEmbeddingExtractor"]

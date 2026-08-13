@@ -142,7 +142,8 @@ def _resolve_speaker_embedding(args, case: dict, paths: list[str]):
         return _load_speaker_embedding(args.speaker_embedding)
     if not (case.get("auto_extract_speaker_embeddings") or args.extract_speaker_embeddings) or not paths:
         return None
-    embs = SpeakerEmbeddingExtractor(args.model).extract_many(paths)
+    # Runs before the engine is built, so nothing has pre-fetched campplus.onnx.
+    embs = SpeakerEmbeddingExtractor(args.model, allow_download=True).extract_many(paths)
     if not embs:
         raise RuntimeError("Speaker extraction produced no embeddings")
     return embs[0] if len(embs) == 1 else torch.stack(embs, dim=0)
