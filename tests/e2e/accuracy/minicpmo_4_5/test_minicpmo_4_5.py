@@ -3,8 +3,8 @@
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
 ~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
-text modalities with ``use_tts_template``, and server ``--interleave-mm-strings``
-+ 1fps / 128-frame media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+text modalities, and server ``--interleave-mm-strings`` + 1fps / 128-frame
+media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
 """
 
 from __future__ import annotations
@@ -40,10 +40,7 @@ _MAX_SEED_TTS_MEAN_WER = 0.05
 # Match the validated Daily-Omni client body from daily_omni_bench.sh.
 _DAILY_EXTRA_BODY = {
     "modalities": ["text"],
-    "chat_template_kwargs": {
-        "enable_thinking": False,
-        "use_tts_template": True,
-    },
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 _SEED_EXTRA_BODY = {
     "modalities": ["text", "audio"],

@@ -605,6 +605,13 @@ python qwen3_tts/streaming_speech_client.py \
 The client writes one PCM file per sentence and a matching
 `sentence_XXX_timestamps.json` sidecar.
 
+Non-streaming requests can also ask for timestamps: pass
+`"word_timestamps": true` to `POST /v1/audio/speech` and read the
+`X-Word-Timestamps` response header (JSON list of `{word, start_ms, end_ms}`,
+ASCII-escaped). Past 4 KB the header is replaced by
+`X-Word-Timestamps-Omitted: oversize; bytes=<n>; limit=4096` and the audio
+still returns — use the WebSocket path for long transcripts.
+
 To *see* the alignment instead of reading a JSON sidecar, run the
 word-timestamp Gradio demo (server must be launched with `--forced-aligner`):
 ```bash

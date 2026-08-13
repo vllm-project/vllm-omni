@@ -93,12 +93,6 @@ def parse_args() -> argparse.Namespace:
         "stabilityai/stable-diffusion-3.5-medium, Tongyi-MAI/Z-Image-Turbo and etc.",
     )
     parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
-    )
-    parser.add_argument(
         "--deploy-config",
         type=str,
         default=None,
@@ -475,8 +469,6 @@ def main():
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
@@ -515,8 +507,8 @@ def main():
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
-    if args.stage_configs_path:
-        print(f"  stage-configs-path: {args.stage_configs_path}")
+    if args.deploy_config:
+        print(f"  deploy-config: {args.deploy_config}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
@@ -656,7 +648,7 @@ def main():
         images = getattr(output, "images", None)
         if images:
             break
-        req_out = getattr(output, "request_output", None)
+        req_out = output
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break

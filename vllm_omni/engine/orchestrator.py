@@ -1543,11 +1543,19 @@ class Orchestrator:
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
+        # A pooling stage is driven by PoolingParams; vLLM validates them against
+        # the stage's supported tasks, so advertise the model's pooling tasks (or
+        # the configured task) instead of generate.
+        if isinstance(params, PoolingParams):
+            model_cfg = next_pool.stage_vllm_config.model_config
+            supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
+        else:
+            supported_tasks = ("generate",)
         request = processor.process_inputs(
             request_id=req_id,
             prompt=next_input,
             params=params,
-            supported_tasks=("generate",),
+            supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
         )
@@ -1625,12 +1633,12 @@ class Orchestrator:
         from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 
         engine_output = attach_duplex_output_decision(
-            OmniRequestOutput(
+            OmniRequestOutput.from_stage_output(
+                output,
                 request_id=req_id,
                 finished=True,
                 stage_id=stage_id,
                 final_output_type=decision.final_output_type,
-                request_output=output,
             ),
             decision,
         )

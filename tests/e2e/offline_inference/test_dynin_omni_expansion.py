@@ -175,7 +175,7 @@ def _find_stage_output(outputs: list[Any], output_type: str) -> Any | None:
 
     # Prefer the latest finished chunk to avoid picking an intermediate stream output.
     for stage_output in reversed(matched):
-        if _is_finished_request_output(getattr(stage_output, "request_output", None)):
+        if _is_finished_request_output(stage_output):
             return stage_output
     return matched[-1]
 
@@ -205,7 +205,7 @@ def _to_token_list(value: Any) -> list[int]:
 
 
 def _extract_text(stage_output: Any, tokenizer: Any | None = None) -> str:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return ""
     req_list = request_output if isinstance(request_output, list) else [request_output]
@@ -240,7 +240,7 @@ def _extract_text(stage_output: Any, tokenizer: Any | None = None) -> str:
 
 
 def _extract_audio(stage_output: Any) -> Any | None:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return None
     req_list = request_output if isinstance(request_output, list) else [request_output]
@@ -256,7 +256,7 @@ def _extract_audio(stage_output: Any) -> Any | None:
 
 
 def _extract_image(stage_output: Any) -> Any | None:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return None
     req_list = request_output if isinstance(request_output, list) else [request_output]

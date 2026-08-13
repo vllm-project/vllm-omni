@@ -119,7 +119,6 @@ class MockGenerationResult:
 
     def __init__(self, images):
         self.images = images
-        self.request_output = SimpleNamespace(images=images)
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -137,10 +136,7 @@ class MockStageResult:
             outputs = [SimpleNamespace(text=text, index=0)]
         else:
             outputs = []
-        self.request_output = SimpleNamespace(
-            outputs=outputs,
-            images=self.images,
-        )
+        self.outputs = outputs
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -2080,22 +2076,20 @@ def test_extract_images_from_result():
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
 
-    # Test dict path: result.request_output["images"]
+    # Test result with "images" attribute set in __init__
     class DictRequestOutput:
         def __init__(self):
-            self.request_output = {"images": [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]}
+            self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
     result = DictRequestOutput()
     images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
-    # Test attribute path: result.request_output.images
+    # Test result with "images" attribute from an inner object
     class AttrRequestOutput:
         def __init__(self):
-            self.request_output = type(
-                "obj", (), {"images": [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]}
-            )()
+            self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
     result = AttrRequestOutput()
     images = _extract_images_from_result(result)
