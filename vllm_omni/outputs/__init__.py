@@ -147,7 +147,9 @@ class OmniRequestOutput(RequestOutput):
     encoder_prompt: str | None = None
     encoder_prompt_token_ids: list[int] | None = None
     num_cached_tokens: int | None = None
+    num_cache_creation_tokens: int | None = None
     kv_transfer_params: dict[str, Any] | None = None
+    ec_transfer_params: dict[str, Any] | None = None
 
     # --- Pipeline stage fields ---
     stage_id: int | None = None

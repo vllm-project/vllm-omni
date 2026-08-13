@@ -270,3 +270,34 @@ class TestMsgpackRoundTrip:
         # Content merged from legacy nested key
         assert result.prompt == "legacy prompt"
         assert result.prompt_token_ids == [1, 2]
+
+
+class TestRequestOutputFieldParity:
+    """``OmniRequestOutput`` must expose everything ``RequestOutput`` sets.
+
+    ``RequestOutput`` is a plain class, so the dataclass-generated ``__init__``
+    replaces its ``__init__`` and the inherited attributes only exist because
+    they are redeclared as fields. Any vLLM field that is not redeclared simply
+    does not exist on an omni output, and vLLM's own serving code reads those
+    attributes unconditionally — ``/v1/completions`` returned HTTP 500 with
+    ``AttributeError: 'OmniRequestOutput' object has no attribute
+    'ec_transfer_params'`` for exactly that reason. This test fails on the next
+    vLLM bump that adds a field, instead of leaving it for an endpoint to hit.
+    """
+
+    def test_carries_every_attribute_request_output_sets(self) -> None:
+        reference = _make_text_request_output()
+        omni = OmniRequestOutput(request_id="req-parity")
+
+        missing = sorted(name for name in vars(reference) if not name.startswith("_") and not hasattr(omni, name))
+        assert not missing, (
+            f"OmniRequestOutput is missing RequestOutput attributes {missing}; "
+            "redeclare them as dataclass fields in vllm_omni/outputs/__init__.py"
+        )
+
+    def test_transfer_param_fields_default_to_none(self) -> None:
+        omni = OmniRequestOutput(request_id="req-defaults")
+        assert omni.kv_transfer_params is None
+        assert omni.ec_transfer_params is None
+        assert omni.num_cached_tokens is None
+        assert omni.num_cache_creation_tokens is None
