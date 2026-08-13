@@ -103,10 +103,6 @@ steps:
             "
         mirror_hardwares: l4_1
 
-      # TO CONFIRM: should we add Gepard-1.0 to nightly/weekly step? If yes,
-      # will need nemo_toolkit[tts] to the image. Currently no Gepard-1.0 step
-      # here
-
       - label: "TTS · Higgs-Audio-V3 Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_higgs_audio_v3.py

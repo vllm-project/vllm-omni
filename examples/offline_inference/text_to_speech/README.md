@@ -422,6 +422,13 @@ against transformers 5.x, so nothing is lost by holding it there.
 `vllm-omni[gepard]` would be unsatisfiable rather than opt-in. SoulX-Singer English
 SVS documents `nemo_toolkit[asr]` the same way.)
 
+On a host whose CUDA toolkit cannot build kernels for the GPU — no `nvcc`/`ninja`, or a
+consumer Blackwell (`sm_120`) card — also set `VLLM_USE_FLASHINFER_SAMPLER=0`. vLLM's
+sampler JIT-compiles through FlashInfer on first use, and where that build fails the engine
+dies inside `profile_run` long after every import has succeeded, which reads as a model
+failure rather than an environment one. The PyTorch sampler it falls back to costs nothing
+here.
+
 ### Quick start (zero-shot, default voice)
 ```bash
 python examples/offline_inference/text_to_speech/gepard/end2end.py \

@@ -3,9 +3,9 @@
 """E2E offline inference tests for the Gepard-1.0 single-stage native-AR TTS.
 
 Zero-shot only (the model's default learned voice). These tests need a GPU and
-the NeMo NanoCodec, and are spread across CI tiers by level marker -- see the
-comment above ``pytestmark``. The window arithmetic behind the streaming decode
-is covered on CPU in ``tests/model_executor/models/test_gepard_window.py``.
+the NeMo NanoCodec, so the whole file runs in the weekly tier -- see the comment
+above ``pytestmark``. The window arithmetic behind the streaming decode is
+covered on CPU in ``tests/model_executor/models/test_gepard_window.py``.
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardCo
 from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_ids
 
 # The codec decoder is an optional dependency; skip rather than fail the engine
-# inside the worker process when it is absent. The CI image does not carry it
-# today, so nothing here runs in CI yet -- see test-merge.yml. Install recipe:
-# examples/offline_inference/text_to_speech/README.md.
+# inside the worker process when it is absent. The CI image does not carry it,
+# so the weekly step installs it first -- see .buildkite/cuda/test-weekly.yml.
+# Install recipe: examples/offline_inference/text_to_speech/README.md.
 pytest.importorskip("nemo.collections.tts.models")
 
 MODEL_NAME = "nineninesix/gepard-1.0"
@@ -91,9 +91,9 @@ _ASR_ESCALATION_MODEL = "small"
 _TRANSCRIBED_CLIPS = 2
 
 # No level marker at module scope: each test carries the one matching how often
-# its claim needs re-checking. There is deliberately no core_model row -- under
-# dummy weights the stop head is random, so every request would run to
-# gepard.yaml's max_tokens, far past what that tier is for.
+# its claim needs re-checking, though the weekly step collects the file whole.
+# There is deliberately no core_model row -- under dummy weights the stop head is
+# random, so every request would run to gepard.yaml's max_tokens.
 pytestmark = [
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
@@ -148,12 +148,9 @@ def _synthesize_all(omni: Omni, texts: list[str]) -> list[_Clip]:
     by_index: dict[int, _Clip] = {}
     for stage_outputs in outputs:
         index = int(str(stage_outputs.request_id).split("_", 1)[0])
-        # OmniRequestOutput.request_output is a single RequestOutput, not a list.
-        req_output = stage_outputs.request_output
-        assert req_output is not None, "request produced no output"
         waveform = None
         frames = 0
-        for out in req_output.outputs:
+        for out in stage_outputs.outputs:
             # Explicit None check: `x or []` would ask an array for a truth value.
             token_ids = out.token_ids if out.token_ids is not None else []
             # STOP sits just past head0's range, so a token equal to it is

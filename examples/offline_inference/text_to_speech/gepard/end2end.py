@@ -88,26 +88,23 @@ def main(args) -> None:
     inputs = build_request(text=args.text)
 
     for i, stage_outputs in enumerate(omni.generate(inputs)):
-        # OmniRequestOutput.request_output is a single RequestOutput, not a list.
-        req_output = stage_outputs.request_output
-        if req_output is not None:
-            for j, out in enumerate(req_output.outputs):
-                mm = out.multimodal_output
-                if mm is None:
-                    print(f"  [req {i}] No audio output.")
-                    continue
-                # The consolidation path renames "model_outputs" to "audio".
-                audio = mm.get("audio")
-                if audio is None:
-                    audio = mm.get("model_outputs")
-                if isinstance(audio, list):
-                    audio = audio[0] if len(audio) else None
-                if audio is None:
-                    print(f"  [req {i}] No waveform in multimodal_output (keys: {list(mm)}).")
-                    continue
-                sr_tensor = mm.get("sr")
-                sr = int(sr_tensor.item()) if hasattr(sr_tensor, "item") else SAMPLE_RATE
-                save_audio(audio.cpu(), str(output_dir / f"output_{i}_{j}.wav"), sr)
+        for j, out in enumerate(stage_outputs.outputs):
+            mm = out.multimodal_output
+            if mm is None:
+                print(f"  [req {i}] No audio output.")
+                continue
+            # The consolidation path renames "model_outputs" to "audio".
+            audio = mm.get("audio")
+            if audio is None:
+                audio = mm.get("model_outputs")
+            if isinstance(audio, list):
+                audio = audio[0] if len(audio) else None
+            if audio is None:
+                print(f"  [req {i}] No waveform in multimodal_output (keys: {list(mm)}).")
+                continue
+            sr_tensor = mm.get("sr")
+            sr = int(sr_tensor.item()) if hasattr(sr_tensor, "item") else SAMPLE_RATE
+            save_audio(audio.cpu(), str(output_dir / f"output_{i}_{j}.wav"), sr)
 
     print("Done.")
 
