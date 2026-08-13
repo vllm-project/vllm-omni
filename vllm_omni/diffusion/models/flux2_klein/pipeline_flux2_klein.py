@@ -1020,10 +1020,8 @@ class Flux2KleinPipeline(
 
             if reference_image_latents is not None:
                 latent_model_input = torch.cat([latents, reference_image_latents], dim=1)
-                
             elif image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                
 
             positive_kwargs = {
                 "hidden_states": latent_model_input,
