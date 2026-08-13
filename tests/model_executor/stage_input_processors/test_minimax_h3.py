@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
     MINIMAX_H3_PRESENTATION_TASK_KEY,
+    MINIMAX_H3_TEXT_HIDDEN_SIZE,
 )
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_ref2va_presentation,
@@ -33,6 +34,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
     deserialize_prepared_reference_videos,
 )
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     MiniMaxH3MultiModalProcessor,
     _build_minimax_h3_presentation,
@@ -42,6 +44,7 @@ from vllm_omni.model_executor.stage_input_processors.minimax_h3 import (
     _diffusion_sampling_params,
     prepare_text_encoder_prompt,
     text_encoder2diffusion,
+    text_encoder2diffusion_full_payload,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -385,3 +388,46 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
     (ref2va / "text_encoder").mkdir(parents=True)
 
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, "ref2va") == str(ref2va)
+
+
+def _stage0_payload(tokens=4):
+    hidden = torch.randn(tokens, MINIMAX_H3_TEXT_HIDDEN_SIZE)
+    token_role_ids = torch.zeros(tokens, 1, dtype=torch.long)
+    return {"hidden_states": {"output": hidden}, "meta": {"token_role_ids": token_role_ids}}
+
+
+def test_full_payload_hook_emits_the_diffusion_ready_structure():
+    payload = _stage0_payload()
+
+    result = text_encoder2diffusion_full_payload(pooling_output=payload)
+
+    assert set(result) == {"text_encoder_output"}
+    conditioning = result["text_encoder_output"]
+    assert torch.equal(conditioning["hidden_states"], payload["hidden_states"]["output"])
+    assert conditioning["token_tags"].shape == (4,)
+
+
+def test_full_payload_hook_tolerates_a_connector_less_stage():
+    assert text_encoder2diffusion_full_payload(pooling_output=None) is None
+    assert text_encoder2diffusion_full_payload(pooling_output={"hidden_states": None}) is None
+
+
+def test_full_payload_hook_rejects_mismatched_conditioning():
+    payload = _stage0_payload()
+    payload["meta"]["token_role_ids"] = torch.zeros(9, 1, dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="align"):
+        text_encoder2diffusion_full_payload(pooling_output=payload)
+
+
+def test_prompt_passes_through_when_conditioning_travels_over_the_connector():
+    source = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=None)])
+
+    assert text_encoder2diffusion([source], {"prompt": "a cat"}) == {"prompt": "a cat"}
+
+
+def test_stage0_declares_the_producer_hook_the_connector_path_needs():
+    stage0, stage1 = MINIMAX_H3_PIPELINE.stages
+
+    assert stage0.custom_process_next_stage_input_func.endswith(".text_encoder2diffusion_full_payload")
+    assert stage1.stage_input_payload_keys == ("text_encoder_output",)
