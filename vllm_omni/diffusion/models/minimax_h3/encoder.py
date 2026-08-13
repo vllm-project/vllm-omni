@@ -39,10 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.layers.norm import (
-    AddRMSNorm as DiffusionAddRMSNorm,
-    RMSNorm as DiffusionRMSNorm,
-)
+from vllm_omni.diffusion.layers.norm import AddRMSNorm as DiffusionAddRMSNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.layers.sdpa import ScaledDotProductAttention as DiffusionScaledDotProductAttention
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50

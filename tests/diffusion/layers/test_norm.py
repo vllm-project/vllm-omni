@@ -361,9 +361,7 @@ def test_add_rmsnorm_inherits_rmsnorm_and_matches_native_contract():
     expected_residual = residual + x
     expected_fp32 = expected_residual.float()
     expected_output = (
-        expected_fp32
-        * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps)
-        * norm.weight.float()
+        expected_fp32 * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps) * norm.weight.float()
     ).to(expected_residual.dtype)
     output, updated_residual = norm.forward_native(x, residual)
 
