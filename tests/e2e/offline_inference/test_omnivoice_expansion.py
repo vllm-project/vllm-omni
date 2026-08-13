@@ -58,7 +58,7 @@ def test_omnivoice_text_to_audio(omni_runner: OmniRunner) -> None:
 
     # Check final output has audio
     final_output = outputs[-1]
-    ro = final_output.request_output
+    ro = final_output
     assert ro is not None, "No request_output"
 
     mm = getattr(ro, "multimodal_output", None)

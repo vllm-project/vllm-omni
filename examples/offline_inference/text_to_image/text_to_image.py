@@ -656,7 +656,7 @@ def main():
         images = getattr(output, "images", None)
         if images:
             break
-        req_out = getattr(output, "request_output", None)
+        req_out = output
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break

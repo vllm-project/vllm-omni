@@ -115,7 +115,7 @@ steps:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2511_vllm_omni.json

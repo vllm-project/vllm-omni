@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image
 
@@ -94,6 +94,7 @@ ImageToVideoPromptBuilder = Callable[
     dict[str, Any],
 ]
 XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
+OutputTensorRange = Literal["negative_one_to_one", "zero_to_one"]
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ class ModelExtraSpec:
     extra_body_params: frozenset[str] = field(default_factory=frozenset)
     extra_output_params: frozenset[str] = field(default_factory=frozenset)
     init_extra_args_for_non_diffusion_stages: bool = False
+    output_tensor_range: OutputTensorRange | None = None
     text_to_image_prompt_builder: TextToImagePromptBuilder | None = None
     image_to_image_prompt_builder: ImageToImagePromptBuilder | None = None
     image_to_video_prompt_builder: ImageToVideoPromptBuilder | None = None
@@ -206,6 +208,7 @@ _EXTRA_SPECS: dict[str, ModelExtraSpec] = {
     ),
     "LingBotVideoPipeline": ModelExtraSpec(
         extra_body_params=LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+        output_tensor_range="zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
         # pipeline owns model-specific validation and normalization.
     ),
@@ -273,6 +276,18 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.extra_output_params if spec is not None else frozenset()
+
+
+def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
+    """Return the declared range for floating-point tensor outputs.
+
+    The default preserves the shared examples' historical handling. Pipelines
+    that already return normalized tensors declare ``zero_to_one`` explicitly.
+    """
+    spec = _get_spec(model_class_name)
+    if spec is None:
+        return "negative_one_to_one"
+    return spec.output_tensor_range or "negative_one_to_one"
 
 
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:

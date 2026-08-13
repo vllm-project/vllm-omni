@@ -1633,12 +1633,12 @@ class Orchestrator:
         from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 
         engine_output = attach_duplex_output_decision(
-            OmniRequestOutput(
+            OmniRequestOutput.from_stage_output(
+                output,
                 request_id=req_id,
                 finished=True,
                 stage_id=stage_id,
                 final_output_type=decision.final_output_type,
-                request_output=output,
             ),
             decision,
         )
