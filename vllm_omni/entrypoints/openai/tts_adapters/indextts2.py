@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -15,6 +15,10 @@ from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -102,6 +106,8 @@ def indextts2_conditioning_cache_salt(
         "emo_text",
         "use_emo_text",
         "use_random",
+        "lang",
+        "text_normalization",
     ):
         h.update(b"\x00")
         h.update(key.encode("utf-8"))
@@ -206,14 +212,34 @@ class IndexTTS2Adapter(ARTTSAdapter):
             estimate_indextts2_prefill_prompt_len,
         )
 
+        prompt_kwargs: dict[str, Any] = {}
+        if self.name == "indextts2_5":
+            from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+                INDEXTTS25_TOKENIZER_FILE,
+            )
+
+            hf_config = getattr(server.engine_client.model_config, "hf_config", None)
+            prompt_kwargs["tokenizer_file"] = getattr(
+                hf_config,
+                "tokenizer_file",
+                INDEXTTS25_TOKENIZER_FILE,
+            )
         ph_len = estimate_indextts2_prefill_prompt_len(
             server.engine_client.model_config.model,
             request.input,
+            model_type=self.name,
+            lang=str(_first_conditioning_value(tts_params.get("lang")) or "zh"),
+            text_normalization=bool(
+                _first_conditioning_value(tts_params.get("text_normalization"))
+                if "text_normalization" in tts_params
+                else True
+            ),
+            **prompt_kwargs,
         )
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="indextts2")
+        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server
@@ -240,4 +266,60 @@ class IndexTTS2Adapter(ARTTSAdapter):
                 params[key] = [[wav_list, sr]]
             else:
                 params[key] = [extras[key]]
+        return params
+
+
+@register_tts_adapter
+class IndexTTS25Adapter(IndexTTS2Adapter):
+    stage_keys = frozenset({"indextts2_5_talker"})
+    name = "indextts2_5"
+    native_speed_control: ClassVar[bool] = True
+
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        error = super().validate(request)
+        if error is not None:
+            return error
+        speed = request.speed if request.speed is not None else 1.0
+        if speed < INDEXTTS25_MIN_DURATION_FACTOR or speed > INDEXTTS25_MAX_DURATION_FACTOR:
+            return "IndexTTS 2.5 speed must be between 0.5 and 2.0"
+        return None
+
+    def _validate_extra_params(self, extras: Mapping[str, Any]) -> str | None:
+        error = super()._validate_extra_params(extras)
+        if error is not None:
+            return error
+
+        if "lang" in extras:
+            value = extras["lang"]
+            if not isinstance(value, str):
+                return "extra_params.lang must be a string"
+            from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+                normalize_language_code,
+            )
+
+            try:
+                normalize_language_code(value)
+            except ValueError as exc:
+                return str(exc)
+        if "text_normalization" in extras and not isinstance(
+            extras["text_normalization"],
+            bool,
+        ):
+            return "extra_params.text_normalization must be a boolean"
+        return None
+
+    async def _build_params(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        params = await super()._build_params(request)
+        extras = request.extra_params if isinstance(request.extra_params, dict) else {}
+        from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+            normalize_language_code,
+        )
+
+        params["lang"] = [normalize_language_code(str(extras.get("lang", "zh")))]
+        params["text_normalization"] = [bool(extras.get("text_normalization", True))]
+        speed = request.speed if request.speed is not None else 1.0
+        params["duration_factor"] = [1.0 / speed]
         return params

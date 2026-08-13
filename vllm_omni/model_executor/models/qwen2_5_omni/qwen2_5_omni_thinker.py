@@ -296,9 +296,23 @@ class Qwen2_5OmniVideoProcessorItems(VideoProcessorItems):
     def get_processor_data(self) -> Mapping[str, object]:
         from transformers.video_utils import VideoMetadata
 
-        videos = [frames for frames, _ in self.data]
+        # Read through self.get(), not self.data. vLLM now wraps loaded media in
+        # MediaWithBytes (multimodal/media/base.py) to retain the original bytes
+        # for hashing, and VideoProcessorItems._unwrap is what strips it back to
+        # the raw frames. Iterating self.data skips that unwrap, so the HF
+        # processor received [MediaWithBytes, ...] where it expects frame arrays.
+        # transformers' make_batched_videos recognises the wrapper as neither a
+        # video nor a sequence, silently builds an empty list, and then indexes
+        # it -- surfacing as a 400 on every video request:
+        #     File "transformers/video_utils.py", in convert_pil_frames_to_video
+        #       if not (isinstance(videos[0], (list, tuple)) and ...
+        #     IndexError: list index out of range
+        # self.get() is also correct on the pre-wrapper vLLM, where it is a
+        # plain self.data[index].
+        items = [self.get(index) for index in range(self.get_count())]
+        videos = [frames for frames, _ in items]
         video_metadata = [
-            VideoMetadata(**{k: v for k, v in metadata.items() if k != "do_sample_frames"}) for _, metadata in self.data
+            VideoMetadata(**{k: v for k, v in metadata.items() if k != "do_sample_frames"}) for _, metadata in items
         ]
         return {"videos": videos, "video_metadata": video_metadata}
 
@@ -622,7 +636,10 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         )
 
         with timing_ctx.record("get_mm_hashes"):
-            mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+            mm_hashes = inputs.get_mm_hashes(
+                self.info.model_id,
+                self.info.ctx.get_mm_config().mm_hasher_algorithm,
+            )
 
         mm_cache_keys = self._paired_cache_keys(mm_hashes, aiv_pairs)
 

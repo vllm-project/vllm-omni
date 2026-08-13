@@ -539,6 +539,7 @@ class AsyncOmniEngine:
         if not isinstance(mm_data, dict) or not mm_data:
             return
 
+        from vllm.config.multimodal import _get_mm_hasher_algorithm
         from vllm.multimodal.hasher import MultiModalHasher
 
         existing_uuids = prompt.get("multi_modal_uuids")
@@ -565,6 +566,7 @@ class AsyncOmniEngine:
                     base_uuid = None
                 else:
                     base_uuid = MultiModalHasher.hash_kwargs(
+                        _get_mm_hasher_algorithm(),
                         model_id=model_id,
                         **{modality: item},
                     )
@@ -1048,6 +1050,9 @@ class AsyncOmniEngine:
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "lora_path": kwargs.get("lora_path", None),
+            "lora_scale": kwargs.get("lora_scale", 1.0),
+            "lora_backend": kwargs.get("lora_backend", "peft"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
@@ -1251,6 +1256,9 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                if kwargs.get("lora_backend") is not None:
+                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
+                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None

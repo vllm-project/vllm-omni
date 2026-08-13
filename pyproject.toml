@@ -84,6 +84,13 @@ forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
+indextts2 = [
+    "fugashi>=1.2.0",
+    "unidic-lite>=1.0.0",
+    "wetext>=0.0.9; sys_platform != 'linux'",
+    "WeTextProcessing; sys_platform == 'linux'",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
@@ -199,6 +206,12 @@ ignore = [
 # These files keep upstream conventions (star imports, long lines, math-symbol
 # argument names) so they stay easy to diff against upstream releases.
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+# NemotronVoiceChat inference modules vendored from NVIDIA-NeMo/Speech (branch
+# nemotron-labs-voicechat). Numerics-bearing code is kept byte-close to
+# upstream to stay diffable and parity-safe, so upstream style (long lines,
+# legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
+# F-correctness rules still apply.
+"vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -307,6 +320,10 @@ extend-ignore-identifiers-re = [
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
+    # NemotronVoiceChat vendored triton kernel: dout/DOUT abbreviate d_out
+    # (output feature dim), not "doubt".
+    ".*dout.*",
+    ".*DOUT.*",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -327,3 +344,10 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# Ryan Leary: author credited in the NemotronVoiceChat vendored NeMo
+# features.py copyright header. A surname, not a typo of "leery".
+Leary = "Leary"
+# IndexTTS 2.5 language codes and speech-emotion-recognition event token.
+fo = "fo"
+ba = "ba"
+SER = "SER"

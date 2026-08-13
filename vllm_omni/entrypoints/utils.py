@@ -905,3 +905,31 @@ def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
         params.skip_clone = True
     params.output_kind = target_type
     return params
+
+
+class PureDiffusionLauncherAdapter:
+    """vLLM launcher compatibility shim for pure-diffusion mode.
+
+    The upstream launcher's shutdown path reads
+    ``app.state.engine_client.vllm_config.shutdown_timeout``
+    (vllm/entrypoints/launcher.py), but ``AsyncOmni.vllm_config`` returns
+    ``None`` when the pipeline has no comprehension stage (pure diffusion),
+    which crashes ``handle_shutdown`` with AttributeError and hangs server
+    teardown (workers force-killed, spurious resource_tracker noise).
+
+    This adapter only overrides the ``vllm_config`` property with a minimal
+    fallback carrying ``shutdown_timeout`` and forwards every other attribute
+    to the wrapped engine client, so the pure-diffusion detection
+    (``get_vllm_config()`` still returns ``None``) is unaffected.
+    """
+
+    def __init__(self, engine_client: Any, shutdown_timeout: float) -> None:
+        object.__setattr__(self, "_wrapped", engine_client)
+        object.__setattr__(self, "_shutdown_timeout", float(shutdown_timeout))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    @property
+    def vllm_config(self) -> Any:
+        return types.SimpleNamespace(shutdown_timeout=self._shutdown_timeout)

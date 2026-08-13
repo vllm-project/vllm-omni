@@ -49,7 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
@@ -388,14 +388,31 @@ class DiffusionWorker:
         """Initialize the LoRA manager for this worker."""
         if self.model_runner.pipeline is None:
             return
-        self.lora_manager = DiffusionLoRAManager(
-            pipeline=self.model_runner.pipeline,
-            device=self.device,
-            dtype=self.od_config.dtype,
-            max_cached_adapters=self.od_config.max_cpu_loras,
-            lora_path=self.od_config.lora_path,
-            lora_scale=self.od_config.lora_scale,
-        )
+
+        lora_path = self.od_config.lora_path
+        if isinstance(lora_path, list) and len(lora_path) == 1:
+            lora_path = lora_path[0]
+
+        lora_backend = self.od_config.lora_backend
+        if lora_backend == LoRABackend.PEFT:
+            self.lora_manager = DiffusionLoRAManager(
+                pipeline=self.model_runner.pipeline,
+                device=self.device,
+                dtype=self.od_config.dtype,
+                max_cached_adapters=self.od_config.max_cpu_loras,
+                lora_path=lora_path,
+                lora_scale=self.od_config.lora_scale,
+            )
+        elif lora_backend == LoRABackend.DISTILL:
+            pipeline = self.model_runner.pipeline
+            if hasattr(pipeline, "load_lora_weights"):
+                if self.od_config.lora_scale > 1.0:
+                    logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+                pipeline.load_lora_weights(lora_path)
+            else:
+                logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
+        else:
+            raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.

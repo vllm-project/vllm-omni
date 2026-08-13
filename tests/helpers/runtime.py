@@ -2938,9 +2938,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output.outputs[0].text
+                    text_content = stage_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.outputs[0].multimodal_output["audio"]
             result.audio_content = audio_content
             result.text_content = text_content
             result.success = True
@@ -3080,7 +3080,7 @@ class OmniRunnerHandler:
         mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                mm_out = stage_out.outputs[0].multimodal_output
                 break
         if mm_out is None:
             raise AssertionError("No audio output from pipeline")
