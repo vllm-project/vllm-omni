@@ -462,8 +462,7 @@ class LingBotVideoTransformer3DModel(nn.Module):
     # FSDP all-gathers each block instead of applying one dtype to all params.
     _hsdp_preserve_param_dtype = True
 
-    # Auto-padding is exact for pure Ulysses. Ring/hybrid remain limited to
-    # divisible, unmasked sequences because Ring attention cannot consume masks.
+    # LingBot supports Ulysses SP. Ring is rejected before this boundary.
     _sp_plan = {
         "sp_input_boundary": {
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
@@ -726,18 +725,20 @@ class LingBotVideoTransformer3DModel(nn.Module):
         temb6 = self.time_modulation(temb_input.reshape(-1, temb_input.shape[-1]))
         temb6 = temb6.reshape(joint.shape[0], joint_seq_len, -1)
 
-        joint, rotary, temb_input, temb6, _local_token_validity = self.sp_input_boundary(
-            joint, rotary, temb_input, temb6, global_token_validity
-        )
-
         ctx = get_forward_context() if is_forward_context_available() else None
-        padding_size = ctx.sp_padding_size if ctx is not None else 0
         parallel_config = (
             getattr(ctx.omni_diffusion_config, "parallel_config", None)
             if ctx is not None and ctx.omni_diffusion_config is not None
             else None
         )
-        ring_degree = int(getattr(parallel_config, "ring_degree", 1))
+        if int(getattr(parallel_config, "ring_degree", 1)) > 1:
+            raise ValueError("LingBot-Video supports Ulysses SP only; set ring_degree=1.")
+
+        joint, rotary, temb_input, temb6, _local_token_validity = self.sp_input_boundary(
+            joint, rotary, temb_input, temb6, global_token_validity
+        )
+
+        padding_size = ctx.sp_padding_size if ctx is not None else 0
 
         padded_global_token_validity = (
             F.pad(global_token_validity, (0, padding_size), value=False) if padding_size else global_token_validity
@@ -753,8 +754,6 @@ class LingBotVideoTransformer3DModel(nn.Module):
             if encoder_attention_mask is None and padding_size == 0:
                 attention_mask = None
 
-        if ring_degree > 1 and attention_mask is not None:
-            raise ValueError("LingBot Ring SP requires divisible sequences without text padding or packed CFG.")
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:

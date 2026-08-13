@@ -3,6 +3,7 @@
 
 import inspect
 from itertools import count
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -213,6 +214,32 @@ def test_transformer_exposes_standard_sp_plan():
     assert all(spec.auto_pad for spec in input_specs.values())
     assert model.sp_input_boundary is not None
     assert model.sp_output_boundary is not None
+
+
+def test_transformer_rejects_ring_before_sequence_sharding(monkeypatch):
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    model = _tiny_transformer()
+    context = SimpleNamespace(
+        omni_diffusion_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(ring_degree=2),
+        )
+    )
+    monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        model.sp_input_boundary,
+        "forward",
+        lambda *args: pytest.fail("unsupported Ring must be rejected before sharding"),
+    )
+
+    with pytest.raises(ValueError, match="supports Ulysses SP only"):
+        model(
+            hidden_states=torch.randn(1, 2, 1, 2, 2),
+            timestep=torch.tensor([300.0]),
+            encoder_hidden_states=torch.randn(1, 2, 8),
+            return_dict=False,
+        )
 
 
 def test_packed_attention_uses_sdpa_after_standard_attention_resharding(monkeypatch):
