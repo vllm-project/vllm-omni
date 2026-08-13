@@ -22,7 +22,9 @@ from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
     MINIMAX_H3_PRESENTATION_TASK_KEY,
+    MINIMAX_H3_TEXT_HIDDEN_SIZE,
 )
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     MiniMaxH3MultiModalProcessor,
     _build_minimax_h3_presentation,
@@ -30,6 +32,8 @@ from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
 from vllm_omni.model_executor.stage_input_processors.minimax_h3 import (
     _audio_items,
     prepare_text_encoder_prompt,
+    text_encoder2diffusion,
+    text_encoder2diffusion_full_payload,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -198,3 +202,61 @@ def test_diffusion_resolver_selects_startup_partition(tmp_path):
     assert resolve_minimax_h3_diffusion_model_path(str(root), None, "fl2va") == str(fl2va)
     assert resolve_minimax_h3_diffusion_model_path(str(root), None, "ref2va") == str(ref2va)
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, None) == str(ref2va)
+
+
+def _stage0_payload(tokens=4):
+    hidden = torch.randn(tokens, MINIMAX_H3_TEXT_HIDDEN_SIZE)
+    tags = torch.zeros(tokens, 1, dtype=torch.long)
+    return {"encoder_hidden_states": hidden, "token_tags": tags}
+
+
+def _source_outputs(multimodal_output):
+    completion = SimpleNamespace(multimodal_output=multimodal_output)
+    return [SimpleNamespace(outputs=[completion])]
+
+
+def test_full_payload_hook_emits_the_diffusion_ready_structure():
+    payload = _stage0_payload()
+
+    result = text_encoder2diffusion_full_payload(pooling_output=payload)
+
+    # The DiT worker merges this verbatim, so it must already be unpacked.
+    assert set(result) == {"text_encoder_output"}
+    conditioning = result["text_encoder_output"]
+    assert torch.equal(conditioning["hidden_states"], payload["encoder_hidden_states"])
+    assert conditioning["token_tags"].shape == (4,)
+
+
+def test_full_payload_hook_tolerates_a_connector_less_stage():
+    assert text_encoder2diffusion_full_payload(pooling_output=None) is None
+    assert text_encoder2diffusion_full_payload(pooling_output={"encoder_hidden_states": None}) is None
+
+
+def test_full_payload_hook_rejects_mismatched_conditioning():
+    payload = _stage0_payload()
+    payload["token_tags"] = torch.zeros(9, 1, dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="align"):
+        text_encoder2diffusion_full_payload(pooling_output=payload)
+
+
+def test_inline_conditioning_still_reaches_the_diffusion_prompt():
+    prompt = text_encoder2diffusion(_source_outputs(_stage0_payload()), {"prompt": "a cat"})
+
+    conditioning = prompt["additional_information"]["text_encoder_output"]
+    assert conditioning["hidden_states"].shape == (4, MINIMAX_H3_TEXT_HIDDEN_SIZE)
+    assert conditioning["token_tags"].shape == (4,)
+
+
+@pytest.mark.parametrize("multimodal_output", [None, {}, {"encoder_hidden_states": torch.zeros(1)}])
+def test_prompt_passes_through_when_conditioning_travels_over_the_connector(multimodal_output):
+    prompt = text_encoder2diffusion(_source_outputs(multimodal_output), {"prompt": "a cat"})
+
+    assert prompt == {"prompt": "a cat"}
+
+
+def test_stage0_declares_the_producer_hook_the_connector_path_needs():
+    stage0, stage1 = MINIMAX_H3_PIPELINE.stages
+
+    assert stage0.custom_process_next_stage_input_func.endswith(".text_encoder2diffusion_full_payload")
+    assert stage1.stage_input_payload_keys == ("text_encoder_output",)
