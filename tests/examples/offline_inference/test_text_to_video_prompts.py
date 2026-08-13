@@ -3,12 +3,20 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from examples.offline_inference.text_to_video.text_to_video import (
+    _DEFAULT_CACHE_DIT_CONFIG,
+    _LINGBOT_CACHE_DIT_BALANCED_CONFIG,
     _MODEL_PRESETS,
+    _cache_dit_config,
     _detect_preset,
+    _extract_output_fps,
+    _extract_stage_durations,
+    _load_prompt_json,
     _normalize_float_tensor,
     build_text_to_video_prompt,
 )
@@ -32,6 +40,25 @@ def test_text_to_video_builds_canonical_prompt(
         assert "negative_prompt" not in result
     else:
         assert result["negative_prompt"] == expected_negative_prompt
+
+
+def test_text_to_video_preserves_structured_prompt() -> None:
+    prompt = {"shot": "tracking", "subject": {"description": "a courier"}}
+
+    result = build_text_to_video_prompt(prompt, None)
+
+    assert result["prompt"] is prompt
+
+
+def test_load_prompt_json_requires_one_object(tmp_path) -> None:
+    prompt_path = tmp_path / "prompt.json"
+    prompt_path.write_text('{"shot": "tracking"}')
+
+    assert _load_prompt_json(prompt_path) == {"shot": "tracking"}
+
+    prompt_path.write_text('["not", "an", "object"]')
+    with pytest.raises(ValueError, match="one structured prompt object"):
+        _load_prompt_json(prompt_path)
 
 
 @pytest.mark.parametrize(
@@ -65,6 +92,36 @@ def test_lingbot_preset_matches_lingbot_defaults() -> None:
         "flow_shift": 3.0,
         "output": "lingbot_video_output.mp4",
     }
+
+
+def test_cache_dit_uses_lingbot_quality_preset_without_sharing_mutable_state() -> None:
+    lingbot = _cache_dit_config("/models/custom", "CustomLingBotVideoPipeline")
+    default = _cache_dit_config("Wan-AI/Wan2.2-T2V-A14B", "WanPipeline")
+
+    assert lingbot == _LINGBOT_CACHE_DIT_BALANCED_CONFIG
+    assert default == _DEFAULT_CACHE_DIT_CONFIG
+    lingbot["Fn_compute_blocks"] = 99
+    assert _LINGBOT_CACHE_DIT_BALANCED_CONFIG["Fn_compute_blocks"] == 4
+
+
+def test_extract_output_metadata_for_reporting_and_export() -> None:
+    output = SimpleNamespace(
+        multimodal_output={
+            "fps": 20,
+            "metadata": {"video": {"fps": 24}},
+        },
+        stage_durations={"LingBotVideoPipeline.diffuse": 1.25},
+    )
+
+    assert _extract_output_fps([output], fallback=16) == 24.0
+    assert _extract_stage_durations([output]) == {"LingBotVideoPipeline.diffuse": 1.25}
+
+
+def test_extract_output_fps_falls_back_for_invalid_metadata() -> None:
+    output = SimpleNamespace(multimodal_output={"fps": "invalid"})
+
+    assert _extract_output_fps(output, fallback=16) == 16.0
+    assert _extract_stage_durations(output) == {}
 
 
 def test_normalize_float_tensor_preserves_zero_to_one_frames() -> None:
