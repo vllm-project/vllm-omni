@@ -13,6 +13,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
+from vllm_omni.worker.determinism import maybe_enable_determinism
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
@@ -77,6 +78,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # Set random seed.
             set_random_seed(self.model_config.seed)
+            maybe_enable_determinism()
 
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
