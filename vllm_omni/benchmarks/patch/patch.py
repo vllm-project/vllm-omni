@@ -85,6 +85,7 @@ from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
 from vllm_omni.experimental.fullduplex.client import (
+    PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
     build_realtime_url,
@@ -1819,6 +1820,15 @@ async def async_request_openai_realtime_duplex(
             pbar.update(1)
         return output
     realtime_pacing = bool(client_options.get("realtime_duplex_pacing", True))
+    max_input_ms = client_options.get("realtime_duplex_max_input_ms")
+    max_input_ms_i = int(max_input_ms) if isinstance(max_input_ms, (int, float)) else None
+    if max_input_ms_i is not None and max_input_ms_i <= 0:
+        output.error = "realtime_duplex_max_input_ms must be positive when set"
+        if pbar:
+            pbar.update(1)
+        return output
+    temperature = client_options.get("temperature")
+    temperature_f = float(temperature) if isinstance(temperature, (int, float)) else None
     fallback_path = str(getattr(request_func_input, "seed_tts_ref_wav_path", "") or "")
 
     try:
@@ -1840,6 +1850,7 @@ async def async_request_openai_realtime_duplex(
                 ),
                 native_duplex=True,
                 auto_response=True,
+                temperature=temperature_f,
                 extra_body={RETURN_STAGE_METRICS_FIELD: True},
                 session_id=session_id,
                 timeout_s=120.0,
@@ -1862,8 +1873,17 @@ async def async_request_openai_realtime_duplex(
                 errors_before = len(client.events.errors())
                 turn_started_at_s = time.monotonic()
                 transcript_hint = str(getattr(turn, "ref_text", "") or "").strip()
+                turn_pcm = _seed_tts_turn_pcm16(turn, fallback_path)
+                if max_input_ms_i is not None:
+                    max_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * max_input_ms_i // 1000
+                    turn_pcm = turn_pcm[:max_bytes]
+                    if not turn_pcm:
+                        raise ValueError(
+                            f"realtime_duplex_max_input_ms={max_input_ms_i} truncated "
+                            f"Seed-TTS turn {request_index} audio to empty"
+                        )
                 await client.stream_pcm16(
-                    _seed_tts_turn_pcm16(turn, fallback_path),
+                    turn_pcm,
                     chunk_ms=chunk_ms,
                     realtime=realtime_pacing,
                     hints={"transcript": transcript_hint} if transcript_hint else None,
@@ -1875,7 +1895,7 @@ async def async_request_openai_realtime_duplex(
                 await wait_for(
                     lambda: client.events.count("response.done") > done_before
                     or len(client.events.errors()) > errors_before,
-                    timeout_s=180.0,
+                    timeout_s=600.0,
                     label=f"Seed-TTS native duplex turn {request_index} response.done",
                 )
                 errors = client.events.errors()

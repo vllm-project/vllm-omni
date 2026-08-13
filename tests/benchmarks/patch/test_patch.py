@@ -322,6 +322,8 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
             "save_duplex_request_metrics": True,
             "realtime_duplex_chunk_ms": 200,
             "realtime_duplex_pacing": False,
+            "realtime_duplex_max_input_ms": 100,
+            "temperature": 0.0,
         },
     )
     request_input.seed_tts_turns = tuple(
@@ -349,11 +351,13 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     assert client.configure_kwargs["auto_response"] is True
     assert client.configure_kwargs["ref_audio"] == "data:audio/wav;base64,AAAA"
     assert client.configure_kwargs["instructions"] == "Speak exactly."
+    assert client.configure_kwargs["temperature"] == 0.0
     assert client.configure_kwargs["extra_body"] == {"return_stage_metrics": True}
     assert [kwargs for _, kwargs in client.streams] == [
         {"chunk_ms": 200, "realtime": False, "hints": {"transcript": f"spoken input {index}"}} for index in range(2)
     ]
-    assert all(len(pcm16) == 6400 for pcm16, _ in client.streams)
+    # 100ms @ 16kHz mono PCM16 = 3200 bytes (wavs are longer; max_input_ms truncates)
+    assert all(len(pcm16) == 3200 for pcm16, _ in client.streams)
     assert client.ack_count == 2
     assert output.success is True
     assert output.generated_text == "native turn 1 native turn 2"

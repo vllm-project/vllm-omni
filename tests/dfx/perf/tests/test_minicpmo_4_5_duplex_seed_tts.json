@@ -39,12 +39,74 @@
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "seed_tts_turns_per_session": 4,
-        "realtime_duplex_chunk_ms": 1000,
+        "realtime_duplex_chunk_ms": 200,
+        "temperature": 0.0,
         "expected_duplex_audio_turns_per_session": 4,
         "extra_body": {
-          "save_duplex_request_metrics": true
+          "save_duplex_request_metrics": true,
+          "realtime_duplex_max_input_ms": 1400
         },
-        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "request_throughput": [
+              0.011
+            ],
+            "mean_ttft_ms": [
+              6500.0
+            ],
+            "mean_tpot_ms": [
+              22.0
+            ],
+            "mean_e2el_ms": [
+              85000.0
+            ],
+            "mean_audio_ttfp_ms": [
+              6500.0
+            ],
+            "mean_audio_rtf": [
+              3.3
+            ],
+            "mean_duplex_global_ttft_ms": [
+              19000.0
+            ],
+            "mean_duplex_global_ttfp_ms": [
+              19000.0
+            ],
+            "mean_duplex_global_rtf": [
+              3.4
+            ]
+          },
+          "A3": {
+            "request_throughput": [
+              0.011
+            ],
+            "mean_ttft_ms": [
+              6500.0
+            ],
+            "mean_tpot_ms": [
+              22.0
+            ],
+            "mean_e2el_ms": [
+              85000.0
+            ],
+            "mean_audio_ttfp_ms": [
+              6500.0
+            ],
+            "mean_audio_rtf": [
+              3.3
+            ],
+            "mean_duplex_global_ttft_ms": [
+              19000.0
+            ],
+            "mean_duplex_global_ttfp_ms": [
+              19000.0
+            ],
+            "mean_duplex_global_rtf": [
+              3.4
+            ]
+          }
+        }
       }
     ]
   }
