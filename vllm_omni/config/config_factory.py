@@ -409,6 +409,10 @@ class StageConfigFactory:
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
+        from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
+
+        pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
+
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.

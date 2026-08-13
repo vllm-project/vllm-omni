@@ -36,6 +36,22 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
+# Preference chain for CUDA flash attention in diffusers, best first. Shared
+# with the accuracy tests' diffusers reference runs so both sides of a
+# similarity comparison resolve to the same backend on any given image
+# (hub kernels may lack a build variant for the image's torch).
+CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS: list[str] = [
+    "_flash_3_hub",
+    "_flash_3_varlen_hub",
+    "_flash_3",
+    "_flash_varlen_3",
+    "flash_hub",
+    "flash_varlen_hub",
+    "flash",
+    "flash_varlen",
+    "_native_flash",
+]
+
 _DIFFUSERS_CONFIG_LOAD_KWARGS = {
     "cache_dir",
     "dduf_entries",
@@ -279,19 +295,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     )
                     attention_backend_attempts.append("native")
                 else:
-                    attention_backend_attempts.extend(
-                        [
-                            "_flash_3_hub",
-                            "_flash_3_varlen_hub",
-                            "_flash_3",
-                            "_flash_varlen_3",
-                            "flash_hub",
-                            "flash_varlen_hub",
-                            "flash",
-                            "flash_varlen",
-                            "_native_flash",
-                        ]
-                    )
+                    attention_backend_attempts.extend(CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS)
             case "SAGE_ATTN":
                 attention_backend_attempts.extend(["sage_hub", "sage", "sage", "sage_varlen"])
             case "ASCEND":

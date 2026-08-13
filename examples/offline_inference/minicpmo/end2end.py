@@ -453,12 +453,6 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="Path to a stage configs file (deprecated; prefer --deploy-config).",
-    )
-    parser.add_argument(
         "--deploy-config",
         type=str,
         default=None,

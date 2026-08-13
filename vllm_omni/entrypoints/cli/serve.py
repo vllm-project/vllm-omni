@@ -7,6 +7,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 
 import argparse
 import json
+import math
 import os
 import signal
 from types import FrameType
@@ -41,6 +42,17 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+def _nonneg_finite_float(value: str) -> float:
+    """Argparse type for finite, non-negative floats (rejects nan/inf)."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {value!r}")
+    return parsed
 
 
 def _ensure_vllm_platform():
@@ -152,6 +164,13 @@ class OmniServeCommand(CLISubcommand):
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
+        lora_backend = getattr(args, "lora_backend", None)
+        lora_path = getattr(args, "lora_path", None)
+        if lora_backend == "distill" and not lora_path:
+            raise ValueError("--lora-backend distill requires --lora-path")
+        if (lora_backend or "peft") == "peft" and isinstance(lora_path, list) and len(lora_path) > 1:
+            raise ValueError("--lora-backend peft accepts only one startup LoRA path")
+
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
         omni_lb_policy = getattr(args, "omni_lb_policy", None)
         if omni_lb_policy is not None:
@@ -218,9 +237,8 @@ class OmniServeCommand(CLISubcommand):
             "VoiceDesign, or Base, while diffusion models may use it to select "
             "task-specific weights. If omitted, the model default is used.",
         )
-        # Forced aligner / word timestamps. --forced-aligner is the opt-in
-        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-        # live in the deploy YAML passed via --forced-aligner-config.
+        # Forced aligner / word timestamps. Either flag opts in (--forced-aligner-config
+        # alone works when its YAML sets the model); heavier knobs live in that YAML.
         omni_config_group.add_argument(
             "--forced-aligner",
             type=str,
@@ -240,6 +258,13 @@ class OmniServeCommand(CLISubcommand):
                 "gpu_memory_utilization, dtype, max_model_len). The --forced-aligner "
                 "flag, when set, overrides the YAML model field."
             ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Device(s) for the forced-aligner stage (e.g. '2'). Defaults to "
+            "sharing an existing stage's GPU when unset.",
         )
         omni_config_group.add_argument(
             "--deploy-config",
@@ -414,6 +439,32 @@ class OmniServeCommand(CLISubcommand):
                 "How to load the diffusion pipeline: native/registry (default), "
                 "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
             ),
+        )
+        omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            nargs="+",
+            default=None,
+            help=(
+                "LoRA checkpoint path(s) loaded when the diffusion server starts. "
+                "The distill backend accepts one file per pipeline transformer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=["peft", "distill"],
+            default=None,
+            help=(
+                "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
+                "into the base model at server startup; 'peft' uses the adapter manager."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",
@@ -599,7 +650,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
-            type=float,
+            type=_nonneg_finite_float,
             default=0.0,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
@@ -894,8 +945,6 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        # The serve CLI no longer accepts legacy stage_args YAMLs.
-        None,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.

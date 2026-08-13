@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from PIL import Image
 
@@ -15,6 +17,7 @@ from vllm_omni.model_extras import (
     build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
@@ -110,6 +113,31 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
     )
     assert get_extra_output_params("SenseNovaU1Pipeline") == frozenset({"think_text"})
     assert should_init_extra_args_for_non_diffusion_stages("SenseNovaU1Pipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_lingbot_extra_registry_declares_request_params() -> None:
+    assert get_extra_body_params("LingBotVideoPipeline") == frozenset(
+        {
+            "batch_cfg",
+            "duration",
+            "flow_shift",
+            "negative_prompt",
+            "null_cond_clone_zero",
+            "offload_vae_during_denoise",
+            "output_type",
+            "refiner_sigma_tail_steps",
+            "resolution",
+            "ratio",
+            "shift",
+            "t_thresh",
+        }
+    )
+    assert get_extra_output_params("LingBotVideoPipeline") == frozenset()
+    assert get_output_tensor_range("LingBotVideoPipeline") == "zero_to_one"
+    assert get_output_tensor_range("WanPipeline") == "negative_one_to_one"
+    assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
 
 
 @pytest.mark.core_model
@@ -258,8 +286,11 @@ def test_ming_flash_omni_declared_extra_args_route_into_sampling_params() -> Non
 def test_ming_flash_omni_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
         "MingImagePipeline",
-        prompt="Please draw a cute cat.",
-        negative_prompt="ugly, blurry",
+        {
+            "prompt": "Please draw a cute cat.",
+            "modalities": ["image"],
+            "negative_prompt": "ugly, blurry",
+        },
         height=512,
         width=768,
     ) == {
@@ -276,8 +307,7 @@ def test_ming_flash_omni_text_to_image_prompt_builder() -> None:
     # pipeline's 1024x1024 default still applies.
     assert build_text_to_image_prompt(
         "MingImagePipeline",
-        prompt="Draw a poster.",
-        negative_prompt=None,
+        {"prompt": "Draw a poster.", "modalities": ["image"]},
     ) == {
         "prompt": "Draw a poster.",
         "modalities": ["image"],
@@ -305,28 +335,6 @@ def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
         "target_w": 256,
     }
     assert "negative_prompt" not in result
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-@pytest.mark.parametrize("pipeline_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
-def test_cosmos3_text_to_image_prompt_builder_selects_image_modality(pipeline_name: str) -> None:
-    assert build_text_to_image_prompt(
-        pipeline_name,
-        prompt="a red sports car at golden hour",
-        negative_prompt="blurry, distorted",
-        height=1024,
-        width=1024,
-    ) == {
-        "prompt": "a red sports car at golden hour",
-        "modalities": ["image"],
-        "negative_prompt": "blurry, distorted",
-    }
-    assert build_text_to_image_prompt(
-        pipeline_name,
-        prompt="a red sports car",
-        negative_prompt=None,
-    ) == {"prompt": "a red sports car", "modalities": ["image"]}
 
 
 @pytest.mark.core_model
@@ -421,8 +429,11 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
 def test_bagel_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
         "BagelPipeline",
-        prompt="a cat",
-        negative_prompt="blurry",
+        {
+            "prompt": "a cat",
+            "modalities": ["image"],
+            "negative_prompt": "blurry",
+        },
         height=512,
         width=768,
     ) == {
@@ -459,14 +470,17 @@ def test_bagel_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_unknown_pipeline_uses_default_text_to_image_prompt() -> None:
-    assert build_text_to_image_prompt(
-        "UnknownPipeline",
-        prompt="a cat",
-        negative_prompt=None,
-        height=512,
-        width=512,
-    ) == {"prompt": "a cat"}
+def test_unknown_pipeline_preserves_canonical_text_to_image_prompt() -> None:
+    canonical_prompt = {"prompt": "a cat", "modalities": ["image"]}
+    assert (
+        build_text_to_image_prompt(
+            "UnknownPipeline",
+            canonical_prompt,
+            height=512,
+            width=512,
+        )
+        is canonical_prompt
+    )
 
 
 @pytest.mark.core_model
@@ -485,12 +499,14 @@ def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
     }
 
 
-def _build_vace_prompt(media_inputs: dict[str, object], *, num_frames: int = 5) -> dict:
+def _build_vace_prompt(media_inputs: dict[str, Any], *, num_frames: int = 5) -> dict:
     return build_image_to_video_prompt(
         "WanVACEPipeline",
-        prompt="a bird flying",
-        negative_prompt=None,
-        media_inputs=media_inputs,
+        {
+            "prompt": "a bird flying",
+            "modalities": ["video"],
+            "multi_modal_data": media_inputs,
+        },
         height=16,
         width=320,
         num_frames=num_frames,
@@ -513,7 +529,7 @@ def _build_vace_prompt(media_inputs: dict[str, object], *, num_frames: int = 5) 
     ],
     ids=["i2v", "v2lf", "flf2v", "inpaint", "r2v"],
 )
-def test_vace_image_to_video_prompt_builder(media_inputs: dict[str, object]) -> None:
+def test_vace_image_to_video_prompt_builder(media_inputs: dict[str, Any]) -> None:
     result = _build_vace_prompt(media_inputs)
     mmd = result["multi_modal_data"]
     if "reference_images" in mmd:
@@ -532,7 +548,7 @@ def test_vace_image_to_video_prompt_builder(media_inputs: dict[str, object]) -> 
         ({"control_image": Image.new("RGB", (320, 16))}, "Unsupported VACE media input"),
     ],
 )
-def test_vace_rejects_invalid_media_combinations(media_inputs: dict[str, object], message: str) -> None:
+def test_vace_rejects_invalid_media_combinations(media_inputs: dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         _build_vace_prompt(media_inputs)
 
@@ -580,8 +596,7 @@ def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> N
 
     wrapper_prompt = build_text_to_image_prompt(
         "MammothModa2ForConditionalGeneration",
-        prompt="a cat",
-        negative_prompt=None,
+        {"prompt": "a cat", "modalities": ["image"]},
         height=256,
         width=256,
     )
@@ -595,8 +610,11 @@ def test_mammothmoda2_text_to_image_prompt_builder() -> None:
     # prompt is ignored (MammothModa2 t2i uses CFG, not an explicit negative path).
     assert build_text_to_image_prompt(
         "MammothModa2DiTPipeline",
-        prompt="a cat",
-        negative_prompt="blurry",
+        {
+            "prompt": "a cat",
+            "modalities": ["image"],
+            "negative_prompt": "blurry",
+        },
         height=512,
         width=768,
     ) == {

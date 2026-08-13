@@ -159,7 +159,7 @@ def test_soulxsinger_multistage_from_audio(
 
     with OmniRunner(
         model,
-        stage_configs_path=get_deploy_config_path(deploy_yaml),
+        deploy_config=get_deploy_config_path(deploy_yaml),
         async_chunk=False,
     ) as runner:
         sampling = OmniDiffusionSamplingParams(
@@ -212,7 +212,7 @@ def test_soulxsinger_svs_precomputed(soulx_weights: tuple[Path, Path, Path]) -> 
 
     with OmniRunner(
         str(base_dir),
-        stage_configs_path=get_deploy_config_path("soulxsinger_svs.yaml"),
+        deploy_config=get_deploy_config_path("soulxsinger_svs.yaml"),
         async_chunk=False,
     ) as runner:
         sampling = OmniDiffusionSamplingParams(

@@ -46,6 +46,8 @@ def apply_rotary_emb_mindiesd(
 ) -> torch.Tensor:
     from mindiesd import rotary_position_embedding
 
+    x, squeezed = _ensure_batch_dim(x)
+
     if cos.dim() == 3:
         # (B, S, D/2) -> (S, D/2)
         cos = cos[0]
@@ -57,13 +59,14 @@ def apply_rotary_emb_mindiesd(
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+    return _restore_batch_dim(out, squeezed)
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -190,7 +193,16 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        # Keep the full-dimension NeoX form inline for MUSA compilation.
+        # Other layouts use the shared native implementation.
+        if self.half_head_dim or self.interleaved:
+            return self.forward_native(x, cos, sin)
+        if cos.dim() == 3:
+            cos, sin = cos[0], sin[0]
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
     def forward_native(
         self,

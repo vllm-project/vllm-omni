@@ -896,23 +896,59 @@ def connect_remote_diffusion_proc(
 def scoped_spawn_device_env(
     stage_visible_devices: str | None,
     spawn_device_lock: threading.Lock | None,
+    *,
+    stage_id: int | None = None,
+    replica_id: int | None = None,
 ) -> Iterator[None]:
     """Briefly scope device visibility while spawning a stage subprocess."""
-    if stage_visible_devices is None or spawn_device_lock is None:
+    with _scoped_replica_compile_cache_env(stage_id, replica_id):
+        if stage_visible_devices is None or spawn_device_lock is None:
+            yield
+            return
+
+        device_control_env = current_omni_platform.device_control_env_var
+        with spawn_device_lock:
+            previous_visible_devices = os.environ.get(device_control_env)
+            try:
+                current_omni_platform.set_device_control_env_var(stage_visible_devices)
+                yield
+            finally:
+                if previous_visible_devices is None:
+                    current_omni_platform.unset_device_control_env_var()
+                else:
+                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+
+_COMPILE_CACHE_ENV_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _scoped_replica_compile_cache_env(stage_id: int | None, replica_id: int | None) -> Iterator[None]:
+    """Give additional replicas an isolated VLLM_CACHE_ROOT at spawn time.
+
+    Replicas of the same stage compile the same model concurrently; vLLM
+    0.27's AOT compile (TritonBundler) races on the shared cache dir and a
+    replica can then die with 'Cubin file saved by TritonBundler not found'
+    (build 2954, Multi-Replica perf). Replica 0 keeps the default shared
+    cache so single-replica deployments stay warm; every further replica
+    compiles into its own subdirectory.
+    """
+    if not replica_id or replica_id <= 0:
         yield
         return
 
-    device_control_env = current_omni_platform.device_control_env_var
-    with spawn_device_lock:
-        previous_visible_devices = os.environ.get(device_control_env)
+    base = os.environ.get("VLLM_CACHE_ROOT") or os.path.expanduser("~/.cache/vllm")
+    isolated = os.path.join(base, f"omni_stage{stage_id if stage_id is not None else 'x'}_replica{replica_id}")
+    with _COMPILE_CACHE_ENV_LOCK:
+        previous = os.environ.get("VLLM_CACHE_ROOT")
+        os.environ["VLLM_CACHE_ROOT"] = isolated
         try:
-            current_omni_platform.set_device_control_env_var(stage_visible_devices)
             yield
         finally:
-            if previous_visible_devices is None:
-                current_omni_platform.unset_device_control_env_var()
+            if previous is None:
+                os.environ.pop("VLLM_CACHE_ROOT", None)
             else:
-                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+                os.environ["VLLM_CACHE_ROOT"] = previous
 
 
 @contextlib.contextmanager
@@ -1007,7 +1043,9 @@ def _launch_omni_core_engines(
                 # an OmniCoordClientForStage and heartbeats to the coordinator.
                 from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-                with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                with scoped_spawn_device_env(
+                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                ):
                     local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
                         local_engine_count=local_engine_count,
                         start_index=start_index,
@@ -1022,7 +1060,9 @@ def _launch_omni_core_engines(
                         omni_replica_base_id=replica_id,
                     )
             else:
-                with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                with scoped_spawn_device_env(
+                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                ):
                     local_engine_manager = CoreEngineProcManager(
                         local_engine_count=local_engine_count,
                         start_index=start_index,
@@ -1104,7 +1144,7 @@ def launch_stage_replica(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id):
         engine_manager = StageEngineCoreProcManager(
             local_engine_count=1,
             start_index=0,

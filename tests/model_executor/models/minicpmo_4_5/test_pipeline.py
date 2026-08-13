@@ -157,6 +157,7 @@ class TestDeployTopology:
         assert connector["name"] == "SharedMemoryConnector"
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
+        assert connector["extra"]["enable_hift_graph"] is True
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
@@ -167,7 +168,7 @@ class TestDeployTopology:
             assert memory_utilizations == [
                 0.55,
                 0.15,
-                0.15,
+                0.18,
             ]
             assert sum(memory_utilizations) <= 0.9 + 1e-6
             # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).

@@ -21,8 +21,6 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # if you are adding a new model and see the tests below fail, please follow the pattern
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
-    "QwenImageEditPipeline",
-    "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
@@ -40,6 +38,7 @@ EXCLUDED_MODELS = [
     "WanT2VDMD2Pipeline",
     "WanI2VDMD2Pipeline",
     "LongCatImagePipeline",
+    "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
     "LancePipeline",
@@ -47,7 +46,6 @@ EXCLUDED_MODELS = [
     "InternVLAA1Pipeline",
     "LongCatImageEditPipeline",
     "StableDiffusion3Pipeline",
-    "FluxKontextPipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
