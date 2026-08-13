@@ -150,6 +150,76 @@ class RMSNorm(CustomOp):
         return out.to(input_dtype)
 
 
+class AddRMSNorm(RMSNorm):
+    """Residual addition followed by RMSNorm.
+
+    NPU executes both operations with ``npu_add_rms_norm``. Other platforms
+    preserve the unfused residual-add semantics and reuse the corresponding
+    :class:`RMSNorm` implementation.
+    """
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = residual + x
+        if torch.compiler.is_compiling():
+            output = RMSNorm.forward_native(self, residual)
+        else:
+            try:
+                output = self._forward_fused(residual)
+            except Exception:
+                output = RMSNorm.forward_native(self, residual)
+        return output, residual
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_cuda(x, residual)
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = residual + x
+        return RMSNorm.forward_musa(self, residual), residual
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch_npu
+
+        output, _, residual = torch_npu.npu_add_rms_norm(
+            x,
+            residual,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return output, residual
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = residual + x
+        return RMSNorm.forward_native(self, residual), residual
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = residual + x
+        return RMSNorm.forward_native(self, residual), residual
+
+
 class RMSNormVAE(CustomOp):
     """Root Mean Square Layer Normalization for Channel-First or Last"""
 

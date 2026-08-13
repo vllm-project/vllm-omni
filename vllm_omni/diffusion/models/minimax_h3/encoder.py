@@ -39,7 +39,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.diffusion.layers.norm import (
+    AddRMSNorm as DiffusionAddRMSNorm,
+    RMSNorm as DiffusionRMSNorm,
+)
 from vllm_omni.diffusion.layers.sdpa import ScaledDotProductAttention as DiffusionScaledDotProductAttention
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -312,8 +315,23 @@ class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
         super().__init__(hidden_size, eps=eps, dtype=dtype)
 
 
+class MiniMaxH3Qwen3VLAddRMSNorm(DiffusionAddRMSNorm):
+    """Qwen3-VL residual-add RMSNorm with platform-specific dispatch."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__(hidden_size, eps=eps, dtype=dtype)
+
+
 class MiniMaxH3Qwen3VLScaledDotProductAttention(DiffusionScaledDotProductAttention):
     """Qwen3-VL SDPA using the common platform-dispatched implementation."""
+
+    def __init__(self, causal: bool = False) -> None:
+        super().__init__(causal=causal)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -761,7 +779,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
         self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
         self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
+        self.post_attention_layernorm = MiniMaxH3Qwen3VLAddRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
 
@@ -773,10 +791,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
