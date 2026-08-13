@@ -9,6 +9,39 @@
 
 ## 2. 快速启动
 
+### 2.1 环境准备
+
+cd /vllm-workspace/vllm-omni
+pip install stepaudio2-minicpmo
+pip install step-audio2 --no-deps
+SETUPTOOLS_SCM_PRETEND_VERSION=0.25.0 pip install -e .
+
+### 2.2 启动服务
+
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+vllm serve /workspace/shared_assets/models/OpenBMB/MiniCPM-o-4_5 --omni \
+    --served-model-name openbmb/MiniCPM-o-4_5 \
+    --trust-remote-code \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
+    --stage-init-timeout 600 \
+    --host 0.0.0.0 --port 8091
+
+### 2.3 文本验证
+
+curl http://127.0.0.1:8091/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"openbmb/MiniCPM-o-4_5","messages":[{"role":"user","content":"你好"}],"max_tokens":128}'
+
+### 2.4 TTS 验证
+
+curl http://127.0.0.1:8091/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "model":"openbmb/MiniCPM-o-4_5",
+    "messages":[{"role":"user","content":"打个招呼"}],
+    "modalities":["text","audio"],
+    "chat_template_kwargs":{"use_tts_template":true}
+    }'
 
 ## 3. 环境要求
 | 项目 | 版本 |
@@ -46,12 +79,63 @@
 
 ## 8. 文件结构
 
+vllm-omni/
+├── submission/
+│ ├── README.md
+│ ├── accuracy_report.md
+│ ├── performance_report.md
+│ ├── fuxian.md
+│ ├── requirements.txt
+│ ├── code_changes.diff
+│ ├── benchmark/
+│ │ ├── baseline_raw.json
+│ │ └── optimized_new.json
+│ ├── scripts/
+│ │ ├── daily_omni.sh
+│ │ ├── seed_tts.sh
+│ │ └── videomme.sh
+│ └── demo/
+│ └── gradio_demo.sh
+├── vllm_omni/deploy/
+│ └── minicpmo_4_5.yaml
+├── vllm_omni/engine/
+│ └── async_omni_engine.py
+├── vllm_omni/model_executor/models/step_audio2/
+│ └── step_audio2_token2wav.py
+└── vllm_omni/benchmarks/data_modules/
+└── videomme_dataset.py
 
 ## 9. 局限性
-1. ASV 未测出: bench 模块缺少参考音频配置（seed_tts_sim_evaluated=0），非模型问题。WER 全量 32 条已测出，0.83%，优于基线 41%。
-2. TTFP 劣于官方基线: Talker->Token2Wav 首包链路存在固有延迟。
-3. 单卡参数调优空间已穷尽，未尝试 FP8 量化或后端代码修改。
 
+### 9.1 stepaudio2 兼容性
+
+当前环境实测：`from stepaudio2 import Token2wav` 和 `HiFTGenerator` 导入均正常，无需手动修复命名冲突。
+
+### 9.2 NPU 配置空间限制
+
+vllm-omni v0.25.0-a3 NPU 后端实测不支持以下方向：
+- `enable_prefix_caching=true`：Orchestrator 初始化失败
+- `async_scheduling=true`：启动失败
+- `max_num_seqs=2`：stage 协调崩溃
+- `enforce_eager=true`：TTFP 劣化至 3361ms
+- `compilation_config.capture_sizes`：PIECEWISE 下无增益
+- `compilation_config.cudagraph_num_of_warmups`：同上
+- `gpu_memory_utilization>0.55`：单卡共用无收益
+- `quantization: fp8`：需额外参数，未成功
+- `quantization: int8`：Unknown quantization method
+- `quantization: ascend`：需 ModelSlim 预量化模型
+- `quantization: fp8_per_tensor`：NPU 不支持
+- `quantization: fp8_per_block`：NPU 不支持
+- `quantization: fbgemm_fp8`：NPU 不支持
+- `cudagraph_mode: DISABLE`：NPU 不支持
+
+### 9.3 910C 双 Die
+
+910C 为双 Die 架构，若出现算子缺失或 stage 超时，建议显式绑定单 Die（`ASCEND_RT_VISIBLE_DEVICES=0`）或改用 2 卡布局。
+
+### 9.4 精度与性能权衡
+
+当前优化以精度不下降为前提（降幅 ≤ 2pp）。配置层面优化已穷尽，主要瓶颈在引擎层 stage 调度。
 ## 10. 交付材料
 | # | 交付物 | 状态 |
 |---|--------|------|
@@ -64,3 +148,4 @@
 | 7 | performance_report.md | 完成 |
 | 8 | fuxian.md | 完成 |
 | 9 | manual_wer_sample.json | 完成 |
+
