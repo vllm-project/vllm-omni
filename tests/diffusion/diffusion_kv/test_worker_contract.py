@@ -284,3 +284,42 @@ def test_dense_worker_call_does_not_extend_model_runner_signature() -> None:
     worker.execute_model(req, SimpleNamespace())
 
     assert calls == [(req, None)]
+
+
+def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    class ModelRunner:
+        def execute_model(self, req, **kwargs):
+            calls.append((req, kwargs))
+            return DiffusionOutput(output=None)
+
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = ModelRunner()
+    worker.lora_manager = None
+    worker._get_profiler = lambda: None
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank",
+        lambda: 1,
+    )
+    req_0 = SimpleNamespace(request_id="req-0")
+    req_1 = SimpleNamespace(request_id="req-1")
+    metadata_0 = make_metadata("req-0")
+    metadata_1 = make_metadata("req-1")
+    envelopes = [
+        NewRequestData(request_id="req-0", req=req_0, diffusion_kv_metadata=metadata_0),
+        NewRequestData(request_id="req-1", req=req_1, diffusion_kv_metadata=metadata_1),
+    ]
+
+    result = worker.execute_model(envelopes, SimpleNamespace())
+
+    assert calls == [
+        (
+            req_1,
+            {
+                "kv_prefetch_job": None,
+                "diffusion_kv_metadata": metadata_1,
+            },
+        )
+    ]
+    assert result["dp_rank"] == 1

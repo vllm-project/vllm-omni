@@ -187,6 +187,57 @@ def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
     fake_executor.shutdown.assert_called_once_with()
 
 
+def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+    expected_profile_request = object()
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    kv_cache_config = object()
+    kv_vllm_config = object()
+    od_config = SimpleNamespace(diffusion_kv_mode="paged_scheduler")
+
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_init_executor",
+        lambda self, config: setattr(self, "executor", fake_executor),
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_prepare_diffusion_kv_profile_request",
+        lambda self: events.append("prepare-profile") or expected_profile_request,
+    )
+
+    def initialize(executor, config, *, profile_request):
+        events.append("profile-workers")
+        assert executor is fake_executor
+        assert config is od_config
+        assert profile_request is expected_profile_request
+        return kv_cache_config, 16, 16, kv_vllm_config
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        initialize,
+    )
+
+    def init_scheduler(self, config, scheduler, *args, **kwargs):
+        events.append("initialize-scheduler")
+        self.scheduler = SimpleNamespace(close=Mock())
+
+    monkeypatch.setattr(DiffusionEngine, "_init_scheduler", init_scheduler)
+    monkeypatch.setattr(DiffusionEngine, "_init_runtime_state", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_init_execute_fn", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_log_execution_mode", lambda self, config: None)
+
+    DiffusionEngine(od_config)
+
+    assert events == ["prepare-profile", "profile-workers", "initialize-scheduler"]
+
+
 @pytest.mark.asyncio
 async def test_step_compatibility_wrapper_returns_final_batch() -> None:
     engine = _make_engine()

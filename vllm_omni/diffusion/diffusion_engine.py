@@ -28,10 +28,12 @@ from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
+    get_dummy_run_num_image_inputs,
     image_color_format,
     supports_audio_output,
     supports_multimodal_input,
@@ -192,9 +194,11 @@ class DiffusionEngine:
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
+            profile_request = self._prepare_diffusion_kv_profile_request()
             kv_control_plane = initialize_diffusion_kv_control_plane(
                 self.executor,
                 od_config,
+                profile_request=profile_request,
             )
             if kv_control_plane is None:
                 self._init_scheduler(od_config, scheduler)
@@ -906,47 +910,86 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        num_inference_steps = 1
-        height = 512
-        width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+    def _make_dummy_request(
+        self,
+        *,
+        height: int,
+        width: int,
+        guidance_scale: float,
+        num_image_inputs: int = 1,
+    ) -> OmniDiffusionRequest | None:
+        """Build a one-step model request for startup profiling or warmup."""
 
+        prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
-            # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+            images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
+            prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
 
         if supports_audio_input:
             audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+            prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:
-            logger.info("Skipping dummy warmup run (num_frames=0)")
-            return
-        req = OmniDiffusionRequest(
+            return None
+        return OmniDiffusionRequest(
             prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=1,
                 num_frames=num_frames,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
+                guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
+
+    def _prepare_diffusion_kv_profile_request(self) -> OmniDiffusionRequest | None:
+        """Prepare the model request used to profile paged-KV headroom.
+
+        The profile executes directly on each Worker before the Scheduler and
+        its KV manager exist. Hunyuan is currently the only model integrated
+        with ``paged_scheduler``; its supported default 1024x1024 image size
+        and enabled CFG exercise the first-step activation peak. Future paged
+        model integrations must extend this recipe for their serving limits
+        (for example, video frame count) rather than reusing it silently.
+        """
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            return None
+        request = self._make_dummy_request(
+            height=1024,
+            width=1024,
+            guidance_scale=5.0,
+            num_image_inputs=get_dummy_run_num_image_inputs(self.od_config.model_class_name),
+        )
+        if request is None:
+            raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
+        request = self._prepare_request_for_admission(request)
+        # Preprocessing owns request geometry and prepared model inputs, but
+        # its native KV requests remain Scheduler-only mutable state. The
+        # profile bypasses Scheduler admission and must not send them to the
+        # Worker.
+        request.diffusion_kv_requests = None
+        return request
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        req = self._make_dummy_request(
+            height=512,
+            width=512,
+            guidance_scale=0.0,
+        )
+        if req is None:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         logger.info("dummy run to warm up the model")
         output = self.add_req_and_wait_for_response(req)
         if output.error:

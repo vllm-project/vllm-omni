@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -112,52 +114,91 @@ def test_worker_selects_its_rank_local_config() -> None:
 
 def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
+    worker.rank = 0
     worker.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(kv_cache_memory_bytes=4096))
+    worker.init_snapshot = SimpleNamespace(free_memory=16384)
+    worker.requested_memory = 8192
+    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=1024)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
+    profile_request = object()
 
-    assert worker.determine_available_kv_memory() == [4096]
+    assert worker.determine_available_kv_memory(profile_request) == [4096]
+    worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
-def test_worker_treats_zero_kv_memory_budget_as_unset(monkeypatch) -> None:
+def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
-    worker.device = torch.device("cpu")
-    worker.local_rank = 0
+    worker.rank = 0
+    worker.init_snapshot = SimpleNamespace(free_memory=900)
+    worker.requested_memory = 750
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kv_cache_memory_bytes=0,
             gpu_memory_utilization=0.75,
         )
     )
+    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=100)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
-    monkeypatch.setattr(
-        diffusion_worker_module.current_omni_platform,
-        "get_device_memory",
-        lambda _device: (200, 1000),
+    profile_result = SimpleNamespace(
+        non_kv_cache_memory=400,
+        after_profile=SimpleNamespace(free_memory=500),
     )
-    monkeypatch.setattr(diffusion_worker_module, "get_process_gpu_memory", lambda _rank: 400)
+    monkeypatch.setattr(
+        diffusion_worker_module,
+        "memory_profiling",
+        lambda snapshot, weights_memory: nullcontext(profile_result),
+    )
+    profile_request = object()
 
-    assert worker.determine_available_kv_memory() == [350]
+    assert worker.determine_available_kv_memory(profile_request) == [350]
+    worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
-def test_worker_derives_kv_budget_from_process_residency(monkeypatch) -> None:
+def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
-    worker.device = torch.device("cpu")
-    worker.local_rank = 0
+    worker.rank = 0
+    worker.init_snapshot = SimpleNamespace(free_memory=1200)
+    worker.requested_memory = 1000
     worker.vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             kv_cache_memory_bytes=None,
-            gpu_memory_utilization=0.75,
+            gpu_memory_utilization=0.8,
         )
     )
+    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=250)
     monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
-    monkeypatch.setattr(
-        diffusion_worker_module.current_omni_platform,
-        "get_device_memory",
-        lambda _device: (200, 1000),
+    profile_result = SimpleNamespace(
+        non_kv_cache_memory=650,
+        after_profile=SimpleNamespace(free_memory=550),
     )
-    monkeypatch.setattr(diffusion_worker_module, "get_process_gpu_memory", lambda _rank: 400)
+    profiling_calls = []
 
-    assert worker.determine_available_kv_memory() == [350]
+    def profile(snapshot, *, weights_memory):
+        profiling_calls.append((snapshot, weights_memory))
+        return nullcontext(profile_result)
+
+    monkeypatch.setattr(
+        diffusion_worker_module,
+        "memory_profiling",
+        profile,
+    )
+    profile_request = object()
+
+    assert worker.determine_available_kv_memory(profile_request) == [350]
+    assert profiling_calls == [(worker.init_snapshot, 250)]
+    worker.model_runner.profile_run.assert_called_once_with(profile_request)
+
+
+def test_worker_rejects_profile_without_preload_snapshot(monkeypatch) -> None:
+    worker = object.__new__(DiffusionWorker)
+    worker.init_snapshot = None
+    worker.requested_memory = None
+    worker.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(kv_cache_memory_bytes=None))
+    worker.model_runner = SimpleNamespace()
+    monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
+
+    with pytest.raises(RuntimeError, match="snapshot was not captured before model loading"):
+        worker.determine_available_kv_memory(object())
 
 
 def test_rank_probe_gathers_local_failure_before_raising(monkeypatch) -> None:

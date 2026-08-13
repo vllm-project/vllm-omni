@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
@@ -128,11 +129,12 @@ class DiffusionExecutor(ABC):
             raise TypeError(f"get_kv_cache_specs returned {type(result).__name__}, expected list")
         return result
 
-    def determine_available_kv_memory(self) -> list[int]:
-        """Collect the KV memory budget calculated on every Worker rank."""
+    def determine_available_kv_memory(self, profile_request: OmniDiffusionRequest) -> list[int]:
+        """Profile and collect the KV memory budget on every Worker rank."""
 
         result = self.collective_rpc(
             "determine_available_kv_memory",
+            args=(profile_request,),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )

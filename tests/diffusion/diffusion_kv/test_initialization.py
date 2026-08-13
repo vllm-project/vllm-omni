@@ -22,11 +22,13 @@ class _Executor:
         self.specs = [{"layer0": object()}, {"layer0": object()}]
         self.memory = [1024, 1024]
         self.configs = None
+        self.profile_request = None
 
     def get_kv_cache_specs(self):
         return self.specs
 
-    def determine_available_kv_memory(self):
+    def determine_available_kv_memory(self, profile_request):
+        self.profile_request = profile_request
         return self.memory
 
     def set_kv_cache_configs(self, configs) -> None:
@@ -69,6 +71,7 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     )
     worker_configs = [object(), object()]
     scheduler_config = object()
+    profile_request = object()
     monkeypatch.setattr(initialization, "create_diffusion_vllm_config", lambda *args, **kwargs: vllm_config)
     build = Mock(return_value=(worker_configs, scheduler_config))
     monkeypatch.setattr(
@@ -81,12 +84,14 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     result = initialization.initialize_diffusion_kv_control_plane(
         executor,
         od_config,
+        profile_request=profile_request,
         device=torch.device("cpu"),
     )
 
     build.assert_called_once_with(vllm_config, executor.specs, executor.memory)
     assert result == (scheduler_config, 16, 16, vllm_config)
     assert executor.configs == worker_configs
+    assert executor.profile_request is profile_request
 
 
 def test_dense_mode_skips_worker_kv_initialization(monkeypatch) -> None:
@@ -112,6 +117,16 @@ def test_control_plane_rejects_rank_count_mismatch(monkeypatch) -> None:
         initialization.initialize_diffusion_kv_control_plane(
             executor,
             od_config,
+            profile_request=object(),
+            device=torch.device("cpu"),
+        )
+
+
+def test_paged_control_plane_requires_prepared_profile_request() -> None:
+    with pytest.raises(ValueError, match="prepared memory profile request"):
+        initialization.initialize_diffusion_kv_control_plane(
+            _Executor(),
+            _od_config(),
             device=torch.device("cpu"),
         )
 
@@ -196,6 +211,15 @@ def test_dense_config_keeps_new_paged_sizing_inputs_inactive() -> None:
     assert vllm_config.scheduler_config.max_num_batched_tokens == original_token_budget
 
 
+def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -> None:
+    vllm_config = diffusion_vllm_config.create_diffusion_vllm_config(
+        torch.device("cpu"),
+        _od_config(gpu_memory_utilization=0.42),
+    )
+
+    assert vllm_config.cache_config.gpu_memory_utilization == 0.42
+
+
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     quantization_config = build_quant_config(
         {
@@ -214,8 +238,16 @@ def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     assert model_config.dtype is torch.bfloat16
     assert model_config.quantization == "modelopt"
     assert model_config.quantization_config is quantization_config
-    assert model_config.is_quantized()
+    assert model_config.is_quantized
     assert model_config.original_max_model_len == model_config.max_model_len
+
+    unquantized_model_config = diffusion_vllm_config._make_diffusion_vllm_model_config(
+        _od_config(
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            quantization_config=None,
+        )
+    )
+    assert not unquantized_model_config.is_quantized
 
 
 def test_minus_one_max_model_len_uses_model_limit() -> None:

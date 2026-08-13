@@ -29,6 +29,17 @@ def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
         else:
             return configured
 
+    # ``max_model_len`` keeps the native vLLM meaning: the per-sequence KV
+    # admission ceiling consumed by ``KVCacheManager``. HunyuanImage3 exposes
+    # that ceiling directly as ``max_position_embeddings`` because its text,
+    # reference-image, and generated-image tokens share one Transformer
+    # sequence. Other diffusion models commonly express their serving limits
+    # through resolution, duration, or frame-count constraints instead. When
+    # paged KV support expands to those models, the model integration must
+    # derive ``max_model_len`` from its serving limits, while model-owned
+    # preprocessing validates each request and derives its matching
+    # ``seq_len``. Text-encoder length fields must not be mistaken for the DiT
+    # KV limit.
     hf_config = getattr(od_config, "tf_model_config", None)
     for field_name in ("max_position_embeddings", "max_sequence_length", "seq_length"):
         value = getattr(hf_config, field_name, None)
@@ -70,6 +81,7 @@ class _DiffusionVllmModelConfig:
     use_mla: bool = False
     is_moe: bool = False
 
+    @property
     def is_quantized(self) -> bool:
         return self.quantization is not None
 

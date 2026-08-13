@@ -532,7 +532,7 @@ class TestRequestScheduler:
 
         assert finished == {"impossible", "schedulable"}
 
-    def test_diffusion_kv_internal_allocation_error_propagates(self, monkeypatch) -> None:
+    def test_diffusion_kv_internal_allocation_error_finishes_request(self, monkeypatch) -> None:
         _initialize_paged_scheduler(self.scheduler)
         request = _make_request("native-error")
         _attach_diffusion_kv(request)
@@ -549,8 +549,14 @@ class TestRequestScheduler:
             raise_native_error,
         )
 
-        with pytest.raises(ValueError, match="native allocation bug"):
-            self.scheduler.schedule()
+        sched_output = self.scheduler.schedule()
+
+        state = self.scheduler.get_request_state("native-error")
+        assert state is not None
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "native allocation bug"
+        assert sched_output.finished_req_ids == {"native-error"}
+        assert sched_output.scheduled_request_ids == []
 
     def test_diffusion_kv_preemption_retains_allocation(self) -> None:
         _initialize_paged_scheduler(self.scheduler, num_blocks=3)

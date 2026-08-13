@@ -64,9 +64,6 @@ class BaseScheduler(ABC):
         hash_block_size: int | None = None,
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
-        if self._diffusion_kv_manager is not None:
-            self._diffusion_kv_manager.close()
-            self._diffusion_kv_manager = None
         self.od_config = od_config
         self._request_states.clear()
         self._step_id = 0
@@ -155,10 +152,16 @@ class BaseScheduler(ABC):
                             request_id,
                             state.diffusion_kv_requests,
                         )
-                    except DiffusionKVAdmissionError as exc:
-                        # A request-specific admission failure should not
-                        # terminate the Engine busy loop. Internal/native cache
-                        # errors deliberately propagate instead.
+                    except Exception as exc:
+                        # schedule() runs outside the Engine execution-error
+                        # wrapper. Convert both expected admission failures and
+                        # unexpected native allocator failures into a terminal
+                        # request error so the busy loop can wake its stream.
+                        if not isinstance(exc, DiffusionKVAdmissionError):
+                            logger.exception(
+                                "Unexpected Diffusion KV allocation failure for request %s",
+                                request_id,
+                            )
                         self._finish_requests(
                             {request_id: DiffusionRequestStatus.FINISHED_ERROR},
                             {request_id: str(exc)},
