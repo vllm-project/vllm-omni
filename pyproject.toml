@@ -301,6 +301,16 @@ filterwarnings = [
     "ignore:.*does not have '__bases__' attribute.*:UserWarning",
 ]
 
+[tool.coverage.run]
+core = "sysmon"
+source = ["vllm_omni"]
+patch = ["subprocess"]
+concurrency = ["multiprocessing", "thread"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
 [tool.typos.default]
 extend-ignore-identifiers-re = [
     ".*_thw",
