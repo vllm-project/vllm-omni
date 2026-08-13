@@ -13,7 +13,6 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from torch import nn
@@ -22,6 +21,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+    DistributedAutoencoderKLWan,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -599,7 +601,7 @@ class LingBotVideoPipeline(
             revision=revision,
         )
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLWan.from_pretrained,
+            DistributedAutoencoderKLWan.from_pretrained,
             model,
             subfolder=vae_subfolder,
             prefetch_list=component_subfolders,
@@ -959,6 +961,11 @@ class LingBotVideoPipeline(
     def _format_output(decoded: torch.Tensor, mode: LingBotGenerationMode) -> torch.Tensor:
         """Convert the canonical tensor to the existing public CPU layout."""
 
+        # Distributed VAE decode reconstructs the full output only on DiT rank
+        # zero. Other ranks return this exact empty sentinel so the worker layer
+        # can discard their results without broadcasting a full video tensor.
+        if decoded.ndim == 1 and decoded.numel() == 0:
+            return decoded.cpu()
         if decoded.ndim != 5:
             raise RuntimeError(f"LingBot decode expected [B, C, T, H, W], got {tuple(decoded.shape)}.")
         frames = decoded.permute(0, 2, 3, 4, 1).cpu()

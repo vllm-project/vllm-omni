@@ -737,6 +737,17 @@ def test_canonical_output_formatter_preserves_video_and_image_contracts():
     assert torch.equal(image, canonical_image.permute(0, 2, 3, 4, 1)[0, 0])
 
 
+def test_output_formatter_preserves_distributed_vae_non_primary_sentinel():
+    from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode, LingBotVideoPipeline
+
+    sentinel = torch.empty(0)
+
+    output = LingBotVideoPipeline._format_output(sentinel, LingBotGenerationMode.T2V)
+
+    assert output.shape == (0,)
+    assert output.device.type == "cpu"
+
+
 def test_pipeline_profiler_records_condition_diffuse_and_decode_stages():
     from vllm_omni.diffusion.models.lingbot_video import LingBotGenerationMode
     from vllm_omni.diffusion.models.lingbot_video.pipeline_lingbot_video import (

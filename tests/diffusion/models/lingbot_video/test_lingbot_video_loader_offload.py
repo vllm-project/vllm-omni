@@ -95,7 +95,7 @@ def _build_pipeline(
         return_value=SimpleNamespace(),
     )
     vae_load = mocker.patch.object(
-        module.AutoencoderKLWan,
+        module.DistributedAutoencoderKLWan,
         "from_pretrained",
         return_value=_TinyComponent(dtype=torch.float32),
     )
