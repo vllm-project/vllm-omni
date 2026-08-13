@@ -1,6 +1,6 @@
-# MiniMax-H3 on a single Ascend 950PR
+# MiniMax-H3 on a single NPU 950PR
 
-This recipe runs MiniMax-H3 with online INT8 quantization on one Ascend 950PR
+This recipe runs MiniMax-H3 with online INT8 quantization on one NPU 950PR
 NPU (128 GB HiBL 1.0 HBM). It covers the single-card T2VA configuration at
 1024x576. For the eight-card Atlas 800I A3 BF16 route at 768P, see
 [MiniMax-H3-NPU.md](MiniMax-H3-NPU.md).
@@ -9,7 +9,7 @@ NPU (128 GB HiBL 1.0 HBM). It covers the single-card T2VA configuration at
 
 | Resource | Requirement |
 | --- | ---: |
-| NPU | 1x Ascend 950PR |
+| NPU | 1x NPU 950PR |
 | NPU HBM | 128 GiB (131,072 MiB reported by `npu-smi`) |
 | Observed HBM high-water mark | 118,442 MiB (90.4% of capacity) |
 | Checkpoint storage | 135 GiB per partition, local disk strongly preferred |
@@ -30,9 +30,9 @@ container's OOM killer terminates the server with exit code -9.
 ## Environment
 
 - Host architecture: x86_64
-- Ascend driver: 25.7.rc1.6 (ascendhal 7.35.23)
-- Ascend firmware: 9.0.0.105.229
-- CANN toolkit: 9.1.0 (`/usr/local/Ascend/cann-9.1.0`)
+-  driver: 25.7.rc1.6 (hal 7.35.23)
+-  firmware: 9.0.0.105.229
+- CANN toolkit: 9.1.0 (`/usr/local//cann-9.1.0`)
 - npu-smi: 25.7.rc1.6
 - Python: 3.12.13
 - PyTorch: 2.10.0+cpu
@@ -83,7 +83,7 @@ H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
 ## Validated evidence
 
-Measured on one Ascend 950PR with the server command above plus
+Measured on one NPU 950PR with the server command above plus
 `--enable-diffusion-pipeline-profiler`, generating a 5 s 1024x576 T2VA clip from
 the request in [§ T2VA request example](#t2va-request-example). MiniMax-H3
 requested 60 denoise steps and executed 59 denoise updates, so per-step latency
@@ -181,8 +181,8 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   the 1344x768 at 50 steps used by the GPU recipes in this directory. Denoise
   cost scales superlinearly with token count, so the numbers are not directly
   comparable across recipes.
-- The image ships a `triton` package whose Ascend backend is not built
-  (`No module named 'triton._C.libtriton.ascend'`). vLLM logs this as an error
+- The image ships a `triton` package whose  backend is not built
+  (`No module named 'triton._C.libtriton.'`). vLLM logs this as an error
   at startup and disables Triton; the diffusion path does not need it and the
   run completes normally.
 
