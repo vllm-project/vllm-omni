@@ -741,7 +741,7 @@ def make_mmu_prompt(
 
 def iter_mm_outputs(outputs: list[Any]):
     for omni_out in outputs:
-        req_out = getattr(omni_out, "request_output", None)
+        req_out = omni_out
         req_list = req_out if isinstance(req_out, list) else [req_out]
         for item in req_list:
             if item is None:

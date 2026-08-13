@@ -26,10 +26,28 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+_synthetic_media_fallback_dir: Path | None = None
+
+
 def _resolve_synthetic_media_cache_dir(cache_dir: Path | str | None) -> Path:
     if cache_dir is not None:
         return Path(cache_dir).expanduser().resolve()
-    return Path(tempfile.gettempdir()) / "vllm_omni_test_synthetic_media"
+
+    default = Path(tempfile.gettempdir()) / "vllm_omni_test_synthetic_media"
+    try:
+        default.mkdir(parents=True, exist_ok=True)
+        # Verify write access: the directory may exist but belong to
+        # another user (e.g. a previous CI job), causing PermissionError
+        # later when individual files are saved.
+        canary = default / ".write_test"
+        canary.touch()
+        canary.unlink()
+        return default
+    except (PermissionError, OSError):
+        global _synthetic_media_fallback_dir
+        if _synthetic_media_fallback_dir is None:
+            _synthetic_media_fallback_dir = Path(tempfile.mkdtemp(prefix="vllm_omni_test_synthetic_media_"))
+        return _synthetic_media_fallback_dir
 
 
 def _np_array_from_mp4_bytes(video_bytes: bytes) -> np.ndarray:

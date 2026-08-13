@@ -164,6 +164,13 @@ class OmniServeCommand(CLISubcommand):
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
+        lora_backend = getattr(args, "lora_backend", None)
+        lora_path = getattr(args, "lora_path", None)
+        if lora_backend == "distill" and not lora_path:
+            raise ValueError("--lora-backend distill requires --lora-path")
+        if (lora_backend or "peft") == "peft" and isinstance(lora_path, list) and len(lora_path) > 1:
+            raise ValueError("--lora-backend peft accepts only one startup LoRA path")
+
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
         omni_lb_policy = getattr(args, "omni_lb_policy", None)
         if omni_lb_policy is not None:
@@ -230,9 +237,8 @@ class OmniServeCommand(CLISubcommand):
             "VoiceDesign, or Base, while diffusion models may use it to select "
             "task-specific weights. If omitted, the model default is used.",
         )
-        # Forced aligner / word timestamps. --forced-aligner is the opt-in
-        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-        # live in the deploy YAML passed via --forced-aligner-config.
+        # Forced aligner / word timestamps. Either flag opts in (--forced-aligner-config
+        # alone works when its YAML sets the model); heavier knobs live in that YAML.
         omni_config_group.add_argument(
             "--forced-aligner",
             type=str,
@@ -252,6 +258,13 @@ class OmniServeCommand(CLISubcommand):
                 "gpu_memory_utilization, dtype, max_model_len). The --forced-aligner "
                 "flag, when set, overrides the YAML model field."
             ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Device(s) for the forced-aligner stage (e.g. '2'). Defaults to "
+            "sharing an existing stage's GPU when unset.",
         )
         omni_config_group.add_argument(
             "--deploy-config",
@@ -426,6 +439,32 @@ class OmniServeCommand(CLISubcommand):
                 "How to load the diffusion pipeline: native/registry (default), "
                 "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
             ),
+        )
+        omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            nargs="+",
+            default=None,
+            help=(
+                "LoRA checkpoint path(s) loaded when the diffusion server starts. "
+                "The distill backend accepts one file per pipeline transformer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=["peft", "distill"],
+            default=None,
+            help=(
+                "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
+                "into the base model at server startup; 'peft' uses the adapter manager."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+
 
 def _align_frame_count(frame_count: int) -> int:
     """Snap ``frame_count`` up to the MiniMax H3 17n+5 frame boundary."""
@@ -35,13 +39,25 @@ def _time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
+    """Build a shifted sigma schedule.
+
+    ``base_schedule`` supplies the rectified-flow positions explicitly and takes
+    precedence over ``num_steps``. Distilled checkpoints need it because their
+    few-step schedule is not the uniform one ``num_steps`` produces; validation
+    and the shift itself live in the shared :class:`DMD2SigmaSchedule`.
+    """
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
-    if num_steps <= 0:
-        raise ValueError("MiniMax H3 num_steps must be > 0")
+
+    if base_schedule is not None:
+        return DMD2SigmaSchedule.from_positions(base_schedule).shifted_sigmas(shift_scale)
 
     import torch
+
+    if num_steps <= 0:
+        raise ValueError("MiniMax H3 num_steps must be > 0")
 
     # The rectified-flow sigma range is fixed at [1.0, 0.0].
     base = torch.linspace(
@@ -81,10 +97,12 @@ class MiniMaxH3ShapePlanner:
         *,
         num_steps: int = 50,
         shift_scale: float = 6.0,
+        base_schedule: Sequence[float] | None = None,
     ) -> list[float]:
         return _time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=shift_scale,
+            base_schedule=base_schedule,
         )
 
 
@@ -103,8 +121,10 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     return MINIMAX_H3_SHAPE_PLANNER.time_shift_sigmas(
         num_steps=num_steps,
         shift_scale=shift_scale,
+        base_schedule=base_schedule,
     )
