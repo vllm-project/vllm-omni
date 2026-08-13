@@ -29,7 +29,6 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
-from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
@@ -43,12 +42,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-
-# yapf conflicts with isort for this block
-# yapf: disable
-# yapf: enable
+from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import (
+    ErrorInfo,
     ErrorResponse,
     ModelCard,
     ModelList,
@@ -93,7 +90,10 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
+from vllm_omni.config.endpoint_policy import (
+    remove_route_from_app,
+    shutdown_unsupported_routes,
+)
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
@@ -275,21 +275,6 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     return getattr(engine_client, "vllm_config", None)
 
 
-def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None):
-    """Remove a route from the app by path and optionally by methods.
-
-    OMNI: used to override upstream /v1/chat/completions with omni behavior.
-    """
-    routes_to_remove = []
-    for route in app.routes:
-        if isinstance(route, Route) and route.path == path:
-            if methods is None or (hasattr(route, "methods") and route.methods & methods):
-                routes_to_remove.append(route)
-
-    for route in routes_to_remove:
-        app.routes.remove(route)
-
-
 def _register_omni_exception_handlers(app) -> None:
     """Override upstream vLLM exception handlers with Omni-aware versions.
 
@@ -395,6 +380,21 @@ def _create_speech_error_json_response(
         status_code=status_code,
     )
     return _error_response_to_json_response(err, status_code=status_code)
+
+
+def _create_unsupported_api_json_response(
+    raw_request: Request,
+    api_name: str,
+) -> JSONResponse:
+    err = ErrorResponse(
+        error=ErrorInfo(
+            message=f"The model does not support {api_name}",
+            type="NotFoundError",
+            param=None,
+            code=HTTPStatus.NOT_FOUND.value,
+        )
+    )
+    return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
 
 
 class _DiffusionServingModels:
@@ -514,10 +514,12 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
 
-        # OMNI: Remove upstream routes that we override with omni-specific handlers
-        _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
-        _remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
-        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        # OMNI: Override completion/chat routes so speech-only models return
+        # 4xx before unsupported generate requests can dispatch to the engine.
+        remove_route_from_app(app, "/v1/completions", {"POST"})
+        remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
+        remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
@@ -1194,12 +1196,61 @@ def OmniBatchChat(request: Request) -> OmniOpenAIServingChatBatch | None:
     return request.app.state.openai_serving_chat_batch
 
 
+def Omnicompletion(request: Request) -> OpenAIServingCompletion | None:
+    return getattr(request.app.state, "openai_serving_completion", None)
+
+
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
 
 def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
     return getattr(request.app.state, "openai_serving_audio_generate", None)
+
+
+@router.post(
+    "/v1/completions",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_completion(request: CompletionRequest, raw_request: Request):
+    metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
+    handler: OpenAIServingCompletion | None = Omnicompletion(raw_request)
+    if handler is None:
+        return _create_unsupported_api_json_response(raw_request, "Completions API")
+    try:
+        generator = await handler.create_completion(request, raw_request)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Completion failed: %s", e)
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+    if isinstance(generator, ErrorResponse):
+        return _error_response_to_json_response(generator)
+    if isinstance(generator, Response):
+        if not isinstance(generator, StreamingResponse):
+            response_metrics_headers = metrics_header(metrics_header_format)
+            if response_metrics_headers:
+                generator.headers.update(response_metrics_headers)
+        return generator
+    if getattr(request, "stream", False):
+        return StreamingResponse(content=generator, media_type="text/event-stream")
+    if hasattr(generator, "model_dump"):
+        return JSONResponse(
+            content=generator.model_dump(mode="json", warnings="none"),
+            headers=metrics_header(metrics_header_format),
+        )
+    return JSONResponse(content=generator, headers=metrics_header(metrics_header_format))
 
 
 @router.post(

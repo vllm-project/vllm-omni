@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
@@ -8,6 +9,7 @@ from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
+    _build_prefill_token_mask,
     _filter_mrope_kwargs_for_model,
 )
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -91,6 +93,80 @@ class DummyBuffer:
 
     def __init__(self, t: torch.Tensor):
         self.gpu = t
+
+
+class _InputIdsCopiedError(RuntimeError):
+    """Stop the real runner preparation immediately after its GPU input copy."""
+
+
+class RunnerBuffer:
+    """CPU/GPU buffer used to exercise the real GPUModelRunner input layout."""
+
+    def __init__(self, size: int, dtype: torch.dtype):
+        self.cpu = torch.zeros(size, dtype=dtype)
+        self.gpu = torch.zeros(size, dtype=dtype)
+        self.np = self.cpu.numpy()
+
+    def copy_to_gpu(self, count: int | None = None) -> None:
+        count = self.cpu.numel() if count is None else count
+        self.gpu[:count].copy_(self.cpu[:count])
+
+
+class InputIdsRunnerBuffer(RunnerBuffer):
+    def copy_to_gpu(self, count: int | None = None) -> None:
+        super().copy_to_gpu(count)
+        raise _InputIdsCopiedError
+
+
+class DummyBlockTable:
+    def commit_block_table(self, num_reqs: int) -> None:
+        pass
+
+    def compute_slot_mapping(self, num_reqs, query_start_loc, positions) -> None:
+        pass
+
+
+class PrefillMaskInputBatch:
+    def __init__(self):
+        self.req_ids = ["decode", "short_prefill", "long_prefill", "prefill_decode"]
+        self.req_id_to_index = {req_id: i for i, req_id in enumerate(self.req_ids)}
+        self.num_prompt_tokens = np.array([3, 1, 4, 3], dtype=np.int32)
+        self.num_computed_tokens_cpu_tensor = torch.tensor([3, 0, 1, 2], dtype=torch.int32)
+        self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+        self.token_ids_cpu_tensor = torch.tensor(
+            [
+                [0, 0, 0, 10, 0],
+                [20, 0, 0, 0, 0],
+                [0, 30, 31, 32, 0],
+                [0, 0, 40, 41, 0],
+            ],
+            dtype=torch.int32,
+        )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        self.req_prompt_embeds = {}
+        self.prev_req_id_to_index = {}
+        self.prev_sampled_token_ids = None
+        self.block_table = DummyBlockTable()
+
+    @property
+    def num_reqs(self) -> int:
+        return len(self.req_ids)
+
+
+class PrefillMaskSchedulerOutput:
+    def __init__(self):
+        self.num_scheduled_tokens = {
+            "decode": 1,
+            "short_prefill": 1,
+            "long_prefill": 3,
+            "prefill_decode": 2,
+        }
+        self.total_num_scheduled_tokens = sum(self.num_scheduled_tokens.values())
+
+
+class DummyScheduledRequest:
+    def __init__(self, num_tokens: int):
+        self.num_tokens = num_tokens
 
 
 class DummyInputBatch:
@@ -210,6 +286,114 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
     }
 
     assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        pytest.param(SimpleNamespace(supports_prefill_token_mask=True), True, id="supported"),
+        pytest.param(SimpleNamespace(), False, id="unsupported"),
+    ],
+)
+def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
+    runner._init_talker_mtp = mocker.Mock()
+    runner._prewarm_attention_capture_workspaces = mocker.Mock()
+    mocker.patch("vllm_omni.worker.gpu_model_runner.GPUModelRunner.load_model")
+
+    OmniGPUModelRunner.load_model(runner)
+
+    assert runner._supports_prefill_token_mask is expected
+
+
+def test_build_prefill_token_mask_marks_single_token_prefill():
+    mask = _build_prefill_token_mask([1], [0], [1], torch.device("cpu"))
+
+    assert mask is True
+
+
+def test_build_prefill_token_mask_skips_decode():
+    mask = _build_prefill_token_mask([1], [1], [1], torch.device("cpu"))
+
+    assert mask is False
+
+
+def test_build_prefill_token_mask_handles_mixed_batch():
+    mask = _build_prefill_token_mask(
+        # Match the scheduler-owned NumPy arrays used by InputBatch.
+        prompt_lens=np.array([3, 1], dtype=np.int32),
+        num_computed_tokens=np.array([3, 0], dtype=np.int32),
+        num_scheduled_tokens=[1, 1],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.tensor([False, True]))
+
+
+def test_build_prefill_token_mask_handles_prompt_decode_boundary():
+    mask = _build_prefill_token_mask(
+        prompt_lens=[3],
+        num_computed_tokens=[2],
+        num_scheduled_tokens=[2],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.tensor([True, False]))
+
+
+def test_runner_aligns_prefill_mask_with_flattened_scheduled_tokens(mocker):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._supports_prefill_token_mask = True
+    runner.input_batch = PrefillMaskInputBatch()
+    runner.input_ids = InputIdsRunnerBuffer(7, torch.int32)
+    runner.model = SimpleNamespace(embed_input_ids=mocker.Mock(return_value=torch.empty(7, 4)))
+    runner.requests = {
+        req_id: DummyScheduledRequest(num_tokens)
+        for req_id, num_tokens in zip(runner.input_batch.req_ids, [4, 1, 4, 4], strict=True)
+    }
+    runner.arange_np = np.arange(16, dtype=np.int32)
+    runner.query_pos = RunnerBuffer(16, torch.int32)
+    runner.query_start_loc = RunnerBuffer(8, torch.int32)
+    runner.optimistic_seq_lens_cpu = torch.zeros(8, dtype=torch.int32)
+    runner.prev_positions = RunnerBuffer(8, torch.int32)
+    runner.discard_request_mask = RunnerBuffer(8, torch.bool)
+    runner.num_accepted_tokens_event = None
+    runner.num_accepted_tokens = RunnerBuffer(8, torch.int32)
+    runner.mamba_prev_last_scheduled_idx = None
+    runner.use_async_spec_decode = False
+    runner.num_computed_tokens = torch.zeros(8, dtype=torch.int32)
+    runner.req_indices = RunnerBuffer(16, torch.int32)
+    runner.num_scheduled_tokens = RunnerBuffer(8, torch.int32)
+    runner.positions = torch.zeros(16, dtype=torch.int64)
+    runner.seq_lens = torch.zeros(8, dtype=torch.int32)
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    scheduler_output = PrefillMaskSchedulerOutput()
+    scheduled_tokens = np.array([1, 1, 3, 2], dtype=np.int32)
+
+    # Exercise vLLM's real _prepare_inputs token-index calculation and its
+    # normal _prepare_input_ids CPU-to-GPU path. The sentinel stops immediately
+    # after the copy so the test does not need unrelated attention metadata.
+    with pytest.raises(_InputIdsCopiedError):
+        runner._prepare_inputs(scheduler_output, scheduled_tokens)
+
+    runner._embed_scheduled_input_ids_with_prefill_mask(
+        scheduler_output,
+        num_scheduled_tokens=7,
+        multimodal_embeddings=[],
+        is_multimodal=torch.zeros(7, dtype=torch.bool),
+    )
+
+    input_ids = runner.model.embed_input_ids.call_args.args[0]
+    prefill_token_mask = runner.model.embed_input_ids.call_args.kwargs["prefill_token_mask"]
+    assert torch.equal(input_ids, torch.tensor([10, 20, 30, 31, 32, 40, 41]))
+    assert torch.equal(
+        prefill_token_mask,
+        torch.tensor([False, True, True, True, True, True, False]),
+    )
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
