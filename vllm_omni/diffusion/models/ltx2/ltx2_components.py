@@ -59,7 +59,6 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "scheduler",
     "latent_upsampler",
 )
-_LTX_ARTIFACTS_DIR_ENV = "VLLM_OMNI_LTX_ARTIFACTS_DIR"
 logger = logging.getLogger(__name__)
 
 
@@ -153,17 +152,7 @@ def resolve_ltx_artifact(
     repo_id: str,
     filename: str,
 ) -> str:
-    """Resolve an official LTX sidecar from one artifact directory or the Hub."""
-    artifacts_dir = os.getenv(_LTX_ARTIFACTS_DIR_ENV)
-    if artifacts_dir:
-        candidate = Path(artifacts_dir) / filename
-        if candidate.is_file():
-            return str(candidate)
-        raise FileNotFoundError(
-            f"{_LTX_ARTIFACTS_DIR_ENV}={artifacts_dir!r} does not contain required LTX artifact "
-            f"{filename!r}: {candidate}"
-        )
-
+    """Resolve an official LTX sidecar from the model root or its Hub repository."""
     candidate = Path(model) / filename
     if candidate.is_file():
         return str(candidate)
@@ -491,16 +480,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
 
     if "latent_upsampler" in profile.resident_modules:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
-        if os.getenv(_LTX_ARTIFACTS_DIR_ENV) and profile.latent_upsampler_filename is not None:
-            if profile.artifact_repo_id is None:
-                raise FileNotFoundError(f"LTX latent upsampler artifact repository not configured for {profile.name}.")
-            upsampler_path = resolve_ltx_artifact(
-                model,
-                profile.artifact_repo_id,
-                profile.latent_upsampler_filename,
-            )
-            pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
-        elif os.path.isfile(upsampler_config) or not local_files_only:
+        if os.path.isfile(upsampler_config) or not local_files_only:
             try:
                 pipeline.latent_upsampler = _load_component(
                     LTX2LatentUpsamplerModel,

@@ -581,11 +581,6 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
     env["PYTHONUNBUFFERED"] = "1"
-    sidecar_paths = [path for path in (spatial_upsampler, distilled_lora) if path is not None]
-    if sidecar_paths:
-        sidecar_dirs = {path.parent for path in sidecar_paths}
-        assert len(sidecar_dirs) == 1, f"LTX sidecars must share one artifact directory: {sidecar_paths}"
-        env["VLLM_OMNI_LTX_ARTIFACTS_DIR"] = str(sidecar_dirs.pop())
     repository_root = Path(__file__).resolve().parents[4]
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (

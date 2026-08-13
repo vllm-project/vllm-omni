@@ -16,11 +16,8 @@
 Repositories in the table are download units. A full pipeline repository
 contains the Transformer, text encoder, connectors, VAEs, vocoder, scheduler,
 and tokenizer; an additional repository supplies LoRA or upsampler sidecars.
-To use predownloaded sidecars, set `VLLM_OMNI_LTX_ARTIFACTS_DIR` to one
-directory containing the applicable files under their official names. The
-directory is authoritative: startup fails if a required file is missing. When
-it is unset, the runtime searches the model root and then the matching
-Lightricks Hub repository.
+The runtime first searches the model root for sidecars under their official
+filenames, then downloads them from the matching Lightricks Hub repository.
 
 `LTX2Pipeline` is the unified one-stage entry. Checkpoint metadata selects the
 LTX-2 or LTX-2.3 profile; omitting an image selects T2V, while one initial

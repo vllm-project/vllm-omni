@@ -155,26 +155,27 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
     assert detect_ltx_model_version(str(tmp_path)) == "2"
 
 
-def test_ltx_artifact_directory_is_an_authoritative_override(tmp_path, monkeypatch):
-    artifacts_dir = tmp_path / "sidecars"
-    artifacts_dir.mkdir()
+def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch):
     filename = "ltx-sidecar.safetensors"
-    expected = artifacts_dir / filename
-    expected.write_bytes(b"sidecar")
-    monkeypatch.setenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", str(artifacts_dir))
-    monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
+    calls = []
 
-    assert resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == str(expected)
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return "/cache/ltx-sidecar.safetensors"
 
-    with pytest.raises(FileNotFoundError, match="does not contain required LTX artifact"):
-        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", "missing.safetensors")
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+
+    assert (
+        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == "/cache/ltx-sidecar.safetensors"
+    )
+    assert calls == [{"repo_id": "Lightricks/test", "filename": filename}]
 
 
-def test_ltx_artifact_falls_back_to_model_root_without_override(tmp_path, monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_LTX_ARTIFACTS_DIR", raising=False)
+def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
     filename = "ltx-sidecar.safetensors"
     expected = tmp_path / filename
     expected.write_bytes(b"sidecar")
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
 
     assert resolve_ltx_artifact(str(tmp_path), "Lightricks/test", filename) == str(expected)
 
