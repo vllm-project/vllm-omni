@@ -27,19 +27,24 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         """Return the task supported by the loaded Qwen3-TTS checkpoint."""
         model_config = self.ctx.server.engine_client.model_config
         configured_variant = getattr(model_config.hf_config, "tts_model_type", None)
-        candidates = [configured_variant, getattr(model_config, "model", None)]
-        for candidate in candidates:
-            if not isinstance(candidate, str):
-                continue
-            normalized = re.sub(r"[^a-z]", "", candidate.lower())
-            for marker, task_type in (
-                ("customvoice", "CustomVoice"),
-                ("voicedesign", "VoiceDesign"),
-                ("base", "Base"),
-            ):
-                if marker in normalized:
-                    return task_type
-        return None
+        variants = {
+            "customvoice": "CustomVoice",
+            "voicedesign": "VoiceDesign",
+            "base": "Base",
+        }
+
+        if isinstance(configured_variant, str):
+            normalized = re.sub(r"[^a-z]", "", configured_variant.lower())
+            return variants.get(normalized)
+
+        model_path = getattr(model_config, "model", None)
+        if not isinstance(model_path, str):
+            return None
+        final_component = Path(model_path.rstrip("/\\")).name.lower()
+        match = re.search(r"(?:^|[-_.])(custom[-_.]?voice|voice[-_.]?design|base)$", final_component)
+        if match is None:
+            return None
+        return variants[re.sub(r"[-_.]", "", match.group(1))]
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is

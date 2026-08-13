@@ -966,15 +966,17 @@ class TestTTSMethods:
     @pytest.mark.parametrize(
         ("configured_variant", "requested_task"),
         [
-            ("CustomVoice", "Base"),
-            ("VoiceDesign", "CustomVoice"),
-            ("Base", "VoiceDesign"),
+            ("custom_voice", "Base"),
+            ("voice_design", "CustomVoice"),
+            ("base", "VoiceDesign"),
         ],
     )
     def test_task_type_must_match_loaded_qwen3_tts_variant(self, speech_server, configured_variant, requested_task):
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
-            model=f"Qwen/Qwen3-TTS-12Hz-1.7B-{configured_variant}",
+            # Deliberately make the path uninformative so this test proves that
+            # the checkpoint config field is authoritative.
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
             hf_config=SimpleNamespace(
                 tts_model_type=configured_variant,
                 talker_config=SimpleNamespace(hidden_size=2048),
@@ -991,13 +993,66 @@ class TestTTSMethods:
         result = speech_server._validate_tts_request(req)
 
         assert result is not None
-        assert f"{configured_variant} checkpoint does not support task_type='{requested_task}'" in result
+        expected_variant = {
+            "custom_voice": "CustomVoice",
+            "voice_design": "VoiceDesign",
+            "base": "Base",
+        }[configured_variant]
+        assert f"{expected_variant} checkpoint does not support task_type='{requested_task}'" in result
 
-    def test_task_type_variant_falls_back_to_model_path(self, speech_server):
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "/models/base_models/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "/models/base_models/Qwen3-TTS-12Hz-1.7B-custom_voice",
+        ],
+    )
+    def test_task_type_variant_falls_back_to_model_path(self, speech_server, model_path):
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
-            model="/models/Qwen3-TTS-12Hz-1.7B-CustomVoice/20260623_01",
+            model=model_path,
             hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_task_type_variant_path_does_not_use_parent_directories(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+
+        # No checkpoint variant is inferred from the generic final component,
+        # so validation must not guess and reject a valid request.
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_task_type_variant_config_wins_over_conflicting_path(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
                 talker_config=SimpleNamespace(hidden_size=2048),
             ),
         )
