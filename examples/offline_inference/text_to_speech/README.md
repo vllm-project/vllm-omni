@@ -23,6 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
+| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -427,6 +428,31 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 ### Notes
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (auto-loaded by HF `model_type`).
+
+---
+
+## dots.tts
+
+Single-stage native AR TTS at 48 kHz (rednote-hilab). Pipeline: `Qwen2.5-1.5B base LM → DiT (10-step Euler flow matching) → patch_encoder AR loopback → AudioVAE (streaming decode)`. Same "vLLM-native base LM + side-path computation" pattern as VoxCPM2, with a plain Qwen2 backbone instead of MiniCPM4 and no FSQ / residual LM stage.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model rednote-hilab/dots.tts-soar \
+    --text "Hello, this is a test of dots TTS running on vLLM Omni."
+```
+
+### Voice cloning
+Not wired in this release — generation is zero-shot only. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
+
+### Streaming
+The AudioVAE decoder has an internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`) used to avoid boundary artifacts between 160 ms patches, but it is not yet exposed through an online serving endpoint or example.
+
+### Notes
+- Output: 48 kHz mono WAV.
+- Deploy config: `vllm_omni/deploy/dots_tts.yaml` (auto-loaded by HF `model_type`).
+- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default. `dots.tts-base` shares the same architecture but is unvalidated in this repo. `dots.tts-mf` (MeanFlow, 2-4 step) is not supported yet.
+- Known limitation: no CUDA graph capture and no batched side-path computation yet, so concurrent requests do not currently scale (each request's DiT Euler steps run serially). See `recipes/rednote-hilab/dots.tts.md` for details and the roadmap.
 
 ---
 

@@ -147,7 +147,7 @@ def _run_once(model: str, yaml_path: str, *, async_mode: bool) -> list[dict]:
     # (see tests/e2e/accuracy/qwen3_omni). Confirm the exact knob at bench time.
     omni = Omni(
         model,
-        stage_configs_path=yaml_path,
+        deploy_config=yaml_path,
         stage_init_timeout=1800,
         init_timeout=3600,
         async_chunk=async_mode,
