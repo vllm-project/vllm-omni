@@ -14,7 +14,10 @@ A: At first, you can check current [issues](https://github.com/vllm-project/vllm
 
 > Q: Does vLLM-Omni support AWQ or any other quantization?
 
-A: We plan to introduce GGUF FP8 prequantized models and online FP8 quantization in version 0.16.0. Support for other quantization types will follow in future releases. For details, please see our [Q1 quantization roadmap](https://github.com/vllm-project/vllm-omni/issues/1057).
+A: AWQ is not currently listed as a validated vLLM-Omni path. Quantization
+support depends on the model, pipeline stage, checkpoint format, and hardware
+backend. See the current [quantization support matrix](../user_guide/quantization/overview.md)
+for online methods, pre-quantized checkpoints, and model-level validation.
 
 > Q: Does vLLM-Omni support multimodal streaming input and output?
 

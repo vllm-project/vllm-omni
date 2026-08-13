@@ -13,6 +13,10 @@ vLLM-Omni provides two quantization methods with different scale structures:
 | `mxfp4` | Single-scale (per-32 fine only) | Online only | Quick accuracy baseline; no checkpoint prep needed |
 | `mxfp4_dualscale` | Dual-scale (fine per-32 + coarse per-512 + per-channel `mul_scale`) | Online + Offline | Production; better accuracy; offline recommended |
 
+The validation terms on this page follow the
+[support levels](overview.md#support-levels). Current model guidance covers
+Wan diffusion transformers only; the text encoder and VAE stay in BF16.
+
 !!! tip "Recommended: `mxfp4_dualscale` offline"
     For production deployments, use the `mxfp4_dualscale` offline mode with a
     pre-quantized checkpoint produced by msModelSlim. Offline checkpoints load
@@ -34,26 +38,45 @@ vLLM-Omni provides two quantization methods with different scale structures:
 
 ## Hardware Support
 
-| Device | Support |
-|--------|---------|
-| NVIDIA Blackwell GPU (SM 100+) | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ |
-| AMD ROCm (gfx950 / MI355X) | ✅ |
-| Intel XPU | ⭕ |
-| Ascend NPU (Atlas 950 A5) | ✅ |
+| Device | Online `mxfp4` | Online `mxfp4_dualscale` | Offline `mxfp4_dualscale` |
+|--------|-----------------|---------------------------|----------------------------|
+| NVIDIA Blackwell GPU (SM 100+) | ❌ | ❌ | ❌ |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ❌ | ❌ | ❌ |
+| NVIDIA Ampere GPU (SM 80+) | ❌ | ❌ | ❌ |
+| AMD ROCm (gfx950 / MI355X) | ✅ | ❌ | ❌ |
+| Intel XPU | ❌ | ❌ | ❌ |
+| Ascend NPU (Atlas 950 A5) | ✅ | ✅ | ✅ |
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
+Legend: `✅` backend available, `❌` unsupported, `⭕` not verified in this
+guide. Backend availability does not imply full-model checkpoint validation.
+
+!!! note "Why NVIDIA is marked unsupported"
+    This table describes the methods currently wired into vLLM-Omni, not every
+    low-precision format NVIDIA hardware could execute. `DiffusionMXFP4Config`
+    has runtime implementations only for Ascend and ROCm gfx950; on CUDA it
+    raises `NotImplementedError` because no CUDA MXFP4 linear method or
+    checkpoint loader is registered.
+
+    On NVIDIA, use [ModelOpt](modelopt.md) NVFP4 for the documented 4-bit
+    checkpoint path. NVFP4 and OCP MXFP4 have different checkpoint metadata,
+    scale layouts, and kernel contracts, so they are not interchangeable. A
+    native CUDA MXFP4 path would require a CUDA linear implementation, loader
+    contract, and model-level output validation.
+
+The ROCm path dispatches online single-scale `mxfp4` to AITER on gfx950. It has
+kernel and dispatch coverage, but this guide does not yet claim end-to-end
+quality validation for a named Wan checkpoint on ROCm. DualScale and
+pre-quantized MXFP4 checkpoints are not supported on ROCm.
 
 ## Model Type Support
 
 ### Diffusion Model (Wan2.2)
 
-| Model | Online | Offline | Notes |
-|-------|--------|---------|-------|
-| Wan2.2-T2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4_dualscale` | MoE cascade (`transformer` + `transformer_2`); both transformers quantized with the same config |
-| Wan2.2-I2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4_dualscale` | MoE cascade; same scheme as T2V-A14B |
-| Wan2.2-TI2V-5B | ❌ | ❌ | Parameter count too small; W4A4 causes unacceptable accuracy loss |
+| Model | Online (Ascend) | Offline (Ascend) | Validation and notes |
+|-------|-----------------|------------------|----------------------|
+| Wan2.2-T2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4_dualscale` | Validated outside scheduled full-model offline NPU CI; both cascade transformers are quantized |
+| Wan2.2-I2V-A14B | `mxfp4` / `mxfp4_dualscale` | `mxfp4_dualscale` | Validated outside scheduled full-model offline NPU CI; same cascade scheme as T2V-A14B |
+| Wan2.2-TI2V-5B | ❌ | ❌ | Unsupported because W4A4 causes unacceptable accuracy loss |
 
 The choice between `mxfp4` and `mxfp4_dualscale` in **online mode** is about
 quantization quality, not model compatibility — both work on cascade (A14B) and
@@ -83,12 +106,13 @@ by the merge script); there is no offline `mxfp4` single-scale format.
 
 ### `mxfp4` — Single-Scale Online Mode
 
-Online mode requires no pre-processing. vLLM-Omni quantizes BF16 weights to
-MXFP4 at load time using `npu_dynamic_mx_quant`. A single block scale
+Online mode requires no pre-processing. On Ascend, vLLM-Omni quantizes BF16
+weights at load time using `npu_dynamic_mx_quant`. On ROCm gfx950, the same
+`mxfp4` config dispatches to the AITER online kernel. A single block scale
 (`float8_e8m0fnu`, one per 32 K elements) is computed on the fly; no
-calibration `mul_scale` is available. Applies equally to single-transformer
-and cascade (A14B) models — both transformers in a cascade receive the same
-quantization config automatically.
+calibration `mul_scale` is available. The config applies equally to
+single-transformer and cascade (A14B) models, but named Wan model validation is
+currently limited to the documented Ascend path.
 
 ```python
 from vllm_omni import Omni
@@ -111,10 +135,10 @@ vllm serve <your-model> --omni --quantization mxfp4
 
 ### `mxfp4_dualscale` — DualScale Online Mode
 
-Online DualScale mode computes both fine and coarse scales on the fly from BF16
-weights using `npu_dynamic_dual_level_mx_quant`. Applies equally to
-single-transformer and cascade (A14B) models. Compared to `mxfp4` online,
-DualScale provides better quantization accuracy at higher compute cost.
+Ascend-only online DualScale mode computes both fine and coarse scales on the
+fly from BF16 weights using `npu_dynamic_dual_level_mx_quant`. It applies
+equally to single-transformer and cascade (A14B) models. Compared to `mxfp4`
+online, DualScale provides better quantization accuracy at higher compute cost.
 
 The default configuration keeps the leading 5 transformer blocks in BF16
 (`num_bf16_fallback_layers=5`). Accuracy evaluation on Wan2.2-A14B shows this
@@ -340,6 +364,11 @@ unless they appear in `ignored_layers`.
    DualScale offline method mitigates this with calibrated `mul_scale` smooth
    quantization. Use `ignored_layers` and `num_bf16_fallback_layers` to trade
    off compression vs. accuracy for precision-sensitive layers.
+
+8. The native methods, merge mappings, and per-transformer cascade metadata
+   have unit coverage. The current Buildkite configuration does not schedule a
+   named full-model offline MXFP4 checkpoint on NPU, so this path is
+   **Validated**, not **CI-backed**.
 
 ## Adapting MXFP4 for a New Model
 

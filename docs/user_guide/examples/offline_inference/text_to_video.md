@@ -143,7 +143,8 @@ python text_to_video.py \
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
+- `--quantization`: online quantization method, for example `fp8`; supported
+  pre-quantized checkpoints are normally auto-detected from checkpoint metadata.
 - `--flow-shift`: scheduler flow_shift parameter.
 - `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
 - `--lora-scale`: scale factor for LoRA weights.

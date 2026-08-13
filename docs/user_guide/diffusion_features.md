@@ -92,7 +92,7 @@ current support.
 |--------|--------------|-------------|----------|
 | **[FP8](quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on validated transformer stages | Memory reduction, inference speedup |
 | **[INT8](quantization/int8.md)** | `quantization="int8"` | INT8 W8A8 on validated transformer stages | Memory reduction, broad GPU compatibility |
-| **[GGUF](quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
+| **[BitsAndBytes W4](quantization/bitsandbytes.md)** | `quantization="bitsandbytes"` | Online NF4/FP4 weight-only quantization on validated CUDA transformer stages | Reducing transformer weight memory without preparing a separate checkpoint |
 
 ## Supported Models
 

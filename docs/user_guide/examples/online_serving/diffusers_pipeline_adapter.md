@@ -90,8 +90,8 @@ vllm serve "Qwen/Qwen-Image" \
     --quantization-config '{"method": "fp8"}'
 ```
 
-Other vLLM-Omni quantization methods, such as `gguf`, `modelopt`, `mxfp4`,
-`mxfp8`, serialized checkpoints, static FP8 configs, and layer-name skip lists
+Other vLLM-Omni quantization methods, such as `modelopt`, `mxfp4`, `mxfp8`,
+serialized checkpoints, static FP8 configs, and layer-name skip lists
 such as `ignored_layers`, are intentionally not translated by this compatibility
 shortcut. Use Diffusers-native configuration through `diffusers_load_kwargs` or
 a native vLLM-Omni pipeline for those cases.

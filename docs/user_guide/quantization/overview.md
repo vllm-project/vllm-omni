@@ -16,72 +16,123 @@ For the internal architecture and backend extension points, see the
 | Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion Flash Attention tensors during inference. | FP8 FA |
 | Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
 
-## Hardware Support
+Online quantization starts from a normal BF16/FP16 checkpoint and repeats the
+conversion on each fresh model load. It is the simplest path for experiments.
+Pre-quantized checkpoints store the packed weights and scales produced by a
+separate tool; they are easier to reuse across deployments and can carry
+calibrated or mixed-precision policies that load-time conversion cannot
+reproduce.
 
-| Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim |
-|--------|----------|-----------|------------------|----------|------------|------------|-----------|-------------|
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
-| NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
-| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ |
-| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
-| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
+## Support Levels
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
-guide. FP8 on Ampere may use a weight-only path where available.
+Quantization support is specific to a model, component, checkpoint format, and
+hardware backend. The tables in this guide use the following levels:
 
-## Model Type Support
+| Level | Meaning |
+|-------|---------|
+| **CI-backed** | A named model and quantized checkpoint are exercised by scheduled full-model hardware CI. |
+| **Validated** | A named model and checkpoint have end-to-end or quality-validation evidence, but the check is not necessarily scheduled in CI. |
+| **Integrated** | The config, loader, quantized layers, or model wiring exists, but this guide has no completed end-to-end validation for the named model and checkpoint. |
+| **Not validated** | There is no current support recommendation for this model/component combination. |
+| **Unsupported** | The combination is intentionally rejected or known not to work. |
 
-### Diffusion Model (Qwen-Image, Wan2.2)
+A method being available on a device does not make every model on that device
+supported. Likewise, successfully detecting a checkpoint's
+`quantization_config` establishes loader compatibility, not output quality.
 
-These models run a diffusion transformer as the primary inference module. The
-default quantization target is the transformer; tokenizer, scheduler, text
-encoder, and VAE stay on the base checkpoint unless a method guide says
-otherwise.
+## Hardware × Quantization Method
 
-| Method | Guide | Mode | Example models | Status |
-|--------|-------|------|----------------|--------|
-| FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
-| Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
-| BitsAndBytes W4 | [BitsAndBytes](bitsandbytes.md) | Online W4 weight-only | Z-Image-Turbo; Qwen-Image/Wan2.2 not validated | Validated for Z-Image-Turbo |
-| ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
-| MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
-| MXFP4 W4A4 | [MXFP4](mxfp4.md) | `mxfp4`: online single-scale only; `mxfp4_dualscale`: online or offline dual-scale (offline recommended) | Wan2.2-T2V-A14B, I2V-A14B | Ascend NPU only; validated for Wan2.2 A14B cascade models; TI2V-5B not supported; offline `mxfp4_dualscale` uses calibrated `mul_scale` for best accuracy |
-| AutoRound | [AutoRound](autoround.md) | Pre-quantized W4A16 checkpoints | FLUX.1-dev; Qwen-Image/Wan2.2 not validated | Checkpoint-driven |
-| msModelSlim | [msModelSlim](msmodelslim.md) | Pre-quantized Ascend checkpoints | Wan2.2 recipe; HunyuanImage-3.0 inference target | Ascend/NPU path |
+This matrix uses concrete inference paths as columns. Producer toolkits are not
+separate methods: NVIDIA ModelOpt produces the ModelOpt FP8/NVFP4 formats,
+Intel AutoRound produces AutoRound checkpoints, and Ascend msModelSlim produces
+checkpoints consumed by the native MXFP or compatible Ascend paths.
 
-### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
+| Hardware | [Online FP8](fp8.md) | [Int8](int8.md) | [BitsAndBytes W4](bitsandbytes.md) | [ModelOpt FP8](modelopt.md) | [ModelOpt NVFP4](modelopt.md#supported-modelopt-checkpoint-formats) | [AutoRound W4A16](autoround.md) | [OCP MXFP8](mxfp8.md) | [OCP MXFP4](mxfp4.md) |
+|----------|-----------------------|------------------|------------------------------------------|--------------------------------|-------------------------------------------------------------------------|--------------------------------------|--------------------------|--------------------------|
+| NVIDIA Blackwell (SM 100+) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| NVIDIA Hopper (SM 90) | ✅ | ✅ | ✅ | ✅ | ✅ (Marlin fallback) | ✅ | ❌ | ❌ |
+| NVIDIA Ada (SM 89) | ✅ | ✅ | ✅ | ✅ | ⭕ | ✅ | ❌ | ❌ |
+| NVIDIA Ampere (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ❌ |
+| AMD ROCm (gfx950 for MXFP4) | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ❌ | ✅ (online only) |
+| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ✅ | ❌ |
+| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 
-These models combine an AR language model with audio, vision, talker, or TTS
-stages. Quantization is scoped to the AR language-model stage when the
-checkpoint contains a supported `quantization_config`; the non-AR stages stay
-in BF16 unless the model guide explicitly adds support.
+Legend: `✅` backend available, `❌` rejected or no implementation, `⭕` not
+verified in this guide. This matrix does not establish model-level support; use
+the model-and-stage tables below for that.
 
-| Method | Guide | Scope | Example models | Status |
-|--------|-------|-------|----------------|--------|
-| ModelOpt | [ModelOpt](modelopt.md) | Thinker or language-model checkpoint config | Qwen3-Omni thinker | ModelOpt checkpoint path |
-| Int8 | [Int8](int8.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
-| BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
-| MXFP8 | [MXFP8](mxfp8.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
-| MXFP4 | [MXFP4](mxfp4.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
-| AutoRound | [AutoRound](autoround.md) | Thinker or language-model checkpoint config | Qwen2.5-Omni, Qwen3-Omni | Supported through AutoRound checkpoints |
-| msModelSlim | [msModelSlim](msmodelslim.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
+The Int8 column covers online and serialized Int8 paths. OCP MXFP8 is online on
+Intel XPU and online/offline on Ascend; Intel's separate AutoRound MXFP8
+checkpoint path is described in the [MXFP8 guide](mxfp8.md). OCP MXFP4 on AMD
+means online single-scale `mxfp4` on gfx950, while MXFP4 DualScale is
+Ascend-only. NVIDIA's NVFP4 and OCP MXFP4 have different checkpoint metadata,
+scale layouts, and kernel contracts. Mixed ModelOpt FP8/NVFP4 checkpoints also
+require a model-specific mixed-precision policy and validation. FP8 on Ampere
+may use a weight-only path where available.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+## Current Model and Stage Support
 
-These models split generation across multiple stages. Quantization must be
-attached to the intended stage rather than applied globally.
+The current offline checkpoint guidance is transformer-first. A listed
+checkpoint quantizes the stage named in the **Scope** column; it does not imply
+that the model's encoders, VAE, decoder, or other stages are also quantized.
 
-| Method | Guide | Scope | Example models | Status |
-|--------|-------|-------|----------------|--------|
-| FP8 | [FP8](fp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
-| Int8 | [Int8](int8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
-| BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Stage-specific transformer or DiT module | BAGEL, GLM-Image | Not validated |
-| ModelOpt | [ModelOpt](modelopt.md) | Checkpoint-defined diffusion stage | BAGEL, GLM-Image | Requires model-specific validation |
-| MXFP8 | [MXFP8](mxfp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Not validated |
-| MXFP4 | [MXFP4](mxfp4.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Not validated |
-| AutoRound | [AutoRound](autoround.md) | Checkpoint-defined stage | BAGEL, GLM-Image | No validated checkpoint listed |
-| msModelSlim | [msModelSlim](msmodelslim.md) | Ascend-generated stage weights | GLM-Image | Requires model-specific adaptation |
+### Vendor and Runtime Ecosystems
+
+The producer and runtime backend are related, but they are not the same support
+claim. A producer can emit several checkpoint formats, and each format still
+needs a compatible vLLM-Omni loader, model-stage wiring, and validation. A
+runtime may also provide online quantization without an offline producer path.
+
+| Ecosystem | Current paths | Current vLLM-Omni scope | Model evidence |
+|-----------|---------------|-------------------------|----------------|
+| NVIDIA | ModelOpt FP8, NVFP4, and mixed FP8/NVFP4 | Diffusion transformer or Qwen-Omni thinker | Qwen-Image and other named diffusion checkpoints are validated; Qwen3-Omni NVFP4 has H100 CI for the Marlin fallback |
+| Intel | AutoRound W4A16 and AutoRound MXFP8 | Diffusion/world-model transformer or Qwen-Omni thinker | Wan A14B and GLM-Image W4A16 are CI-backed; Qwen-Image, Qwen-Omni, and Cosmos3-Super have validation outside scheduled CI |
+| AMD ROCm | Online OCP MXFP4 through AITER on gfx950; no pre-quantized MXFP4 or AMD Quark workflow is integrated | Diffusion transformer linear layers | Integrated backend with dispatch and weight-allocation unit coverage; no named-model quality validation or scheduled gfx950 full-model CI |
+| Ascend | msModelSlim output through native MXFP8/MXFP4 merge workflows or a compatible generic Ascend format | Wan diffusion transformers | Native Wan MXFP8/MXFP4 paths are validated outside scheduled full-model NPU CI; other model families remain integrated or unvalidated |
+
+### Pre-Quantized Model Matrix
+
+| Model family | Method | Scope | Level | Notes |
+|--------------|--------|-------|-------|-------|
+| Qwen-Image | [ModelOpt](modelopt.md) FP8 or mixed FP8/NVFP4 | Diffusion transformer | Validated | Named Qwen-Image 2512 checkpoints and recipes are available. Text encoder and VAE stay BF16. |
+| Qwen-Image | [AutoRound](autoround.md) W4A16 | Diffusion transformer | Validated | Uses `INC4AI/Qwen-Image-AutoRound-W4A16`; text encoder and VAE stay BF16. |
+| Wan2.2 I2V/T2V A14B | [AutoRound](autoround.md) W4A16 | Both diffusion transformers | CI-backed | The high-noise and low-noise DiTs are quantized; text encoder and VAE stay BF16. |
+| Wan2.2 TI2V 5B | [AutoRound](autoround.md) W4A16 | Diffusion transformer | Validated | Named checkpoint available; not covered by the scheduled Wan AutoRound job. |
+| Wan2.2 | [MXFP8](mxfp8.md) | One or both diffusion transformers | Validated | Native Ascend and AutoRound checkpoint formats are integrated; no scheduled full-model offline NPU job. |
+| Wan2.2 I2V/T2V A14B | [MXFP4 DualScale](mxfp4.md) | Both diffusion transformers | Validated | Offline calibrated checkpoints are recommended; no scheduled full-model offline NPU job. |
+| Qwen2.5-Omni | [AutoRound](autoround.md) W4A16 | Thinker language model | Validated | Encoders and output/audio stages stay BF16. |
+| Qwen3-Omni | [ModelOpt](modelopt.md) FP8 | Thinker language model | Validated | Tested outside scheduled CI. |
+| Qwen3-Omni | [ModelOpt](modelopt.md) NVFP4 | Thinker language model | CI-backed | H100 CI exercises the Marlin fallback; the native Blackwell FP4 path has separate recipe validation. |
+| Qwen3-Omni | [AutoRound](autoround.md) W4A16 | Thinker language model | Validated | Audio encoder, vision encoder, talker, and Code2Wav stay BF16. |
+| GLM-Image | [AutoRound](autoround.md) W4A16 | Diffusion transformer stage | CI-backed | Text-to-image and image-to-image full-model smoke coverage. |
+| Cosmos3-Super | [AutoRound](autoround.md) W4A16 | World-model transformer | Validated | Manually validated serving path; VAE and other components stay BF16. |
+| Cosmos3-Nano | [AutoRound](autoround.md) W4A16 | World-model transformer | Integrated | Named checkpoint is listed, but no model-specific end-to-end test is maintained in-tree. |
+| MiniMax H3 | None | None | Not validated | No offline vendor checkpoint path is documented; online FP8 targets the DiT only. |
+
+The method pages contain the complete checkpoint lists, including FLUX,
+Z-Image, and HunyuanImage-3.0 variants.
+
+### Online Quantization
+
+| Model family | Methods | Scope | Level |
+|--------------|---------|-------|-------|
+| Qwen-Image | FP8, Int8 | Diffusion transformer | Validated |
+| Z-Image | Int8, BitsAndBytes W4 | Diffusion transformer | Validated |
+| Wan2.2 | MXFP8 | One or both diffusion transformers | Validated on the documented XPU/NPU paths |
+| Wan2.2 A14B | MXFP4 | Both diffusion transformers | Validated on Ascend; the ROCm gfx950 online backend is integrated but not model-validated |
+| MiniMax H3 | FP8 | DiT and optional reference DiT | Validated |
+| Qwen3-Omni | Generic online methods, such as FP8 | Thinker language model only | Integrated; not model-validated as an online recommendation |
+
+See [Online Quantization](online.md) for configuration and hardware details.
+
+### Unlisted and Long-Tail Models
+
+For models not listed above, generic quantized linear layers or compatible
+checkpoint metadata are only an integration starting point. The default support
+target is the model's primary transformer, DiT, or AR language-model stage.
+Text/audio/vision encoders, VAEs, vocoders, decoders, and output stages remain
+BF16 until a model-specific integration supplies quant-aware layers, checkpoint
+mapping, end-to-end output validation, and backend coverage.
 
 !!! note
     "Online quantization" means vLLM-Omni computes the quantization data while
@@ -92,8 +143,8 @@ attached to the intended stage rather than applied globally.
 
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
-The default target is the diffusion transformer. Component routing is available
-through `build_quant_config()`:
+The default target is the diffusion transformer. `build_quant_config()` can
+construct a component router:
 
 ```python
 from vllm_omni.quantization import build_quant_config
@@ -104,11 +155,19 @@ config = build_quant_config({
 })
 ```
 
+!!! warning "Routing syntax is not a support claim"
+    A component dictionary only selects a quantization config by module prefix.
+    It does not make an encoder or VAE quantizable. The model must construct
+    that component from quantization-aware layers, and an offline checkpoint
+    must contain matching packed weights and scales. Current user guidance
+    keeps diffusion text encoders and VAEs in BF16.
+
 | Component | Default quantized? | Notes |
 |-----------|--------------------|-------|
-| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
+| Diffusion transformer | Yes, for listed model/method pairs | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
+| Second diffusion transformer | Yes, for listed Wan2.2 A14B methods | `transformer` and `transformer_2` read their own offline checkpoint metadata; arbitrary mixed methods are not currently validated |
 | Text encoder | No | Keep BF16 unless a method-specific guide documents support |
-| VAE | No | Keep BF16; storage-only paths are method-specific |
+| VAE | No | Keep BF16 |
 | Scheduler/tokenizer | No | Loaded from the base model repository |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
@@ -120,6 +179,18 @@ config = build_quant_config({
 | Vision encoder | No | BF16 |
 | Talker or TTS stage | No | BF16 unless model-specific support is documented |
 | Code2Wav | No | BF16 |
+
+An explicit `ComponentQuantizationConfig` can be used by model developers to
+route different configs to `audio_tower`, `visual`, and `language_model`, but
+the supported Qwen-Omni checkpoints currently quantize only the thinker
+language model.
+
+### World Model (Cosmos3)
+
+| Component | Default quantized? | Notes |
+|-----------|--------------------|-------|
+| World-model transformer | AutoRound checkpoints only | Cosmos3-Super is validated; Cosmos3-Nano is integrated but not end-to-end tested in-tree |
+| VAE and guardrail components | No | BF16 |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
@@ -141,6 +212,7 @@ build_quant_config("fp8")
 build_quant_config({"method": "fp8", "activation_scheme": "static"})
 build_quant_config("bitsandbytes")
 build_quant_config("auto-round", bits=4, group_size=128)
+# Component routing syntax; model-specific support is still required.
 build_quant_config({"transformer": {"method": "fp8"}, "vae": None})
 build_quant_config(None)
 ```

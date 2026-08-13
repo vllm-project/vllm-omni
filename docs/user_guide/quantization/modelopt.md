@@ -13,6 +13,11 @@ components, such as the tokenizer, scheduler, text encoder, vision/audio
 encoder, and VAE, on the base checkpoint unless a model-specific guide says
 otherwise.
 
+The validation terms on this page follow the
+[support levels](overview.md#support-levels) defined in the overview. ModelOpt
+format detection and checkpoint adaptation are shared runtime integrations;
+each model and stage still requires its own end-to-end validation.
+
 !!! note
     ModelOpt checkpoints are pre-quantized checkpoints. Do not pass
     `--quantization fp8` for these checkpoints. The checkpoint
@@ -58,11 +63,11 @@ stay unquantized unless the model-specific recipe validates otherwise.
 | Intel XPU | ⭕ |
 | Ascend NPU | ❌ |
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
-The optional CUTLASS FP8 runtime override requires CUDA SM89+. ModelOpt NVFP4
-and mixed FP8/NVFP4 diffusion checkpoints are currently validated on Blackwell
-CUDA systems in the recipes below; other CUDA generations require separate
-backend and quality validation.
+Legend: `✅` backend available, `❌` unsupported, `⭕` not verified in this
+guide. The optional CUTLASS FP8 runtime override requires CUDA SM89+. ModelOpt
+NVFP4 and mixed FP8/NVFP4 diffusion checkpoints are currently validated on
+Blackwell CUDA systems in the recipes below; other CUDA generations require
+separate backend and quality validation.
 
 ## Model Type Support
 
@@ -79,6 +84,9 @@ backend and quality validation.
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8` | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
 | Wan2.2 | Not available | Diffusion transformer | Not validated |
 
+The validated diffusion entries above have named checkpoint and recipe
+evidence. They are not all exercised by scheduled full-model CI.
+
 For full serving commands and benchmark context, see
 [`recipes/Qwen/Qwen-Image.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image.md)
 and
@@ -88,8 +96,8 @@ and
 
 | Model | Scope | Status |
 |-------|-------|--------|
-| Qwen3-Omni | Thinker language-model stage | ModelOpt FP8 checkpoint path |
-| Qwen3-Omni | Thinker language-model stage (W4A4 NVFP4) | Validated; see [Qwen3-Omni NVFP4 W4A4](#qwen3-omni-nvfp4-w4a4-thinker) below |
+| Qwen3-Omni | Thinker language-model stage (FP8) | Validated outside scheduled CI |
+| Qwen3-Omni | Thinker language-model stage (W4A4 NVFP4) | CI-backed for the H100 Marlin fallback; native Blackwell path is recipe-validated |
 | Qwen3-TTS | TTS language-model stage | Not validated |
 
 Audio encoder, vision encoder, talker, and code2wav stages stay in BF16 unless
@@ -102,9 +110,9 @@ Qwen3-Omni-30B-A3B-Instruct thinker language model. The thinker text body
 (attention + MoE experts) is quantized to NVFP4 with FP8 per-tensor input
 scales; the audio encoder, vision encoder, talker, and code2wav stay in BF16.
 
-| Variant | HF checkpoint | Hardware |
-|---------|---------------|----------|
-| W4A4 NVFP4 (full thinker) | `YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A4-full-thinker-awqclip` | sm_100+ (Blackwell, FlashInfer FP4 GEMM) |
+| Variant | HF checkpoint | Hardware and validation |
+|---------|---------------|-------------------------|
+| W4A4 NVFP4 (full thinker) | `YihongJin/Qwen3-Omni-30B-A3B-Instruct-NVFP4-W4A4-full-thinker-awqclip` | sm_100+ native FlashInfer FP4 GEMM; H100 Marlin fallback is CI-backed |
 
 Calibration uses ModelOpt `mtq.NVFP4_DEFAULT_CFG` with the `awq_clip` algorithm
 on 1024 ultrachat samples chat-templated through the Qwen3-Omni tokenizer.
@@ -232,3 +240,6 @@ omni = Omni(
 5. Keep `--quantization fp8` for online FP8 from BF16 checkpoints; use this
    ModelOpt path only when the checkpoint already contains ModelOpt quantized
    weights and scales.
+6. The Qwen3-Omni full-model CI smoke exercises the H100 Marlin fallback. A
+   scheduled Blackwell test is still required before treating the native
+   FlashInfer FP4 kernel path as CI-backed.

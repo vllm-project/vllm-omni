@@ -9,6 +9,10 @@ stay in BF16/FP16. No pre-quantized checkpoint is required.
 This is an online (dynamic) path: load the normal HuggingFace checkpoint and
 quantize during model loading via the `bitsandbytes` CUDA kernels.
 
+The validation terms on this page follow the
+[support levels](overview.md#support-levels). BitsAndBytes kernel support does
+not imply that every diffusion transformer has been quality-validated.
+
 ## Hardware Support
 
 | Device | Support |
@@ -21,7 +25,7 @@ quantize during model loading via the `bitsandbytes` CUDA kernels.
 | Intel XPU | ❌ |
 | Ascend NPU | ❌ |
 
-Legend: `✅` supported, `❌` unsupported. Non-CUDA platforms raise in
+Legend: `✅` backend available, `❌` unsupported. Non-CUDA platforms raise in
 `get_quant_method()`; CUDA requires compute capability 7.5+ (`SM 75+`).
 
 Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
@@ -30,11 +34,11 @@ Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
 
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
-| Model | HF models | CUDA | Mode | Recommendation |
-|-------|-----------|:----:|------|----------------|
-| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Online W4 weight-only | All heavy linear layers; sensitive embedders stay BF16 |
-| Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Not validated | Online W4 weight-only | Compare vs BF16 before enabling |
-| Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Online W4 weight-only | Validate before enabling in docs |
+| Model | HF models | Scope | Level | Recommendation |
+|-------|-----------|-------|-------|----------------|
+| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Diffusion transformer | Validated | All heavy linear layers; sensitive embedders stay BF16 |
+| Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Diffusion transformer | Not validated | Compare with BF16 before enabling |
+| Wan2.2 | Wan2.2 diffusion pipelines | One or both diffusion transformers | Not validated | Validate quality and cascade behavior before enabling |
 
 Other diffusion models may work if their transformer uses supported linear
 layers, but they are not validated in this guide.
@@ -103,6 +107,10 @@ quality against a BF16 baseline before enabling on new models.
 Multi-GPU tensor parallelism (`tensor_parallel_size` > 1) is not validated for
 BitsAndBytes in diffusion models; each rank quantizes its own weight shard
 independently.
+
+Z-Image-Turbo is validated outside scheduled full-model BitsAndBytes CI. The
+real CUDA kernel smoke tests cover quantization and matrix multiplication, but
+do not establish model-level quality for unlisted architectures.
 
 If quality regresses, use `ignored_layers` to keep sensitive projections in BF16
 (for example `to_out` or `w2`).

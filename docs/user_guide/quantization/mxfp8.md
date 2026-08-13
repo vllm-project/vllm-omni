@@ -15,30 +15,45 @@ This method supports three modes:
 | **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
 | **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
 
+The validation terms on this page follow the
+[support levels](overview.md#support-levels). Current model guidance covers
+Wan diffusion transformers only; the text encoder and VAE stay in BF16.
+
 ## Hardware Support
 
 | Device | Online | Offline (Native) | Offline (AutoRound) |
 |--------|--------|------------------|---------------------|
-| NVIDIA Blackwell GPU (SM 100+) | ⭕ | ⭕ | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ | ⭕ | ⭕ |
-| NVIDIA Ampere GPU (SM 80+) | ⭕ | ⭕ | ⭕ |
-| AMD ROCm | ⭕ | ⭕ | ⭕ |
+| NVIDIA Blackwell GPU (SM 100+) | ❌ | ❌ | ⭕ |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ❌ | ❌ | ⭕ |
+| NVIDIA Ampere GPU (SM 80+) | ❌ | ❌ | ⭕ |
+| AMD ROCm | ❌ | ❌ | ⭕ |
 | Intel XPU | ✅ | ❌ | ✅ |
 | Ascend NPU (Atlas 950 A5) | ✅ | ✅ | ⭕ |
 
-Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
+Legend: `✅` backend available, `❌` unsupported, `⭕` not verified in this
+guide. Backend availability does not imply full-model checkpoint validation.
 
-**Note**: Intel XPU only supports AutoRound MXFP8 for offline mode. Use AutoRound quantized checkpoints or online mode for XPU.
+The native `DiffusionMXFP8Config` currently dispatches only to Intel XPU and
+Ascend NPU implementations. CUDA reaches `NotImplementedError`, so the NVIDIA
+rows are marked unsupported even though this is an implementation gap rather
+than a general claim about NVIDIA hardware capabilities. On NVIDIA, use
+[FP8](fp8.md) for load-time quantization or [ModelOpt](modelopt.md) FP8 for
+pre-quantized checkpoints. Adding native CUDA MXFP8 requires a registered CUDA
+linear method, a compatible checkpoint contract, and model-level validation.
+
+Native `mxfp8` is available online on Intel XPU and online or offline on
+Ascend. Intel XPU only supports AutoRound MXFP8 for offline mode. The AutoRound
+column is a separate checkpoint format and compute path.
 
 ## Model Type Support
 
 ### Diffusion Model (Wan2.2)
 
-| Model | Mode | Notes |
-|-------|------|-------|
-| Wan2.2-T2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
-| Wan2.2-I2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
-| Wan2.2-TI2V-5B | Online + Offline | Single transformer |
+| Model | Mode | Scope | Validation |
+|-------|------|-------|------------|
+| Wan2.2-T2V-A14B | Online + Offline | MoE cascade: `transformer` + `transformer_2` | Validated outside scheduled full-model offline NPU CI |
+| Wan2.2-I2V-A14B | Online + Offline | MoE cascade: `transformer` + `transformer_2` | Validated outside scheduled full-model offline NPU CI |
+| Wan2.2-TI2V-5B | Online + Offline | Single diffusion transformer | Validated outside scheduled full-model offline NPU CI |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -218,3 +233,7 @@ omni = Omni(model="<autoround-mxfp8-model>")
    `--output-dir`), regenerate it with the current script. The old script
    wrote a separate `quantization_config.json` that is not read by vLLM-Omni;
    the current script injects the config directly into `transformer/config.json`.
+4. The native loader, merge mappings, and Wan cascade config propagation have
+   unit coverage. The current Buildkite configuration does not schedule a
+   named full-model offline MXFP8 checkpoint on NPU, so this path is
+   **Validated**, not **CI-backed**.
