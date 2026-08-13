@@ -22,6 +22,7 @@ class Task(TypedDict, total=False):
     request_id: str
     engine_inputs: Any
     sampling_params: Any
+    topology_domain: str
 
 
 class LoadBalancingPolicy(str, Enum):
