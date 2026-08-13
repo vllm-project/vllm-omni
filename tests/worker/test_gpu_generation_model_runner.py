@@ -176,6 +176,30 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
     assert len(calls) == 1
 
 
+def test_execute_model_zero_tokens_ec_producer_takes_encoder_path(monkeypatch):
+    """AR lock-step: the EC-producer block sits ABOVE the zero-token block
+    (matching GPUARModelRunner), so a 0-token step on an EC producer returns
+    the empty ENCODER output. Before the C1 reorder, the unconditional early
+    return won and produced EMPTY_MODEL_RUNNER_OUTPUT instead — this is the
+    one cell whose behaviour the reorder changed."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: True)
+    monkeypatch.setattr(gen_runner_module, "get_ec_transfer", lambda: SimpleNamespace(is_consumer=False))
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    sentinel = object()
+    monkeypatch.setattr(gen_runner_module, "make_empty_encoder_model_runner_output", lambda so: sentinel)
+    runner = _make_guard_runner()
+    runner.encoder_cache = {}
+    runner.maybe_get_ec_connector_output = lambda scheduler_output, encoder_cache: contextlib.nullcontext()
+    encoder_calls = []
+    runner._execute_mm_encoder = lambda so: encoder_calls.append(so)
+
+    output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
+
+    assert output is sentinel
+    assert len(encoder_calls) == 1
+    assert runner._dummy_run_calls == []
+
+
 class TestSampleTokensBatched:
     """RFC #5450 C5: `sample_tokens` must slice per request for num_reqs > 1.
     The tensor branch's asserts used to force num_reqs == 1 and the list

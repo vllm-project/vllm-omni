@@ -1201,13 +1201,15 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
 
 
 class TestPromptIdsClampPaddingConvention:
-    """Pin the `clamp(max=logits_vocab)` in `GPUARModelRunner.sample_tokens`.
+    """Pin `GPUARModelRunner._clamp_prompt_ids_to_penalty_padding` (the clamp
+    `sample_tokens` applies before penalties).
 
     The audit (RFC #5450 C2) originally flagged the clamp as an off-by-one
     (OOB index). It is not: upstream penalties allocate `vocab_size + 1` bins
     and drop the last column, so `vocab_size` is the designed padding value
     (vllm/model_executor/layers/utils.py::get_token_bin_counts_and_mask).
-    These tests pin that contract so a future "fix" cannot re-break it.
+    These tests call the runner's own helper, so a future "fix" to the clamp
+    fails here.
     """
 
     LOGITS_VOCAB = 8
@@ -1220,8 +1222,8 @@ class TestPromptIdsClampPaddingConvention:
     def test_clamp_to_logits_vocab_keeps_padding_inert(self):
         from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
 
-        # The runner's exact expression.
-        clamped = self._padded_prompt().clamp(max=self.LOGITS_VOCAB)
+        # The runner's own helper, not a re-implementation.
+        clamped = GPUARModelRunner._clamp_prompt_ids_to_penalty_padding(self._padded_prompt(), self.LOGITS_VOCAB)
 
         _, mask = get_token_bin_counts_and_mask(clamped, self.LOGITS_VOCAB, 1)
 

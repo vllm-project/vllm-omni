@@ -1091,11 +1091,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         finished_reqs: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        """Merge model-provided KV-transfer metadata into a COPY of the
-        scheduler's finished-request data.
+        """Merge model-provided KV-transfer metadata copy-on-write.
 
+        The outer mapping is always new; a per-request dict is shallow-copied
+        (with a fresh merged ``custom_metadata``) only when the model supplies
+        metadata for it, and passes through unchanged otherwise.
         `scheduler_output` (and its per-request dicts) can be shared with the
-        engine-core process, so it must not be mutated here — the ngram block
+        engine-core process, so nothing here mutates them — the ngram block
         in `execute_model` `replace()`-copies for exactly the same reason. The
         merged mapping is only consumed by
         `kv_transfer_manager.handle_finished_requests_kv_transfer`.
@@ -2200,6 +2202,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             output.routed_experts = routed_experts_lists
         return output
 
+    @staticmethod
+    def _clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:
+        """Clamp batch-level pad ids down to ``logits_vocab`` — upstream's
+        designed penalty padding value.
+
+        ``max=logits_vocab`` (NOT ``logits_vocab - 1``) is deliberate:
+        upstream penalty computation allocates ``vocab_size + 1`` bins and
+        drops the last column, so ``vocab_size`` is the padding value that
+        never affects penalties (vllm/model_executor/layers/utils.py::
+        get_token_bin_counts_and_mask). Clamping one lower would count
+        padding as real occurrences of the last vocab token.
+        """
+        return prompt_token_ids.clamp(max=logits_vocab)
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -2242,17 +2258,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
 
         # Correct padding values of prompt_token_ids to match the logits vocabulary size.
-        # `max=logits_vocab` (NOT `logits_vocab - 1`) is deliberate: upstream penalty
-        # computation allocates `vocab_size + 1` bins and drops the last column, so
-        # `vocab_size` is the designed padding value that never affects penalties
-        # (vllm/model_executor/layers/utils.py::get_token_bin_counts_and_mask). Clamping
-        # one lower would count padding as real occurrences of the last vocab token.
         if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
             smd = self.input_batch.sampling_metadata
             if smd.prompt_token_ids is not None:
                 logits_vocab = logits.shape[-1]
                 if self.input_batch.vocab_size > logits_vocab:
-                    smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
+                    smd.prompt_token_ids = self._clamp_prompt_ids_to_penalty_padding(
+                        smd.prompt_token_ids, logits_vocab
+                    )
 
         # Drop min-tokens stop ids the head cannot emit (e.g. the text
         # tokenizer EOS folded into all_stop_token_ids on a narrow codec
