@@ -106,6 +106,16 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # video/text/audio tokens (padding is clamped to 0 before the embedding
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+MINIMAX_H3_STATIC_CONDITIONING_KWARG = "static_conditioning"
+_MINIMAX_H3_PREPARE_STATIC_CONDITIONING_KWARG = "prepare_static_conditioning"
+
+
+@dataclass(frozen=True)
+class MiniMaxH3StaticConditioning:
+    """Timestep-invariant conditioning prepared for one generation request."""
+
+    refined_prompt_embeds: torch.Tensor
+    rope_freqs: torch.Tensor
 
 # Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
 # (consumed only via the "laser_input_scale" extra key; other backends and
@@ -144,6 +154,8 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "packed_seq_params",
         "refiner_packed_seq_params",
         "video_token_layout",
+        MINIMAX_H3_STATIC_CONDITIONING_KWARG,
+        _MINIMAX_H3_PREPARE_STATIC_CONDITIONING_KWARG,
     }
 )
 
@@ -1056,18 +1068,117 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError(f"{key}.{field} is required")
         return value
 
+    def _refine_prompt_embeddings(
+        self,
+        *,
+        prompt_embeds: torch.Tensor,
+        refiner_cu_seqlens: torch.Tensor,
+        refiner_max_seqlen: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        text_rows = prompt_embeds.to(device=device, dtype=_BF16_DTYPE)
+        text_embed, _ = self.condition_proj(text_rows)
+        return self.token_refiner(
+            text_embed,
+            cu_seqlens=refiner_cu_seqlens.to(device),
+            max_seqlen=refiner_max_seqlen,
+        )
+
+    def _prepare_static_conditioning(
+        self,
+        *,
+        prompt_embeds: torch.Tensor,
+        img_position_ids: torch.Tensor,
+        refiner_cu_seqlens: torch.Tensor,
+        refiner_max_seqlen: int,
+        device: torch.device,
+    ) -> MiniMaxH3StaticConditioning:
+        """Prepare prompt refinement and RoPE once for a denoise request."""
+        return MiniMaxH3StaticConditioning(
+            refined_prompt_embeds=self._refine_prompt_embeddings(
+                prompt_embeds=prompt_embeds,
+                refiner_cu_seqlens=refiner_cu_seqlens,
+                refiner_max_seqlen=refiner_max_seqlen,
+                device=device,
+            ),
+            rope_freqs=self.rope(img_position_ids.to(device)).to(device),
+        )
+
+    def prepare_static_conditioning(
+        self,
+        *,
+        prompt_embeds: torch.Tensor,
+        img_position_ids: torch.Tensor,
+        refiner_cu_seqlens: torch.Tensor,
+        refiner_max_seqlen: int,
+    ) -> MiniMaxH3StaticConditioning:
+        """Prepare request conditioning through the model's forward hooks."""
+        result = self(
+            **{
+                _MINIMAX_H3_PREPARE_STATIC_CONDITIONING_KWARG: True,
+                "prompt_embeds": prompt_embeds,
+                "img_position_ids": img_position_ids,
+                "refiner_packed_seq_params": {
+                    "cu_seqlens_q": refiner_cu_seqlens,
+                    "max_seqlen_q": refiner_max_seqlen,
+                },
+            }
+        )
+        if not isinstance(result, MiniMaxH3StaticConditioning):
+            raise RuntimeError(f"unexpected static conditioning result: {type(result)!r}")
+        return result
+
+    def _resolve_static_conditioning(
+        self,
+        *,
+        static_conditioning: MiniMaxH3StaticConditioning | None,
+        prompt_embeds: torch.Tensor | None,
+        img_position_ids: torch.Tensor | None,
+        refiner_packed_seq_params: object | None,
+        device: torch.device,
+    ) -> MiniMaxH3StaticConditioning:
+        if static_conditioning is not None:
+            if not isinstance(static_conditioning, MiniMaxH3StaticConditioning):
+                raise TypeError(
+                    f"static_conditioning must be a MiniMaxH3StaticConditioning, got {type(static_conditioning)!r}"
+                )
+            return static_conditioning
+
+        if prompt_embeds is None or img_position_ids is None or refiner_packed_seq_params is None:
+            raise ValueError(
+                "MiniMaxH3DiTModel.forward requires static_conditioning or "
+                "prompt_embeds, img_position_ids, and refiner_packed_seq_params"
+            )
+        refiner_cu = self._psp_field(
+            refiner_packed_seq_params,
+            "refiner_packed_seq_params",
+            "cu_seqlens_q",
+        ).to(torch.int32)
+        refiner_max = int(
+            self._psp_field(
+                refiner_packed_seq_params,
+                "refiner_packed_seq_params",
+                "max_seqlen_q",
+            )
+        )
+        return self._prepare_static_conditioning(
+            prompt_embeds=prompt_embeds,
+            img_position_ids=img_position_ids,
+            refiner_cu_seqlens=refiner_cu,
+            refiner_max_seqlen=refiner_max,
+            device=device,
+        )
+
     def _embed(
         self,
         *,
         x: torch.Tensor,
         audio_x: torch.Tensor,
-        text_embeddings_selected: torch.Tensor,
+        refined_prompt_embeds: torch.Tensor,
         unique_timesteps: torch.Tensor,
         img_pos: torch.Tensor,
         audio_pos: torch.Tensor,
         text_pos: torch.Tensor,
-        refiner_cu_seqlens: torch.Tensor,
-        refiner_max_seqlen: int,
         seq_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1082,13 +1193,7 @@ class MiniMaxH3DiTModel(nn.Module):
         audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
-        text_embed, _ = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(
-            text_embed,
-            cu_seqlens=refiner_cu_seqlens,
-            max_seqlen=refiner_max_seqlen,
-        )
+        text_embed = refined_prompt_embeds.to(device=device, dtype=_BF16_DTYPE)
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
         embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
@@ -1098,7 +1203,10 @@ class MiniMaxH3DiTModel(nn.Module):
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
-    def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor] | MiniMaxH3StaticConditioning:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -1115,16 +1223,26 @@ class MiniMaxH3DiTModel(nn.Module):
                 f"{sorted(_FORWARD_SUPPORTED_KWARGS)}"
             )
 
+        if kwargs.get(_MINIMAX_H3_PREPARE_STATIC_CONDITIONING_KWARG, False):
+            prompt_embeds = _required_kwarg(kwargs, "prompt_embeds")
+            return self._resolve_static_conditioning(
+                static_conditioning=None,
+                prompt_embeds=prompt_embeds,
+                img_position_ids=_required_kwarg(kwargs, "img_position_ids"),
+                refiner_packed_seq_params=_required_kwarg(
+                    kwargs,
+                    "refiner_packed_seq_params",
+                ),
+                device=prompt_embeds.device,
+            )
+
         x = _required_kwarg(kwargs, "x")
         audio_x = _required_kwarg(kwargs, "audio_x")
-        img_position_ids = _required_kwarg(kwargs, "img_position_ids")
         unique_timesteps = _required_kwarg(kwargs, "unique_timesteps")
         inverse_indices = _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
         update_mask = _required_kwarg(kwargs, "update_mask")
         token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
         skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
-
-        text_selected = _required_kwarg(kwargs, "prompt_embeds")
 
         img_pos = self._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
         audio_pos = self._pos_ids(_required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info")
@@ -1140,9 +1258,6 @@ class MiniMaxH3DiTModel(nn.Module):
         psp = _required_kwarg(kwargs, "packed_seq_params")
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
-        refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
-        refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
-        refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
@@ -1153,19 +1268,23 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        # Compute RoPE frequencies over the full packed sequence.
-        rope_freqs = self.rope(img_position_ids).to(device)
+        static_conditioning = self._resolve_static_conditioning(
+            static_conditioning=kwargs.get(MINIMAX_H3_STATIC_CONDITIONING_KWARG),
+            prompt_embeds=kwargs.get("prompt_embeds"),
+            img_position_ids=kwargs.get("img_position_ids"),
+            refiner_packed_seq_params=kwargs.get("refiner_packed_seq_params"),
+            device=device,
+        )
+        rope_freqs = static_conditioning.rope_freqs
 
         decoder_input, t_emb = self._embed(
             x=x,
             audio_x=audio_x,
-            text_embeddings_selected=text_selected,
+            refined_prompt_embeds=static_conditioning.refined_prompt_embeds,
             unique_timesteps=unique_timesteps.view(-1).to(device),
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device),
-            refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
         )
@@ -1225,6 +1344,8 @@ EntryClass = MiniMaxH3DiTModel
 __all__ = [
     "MINIMAX_H3_FP32_BUFFER_NAMES",
     "MINIMAX_H3_FP32_PARAM_NAMES",
+    "MINIMAX_H3_STATIC_CONDITIONING_KWARG",
     "MiniMaxH3DiTModel",
+    "MiniMaxH3StaticConditioning",
     "_reorder_grouped_qkv_to_qkv",
 ]
