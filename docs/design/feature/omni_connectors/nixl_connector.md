@@ -58,7 +58,8 @@ Parameters:
 - `host`: address the producer binds its handshake socket to (`"auto"` to detect).
 - `zmq_port`: handshake port. Omit it when the pipeline forwards `put()`'s metadata
   itself, in which case no socket is opened. Stages colocated on one host each need
-  a distinct port.
+  a distinct port. The value in the deploy YAML is the base port: stage and rank
+  offsets are added to it, so a tensor-parallel stage does not need one entry per rank.
 - `sender_host` / `sender_zmq_port`: consumer-side override naming the producer's
   handshake endpoint. Only needed when the consumer cannot learn it from metadata.
 - `backends`: NIXL backends to register memory with. Defaults to `["UCX"]`.
