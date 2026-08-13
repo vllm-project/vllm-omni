@@ -98,7 +98,7 @@ class StableDiffusionXLPipeline(
             prefetch_list=sdxl_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
         self.text_encoder_2 = from_pretrained_with_prefetch(
             CLIPTextModelWithProjection.from_pretrained,
             model,
@@ -106,7 +106,7 @@ class StableDiffusionXLPipeline(
             prefetch_list=sdxl_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
         self.unet = SDXLUNet2DConditionModel(od_config=od_config)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKL.from_pretrained,
