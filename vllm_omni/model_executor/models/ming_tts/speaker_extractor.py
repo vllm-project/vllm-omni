@@ -9,10 +9,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.common.ming.speaker_extractor import (
-    SpeakerEmbeddingExtractor,
-    resolve_model_to_local_path,
-)
+from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
 
 from .audio_prep import coerce_prompt_waveform, coerce_speaker_embeddings
 from .constants import (
@@ -31,9 +28,6 @@ _EXTRACTOR_LOAD_LOCK = threading.Lock()
 
 # Ming's bundle ships the CAM++ artifact as `campplus.onnx` in the model
 # directory, which is the shared extractor's default.
-MingSpeakerEmbeddingExtractor = SpeakerEmbeddingExtractor
-
-
 def _load_speaker_extractor(wrapper: MingTTSForConditionalGeneration) -> SpeakerEmbeddingExtractor:
     extractor = getattr(wrapper, "_speaker_extractor", None)
     if extractor is not None:
@@ -138,9 +132,6 @@ def _resolve_speaker_embeddings(
 
 
 __all__ = [
-    "MingSpeakerEmbeddingExtractor",
-    "SpeakerEmbeddingExtractor",
     "_load_speaker_extractor",
     "_resolve_speaker_embeddings",
-    "resolve_model_to_local_path",
 ]
