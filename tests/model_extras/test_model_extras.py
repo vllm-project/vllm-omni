@@ -17,6 +17,7 @@ from vllm_omni.model_extras import (
     build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
@@ -134,6 +135,8 @@ def test_lingbot_extra_registry_declares_request_params() -> None:
         }
     )
     assert get_extra_output_params("LingBotVideoPipeline") == frozenset()
+    assert get_output_tensor_range("LingBotVideoPipeline") == "zero_to_one"
+    assert get_output_tensor_range("WanPipeline") == "negative_one_to_one"
     assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
 
 

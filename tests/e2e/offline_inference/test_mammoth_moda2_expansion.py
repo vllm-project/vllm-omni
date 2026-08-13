@@ -172,7 +172,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
 
     found_image = False
     for out in outputs:
-        ro_list = getattr(out, "request_output", out)
+        ro_list = out
         if not isinstance(ro_list, list):
             ro_list = [ro_list]
         for ro in ro_list:
