@@ -6,6 +6,9 @@ explicitly patch values that differ from vLLM.
 
 import argparse
 import inspect
+import json
+import os
+import shutil
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -192,6 +195,155 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
             "max_position_embeddings": 65536,
         },
     }
+
+
+def test_patch_missing_local_hf_config(tmp_path):
+    """Native model bundles may only contain a checkpoints/ directory."""
+    (tmp_path / "checkpoints").mkdir()
+    args = object.__new__(OmniEngineArgs)
+    args.model = str(tmp_path)
+    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.hf_config_path = None
+
+    try:
+        args._patch_empty_hf_config("indextts2_5")
+
+        assert args.hf_config_path is not None
+        config_path = args.hf_config_path + "/config.json"
+        with open(config_path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        assert config == {
+            "model_type": "indextts2_5",
+            "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
+        }
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "config_entry",
+    ["malformed", "directory", "broken_symlink", "permission_error"],
+)
+def test_non_missing_local_hf_config_error_reaches_parent_loader(tmp_path, monkeypatch, config_entry):
+    """Non-missing config errors must reach vLLM's normal loader."""
+    config_path = tmp_path / "config.json"
+    if config_entry == "malformed":
+        config_path.write_text("{not valid json", encoding="utf-8")
+        loader_error = json.JSONDecodeError("invalid config", "{not valid json", 1)
+    elif config_entry == "directory":
+        config_path.mkdir()
+        loader_error = IsADirectoryError(str(config_path))
+    elif config_entry == "broken_symlink":
+        config_path.symlink_to(tmp_path / "missing-target.json")
+        loader_error = FileNotFoundError(str(config_path))
+    else:
+        config_path.write_text("{}", encoding="utf-8")
+        loader_error = PermissionError(str(config_path))
+
+    parent_inputs = {}
+
+    def controlled_get_config_dict(cls, model, **kwargs):
+        if model == str(tmp_path):
+            raise loader_error
+        with open(os.path.join(model, "config.json"), encoding="utf-8") as config_file:
+            return json.load(config_file), {}
+
+    def fake_parent_create_model_config(self):
+        parent_inputs["called"] = True
+        parent_inputs["model"] = self.model
+        parent_inputs["hf_config_path"] = self.hf_config_path
+        config_root = self.hf_config_path or self.model
+        parent_inputs["config_root"] = config_root
+        return PretrainedConfig.get_config_dict(config_root)[0]
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_parent_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(
+        model=str(tmp_path),
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+    )
+
+    with pytest.raises(type(loader_error)) as exc_info:
+        args.create_model_config()
+
+    assert str(exc_info.value) == str(loader_error)
+    assert parent_inputs["called"] is True
+    assert parent_inputs["model"] == str(tmp_path)
+    assert parent_inputs["config_root"] == str(tmp_path)
+    assert parent_inputs["hf_config_path"] is None
+    assert args.model == str(tmp_path)
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+
+
+def test_patch_valid_hf_config_without_model_type_preserves_keys(tmp_path):
+    """A valid partial config should be copied before required keys are added."""
+    original_config = {
+        "hidden_size": 1024,
+        "custom_key": {"nested": True},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(original_config), encoding="utf-8")
+    args = object.__new__(OmniEngineArgs)
+    args.model = str(tmp_path)
+    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.hf_config_path = None
+
+    try:
+        args._patch_empty_hf_config("indextts2_5")
+
+        assert args.hf_config_path is not None
+        with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+            patched_config = json.load(config_file)
+        assert patched_config["hidden_size"] == original_config["hidden_size"]
+        assert patched_config["custom_key"] == original_config["custom_key"]
+        assert patched_config["model_type"] == "indextts2_5"
+        assert patched_config["architectures"] == ["IndexTTS25TalkerForConditionalGeneration"]
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
+    """Remote resolution failures must stay on vLLM's normal error path."""
+    loader_error = OSError("remote config resolution failed")
+    parent_inputs = {}
+
+    def controlled_get_config_dict(cls, model, **kwargs):
+        raise loader_error
+
+    def fake_parent_create_model_config(self):
+        parent_inputs["called"] = True
+        parent_inputs["model"] = self.model
+        parent_inputs["hf_config_path"] = self.hf_config_path
+        return PretrainedConfig.get_config_dict(self.model)[0]
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_parent_create_model_config)
+
+    args = OmniEngineArgs(
+        model="remote/model",
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        args.create_model_config()
+
+    assert str(exc_info.value) == str(loader_error)
+    assert parent_inputs["called"] is True
+    assert parent_inputs["model"] == "remote/model"
+    assert parent_inputs["hf_config_path"] is None
+    assert args.model == "remote/model"
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
 
 
 def test_stage_specific_text_config_override():

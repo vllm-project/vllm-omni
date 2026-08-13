@@ -671,17 +671,8 @@ class OmniStreamingVideoOutputHandler:
         if result.images:
             # Video frames may be list[list[Image.Image]] despite images: list[Image.Image].
             videos = result.images  # type: ignore[assignment]
-        elif result.request_output is not None:
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
-                videos = request_output["images"]
-            elif isinstance(request_output, OmniRequestOutput):
-                if request_output.images:
-                    # Same nested-frames mismatch as result.images above.
-                    videos = request_output.images  # type: ignore[assignment]
-                else:
-                    request_multimodal_output = request_output.multimodal_output
-                    videos = request_multimodal_output.get("video")
+        # OmniRequestOutput IS the RequestOutput now — images and
+        # multimodal_output are checked directly on result.
         if videos is None:
             videos = result.multimodal_output.get("video")
 

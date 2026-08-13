@@ -38,7 +38,7 @@ def _stage_durations_from_output(outputs) -> dict[str, float]:
     durations = getattr(omni_out, "stage_durations", None) or {}
     if durations:
         return dict(durations)
-    ro = getattr(omni_out, "request_output", None)
+    ro = omni_out
     if ro is not None:
         return dict(getattr(ro, "stage_durations", None) or {})
     return {}

@@ -55,7 +55,7 @@ pytestmark = [
 def _extract_text(omni_outputs: list) -> str:
     """Extract generated text from OmniRequestOutput list."""
     for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
+        ro = req_output
         if ro and getattr(ro, "outputs", None):
             return "".join(getattr(o, "text", "") or "" for o in ro.outputs)
     return ""

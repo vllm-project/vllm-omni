@@ -42,7 +42,7 @@ def _sampling_params() -> OmniDiffusionSamplingParams:
 def _first_request_images(outputs) -> list:
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
     return req_out.images
 
