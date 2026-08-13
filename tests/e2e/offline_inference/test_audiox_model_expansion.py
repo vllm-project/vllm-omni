@@ -17,7 +17,7 @@ from vllm_omni.platforms import current_omni_platform
 # Override in CI if needed: AUDIOX_TEST_MODEL=<model-or-local-path>
 models = [os.environ.get("AUDIOX_TEST_MODEL", "zhangj1an/audiox_random")]
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAMS = [(m, None, {"model_class_name": "AudioXPipeline"}) for m in models]
 
 pytestmark = [

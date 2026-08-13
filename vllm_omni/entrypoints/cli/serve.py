@@ -945,8 +945,6 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        # The serve CLI no longer accepts legacy stage_args YAMLs.
-        None,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.

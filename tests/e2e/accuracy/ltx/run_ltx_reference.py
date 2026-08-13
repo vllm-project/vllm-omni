@@ -20,6 +20,11 @@ from PIL import Image
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("official", "omni"), required=True)
+    parser.add_argument(
+        "--pipeline-kind",
+        choices=("one_stage", "distilled", "two_stage"),
+        default="one_stage",
+    )
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model")
@@ -27,6 +32,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--official-root", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--gemma-root", type=Path)
+    parser.add_argument("--spatial-upsampler", type=Path)
+    parser.add_argument("--distilled-lora", type=Path)
     parser.add_argument("--enable-layerwise-offload", action="store_true")
     return parser.parse_args()
 
@@ -91,9 +98,13 @@ def _configure_official_sdpa(pipeline: Any) -> None:
         attention=attention,
         masked_attention=attention,
     )
-    owners_and_attributes = (
-        (pipeline.stage, "_transformer_builder"),
+    owners_and_attributes = [
         (pipeline.prompt_encoder, "_embeddings_processor_builder"),
+    ]
+    owners_and_attributes.extend(
+        (stage, "_transformer_builder")
+        for name in ("stage", "stage_1", "stage_2")
+        if (stage := getattr(pipeline, name, None)) is not None
     )
     for owner, attribute in owners_and_attributes:
         builder = getattr(owner, attribute)
@@ -102,6 +113,12 @@ def _configure_official_sdpa(pipeline: Any) -> None:
             attribute,
             builder.with_module_ops((*builder.module_ops, module_op)),
         )
+
+
+def _require_path(path: Path | None, description: str) -> str:
+    if path is None or not path.is_file():
+        raise ValueError(f"Official {description} is required and must exist: {path}")
+    return str(path)
 
 
 @torch.inference_mode()
@@ -113,16 +130,54 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     torch.backends.cuda.enable_cudnn_sdp(False)
 
     from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+    from ltx_pipelines.distilled import DistilledPipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
+    from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
     from ltx_pipelines.utils.args import ImageConditioningInput
     from ltx_pipelines.utils.types import OffloadMode
 
-    pipeline = TI2VidOneStagePipeline(
-        checkpoint_path=str(args.checkpoint),
-        gemma_root=str(args.gemma_root),
-        loras=(),
-        offload_mode=OffloadMode.CPU if args.enable_layerwise_offload else OffloadMode.NONE,
-    )
+    if request.get("pipeline_kind", "one_stage") != args.pipeline_kind:
+        raise ValueError(
+            f"Request pipeline kind {request.get('pipeline_kind')!r} does not match {args.pipeline_kind!r}"
+        )
+    checkpoint = _require_path(args.checkpoint, "checkpoint")
+    gemma_root = str(args.gemma_root)
+    if not Path(gemma_root).is_dir():
+        raise ValueError(f"Official Gemma root is required and must be a directory: {gemma_root}")
+    offload_mode = OffloadMode.CPU if args.enable_layerwise_offload else OffloadMode.NONE
+    pipeline: Any
+    if args.pipeline_kind == "one_stage":
+        pipeline = TI2VidOneStagePipeline(
+            checkpoint_path=checkpoint,
+            gemma_root=gemma_root,
+            loras=(),
+            offload_mode=offload_mode,
+        )
+    elif args.pipeline_kind == "distilled":
+        pipeline = DistilledPipeline(
+            distilled_checkpoint_path=checkpoint,
+            spatial_upsampler_path=_require_path(args.spatial_upsampler, "spatial upsampler"),
+            gemma_root=gemma_root,
+            loras=(),
+            offload_mode=offload_mode,
+        )
+    else:
+        distilled_lora = [
+            LoraPathStrengthAndSDOps(
+                path=_require_path(args.distilled_lora, "distilled LoRA"),
+                strength=1.0,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+        ]
+        pipeline = TI2VidTwoStagesPipeline(
+            checkpoint_path=checkpoint,
+            distilled_lora=distilled_lora,
+            spatial_upsampler_path=_require_path(args.spatial_upsampler, "spatial upsampler"),
+            gemma_root=gemma_root,
+            loras=(),
+            offload_mode=offload_mode,
+        )
     _configure_official_sdpa(pipeline)
     image_path = request.get("image")
     images = (
@@ -140,34 +195,45 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
             )
         ]
     )
-    video, audio = pipeline(
-        prompt=request["prompt"],
-        negative_prompt=request["negative_prompt"],
-        seed=request["seed"],
-        height=request["height"],
-        width=request["width"],
-        num_frames=request["num_frames"],
-        frame_rate=request["fps"],
-        num_inference_steps=request["num_inference_steps"],
-        video_guider_params=MultiModalGuiderParams(
-            cfg_scale=request["video_cfg_scale"],
-            stg_scale=request["video_stg_scale"],
-            rescale_scale=request["video_rescale_scale"],
-            modality_scale=request["video_modality_scale"],
-            skip_step=0,
-            stg_blocks=request["video_stg_blocks"],
-        ),
-        audio_guider_params=MultiModalGuiderParams(
-            cfg_scale=request["audio_cfg_scale"],
-            stg_scale=request["audio_stg_scale"],
-            rescale_scale=request["audio_rescale_scale"],
-            modality_scale=request["audio_modality_scale"],
-            skip_step=0,
-            stg_blocks=request["audio_stg_blocks"],
-        ),
-        images=images,
-        max_batch_size=4,
-    )
+    if args.pipeline_kind == "distilled":
+        video, audio = pipeline(
+            prompt=request["prompt"],
+            seed=request["seed"],
+            height=request["height"],
+            width=request["width"],
+            num_frames=request["num_frames"],
+            frame_rate=request["fps"],
+            images=images,
+        )
+    else:
+        video, audio = pipeline(
+            prompt=request["prompt"],
+            negative_prompt=request["negative_prompt"],
+            seed=request["seed"],
+            height=request["height"],
+            width=request["width"],
+            num_frames=request["num_frames"],
+            frame_rate=request["fps"],
+            num_inference_steps=request["num_inference_steps"],
+            video_guider_params=MultiModalGuiderParams(
+                cfg_scale=request["video_cfg_scale"],
+                stg_scale=request["video_stg_scale"],
+                rescale_scale=request["video_rescale_scale"],
+                modality_scale=request["video_modality_scale"],
+                skip_step=0,
+                stg_blocks=request["video_stg_blocks"],
+            ),
+            audio_guider_params=MultiModalGuiderParams(
+                cfg_scale=request["audio_cfg_scale"],
+                stg_scale=request["audio_stg_scale"],
+                rescale_scale=request["audio_rescale_scale"],
+                modality_scale=request["audio_modality_scale"],
+                skip_step=0,
+                stg_blocks=request["audio_stg_blocks"],
+            ),
+            images=images,
+            max_batch_size=4,
+        )
     video_tensor = torch.cat([chunk.detach().cpu() for chunk in video], dim=0)
     _save_outputs(
         args.output_dir,
@@ -179,6 +245,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
             "attention_backend": "torch_sdpa",
             "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
             "checkpoint": str(args.checkpoint),
+            "pipeline_kind": args.pipeline_kind,
         },
     )
 
@@ -253,6 +320,10 @@ def _canonical_video(video: Any) -> torch.Tensor:
 def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.model is None or args.model_class_name is None:
         raise ValueError("Omni backend requires --model and --model-class-name")
+    if request.get("pipeline_kind", "one_stage") != args.pipeline_kind:
+        raise ValueError(
+            f"Request pipeline kind {request.get('pipeline_kind')!r} does not match {args.pipeline_kind!r}"
+        )
 
     attention_config = {"default": {"backend": "TORCH_SDPA"}}
 
@@ -273,7 +344,8 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
         parallel_config=DiffusionParallelConfig(),
     )
     try:
-        model_class_name = get_model_class_name(omni)
+        detected_model_class_name = get_model_class_name(omni)
+        model_class_name = args.model_class_name
         sampling_params = OmniDiffusionSamplingParams(
             height=request["height"],
             width=request["width"],
@@ -289,10 +361,9 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
             key: value for key, value in request.items() if key.startswith("video_") or key.startswith("audio_")
         }
         apply_declared_extra_args(sampling_params, get_extra_body_params(model_class_name), guidance)
-        prompt: dict[str, Any] = {
-            "prompt": request["prompt"],
-            "negative_prompt": request["negative_prompt"],
-        }
+        prompt: dict[str, Any] = {"prompt": request["prompt"]}
+        if request.get("negative_prompt"):
+            prompt["negative_prompt"] = request["negative_prompt"]
         image_path = request.get("image")
         if image_path is not None:
             with Image.open(str(image_path)) as source_image:
@@ -312,6 +383,8 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
                 "attention_backend": "torch_sdpa",
                 "model": args.model,
                 "model_class_name": model_class_name,
+                "model_config_class_name": detected_model_class_name,
+                "pipeline_kind": args.pipeline_kind,
             },
         )
     finally:
