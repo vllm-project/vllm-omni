@@ -250,7 +250,7 @@ def _multimodal_output(output: object, completion: object | None) -> dict[str, A
     return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
-def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
+def _special_token_ids(metadata: Mapping[str, Any]) -> dict[str, int]:
     sources: list[object] = [metadata.get("special_token_ids"), metadata.get("meta")]
     sources.append(
         {
@@ -261,7 +261,7 @@ def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
     )
     token_ids: dict[str, int] = {}
     for source in sources:
-        if not isinstance(source, dict):
+        if not isinstance(source, Mapping):
             continue
         for key, value in source.items():
             if not isinstance(key, str) or not key.endswith("_token_id"):
@@ -272,9 +272,9 @@ def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
     return token_ids
 
 
-def _audio_encoder_latency_ms(metadata: dict[str, Any]) -> float | None:
+def _audio_encoder_latency_ms(metadata: Mapping[str, Any]) -> float | None:
     nested_meta = metadata.get("meta")
-    raw_latency = nested_meta.get("audio_encoder_latency_ms") if isinstance(nested_meta, dict) else None
+    raw_latency = nested_meta.get("audio_encoder_latency_ms") if isinstance(nested_meta, Mapping) else None
     if raw_latency is None:
         raw_latency = metadata.get("meta.audio_encoder_latency_ms")
     return _coerce_float(raw_latency)
@@ -372,9 +372,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         # ``is_segment_finished`` marker in the processed output. Its sampled
         # listen token is still a Stage-0 control result and must not enter the
         # text-to-codec stages.
-        if stage_id >= final_stage_id or not (
-            segment_finished or bool(getattr(output, "finished", False))
-        ):
+        if stage_id >= final_stage_id or not (segment_finished or bool(getattr(output, "finished", False))):
             return None
 
         completion = _first_completion(output)

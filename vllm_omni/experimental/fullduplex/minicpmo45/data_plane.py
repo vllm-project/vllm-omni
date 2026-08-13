@@ -175,6 +175,16 @@ class MiniCPMO45DataPlaneSession:
                         mm_output = inner_mm_output
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
 
+        audio_encoder_latency_ms = mm_output.get("audio_encoder_latency_ms")
+        stage0_metrics = stage_metrics.get("0") if stage_metrics is not None else None
+        if (
+            isinstance(stage0_metrics, dict)
+            and isinstance(audio_encoder_latency_ms, int | float)
+            and not isinstance(audio_encoder_latency_ms, bool)
+            and audio_encoder_latency_ms > 0
+        ):
+            stage0_metrics["audio_encoder_latency_ms"] = float(audio_encoder_latency_ms)
+
         output_turn_id = output_turn_id_from_metadata(mm_output)
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
