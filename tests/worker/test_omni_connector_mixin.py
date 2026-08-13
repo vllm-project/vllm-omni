@@ -20,6 +20,7 @@ import torch
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -1327,6 +1328,37 @@ class TestConnectorConfigValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "missing connector name"):
             host.init_omni_connectors(model_config=model_config)
+
+
+class TestRankAwareHandshakePort(unittest.TestCase):
+    """A sender must bind the port the orchestrator advertises for its rank."""
+
+    @staticmethod
+    def _resolve(name, extra, local_rank=0):
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
+            return_value=local_rank,
+        ):
+            return OmniConnectorModelRunnerMixin._rank_aware_extra(name, extra)
+
+    def test_sender_port_matches_the_orchestrator_formula(self):
+        for local_rank in (0, 1, 3):
+            with self.subTest(local_rank=local_rank):
+                extra = {"zmq_port": 50071, "stage_id": 2, "role": "sender"}
+                resolved = self._resolve("NixlConnector", extra, local_rank=local_rank)
+                self.assertEqual(resolved["zmq_port"], kv_zmq_port(50071, 2, local_rank))
+                self.assertEqual(extra["zmq_port"], 50071, "the source config must not be mutated")
+
+    def test_receiver_and_handshake_less_connectors_keep_their_port(self):
+        receiver = self._resolve("NixlConnector", {"zmq_port": 50071, "role": "receiver"}, local_rank=1)
+        self.assertEqual(receiver["zmq_port"], 50071)
+
+        shm = self._resolve("SharedMemoryConnector", {"zmq_port": 50071, "role": "sender"}, local_rank=1)
+        self.assertEqual(shm["zmq_port"], 50071)
+
+    def test_unresolvable_port_is_left_as_configured(self):
+        extra = {"zmq_port": "${MISSING_PORT_VAR}", "stage_id": 0, "role": "sender"}
+        self.assertEqual(self._resolve("NixlConnector", extra), extra)
 
 
 class _FailingConnector:
