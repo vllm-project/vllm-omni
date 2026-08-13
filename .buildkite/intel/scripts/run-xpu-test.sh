@@ -34,8 +34,23 @@ docker_build() {
     docker build "${out[@]}" "$@" -f docker/Dockerfile.xpu .
 }
 
+build_vllm_base() (
+    local vllm_source_dir
+    vllm_source_dir=$(mktemp -d)
+    trap 'rm -rf "${vllm_source_dir}"' EXIT
+
+    git clone --depth 1 --branch "${VLLM_VERSION}" \
+        https://github.com/vllm-project/vllm "${vllm_source_dir}"
+
+    local out=("${export_args[@]/'{{IMAGE}}'/${base_image_name}}")
+    docker build "${out[@]}" \
+        --target vllm-openai \
+        -f "${vllm_source_dir}/docker/Dockerfile.xpu" \
+        "${vllm_source_dir}"
+)
+
 if [ -z "$(docker images -q "${base_image_name}")" ]; then
-    docker_build "${base_image_name}" --target vllm-base --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+    build_vllm_base
 fi
 
 # Try building the docker image

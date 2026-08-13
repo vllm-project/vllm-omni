@@ -11,6 +11,9 @@ from vllm_omni.experimental.fullduplex.client import (
     read_pcm16_wav,
     write_pcm16_wav,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,6 +33,19 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "minicpmo45_native_duplex": ["1"],
         "session_id": ["session-a"],
     }
+
+
+def test_seed_tts_initial_text_is_part_of_native_duplex_context():
+    prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
+        "Speak exactly.",
+        True,
+        "The quick brown fox.",
+    )
+
+    assert prefix == "<|im_start|>system\nSpeak exactly.\n<|audio_start|>"
+    assert suffix == (
+        "<|audio_end|><|im_end|>\n<|im_start|>user\nThe quick brown fox.<|im_end|>\n<|im_start|>assistant\n"
+    )
 
 
 def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
@@ -86,6 +102,59 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
 
 
+@pytest.mark.asyncio
+async def test_realtime_client_configure_sends_seed_tts_text_condition():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        instructions="Speak the requested text exactly.",
+        initial_user_text="The quick brown fox.",
+        timeout_s=1,
+    )
+
+    session = client.sent[0]["session"]
+    assert session["instructions"] == "Speak the requested text exactly."
+    assert session["extra_body"]["duplex_initial_user_text"] == "The quick brown fox."
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        native_duplex=False,
+        auto_response=False,
+        extra_body={"ref_audio": "data:audio/wav;base64,AAAA"},
+        timeout_s=1,
+    )
+
+    session_extra_body = client.sent[0]["session"]["extra_body"]
+    assert session_extra_body == {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+        "minicpmo45_native_duplex": False,
+    }
+
+
 def test_realtime_event_collector_partitions_audio_by_response():
     collector = RealtimeEventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})
@@ -134,6 +203,26 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
             },
             received_at_s=received_at_s,
         )
+    collector.add(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp-a",
+            "delta": "",
+        },
+        received_at_s=10.1,
+    )
+    collector.add(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp-a",
+            "delta": "hello",
+        },
+        received_at_s=10.15,
+    )
+    collector.add(
+        {"type": "response.done", "response": {"id": "resp-a"}},
+        received_at_s=10.4,
+    )
 
     timing = collector.timing_summary(
         after_s=10.0,
@@ -174,6 +263,19 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
             "max": 80.0,
         },
         "max_chunk_gap_ms": 110.0,
+    }
+    assert timing["request_metrics"] == {
+        "source": "client_monotonic_receive",
+        "measurement_origin": {
+            "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+            "ttfp": "input_audio_buffer.commit client send to first audio packet",
+            "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+        },
+        "ttft_ms": 250.0,
+        "ttfp_ms": 300.0,
+        "rtf": pytest.approx(1.916667),
+        "audio_generation_ms": 460.0,
+        "audio_duration_ms": 240.0,
     }
 
 

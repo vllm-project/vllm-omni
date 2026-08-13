@@ -273,7 +273,7 @@ class TestPipelineStreamingOutputToEntrypoint:
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id.startswith("req-omni-")
             assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
-            assert [getattr(output.request_output, "finished", output.finished) for output in outputs] == [False, True]
+            assert [output.finished for output in outputs] == [False, True]
         finally:
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
 

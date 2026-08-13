@@ -104,7 +104,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     for stage_outputs in omni_outputs:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text

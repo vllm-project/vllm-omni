@@ -9,6 +9,7 @@ from vllm_omni.model_extras.registry import (
     get_extra_body_params,
     get_extra_output_params,
     get_model_class_name,
+    get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "get_extra_body_params",
     "get_extra_output_params",
     "get_model_class_name",
+    "get_output_tensor_range",
     "get_x_to_text_model_family",
     "should_init_extra_args_for_non_diffusion_stages",
 ]

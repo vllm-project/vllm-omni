@@ -111,6 +111,7 @@ plugins:
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building
         - "vllm_omni.experimental"  # avoid importing optional serving deps (openai, fastapi, uvicorn, httpx) in mkdocs building
+        - "vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored"  # vendored NeMo code; upstream docstrings trip griffe strict warnings
   - mkdocstrings:
       handlers:
         python:

@@ -19,36 +19,14 @@ DEPLOY_CONFIG = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
+        # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
+        # is left automatic so duplex matches the simplex deploy profiles.
         "stages": {
-            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
-            1: {"kv_cache_memory_bytes": 512 * 1024 * 1024},
-            2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
-        },
-        # Platform overrides are applied after ordinary stage settings. Keep
-        # the constrained duplex test's Talker budget ahead of the base CUDA
-        # profile's single-GPU default.
-        "platforms": {
-            "cuda": {
-                "stages": [
-                    {
-                        "stage_id": 1,
-                        "kv_cache_memory_bytes": 512 * 1024 * 1024,
-                    }
-                ]
-            }
+            1: {"max_model_len": 4096},
         },
     },
 )
-CORE_DEPLOY_CONFIG = modify_stage_config(
-    DEPLOY_CONFIG,
-    updates={
-        "stages": {
-            0: {"enforce_eager": True},
-            1: {"enforce_eager": True},
-        }
-    },
-)
-ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "minicpmo_4_5"
+ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
 SOFT_INTERRUPT_WAV = ASSET_DIR / "soft_interrupt_16k.wav"
@@ -60,18 +38,7 @@ SERVER_PARAMS = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=DEPLOY_CONFIG,
-            use_stage_cli=True,
-            server_args=["--trust-remote-code"],
-        ),
-        id="three-stage-single-gpu",
-    )
-]
-CORE_SERVER_PARAMS = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=CORE_DEPLOY_CONFIG,
-            use_stage_cli=True,
+            use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
         id="three-stage-single-gpu",
@@ -107,9 +74,11 @@ def validated_soft_interrupt_wav() -> Path:
 
 
 def resolve_ref_audio(model_prefix: str) -> Path:
-    if model_prefix:
-        model_root = Path(model_prefix) / MODEL
-    else:
+    # ``MODEL`` may be a local checkpoint directory instead of a Hub repo id
+    # (``Path("/prefix") / "/abs/path"`` collapses to the absolute path), so only
+    # fall back to the Hub cache when no such directory exists on disk.
+    model_root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
+    if not model_root.is_dir():
         model_root = Path(snapshot_download(MODEL, local_files_only=True))
     ref_audio = model_root / REF_AUDIO_RELATIVE_PATH
     if not ref_audio.is_file():
