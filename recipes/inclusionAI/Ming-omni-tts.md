@@ -5,20 +5,21 @@
 ## Summary
 
 - Vendor: inclusionAI
-- Model: `inclusionAI/Ming-omni-tts-0.5B`
+- Model: `inclusionAI/Ming-omni-tts-16.8B-A3B`, `inclusionAI/Ming-omni-tts-0.5B`
 - Task: Text-to-speech with style, dialect, cloning, and multi-speaker controls
 - Mode: Online serving via the OpenAI-compatible `/v1/audio/speech` API
 - Maintainer: Community
 
 ## References
 
-- [Huggingface Model card](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
+- [Huggingface: inclusionAI/Ming-omni-tts-16.8B-A3B](https://huggingface.co/inclusionAI/Ming-omni-tts-16.8B-A3B)
+- [Huggingface: inclusionAI/Ming-omni-tts-0.5B](https://huggingface.co/inclusionAI/Ming-omni-tts-0.5B)
 - Upstream repository [inclusionAI/Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts)
 
 
 ## Hardware Support
 
-This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B two-stage TTS pipeline deployment.
+This recipe documents a validated ROCm configuration and a CUDA configuration for the dense 0.5B and the MoE 16.8B two-stage TTS pipeline deployment.
 Other hardware is welcome as community validation lands.
 
 ## CUDA
