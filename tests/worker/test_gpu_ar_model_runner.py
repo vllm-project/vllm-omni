@@ -1270,38 +1270,92 @@ class TestSparseAudioMarkerRobustness:
         assert marker(np.array(1)) is True
         assert marker(np.array([0])) is False
 
-    def test_marker_multi_element_tensor_does_not_crash(self):
+    def test_marker_multi_element_tensor_does_not_crash_and_keeps_semantics(self):
         # `bool(tensor)` used to raise "Boolean value of Tensor with more than
-        # one element is ambiguous"; now warns and treats it as no-marker.
+        # one element is ambiguous". Multi-element carriers now normalize
+        # element-wise: a genuinely truthy marker stays sparse instead of
+        # being silently read as dense.
         marker = GPUARModelRunner._is_sparse_audio_marker
-        assert marker(torch.ones(3)) is False
-        assert marker(np.ones((2, 2))) is False
+        assert marker(torch.ones(3)) is True
+        assert marker(torch.zeros(3)) is False
+        assert marker(np.ones((2, 2))) is True
+        assert marker(np.zeros(2)) is False
+
+    def test_marker_same_logical_value_agrees_across_container_types(self):
+        # One predicate for every carrier: `bool("0")` is True in Python, so
+        # a bare-bool branch used to read np.array(["0"]) as SPARSE while the
+        # list branch read ["0"] as dense — a routing flip, not cosmetics.
+        marker = GPUARModelRunner._is_sparse_audio_marker
+        assert marker(np.array(["0"])) is False
+        assert marker(np.array(["1"])) is True
+        assert marker(torch.tensor([0, 0])) is False
+        assert marker(torch.tensor([1, 1])) is True
+
+    def test_marker_device_tensor_rejected_without_sync(self):
+        # Markers are protocol metadata and must be CPU-native: a device
+        # tensor is rejected WITHOUT a D2H sync. Meta tensors hold no data,
+        # so any read (`.item()`/`bool()`) would raise -- these passing at
+        # all proves the marker's data is never touched.
+        marker = GPUARModelRunner._is_sparse_audio_marker
+        assert marker(torch.ones((), device="meta")) is False
+        assert marker(torch.ones(3, device="meta")) is False
 
     def test_combined_payload_unwraps_aligned_list(self):
         combined = {"codes.audio": {"req-1": [torch.zeros(1), torch.ones(1)]}}
-        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", idx=1)
+        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=1)
         assert torch.equal(payload["codes.audio"], torch.ones(1))
 
     def test_combined_payload_broadcasts_shared_singleton(self):
         # Length-1 lists are batch-shared passthrough metadata (e.g.
         # `meta.sparse_audio: ["1"]`) duplicated per request by the merge.
         combined = {"meta.sparse_audio": {"req-1": ["1"]}}
-        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", idx=2)
+        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=2)
         assert payload["meta.sparse_audio"] == "1"
 
-    def test_combined_payload_misalignment_raises_not_request_zero(self):
+    def test_combined_payload_misalignment_drops_key_not_request_zero(self):
         # A short multi-element list used to silently return `v[0]` - request
-        # 0's payload shipped under request `rid`. It must fail loudly instead.
-        combined = {"codes.audio": {"req-3": [torch.zeros(1), torch.ones(1)]}}
-        with pytest.raises(ValueError, match="req-3"):
-            GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-3", idx=2)
+        # 0's payload shipped under request `rid`. Never substitute another
+        # request's data; the key is dropped with an error log (same policy
+        # as the non-combined sparse mismatch) rather than raised - v1
+        # runners don't catch per-request exceptions, so a raise would turn a
+        # per-request protocol break (reachable via voxcpm2's dense coalesce)
+        # into a whole-stage outage.
+        combined = {
+            "codes.audio": {"req-3": [torch.zeros(1), torch.ones(1)]},
+            "sr": {"req-3": 22050},
+        }
+        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-3", list_idx=2)
+        assert "codes.audio" not in payload
+        assert payload["sr"] == 22050
+
+    def test_direct_path_sparse_mismatch_drops_key_and_keeps_payload_shape(self):
+        # Mirror of the combined-path policy on the non-prefix-cache path:
+        # a sparse index beyond the per-request list drops that key (error
+        # log) and the rest of the request's payload survives.
+        runner = GPUARModelRunner.__new__(GPUARModelRunner)
+        payload = runner._build_omni_mm_payload(
+            combined_multimodal_outputs=None,
+            mm_cpu={"codes.audio": [torch.zeros(1)]},
+            rid="r2",
+            idx=1,
+            start=0,
+            end=1,
+            audio_sparse_output=True,
+            sparse_mm_index={"r2": 1},
+            hidden_seq_len=1,
+            scheduled_seq_len=1,
+        )
+        assert payload == {}
 
     def test_combined_payload_uses_sparse_index_under_sparse_routing(self):
         # Batch [r0, r1, r2], sparse outputs only for [r1, r2]: producers
         # align per-request lists to the SPARSE order, so r1 (batch idx 1,
         # sparse idx 0) must get element 0 and r2 (batch idx 2, sparse idx 1)
         # element 1. Indexing by batch idx shipped r2's payload to r1 and
-        # went out of range for r2.
+        # went out of range for r2. The sparse->list_idx resolution lives in
+        # `_build_omni_mm_payload` (the combined helper itself is
+        # sparse-agnostic), so this exercises the caller.
+        runner = GPUARModelRunner.__new__(GPUARModelRunner)
         sparse_mm_index = {"r1": 0, "r2": 1}
         combined = {
             "codes.audio": {
@@ -1309,14 +1363,22 @@ class TestSparseAudioMarkerRobustness:
                 "r2": [torch.zeros(1), torch.ones(1)],
             }
         }
-        p1 = GPUARModelRunner._build_combined_prefix_cache_mm_payload(
-            combined, rid="r1", idx=1, audio_sparse_output=True, sparse_mm_index=sparse_mm_index
-        )
-        p2 = GPUARModelRunner._build_combined_prefix_cache_mm_payload(
-            combined, rid="r2", idx=2, audio_sparse_output=True, sparse_mm_index=sparse_mm_index
-        )
-        assert torch.equal(p1["codes.audio"], torch.zeros(1))
-        assert torch.equal(p2["codes.audio"], torch.ones(1))
+        payloads = {}
+        for rid, idx in (("r1", 1), ("r2", 2)):
+            payloads[rid] = runner._build_omni_mm_payload(
+                combined_multimodal_outputs=combined,
+                mm_cpu=None,
+                rid=rid,
+                idx=idx,
+                start=0,
+                end=1,
+                audio_sparse_output=True,
+                sparse_mm_index=sparse_mm_index,
+                hidden_seq_len=1,
+                scheduled_seq_len=1,
+            )
+        assert torch.equal(payloads["r1"]["codes.audio"], torch.zeros(1))
+        assert torch.equal(payloads["r2"]["codes.audio"], torch.ones(1))
 
 
 class TestMergeModelKvTransferMetadata:

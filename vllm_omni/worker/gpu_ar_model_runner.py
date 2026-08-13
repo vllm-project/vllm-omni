@@ -531,25 +531,44 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return sparse_downstream_req_ids, sparse_mm_index, True
 
     @staticmethod
+    def _sparse_marker_item_truthy(item: Any) -> bool:
+        """ONE item-level truth predicate for every marker carrier form.
+
+        Numbers count by numeric truth, strings by the literal set; a bare
+        `bool()` disagrees with the string set (`bool("0")` is True in
+        Python), so the same logical value must never route through different
+        predicates depending on container type.
+        """
+        if isinstance(item, bool):
+            return item
+        if isinstance(item, (int, float)):
+            return bool(item)
+        return str(item).lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
     def _is_sparse_audio_marker(value: Any) -> bool:
+        item_truthy = GPUARModelRunner._sparse_marker_item_truthy
         if isinstance(value, list):
-            return any(str(item).lower() in ("1", "true", "yes", "on") for item in value)
+            return any(item_truthy(item) for item in value)
         if isinstance(value, str):
-            return value.lower() in ("1", "true", "yes", "on")
-        # Defensive hardening: markers ride `multimodal_outputs`, so tensors or
-        # arrays can appear. `bool()` on a multi-element tensor/ndarray raises
-        # ("Boolean value ... is ambiguous"); only a scalar has an unambiguous
-        # truth value. In-tree producers emit `["1"]` (voxcpm2) today.
+            return item_truthy(value)
+        # Defensive hardening: markers ride `multimodal_outputs`, so tensors
+        # or arrays can appear. Markers are protocol metadata and must be
+        # CPU-native: reading a device tensor (`bool()`/`.item()`/`str()`)
+        # is a D2H sync on the per-step output path, so device tensors are
+        # rejected without touching their data. Host tensors/arrays normalize
+        # element-wise through the SAME predicate as lists/strings.
         if isinstance(value, torch.Tensor):
-            if value.numel() == 1:
-                return bool(value.item())
-            logger.warning("Ignoring non-scalar sparse-audio marker tensor of shape %s.", tuple(value.shape))
-            return False
+            if value.device.type != "cpu":
+                logger.warning_once(
+                    "Sparse-audio marker arrived as a %s tensor; markers must be CPU-native. "
+                    "Treating as no-marker.",
+                    value.device.type,
+                )
+                return False
+            return any(item_truthy(item) for item in value.reshape(-1).tolist())
         if isinstance(value, np.ndarray):
-            if value.size == 1:
-                return bool(value.reshape(()).item())
-            logger.warning("Ignoring non-scalar sparse-audio marker array of shape %s.", value.shape)
-            return False
+            return any(item_truthy(item) for item in value.reshape(-1).tolist())
         return bool(value)
 
     def capture_model(self) -> int:
@@ -905,20 +924,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         combined_multimodal_outputs: dict,
         *,
         rid: str,
-        idx: int,
-        audio_sparse_output: bool = False,
-        sparse_mm_index: dict[str, int] | None = None,
+        list_idx: int,
     ) -> dict[str, object]:
-        # Sparse-audio producers emit per-request lists aligned to the sparse
-        # request order (`meta.req_id`), not the batch order; under sparse
-        # routing the request's sparse index selects its element.
-        list_idx = idx
-        if audio_sparse_output and sparse_mm_index is not None:
-            sparse_idx = sparse_mm_index.get(rid)
-            if sparse_idx is not None:
-                list_idx = sparse_idx
+        """Unwrap one request's entry from the prefix-cache-merged payload.
 
-        def _unwrap_lists(v):
+        Sparse-agnostic by design: ``list_idx`` arrives pre-resolved by the
+        caller (`_build_omni_mm_payload`, which owns the sparse-routing
+        context) — batch index normally, sparse index under sparse routing.
+        """
+        missing = object()
+
+        def _unwrap_lists(v, mm_key):
             if isinstance(v, list):
                 if list_idx < len(v):
                     return v[list_idx]
@@ -928,22 +944,40 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     # merge broadcasts to every request; unwrap the shared
                     # element.
                     return v[0]
-                # A multi-element list shorter than the request's batch index
-                # is per-request data that lost alignment; returning `v[0]`
-                # here would silently ship request 0's payload as request
-                # `rid`'s.
-                raise ValueError(
-                    f"Combined prefix-cache mm payload misaligned for request {rid}: "
-                    f"index {list_idx} out of range for per-request list of length {len(v)}."
+                # A multi-element list shorter than the request's index is
+                # per-request data that lost alignment. Never substitute
+                # another request's element (`v[0]` used to ship request 0's
+                # payload as `rid`'s); drop the key loudly instead — the SAME
+                # protocol-break policy as the sparse mismatch in
+                # `_build_omni_mm_payload`. Not a raise: in-tree producers can
+                # emit subset-length lists without the sparse marker (voxcpm2
+                # dense-mode coalesce), and v1 runners do not catch
+                # per-request exceptions, so raising would turn a per-request
+                # protocol break into a whole-stage outage.
+                logger.error(
+                    "Combined prefix-cache mm payload misaligned for request %s: index %d out of "
+                    "range for per-request list of length %d; dropping key %s.",
+                    rid,
+                    list_idx,
+                    len(v),
+                    mm_key,
                 )
+                return missing
             if isinstance(v, dict):
-                return {k: _unwrap_lists(sv) for k, sv in v.items()}
+                nested = {}
+                for k, sv in v.items():
+                    unwrapped = _unwrap_lists(sv, mm_key)
+                    if unwrapped is not missing:
+                        nested[k] = unwrapped
+                return nested
             return v
 
-        return {
-            mm_key: _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
-            for mm_key in combined_multimodal_outputs.keys()
-        }
+        payload: dict[str, object] = {}
+        for mm_key in combined_multimodal_outputs.keys():
+            unwrapped = _unwrap_lists(combined_multimodal_outputs[mm_key][rid], mm_key)
+            if unwrapped is not missing:
+                payload[mm_key] = unwrapped
+        return payload
 
     def _build_omni_mm_payload(
         self,
@@ -960,12 +994,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         scheduled_seq_len: int,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
+            # Sparse-audio producers emit per-request lists aligned to the
+            # sparse request order (`meta.req_id`), not the batch order; under
+            # sparse routing the request's sparse index selects its element.
+            list_idx = sparse_mm_index.get(rid, idx) if audio_sparse_output else idx
             return self._build_combined_prefix_cache_mm_payload(
                 combined_multimodal_outputs,
                 rid=rid,
-                idx=idx,
-                audio_sparse_output=audio_sparse_output,
-                sparse_mm_index=sparse_mm_index,
+                list_idx=list_idx,
             )
 
         mm_payload: dict[str, object] = {}
