@@ -502,11 +502,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _get_tts_adapter(self):
         """Return the per-model serving adapter for the current ``_tts_model_type``.
 
+        Pure-diffusion speech uses its dedicated request path and does not
+        resolve adapters for AR-stage TTS models.
+
         Resolved lazily (rebuilt if ``_tts_model_type`` changed since the cached
         instance was built) so callers that set ``_tts_model_type`` after
         construction still dispatch to the matching adapter. In production
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
+        if self._diffusion_mode:
+            return None
+
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
             self._adapter = None
