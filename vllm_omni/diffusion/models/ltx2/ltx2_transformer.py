@@ -355,6 +355,19 @@ def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask
 
 
+class _LTX2ParallelAttention(Attention):
+    """Preserve LTX SP collectives while applying model-specific padding masks."""
+
+    def _run_local_attention(self, query, key, value, attn_metadata):
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if attention_mask is not None:
+            # LTX masks describe K/V padding. Flash varlen applies a 2D mask
+            # to both Q and K, while SP uses a broadcast key-only mask. SDPA
+            # preserves the intended semantics in both cases.
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        return super()._run_local_attention(query, key, value, attn_metadata)
+
+
 class LTX2AudioVideoAttnProcessor:
     r"""
     Processor for implementing attention (SDPA is used by default if you're using PyTorch 2.0) for the LTX-2.0 model.
@@ -396,11 +409,10 @@ class LTX2AudioVideoAttnProcessor:
             return None
 
         if self._is_sp_enabled():
-            # In SP, Ulysses expects a 2D padding mask that matches query length.
-            # For cross-attention, encoder sequence length != query length, so drop the mask.
-            if encoder_hidden_states is not None and encoder_hidden_states.shape[1] != hidden_states.shape[1]:
-                return None
-            return to_ltx_padding_mask(attention_mask)
+            # Keep the full key mask replicated while strict Ulysses reshards
+            # Q/K/V. The broadcast Q dimension also supports cross-attention
+            # where Q and K have different sequence lengths.
+            return to_ltx_padding_mask(attention_mask)[:, None, None, :]
 
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
@@ -696,7 +708,7 @@ class LTX2Attention(torch.nn.Module):
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
         )
-        self.attn = Attention(
+        self.attn = _LTX2ParallelAttention(
             num_heads=self.query_num_heads,
             head_size=dim_head,
             num_kv_heads=self.kv_num_heads,
@@ -1828,6 +1840,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_sigma: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1861,6 +1874,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)`.
             audio_encoder_attention_mask (`torch.Tensor`, *optional*):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)` for audio modeling.
+            audio_attention_mask (`torch.Tensor`, *optional*):
+                Optional audio-token key padding mask shared by audio self-attention and audio-to-video attention.
             num_frames (`int`, *optional*):
                 The number of latent video frames. Used if calculating the video coordinates for RoPE.
             height (`int`, *optional*):
@@ -2044,6 +2059,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "audio_self_attention_mask": audio_attention_mask,
+                "a2v_cross_attention_mask": audio_attention_mask,
                 "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),
                 "audio_self_attention_perturbation_mask": perturbation_mask_for("audio_self_attention", block_idx),
                 "a2v_cross_attention_perturbation_mask": perturbation_mask_for("a2v_cross_attention", block_idx),

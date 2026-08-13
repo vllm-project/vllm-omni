@@ -62,6 +62,7 @@ class LTXDenoiseContext:
     audio_latents: torch.Tensor
     video_coords: torch.Tensor
     audio_coords: torch.Tensor
+    audio_attention_mask: torch.Tensor | None = None
     conditioning_mask: torch.Tensor | None = None
     conditioning_mask_for_model: torch.Tensor | None = None
 
@@ -331,6 +332,7 @@ def build_transformer_kwargs(
         # with a learned register, making all output context tokens valid.
         "encoder_attention_mask": None,
         "audio_encoder_attention_mask": None,
+        "audio_attention_mask": denoise_ctx.audio_attention_mask,
         "num_frames": forward_ctx.latent_num_frames,
         "height": forward_ctx.latent_height,
         "width": forward_ctx.latent_width,
@@ -442,11 +444,25 @@ class LTXPhaseExecutor:
             video_audio_step_adapter=video_audio_step_adapter,
         )
         video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
+        ring_degree = getattr(pipeline.od_config.parallel_config, "ring_degree", 1) or 1
+        if padded_audio_num_frames > original_audio_num_frames and ring_degree > 1:
+            raise ValueError(
+                "LTX audio padding requires an attention mask, which Ring sequence parallelism does not support. "
+                "Use Ulysses-only SP or choose a request whose audio latent length is divisible by the SP size."
+            )
         denoise_ctx = LTXDenoiseContext(
             latents=latents,
             audio_latents=audio_latents,
             video_coords=video_coords,
             audio_coords=audio_coords,
+            audio_attention_mask=(
+                torch.arange(padded_audio_num_frames, device=audio_latents.device)
+                .lt(original_audio_num_frames)
+                .unsqueeze(0)
+                .expand(audio_latents.shape[0], -1)
+                if padded_audio_num_frames > original_audio_num_frames
+                else None
+            ),
             conditioning_mask=conditioning_mask,
         )
         denoise_ctx = pipeline._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)

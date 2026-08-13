@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
     LTXGuidancePlan,
     LTXGuidanceSpec,
     LTXModalityGuidance,
+    _repeat_batch,
     build_perturbation_kwargs,
     combine_guided_x0,
 )
@@ -64,6 +65,16 @@ def _make_ltx_request_pipe(cls):
     pipe.vae_spatial_compression_ratio = 32
     pipe.vae_temporal_compression_ratio = 8
     return pipe
+
+
+def test_ltx_rejects_advanced_uaa_before_component_initialization():
+    od_config = SimpleNamespace(
+        model="unused",
+        parallel_config=SimpleNamespace(ulysses_mode="advanced_uaa"),
+    )
+
+    with pytest.raises(ValueError, match="does not support ulysses_mode='advanced_uaa'"):
+        LTX2Pipeline(od_config=od_config)
 
 
 def _resolve_request_inputs_for_test(
@@ -330,6 +341,15 @@ def test_ltx_guidance_uses_official_close_to_disabled_semantics():
     assert LTXGuidancePlan.build(LTXGuidanceSpec(video=guidance)).names == ("cond",)
 
 
+def test_ltx_positive_only_guidance_preserves_token_major_layout():
+    tensor = torch.arange(24).view(1, 3, 8).transpose(1, 2).contiguous().transpose(1, 2)
+
+    repeated = _repeat_batch(tensor, 1)
+
+    assert repeated is tensor
+    assert repeated.stride() == tensor.stride()
+
+
 def test_ltx_guidance_rescale_is_invariant_to_request_batching():
     cond = torch.tensor(
         [
@@ -378,6 +398,32 @@ def test_ltx_guidance_rescale_handles_zero_variance_prediction():
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, torch.zeros_like(cond))
+
+
+def test_ltx_audio_guidance_rescale_ignores_sp_padding_tokens():
+    logical_cond = torch.tensor([[[1.0, 2.0], [3.0, 5.0]]])
+    logical_uncond = torch.tensor([[[0.5, -1.0], [2.0, 1.0]]])
+    guidance = LTXModalityGuidance(cfg_scale=3.0, rescale_scale=1.0)
+    expected = combine_guided_x0(
+        cond=logical_cond,
+        uncond_text=logical_uncond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+    )
+    padded_cond = torch.cat([logical_cond, torch.tensor([[[1000.0, -1000.0]]])], dim=1)
+    padded_uncond = torch.cat([logical_uncond, torch.tensor([[[-500.0, 500.0]]])], dim=1)
+
+    actual = combine_guided_x0(
+        cond=padded_cond,
+        uncond_text=padded_uncond,
+        uncond_perturbed=0.0,
+        uncond_modality=0.0,
+        guidance=guidance,
+        rescale_token_count=2,
+    )
+
+    torch.testing.assert_close(actual[:, :2], expected)
 
 
 def test_ltx_guidance_builds_per_sample_stg_and_modality_masks():
