@@ -115,24 +115,6 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "ltx23_output.mp4",
     },
-    "sana_480p": {
-        "height": 480,
-        "width": 832,
-        "num_frames": 81,
-        "num_inference_steps": 50,
-        "guidance_scale": 6.0,
-        "fps": 16,
-        "output": "sana_video_480p.mp4",
-    },
-    "sana_720p": {
-        "height": 704,
-        "width": 1280,
-        "num_frames": 81,
-        "num_inference_steps": 50,
-        "guidance_scale": 6.0,
-        "fps": 16,
-        "output": "sana_video_720p.mp4",
-    },
 }
 
 _LINGBOT_CACHE_DIT_BALANCED_CONFIG = {
@@ -148,12 +130,23 @@ _LINGBOT_CACHE_DIT_BALANCED_CONFIG = {
     "scm_steps_policy": "dynamic",
 }
 
+_DEFAULT_CACHE_DIT_CONFIG = {
+    "Fn_compute_blocks": 1,
+    "Bn_compute_blocks": 0,
+    "max_warmup_steps": 4,
+    "max_cached_steps": 20,
+    "residual_diff_threshold": 0.24,
+    "max_continuous_cached_steps": 3,
+    "enable_taylorseer": False,
+    "taylorseer_order": 1,
+    "scm_steps_mask_policy": None,
+    "scm_steps_policy": "dynamic",
+}
+
 
 def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
     class_lower = (model_class_name or "").lower()
-    if "sana-video" in model_lower or "sana_video" in model_lower or "sanavideo" in class_lower:
-        return _MODEL_PRESETS["sana_720p" if "720p" in model_lower else "sana_480p"]
     if "lingbot" in model_lower or "lingbotvideo" in class_lower:
         return _MODEL_PRESETS["lingbot"]
     if "ltx" in class_lower or "ltx" in model_lower:
@@ -192,17 +185,6 @@ def build_text_to_video_prompt(prompt: Any, negative_prompt: str | None) -> dict
     return result
 
 
-def _normalize_float_tensor(tensor: torch.Tensor, source_range: str) -> torch.Tensor:
-    """Normalize decoded frames according to the pipeline's output contract."""
-    if not tensor.is_floating_point():
-        return tensor
-    if source_range == "negative_one_to_one":
-        return tensor.clamp(-1, 1) * 0.5 + 0.5
-    if source_range == "zero_to_one":
-        return tensor.clamp(0, 1)
-    raise ValueError(f"Unsupported floating-point tensor range: {source_range!r}")
-
-
 def _parse_json_object(value: str, option: str) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
@@ -216,6 +198,17 @@ def _parse_json_object(value: str, option: str) -> dict[str, Any]:
 def parse_model_config(value: str) -> dict[str, Any]:
     """Parse engine-level, model-specific configuration."""
     return _parse_json_object(value, "--model-config")
+
+
+def _normalize_float_tensor(tensor: torch.Tensor, source_range: str) -> torch.Tensor:
+    """Normalize decoded frames according to the pipeline's output contract."""
+    if not tensor.is_floating_point():
+        return tensor
+    if source_range == "negative_one_to_one":
+        return tensor.clamp(-1, 1) * 0.5 + 0.5
+    if source_range == "zero_to_one":
+        return tensor.clamp(0, 1)
+    raise ValueError(f"Unsupported floating-point tensor range: {source_range!r}")
 
 
 def parse_profiler_config(value: str) -> dict[str, Any]:
@@ -240,6 +233,40 @@ def _load_prompt_json(path: Path) -> dict[str, Any]:
     if not isinstance(prompt, dict):
         raise ValueError("--prompt-json must contain one structured prompt object")
     return prompt
+
+
+def _cache_dit_config(model: str, model_class_name: str | None) -> dict[str, Any]:
+    config = _LINGBOT_CACHE_DIT_BALANCED_CONFIG if _is_lingbot(model, model_class_name) else _DEFAULT_CACHE_DIT_CONFIG
+    return dict(config)
+
+
+def _unwrap_first(output: Any) -> Any:
+    return output[0] if isinstance(output, list) and output else output
+
+
+def _extract_stage_durations(output: Any) -> dict[str, float]:
+    durations = getattr(_unwrap_first(output), "stage_durations", None)
+    if not isinstance(durations, Mapping):
+        return {}
+    return {str(name): float(duration) for name, duration in durations.items()}
+
+
+def _extract_output_fps(output: Any, fallback: int) -> float:
+    result = _unwrap_first(output)
+    multimodal_output = getattr(result, "multimodal_output", None)
+    if not isinstance(multimodal_output, Mapping):
+        return float(fallback)
+
+    fps = multimodal_output.get("fps")
+    metadata = multimodal_output.get("metadata")
+    if isinstance(metadata, Mapping):
+        video_metadata = metadata.get("video")
+        if isinstance(video_metadata, Mapping):
+            fps = video_metadata.get("fps", fps)
+    try:
+        return float(fps) if fps is not None else float(fallback)
+    except (TypeError, ValueError):
+        return float(fallback)
 
 
 def parse_args() -> argparse.Namespace:
@@ -464,8 +491,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=1,
-        help="Number of GPUs to shard weights across for HSDP.",
+        default=-1,
+        help="Number of GPUs to shard weights across for HSDP (-1: infer from the parallel world size).",
     )
     parser.add_argument(
         "--hsdp-replicate-size",
@@ -497,17 +524,6 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
 
 
-def _unwrap_first(output: Any) -> Any:
-    return output[0] if isinstance(output, list) and output else output
-
-
-def _extract_stage_durations(output: Any) -> dict[str, float]:
-    durations = getattr(_unwrap_first(output), "stage_durations", None)
-    if not isinstance(durations, Mapping):
-        return {}
-    return {str(name): float(duration) for name, duration in durations.items()}
-
-
 def main():
     args = parse_args()
     model_class_name = args.model_class_name
@@ -519,25 +535,10 @@ def main():
     model_class_name = args.model_class_name
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    # Cache-dit config (Wan2.2 only)
+    # Cache-DiT config. LingBot uses its quality-validated balanced preset.
     cache_config = None
     if args.cache_backend == "cache_dit":
-        cache_config = (
-            dict(_LINGBOT_CACHE_DIT_BALANCED_CONFIG)
-            if _is_lingbot(args.model, model_class_name)
-            else {
-            "Fn_compute_blocks": 1,
-            "Bn_compute_blocks": 0,
-            "max_warmup_steps": 4,
-            "max_cached_steps": 20,
-            "residual_diff_threshold": 0.24,
-            "max_continuous_cached_steps": 3,
-            "enable_taylorseer": False,
-            "taylorseer_order": 1,
-            "scm_steps_mask_policy": None,
-            "scm_steps_policy": "dynamic",
-            }
-        )
+        cache_config = _cache_dit_config(args.model, model_class_name)
 
     profiler_enabled = args.profiler_config is not None
 
@@ -651,8 +652,6 @@ def main():
         num_frames=args.num_frames,
         extra_args=extra_args,
     )
-    if args.frame_rate is not None:
-        sampling_kwargs["frame_rate"] = args.frame_rate
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 
@@ -673,6 +672,7 @@ def main():
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
+    output_fps = _extract_output_fps(frames, args.fps)
 
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
@@ -850,13 +850,13 @@ def main():
         video_bytes = mux_video_audio_bytes(
             frames_u8,
             audio_np,
-            fps=float(args.fps),
+            fps=output_fps,
             audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)
     else:
-        export_to_video(video_array, str(output_path), fps=args.fps)
+        export_to_video(video_array, str(output_path), fps=output_fps)
     print(f"Saved generated video to {output_path}")
 
     if profiler_enabled:

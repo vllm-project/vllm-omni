@@ -510,13 +510,21 @@ def resolve_lingbot_output_dimensions(
     prompt_fields = prompt_fields or {}
     extra_fields = extra_fields or {}
     # Online requests deliver `extra_params` through sampling.extra_args; the
-    # offline path embeds the same fields in the prompt dict. Consult both,
-    # extra_args first — the same precedence fps and num_frames use.
-    requested_width = _first_not_none(_pick(extra_fields, "width"), _pick(prompt_fields, "width"))
-    requested_height = _first_not_none(_pick(extra_fields, "height"), _pick(prompt_fields, "height"))
-    size = _first_not_none(_pick(extra_fields, "size"), _pick(prompt_fields, "size"))
-    resolution = _first_not_none(_pick(extra_fields, "resolution"), _pick(prompt_fields, "resolution"))
-    ratio = _first_not_none(_pick(extra_fields, "ratio"), _pick(prompt_fields, "ratio"))
+    # offline path embeds the same fields in the prompt dict. Select one source
+    # as a unit so an extra_args `size` does not conflict with prompt
+    # `width`/`height` (and vice versa).
+    dimension_keys = ("width", "height", "size", "resolution", "ratio")
+    selected_fields: Mapping[str, Any] = {}
+    for fields in (extra_fields, prompt_fields):
+        if any(_pick(fields, key) is not None for key in dimension_keys):
+            selected_fields = fields
+            break
+
+    requested_width = _pick(selected_fields, "width")
+    requested_height = _pick(selected_fields, "height")
+    size = _pick(selected_fields, "size")
+    resolution = _pick(selected_fields, "resolution")
+    ratio = _pick(selected_fields, "ratio")
     if requested_width is not None or requested_height is not None:
         width, height = requested_width, requested_height
     elif size is not None or resolution is not None or ratio is not None:
