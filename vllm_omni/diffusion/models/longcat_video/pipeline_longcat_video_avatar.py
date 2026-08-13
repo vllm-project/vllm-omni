@@ -31,8 +31,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
+from vllm_omni.diffusion.models.interface import (
+    SupportAudioInput,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+)
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer import (
+    _LORA_ADAPTERS_ATTR,
     create_full_precision_avatar_dit,
     create_quantized_avatar_dit,
 )
@@ -511,12 +516,20 @@ def get_longcat_video_avatar_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
-class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput):
+class LongCatVideoAvatarPipeline(
+    nn.Module,
+    SupportImageInput,
+    SupportAudioInput,
+    SupportsComponentDiscovery,
+):
     """Native LongCat-Video-Avatar A2V/AI2V pipeline."""
 
     support_image_input: ClassVar[bool] = True
     support_audio_input: ClassVar[bool] = True
     dummy_run_num_frames: ClassVar[int] = 1
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "audio_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -537,6 +550,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         self.save_fps = 25
         self.audio_stride = 1
         self.default_num_frames = 93
+        self._distill_lora_path: Path | None = None
         self.video_processor = VideoProcessor(vae_scale_factor=8)
         dit_subfolder = "base_model_int8" if self.use_int8 else "base_model"
         self.weights_sources = [
@@ -566,6 +580,34 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             allow_patterns=["tokenizer/*", "text_encoder/*", "vae/*", "config.json", "model_index.json"],
         )
 
+    def _stage_components_on_cpu(self) -> bool:
+        return bool(
+            getattr(self.od_config, "enable_cpu_offload", False)
+            or getattr(self.od_config, "enable_layerwise_offload", False)
+            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        )
+
+    def _initial_component_device(self) -> torch.device:
+        return torch.device("cpu") if self._stage_components_on_cpu() else self.device
+
+    def _build_components_on_accelerator(self) -> bool:
+        return self.build_components_on_gpu and not self._stage_components_on_cpu()
+
+    def _place_components_after_construction(self) -> None:
+        """Place components without changing the request execution device.
+
+        Offload backends are enabled only after pipeline loading. Keeping large
+        components on CPU here prevents a transient all-components accelerator
+        allocation; the selected backend then materializes the components it
+        owns. ``self.device`` remains the execution device so request tensors
+        match the module after its pre-forward offload hook runs.
+        """
+        component_device = self._initial_component_device()
+        self.text_encoder = self.text_encoder.to(component_device)
+        self.vae = self.vae.to(component_device)
+        self.transformer = self.transformer.to(device=component_device)
+        self.audio_encoder = self.audio_encoder.to(component_device)
+
     def _load_components(self) -> None:
         try:
             from audio_separator.separator import Separator
@@ -583,8 +625,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         # vLLM initializes native pipelines under the target device context.
         # Build LongCat's large components on CPU first by default to avoid
         # transient full-precision CUDA allocations before int8 DiT replacement.
-        build_context = nullcontext() if self.build_components_on_gpu else torch.device("cpu")
-        enable_distill_lora = False
+        build_context = nullcontext() if self._build_components_on_accelerator() else torch.device("cpu")
         with build_context:
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 str(base_dir), subfolder="text_encoder", torch_dtype=dtype
@@ -608,24 +649,21 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             if self.use_distill:
                 lora_path = self.model_dir / "lora" / "dmd_lora.safetensors"
                 if lora_path.exists():
-                    self.transformer.load_lora(
-                        str(lora_path),
-                        "dmd",
-                        multiplier=1.0,
-                        lora_network_dim=128,
-                        lora_network_alpha=64,
-                    )
-                    enable_distill_lora = True
+                    # Register the LoRA after base weights are loaded. This
+                    # keeps adapter parameters out of the loader's strict base
+                    # checkpoint accounting while still registering them on
+                    # their target modules before offload hooks are installed.
+                    self._distill_lora_path = lora_path
 
             audio_model_path = self.model_dir / "whisper-large-v3"
-            self.audio_encoder = WhisperModel.from_pretrained(str(audio_model_path)).eval()
+            whisper_model = WhisperModel.from_pretrained(str(audio_model_path)).eval()
+            # Avatar inference only consumes Whisper encoder hidden states. Keep
+            # the encoder as the managed component so sequential offload hooks
+            # run on the exact module whose forward method is invoked, and do
+            # not retain the unused decoder on the accelerator.
+            self.audio_encoder = whisper_model.encoder
 
-        self.text_encoder = self.text_encoder.to(self.device)
-        self.vae = self.vae.to(self.device)
-        self.transformer = self.transformer.to(device=self.device)
-        if enable_distill_lora:
-            self.transformer.enable_loras(["dmd"])
-        self.audio_encoder = self.audio_encoder.to(self.device)
+        self._place_components_after_construction()
         self.audio_encoder.requires_grad_(False)
         self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(str(audio_model_path))
 
@@ -654,8 +692,27 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load DiT weights using vLLM's diffusion weight loader."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        # LoRA adapters are attached after the first base-weight load. Exclude
+        # their private target-module path if a caller explicitly reloads base
+        # weights, so strict checkpoint accounting remains base-only.
+        retained_adapter_names = {name for name, _ in self.named_parameters() if f".{_LORA_ADAPTERS_ATTR}." in name}
+        loader = AutoWeightsLoader(self, skip_substrs=[f".{_LORA_ADAPTERS_ATTR}."])
+        loaded_weights = loader.load_weights(weights)
+        if self._distill_lora_path is not None and "dmd" not in self.transformer.lora_dict:
+            self.transformer.load_lora(
+                str(self._distill_lora_path),
+                "dmd",
+                multiplier=1.0,
+                lora_network_dim=128,
+                lora_network_alpha=64,
+            )
+            self.transformer.enable_loras(["dmd"])
+        # The outer diffusion loader performs its strict missing-weight check
+        # against parameters that existed before this call. On a base-weight
+        # reload, adapters registered by the first call are intentionally
+        # retained rather than reloaded from the base checkpoint, so count only
+        # that pre-existing snapshot as satisfied.
+        return loaded_weights | retained_adapter_names
 
     @staticmethod
     def _prompt_clean(text: str) -> str:
@@ -961,7 +1018,7 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
 
         enc_chunks = []
         for idx in range(0, audio_features.shape[-1], _WHISPER_ENCODER_CHUNK_FRAMES):
-            chunk_hs = self.audio_encoder.encoder(
+            chunk_hs = self.audio_encoder(
                 audio_features[:, :, idx : idx + _WHISPER_ENCODER_CHUNK_FRAMES].to(self.device),
                 output_hidden_states=True,
             ).hidden_states

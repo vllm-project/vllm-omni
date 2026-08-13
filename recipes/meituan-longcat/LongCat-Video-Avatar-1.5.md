@@ -208,6 +208,28 @@ ffprobe -hide_banner longcat_avatar_ai2v.mp4
 The output must report one video stream and one audio stream: the example muxes
 the generated frames with the input audio.
 
+#### Memory-constrained inference
+
+LongCat-Video-Avatar can keep its DiT mutually exclusive with the T5 text and
+Whisper audio encoders on the accelerator. The VAE remains accelerator-resident:
+
+```bash
+python examples/offline_inference/longcat_video/end2end.py \
+  --model "$AVATAR_MODEL" \
+  --base-model-dir "$BASE_MODEL_DIR" \
+  --stage ai2v \
+  --audio "$LONGCAT_VIDEO_ASSET_DIR/single/man.mp3" \
+  --image "$LONGCAT_VIDEO_ASSET_DIR/single/man.png" \
+  --prompt "$PROMPT" \
+  --enable-cpu-offload \
+  --output longcat_avatar_cpu_offload.mp4
+```
+
+For tighter accelerator memory limits, replace `--enable-cpu-offload` with
+`--enable-layerwise-offload`. Layerwise offload keeps the non-DiT components
+resident and streams the DiT blocks from host memory during denoising. The
+two offload modes are mutually exclusive.
+
 #### Notes
 
 **Support matrix**
@@ -276,7 +298,8 @@ memory guidance rather than a performance benchmark.
 **Known limitations**
 
 - Single GPU only. Cache acceleration, sequence/CFG/tensor parallelism, HSDP,
-  CPU offload, VAE patch parallelism and quantization are not wired up for this
-  pipeline yet; see the diffusion feature matrix in
+  VAE patch parallelism and runtime quantization beyond the bundled INT8
+  weights are not wired up for this pipeline yet; see the diffusion feature
+  matrix in
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md).
 - Offline inference only. Online serving is not supported yet.

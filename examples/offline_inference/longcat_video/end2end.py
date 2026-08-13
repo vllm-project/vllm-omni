@@ -55,6 +55,17 @@ def parse_args():
     )
     parser.add_argument("--use-kv-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--offload-kv-cache", action=argparse.BooleanOptionalAction, default=False)
+    offload_group = parser.add_mutually_exclusive_group()
+    offload_group.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Swap the DiT with the T5 and Whisper encoders between inference phases.",
+    )
+    offload_group.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Stream LongCat DiT blocks from host memory during denoising.",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     return parser.parse_args()
 
@@ -235,6 +246,8 @@ def main():
         model_class_name="LongCatVideoAvatarPipeline",
         dtype="bfloat16",
         enforce_eager=args.enforce_eager,
+        enable_cpu_offload=args.enable_cpu_offload,
+        enable_layerwise_offload=args.enable_layerwise_offload,
         additional_config=additional_config,
         parallel_config=DiffusionParallelConfig(
             ulysses_degree=1,

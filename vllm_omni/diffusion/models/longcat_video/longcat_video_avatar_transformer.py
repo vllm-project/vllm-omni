@@ -1139,6 +1139,9 @@ def create_lora_network(
     return network
 
 
+_LORA_ADAPTERS_ATTR = "_longcat_lora_adapters"
+
+
 class LongCatAvatarSingleStreamBlock(nn.Module):
     def __init__(
         self,
@@ -1308,6 +1311,7 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
 
 class LongCatVideoAvatarTransformer3DModel(nn.Module):
     _supports_gradient_checkpointing = True
+    _layerwise_offload_blocks_attrs = ["blocks"]
 
     def __init__(
         self,
@@ -1353,8 +1357,11 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
         self.audio_window = audio_window
         self.text_tokens_zero_pad = text_tokens_zero_pad
         self.gradient_checkpointing = False
-        self.lora_dict = {}
-        self.active_loras = []
+        # Keep the networks out of the top-level module tree. Individual LoRA
+        # modules are registered on their target Linear modules in load_lora(),
+        # so model-level and block-level offload traverse them exactly once.
+        self.lora_dict: dict[str, LoRANetwork] = {}
+        self.active_loras: list[str] = []
         self.config = SimpleNamespace(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -1427,20 +1434,63 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
     def dtype(self) -> torch.dtype:
         return self.x_embedder.proj.weight.dtype
 
-    def load_lora(self, lora_path, lora_key, multiplier=1.0, lora_network_dim=128, lora_network_alpha=64):
+    def load_lora(
+        self,
+        lora_path: str | os.PathLike[str],
+        lora_key: str,
+        multiplier: float = 1.0,
+        lora_network_dim: int = 128,
+        lora_network_alpha: float = 64,
+    ) -> None:
+        if not lora_key or "." in lora_key:
+            raise ValueError("LongCat LoRA keys must be non-empty and cannot contain '.'.")
+        if lora_key in self.lora_dict:
+            raise ValueError(f"LongCat LoRA {lora_key!r} is already loaded.")
+
         lora_state_dict = load_file(lora_path, device="cpu")
-        self.lora_dict[lora_key] = create_lora_network(
+        network = create_lora_network(
             self,
             lora_state_dict,
             multiplier=multiplier,
             network_dim=lora_network_dim,
             network_alpha=lora_network_alpha,
         )
+        self._register_loras_on_targets(lora_key, network)
+        self.lora_dict[lora_key] = network
 
-    def enable_loras(self, lora_key_list=None):
+    @staticmethod
+    def _lora_target_name(lora: LoRAModule) -> str:
+        return lora.lora_name.replace("lora___lorahyphen___", "").replace("___lorahyphen___", ".")
+
+    def _register_loras_on_targets(self, lora_key: str, network: LoRANetwork) -> None:
+        targets: list[nn.Module] = []
+        seen_targets: set[int] = set()
+        for lora in network.loras:
+            target = self._get_module_by_name(self._lora_target_name(lora))
+            if id(target) in seen_targets:
+                raise ValueError(f"LongCat LoRA {lora_key!r} contains multiple adapters for the same target.")
+            seen_targets.add(id(target))
+
+            adapters = getattr(target, _LORA_ADAPTERS_ATTR, None)
+            if adapters is not None and not isinstance(adapters, nn.ModuleDict):
+                raise TypeError(f"{_LORA_ADAPTERS_ATTR} on {target.__class__.__name__} must be an nn.ModuleDict.")
+            if adapters is not None and lora_key in adapters:
+                raise ValueError(f"LongCat LoRA {lora_key!r} is already registered on a target module.")
+            targets.append(target)
+
+        # Registration happens only after all targets have been validated, so
+        # a malformed adapter cannot leave a partially registered module tree.
+        for target, lora in zip(targets, network.loras, strict=True):
+            adapters = getattr(target, _LORA_ADAPTERS_ATTR, None)
+            if adapters is None:
+                adapters = nn.ModuleDict()
+                target.add_module(_LORA_ADAPTERS_ATTR, adapters)
+            adapters[lora_key] = lora
+
+    def enable_loras(self, lora_key_list: list[str] | None = None) -> None:
         lora_key_list = lora_key_list or []
         self.disable_all_loras()
-        module_loras = {}
+        module_loras: dict[str, list[LoRAModule]] = {}
         model_device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
         for lora_key in lora_key_list:
@@ -1448,7 +1498,7 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
                 continue
             for lora in self.lora_dict[lora_key].loras:
                 lora.to(model_device, dtype=model_dtype, non_blocking=True)
-                module_name = lora.lora_name.replace("lora___lorahyphen___", "").replace("___lorahyphen___", ".")
+                module_name = self._lora_target_name(lora)
                 module_loras.setdefault(module_name, []).append(lora)
             self.active_loras.append(lora_key)
 
@@ -1474,7 +1524,7 @@ class LongCatVideoAvatarTransformer3DModel(nn.Module):
 
         return multi_lora_forward
 
-    def _get_module_by_name(self, module_name):
+    def _get_module_by_name(self, module_name: str) -> nn.Module:
         module = self
         for part in module_name.split("."):
             module = getattr(module, part)
