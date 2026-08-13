@@ -20,6 +20,8 @@ def _single_rank_tp_group(init_fake_tp_group):
 
 
 def _tiny_transformer(**overrides):
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+
     from vllm_omni.diffusion.models.lingbot_video import LingBotVideoTransformer3DModel
 
     config = {
@@ -37,7 +39,13 @@ def _tiny_transformer(**overrides):
         "prefix": f"test_lingbot_{next(_MODEL_PREFIXES)}",
     }
     config.update(overrides)
-    return LingBotVideoTransformer3DModel(**config)
+    model = LingBotVideoTransformer3DModel(**config)
+    for module in model.modules():
+        if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+            torch.nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+    return model
 
 
 def test_transformer_declares_pattern_3_cache_dit_contract():
@@ -270,6 +278,86 @@ def test_packed_attention_uses_sdpa_after_standard_attention_resharding(monkeypa
     assert mask[0, 0, 2:, 2:].all()
     assert not mask[0, 0, :2, 2:].any()
     assert not mask[0, 0, 2:, :2].any()
+
+
+def test_dense_tp_layers_shard_checkpoint_weights(mocker):
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    mocker.patch.object(module, "get_tensor_model_parallel_world_size", return_value=2)
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+        return_value=2,
+    )
+    mocker.patch(
+        "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    model = _tiny_transformer(
+        depth=1,
+        num_attention_heads=2,
+        axes_dims=(2, 2, 4),
+    )
+    block = model.blocks[0]
+
+    assert block.attn.num_heads == 1
+    assert isinstance(block.attn.to_q, ColumnParallelLinear)
+    assert isinstance(block.attn.to_out, RowParallelLinear)
+    assert isinstance(block.ffn.gate_proj, ColumnParallelLinear)
+    assert isinstance(block.ffn.down_proj, RowParallelLinear)
+    assert block.attn.to_q.weight.shape == (8, 16)
+    assert block.attn.to_out.weight.shape == (16, 8)
+    assert block.ffn.gate_proj.weight.shape == (16, 16)
+    assert block.ffn.down_proj.weight.shape == (16, 16)
+
+    q_weight = torch.arange(16 * 16, dtype=torch.float32).reshape(16, 16)
+    out_weight = torch.arange(16 * 16, dtype=torch.float32).reshape(16, 16)
+    gate_weight = torch.arange(32 * 16, dtype=torch.float32).reshape(32, 16)
+    down_weight = torch.arange(16 * 32, dtype=torch.float32).reshape(16, 32)
+    loaded = model.load_weights(
+        [
+            ("blocks.0.attn.to_q.weight", q_weight),
+            ("blocks.0.attn.to_out.weight", out_weight),
+            ("blocks.0.ffn.gate_proj.weight", gate_weight),
+            ("blocks.0.ffn.down_proj.weight", down_weight),
+        ]
+    )
+
+    assert loaded == {
+        "blocks.0.attn.to_q.weight",
+        "blocks.0.attn.to_out.weight",
+        "blocks.0.ffn.gate_proj.weight",
+        "blocks.0.ffn.down_proj.weight",
+    }
+    torch.testing.assert_close(block.attn.to_q.weight, q_weight[:8])
+    torch.testing.assert_close(block.attn.to_out.weight, out_weight[:, :8])
+    torch.testing.assert_close(block.ffn.gate_proj.weight, gate_weight[:16])
+    torch.testing.assert_close(block.ffn.down_proj.weight, down_weight[:, :16])
+
+
+def test_sparse_moe_passes_tp_size_to_common_runner(mocker):
+    from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
+
+    mocker.patch.object(module, "get_tensor_model_parallel_world_size", return_value=2)
+    fused_moe = mocker.patch.object(module, "FusedMoE", return_value=torch.nn.Identity())
+
+    module.LingBotVideoSparseMoeBlock(
+        hidden_size=16,
+        num_experts=4,
+        top_k=2,
+        moe_intermediate_size=8,
+        score_func="sigmoid",
+        norm_topk_prob=True,
+        n_group=2,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        n_shared_experts=None,
+        prefix="test.blocks.0.ffn",
+    )
+
+    assert fused_moe.call_args.kwargs["tp_size"] == 2
+    assert fused_moe.call_args.kwargs["prefix"] == "test.blocks.0.ffn.experts"
 
 
 def test_tiny_transformer_rejects_invalid_rope_dims():

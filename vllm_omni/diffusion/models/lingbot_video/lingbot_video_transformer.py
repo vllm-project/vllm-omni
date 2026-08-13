@@ -14,8 +14,10 @@ from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import set_forward_context as set_vllm_forward_context
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -182,22 +184,62 @@ class LingBotVideoTextEmbedder(nn.Module):
 
 
 class LingBotVideoAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, norm_eps, qkv_bias, out_bias):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        norm_eps,
+        qkv_bias,
+        out_bias,
+        *,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        if num_heads % tp_size != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by tensor parallel size ({tp_size}).")
+        self.num_heads = num_heads // tp_size
         self.head_dim = hidden_size // num_heads
-        self.to_q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.to_k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.to_v = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.to_q = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
+        )
+        self.to_k = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
+        )
+        self.to_v = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
+        )
         self.norm_q = LingBotVideoRMSNorm(self.head_dim, norm_eps)
         self.norm_k = LingBotVideoRMSNorm(self.head_dim, norm_eps)
-        self.to_out = nn.Linear(hidden_size, hidden_size, bias=out_bias)
+        self.to_out = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=out_bias,
+            input_is_parallel=True,
+            return_bias=False,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
+        )
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / math.sqrt(self.head_dim),
             causal=False,
-            num_kv_heads=num_heads,
+            num_kv_heads=self.num_heads,
             role="self",
         )
 
@@ -222,11 +264,32 @@ class LingBotVideoAttention(nn.Module):
 
 
 class LingBotVideoMLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size):
+    def __init__(self, hidden_size, intermediate_size, *, prefix: str = ""):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.gate_proj" if prefix else "gate_proj",
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.up_proj" if prefix else "up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            return_bias=False,
+            prefix=f"{prefix}.down_proj" if prefix else "down_proj",
+        )
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -253,6 +316,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        tp_size = get_tensor_model_parallel_world_size()
         gate = GateLinear(
             hidden_size,
             num_experts,
@@ -260,7 +324,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             out_dtype=torch.float32,
             params_dtype=torch.float32,
             force_fp32_compute=True,
-            prefix=f"{prefix}.gate",
+            prefix=f"{prefix}.experts.gate",
         )
         correction_bias = nn.Parameter(
             torch.zeros(num_experts, dtype=torch.float32),
@@ -281,16 +345,17 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             activation="silu",
             gate=gate,
             ckpt_names=("w1", "w2", "w3"),
-            tp_size=1,
+            tp_size=tp_size,
             dp_size=1,
             pcp_size=1,
-            prefix=prefix,
+            prefix=f"{prefix}.experts",
         )
         self.shared_experts = None
         if n_shared_experts is not None and n_shared_experts > 0:
             self.shared_experts = LingBotVideoMLP(
                 hidden_size,
                 moe_intermediate_size * n_shared_experts,
+                prefix=f"{prefix}.shared_experts",
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -351,7 +416,14 @@ class LingBotVideoBlock(nn.Module):
         h = hidden_size
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
         self.norm1 = LingBotVideoRMSNorm(h, norm_eps)
-        self.attn = LingBotVideoAttention(h, num_attention_heads, norm_eps, qkv_bias, out_bias)
+        self.attn = LingBotVideoAttention(
+            h,
+            num_attention_heads,
+            norm_eps,
+            qkv_bias,
+            out_bias,
+            prefix=f"{prefix}.attn",
+        )
         self.norm_post_attn = LingBotVideoRMSNorm(h, norm_eps)
         self.norm2 = LingBotVideoRMSNorm(h, norm_eps)
         use_sparse_moe = (
@@ -369,10 +441,14 @@ class LingBotVideoBlock(nn.Module):
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
                 n_shared_experts=n_shared_experts,
-                prefix=f"{prefix}.ffn.experts",
+                prefix=f"{prefix}.ffn",
             )
         else:
-            self.ffn = LingBotVideoMLP(h, intermediate_size)
+            self.ffn = LingBotVideoMLP(
+                h,
+                intermediate_size,
+                prefix=f"{prefix}.ffn",
+            )
         self.norm_post_ffn = LingBotVideoRMSNorm(h, norm_eps)
 
     def forward(
