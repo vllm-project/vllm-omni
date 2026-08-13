@@ -46,11 +46,7 @@ def _make_config(*, parallel_kwargs=None, **config_kwargs):
     ("parallel_kwargs", "config_kwargs", "message"),
     [
         ({"pipeline_parallel_size": 2}, {}, "pipeline parallelism"),
-        ({"tensor_parallel_size": 2}, {}, "tensor parallelism"),
         ({"enable_expert_parallel": True}, {}, "expert parallelism"),
-        ({"ulysses_degree": 2}, {}, "sequence parallelism"),
-        ({"cfg_parallel_size": 2}, {}, "CFG parallelism"),
-        ({"vae_patch_parallel_size": 2}, {}, "VAE patch parallelism"),
         (
             {"use_hsdp": True, "hsdp_shard_size": 2},
             {},
@@ -92,6 +88,64 @@ def test_cache_dit_allows_supported_offload_modes(config_kwargs):
     LingBotVideoPipeline._validate_cache_dit_configuration(_make_config(**config_kwargs))
 
 
+@pytest.mark.parametrize(
+    "parallel_kwargs",
+    [
+        {"tensor_parallel_size": 2},
+        {"ulysses_degree": 2},
+        {"cfg_parallel_size": 2},
+        {"vae_patch_parallel_size": 2},
+        {
+            "tensor_parallel_size": 2,
+            "ulysses_degree": 2,
+            "cfg_parallel_size": 2,
+            "vae_patch_parallel_size": 2,
+        },
+    ],
+)
+def test_cache_dit_allows_supported_parallelism(parallel_kwargs):
+    from vllm_omni.diffusion.models.lingbot_video import LingBotVideoPipeline
+
+    LingBotVideoPipeline._validate_cache_dit_configuration(_make_config(parallel_kwargs=parallel_kwargs))
+
+
+@pytest.mark.parametrize(
+    ("cfg_parallel_size", "expected_separate_cfg"),
+    [(1, True), (2, False)],
+)
+def test_cache_dit_matches_per_rank_cfg_forward_count(
+    monkeypatch,
+    cfg_parallel_size,
+    expected_separate_cfg,
+):
+    from vllm_omni.diffusion.cache.cachedit import model_specific as module
+
+    captured = {}
+
+    class CapturingBlockAdapter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(module, "BlockAdapter", CapturingBlockAdapter)
+    monkeypatch.setattr(
+        module,
+        "enable_cache_for_dit",
+        lambda *args, **kwargs: lambda *refresh_args, **refresh_kwargs: None,
+    )
+    pipeline = SimpleNamespace(
+        transformer=SimpleNamespace(blocks=[]),
+        refiner_transformer=None,
+        od_config=SimpleNamespace(parallel_config=SimpleNamespace(cfg_parallel_size=cfg_parallel_size)),
+        _cache_dit_stage_refreshers={},
+    )
+
+    installation = module.enable_cache_for_lingbot_video(pipeline, SimpleNamespace())
+
+    assert captured["has_separate_cfg"] is expected_separate_cfg
+    installation.cleanup()
+    assert pipeline._cache_dit_stage_refreshers == {}
+
+
 def test_invalid_cache_dit_config_fails_before_model_prefetch(monkeypatch):
     from vllm_omni.diffusion.models.lingbot_video import (
         pipeline_lingbot_video as module,
@@ -103,9 +157,9 @@ def test_invalid_cache_dit_config_fails_before_model_prefetch(monkeypatch):
         "prefetch_subfolders",
         lambda *args, **kwargs: prefetch_calls.append((args, kwargs)),
     )
-    config = _make_config(parallel_kwargs={"tensor_parallel_size": 2})
+    config = _make_config(parallel_kwargs={"pipeline_parallel_size": 2})
 
-    with pytest.raises(ValueError, match="tensor parallelism"):
+    with pytest.raises(ValueError, match="pipeline parallelism"):
         module.LingBotVideoPipeline(od_config=config)
 
     assert prefetch_calls == []
@@ -126,7 +180,7 @@ def test_invalid_cache_dit_config_fails_before_model_prefetch(monkeypatch):
         (3.0, False, 3.0, True, "Refiner batch_cfg"),
     ],
 )
-def test_cache_dit_requires_sequential_two_pass_cfg(
+def test_cache_dit_requires_two_pass_cfg(
     base_guidance,
     base_batch_cfg,
     refiner_guidance,

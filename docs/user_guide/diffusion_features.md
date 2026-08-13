@@ -178,6 +178,8 @@ The following tables show which models support each feature:
 >    an all-gather before every GDN block. The remaining ❌ columns are simply
 >    unvalidated on this model, not known-broken.
 
+> **LingBot-Video Cache-DiT:** supports Tensor Parallel, Ulysses SP, CFG Parallel, and VAE Patch Parallel. Pipeline Parallel, Expert Parallel, HSDP, and distributed layerwise offload are not supported with Cache-DiT.
+
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
 

@@ -843,9 +843,12 @@ def enable_cache_for_lingbot_video(
 ) -> CacheDiTInstallation:
     """Enable Cache-DiT for LingBot Base and its optional Refiner.
 
-    Both native transformers use Pattern_3 and sequential CFG. Their scheduler
-    lengths may differ from the request values, so the pipeline owns refreshes
-    at each denoising-stage boundary after the scheduler is configured.
+    Both native transformers use Pattern_3. Single-rank CFG executes cond/uncond
+    as two sequential forwards, while CFG parallel executes one branch per rank;
+    ``has_separate_cfg`` must match that per-rank forward count. Scheduler lengths
+    may differ from the request values, so the pipeline owns refreshes at each
+    denoising-stage boundary after the scheduler is configured. Cache-DiT itself
+    synchronizes cache decisions whenever torch.distributed has multiple ranks.
     """
     transformers = [pipeline.transformer]
     blocks = [pipeline.transformer.blocks]
@@ -857,11 +860,13 @@ def enable_cache_for_lingbot_video(
         blocks.append(refiner_transformer.blocks)
         forward_patterns.append(ForwardPattern.Pattern_3)
 
+    parallel_config = getattr(getattr(pipeline, "od_config", None), "parallel_config", None)
+    has_separate_cfg = int(getattr(parallel_config, "cfg_parallel_size", 1)) == 1
     block_adapter = BlockAdapter(
         transformer=transformers[0] if len(transformers) == 1 else transformers,
         blocks=blocks,
         forward_pattern=forward_patterns,
-        has_separate_cfg=True,
+        has_separate_cfg=has_separate_cfg,
         check_forward_pattern=True,
     )
     refreshers: dict[str, RefreshCacheContextFunc] = {

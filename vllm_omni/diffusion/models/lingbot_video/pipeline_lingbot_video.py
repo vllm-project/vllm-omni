@@ -476,21 +476,8 @@ class LingBotVideoPipeline(
                 "pipeline parallelism",
             ),
             (
-                parallel_config.tensor_parallel_size > 1,
-                "tensor parallelism",
-            ),
-            (
                 parallel_config.enable_expert_parallel,
                 "expert parallelism",
-            ),
-            (
-                (parallel_config.sequence_parallel_size or 1) > 1,
-                "sequence parallelism",
-            ),
-            (parallel_config.cfg_parallel_size > 1, "CFG parallelism"),
-            (
-                parallel_config.vae_patch_parallel_size > 1,
-                "VAE patch parallelism",
             ),
             (parallel_config.use_hsdp, "HSDP"),
             (
@@ -503,8 +490,8 @@ class LingBotVideoPipeline(
             raise ValueError(
                 "LingBot Cache-DiT does not support the following combinations: "
                 + ", ".join(unsupported)
-                + ". Use an unsharded DiT stage; CPU offload and ordinary "
-                "layerwise offload remain supported."
+                + ". Tensor, Ulysses sequence, CFG, and VAE patch parallelism; "
+                "CPU offload; and ordinary layerwise offload remain supported."
             )
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -734,8 +721,8 @@ class LingBotVideoPipeline(
 
         if unsupported:
             raise ValueError(
-                "LingBot Cache-DiT currently requires sequential two-pass CFG "
-                "for every enabled denoising stage; unsupported request options: " + ", ".join(unsupported)
+                "LingBot Cache-DiT currently requires two-pass CFG for every "
+                "enabled denoising stage; unsupported request options: " + ", ".join(unsupported)
             )
 
     def to(self, *args, **kwargs):
