@@ -3898,6 +3898,84 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             architectures=[llm_arch],
         )
 
+        # Perf: INT8 online quantization for Thinker Linear layers.
+        # Unlike the vllm_config.quant_config approach, we quantize weights
+        # directly post-init (same pattern as Talker RMSNorm fusion),
+        # bypassing vllm-ascend 310P quant_description / config validation.
+        # Each Linear layer's weight is quantized to int8 + float32 scale
+        # via torch_npu.npu_dynamic_quant, converted to FRACTAL_NZ format
+        # via maybe_trans_nz, and its forward is patched to use
+        # torch_npu.npu_dynamic_quant(activation) + npu_quant_matmul.
+        try:
+            import torch_npu  # noqa: F401
+            from vllm.model_executor.layers.linear import LinearBase
+            from vllm_ascend.utils import maybe_trans_nz
+
+            _patched = 0
+            _skipped = 0
+            for _name, _mod in self.llm.named_modules():
+                if not isinstance(_mod, LinearBase):
+                    continue
+                # Keep lm_head (output projection) in BF16.
+                if "lm_head" in _name:
+                    _skipped += 1
+                    continue
+                # Keep fused layers (QKV/gate_up) in BF16 — they have
+                # special weight sharding that npu_quant_matmul may not
+                # handle correctly.
+                if hasattr(_mod, "fused_proj_shapes") or hasattr(
+                    _mod, "packed_dim"
+                ):
+                    _skipped += 1
+                    continue
+
+                _weight = _mod.weight.data
+                _qweight, _wscale = torch_npu.npu_dynamic_quant(_weight)
+                # NZ format + transpose for npu_quant_matmul kernel.
+                # Keep original BF16 weight intact so vLLM weight reload
+                # during graph capture doesn't see a shape mismatch.
+                _qweight_nz = maybe_trans_nz(_qweight).transpose(0, 1)
+                _mod.register_buffer(
+                    "_int8_weight", _qweight_nz, persistent=False
+                )
+                _mod.register_buffer(
+                    "_int8_weight_scale", _wscale.flatten(), persistent=False
+                )
+                _bias = _mod.bias
+
+                # Replace forward with NPU int8 matmul.
+                def _make_int8_forward(layer, bias):
+                    def _int8_fwd(x: torch.Tensor) -> torch.Tensor:
+                        ori_shape, ori_dtype = x.shape, x.dtype
+                        x_flat = x.reshape(-1, ori_shape[-1])
+                        qx, pscale = torch_npu.npu_dynamic_quant(x_flat)
+                        out = torch_npu.npu_quant_matmul(
+                            qx,
+                            layer._int8_weight,
+                            layer._int8_weight_scale,
+                            pertoken_scale=pscale,
+                            bias=bias,
+                            output_dtype=ori_dtype,
+                        )
+                        return out.reshape(*ori_shape[:-1], -1)
+
+                    return _int8_fwd
+
+                _mod.forward = _make_int8_forward(_mod, _bias)
+                _patched += 1
+
+            logger.info(
+                "INT8 quantized %d Thinker Linear layers (skipped %d).",
+                _patched,
+                _skipped,
+            )
+        except Exception as _exc:
+            logger.warning(
+                "Failed to INT8-quantize Thinker: %s. Running unquantized.",
+                _exc,
+                exc_info=True,
+            )
+
         embed_dim = self.llm.config.hidden_size
 
         # Initialize 3D Resampler
