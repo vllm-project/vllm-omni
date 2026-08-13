@@ -631,11 +631,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not isinstance(handle, dict) and not expected_keys:
             return
 
+        from_stage, to_stage = self.kv_transfer_manager.recv_stages
+        # Apply the producer endpoint before the connector is built so the
+        # handshake socket exists from the start.
+        sender_info = getattr(req, "kv_sender_info", None)
+        if sender_info:
+            self.kv_transfer_manager.update_sender_info(sender_info, sender_stage_id=from_stage)
+
         connector = self._stage_payload_connector()
         if connector is None:
             return
 
-        from_stage, to_stage = self.kv_transfer_manager.recv_stages
         metadata = None
         if isinstance(handle, dict):
             get_key = handle.get("key")
