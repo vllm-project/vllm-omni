@@ -48,8 +48,29 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to Wan2.2 S2V model (local path or HuggingFace ID).",
     )
-    parser.add_argument("--image", required=True, help="Path to reference image.")
-    parser.add_argument("--audio", required=True, help="Path to audio file (wav/mp3).")
+    parser.add_argument(
+        "--model-type",
+        default="wan-s2v",
+        choices=["wan-s2v", "longcat-video-avatar"],
+        help="Model type.",
+    )
+    parser.add_argument(
+        "--image",
+        help="Path to reference image. Required for Wan2.2 S2V and for LongCat Avatar AI2V; "
+        "LongCat Avatar AT2V is driven by audio alone, and an --extra-body input_json brings its own.",
+    )
+    parser.add_argument(
+        "--audio",
+        help="Path to audio file (wav/mp3). Required unless a LongCat Avatar JSON case supplies the tracks.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="[longcat-video-avatar] JSON dict of model-specific extra params (declared in "
+        "vllm_omni/model_extras/), merged into sampling extra_args. "
+        'Example: \'{"stage": "ai2v", "num_segments": "auto"}\'.',
+    )
     parser.add_argument(
         "--prompt",
         default="A person speaking naturally",
@@ -82,8 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-frames",
         type=int,
-        default=80,
-        help="Frames per clip (should be divisible by 4, default: 80).",
+        default=None,
+        help="Frames per clip (should be divisible by 4). Default: 80 for Wan2.2 S2V, 93 for LongCat Avatar.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -112,8 +133,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fps",
         type=int,
-        default=16,
-        help="Frames per second for the output video (default: 16).",
+        default=None,
+        help="Frames per second for the output video. Default: 16 for Wan2.2 S2V, 25 for LongCat Avatar.",
     )
     parser.add_argument(
         "--init-first-frame",
@@ -227,12 +248,31 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    is_longcat_avatar = args.model_type == "longcat-video-avatar"
+    # Per-model defaults, so each pipeline keeps the clip length and frame rate
+    # it was tuned for.
+    num_frames = args.num_frames if args.num_frames is not None else (93 if is_longcat_avatar else 80)
+    fps = args.fps if args.fps is not None else (25 if is_longcat_avatar else 16)
+    extra_body = json.loads(args.extra_body) if args.extra_body else {}
+    # LongCat Avatar AT2V is driven by audio alone; every other path needs a
+    # reference image.
+    # An official LongCat Avatar JSON case carries its own reference image and
+    # speaker tracks, so both media flags become optional in that mode only.
+    has_input_json = bool(extra_body.get("input_json"))
+    if args.audio is None and not (is_longcat_avatar and has_input_json):
+        raise ValueError("--audio is required (only a LongCat Avatar --extra-body input_json can supply it).")
+    if args.image is None and not has_input_json:
+        if not is_longcat_avatar:
+            raise ValueError("--image is required for --model-type wan-s2v.")
+        if str(extra_body.get("stage", "")).lower() == "ai2v":
+            raise ValueError("--image is required for LongCat Avatar AI2V.")
+
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     # Load reference image
     import PIL.Image
 
-    image = PIL.Image.open(args.image).convert("RGB")
+    image = PIL.Image.open(args.image).convert("RGB") if args.image else None
 
     # Cache-dit config
     cache_config = None
@@ -282,6 +322,30 @@ def main():
     if args.boundary_ratio is not None:
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
 
+    if is_longcat_avatar:
+        from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
+            prepare_longcat_video_avatar_model_for_omni,
+        )
+
+        # Avatar loads its own component set, so drop the Wan-only engine knobs
+        # and keep the shared ones (parallelism, offload, cache, profiling).
+        for key in ("flow_shift", "boundary_ratio", "vae_use_slicing", "vae_use_tiling"):
+            omni_kwargs.pop(key, None)
+        # The pipeline defaults every engine-level knob and reads the rest from
+        # sampling extra_args, so only the load-time ones are forwarded here.
+        additional_config = {
+            key: extra_body.pop(key)
+            for key in ("use_int8", "build_components_on_gpu", "base_model_dir")
+            if key in extra_body
+        }
+        omni_kwargs["model"] = prepare_longcat_video_avatar_model_for_omni(
+            args.model, additional_config.get("use_int8", True)
+        )
+        omni_kwargs["model_class_name"] = "LongCatVideoAvatarPipeline"
+        omni_kwargs["dtype"] = "bfloat16"
+        if additional_config:
+            omni_kwargs["additional_config"] = additional_config
+
     omni = Omni(**omni_kwargs)
 
     # Print generation configuration
@@ -291,7 +355,7 @@ def main():
     print(f"  Reference image: {args.image}")
     print(f"  Audio: {args.audio}")
     print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Frames per clip: {args.num_frames}")
+    print(f"  Frames per clip: {num_frames}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Flow shift: {args.flow_shift}")
     print(f"  Init first frame: {args.init_first_frame}")
@@ -308,8 +372,27 @@ def main():
 
     generation_start = time.perf_counter()
 
-    result = omni.generate(
-        {
+    if is_longcat_avatar:
+        # The pipeline resolves the stage, the speaker layout and the official
+        # JSON cases itself, so the request only carries the raw media inputs.
+        multi_modal_data: dict[str, Any] = {}
+        if args.audio is not None:
+            multi_modal_data["audio"] = args.audio
+        if image is not None:
+            multi_modal_data["image"] = image
+        prompt = {"prompt": args.prompt, "multi_modal_data": multi_modal_data}
+        if args.negative_prompt is not None:
+            prompt["negative_prompt"] = args.negative_prompt
+        sampling_params = OmniDiffusionSamplingParams(
+            num_frames=num_frames,
+            fps=fps,
+            num_inference_steps=args.num_inference_steps,
+            seed=args.seed,
+            generator=generator,
+            extra_args=extra_body,
+        )
+    else:
+        prompt = {
             "prompt": args.prompt,
             "negative_prompt": args.negative_prompt,
             "multi_modal_data": {
@@ -317,17 +400,18 @@ def main():
                 "audio": args.audio,
                 "init_first_frame": args.init_first_frame,
             },
-        },
-        OmniDiffusionSamplingParams(
+        }
+        sampling_params = OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
-            num_frames=args.num_frames,
+            num_frames=num_frames,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             seed=args.seed,
             generator=generator,
-        ),
-    )
+        )
+
+    result = omni.generate(prompt, sampling_params)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -360,7 +444,7 @@ def main():
     # Extract audio from multimodal_output (set by pipeline post-processor)
     mm = output.multimodal_output or {}
     audio_waveform = mm.get("audio")
-    output_fps = float(mm.get("fps", args.fps))
+    output_fps = float(mm.get("fps", fps))
     output_sr = int(mm.get("audio_sample_rate", 16000))
 
     if audio_waveform is not None:
@@ -384,6 +468,10 @@ def main():
                 return _flatten_to_array(first_elem)
             if isinstance(first_elem, np.ndarray) and first_elem.ndim == 3:
                 return np.stack(data)  # list of (H, W, C) → (T, H, W, C)
+            if isinstance(first_elem, list):
+                return _flatten_to_array(first_elem)  # [[frame, ...]] → [frame, ...]
+            if isinstance(first_elem, PIL.Image.Image):
+                return np.stack([np.asarray(frame) for frame in data])
         return data
 
     video_frames = _flatten_to_array(output.images)
@@ -410,7 +498,8 @@ def main():
     print(f"Saved generated video to {output_path}")
     print(f"Video has {num_frames} frames at {output_fps} fps ({num_frames / output_fps:.1f}s)")
     if audio_waveform is not None:
-        print(f"Audio: {len(audio_waveform) / output_sr:.1f}s at {output_sr} Hz")
+        audio_samples = audio_waveform.shape[-1] if audio_waveform.ndim > 1 else len(audio_waveform)
+        print(f"Audio: {audio_samples / output_sr:.1f}s at {output_sr} Hz")
 
 
 if __name__ == "__main__":
