@@ -11,15 +11,21 @@ NPU (128 GB HiBL 1.0 HBM). It covers the single-card T2VA configuration at
 | --- | ---: |
 | NPU | 1x Ascend 950PR |
 | NPU HBM | 128 GiB (131,072 MiB reported by `npu-smi`) |
-| Checkpoint storage | 135 GiB per partition |
-| Container shared memory | 8 GiB minimum |
+| Observed HBM high-water mark | 118,442 MiB (90.4% of capacity) |
+| Checkpoint storage | 135 GiB per partition, local disk strongly preferred |
+| Container shared memory | 8 GiB, or a writable local filesystem for spill |
 
-The container's `/dev/shm` is load-bearing: the decoded video is handed back to
-the API server through POSIX shared memory, and a 5 s clip at this shape
-produces an 837 MiB payload. Docker's 64 MB default cannot back it, and the
-failure is expensive — every denoise step completes first, then the worker dies
-with `Bus error (core dumped)` during the handoff, with no Python traceback.
-Start the container with `--shm-size=8g` or `--ipc=host`.
+The observed high-water mark leaves about 12.3 GiB of headroom, so this card is
+sized for exactly one resident task partition at 1024x576. Do not expect a
+larger output shape or concurrency greater than one to fit.
+
+Because a single 950PR holds the whole partition in HBM, this route does not
+need layerwise offload, and the 200 GiB system-RAM floor carried by the 72 GiB
+GPU recipes does not apply. The validated run completed inside a container
+limited to 32 GiB of RAM. Passing `--enable-layerwise-offload` on this card is
+actively harmful: it stages weights in non-reclaimable host memory and the
+container's OOM killer terminates the server with exit code -9.
+
 
 ## Environment
 
@@ -77,32 +83,67 @@ H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
 ## Validated evidence
 
-Measured on one Ascend 950PR with the configuration above, generating a 5 s
-1024x576 T2VA clip at 60 requested steps (59 denoise updates). The request
-returned `200 OK` with a playable MP4.
+Measured on one Ascend 950PR with the server command above plus
+`--enable-diffusion-pipeline-profiler`, generating a 5 s 1024x576 T2VA clip from
+the request in [§ T2VA request example](#t2va-request-example). MiniMax-H3
+requested 60 denoise steps and executed 59 denoise updates, so per-step latency
+is `denoise / 59`. `ffprobe` confirms every returned MP4 is 1024x576, 24 fps,
+124 video frames, 5.175 s, with a 32 kHz audio track of 165,600 samples.
 
-| Measurement | Result |
-| --- | ---: |
-| End-to-end request | 472.47 s |
-| Denoise (59 updates) | 435 s at 7.39 s/update |
-| Server-reported `denoise_step_latency_ms` | 7,874.4 ms |
-| MP4 muxing | 0.59 s |
-| Generated audio | 5.175 s at 32 kHz (165,600 samples) |
-| Peak HBM | 81,059 MiB of 131,072 MiB |
+Five requests were issued back to back with no idle time between them. The card
+is measurably faster on the first request than in steady state, so both regimes
+are reported.
 
-The server-reported per-step latency divides the whole stage time by the 60
-requested steps, so it reads higher than the 7.39 s measured per actual denoise
-update. The roughly 37 s outside the denoise loop covers text encoding, VAE
-decode, the 837 MiB worker-to-scheduler transfer, and MP4 muxing.
+| Stage | First request, cold card | Thermal steady state |
+| --- | ---: | ---: |
+| End-to-end request | 462.13 s | 506.38 s |
+| Text encode | 0.55 s | 0.05 s |
+| Denoise (59 updates) | 429.29 s | 471.74 s |
+| Per denoise update | 7,276 ms | 7,996 ms |
+| VAE decode | 8.43 s | 8.14 s |
+| Worker-to-server handoff | 24 s | 27 s |
+| MP4 muxing | 0.57 s | 0.50 s |
+| Server-reported `denoise_step_latency_ms` | 7,702 ms | 8,440 ms |
+| Peak HBM (`npu-smi`) | 118,442 MiB | 118,442 MiB |
+| Average NPU power | 566.9 W | 556.9 W |
+| Peak NPU temperature | 104 C | 104 C |
 
-This run was taken in a container whose `/dev/shm` was the 64 MB default and
-could not be remounted, so the oversized transfer used a file-backed fallback
-rather than shared memory; about 28 s of the end-to-end time went to writing
-and reading back that payload. A container started with `--shm-size=8g` keeps
-the transfer in shared memory and avoids that cost.
+Sample counts differ per row. The cold column is a single request. In the steady
+column, text encode, denoise and VAE decode are means over the four subsequent
+requests — denoise spanned 470.37 to 473.21 s, a 0.60% spread — while
+end-to-end, handoff and muxing are means over the two of those four that
+survived the handoff timeout described above.
 
-Peak HBM is sampled externally with `npu-smi`. Re-measure for longer outputs,
-a different output shape, or concurrency greater than one.
+**Report the steady-state column.** The cold card completes denoise 9.9% faster
+while drawing only 1.8% more average power, and both regimes reach the same
+104 C ceiling, so the first request is buying a short window of higher clocks
+before the die saturates. Any benchmark that issues a single request against an
+idle card will overstate throughput by about 10%.
+
+**Do not read `denoise_step_latency_ms` as a per-step time.** The server divides
+the entire stage wall time by the 60 *requested* steps, so it absorbs text
+encoding, VAE decode and the 837 MiB handoff. All three successful requests
+satisfy `denoise_step_latency_ms == e2e_stage_wall_time_ms / 60` exactly. The
+per-update figure in the table is `diffuse / 59` from the pipeline profiler.
+
+Denoise accounts for 93% of the steady-state request and the handoff accounts
+for 5.3%, so keeping the transfer in shared memory should bring end-to-end down
+to roughly 480 s.
+
+Peak HBM is sampled externally with `npu-smi` at a 3 s interval. It is a
+reserved high-water mark rather than live allocation: it reads 111,272 MiB after
+weight loading and before the first request, and does not fall back after
+requests complete. Re-measure for longer outputs, a different output shape, or
+concurrency greater than one.
+
+### Startup
+
+Weight loading took **31 min 50 s** on the validated host (first log line
+08:04:59, `Application startup complete` 08:36:49), with the checkpoint on a
+shared GlusterFS network mount. This is why the server command sets
+`--init-timeout 14400` and `--stage-init-timeout 14400`; the stock 600 s and
+1800 s timeouts both abort mid-load with `TimeoutError` and exit code 143.
+Reduce both timeouts when the partition is staged on local disk.
 
 ## T2VA request example
 
@@ -128,8 +169,18 @@ curl -sS --max-time 1800 -X POST "${API_URL}" \
   FL2VA and Ref2VA, or re-measure before relying on it.
 - Single-card serving loads one task partition at a time. For Ref2VA, stop the
   server and restart it against the `Ref2VA` directory.
-- Video outputs at this shape exceed the default container shared-memory mount.
-  See [§ Capacity requirements](#capacity-requirements).
+- Sustained load drives the die to 104 C and costs about 10% of denoise
+  throughput relative to a cold card. Warm the server with at least one full
+  request before measuring, and treat steady state as the reportable number.
+- Requests can fail during result handoff on hosts where the IPC spill path is
+  slow. See [§ Result handoff and shared
+  memory](#result-handoff-and-shared-memory).
+- Loading the checkpoint from a network mount takes over 30 minutes and forces
+  very large init timeouts. Stage the partition on local disk when possible.
+- The configuration measured here is 1024x576 at 60 steps, which differs from
+  the 1344x768 at 50 steps used by the GPU recipes in this directory. Denoise
+  cost scales superlinearly with token count, so the numbers are not directly
+  comparable across recipes.
 - The image ships a `triton` package whose Ascend backend is not built
   (`No module named 'triton._C.libtriton.ascend'`). vLLM logs this as an error
   at startup and disables Triton; the diffusion path does not need it and the
