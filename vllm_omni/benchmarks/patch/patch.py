@@ -1722,7 +1722,12 @@ async def async_request_openai_realtime_tts(
                     )
                 )
                 turn_transcripts.append(client.events.response_text(response_id))
-                await client.acknowledge_playback()
+                await client.acknowledge_playback(
+                    response_id=response_id,
+                    timeout_s=60.0,
+                    wait_for_history_committed=False,
+                    settle_s=2.0,
+                )
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(
                 turn_metrics,
@@ -1787,6 +1792,87 @@ def _seed_tts_turn_pcm16(turn: object, fallback_path: str) -> bytes:
     if not pcm16:
         raise ValueError(f"Seed-TTS prompt WAV has no audio: {wav_path}")
     return pcm16
+
+
+def _pcm16_silence(duration_ms: int) -> bytes:
+    if duration_ms <= 0:
+        return b""
+    sample_count = PCM16_SAMPLE_RATE * int(duration_ms) // 1000
+    return b"\x00\x00" * max(0, sample_count)
+
+
+def _chunk_period_ms_from_events(events: list[dict[str, object]]) -> int | None:
+    for event in reversed(events):
+        session = event.get("session")
+        if not isinstance(session, dict):
+            continue
+        capabilities = session.get("capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        chunk_period_ms = capabilities.get("chunk_period_ms")
+        if isinstance(chunk_period_ms, int) and chunk_period_ms > 0:
+            return chunk_period_ms
+    return None
+
+
+def _pad_pcm16_to_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bytes:
+    """Pad trailing silence so native MiniCPM units are complete.
+
+    Seed-TTS PERF often truncates prompts (e.g. 1400ms) leaving a residual
+    against the ~1000ms model unit. Without a full trailing unit the model can
+    stay in listen forever on later turns.
+    """
+    if chunk_period_ms <= 0 or not pcm16:
+        return pcm16
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    if unit_bytes <= 0:
+        return pcm16
+    remainder = len(pcm16) % unit_bytes
+    if remainder == 0:
+        return pcm16
+    return pcm16 + _pcm16_silence((unit_bytes - remainder) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE))
+
+
+async def _drain_quiet_duplex_responses(
+    client: RealtimeDuplexClient,
+    *,
+    settle_s: float,
+    timeout_s: float,
+) -> None:
+    """Wait until no response is in flight after a completed turn."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    quiet_since: float | None = None
+    settle_s = max(0.0, settle_s)
+    while True:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            return
+        created = client.events.count("response.created")
+        done_count = client.events.count("response.done")
+        if created <= done_count:
+            if quiet_since is None:
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= settle_s:
+                return
+        else:
+            # Extra model-policy speak: ack completed audio so the next turn can start.
+            for response_id in list(client.events.response_ids):
+                if not client.events.audio_bytes(response_id):
+                    continue
+                done = any(
+                    event.get("type") == "response.done" and client.events.response_id(event) == response_id
+                    for event in client.events.events
+                )
+                if not done:
+                    continue
+                await client.acknowledge_playback(
+                    response_id=response_id,
+                    timeout_s=min(30.0, remaining_s),
+                    wait_for_history_committed=False,
+                    settle_s=0.0,
+                )
+            quiet_since = None
+        await asyncio.sleep(0.05)
 
 
 async def async_request_openai_realtime_duplex(
@@ -1882,6 +1968,13 @@ async def async_request_openai_realtime_duplex(
                             f"realtime_duplex_max_input_ms={max_input_ms_i} truncated "
                             f"Seed-TTS turn {request_index} audio to empty"
                         )
+                chunk_period_ms = _chunk_period_ms_from_events(client.events.events)
+                if chunk_period_ms is not None:
+                    turn_pcm = _pad_pcm16_to_model_unit(turn_pcm, chunk_period_ms=chunk_period_ms)
+                # Optional trailing silence (scenarios use ~500ms) after truncated prompts.
+                trailing_silence_ms = int(client_options.get("realtime_duplex_trailing_silence_ms", 0) or 0)
+                if trailing_silence_ms > 0:
+                    turn_pcm = turn_pcm + _pcm16_silence(trailing_silence_ms)
                 await client.stream_pcm16(
                     turn_pcm,
                     chunk_ms=chunk_ms,
@@ -1954,7 +2047,18 @@ async def async_request_openai_realtime_duplex(
                         }
                     )
                 )
-                await client.acknowledge_playback()
+                await client.acknowledge_playback(
+                    response_id=response_id,
+                    timeout_s=60.0,
+                    wait_for_history_committed=False,
+                    settle_s=0.0,
+                )
+                if request_index + 1 < len(configured_turns):
+                    await _drain_quiet_duplex_responses(
+                        client,
+                        settle_s=float(client_options.get("realtime_duplex_inter_turn_settle_s", 2.0)),
+                        timeout_s=120.0,
+                    )
 
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(turn_metrics, session_id=session_id)

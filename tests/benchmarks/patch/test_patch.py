@@ -119,7 +119,7 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
                 received_at_s=now + 0.04,
             )
 
-        async def acknowledge_playback(self):
+        async def acknowledge_playback(self, **_kwargs):
             self.ack_count += 1
 
         async def close_session(self, **_kwargs):
@@ -298,7 +298,7 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
                 received_at_s=now + 0.04,
             )
 
-        async def acknowledge_playback(self):
+        async def acknowledge_playback(self, **_kwargs):
             self.ack_count += 1
 
         async def close_session(self, **_kwargs):
@@ -323,6 +323,8 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
             "realtime_duplex_chunk_ms": 200,
             "realtime_duplex_pacing": False,
             "realtime_duplex_max_input_ms": 100,
+            "realtime_duplex_trailing_silence_ms": 0,
+            "realtime_duplex_inter_turn_settle_s": 0,
             "temperature": 0.0,
         },
     )

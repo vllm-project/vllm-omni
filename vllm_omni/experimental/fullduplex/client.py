@@ -697,13 +697,86 @@ class RealtimeDuplexClient:
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
 
-    async def acknowledge_playback(self) -> None:
-        for response_id in self.events.response_ids:
-            pcm16 = self.events.audio_bytes(response_id)
+    def _playback_ack_event(
+        self,
+        response_id: str,
+        *,
+        after_count: int,
+    ) -> dict[str, object] | None:
+        item_id = f"item_{response_id}"
+        acknowledged = 0
+        for event in self.events.events:
+            if event.get("type") != "playback.acknowledged":
+                continue
+            acknowledged += 1
+            if acknowledged <= after_count:
+                continue
+            if event.get("item_id") == item_id or event.get("response_id") == response_id:
+                return event
+        return None
+
+    def _playback_history_committed(self, response_id: str, *, after_count: int) -> bool:
+        event = self._playback_ack_event(response_id, after_count=after_count)
+        return bool(event is not None and event.get("history_committed") is True)
+
+    async def acknowledge_playback(
+        self,
+        *,
+        response_id: str | None = None,
+        timeout_s: float = 30.0,
+        wait_for_history_committed: bool = True,
+        settle_s: float = 0.0,
+    ) -> None:
+        """Ack playback for one or all audio responses.
+
+        Multi-turn native duplex should wait for ``playback.acknowledged`` before
+        the next input stream/commit. Prefer ``history_committed=true`` when the
+        server provides it; otherwise still proceed after the ack event so later
+        turns are not blocked forever on a soft commit miss.
+        """
+        targets = [response_id] if response_id is not None else list(self.events.response_ids)
+        for rid in targets:
+            if not isinstance(rid, str) or not rid:
+                continue
+            pcm16 = self.events.audio_bytes(rid)
             if not pcm16:
                 continue
+            if self._playback_history_committed(rid, after_count=0):
+                continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send_playback_ack(response_id, played_ms)
+            before_ack = self.events.count("playback.acknowledged")
+            await self.send_playback_ack(rid, played_ms)
+            if timeout_s <= 0:
+                continue
+            try:
+                await wait_for(
+                    lambda rid=rid, before_ack=before_ack: self._playback_ack_event(rid, after_count=before_ack)
+                    is not None,
+                    timeout_s=timeout_s,
+                    label=f"playback.acknowledged for {rid}",
+                )
+            except TimeoutError:
+                if wait_for_history_committed:
+                    raise
+                continue
+            if wait_for_history_committed and not self._playback_history_committed(rid, after_count=before_ack):
+                # Soft-commit miss: retry once after a short settle.
+                await asyncio.sleep(0.5)
+                before_retry = self.events.count("playback.acknowledged")
+                await self.send_playback_ack(rid, played_ms)
+                try:
+                    await wait_for(
+                        lambda rid=rid, before_retry=before_retry: self._playback_history_committed(
+                            rid, after_count=before_retry
+                        )
+                        or self._playback_ack_event(rid, after_count=before_retry) is not None,
+                        timeout_s=min(timeout_s, 30.0),
+                        label=f"playback.acknowledged retry for {rid}",
+                    )
+                except TimeoutError:
+                    pass
+        if settle_s > 0:
+            await asyncio.sleep(settle_s)
 
     async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
         await self.send(
