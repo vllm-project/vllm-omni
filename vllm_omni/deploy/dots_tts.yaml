@@ -1,0 +1,28 @@
+# dots.tts deployment config (single-stage AR talker).
+#
+# Conservative first-integration settings: eager execution, no CUDA
+# Graphs, no batched side-path optimizations yet — see voxcpm2.yaml for
+# the runtime knobs a mature deployment of this model family grows.
+#
+# Verified locally on RTX 5080 16GB.
+
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      repetition_penalty: 1.0

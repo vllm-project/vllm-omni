@@ -95,6 +95,24 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
 
 
+def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _build_rope_table,
+    )
+
+    local_freqs_half = torch.randn(2, 48)
+    local_freqs = torch.cat((local_freqs_half, local_freqs_half), dim=-1)
+
+    actual = _build_rope_table(local_freqs)
+    expected = torch.cat(
+        (torch.cos(local_freqs_half), torch.sin(local_freqs_half)),
+        dim=-1,
+    ).to(torch.bfloat16)
+
+    assert actual.shape == (2, 96)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_strict_sp_local_span_uses_rank_owned_rows(monkeypatch):
     from vllm_omni.diffusion import forward_context
     from vllm_omni.diffusion.distributed import parallel_state
