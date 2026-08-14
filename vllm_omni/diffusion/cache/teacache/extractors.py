@@ -1333,6 +1333,7 @@ def extract_minimax_h3_context(
         refiner_max_seqlen=refiner_max,
         seq_len=seq_len,
         device=device,
+        local_span=(0, seq_len),
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
