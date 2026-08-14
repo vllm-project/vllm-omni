@@ -679,7 +679,7 @@ async def build_async_omni_from_stage_config(
         EngineClient instance (AsyncOmni) ready for use
 
     Note:
-        Stage configurations are loaded from args.stage_configs_path if provided,
+        Stage configurations are loaded from ``args.deploy_config`` when provided,
         otherwise from the model's default configuration.
     """
 
@@ -1156,7 +1156,7 @@ async def omni_init_app_state(
     state.openai_serving_duplex = None
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
-        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+        config_path=getattr(args, "deploy_config", None),
     ):
         from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
 

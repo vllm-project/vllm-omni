@@ -100,13 +100,19 @@ steps:
           - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - .buildkite/common/scripts/run_cov_split.sh
+          - pyproject.toml
+        # 40 -> 60: the coverage split runs the model twice.
+        timeout_in_minutes: 60
         commands:
           - |
-            timeout 40m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
+            export VLLM_LOGGING_LEVEL=DEBUG
+            export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+            .buildkite/common/scripts/run_cov_split.sh \
+              --model-id qwen3_tts \
+              --offline tests/e2e/offline_inference/test_qwen3_tts_base.py \
+              --online tests/e2e/online_serving/test_qwen3_tts_base.py \
+              -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
       - label: "Omni · Qwen3-Omni Test"

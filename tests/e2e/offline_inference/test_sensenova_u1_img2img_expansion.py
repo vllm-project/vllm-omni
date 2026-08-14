@@ -164,10 +164,7 @@ def _generate_sensenova_u1_img2img(
 def test_sensenova_u1_img2img(run_level):
     """Test SenseNova-U1 img2img (single-stage diffusion, no deploy YAML)."""
     input_image = _load_input_image()
-    with OmniRunner(
-        "SenseNova/SenseNova-U1-8B-MoT",
-        stage_configs_path=None,
-    ) as runner:
+    with OmniRunner("SenseNova/SenseNova-U1-8B-MoT") as runner:
         generated_image = _generate_sensenova_u1_img2img(runner.omni, input_image)
         if run_level == "full_model" or run_level == "advanced_model":
             _validate_pixels(generated_image)
@@ -182,7 +179,6 @@ def test_sensenova_u1_img2img_cache_dit():
     input_image = _load_input_image()
     with OmniRunner(
         "SenseNova/SenseNova-U1-8B-MoT",
-        stage_configs_path=None,
         cache_backend="cache_dit",
     ) as runner:
         _generate_sensenova_u1_img2img(runner.omni, input_image)

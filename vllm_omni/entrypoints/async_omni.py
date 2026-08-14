@@ -123,9 +123,8 @@ class AsyncOmni(EngineClient, OmniBase):
     Args:
         model: Model name or path to load.
         **kwargs: Additional keyword arguments.
-            - stage_configs_path: Optional path to YAML file containing stage
-              configurations. If None, configurations are resolved from model
-              pipeline factory.
+            - deploy_config: Optional path to a deploy YAML. If None,
+              configurations are resolved from the model pipeline factory.
             - log_stats: Whether to enable statistics logging.
             - stage_init_timeout: Timeout for per-stage initialization.
             - init_timeout: Total timeout for orchestrator startup.

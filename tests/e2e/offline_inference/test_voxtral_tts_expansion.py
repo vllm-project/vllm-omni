@@ -102,7 +102,7 @@ def test_voxtral_tts_offline_streaming():
     async def _run():
         async_omni = AsyncOmni(
             model=MODEL,
-            stage_configs_path=STAGE_CONFIG,
+            deploy_config=STAGE_CONFIG,
             stage_init_timeout=300,
             enforce_eager=True,
         )
