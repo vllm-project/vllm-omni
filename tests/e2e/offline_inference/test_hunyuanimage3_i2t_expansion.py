@@ -52,7 +52,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def omni() -> Generator[Omni, None, None]:
     with OmniRunner(
         MODEL_NAME,
-        stage_configs_path=str(STAGE_CONFIG_PATH),
+        deploy_config=str(STAGE_CONFIG_PATH),
         trust_remote_code=True,
     ) as runner:
         yield runner.omni
@@ -74,7 +74,7 @@ def test_i2t_generates_text(omni: Omni) -> None:
     outputs = omni.generate(prompts=[prompt_dict])
     assert outputs, "No outputs returned from Omni.generate()"
 
-    request_output = outputs[0].request_output
+    request_output = outputs[0]
     assert request_output.outputs, "No completion outputs"
 
     completion = request_output.outputs[0]

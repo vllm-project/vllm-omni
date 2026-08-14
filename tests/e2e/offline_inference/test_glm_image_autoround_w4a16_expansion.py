@@ -161,7 +161,7 @@ def test_glm_image_autoround_w4a16_generates_image(omni_runner_handler: OmniRunn
 
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
     images = req_out.images
 
@@ -224,7 +224,7 @@ def test_glm_image_autoround_w4a16_image_to_image(omni_runner_handler: OmniRunne
 
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
     images = req_out.images
 

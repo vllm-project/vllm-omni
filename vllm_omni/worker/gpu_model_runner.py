@@ -882,6 +882,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -909,6 +910,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            randomize_inputs: If True, randomize dummy input ids to balance
+                expert selection. vLLM's kernel_warmup passes this when
+                autotuning flashinfer.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -1131,7 +1135,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                self.maybe_randomize_inputs(input_ids, inputs_embeds, randomize_inputs=randomize_inputs),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,

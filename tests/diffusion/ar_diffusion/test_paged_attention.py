@@ -60,8 +60,17 @@ def _dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     return torch.einsum("bhqk,bkhd->bqhd", probs, value)
 
 
-def _cuda_flash_attn_usable() -> bool:
+def _gpu_flash_attn_usable() -> bool:
     if not torch.cuda.is_available():
+        return False
+    if torch.version.hip is not None:
+        for module in ("aiter", "flash_attn"):
+            try:
+                imported = __import__(module, fromlist=["flash_attn_varlen_func"])
+                if getattr(imported, "flash_attn_varlen_func", None) is not None:
+                    return True
+            except ImportError:
+                pass
         return False
     try:
         spec = find_spec("vllm.vllm_flash_attn")
@@ -227,12 +236,11 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
-@pytest.mark.skipif(not _cuda_flash_attn_usable(), reason="usable CUDA FlashAttention is required")
+@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len, commit_current):
-    pytest.importorskip("vllm.vllm_flash_attn")
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.float16
