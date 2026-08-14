@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_omni.diffusion.vae_optimization import finalize_vae_stage_durations
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -27,7 +29,7 @@ def consume_pipeline_stage_durations(pipeline: Any) -> dict[str, float]:
     stage_durations = getattr(pipeline, "stage_durations", None)
     if not isinstance(stage_durations, dict):
         return {}
-    result = {stage: float(duration) for stage, duration in stage_durations.items()}
+    result = finalize_vae_stage_durations({stage: float(duration) for stage, duration in stage_durations.items()})
     clear_pipeline_stage_durations(pipeline)
     return result
 

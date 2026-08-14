@@ -775,6 +775,8 @@ class OmniServeCommand(CLISubcommand):
             default=1,
             help="VAE Patch Parallelism degree for diffusion models. "
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "The value must evenly divide the diffusion world size; capable models such as MiniMax-H3 "
+            "use deterministic VAE process groups of this size independently of DiT TP/SP groups. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
@@ -797,6 +799,35 @@ class OmniServeCommand(CLISubcommand):
             "decoder feature maps along height/width and exchanges halo regions. The "
             "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
             "Equivalent to setting DiffusionParallelConfig.vae_parallel_mode.",
+        )
+        omni_config_group.add_argument(
+            "--vae-optimization-profile",
+            choices=("safe", "optimized", "diagnostic", "student"),
+            default="safe",
+            help=(
+                "VAE production profile. 'safe' disables experimental fast paths; "
+                "'optimized' selects validated automatic paths; 'diagnostic' exposes "
+                "component timings and accepts explicit overrides; 'student' requires "
+                "a model-specific post-trained decoder artifact."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--vae-stack-tiling",
+            choices=("auto", "true", "false"),
+            default=None,
+            help="Stack native VAE tiles per rank. Defaults are selected by the VAE optimization profile.",
+        )
+        omni_config_group.add_argument(
+            "--vae-compile",
+            choices=("auto", "true", "false"),
+            default=None,
+            help="Regionally compile stable VAE decoder blocks with bounded shape buckets and eager fallback.",
+        )
+        omni_config_group.add_argument(
+            "--vae-compile-max-shape-buckets",
+            type=int,
+            default=4,
+            help="Maximum VAE decoder shape buckets compiled per repeated block (default: 4).",
         )
 
         # Default sampling parameters

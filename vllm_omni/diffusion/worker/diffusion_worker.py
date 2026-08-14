@@ -47,12 +47,20 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.distributed.vae_parallel_state import (
+    initialize_vae_parallel_group,
+    validate_vae_parallel_group_size,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.vae_optimization import (
+    resolve_vae_optimization,
+    supports_independent_vae_process_group,
+)
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -264,6 +272,13 @@ class DiffusionWorker:
         """Initialize the device and distributed environment."""
         world_size = self.od_config.num_gpus
         rank = self.rank
+        parallel_config = self.od_config.parallel_config
+        # Capability and composition errors must fail before any collective or
+        # model-weight load. Every rank resolves the same immutable contract.
+        resolve_vae_optimization(self.od_config)
+        use_independent_vae_group = supports_independent_vae_process_group(self.od_config.model_class_name)
+        if use_independent_vae_group:
+            validate_vae_parallel_group_size(world_size, parallel_config.vae_patch_parallel_size)
 
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
@@ -279,7 +294,6 @@ class DiffusionWorker:
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
-        parallel_config = self.od_config.parallel_config
         vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
         if parallel_config.enable_expert_parallel and self.od_config.is_moe:
@@ -317,7 +331,6 @@ class DiffusionWorker:
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
-            parallel_config = self.od_config.parallel_config
             initialize_model_parallel(
                 data_parallel_size=parallel_config.data_parallel_size,
                 cfg_parallel_size=parallel_config.cfg_parallel_size,
@@ -331,6 +344,8 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
+            if use_independent_vae_group and parallel_config.vae_patch_parallel_size > 1:
+                initialize_vae_parallel_group(parallel_config.vae_patch_parallel_size)
             init_workspace_manager(self.device)
 
     def _create_profiler(self) -> WorkerProfiler | None:

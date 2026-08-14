@@ -29,6 +29,9 @@ If you only need to use the distributed environment without model parallelism,
 """
 
 import inspect
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 import torch.distributed
@@ -61,6 +64,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
+_DIT_GROUP_OVERRIDE: ContextVar[torch.distributed.ProcessGroup | None] = ContextVar("dit_group_override", default=None)
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -555,8 +559,25 @@ def init_dit_group(
 
 
 def get_dit_group():
+    override = _DIT_GROUP_OVERRIDE.get()
+    if override is not None:
+        return override
     assert _DIT is not None, "DIT group is not initialized"
     return _DIT
+
+
+@contextmanager
+def override_dit_group(group: torch.distributed.ProcessGroup) -> Iterator[None]:
+    """Temporarily expose ``group`` through :func:`get_dit_group`.
+
+    This lets generic runtime code configure a component against a dedicated
+    subgroup without changing that component's process-group lookup contract.
+    """
+    token = _DIT_GROUP_OVERRIDE.set(group)
+    try:
+        yield
+    finally:
+        _DIT_GROUP_OVERRIDE.reset(token)
 
 
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
@@ -975,6 +996,12 @@ def initialize_model_parallel(
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _DP, _CFG, _SP, _PP, _FS, _EXPERT_PARALLEL_GROUP_RANKS
+
+    # The VAE subgroup is intentionally owned outside the DiT rank layout.
+    # Import lazily to keep its lifecycle independent from DiT group creation.
+    from .vae_parallel_state import destroy_vae_parallel_group
+
+    destroy_vae_parallel_group()
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()

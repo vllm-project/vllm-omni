@@ -49,6 +49,7 @@ from vllm_omni.diffusion.sched.interface import (
     KVPrefetchJob,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.vae_optimization import finalize_vae_stage_durations, setup_vae_compile
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -319,6 +320,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
                     current_omni_platform.get_torch_device(),
                 )
+        # VAE compilation is independently capability-gated. It may be enabled
+        # while enforce_eager keeps the DiT eager, which makes qualification and
+        # failure rollback specific to the decoder path.
+        setup_vae_compile(self.pipeline)
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
@@ -553,6 +558,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         allow_single_output=allow_single_output,
                         pipeline_name=type(self.pipeline).__name__,
                     )
+                    for output in outputs:
+                        output.stage_durations = finalize_vae_stage_durations(output.stage_durations)
 
             if is_primary and outputs:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()

@@ -33,6 +33,52 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_propagates_vae_optimization_contract():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "vae_optimization_profile": "diagnostic",
+            "vae_stack_tiling": "true",
+            "vae_compile": "false",
+            "vae_compile_max_shape_buckets": 3,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["vae_optimization_profile"] == "diagnostic"
+    assert engine_args["vae_stack_tiling"] == "true"
+    assert engine_args["vae_compile"] == "false"
+    assert engine_args["vae_compile_max_shape_buckets"] == 3
+
+
+def test_serve_cli_accepts_vae_optimization_contract():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--vae-optimization-profile",
+            "diagnostic",
+            "--vae-stack-tiling",
+            "true",
+            "--vae-compile",
+            "false",
+            "--vae-compile-max-shape-buckets",
+            "3",
+        ]
+    )
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(args.get_explicit_kwargs_dict())[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert engine_args["vae_optimization_profile"] == "diagnostic"
+    assert engine_args["vae_stack_tiling"] == "true"
+    assert engine_args["vae_compile"] == "false"
+    assert engine_args["vae_compile_max_shape_buckets"] == 3
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

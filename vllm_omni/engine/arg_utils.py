@@ -537,6 +537,10 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_optimization_profile: str = "safe"
+    vae_stack_tiling: str | None = None
+    vae_compile: str | None = None
+    vae_compile_max_shape_buckets: int = 4
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
