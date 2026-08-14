@@ -424,7 +424,7 @@ class HiDreamO1ImageModel(nn.Module):
         position_ids: torch.Tensor,
         vinputs: torch.Tensor,
         timestep: torch.Tensor,
-        token_types: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> HiDreamO1ImageOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         timestep_embeds = self.t_embedder1(timestep.to(inputs_embeds.device))
@@ -439,33 +439,12 @@ class HiDreamO1ImageModel(nn.Module):
         inputs_embeds = torch.cat([inputs_embeds, image_embeds], dim=1)
         batch_size, total_seq_len, _ = inputs_embeds.shape
 
-        if token_types.ndim == 1:
-            token_types = token_types.unsqueeze(0)
-        elif token_types.ndim == 2 and token_types.shape == (total_seq_len, 1):
-            token_types = token_types.transpose(0, 1)
-        if token_types.shape[0] == 1 and batch_size > 1:
-            token_types = token_types.expand(batch_size, -1)
-        token_types = token_types.to(inputs_embeds.device)
-        if token_types.shape != (batch_size, total_seq_len):
-            raise ValueError(
-                f"token_types must have shape {(batch_size, total_seq_len)}, got {tuple(token_types.shape)}"
-            )
-
-        min_value = torch.finfo(inputs_embeds.dtype).min
-        masks = []
-        for batch_idx in range(batch_size):
-            mask = torch.triu(
-                torch.full(
-                    (total_seq_len, total_seq_len),
-                    min_value,
-                    dtype=inputs_embeds.dtype,
-                    device=inputs_embeds.device,
-                ),
-                diagonal=1,
-            )
-            mask[token_types[batch_idx].bool()] = 0
-            masks.append(mask)
-        attention_mask = torch.stack(masks).unsqueeze(1)
+        if attention_mask.shape[0] == 1 and batch_size > 1:
+            attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+        expected_mask_shape = (batch_size, 1, total_seq_len, total_seq_len)
+        if attention_mask.shape != expected_mask_shape:
+            raise ValueError(f"attention_mask must have shape {expected_mask_shape}, got {tuple(attention_mask.shape)}")
+        attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
         hidden_states = self.language_model(
             inputs_embeds,
@@ -498,7 +477,7 @@ class HiDreamO1ImageTransformer(nn.Module):
         position_ids: torch.Tensor,
         vinputs: torch.Tensor,
         timestep: torch.Tensor,
-        token_types: torch.Tensor,
+        attention_mask: torch.Tensor,
         **_: object,
     ) -> HiDreamO1ImageOutput:
         return self.model(
@@ -506,7 +485,7 @@ class HiDreamO1ImageTransformer(nn.Module):
             position_ids=position_ids,
             vinputs=vinputs,
             timestep=timestep,
-            token_types=token_types,
+            attention_mask=attention_mask,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

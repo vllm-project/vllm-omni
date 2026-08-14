@@ -71,6 +71,12 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+HIDREAM_O1_SIGNATURE_WEIGHTS = (
+    "model.final_layer2.linear.weight",
+    "final_layer2.linear.weight",
+)
+
+
 def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
     """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
     try:
@@ -82,7 +88,9 @@ def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bo
         if not isinstance(index, Mapping):
             return False
         weight_map = index.get("weight_map")
-        return isinstance(weight_map, Mapping) and "model.final_layer2.linear.weight" in weight_map
+        if not isinstance(weight_map, Mapping):
+            return False
+        return any(key in weight_map for key in HIDREAM_O1_SIGNATURE_WEIGHTS)
     except (AttributeError, OSError, TypeError, ValueError):
         return False
 

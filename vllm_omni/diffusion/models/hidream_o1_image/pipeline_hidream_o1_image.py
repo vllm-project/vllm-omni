@@ -57,7 +57,7 @@ PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
 class HiDreamO1TextSample(TypedDict):
     input_ids: torch.Tensor
     position_ids: torch.Tensor
-    token_types: torch.Tensor
+    attention_mask: torch.Tensor
     vinput_mask: torch.Tensor
 
 
@@ -208,7 +208,7 @@ def build_t2i_text_sample(
     tokenizer: PreTrainedTokenizerBase,
     processor: ProcessorMixin,
     model_config: Qwen3VLConfig,
-) -> HiDreamO1TextSample:
+) -> dict[str, torch.Tensor]:
     image_token_id = model_config.image_token_id
     video_token_id = model_config.video_token_id
     vision_start_token_id = model_config.vision_start_token_id
@@ -260,6 +260,37 @@ def build_t2i_text_sample(
         "token_types": token_types_bin,
         "vinput_mask": vinput_mask,
     }
+
+
+def build_hidream_o1_attention_mask(
+    token_types: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build the mixed causal/full mask once while preparing a request.
+
+    Text rows stay causal; image and timestep rows get full attention.
+    """
+    if token_types.ndim == 1:
+        token_types = token_types.unsqueeze(0)
+    elif token_types.ndim == 2 and token_types.shape[1] == 1 and token_types.shape[0] != 1:
+        token_types = token_types.transpose(0, 1)
+    if token_types.ndim != 2:
+        raise ValueError(f"token_types must have one or two dimensions, got shape {tuple(token_types.shape)}")
+
+    batch_size, seq_len = token_types.shape
+    min_value = torch.finfo(dtype).min
+    attention_mask = torch.triu(
+        torch.full(
+            (batch_size, seq_len, seq_len),
+            min_value,
+            dtype=dtype,
+            device=token_types.device,
+        ),
+        diagonal=1,
+    )
+    attention_mask[token_types.bool()] = 0
+    return attention_mask.unsqueeze(1)
 
 
 def build_hidream_o1_scheduler(
@@ -548,7 +579,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 position_ids=sample["position_ids"],
                 vinputs=z_in,
                 timestep=t_pixeldit.reshape(-1).to(self.device),
-                token_types=sample["token_types"],
+                attention_mask=sample["attention_mask"],
                 use_flash_attn=False,
             )
 
@@ -580,7 +611,16 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             raise RuntimeError(
                 f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} for {height}x{width}"
             )
-        return {key: value.to(self.device) for key, value in sample.items()}
+        inputs = {key: value.to(self.device) for key, value in sample.items()}
+        return {
+            "input_ids": inputs["input_ids"],
+            "position_ids": inputs["position_ids"],
+            "attention_mask": build_hidream_o1_attention_mask(
+                inputs["token_types"],
+                dtype=self.dtype,
+            ),
+            "vinput_mask": inputs["vinput_mask"],
+        }
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:

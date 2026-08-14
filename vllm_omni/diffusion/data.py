@@ -567,11 +567,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
-    if model_type == "qwen3_vl":
-        from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
-        if _looks_like_hidream_o1(model, cfg):
-            return "HiDreamO1ImagePipeline"
+    if _looks_like_hidream_o1(model, cfg):
+        return "HiDreamO1ImagePipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1252,13 +1251,13 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "qwen3_vl":
-                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+                from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
-                    if self.model_class_name != "HiDreamO1ImagePipeline" and not _looks_like_hidream_o1(
-                        self.model, cfg
-                    ):
-                        raise ValueError(f"Qwen3-VL checkpoint {self.model} is not a supported diffusion model")
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
+                    raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
+
+                if is_hidream_o1:
                     self.model_class_name = "HiDreamO1ImagePipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
