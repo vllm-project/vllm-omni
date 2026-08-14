@@ -27,6 +27,7 @@ _MIXIN_UPDATE_HELPERS = (
     "_attach_finished_request_sets",
     "_attach_scheduler_stats",
     "_capture_omni_connector_output",
+    "_maybe_decode_pooling_output",
 )
 
 
@@ -138,6 +139,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         pending_stop_after_extraction=set(),
         waiting_for_transfer_free=set(),
         _new_prompt_len_snapshot={},
+        _pooling_output_decoder=None,
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
@@ -267,3 +269,72 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     assert output_by_id["bad"].new_token_ids == []
     assert output_by_id["good"].new_token_ids == [8]
     np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:
+    return SimpleNamespace(
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[pooler_tensor],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req": 0},
+        routed_experts=None,
+    )
+
+
+def _make_pooling_stub(decoder) -> tuple[_Request, SimpleNamespace]:
+    request = _Request("req")
+    request.sampling_params = SimpleNamespace(num_logprobs=None)
+    request.pooling_params = SimpleNamespace()
+    scheduler = _make_scheduler_stub([request])
+    scheduler._pooling_output_decoder = decoder
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=None))
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    return request, scheduler
+
+
+def test_pooling_decode_success_emits_decoded_payload() -> None:
+    import torch
+
+    decoded = torch.tensor([[1, 2]], dtype=torch.int32)
+    request, scheduler = _make_pooling_stub(lambda logits, req, hf: decoded)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    assert output.finish_reason is FinishReason.STOP
+    assert output.pooling_output is decoded
+
+
+def test_pooling_decode_failure_finishes_request_with_error() -> None:
+    import torch
+
+    def raising_decoder(logits, req, hf):
+        raise ValueError("boom")
+
+    request, scheduler = _make_pooling_stub(raising_decoder)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    outputs = OmniARScheduler.update_from_output(
+        scheduler, scheduler_output, _pooling_model_runner_output(torch.zeros(2, 4))
+    )
+    (output,) = outputs[0].outputs
+
+    # Decoder failure is a request error (500), not an empty success.
+    assert output.finish_reason is FinishReason.ERROR
+    assert output.pooling_output is None
+    assert "pooling output decode failed" in str(request.stop_reason)

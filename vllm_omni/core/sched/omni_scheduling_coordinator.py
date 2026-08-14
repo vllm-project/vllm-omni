@@ -51,6 +51,10 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("MiniCPMO45Code2Wav", "code2wav"),
         # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # nemotron_voicechat: talker (Stage 1) -> code2wav (Stage 2). Stage 2
+        # waits for the talker's full-payload code stacks; the thinker (Stage 0)
+        # -> talker (Stage 1) hop is token-path only and must NOT be listed.
+        ("NemotronVoiceChatCode2Wav", "code2wav"),
         # audex TTS sync path: thinker (Stage 0) -> streaming decoder (Stage 1).
         # The default deploy is async_chunk; this covers async_chunk: false.
         ("AudexCode2Wav", "audex_code2wav"),

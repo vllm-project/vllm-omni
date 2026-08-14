@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -235,6 +236,15 @@ class MiniMaxH3Rope(nn.Module):
         t_f, h_f, w_f = per_axis.unbind(dim=1)  # each [S, 16]
         half = torch.cat((t_f, h_f, w_f), dim=-1)  # [S, 48]
         return torch.cat((half, half), dim=-1)  # [S, 96]
+
+
+def _build_rope_table(freqs: torch.Tensor) -> torch.Tensor:
+    """Materialize H3's packed ``[cos(freqs[:48]), sin(freqs[:48])]`` table."""
+    half = freqs.shape[-1] // 2
+    return torch.cat(
+        (torch.cos(freqs[..., :half]), torch.sin(freqs[..., :half])),
+        dim=-1,
+    ).to(_BF16_DTYPE)
 
 
 class MiniMaxH3TimeEmbedder(nn.Module):
@@ -453,7 +463,7 @@ class MiniMaxH3Attention(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        rope_freqs: torch.Tensor | None,
+        rope_table: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int | None = None,
@@ -479,11 +489,18 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if rope_freqs is not None:
-            q = self._apply_rope(q, rope_freqs)
-            k = self._apply_rope(k, rope_freqs)
+        if rope_table is None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        else:
+            q, k = fused_qk_norm_rope(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table,
+                self.q_norm.variance_epsilon,
+            )
 
         # The packed layout uses a second document for alignment padding.
         # Local/Ulysses backends unpad it, while Ring keeps aligned rows for
@@ -628,7 +645,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
-            rope_freqs=None,
+            rope_table=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
@@ -707,7 +724,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         t_emb: torch.Tensor,
         combined_indices: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_table: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
@@ -735,7 +752,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE)
         h = self.attn(
             h,
-            rope_freqs=rope_freqs,
+            rope_table=rope_table,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             packed_total=packed_total,
@@ -817,10 +834,10 @@ class MiniMaxH3SPPrepare(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rope_freqs: torch.Tensor,
+        rope_table: torch.Tensor,
         combined_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return hidden_states, rope_freqs, combined_indices
+        return hidden_states, rope_table, combined_indices
 
 
 class MiniMaxH3SPGather(nn.Module):
@@ -1153,8 +1170,8 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        # Compute RoPE frequencies over the full packed sequence.
-        rope_freqs = self.rope(img_position_ids).to(device)
+        # Compute the packed RoPE table once for all transformer blocks.
+        rope_table = _build_rope_table(self.rope(img_position_ids).to(device))
 
         decoder_input, t_emb = self._embed(
             x=x,
@@ -1175,7 +1192,7 @@ class MiniMaxH3DiTModel(nn.Module):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        block_rope = rope_freqs
+        block_rope = rope_table
         block_combined = combined_indices
 
         hidden, block_rope, block_combined = self.sp_prepare(
@@ -1188,7 +1205,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 hidden,
                 t_emb=t_emb,
                 combined_indices=block_combined,
-                rope_freqs=block_rope,
+                rope_table=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,

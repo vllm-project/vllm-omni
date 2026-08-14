@@ -129,6 +129,9 @@ class OmniModelConfig(ModelConfig):
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder applied
+    # worker-side before IPC. Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(

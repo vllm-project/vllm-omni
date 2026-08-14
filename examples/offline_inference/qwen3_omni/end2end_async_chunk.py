@@ -237,7 +237,7 @@ async def run_single_request(
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
         ):
-            output = omni_output.request_output
+            output = omni_output
             if omni_output.final_output_type == "text":
                 if stage_0_first_output_ts is None:
                     stage_0_first_output_ts = time.perf_counter()

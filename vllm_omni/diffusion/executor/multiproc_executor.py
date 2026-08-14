@@ -18,6 +18,7 @@ import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
@@ -294,6 +295,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
+        # Without this, every worker inherits one Torch thread per core, so an
+        # N-GPU run oversubscribes the host by N x core_count. Honours a
+        # user-provided OMP_NUM_THREADS.
+        set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
         processes = []
 

@@ -116,7 +116,7 @@ def main(args: Any) -> None:
     prompt = _build_custom_voice_input(args)
     final_output = None
     for stage_outputs in omni.generate([prompt]):
-        final_output = stage_outputs.request_output
+        final_output = stage_outputs
     if final_output is None:
         raise RuntimeError("Qwen3-TTS did not produce an output.")
 

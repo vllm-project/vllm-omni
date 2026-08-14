@@ -23,6 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
+| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -372,18 +373,10 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 Streaming requires `async_chunk: true` in the stage config.
 
 ### Word Timestamps
-Generate a WAV offline and a JSON sidecar with word-level timestamps from
-`Qwen/Qwen3-ForcedAligner-0.6B`:
-```bash
-python examples/offline_inference/text_to_speech/qwen3_tts/word_timestamps.py \
-    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B \
-    --text "Hello world." \
-    --output-dir /tmp/qwen3_tts_timestamps
-```
-The script writes `qwen3_tts_word_timestamps.wav` and
-`qwen3_tts_word_timestamps.json`. On machines without a local CUDA toolkit,
-set `VLLM_USE_FLASHINFER_SAMPLER=0` to avoid FlashInfer sampler JIT.
+Word-level timestamps are currently a serving-path feature: launch
+`vllm-omni serve` with `--forced-aligner` and request `word_timestamps`
+(see `examples/online_serving/text_to_speech/README.md`). An offline
+example is not provided in this release.
 
 ### Batched decoding
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, point `--stage-configs-path` at a stage configs YAML with the desired values (see `vllm_omni/model_executor/stage_configs/` for templates):
@@ -435,6 +428,31 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 ### Notes
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (auto-loaded by HF `model_type`).
+
+---
+
+## dots.tts
+
+Single-stage native AR TTS at 48 kHz (rednote-hilab). Pipeline: `Qwen2.5-1.5B base LM → DiT (10-step Euler flow matching) → patch_encoder AR loopback → AudioVAE (streaming decode)`. Same "vLLM-native base LM + side-path computation" pattern as VoxCPM2, with a plain Qwen2 backbone instead of MiniCPM4 and no FSQ / residual LM stage.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model rednote-hilab/dots.tts-soar \
+    --text "Hello, this is a test of dots TTS running on vLLM Omni."
+```
+
+### Voice cloning
+Not wired in this release — generation is zero-shot only. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
+
+### Streaming
+The AudioVAE decoder has an internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`) used to avoid boundary artifacts between 160 ms patches, but it is not yet exposed through an online serving endpoint or example.
+
+### Notes
+- Output: 48 kHz mono WAV.
+- Deploy config: `vllm_omni/deploy/dots_tts.yaml` (auto-loaded by HF `model_type`).
+- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default. `dots.tts-base` shares the same architecture but is unvalidated in this repo. `dots.tts-mf` (MeanFlow, 2-4 step) is not supported yet.
+- Known limitation: no CUDA graph capture and no batched side-path computation yet, so concurrent requests do not currently scale (each request's DiT Euler steps run serially). See `recipes/rednote-hilab/dots.tts.md` for details and the roadmap.
 
 ---
 
