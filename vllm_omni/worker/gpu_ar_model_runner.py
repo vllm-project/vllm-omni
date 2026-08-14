@@ -845,6 +845,57 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
     @staticmethod
+    def _unwrap_combined_payload_value(
+        value: Any,
+        *,
+        rid: str,
+        list_idx: int,
+        mm_key: str,
+    ) -> tuple[bool, Any]:
+        """Unwrap one value from the prefix-cache-merged payload.
+
+        Returns ``(keep, unwrapped)``: ``keep`` is False when the value is a
+        misaligned per-request list and must be dropped.
+        """
+        unwrap = GPUARModelRunner._unwrap_combined_payload_value
+        if isinstance(value, list):
+            if list_idx < len(value):
+                return True, value[list_idx]
+            if len(value) == 1:
+                # Length-1 lists are batch-shared passthrough metadata
+                # (e.g. `meta.sparse_audio: ["1"]`) that the prefix-cache
+                # merge broadcasts to every request; unwrap the shared
+                # element.
+                return True, value[0]
+            # A multi-element list shorter than the request's index is
+            # per-request data that lost alignment. Never substitute
+            # another request's element (`v[0]` used to ship request 0's
+            # payload as `rid`'s); drop the key loudly instead — the SAME
+            # protocol-break policy as the sparse mismatch in
+            # `_build_omni_mm_payload`. Not a raise: in-tree producers can
+            # emit subset-length lists without the sparse marker (voxcpm2
+            # dense-mode coalesce), and v1 runners do not catch
+            # per-request exceptions, so raising would turn a per-request
+            # protocol break into a whole-stage outage.
+            logger.error(
+                "Combined prefix-cache mm payload misaligned for request %s: index %d out of "
+                "range for per-request list of length %d; dropping key %s.",
+                rid,
+                list_idx,
+                len(value),
+                mm_key,
+            )
+            return False, None
+        if isinstance(value, dict):
+            nested = {}
+            for k, sv in value.items():
+                keep, unwrapped = unwrap(sv, rid=rid, list_idx=list_idx, mm_key=mm_key)
+                if keep:
+                    nested[k] = unwrapped
+            return True, nested
+        return True, value
+
+    @staticmethod
     def _build_combined_prefix_cache_mm_payload(
         combined_multimodal_outputs: dict,
         *,
@@ -857,50 +908,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         caller (`_build_omni_mm_payload`, which owns the sparse-routing
         context) — batch index normally, sparse index under sparse routing.
         """
-        missing = object()
-
-        def _unwrap_lists(v, mm_key):
-            if isinstance(v, list):
-                if list_idx < len(v):
-                    return v[list_idx]
-                if len(v) == 1:
-                    # Length-1 lists are batch-shared passthrough metadata
-                    # (e.g. `meta.sparse_audio: ["1"]`) that the prefix-cache
-                    # merge broadcasts to every request; unwrap the shared
-                    # element.
-                    return v[0]
-                # A multi-element list shorter than the request's index is
-                # per-request data that lost alignment. Never substitute
-                # another request's element (`v[0]` used to ship request 0's
-                # payload as `rid`'s); drop the key loudly instead — the SAME
-                # protocol-break policy as the sparse mismatch in
-                # `_build_omni_mm_payload`. Not a raise: in-tree producers can
-                # emit subset-length lists without the sparse marker (voxcpm2
-                # dense-mode coalesce), and v1 runners do not catch
-                # per-request exceptions, so raising would turn a per-request
-                # protocol break into a whole-stage outage.
-                logger.error(
-                    "Combined prefix-cache mm payload misaligned for request %s: index %d out of "
-                    "range for per-request list of length %d; dropping key %s.",
-                    rid,
-                    list_idx,
-                    len(v),
-                    mm_key,
-                )
-                return missing
-            if isinstance(v, dict):
-                nested = {}
-                for k, sv in v.items():
-                    unwrapped = _unwrap_lists(sv, mm_key)
-                    if unwrapped is not missing:
-                        nested[k] = unwrapped
-                return nested
-            return v
-
         payload: dict[str, object] = {}
         for mm_key in combined_multimodal_outputs.keys():
-            unwrapped = _unwrap_lists(combined_multimodal_outputs[mm_key][rid], mm_key)
-            if unwrapped is not missing:
+            keep, unwrapped = GPUARModelRunner._unwrap_combined_payload_value(
+                combined_multimodal_outputs[mm_key][rid],
+                rid=rid,
+                list_idx=list_idx,
+                mm_key=mm_key,
+            )
+            if keep:
                 payload[mm_key] = unwrapped
         return payload
 
