@@ -24,9 +24,8 @@ jobs:
           python-version: "3.12"
           cache: 'pip'
       - uses: pre-commit/action@v3.0.1
-        # Don't run the pytest mark check against everything in the CI
-        # for now since a lot of files are still missing them. This check
-        # is used to help contributors remember to add the marks when they
-        # commit.
+        # Don't run the pytest mark check or markdownlint against everything
+        # in CI yet: many tests still lack marks, and many docs still fail
+        # markdownlint. Both hooks still run locally on changed files.
         env:
-          SKIP: check-test-ci-coverage
+          SKIP: check-test-ci-coverage,markdownlint-cli2

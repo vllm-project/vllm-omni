@@ -38,6 +38,15 @@ repos:
       - id: actionlint
         files: ^\.github/workflows/.*\.ya?ml$
 
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.23.2
+    hooks:
+      - id: markdownlint-cli2
+        language_version: lts
+        args: [--fix]
+        files: (^docs/|^recipes/|(^|/)README\.md$|^CONTRIBUTING\.md$)
+        # Agent skill docs and CLAUDE.md are not user-facing docs/READMEs.
+        exclude: (^|/)CLAUDE\.md$|^\.claude/|^\.cursor/
 
   - repo: local
     hooks:
