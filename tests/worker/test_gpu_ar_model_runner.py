@@ -3,6 +3,7 @@ import copy
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
+import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -1265,42 +1267,123 @@ class TestSparseAudioMarkerRobustness:
         assert marker("true") is True
         assert marker("off") is False
 
-    def test_marker_scalar_tensor_and_array(self):
+    def test_marker_enforced_canonical_forms_no_error(self):
+        # The designed carrier (list-of-str; bare str accepted) and marker
+        # absence (None) are the ONLY silent forms.
         marker = GPUARModelRunner._is_sparse_audio_marker
-        assert marker(torch.tensor(1)) is True
-        assert marker(torch.tensor([0])) is False
-        assert marker(np.array(1)) is True
-        assert marker(np.array([0])) is False
+        with patch.object(ar_runner_module.logger, "error") as err:
+            assert marker(["1"]) is True
+            assert marker(["0"]) is False
+            assert marker(["0", "1"]) is True
+            assert marker("true") is True
+            assert marker("off") is False
+            assert marker(None) is False
+        err.assert_not_called()
 
-    def test_marker_multi_element_tensor_does_not_crash_and_keeps_semantics(self):
-        # `bool(tensor)` used to raise "Boolean value of Tensor with more than
-        # one element is ambiguous". Multi-element carriers now normalize
-        # element-wise: a genuinely truthy marker stays sparse instead of
-        # being silently read as dense.
+    def test_marker_illegal_carriers_raise_one_error_per_type(self):
+        # Enforcement, not normalization: any carrier outside the design
+        # contract is a producer bug - it raises _InvalidSparseDeclaration
+        # (caught only by _resolve_sparse_mm_routing, which fails closed)
+        # and logs at error level once per offending type. Interpreting
+        # deviants would need a second truth predicate, and predicate
+        # divergence is exactly how the np.array(["0"])-routes-as-sparse bug
+        # happened.
         marker = GPUARModelRunner._is_sparse_audio_marker
-        assert marker(torch.ones(3)) is True
-        assert marker(torch.zeros(3)) is False
-        assert marker(np.ones((2, 2))) is True
-        assert marker(np.zeros(2)) is False
+        for value in (torch.tensor(1), torch.tensor([1, 1]), np.array(["1"]), 1, 1.0, True, ["1", 1]):
+            with (
+                patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()),
+                patch.object(ar_runner_module.logger, "error") as err,
+            ):
+                with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                    marker(value)
+                assert err.call_count == 1, f"expected one error for {value!r}"
+                with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                    marker(value)
+                assert err.call_count == 1  # deduped per type, not per step
 
-    def test_marker_same_logical_value_agrees_across_container_types(self):
-        # One predicate for every carrier: `bool("0")` is True in Python, so
-        # a bare-bool branch used to read np.array(["0"]) as SPARSE while the
-        # list branch read ["0"] as dense — a routing flip, not cosmetics.
+    def test_marker_device_tensor_rejected_without_read(self):
+        # Deviant carriers are never read element-wise, so a device tensor
+        # can never introduce a D2H sync here. Meta tensors hold no data -
+        # any read (`.item()`/`bool()`) raises a RuntimeError, so seeing OUR
+        # exception type (not RuntimeError) proves the data is never touched.
         marker = GPUARModelRunner._is_sparse_audio_marker
-        assert marker(np.array(["0"])) is False
-        assert marker(np.array(["1"])) is True
-        assert marker(torch.tensor([0, 0])) is False
-        assert marker(torch.tensor([1, 1])) is True
+        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
+            with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                marker(torch.ones((), device="meta"))
+            with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                marker(torch.ones(3, device="meta"))
 
-    def test_marker_device_tensor_rejected_without_sync(self):
-        # Markers are protocol metadata and must be CPU-native: a device
-        # tensor is rejected WITHOUT a D2H sync. Meta tensors hold no data,
-        # so any read (`.item()`/`bool()`) would raise -- these passing at
-        # all proves the marker's data is never touched.
-        marker = GPUARModelRunner._is_sparse_audio_marker
-        assert marker(torch.ones((), device="meta")) is False
-        assert marker(torch.ones(3, device="meta")) is False
+    def test_invalid_marker_fails_closed_at_routing(self):
+        # A present-but-invalid sparse declaration most likely belongs to a
+        # producer that INTENDED sparse output; falling back to dense would
+        # batch-index-assign its payloads to the WRONG requests. Routing
+        # must fail closed: no payload routed for the step (empty sparse
+        # set), never dense misrouting.
+        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
+            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+                engine_output_type="audio",
+                req_ids_output_copy=["r0", "r1"],
+                downstream_req_ids=["r0", "r1"],
+                multimodal_outputs={
+                    "meta": {"req_id": ["r0"], "sparse_audio": torch.tensor([1, 1])},
+                    "model_outputs": [torch.zeros(1)],
+                },
+            )
+        assert downstream == []
+        assert index == {}
+        assert is_sparse is True
+
+    def test_sparse_marker_with_unusable_req_ids_fails_closed(self):
+        # The marker says "sparse" but the alignment list is unusable - the
+        # declaration as a whole is out of contract; same fail-closed shape.
+        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
+            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+                engine_output_type="audio",
+                req_ids_output_copy=["r0"],
+                downstream_req_ids=["r0"],
+                multimodal_outputs={"meta": {"req_id": "r0", "sparse_audio": ["1"]}},
+            )
+        assert downstream == []
+        assert is_sparse is True
+
+    def test_nested_marker_without_req_id_fails_closed(self):
+        # {"meta": {"sparse_audio": ["1"]}} - marker set, req_id missing.
+        # The flattened-encoding fallback must not ERASE the nested marker
+        # (which used to silently demote the declaration to dense); this is
+        # an unusable-req_id invalid declaration -> fail closed.
+        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
+            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+                engine_output_type="audio",
+                req_ids_output_copy=["r0"],
+                downstream_req_ids=["r0"],
+                multimodal_outputs={"meta": {"sparse_audio": ["1"]}},
+            )
+        assert downstream == []
+        assert is_sparse is True
+
+    def test_invalid_marker_on_non_audio_pipeline_keeps_dense_routing(self):
+        # Non-audio pipelines never consult sparse routing; the carrier
+        # error is logged by the classifier but routing is unaffected.
+        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
+            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+                engine_output_type="latent",
+                req_ids_output_copy=["r0", "r1"],
+                downstream_req_ids=["r0", "r1"],
+                multimodal_outputs={"meta": {"req_id": ["r0"], "sparse_audio": torch.tensor([1, 1])}},
+            )
+        assert downstream == ["r0", "r1"]
+        assert is_sparse is False
+
+    def test_legal_marker_still_routes_sparse(self):
+        downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+            engine_output_type="audio",
+            req_ids_output_copy=["r0", "r1", "r2"],
+            downstream_req_ids=["r0", "r1", "r2"],
+            multimodal_outputs={"meta": {"req_id": ["r1", "r2"], "sparse_audio": ["1"]}},
+        )
+        assert downstream == ["r1", "r2"]
+        assert index == {"r1": 0, "r2": 1}
+        assert is_sparse is True
 
     def test_combined_payload_unwraps_aligned_list(self):
         combined = {"codes.audio": {"req-1": [torch.zeros(1), torch.ones(1)]}}
