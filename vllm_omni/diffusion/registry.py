@@ -418,7 +418,7 @@ def initialize_model(
         if is_distributed_vae:
             use_independent_vae_group = requires_independent_vae_process_group(
                 od_config.model_class_name,
-                od_config.num_gpus,
+                od_config.parallel_config.world_size,
                 vae_pp_size,
             )
             vae_group_context = override_dit_group(get_vae_group()) if use_independent_vae_group else nullcontext()

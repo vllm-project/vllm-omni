@@ -115,7 +115,7 @@ In `DiffusionParallelConfig`:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. It should typically match `tensor_parallel_size` for models that reuse the DiT group. For MiniMax-H3, it must evenly divide the diffusion world size. |
+| `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. It should typically match `tensor_parallel_size` for models that reuse the DiT group. For MiniMax-H3, it must not exceed and must evenly divide the DiT process-group size. |
 | `vae_parallel_mode` | str | `"tile"` | VAE parallel decode strategy: `"tile"` (default tile/patch parallel decode), `"spatial_shard_height"`, or `"spatial_shard_width"` (spatially-sharded decode, Wan only). See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
 
 Additional requirements:
@@ -150,7 +150,10 @@ vllm serve /path/to/MiniMax-H3/FL2VA \
 The following constraints are validated before distributed initialization:
 
 - `vae_patch_parallel_size` must be positive, no greater than the diffusion
-  world size, and evenly divide it.
+  world size or DiT process-group size, and evenly divide both. This keeps
+  every contiguous VAE subgroup inside one DiT rank partition.
+- The DiT process-group size must itself evenly divide the diffusion world
+  size.
 - Only `vae_parallel_mode=tile` is supported for MiniMax-H3. H3 spatial
   sharding remains unsupported.
 - Every rank creates every subgroup in the same order. Each rank then retains
@@ -262,8 +265,8 @@ if vae_pp_size > 1 and not is_distributed_vae:
 
 **Recommendation**: For models that reuse the DiT group, set
 `vae_patch_parallel_size` no greater than the DiT process group size. For
-MiniMax-H3, choose a tile-mode size that evenly divides the diffusion world
-size; it uses an independent group.
+MiniMax-H3, choose a tile-mode size that does not exceed and evenly divides the
+DiT process-group size; a smaller size uses an independent group.
 
 Note that the size of DiT process group size equals to:
 ```text

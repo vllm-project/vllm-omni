@@ -775,7 +775,7 @@ class OmniServeCommand(CLISubcommand):
             default=1,
             help="VAE Patch Parallelism degree for diffusion models. "
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
-            "For MiniMax-H3, values greater than one must evenly divide the diffusion world size and use "
+            "For MiniMax-H3, values greater than one must evenly divide the DiT process-group size and use "
             "a deterministic VAE process group independent from the DiT group. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )

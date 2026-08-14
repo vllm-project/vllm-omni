@@ -276,12 +276,13 @@ class DiffusionWorker:
             # Composition errors must fail before any collective or model load.
             validate_independent_vae_parallel_config(
                 world_size,
+                parallel_config.world_size,
                 parallel_config.vae_patch_parallel_size,
                 parallel_config.vae_parallel_mode,
             )
         use_independent_vae_group = requires_independent_vae_process_group(
             self.od_config.model_class_name,
-            world_size,
+            parallel_config.world_size,
             parallel_config.vae_patch_parallel_size,
         )
 

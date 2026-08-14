@@ -22,7 +22,7 @@ def test_independent_group_capability_is_limited_to_h3_adapters():
     assert not supports_independent_vae_process_group("WanPipeline")
 
 
-def test_h3_requires_dedicated_group_only_when_smaller_than_world():
+def test_h3_requires_dedicated_group_only_when_smaller_than_dit_group():
     assert not requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 1)
     assert requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 2)
     assert not requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 4)
@@ -31,7 +31,25 @@ def test_h3_requires_dedicated_group_only_when_smaller_than_world():
 
 def test_independent_h3_group_rejects_spatial_sharding():
     with pytest.raises(ValueError, match="tile mode only"):
-        validate_independent_vae_parallel_config(4, 2, "spatial_shard_height")
+        validate_independent_vae_parallel_config(4, 4, 2, "spatial_shard_height")
+
+
+def test_independent_group_accepts_subgroup_within_dit_partition():
+    validate_independent_vae_parallel_config(8, 4, 2, "tile")
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dit_group_size", "group_size", "message"),
+    [
+        (8, 9, 2, "DiT process group size"),
+        (8, 6, 2, "evenly divide diffusion"),
+        (8, 4, 8, "cannot exceed DiT"),
+        (12, 6, 4, "evenly divide DiT"),
+    ],
+)
+def test_independent_group_rejects_invalid_dit_composition(world_size, dit_group_size, group_size, message):
+    with pytest.raises(ValueError, match=message):
+        validate_independent_vae_parallel_config(world_size, dit_group_size, group_size, "tile")
 
 
 @pytest.mark.parametrize(
