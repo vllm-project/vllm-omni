@@ -22,10 +22,12 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    _validate_stage_overrides,
     coerce_param_message_types,
     filter_dataclass_kwargs,
     filter_stages,
     load_and_resolve_stage_configs,
+    load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
@@ -370,6 +372,58 @@ class TestResolveModelConfigPath:
         assert sender["extra"]["connector_get_sleep_s"] == 0.01
         assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert sender["extra"]["connector_get_max_wait"] == 300
+
+
+class TestValidateStageOverrides:
+    """Shape validation for the ``--stage-overrides`` JSON payload."""
+
+    def test_none_and_empty_are_noops(self):
+        # No payload / empty payload must not raise.
+        _validate_stage_overrides(None)
+        _validate_stage_overrides({})
+
+    def test_well_formed_payload_passes(self):
+        _validate_stage_overrides({"0": {"gpu_memory_utilization": 0.8}})
+        # Integer stage ids (programmatic callers) are accepted too.
+        _validate_stage_overrides({0: {"enforce_eager": True}, 2: {}})
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [1, 2],  # top-level list
+            5,  # top-level scalar
+            "hello",  # top-level string
+        ],
+    )
+    def test_non_object_top_level_raises(self, payload):
+        with pytest.raises(ValueError, match="--stage-overrides"):
+            _validate_stage_overrides(payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"0": 5},  # stage value is a scalar
+            {"0": [1, 2]},  # stage value is a list
+            {"0": "eager"},  # stage value is a string
+        ],
+    )
+    def test_non_dict_stage_value_raises(self, payload):
+        with pytest.raises(ValueError, match="--stage-overrides"):
+            _validate_stage_overrides(payload)
+
+    @pytest.mark.parametrize("bad_key", ["abc", "stage0", "0.5", "-1", True])
+    def test_non_integer_stage_id_raises(self, bad_key):
+        # A non-numeric stage id is silently dropped downstream (the parser only
+        # matches ``stage_<digits>_*``); reject it up-front instead.
+        with pytest.raises(ValueError, match="stage id"):
+            _validate_stage_overrides({bad_key: {"k": 1}})
+
+    def test_loader_rejects_malformed_overrides_before_model_load(self):
+        # The validator runs at the top of load_stage_configs_from_model, so a
+        # malformed payload fails fast with a clear error rather than a cryptic
+        # AttributeError raised deep in config loading.
+        with pytest.raises(ValueError, match="--stage-overrides"):
+            load_stage_configs_from_model("any-model", stage_overrides=[1, 2])
 
 
 class TestLoadAndResolveStageConfigs:

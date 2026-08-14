@@ -347,6 +347,50 @@ def resolve_model_config_path(model: str) -> str | None:
     return _registry_default_deploy_path(model)
 
 
+def _validate_stage_overrides(stage_overrides: Any) -> None:
+    """Validate the shape of ``--stage-overrides`` before it is consumed.
+
+    ``--stage-overrides`` is documented as a JSON object mapping each
+    ``stage_id`` to a dict of per-stage overrides, e.g.
+    ``{"0": {"gpu_memory_utilization": 0.8}}``. The engine only checks that the
+    value is valid JSON, so a syntactically-valid but malformed payload (a list,
+    a scalar, or a ``stage_id -> scalar`` mapping) would otherwise blow up deep in
+    config loading with a bare ``AttributeError`` that names neither the flag nor
+    the offending value. Stage ids must be integers: the downstream parser
+    (``_STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\\d+)_(.+)$")`` in
+    ``config/stage_config.py``) only matches numeric stage ids, so a non-numeric
+    key would be silently dropped rather than applied.
+
+    Raises:
+        ValueError: if ``stage_overrides`` is not a ``stage_id -> {param: value}``
+            mapping with integer stage ids.
+    """
+    if not stage_overrides:
+        return
+
+    example = '{"0": {"gpu_memory_utilization": 0.8}}'
+    if not isinstance(stage_overrides, dict):
+        raise ValueError(
+            "--stage-overrides must be a JSON object mapping stage_id -> "
+            f"{{param: value}}, e.g. '{example}'; got "
+            f"{type(stage_overrides).__name__}."
+        )
+
+    for stage_id, overrides in stage_overrides.items():
+        if isinstance(stage_id, bool) or not (
+            isinstance(stage_id, int) or (isinstance(stage_id, str) and stage_id.isdigit())
+        ):
+            raise ValueError(
+                f'--stage-overrides keys must be integer stage ids (e.g. "0"), got invalid stage id {stage_id!r}.'
+            )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"--stage-overrides[{stage_id!r}] must be a JSON object of "
+                f"{{param: value}}, e.g. '{example}'; got "
+                f"{type(overrides).__name__}."
+            )
+
+
 def load_stage_configs_from_model(
     model: str,
     *,
@@ -382,6 +426,8 @@ def load_stage_configs_from_model(
     """
     if base_engine_args is None:
         base_engine_args = {}
+
+    _validate_stage_overrides(stage_overrides)
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
     # A False inherited from the engine-args dump is the store_true flag's
