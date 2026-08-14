@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _MODULE_PATH = Path(__file__).parents[4] / "vllm_omni/diffusion/models/lingbot_world/transformer.py"
 _MODULE_NAME = "_lingbot_world_attention_under_test"
+_MISSING_MODULE = object()
 _STUBBED_MODULE_NAMES = (
     "vllm",
     "vllm.distributed",
@@ -46,18 +47,6 @@ _STUBBED_MODULE_NAMES = (
 def _inference_context():
     with torch.inference_mode():
         yield
-
-
-@pytest.fixture(autouse=True)
-def _restore_stubbed_modules():
-    previous = {name: sys.modules.get(name) for name in _STUBBED_MODULE_NAMES}
-    yield
-    sys.modules.pop(_MODULE_NAME, None)
-    for name, module in previous.items():
-        if module is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = module
 
 
 def _install_vllm_stubs() -> None:
@@ -212,13 +201,32 @@ def _install_vllm_stubs() -> None:
 
 def _load_module():
     assert _MODULE_PATH.exists(), "LingBot attention module has not been implemented"
-    _install_vllm_stubs()
-    spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    module_names = (*_STUBBED_MODULE_NAMES, _MODULE_NAME)
+    previous = {name: sys.modules.get(name, _MISSING_MODULE) for name in module_names}
+    try:
+        _install_vllm_stubs()
+        spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in previous.items():
+            if original is _MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+def test_load_module_restores_process_module_state() -> None:
+    module_names = (*_STUBBED_MODULE_NAMES, _MODULE_NAME)
+    previous = {name: sys.modules.get(name, _MISSING_MODULE) for name in module_names}
+
+    _load_module()
+
+    for name, original in previous.items():
+        assert sys.modules.get(name, _MISSING_MODULE) is original
 
 
 def test_allocate_lingbot_cache_creates_request_local_layer_storage() -> None:

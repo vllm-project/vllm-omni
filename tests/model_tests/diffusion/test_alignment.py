@@ -62,6 +62,9 @@ EXCLUDED_MODELS = [
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated contract tests and real-checkpoint E2E smoke instead.
+    "LingBotWorldCausalDMDPipeline",
     "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
