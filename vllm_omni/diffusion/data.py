@@ -8,7 +8,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import diffusers
 import huggingface_hub
@@ -713,10 +713,6 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
-    vae_optimization_profile: Literal["safe", "optimized", "diagnostic", "student"] = "safe"
-    vae_stack_tiling: Literal["auto", "true", "false"] | None = None
-    vae_compile: Literal["auto", "true", "false"] | None = None
-    vae_compile_max_shape_buckets: int = 4
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

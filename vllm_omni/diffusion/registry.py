@@ -14,15 +14,13 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.parallel_state import override_dit_group
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
-from vllm_omni.diffusion.distributed.vae_parallel_state import get_vae_group
+from vllm_omni.diffusion.distributed.vae_parallel_state import (
+    get_vae_group,
+    requires_independent_vae_process_group,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
-from vllm_omni.diffusion.vae_optimization import (
-    configure_vae_runtime,
-    prepare_vae_optimization_config,
-    supports_independent_vae_process_group,
-)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -336,6 +334,7 @@ _DIFFUSION_MODELS = {
     ),
 }
 
+
 DiffusionModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
@@ -377,7 +376,7 @@ def initialize_model(
     This function:
     1. Loads the model class from the registry
     2. Instantiates the model with the config
-    3. Configures VAE optimization settings
+    3. Configures VAE parallelism and memory options
     4. Applies sequence parallelism if enabled (similar to diffusers' enable_parallelism)
 
     Args:
@@ -391,7 +390,6 @@ def initialize_model(
     """
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
-        prepare_vae_optimization_config(od_config)
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):
             model = model_class(od_config=od_config)
@@ -418,14 +416,14 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
-            use_independent_vae_group = vae_pp_size > 1 and supports_independent_vae_process_group(
-                od_config.model_class_name
+            use_independent_vae_group = requires_independent_vae_process_group(
+                od_config.model_class_name,
+                od_config.num_gpus,
+                vae_pp_size,
             )
             vae_group_context = override_dit_group(get_vae_group()) if use_independent_vae_group else nullcontext()
             with vae_group_context:
                 model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
-
-        configure_vae_runtime(model, od_config)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called

@@ -49,7 +49,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.vae_parallel_state import (
     initialize_vae_parallel_group,
-    validate_vae_parallel_group_size,
+    requires_independent_vae_process_group,
+    supports_independent_vae_process_group,
+    validate_independent_vae_parallel_config,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
@@ -57,10 +59,6 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
-from vllm_omni.diffusion.vae_optimization import (
-    resolve_vae_optimization,
-    supports_independent_vae_process_group,
-)
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -273,12 +271,19 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
         parallel_config = self.od_config.parallel_config
-        # Capability and composition errors must fail before any collective or
-        # model-weight load. Every rank resolves the same immutable contract.
-        resolve_vae_optimization(self.od_config)
-        use_independent_vae_group = supports_independent_vae_process_group(self.od_config.model_class_name)
-        if use_independent_vae_group:
-            validate_vae_parallel_group_size(world_size, parallel_config.vae_patch_parallel_size)
+        supports_independent_vae_group = supports_independent_vae_process_group(self.od_config.model_class_name)
+        if supports_independent_vae_group:
+            # Composition errors must fail before any collective or model load.
+            validate_independent_vae_parallel_config(
+                world_size,
+                parallel_config.vae_patch_parallel_size,
+                parallel_config.vae_parallel_mode,
+            )
+        use_independent_vae_group = requires_independent_vae_process_group(
+            self.od_config.model_class_name,
+            world_size,
+            parallel_config.vae_patch_parallel_size,
+        )
 
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
@@ -344,7 +349,7 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
-            if use_independent_vae_group and parallel_config.vae_patch_parallel_size > 1:
+            if use_independent_vae_group:
                 initialize_vae_parallel_group(parallel_config.vae_patch_parallel_size)
             init_workspace_manager(self.device)
 

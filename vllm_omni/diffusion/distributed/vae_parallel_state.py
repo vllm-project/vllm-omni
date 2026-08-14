@@ -5,14 +5,26 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch.distributed as dist
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _VAE_GROUP: dist.ProcessGroup | None = None
 _VAE_GROUP_RANKS: list[int] | None = None
+_INDEPENDENT_VAE_GROUP_MODELS = frozenset({"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
+
+
+def supports_independent_vae_process_group(model_class_name: str) -> bool:
+    """Return whether a pipeline can bind its VAE after construction."""
+
+    return model_class_name in _INDEPENDENT_VAE_GROUP_MODELS
+
+
+def requires_independent_vae_process_group(model_class_name: str, world_size: int, group_size: int) -> bool:
+    """Return whether a smaller dedicated group is required."""
+
+    return supports_independent_vae_process_group(model_class_name) and 1 < group_size < world_size
 
 
 def validate_vae_parallel_group_size(world_size: int, group_size: int) -> None:
@@ -27,6 +39,14 @@ def validate_vae_parallel_group_size(world_size: int, group_size: int) -> None:
         raise ValueError(
             f"vae_patch_parallel_size ({group_size}) must evenly divide diffusion world_size ({world_size})"
         )
+
+
+def validate_independent_vae_parallel_config(world_size: int, group_size: int, mode: str) -> None:
+    """Validate the MiniMax-H3 subgroup contract before collectives start."""
+
+    validate_vae_parallel_group_size(world_size, group_size)
+    if mode != "tile":
+        raise ValueError(f"independent MiniMax-H3 VAE process groups support tile mode only, got {mode!r}")
 
 
 def generate_contiguous_rank_groups(world_size: int, group_size: int) -> list[list[int]]:

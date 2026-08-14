@@ -583,10 +583,6 @@ class _DiffusionConfigProjection:
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
-    vae_optimization_profile: Literal["safe", "optimized", "diagnostic", "student"] = "safe"
-    vae_stack_tiling: Literal["auto", "true", "false"] | None = None
-    vae_compile: Literal["auto", "true", "false"] | None = None
-    vae_compile_max_shape_buckets: int = Field(default=4, ge=1)
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0

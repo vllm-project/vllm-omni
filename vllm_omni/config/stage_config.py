@@ -367,10 +367,6 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
-    vae_optimization_profile: str | None = None
-    vae_stack_tiling: str | None = None
-    vae_compile: str | None = None
-    vae_compile_max_shape_buckets: int | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
