@@ -39,6 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
@@ -206,6 +208,38 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
             raise ValueError(f"unexpected QKV shard id {loaded_shard_id!r}")
 
 
+# A fused weight is filled from several checkpoint tensors, so a partial load leaves
+# uninitialized `torch.empty` rows that no later check would catch. Keyed by the class
+# owning the multi-shard `weight_loader`; each entry is the source name reported to the
+# user paired with the shard id that loader expects, in projection order.
+_FUSED_SOURCE_SHARDS: dict[type[nn.Module], tuple[tuple[str, str | int], ...]] = {
+    MiniMaxH3Qwen3VLQKVParallelLinear: (("q", "q"), ("k", "k"), ("v", "v")),
+    MiniMaxH3Qwen3VLMergedColumnParallelLinear: (("gate", 0), ("up", 1)),
+}
+
+
+def _fused_source_shards(module: nn.Module) -> tuple[tuple[str, str | int], ...] | None:
+    for cls, sources in _FUSED_SOURCE_SHARDS.items():
+        if isinstance(module, cls):
+            return sources
+    return None
+
+
+def _verify_fused_shards_complete(
+    expected: dict[str, tuple[tuple[str, str | int], ...]],
+    loaded: dict[str, set[str | int]],
+) -> None:
+    missing = {
+        name: [source for source, shard_id in sources if shard_id not in loaded[name]]
+        for name, sources in expected.items()
+    }
+    missing = {name: sources for name, sources in missing.items() if sources}
+    if not missing:
+        return
+    details = "; ".join(f"{name}: {sources}" for name, sources in sorted(missing.items()))
+    raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
+
+
 class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
     def __init__(
         self,
@@ -259,18 +293,22 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class MiniMaxH3Qwen3VLRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
+    """Qwen3-VL RMSNorm using the common implementation.
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    The model-specific name keeps checkpoint weight keys stable, while the
+    common RMSNorm dispatches to torch_npu.npu_rms_norm on Ascend. Gamma uses
+    the checkpoint/model dtype, but native fallbacks keep the RMS variance
+    reduction and scaling in float32.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__(hidden_size, eps=eps, dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -653,8 +691,8 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             dtype=dtype,
             input_is_parallel=True,
         )
-        self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(
         self,
@@ -728,8 +766,10 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
         self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
-        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
 
     def forward(
         self,
@@ -952,7 +992,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def tp_size(self) -> int:
         return self._tp_size
 
-    def _map_weight_name(self, name: str) -> tuple[str, str | None] | None:
+    def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
         if name == "lm_head.weight" or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
@@ -1004,6 +1044,15 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         files = sorted(set(weight_map.values()))
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        # Seeded from the modules that own a multi-shard loader, so a fused weight
+        # that receives no source shard at all is caught too, not only a partially
+        # filled one.
+        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
+            f"{module_name}.weight": sources
+            for module_name, module in self.named_modules()
+            if (sources := _fused_source_shards(module)) is not None
+        }
+        loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for shard in files:
             tensors = safetensors.torch.load_file(os.path.join(model_path, shard), device="cpu")
             for name, tensor in tensors.items():
@@ -1018,13 +1067,13 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
                 weight_loader(param, tensor, shard_id)
                 loaded.add(param_name)
+                if shard_id is not None and param_name in loaded_fused_shards:
+                    loaded_fused_shards[param_name].add(shard_id)
+        _verify_fused_shards_complete(expected_fused_shards, loaded_fused_shards)
         missing = sorted(set(params) - loaded)
         if missing:
-            logger.warning(
-                "MiniMax H3 text encoder weights not loaded (retained-layer subset): %d params, e.g. %s",
-                len(missing),
-                missing[:5],
-            )
+            # Listed in full: this aborts startup, so the message is the only diagnostic.
+            raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
 
     def load_to_device(self) -> None:
         if not self.is_loaded:

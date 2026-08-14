@@ -428,7 +428,7 @@ class TestSingleStageModeDetection:
         assert engine.single_stage_mode is False
         assert engine._single_stage_id_filter is None
 
-    def test_stage_configs_path_loads_duplex_runtime_config(self, mocker: MockerFixture):
+    def test_deploy_config_loads_duplex_runtime_config(self, mocker: MockerFixture):
         duplex_session = DuplexSessionRuntimeConfig(max_sessions=2)
         get_pipeline_config = mocker.patch(
             "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
@@ -441,7 +441,7 @@ class TestSingleStageModeDetection:
 
         engine = self._make_engine_no_thread(
             mocker,
-            stage_configs_path="/fake/duplex.yaml",
+            deploy_config="/fake/duplex.yaml",
         )
 
         get_pipeline_config.assert_called_once_with(

@@ -200,6 +200,8 @@ class OmniOpenAIServingVideo:
 
         if "num_inference_steps" in provided_fields and request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
+        if "quality" in provided_fields:
+            gen_params.quality = request.quality
         if "guidance_scale" in provided_fields and request.guidance_scale is not None:
             gen_params.guidance_scale = request.guidance_scale
         if "guidance_scale_2" in provided_fields and request.guidance_scale_2 is not None:
@@ -503,16 +505,6 @@ class OmniOpenAIServingVideo:
         videos = None
         if hasattr(result, "images") and result.images:
             videos = result.images
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
-                videos = request_output["images"]
-            elif hasattr(request_output, "images") and request_output.images:
-                videos = request_output.images
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    videos = request_multimodal_output.get("video")
         if videos is None:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
@@ -532,16 +524,6 @@ class OmniOpenAIServingVideo:
         multimodal_output = getattr(result, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             audio = multimodal_output.get("audio")
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("multimodal_output"):
-                mm_output = request_output.get("multimodal_output") or {}
-                if isinstance(mm_output, Mapping):
-                    audio = mm_output.get("audio")
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    audio = request_multimodal_output.get("audio")
 
         if audio is None:
             return [None] * expected_count
@@ -597,7 +579,7 @@ class OmniOpenAIServingVideo:
         if isinstance(multimodal_output, Mapping):
             return dict(multimodal_output)
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output")
             if multimodal_output is None:
@@ -714,7 +696,7 @@ class OmniOpenAIServingVideo:
                 except (TypeError, ValueError):
                     pass
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             mm = request_output.get("multimodal_output") or {}
             if isinstance(mm, Mapping):
@@ -753,7 +735,7 @@ class OmniOpenAIServingVideo:
             if sample_rate is not None:
                 return sample_rate
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output") or {}
             if isinstance(multimodal_output, Mapping):

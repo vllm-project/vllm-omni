@@ -24,6 +24,23 @@ SERVING_MODE_TITLES = {
     "online_serving": "Online serving",
 }
 
+# Keep the Examples navigation focused on reusable modality/task entry points.
+# Model-specific scripts remain available under ``examples/`` and are surfaced
+# from these shared pages instead of getting one page per model.
+GENERAL_EXAMPLE_SLUGS = frozenset(
+    {
+        "image_to_image",
+        "image_to_video",
+        "speech_to_video",
+        "text_to_audio",
+        "text_to_image",
+        "text_to_speech",
+        "text_to_video",
+        "x_to_text",
+        "x_to_video_audio",
+    }
+)
+
 
 def load_model_display_names() -> dict[str, str]:
     try:
@@ -44,6 +61,13 @@ def load_model_display_names() -> dict[str, str]:
 
 
 MODEL_DISPLAY_NAMES = load_model_display_names()
+
+
+def is_general_example(example: "Example") -> bool:
+    """Return whether an example should get a generated serving page."""
+    if example.category not in SERVING_MODE_TITLES:
+        return True
+    return example.path.stem in GENERAL_EXAMPLE_SLUGS
 
 
 def fix_case(text: str) -> str:
@@ -340,22 +364,21 @@ def update_nav_file(examples: list[Example]):
             examples_by_category[category] = []
         examples_by_category[category].append(example)
 
-    # Build the new Examples section - start with preserved items
-    examples_section = preserved_items.copy()
-
-    # Add examples grouped by category, sorted by category name
-    for category in sorted(examples_by_category.keys()):
-        category_examples = sorted(examples_by_category[category], key=lambda e: e.path.stem)
-        category_items = []
-        for example in category_examples:
+    def category_items(category: str) -> list[dict[str, str]]:
+        items = []
+        for example in sorted(examples_by_category[category], key=lambda e: e.path.stem):
             doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
             rel_path = doc_path.relative_to(ROOT_DIR / "docs")
-            category_items.append({example.nav_title: rel_path.as_posix()})
+            items.append({example.nav_title: rel_path.as_posix()})
+        return items
 
-        if category_items:
-            # Format category name (e.g., "offline_inference" -> "Offline Inference")
+    # Build the new Examples section - start with preserved items.
+    examples_section = preserved_items.copy()
+    for category in sorted(examples_by_category.keys()):
+        items = category_items(category)
+        if items:
             category_title = fix_case(category.replace("_", " ").title())
-            examples_section.append({category_title: category_items})
+            examples_section.append({category_title: items})
 
     # Update the nav structure
     nav_list[user_guide_idx]["User Guide"][examples_idx]["Examples"] = examples_section
@@ -389,6 +412,8 @@ def on_startup(command: Literal["build", "gh-deploy", "serve"], dirty: bool):
         # Find examples in subdirectories
         for path in category.glob("*/*.md"):
             examples.append(Example(path.parent, category.stem))
+
+    examples = [example for example in examples if is_general_example(example)]
 
     # Generate the example documentation
     for example in sorted(examples, key=lambda e: e.path.stem):

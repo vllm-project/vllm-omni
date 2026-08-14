@@ -1,5 +1,5 @@
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.26.0-a3
+ARG VLLM_ASCEND_TAG=v0.27.0-a3
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
@@ -46,6 +46,7 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "onnx>=1.16.0" \
       "librosa>=0.10.0" \
       "torchmetrics>=1.9.0" \
+      "datasets>=3.0.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \

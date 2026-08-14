@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -16,14 +17,29 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from minicpmo_realtime_duplex_scenarios import (  # noqa: E402
-    _ref_audio_data_url,
-    _url_with_model,
-    run_demo,
-)
+
+@lru_cache(maxsize=1)
+def _scenario_module():
+    """Delay heavyweight vLLM imports so ``--help`` remains directly executable."""
+    from tests.e2e.online_serving.helpers import minicpmo_realtime_duplex_scenarios
+
+    return minicpmo_realtime_duplex_scenarios
+
+
+def _ref_audio_data_url(path: str) -> str:
+    return _scenario_module()._ref_audio_data_url(path)
+
+
+def _url_with_model(*args, **kwargs) -> str:
+    return _scenario_module()._url_with_model(*args, **kwargs)
+
+
+async def run_demo(args):
+    return await _scenario_module().run_demo(args)
 
 
 def _with_resume_mode(url: str) -> str:

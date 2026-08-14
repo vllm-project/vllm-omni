@@ -129,6 +129,9 @@ class OmniModelConfig(ModelConfig):
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder applied
+    # worker-side before IPC. Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -177,6 +180,14 @@ class OmniModelConfig(ModelConfig):
             if override is not None:
                 return override
         return super().embedding_size
+
+    def get_inputs_embeds_size(self) -> int:
+        if self.hf_config_name is not None:
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            override = getattr(stage_config, "embedding_size", None)
+            if override is not None:
+                return override
+        return super().get_inputs_embeds_size()
 
     def get_model_arch_config(self):
         # For multi-stage omni models, use a stage-aware convertor so that

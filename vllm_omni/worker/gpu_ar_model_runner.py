@@ -46,7 +46,12 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     stage_sends_async_output,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    partition_payload_list,
+    snapshot_mm_payload,
+    to_payload_element,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
@@ -303,7 +308,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        # The width of embeddings received by this stage. It can differ from
+        # the stage's internal hidden size (e.g., Qwen2.5-Omni Talker receives
+        # 3584-wide Thinker states and projects them to a 896-wide hidden state).
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens,
+            self.inputs_embeds_size,
+            dtype=self.dtype,
+            numpy=False,
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
@@ -325,6 +339,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "NemotronHForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
+            # nemotron_voicechat: the talker (stage 1) is the full-payload
+            # producer for code2wav (stage 2); the thinker (stage 0) only
+            # produces over the connector in async-chunk (streaming) mode.
+            "NemotronVoiceChatTalkerForConditionalGeneration",
+            "NemotronVoiceChatThinkerForConditionalGeneration",
         }
         # The stage-level ``model_arch`` override may be blank so the class
         # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
@@ -1346,7 +1365,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            # A pooling stage skips mm extraction + the omni prefix cache (both assume an AR
+            # [n_tok, hidden] output) and exits through the shared _pool() branch below.
+            if self.is_pooling_model:
+                multimodal_outputs = None
+            else:
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
@@ -1355,7 +1379,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # the actual CPU scatter into ``hidden_states_cache`` /
             # ``mm_outputs_cache`` happens in ``drain_ready_async_writes``
             # at the top of subsequent execute_model() calls.
-            if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+            if not self.is_pooling_model and self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
                 hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
                 # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
                 # prefix caching but the downstream pooler payload path still
@@ -1706,6 +1730,35 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
 
+    def _should_defer_full_payload_d2h(self) -> bool:
+        """Keep opted-in full payloads on device until request completion."""
+        return (
+            getattr(self, "omni_prefix_cache", None) is None
+            and self._runner_model_omni_flag("omni_payload_at_request_end")
+            and self._should_accumulate_full_payload_output()
+        )
+
+    def _build_omni_step_outputs(
+        self,
+        pooler_inter: list[dict[str, object]],
+        pooler_client: list[dict[str, object]],
+        *,
+        defer_full_payload_d2h: bool,
+    ) -> tuple[
+        list[dict[str, torch.Tensor] | None] | None,
+        list[dict[str, torch.Tensor] | None] | None,
+    ]:
+        if defer_full_payload_d2h:
+            # The connector-side full-payload accumulator owns the snapshots.
+            # Nothing from an intermediate stage needs to cross the worker/core
+            # boundary on each decode step.
+            return None, None
+        inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
+        multimodal_outputs = (
+            inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+        )
+        return inter_stage_outputs, multimodal_outputs
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1870,6 +1923,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        defer_full_payload_d2h = needs_pooler_payload and self._should_defer_full_payload_d2h()
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
@@ -1924,10 +1978,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                 )
             if combined_multimodal_outputs is None:
-                with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
-                    mm_cpu = build_mm_cpu(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                    )
+                flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                if defer_full_payload_d2h:
+                    with record_function_or_nullcontext("omni_output_builder:snapshot_mm_payload"):
+                        mm_cpu = snapshot_mm_payload(flat_mm)
+                else:
+                    with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
+                        mm_cpu = build_mm_cpu(flat_mm)
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
                 if not postprocess_already_applied:
@@ -1986,9 +2043,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
-            inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-            multimodal_outputs = (
-                inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
+                pooler_inter,
+                pooler_client,
+                defer_full_payload_d2h=defer_full_payload_d2h,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):

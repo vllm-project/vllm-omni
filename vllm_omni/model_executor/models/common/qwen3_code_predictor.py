@@ -571,7 +571,10 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
 
-        if not current_omni_platform.supports_torch_inductor():
+        # Torch 2.13 XPU Dynamo can double-register built-in handlers when
+        # spawned workers compile this predictor. Keep this narrow path eager
+        # until the upstream XPU compiler issue is resolved.
+        if current_omni_platform.is_xpu() or not current_omni_platform.supports_torch_inductor():
             # NPU or other platforms without Inductor support
             self._compiled_model_fwd = self.model.forward
 

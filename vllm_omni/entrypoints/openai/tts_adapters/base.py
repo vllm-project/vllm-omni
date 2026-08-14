@@ -99,10 +99,24 @@ class TTSModelAdapter(ABC):
 
     #: Stable discriminator string (the model-type from detection); registry key.
     name: ClassVar[str]
-    #: Engine ``model_stage`` key(s) this model uses, for documentation only.
+    #: Engine ``model_stage`` key(s) this model uses. Load-bearing: the serving
+    #: layer discovers the TTS stage and resolves the model type from these.
     stage_keys: ClassVar[frozenset[str]] = frozenset()
+    #: Engine ``model_arch`` value(s) that identify this model type. Checked
+    #: before ``stage_keys`` in :meth:`matches`. Only needed by models whose
+    #: ``model_stage`` alone is ambiguous or absent.
+    model_archs: ClassVar[frozenset[str]] = frozenset()
+    #: Set when the model has no dedicated ``model_stage`` value and its AR
+    #: entry stage must be discovered by ``model_archs`` instead (Ming dense).
+    arch_identifies_entry_stage: ClassVar[bool] = False
+    #: Detection order; lower runs first. Only set this to break a genuine
+    #: overlap with another adapter — see ``tests/.../test_tts_detection.py``,
+    #: which fails if two same-priority detectors can match the same input.
+    detect_priority: ClassVar[int] = 100
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Whether the model consumes ``request.speed`` in its native parameters.
+    native_speed_control: ClassVar[bool] = False
 
     max_new_tokens_min = 1
 
@@ -110,6 +124,31 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
+
+    @classmethod
+    def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
+        """Whether a deployed stage with this ``model_stage``/``model_arch``
+        is served by this adapter.
+
+        Architecture wins over stage key, so a model that declares both is
+        recognized even when deployed under a stage key it shares with another
+        model. Override only for match rules that are not a set membership
+        test (see ``covo_audio``).
+        """
+        if model_arch is not None and model_arch in cls.model_archs:
+            return True
+        return model_stage is not None and model_stage in cls.stage_keys
+
+    @classmethod
+    def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
+        """Whether a matched stage really accepts ``/v1/audio/speech`` in *this*
+        deployment.
+
+        Lets a model that is speech-capable only in some topologies say so
+        (Audex: its omni thinker is text-final unless the speech decoder is
+        deployed alongside). Default: always.
+        """
+        return True
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """In-place request normalization/mutation (e.g. infer task type,
@@ -189,10 +228,37 @@ class DiffusionTTSAdapter(TTSModelAdapter):
         return frozenset(params) if params is not None else frozenset()
 
 
+@dataclass(frozen=True)
+class LegacyDetector:
+    """A model type the serving layer detects but has no adapter for yet.
+
+    Detection has to keep naming these models so ``serving_speech.py`` can route
+    them down its legacy path, but they own none of the adapter contract. Each
+    entry is a migration debt: delete it when the model gets an adapter. The
+    pre-commit gate (``tools/pre_commit/check_tts_adapter.py``) fails if the list
+    grows.
+
+    Exposes the subset of the :class:`TTSModelAdapter` class surface that
+    detection reads, so both kinds live in one sorted sequence.
+    """
+
+    name: str
+    stage_keys: frozenset[str] = frozenset()
+    model_archs: frozenset[str] = frozenset()
+    arch_identifies_entry_stage: bool = False
+    detect_priority: int = 100
+
+    def matches(self, model_stage: str | None, model_arch: str | None) -> bool:
+        if model_arch is not None and model_arch in self.model_archs:
+            return True
+        return model_stage is not None and model_stage in self.stage_keys
+
+
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "LegacyDetector",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

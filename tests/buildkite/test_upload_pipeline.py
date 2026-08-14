@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
@@ -139,3 +140,48 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
         {"name": "swr-secret"},
     ]
+
+
+COVERAGE_PILOT_LABELS = ("Diffusion · Bagel Test", "TTS · Qwen3-TTS Base Test")
+MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
+
+
+def _surviving_labels(changed_files: list[str]) -> set[str]:
+    doc = yaml.safe_load(MERGE_PIPELINE.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=changed_files)
+    labels: set[str] = set()
+
+    def walk(steps: list | None) -> None:
+        for step in steps or []:
+            if not isinstance(step, dict):
+                continue
+            if "label" in step:
+                labels.add(step["label"])
+            walk(step.get("steps"))
+
+    walk(rendered.get("steps"))
+    return labels
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        ".buildkite/common/scripts/run_cov_split.sh",
+        "pyproject.toml",
+    ],
+)
+def test_coverage_pilots_selected_by_their_shared_inputs(changed_file: str) -> None:
+    """The split helper and the coverage config both change what these jobs measure.
+
+    Without them in source_file_dependencies the jobs are filtered out of normal
+    PR builds, so a regression would only surface in a later nightly.
+    """
+    labels = _surviving_labels([changed_file])
+    for pilot in COVERAGE_PILOT_LABELS:
+        assert pilot in labels, f"{pilot} dropped when {changed_file} changed"
+
+
+def test_coverage_pilots_not_selected_by_unrelated_change() -> None:
+    labels = _surviving_labels(["vllm_omni/entrypoints/openai/serving_chat.py"])
+    for pilot in COVERAGE_PILOT_LABELS:
+        assert pilot not in labels
