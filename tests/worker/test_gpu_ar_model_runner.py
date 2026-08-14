@@ -17,14 +17,14 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import sparse_audio
-from vllm_omni.worker.output import payload_build
-from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
 )
+from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
+from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1284,7 +1284,7 @@ class TestSparseAudioMarkerRobustness:
 
     def test_marker_illegal_carriers_raise_one_error_per_type(self):
         # Enforcement, not normalization: any carrier outside the design
-        # contract is a producer bug - it raises InvalidSparseDeclaration
+        # contract is a producer bug - it raises InvalidSparseDeclarationError
         # (caught inside the module by resolve_sparse_mm_routing, which
         # fails closed)
         # and logs at error level once per offending type. Interpreting
@@ -1297,10 +1297,10 @@ class TestSparseAudioMarkerRobustness:
                 patch.object(sparse_audio, "_logged_offenders", set()),
                 patch.object(sparse_audio.logger, "error") as err,
             ):
-                with pytest.raises(sparse_audio.InvalidSparseDeclaration):
+                with pytest.raises(sparse_audio.InvalidSparseDeclarationError):
                     marker(value)
                 assert err.call_count == 1, f"expected one error for {value!r}"
-                with pytest.raises(sparse_audio.InvalidSparseDeclaration):
+                with pytest.raises(sparse_audio.InvalidSparseDeclarationError):
                     marker(value)
                 assert err.call_count == 1  # deduped per type, not per step
 
@@ -1311,9 +1311,9 @@ class TestSparseAudioMarkerRobustness:
         # exception type (not RuntimeError) proves the data is never touched.
         marker = sparse_audio.is_sparse_audio_marker
         with patch.object(sparse_audio, "_logged_offenders", set()):
-            with pytest.raises(sparse_audio.InvalidSparseDeclaration):
+            with pytest.raises(sparse_audio.InvalidSparseDeclarationError):
                 marker(torch.ones((), device="meta"))
-            with pytest.raises(sparse_audio.InvalidSparseDeclaration):
+            with pytest.raises(sparse_audio.InvalidSparseDeclarationError):
                 marker(torch.ones(3, device="meta"))
 
     def test_invalid_marker_fails_closed_at_routing(self):

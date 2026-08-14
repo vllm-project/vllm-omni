@@ -50,7 +50,6 @@ from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
     partition_payload_list,
     snapshot_mm_payload,
-    to_payload_element,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -495,7 +494,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if engine_output_type == "audio" and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
-
 
     def capture_model(self) -> int:
         result = super().capture_model()

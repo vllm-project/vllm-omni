@@ -22,7 +22,7 @@ tolerance shim.
 A present-but-invalid declaration (illegal marker carrier, or marker set
 with an unusable ``meta.req_id``) FAILS CLOSED: it most likely belongs to a
 producer that INTENDED sparse output, and falling back to dense would
-batch-index-assign its payloads to the WRONG requests. `InvalidSparseDeclaration`
+batch-index-assign its payloads to the WRONG requests. `InvalidSparseDeclarationError`
 is raised by the classifiers and caught INSIDE this module by
 `resolve_sparse_mm_routing`, which routes no payload for the affected step —
 the exception never crosses the module boundary, so it can never escape a
@@ -49,7 +49,7 @@ _SPARSE_MARKER_TRUTHY = ("1", "true", "yes", "on")
 _logged_offenders: set[str] = set()
 
 
-class InvalidSparseDeclaration(ValueError):
+class InvalidSparseDeclarationError(ValueError):
     """Sparse-audio metadata is PRESENT but out of contract.
 
     Internal control signal: raised by `is_sparse_audio_marker` /
@@ -73,7 +73,7 @@ def is_sparse_audio_marker(value: Any) -> bool:
     literal truthy set; ``None`` means "marker absent" and returns ``False``.
     An ILLEGAL carrier (tensors, arrays, numbers, lists with non-string
     items) is a producer bug: logged at error level once per offending type,
-    then raised as `InvalidSparseDeclaration`. Deviant carriers are never
+    then raised as `InvalidSparseDeclarationError`. Deviant carriers are never
     read element-wise, so a device tensor can never introduce a D2H sync
     here.
     """
@@ -90,7 +90,7 @@ def is_sparse_audio_marker(value: Any) -> bool:
         "The emitting model is out of contract; routing fails closed for the affected step(s).",
         vtype,
     )
-    raise InvalidSparseDeclaration(f"illegal sparse-audio marker carrier: {vtype}")
+    raise InvalidSparseDeclarationError(f"illegal sparse-audio marker carrier: {vtype}")
 
 
 def resolve_sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
@@ -98,7 +98,7 @@ def resolve_sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
 
     Returns the request-id list when a legal sparse declaration is present,
     and ``None`` when there is no sparse declaration (dense). Raises
-    `InvalidSparseDeclaration` when the declaration is present but out of
+    `InvalidSparseDeclarationError` when the declaration is present but out of
     contract (illegal marker carrier, or marker set with an unusable
     ``meta.req_id``).
     """
@@ -131,7 +131,7 @@ def resolve_sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
             "request-id strings). Failing closed.",
             rtype,
         )
-        raise InvalidSparseDeclaration(f"sparse marker set but meta.req_id is unusable: {rtype}")
+        raise InvalidSparseDeclarationError(f"sparse marker set but meta.req_id is unusable: {rtype}")
     return list(req_ids)
 
 
@@ -148,7 +148,7 @@ def resolve_sparse_mm_routing(
     """
     try:
         sparse_mm_req_ids = resolve_sparse_mm_req_ids(multimodal_outputs)
-    except InvalidSparseDeclaration:
+    except InvalidSparseDeclarationError:
         if engine_output_type != "audio":
             # Non-audio pipelines never consult sparse routing; the carrier
             # error is already logged by the classifier.
