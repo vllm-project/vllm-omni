@@ -1100,6 +1100,13 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_rejects_legacy_stage_args_schema(self, tmp_path):
+        deploy_path = tmp_path / "legacy.yaml"
+        deploy_path.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
+            load_deploy_config(deploy_path)
+
     def test_load_minicpmo_duplex_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5_duplex.yaml"))
 
