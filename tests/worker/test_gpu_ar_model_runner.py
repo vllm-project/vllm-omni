@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import sparse_audio
 from vllm_omni.worker.output import payload_build
+from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -1204,7 +1205,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
 
 
 class TestPromptIdsClampPaddingConvention:
-    """Pin `GPUARModelRunner._clamp_prompt_ids_to_penalty_padding` (the clamp
+    """Pin `sampling_utils.clamp_prompt_ids_to_penalty_padding` (the clamp
     `sample_tokens` applies before penalties).
 
     The audit (RFC #5450 C2) originally flagged the clamp as an off-by-one
@@ -1226,7 +1227,7 @@ class TestPromptIdsClampPaddingConvention:
         from vllm.model_executor.layers.utils import get_token_bin_counts_and_mask
 
         # The runner's own helper, not a re-implementation.
-        clamped = GPUARModelRunner._clamp_prompt_ids_to_penalty_padding(self._padded_prompt(), self.LOGITS_VOCAB)
+        clamped = clamp_prompt_ids_to_penalty_padding(self._padded_prompt(), self.LOGITS_VOCAB)
 
         _, mask = get_token_bin_counts_and_mask(clamped, self.LOGITS_VOCAB, 1)
 

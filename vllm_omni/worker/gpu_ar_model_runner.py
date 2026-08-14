@@ -56,7 +56,7 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
@@ -2007,20 +2007,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             output.routed_experts = routed_experts_lists
         return output
 
-    @staticmethod
-    def _clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:
-        """Clamp batch-level pad ids down to ``logits_vocab`` — upstream's
-        designed penalty padding value.
-
-        ``max=logits_vocab`` (NOT ``logits_vocab - 1``) is deliberate:
-        upstream penalty computation allocates ``vocab_size + 1`` bins and
-        drops the last column, so ``vocab_size`` is the padding value that
-        never affects penalties (vllm/model_executor/layers/utils.py::
-        get_token_bin_counts_and_mask). Clamping one lower would count
-        padding as real occurrences of the last vocab token.
-        """
-        return prompt_token_ids.clamp(max=logits_vocab)
-
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -2068,9 +2054,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if smd.prompt_token_ids is not None:
                 logits_vocab = logits.shape[-1]
                 if self.input_batch.vocab_size > logits_vocab:
-                    smd.prompt_token_ids = self._clamp_prompt_ids_to_penalty_padding(
-                        smd.prompt_token_ids, logits_vocab
-                    )
+                    smd.prompt_token_ids = clamp_prompt_ids_to_penalty_padding(smd.prompt_token_ids, logits_vocab)
 
         # Drop min-tokens stop ids the head cannot emit (e.g. the text
         # tokenizer EOS folded into all_stop_token_ids on a narrow codec
