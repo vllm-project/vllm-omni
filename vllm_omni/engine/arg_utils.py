@@ -167,9 +167,6 @@ class OmniEngineArgs(EngineArgs):
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
-        stage_configs_path: Optional path to a JSON/YAML file containing
-            stage configurations for the multi-stage pipeline. If None,
-            stage configs are resolved from the model's default configuration.
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
@@ -231,7 +228,6 @@ class OmniEngineArgs(EngineArgs):
     omni_dp_size_local: int = 1
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = 30.0
-    stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
@@ -490,7 +486,6 @@ class OrchestratorArgs:
     ray_address: str | None = None
 
     # === Config Files ===
-    stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
@@ -582,7 +577,6 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
-        "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
     }

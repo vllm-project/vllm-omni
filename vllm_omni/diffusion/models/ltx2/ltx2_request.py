@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -47,6 +48,34 @@ class LTXRequestInputs:
     def guidance_scale(self) -> float:
         """Compatibility view for callers that only understand video CFG."""
         return self.guidance.video.cfg_scale
+
+
+LTXCheckpointKind = Literal["distilled", "regular"]
+
+
+def validate_ltx_checkpoint(
+    scheduler_config: Mapping[str, Any],
+    *,
+    expected_kind: LTXCheckpointKind | None,
+    pipeline_name: str,
+) -> None:
+    """Ensure scheduler metadata matches the checkpoint required by a profile."""
+    if expected_kind is None:
+        return
+
+    if expected_kind == "distilled":
+        if scheduler_config.get("use_dynamic_shifting", True) or scheduler_config.get("shift_terminal") is not None:
+            raise ValueError(
+                f"{pipeline_name} requires a merged distilled LTX2 checkpoint; "
+                "the loaded scheduler metadata describes a non-distilled checkpoint."
+            )
+        return
+
+    if not scheduler_config.get("use_dynamic_shifting", False) or scheduler_config.get("shift_terminal") is None:
+        raise ValueError(
+            f"{pipeline_name} requires a regular non-distilled LTX checkpoint; "
+            "the loaded scheduler metadata describes a distilled checkpoint."
+        )
 
 
 def validate_pipeline_request(

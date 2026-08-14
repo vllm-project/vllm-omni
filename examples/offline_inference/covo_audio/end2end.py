@@ -59,7 +59,7 @@ def main(args):
 
     omni = Omni(
         model=args.model_name,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
@@ -167,10 +167,10 @@ def parse_args():
         help="Sampling rate for audio loading (default: 16000).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to stage configs YAML file.",
+        help="Path to a deploy config YAML file.",
     )
     parser.add_argument(
         "--log-stats",

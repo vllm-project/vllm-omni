@@ -2635,7 +2635,7 @@ class OmniRunner:
         # affects the test runner wrapper.
         init_timeout: int = 1800,
         log_stats: bool = False,
-        stage_configs_path: str | None = None,
+        deploy_config: str | None = None,
         **kwargs,
     ) -> None:
         startup_t0 = time.perf_counter()
@@ -2653,7 +2653,7 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            stage_configs_path=stage_configs_path,
+            deploy_config=deploy_config,
             **kwargs,
         )
         startup_s = time.perf_counter() - startup_t0
@@ -3179,12 +3179,7 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                from vllm_omni.entrypoints.utils import is_new_format_deploy_config
-
-                if is_new_format_deploy_config(stage_config_path):
-                    server_args += ["--deploy-config", stage_config_path]
-                else:
-                    server_args += ["--stage-configs-path", stage_config_path]
+                server_args += ["--deploy-config", stage_config_path]
 
             with (
                 OmniServer(
@@ -3237,7 +3232,7 @@ def iter_omni_runner(
         model = model_prefix + model
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
+        with OmniRunner(model, seed=42, deploy_config=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")

@@ -4,7 +4,6 @@ invariant to the specific attributes of vLLM config except in cases where we
 explicitly patch values that differ from vLLM.
 """
 
-import argparse
 import inspect
 import json
 import os
@@ -20,7 +19,6 @@ from vllm.engine.arg_utils import EngineArgs
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -147,19 +145,6 @@ def test_qwen3_tts_startup_task_type_is_validated():
             model_arch="Qwen3TTSTalkerForConditionalGenerationARVLLM",
             task_type="fl2va",
         )
-
-
-def test_from_cli_args_picks_up_stage_configs_path():
-    """from_cli_args should pick up stage_configs_path from namespace."""
-    ns = argparse.Namespace(
-        model="facebook/opt-125m",
-        stage_configs_path="/some/path.yaml",
-        custom_pipeline_args=None,
-    )
-
-    args = OmniEngineArgs.from_cli_args(ns)
-    assert args.stage_configs_path == "/some/path.yaml"
-    assert args.custom_pipeline_args is None
 
 
 def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
@@ -416,130 +401,6 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
         is None
     )
     assert omni_config.get_inputs_embeds_size() == omni_config.hf_text_config.hidden_size
-
-
-def test_stage_configs_path_field():
-    """OmniEngineArgs with stage_configs_path should construct without error."""
-    args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
-    assert args.stage_configs_path == "/some/path.yaml"
-
-
-def test_strip_single_engine_args():
-    """_strip_single_engine_args should remove EngineArgs fields but keep omni fields."""
-    kwargs = {
-        # Parent EngineArgs fields — stripped unless explicitly allowlisted
-        "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
-        "tensor_parallel_size": 4,
-        "gpu_memory_utilization": 0.9,
-        "model": "some/model",
-        # Parent field that should be kept (allowlisted)
-        "worker_extension_cls": "some.Extension",
-        # OmniEngineArgs-only / non-engine fields — should pass through
-        "stage_configs_path": "/path/to/yaml",
-        "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        "mode": "text-to-image",
-        "lora_path": "/some/lora",
-    }
-
-    filtered = AsyncOmniEngine._strip_single_engine_args(kwargs)
-
-    # Stripped — parent EngineArgs fields
-    assert "compilation_config" not in filtered
-    assert filtered["tensor_parallel_size"] == 4
-    assert "gpu_memory_utilization" not in filtered
-    assert "model" not in filtered
-
-    # Stripped — orchestrator-level OmniEngineArgs field
-    assert "stage_configs_path" not in filtered
-
-    # Kept
-    assert filtered["worker_extension_cls"] == "some.Extension"
-    assert filtered["custom_pipeline_args"] == {"pipeline_class": "my.Pipeline"}
-    assert filtered["mode"] == "text-to-image"
-    assert filtered["lora_path"] == "/some/lora"
-
-
-def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
-    """model is always in kwargs (callers set it via from_cli_args/asdict),
-    so it should not cause the override warning by itself or appear in it."""
-    mock_warn = mocker.patch("vllm_omni.engine.async_omni_engine.logger.warning")
-
-    # Typical caller kwargs: model is always present, no other parent
-    # EngineArgs fields are explicitly overridden.
-    AsyncOmniEngine._strip_single_engine_args(
-        {
-            "model": "some/model",
-            "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        }
-    )
-    mock_warn.assert_not_called()
-
-    # When there *are* genuinely surprising overrides alongside model,
-    # the warning should mention them but not model. Keep-listed fields such as
-    # tensor_parallel_size are intentionally passed through and should not warn.
-    AsyncOmniEngine._strip_single_engine_args(
-        {
-            "model": "some/model",
-            "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
-            "tensor_parallel_size": 4,
-            "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
-        }
-    )
-    mock_warn.assert_called_once()
-    warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
-    assert "compilation_config" in warned_args
-    assert "tensor_parallel_size" not in warned_args
-    assert "model" not in warned_args
-
-
-def test_new_format_deploy_yaml_does_not_strip_interleave_cli_overrides(tmp_path):
-    """New-format deploy YAMLs must not strip interleave_mm_strings / media_io_kwargs.
-
-    Pytest historically passed ``--stage-configs-path`` for deploy YAMLs; stripping
-    those CLI flags dropped MiniCPM interleaved AV packing and cut Daily-Omni
-    accuracy from ~78% to ~70%.
-    """
-    from vllm_omni.entrypoints.utils import is_new_format_deploy_config
-
-    yaml_path = tmp_path / "minicpm_deploy.yaml"
-    yaml_path.write_text(
-        """
-pipeline: minicpmo_4_5
-async_chunk: true
-stages:
-  - stage_id: 0
-    devices: "0"
-""".strip(),
-        encoding="utf-8",
-    )
-    path = str(yaml_path)
-    assert is_new_format_deploy_config(path)
-
-    kwargs = {
-        "stage_configs_path": path,
-        "trust_remote_code": True,
-        "interleave_mm_strings": True,
-        "media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}},
-        "gpu_memory_utilization": 0.55,
-    }
-    # Mirror AsyncOmniEngine._resolve_stage_configs strip decision.
-    if kwargs.get("stage_configs_path") is not None and not is_new_format_deploy_config(kwargs["stage_configs_path"]):
-        base = AsyncOmniEngine._strip_single_engine_args(dict(kwargs))
-    else:
-        base = dict(kwargs)
-    assert base.get("interleave_mm_strings") is True
-    assert base.get("media_io_kwargs") == {"video": {"fps": 1, "num_frames": 128}}
-    # Parent EngineArgs fields also remain available for deploy merge.
-    assert base.get("gpu_memory_utilization") == 0.55
-
-    legacy = tmp_path / "legacy.yaml"
-    legacy.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
-    assert not is_new_format_deploy_config(str(legacy))
-    legacy_kwargs = dict(kwargs, stage_configs_path=str(legacy))
-    stripped = AsyncOmniEngine._strip_single_engine_args(legacy_kwargs)
-    assert "interleave_mm_strings" not in stripped
-    assert "media_io_kwargs" not in stripped
-    assert "gpu_memory_utilization" not in stripped
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/3293
