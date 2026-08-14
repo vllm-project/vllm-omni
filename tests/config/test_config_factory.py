@@ -14,7 +14,8 @@ import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config import config_factory as config_factory_module
+from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -55,6 +56,7 @@ def clear_config_factory_caches():
     yield
     StageConfigFactory.get_hf_config.cache_clear()
     StageConfigFactory.try_infer_model_type.cache_clear()
+    _materialize_object_storage_configs.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -2765,3 +2767,89 @@ class TestPipelineConfigResolvers:
             pass
 
         assert resolver(NotTheRightHfConfig()) is None
+
+
+class TestObjectStorageConfigResolution:
+    """Object-storage URIs must be materialized locally before any HF-style reads.
+
+    Regression coverage for review on the Run:AI PR: ``get_config`` and the
+    config.json/model_index.json fallbacks crashed with ``HFValidationError``
+    for ``s3://`` URIs, and the name-match fallback scanned the whole URI, so
+    a bucket named after another pipeline could hijack pipeline selection.
+    """
+
+    @pytest.fixture
+    def fake_object_storage(self, monkeypatch, tmp_path):
+        """Replace ObjectStorageModel with a fake that "pulls" into a tmp dir.
+
+        Returns a recorder: calls to the returned callable write files into
+        the materialized directory, and ``recorder.pulls`` records every
+        ``pull_files`` invocation.
+        """
+        pulls: list[tuple[str, list[str] | None, list[str] | None]] = []
+        materialized_files: list[tuple[str, str]] = []
+
+        class FakeObjectStorageModel:
+            def __init__(self, url: str):
+                self.dir = str(tmp_path)
+
+            def pull_files(self, model_path, allow_pattern=None, ignore_pattern=None):
+                pulls.append((model_path, allow_pattern, ignore_pattern))
+                for name, content in materialized_files:
+                    (tmp_path / name).write_text(content)
+
+        monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
+
+        class Recorder:
+            def set_files(self, files: list[tuple[str, str]]) -> None:
+                materialized_files.clear()
+                materialized_files.extend(files)
+
+        recorder = Recorder()
+        recorder.pulls = pulls
+        return recorder
+
+    def test_passthrough_for_non_uri(self, fake_object_storage):
+        assert _materialize_object_storage_configs("org/model") == "org/model"
+        assert _materialize_object_storage_configs("/local/model") == "/local/model"
+        assert fake_object_storage.pulls == []
+
+    def test_materialize_pulls_configs_once_per_uri(self, fake_object_storage):
+        uri = "s3://bucket/model"
+
+        first = _materialize_object_storage_configs(uri)
+        second = _materialize_object_storage_configs(uri)
+
+        assert first == second
+        assert len(fake_object_storage.pulls) == 1
+        pulled_uri, allow_pattern, ignore_pattern = fake_object_storage.pulls[0]
+        assert pulled_uri == uri
+        assert "*.json" in allow_pattern
+        assert ignore_pattern is None
+
+    def test_try_infer_model_type_reads_materialized_config(self, fake_object_storage):
+        """A misleading bucket name must not beat the real config.json content."""
+        fake_object_storage.set_files(
+            [
+                (
+                    "config.json",
+                    '{"model_type": "qwen3_omni_moe", "architectures": ["Qwen3OmniMoeForConditionalGeneration"]}',
+                )
+            ]
+        )
+        uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
+
+        model = StageConfigFactory.try_infer_model_type(model=uri, trust_remote_code=False)
+
+        assert model == "qwen3_omni_moe"
+        assert fake_object_storage.pulls  # materialization happened
+
+    def test_name_match_fallback_scans_basename_only(self, fake_object_storage):
+        # Empty config.json (CosyVoice3 style) forces the name-match fallback.
+        fake_object_storage.set_files([("config.json", "{}")])
+
+        deceptive = "s3://qwen3-tts-models/plain-checkpoint"
+        assert StageConfigFactory.try_infer_model_type(model=deceptive, trust_remote_code=False) is None
+
+        matching = "s3://any-bucket/my-cosyvoice3-model"
+        assert StageConfigFactory.try_infer_model_type(model=matching, trust_remote_code=False) == "cosyvoice3"

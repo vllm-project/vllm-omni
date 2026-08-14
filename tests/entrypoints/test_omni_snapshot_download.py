@@ -28,6 +28,7 @@ MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     [
         "s3://bucket/model",
         "gs://bucket/model",
+        "az://bucket/model",
     ],
 )
 def test_omni_snapshot_download_preserves_object_storage_uri(
@@ -66,10 +67,12 @@ def test_omni_snapshot_download_uses_hf_for_relative_repo_id(
 ) -> None:
     monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
     model_id = "org/model"
-    mocker.patch.object(omni_base.os.path, "exists", return_value=False)
+    # Stub the modular-index probe so the test never reaches huggingface.co.
+    hf_file_probe = mocker.patch.object(omni_base, "file_or_path_exists", return_value=False)
     hf_download = mocker.patch.object(omni_base, "download_weights_from_hf_specific")
 
     assert omni_base.omni_snapshot_download(model_id) == model_id
+    hf_file_probe.assert_called_once_with(model_id, "modular_model_index.json", revision=None)
     hf_download.assert_called_once_with(
         model_name_or_path=model_id,
         cache_dir=None,
