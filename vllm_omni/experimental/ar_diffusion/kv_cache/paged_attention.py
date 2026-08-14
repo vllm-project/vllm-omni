@@ -365,6 +365,22 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
+def _rocm_flash_attn_varlen_func():
+    """Resolve a ROCm varlen kernel, preferring AITER when available.
+
+    The caller gathers paged KV into packed tensors before invoking this
+    function, avoiding AITER releases whose ``block_table`` kernel is broken.
+    """
+    try:
+        from aiter import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+    except ImportError:
+        from flash_attn import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+
+
 def ar_diffusion_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -399,6 +415,34 @@ def ar_diffusion_paged_attention(
             query_start_loc,
             seq_lens,
             softmax_scale,
+            causal=causal,
+        )
+    elif torch.version.hip is not None:
+        # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
+        # upstream flash-attn expose the standard cu_seqlens_k API instead of
+        # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
+        # requires 128-token blocks, while AR-Diffusion uses frame-aligned
+        # 16-token blocks, so gather the visible blocks on-device first.
+        flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
+        cu_seqlens_k = torch.cat([seq_lens.new_zeros(1), torch.cumsum(seq_lens, dim=0, dtype=torch.int32)])
+        positions = torch.arange(int(max_seq_len), device=query_flat.device)
+        logical_blocks = torch.div(positions, key_cache.shape[1], rounding_mode="floor")
+        offsets = positions % key_cache.shape[1]
+        physical_blocks = block_table[:, logical_blocks].long()
+        gathered_k = key_cache[physical_blocks, offsets]
+        gathered_v = value_cache[physical_blocks, offsets]
+        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+        packed_k = gathered_k[valid]
+        packed_v = gathered_v[valid]
+        out = flash_attn_varlen_func(
+            q=query_flat,
+            k=packed_k,
+            v=packed_v,
+            cu_seqlens_q=query_start_loc,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(max_query_len),
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
             causal=causal,
         )
     else:

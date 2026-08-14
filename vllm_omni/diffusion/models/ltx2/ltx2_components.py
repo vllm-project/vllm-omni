@@ -9,7 +9,8 @@ import inspect
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -19,6 +20,8 @@ from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+from safetensors.torch import load_file
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -32,6 +35,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
     apply_interleaved_rotary_emb,
@@ -70,6 +74,9 @@ class LTXComponentProfile:
     video_vae_cls: type = AutoencoderKLLTX2Video
     vocoder_cls: type = LTX2Vocoder
     vocoder_fallback_cls: type | None = None
+    artifact_repo_id: str | None = None
+    latent_upsampler_filename: str | None = None
+    distilled_lora_filename: str | None = None
 
 
 LTX2_COMPONENT_PROFILE = LTXComponentProfile(
@@ -101,14 +108,94 @@ LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
 )
 
+LTX23_DISTILLED_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_distilled",
+    resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2.3",
+    latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+)
+
+LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
+    LTX2_COMPONENT_PROFILE,
+    name="ltx2_two_stage",
+    resident_modules=(*LTX2_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2",
+    latent_upsampler_filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
+    distilled_lora_filename="ltx-2-19b-distilled-lora-384.safetensors",
+)
+
+LTX23_TWO_STAGE_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_two_stage",
+    resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2.3",
+    latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+    distilled_lora_filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+)
+
 
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
+    ("two_stage", "2"): LTX2_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2.3"): LTX23_DISTILLED_COMPONENT_PROFILE,
     ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
     ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
 }
+
+
+def resolve_ltx_artifact(
+    model: str,
+    repo_id: str,
+    filename: str,
+) -> str:
+    """Resolve an official LTX sidecar from the model root or its Hub repository."""
+    candidate = Path(model) / filename
+    if candidate.is_file():
+        return str(candidate)
+
+    try:
+        return hf_hub_download(repo_id=repo_id, filename=filename)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Unable to resolve LTX artifact {filename!r}. Searched {candidate}; "
+            f"place the file in the model root or make {repo_id} available."
+        ) from exc
+
+
+def _load_ltx_latent_upsampler_single_file(path: str, dtype: torch.dtype) -> LTX2LatentUpsamplerModel:
+    """Load an official single-file upsampler into the Diffusers module."""
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+    raw_config = json.loads(metadata.get("config", "{}"))
+    config = {
+        "in_channels": raw_config.get("in_channels", 128),
+        "mid_channels": raw_config.get("mid_channels", 1024),
+        "num_blocks_per_stage": raw_config.get("num_blocks_per_stage", 4),
+        "dims": raw_config.get("dims", 3),
+        "spatial_upsample": raw_config.get("spatial_upsample", True),
+        "temporal_upsample": raw_config.get("temporal_upsample", False),
+        "rational_spatial_scale": raw_config.get("spatial_scale", 2.0),
+        "use_rational_resampler": raw_config.get("rational_resampler", False),
+    }
+    with torch.device("cpu"):
+        upsampler = LTX2LatentUpsamplerModel(**config).to(dtype=dtype)
+
+    state_dict = load_file(path, device="cpu")
+    if "upsampler.0.weight" in state_dict and hasattr(upsampler.upsampler, "conv"):
+        state_dict["upsampler.conv.weight"] = state_dict.pop("upsampler.0.weight")
+        state_dict["upsampler.conv.bias"] = state_dict.pop("upsampler.0.bias")
+    missing, unexpected = upsampler.load_state_dict(state_dict, strict=False)
+    unresolved_missing = set(missing) - {"upsampler.blur_down.kernel"}
+    if unresolved_missing or unexpected:
+        raise ValueError(
+            f"Invalid LTX latent upsampler {path}: missing={sorted(unresolved_missing)}, "
+            f"unexpected={sorted(unexpected)}."
+        )
+    return upsampler
 
 
 def resolve_ltx_component_profile(pipeline_kind: str, model_version: str) -> LTXComponentProfile:
@@ -392,16 +479,34 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         )
 
     if "latent_upsampler" in profile.resident_modules:
-        # BlurDownsample constructs an integer kernel that must be initialized
-        # on CPU; component placement is handled uniformly after construction.
-        with torch.device("cpu"):
-            pipeline.latent_upsampler = _load_component(
-                LTX2LatentUpsamplerModel,
+        upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
+        if os.path.isfile(upsampler_config) or not local_files_only:
+            try:
+                pipeline.latent_upsampler = _load_component(
+                    LTX2LatentUpsamplerModel,
+                    model,
+                    "latent_upsampler",
+                    local_files_only=local_files_only,
+                    dtype=dtype,
+                )
+            except (OSError, ValueError):
+                if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
+                    raise
+                upsampler_path = resolve_ltx_artifact(
+                    model,
+                    profile.artifact_repo_id,
+                    profile.latent_upsampler_filename,
+                )
+                pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
+        else:
+            if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
+                raise FileNotFoundError(f"LTX latent upsampler component not found under {model}.")
+            upsampler_path = resolve_ltx_artifact(
                 model,
-                "latent_upsampler",
-                local_files_only=local_files_only,
-                dtype=dtype,
+                profile.artifact_repo_id,
+                profile.latent_upsampler_filename,
             )
+            pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
     transformer_config = load_transformer_config(model, "transformer", local_files_only)
     quant_config = getattr(od_config, "quantization_config", None)
@@ -411,6 +516,16 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         model,
         subfolder="scheduler",
         local_files_only=local_files_only,
+    )
+    expected_checkpoint_kind: LTXCheckpointKind | None = None
+    if pipeline.pipeline_kind == "two_stage":
+        expected_checkpoint_kind = "regular"
+    elif pipeline.pipeline_kind == "distilled_two_stage":
+        expected_checkpoint_kind = "distilled"
+    validate_ltx_checkpoint(
+        pipeline.scheduler.config,
+        expected_kind=expected_checkpoint_kind,
+        pipeline_name=type(pipeline).__name__,
     )
 
     pipeline.vae_spatial_compression_ratio = pipeline.vae.spatial_compression_ratio

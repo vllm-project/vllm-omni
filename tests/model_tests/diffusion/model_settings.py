@@ -74,4 +74,14 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_flux2_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
     ),
+    "QwenImageEditPipeline": DiffusionModelTestOpts(
+        model="Qwen/Qwen-Image-Edit",
+        builder=diff_model_builders.tiny_qwen_image_edit_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
+    ),
+    "QwenImageEditPlusPipeline": DiffusionModelTestOpts(
+        model="Qwen/Qwen-Image-Edit-2511",
+        builder=diff_model_builders.tiny_qwen_image_edit_plus_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
+    ),
 }

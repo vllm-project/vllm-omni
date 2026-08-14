@@ -679,7 +679,7 @@ async def build_async_omni_from_stage_config(
         EngineClient instance (AsyncOmni) ready for use
 
     Note:
-        Stage configurations are loaded from args.stage_configs_path if provided,
+        Stage configurations are loaded from ``args.deploy_config`` when provided,
         otherwise from the model's default configuration.
     """
 
@@ -1156,7 +1156,7 @@ async def omni_init_app_state(
     state.openai_serving_duplex = None
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
-        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+        config_path=getattr(args, "deploy_config", None),
     ):
         from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
 
@@ -2649,12 +2649,6 @@ def _extract_images_from_result(result: Any) -> list[Any]:
     images = []
     if hasattr(result, "images") and result.images:
         images = result.images
-    elif hasattr(result, "request_output"):
-        request_output = result.request_output
-        if isinstance(request_output, dict) and request_output.get("images"):
-            images = request_output["images"]
-        elif hasattr(request_output, "images") and request_output.images:
-            images = request_output.images
     # Handle when generate more than one image
     if images and isinstance(images[0], np.ndarray) and images[0].shape[0] > 1 and images[0].ndim == 5:
         # Unwrap batch: (N, T, H, W, C) -> [img1, img2, ...]

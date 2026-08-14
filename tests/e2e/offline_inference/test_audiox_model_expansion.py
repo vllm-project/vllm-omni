@@ -17,7 +17,7 @@ from vllm_omni.platforms import current_omni_platform
 # Override in CI if needed: AUDIOX_TEST_MODEL=<model-or-local-path>
 models = [os.environ.get("AUDIOX_TEST_MODEL", "zhangj1an/audiox_random")]
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAMS = [(m, None, {"model_class_name": "AudioXPipeline"}) for m in models]
 
 pytestmark = [
@@ -53,9 +53,9 @@ def test_audiox_model(omni_runner: OmniRunner) -> None:
     assert outputs is not None
     first_output = outputs[0]
     assert first_output.final_output_type == "audio"
-    assert hasattr(first_output, "request_output") and first_output.request_output
+    assert isinstance(first_output, OmniRequestOutput) and first_output
 
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output

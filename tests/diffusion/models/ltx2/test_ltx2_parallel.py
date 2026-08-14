@@ -12,6 +12,19 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_velocity_from_x0_uses_official_host_scalar_sigma(mocker):
+    from vllm_omni.diffusion.models.ltx2.ltx2_guidance import velocity_from_x0
+
+    sigma = mocker.MagicMock()
+    sigma.to.return_value.item.return_value = 0.5
+
+    actual = velocity_from_x0(torch.tensor([1.0]), torch.tensor([0.0]), sigma)
+
+    sigma.to.assert_called_once_with(torch.float32)
+    sigma.to.return_value.item.assert_called_once_with()
+    torch.testing.assert_close(actual, torch.tensor([2.0]))
+
+
 class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
@@ -199,6 +212,7 @@ class TestCFGParallelHelpers:
             ),
             attention_kwargs=None,
             audio_scheduler=SimpleNamespace(sigmas=torch.stack([audio_sigma])),
+            original_audio_num_frames=state.audio.shape[1],
         )
 
         actual_video, actual_audio = executor.predict_parallel_guidance(
