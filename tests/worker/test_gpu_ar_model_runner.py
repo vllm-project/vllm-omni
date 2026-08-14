@@ -17,6 +17,7 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import sparse_audio
+from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -1388,14 +1389,14 @@ class TestSparseAudioMarkerRobustness:
 
     def test_combined_payload_unwraps_aligned_list(self):
         combined = {"codes.audio": {"req-1": [torch.zeros(1), torch.ones(1)]}}
-        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=1)
+        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=1)
         assert torch.equal(payload["codes.audio"], torch.ones(1))
 
     def test_combined_payload_broadcasts_shared_singleton(self):
         # Length-1 lists are batch-shared passthrough metadata (e.g.
         # `meta.sparse_audio: ["1"]`) duplicated per request by the merge.
         combined = {"meta.sparse_audio": {"req-1": ["1"]}}
-        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=2)
+        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=2)
         assert payload["meta.sparse_audio"] == "1"
 
     def test_combined_payload_misalignment_drops_key_not_request_zero(self):
@@ -1410,7 +1411,7 @@ class TestSparseAudioMarkerRobustness:
             "codes.audio": {"req-3": [torch.zeros(1), torch.ones(1)]},
             "sr": {"req-3": 22050},
         }
-        payload = GPUARModelRunner._build_combined_prefix_cache_mm_payload(combined, rid="req-3", list_idx=2)
+        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-3", list_idx=2)
         assert "codes.audio" not in payload
         assert payload["sr"] == 22050
 
@@ -1418,8 +1419,7 @@ class TestSparseAudioMarkerRobustness:
         # Mirror of the combined-path policy on the non-prefix-cache path:
         # a sparse index beyond the per-request list drops that key (error
         # log) and the rest of the request's payload survives.
-        runner = GPUARModelRunner.__new__(GPUARModelRunner)
-        payload = runner._build_omni_mm_payload(
+        payload = payload_build.build_omni_mm_payload(
             combined_multimodal_outputs=None,
             mm_cpu={"codes.audio": [torch.zeros(1)]},
             rid="r2",
@@ -1441,7 +1441,6 @@ class TestSparseAudioMarkerRobustness:
         # went out of range for r2. The sparse->list_idx resolution lives in
         # `_build_omni_mm_payload` (the combined helper itself is
         # sparse-agnostic), so this exercises the caller.
-        runner = GPUARModelRunner.__new__(GPUARModelRunner)
         sparse_mm_index = {"r1": 0, "r2": 1}
         combined = {
             "codes.audio": {
@@ -1451,7 +1450,7 @@ class TestSparseAudioMarkerRobustness:
         }
         payloads = {}
         for rid, idx in (("r1", 1), ("r2", 2)):
-            payloads[rid] = runner._build_omni_mm_payload(
+            payloads[rid] = payload_build.build_omni_mm_payload(
                 combined_multimodal_outputs=combined,
                 mm_cpu=None,
                 rid=rid,
