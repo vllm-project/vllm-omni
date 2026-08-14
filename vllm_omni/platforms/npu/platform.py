@@ -82,6 +82,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
+        from vllm_omni.platforms.npu.models.minimax_h3 import (
+            apply_minimax_h3_qwen3vl_swiglu_patch,
+        )
+
+        # The patch imports the MiniMax encoder, which depends on
+        # current_omni_platform. Run it only after platform construction has
+        # completed, but before the diffusion pipeline is loaded.
+        apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
