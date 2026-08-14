@@ -150,6 +150,7 @@ Content-Type: application/json
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
 | `seed` | integer | null | Random seed for reproducibility |
+| `use_prompt_upscaling` | boolean | false | Enable prompt enhancement/rewriting before generation. Only effective for models that support prompt upscaling (e.g., ERNIE-Image, Flux2, LongCat). For models with an external upscaler (e.g., ERNIE-Image), the server must be configured with `enable_external_prompt_upscaler: true` in the stage config. |
 
 ### Response Format
 

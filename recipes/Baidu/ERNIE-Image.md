@@ -141,11 +141,14 @@ curl -X POST http://localhost:8091/v1/images/generations \
     for faster generation; configure via `--cache-config`.
   - **Layer offload:** `--enable-layerwise-offload` offloads DiT layers to CPU
     for memory-constrained scenarios.
-- **Prompt Enhancer (PE):** ERNIE-Image includes an optional 3B-parameter
+- **Prompt Upscaling (PE):** ERNIE-Image includes an optional 3B-parameter
   Prompt Enhancer model that expands brief user inputs into richer structured
-  descriptions, improving output quality. Set `use_pe=False` in the request
-  body to disable it if you prefer direct prompt processing or want to use
-  larger LLMs (e.g., Gemini, ChatGPT) for prompt enhancement instead.
+  descriptions, improving output quality. Because this loads an additional
+  model onto GPU, it must be explicitly enabled at server startup with
+  `--enable-external-prompt-upscaler`. Once enabled, set
+  `"use_prompt_upscaling": true` in the request body
+  (`/v1/images/generations`) or in `"extra_body"` (`/v1/chat/completions`)
+  to activate it per request.
 - **Recommended settings:**
   - ERNIE-Image: `num_inference_steps=50`, `guidance_scale=4.0`
   - ERNIE-Image-Turbo: `num_inference_steps=8`, `guidance_scale=1.0`

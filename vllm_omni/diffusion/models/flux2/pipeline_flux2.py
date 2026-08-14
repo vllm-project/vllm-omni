@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.utils.prompt_utils import do_prompt_upscaling
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -659,22 +660,6 @@ class Flux2Pipeline(
 
         return torch.stack(x_list, dim=0)
 
-    def upsample_prompt(
-        self,
-        prompt: str | list[str],
-        images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] = None,
-        temperature: float = 0.15,
-        device: torch.device = None,
-    ) -> list[str]:
-        if images:
-            images = _validate_and_process_images(images, self.image_processor, self.upsampling_max_image_size)
-        return self.text_encoder.upsample_prompt(
-            prompt,
-            images=images,
-            temperature=temperature,
-            device=device,
-        )
-
     def encode_prompt(
         self,
         prompt: str | list[str],
@@ -892,7 +877,6 @@ class Flux2Pipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
-        caption_upsample_temperature: float = None,
     ) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
@@ -928,9 +912,12 @@ class Flux2Pipeline(
         )
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
-        caption_upsample_temperature = req.sampling_params.extra_args.get(
-            "caption_upsample_temperature", caption_upsample_temperature
-        )
+        if req.num_reqs != 1:
+            logger.warning(
+                "Flux2 prompt upscaling only supports single-request batches; skipping for batch of %d requests",
+                req.num_reqs,
+            )
+        should_upsample_prompt = do_prompt_upscaling(req.requests[0]) if req.num_reqs == 1 else False
 
         req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
         if any(p is not None for p in req_prompt_embeds):
@@ -974,8 +961,20 @@ class Flux2Pipeline(
         device = self._execution_device
 
         # 3. prepare text embeddings
-        if caption_upsample_temperature:
-            prompt = self.upsample_prompt(prompt, images=image, temperature=caption_upsample_temperature, device=device)
+        if should_upsample_prompt:
+            upsample_images = (
+                _validate_and_process_images(image, self.image_processor, self.upsampling_max_image_size)
+                if image
+                else None
+            )
+            # NOTE (Alex): For now we don't expose temperature as a param for
+            # prompt upscaling to avoid too many obscure model specific params.
+            # If configuring this seems useful across several models, revisit.
+            prompt = self.text_encoder.upsample_prompt(
+                prompt,
+                images=upsample_images,
+                device=device,
+            )
         prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,

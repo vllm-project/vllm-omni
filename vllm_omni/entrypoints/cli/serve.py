@@ -729,6 +729,15 @@ class OmniServeCommand(CLISubcommand):
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
         )
+
+        # For models with external prompt upscalers
+        omni_config_group.add_argument(
+            "--enable-external-prompt-upscaler",
+            action="store_true",
+            help="Allow lazy-loading external prompt upscaler models (e.g., ERNIE PE). "
+            "Required for use_prompt_upscaling to work on models with external upscalers.",
+        )
+
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

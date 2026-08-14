@@ -1,5 +1,20 @@
 import torch
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+
+def do_prompt_upscaling(req: OmniDiffusionRequest) -> bool:
+    """Check whether prompt upscaling should run for this request."""
+    # NOTE: This may get more complex in the future since some models
+    # Use their text encoder directly, while others have an externally
+    # loaded component. Since only Ernie Image does this for now
+    # though, we currently don't distinguish at load time to avoid having
+    # too many obscure flags.
+    value = req.sampling_params.extra_args.get("use_prompt_upscaling")
+    if not isinstance(value, bool) and value is not None:
+        raise TypeError(f"use_prompt_upscaling must be a bool, got {type(value).__name__}")
+    return bool(value)
+
 
 def validate_prompt_sequence_lengths(
     attention_mask: torch.Tensor,

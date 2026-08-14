@@ -22,14 +22,19 @@ class _FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
 
-    def apply_chat_template(self, *_args, **_kwargs):
+    def __init__(self):
+        self.last_chat_input = None
+
+    def apply_chat_template(self, messages, *_args, **_kwargs):
+        # Store the last input for checking prompt enhance
+        self.last_chat_input = messages[0]["content"]
         return "chat prompt"
 
     def __call__(self, *_args, **_kwargs):
         return _TokenInputs(input_ids=torch.tensor([[1, 2]]))
 
     def decode(self, *_args, **_kwargs):
-        return "rank1-enhanced"
+        return "enhanced-prompt"
 
 
 class _FakePEModel:
@@ -43,9 +48,12 @@ class _FakePEModel:
 
 def test_enhance_prompt_uses_rank0_result_in_distributed(monkeypatch):
     pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
-    pipe.use_pe = True
-    pipe.pe_tokenizer = _FakeTokenizer()
-    pipe.pe_model = _FakePEModel()
+    pipe.pe_model = None
+    pipe.pe_tokenizer = None
+
+    fake_model = _FakePEModel()
+    fake_tokenizer = _FakeTokenizer()
+    pipe._load_pe = lambda: (fake_model, fake_tokenizer)
 
     broadcasts = []
 
@@ -62,20 +70,79 @@ def test_enhance_prompt_uses_rank0_result_in_distributed(monkeypatch):
     enhanced = pipe._enhance_prompt("original", torch.device("cpu"))
 
     assert enhanced == "rank0-enhanced"
-    assert pipe.pe_model.calls == 0
+    assert fake_model.calls == 0
     assert broadcasts == [([None], 0)]
 
 
-def test_should_apply_pe_respects_sampling_extra_args():
-    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"apply_pe": False}))
+def _make_batch(*requests):
+    return SimpleNamespace(
+        num_reqs=len(requests),
+        requests=list(requests),
+        request_id=requests[0].request_id if requests else "test",
+    )
 
-    assert ErnieImagePipeline._should_apply_pe(req) is False
+
+def _make_request(extra_args=None, *, request_id="real_req"):
+    return SimpleNamespace(
+        request_id=request_id,
+        sampling_params=SimpleNamespace(extra_args=extra_args or {}),
+    )
+
+
+def test_should_apply_pe_true_when_requested():
+    """Ensure that use_prompt_upscaling forwards through."""
+    batch = _make_batch(_make_request({"use_prompt_upscaling": True}))
+    assert ErnieImagePipeline._should_apply_pe(batch) is True
+
+
+def test_should_apply_pe_false_when_not_requested():
+    """Ensure that use_prompt_upscaling is False by default."""
+    batch = _make_batch(_make_request({}))
+    assert ErnieImagePipeline._should_apply_pe(batch) is False
 
 
 def test_should_apply_pe_disables_dummy_warmup_request():
-    req = SimpleNamespace(is_dummy_run=lambda: True, sampling_params=SimpleNamespace(extra_args={}))
+    """Ensure that use_prompt_upscaling is False during warmup."""
+    batch = _make_batch(
+        _make_request(
+            {"use_prompt_upscaling": True},
+            request_id="dummy_req_id",
+        )
+    )
+    assert ErnieImagePipeline._should_apply_pe(batch) is False
 
-    assert ErnieImagePipeline._should_apply_pe(req) is False
+
+def test_enhance_prompt_triggers_lazy_load(monkeypatch):
+    """_enhance_prompt lazy-loads the PE model on first call."""
+    pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    pipe.pe_model = None
+    pipe.pe_tokenizer = None
+
+    fake_model = _FakePEModel()
+    fake_tokenizer = _FakeTokenizer()
+    pipe._load_pe = lambda: (fake_model, fake_tokenizer)
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    result = pipe._enhance_prompt("a cat sitting on a mat", torch.device("cpu"))
+
+    assert pipe.pe_model is fake_model
+    assert fake_model.calls == 1
+    # Should get the enhanced result back after getting our input
+    assert result == "enhanced-prompt"
+    assert "a cat sitting on a mat" in fake_tokenizer.last_chat_input
+
+
+def test_ensure_pe_loaded_skips_when_disabled():
+    """Ensure has pe loaded is False when external upscaler loading is not enabled."""
+    pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    pipe.pe_model = None
+    pipe.pe_tokenizer = None
+    pipe.has_external_prompt_upscaler = True
+    pipe._load_pe = None
+
+    assert pipe._ensure_pe_loaded() is False
+    assert pipe.pe_model is None
 
 
 def test_hybrid_ring_slices_full_attention_mask(monkeypatch):

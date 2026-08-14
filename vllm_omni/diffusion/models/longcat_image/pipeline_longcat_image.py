@@ -31,6 +31,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.utils.prompt_utils import do_prompt_upscaling
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -519,7 +520,9 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         latents = req.sampling_params.latents
 
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
-        enable_prompt_rewrite: bool = extra_args.get("enable_prompt_rewrite", True)
+        # Batch can be heterogeneous with prompt rewrite,
+        # so consider each request individually
+        should_rewrite = [do_prompt_upscaling(sub_req) for sub_req in req.requests]
         enable_cfg_renorm: bool = extra_args.get("enable_cfg_renorm", True)
         cfg_renorm_min: float = extra_args.get("cfg_renorm_min", 0.0)
         joint_attention_kwargs: dict[str, Any] | None = None
@@ -543,8 +546,13 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
         batch_size = len(prompt)
 
         device = self.device
-        if enable_prompt_rewrite and prompt is not None:
-            prompt = self.rewire_prompt(prompt if isinstance(prompt, list) else [prompt], device)
+        # If any requests in the batch enable prompt rewrite, rewrite just those prompts
+        rewrite_indices = [idx for idx, do_rewrite in enumerate(should_rewrite) if do_rewrite]
+        if rewrite_indices and prompt is not None:
+            prompts_to_rewrite = [prompt[idx] for idx in rewrite_indices]
+            rewired_prompts = self.rewire_prompt(prompts_to_rewrite, device)
+            for rewrite_idx, rewired_prompt in zip(rewrite_indices, rewired_prompts):
+                prompt[rewrite_idx] = rewired_prompt
 
         negative_prompt = "" if negative_prompt is None else negative_prompt
 

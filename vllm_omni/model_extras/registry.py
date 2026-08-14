@@ -28,12 +28,15 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.ernie_image import ERNIE_IMAGE_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.flux2 import FLUX2_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.longcat_image import LONGCAT_IMAGE_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import LTX_EXTRA_BODY_PARAMS, LTX_EXTRA_OUTPUT_PARAMS
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
@@ -208,6 +211,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2TwoStagePipeline",
             "LTX2DistilledPipeline",
         )
+    },
+    "Flux2Pipeline": {
+        "extra_body_params": FLUX2_EXTRA_BODY_PARAMS,
+    },
+    "LongCatImagePipeline": {
+        "extra_body_params": LONGCAT_IMAGE_EXTRA_BODY_PARAMS,
+    },
+    "ErnieImagePipeline": {
+        "extra_body_params": ERNIE_IMAGE_EXTRA_BODY_PARAMS,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
