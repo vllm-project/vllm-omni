@@ -80,6 +80,12 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
+neutts-air = [
+    "neucodec>=0.0.4",
+    "phonemizer>=3.0.0",
+    "espeakng-loader==0.2.4",
+]
+
 forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]

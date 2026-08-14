@@ -345,6 +345,17 @@ _OMNI_MODELS = {
         "covo_audio_code2wav",
         "CovoAudioCode2WavForConditionalGeneration",
     ),
+    ## NeuTTS-Air
+    "NeuTTSAirForCausalLM": (
+        "neutts_air",
+        "neutts_air_talker",
+        "NeuTTSAirForCausalLM",
+    ),
+    "NeuTTSAirCode2Wav": (
+        "neutts_air",
+        "neutts_air_code2wav",
+        "NeuTTSAirCode2Wav",
+    ),
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",

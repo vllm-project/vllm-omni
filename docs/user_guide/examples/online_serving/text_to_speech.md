@@ -22,6 +22,7 @@ For the full list of supported architectures across all modalities, see
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
+| NeuTTS-Air | `neuphonic/neutts-air` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
@@ -303,6 +304,38 @@ The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--l
 - Voice cloning and voice design require offline inference; see the [offline OmniVoice section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#omnivoice).
 
 ---
+
+## NeuTTS-Air
+
+### Prerequisites
+
+```bash
+pip install -e '.[neutts-air]'
+```
+
+### Launch
+
+```bash
+vllm serve neuphonic/neutts-air --omni --host 0.0.0.0 --port 8000
+```
+
+### Voice cloning
+
+```bash
+curl http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "neuphonic/neutts-air",
+    "input": "Hello from NeuTTS-Air.",
+    "ref_audio": "file:///path/to/reference.wav",
+    "ref_text": "Transcript of the reference audio.",
+    "response_format": "wav",
+    "stream": true
+  }' \
+  --output neutts_air.wav
+```
+
+NeuTTS-Air currently supports English synthesis and produces 24 kHz audio. Each request requires one reference-audio and reference-text pair. Reference audio is encoded on CPU unless precomputed reference codes are supplied. The default deployment supports up to four concurrent sequences.
 
 ## Qwen3-TTS
 
