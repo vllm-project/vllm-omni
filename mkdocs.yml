@@ -73,6 +73,8 @@ plugins:
   - awesome-nav
   - redirects:
       redirect_maps:
+        community/meetups.md: community/meetings.md
+        community/volunteers.md: community/contact_us.md
         user_guide/diffusion/request_batching.md: user_guide/diffusion/execution_modes.md
         user_guide/diffusion/step_execution.md: user_guide/diffusion/execution_modes.md
         user_guide/diffusion/cpu_offload_diffusion.md: user_guide/diffusion/cpu_offload.md
@@ -111,6 +113,7 @@ plugins:
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building
         - "vllm_omni.experimental"  # avoid importing optional serving deps (openai, fastapi, uvicorn, httpx) in mkdocs building
+        - "vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored"  # vendored NeMo code; upstream docstrings trip griffe strict warnings
   - mkdocstrings:
       handlers:
         python:

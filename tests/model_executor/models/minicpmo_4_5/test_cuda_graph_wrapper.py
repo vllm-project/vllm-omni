@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import lru_cache
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    CFMGraphWrapper,
     HiFTGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model]
+pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 
 
 class _F0Predictor(nn.Module):
@@ -142,3 +145,248 @@ def test_lazy_capture_limit_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch)
     wrapper._capture.assert_not_called()
     wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
     assert result is wrapper.decode_fn.return_value
+
+
+# ---------------------------------------------------------------------------
+# CFMGraphWrapper tests
+# ---------------------------------------------------------------------------
+
+
+class _MiniDiT(nn.Module):
+    """Minimal DiT-like module with blocks_forward_chunk for CFM graph testing.
+
+    Mimics the upstream cosyvoice2 DiT's cache semantics:
+    - CausalConv1d.forward_chunk: cat([cnn_cache, x], dim=time) when cache is not None
+    - Attention.forward_chunk: cat([k, k_cache], dim=seq) when att_cache is not None
+    """
+
+    def __init__(self, in_dim: int = 16, hidden: int = 8, depth: int = 2) -> None:
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, hidden)
+        self.blocks = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(depth)])
+        self.final_layer = nn.Linear(hidden, in_dim)
+
+    def blocks_forward_chunk(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None,
+        cnn_cache: torch.Tensor | None = None,
+        att_cache: torch.Tensor | None = None,
+        cnn_cache_buffer: torch.Tensor | None = None,
+        att_cache_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        x = self.in_proj(x)
+        for b_idx in range(len(self.blocks)):
+            # Simulate CausalConv1d: cnn_cache contributes to the first frames.
+            # Upstream: if cnn_cache[b_idx] is None, creates zeros internally (same as zeros).
+            cnn_b = cnn_cache[b_idx] if cnn_cache is not None else None
+            if cnn_b is not None:
+                x[:, : cnn_b.shape[2], :] += cnn_b.transpose(1, 2)
+            # Simulate Attention: att_cache contributes a bias when non-empty.
+            # Upstream: if att_cache[b_idx] is None, skips cat entirely (different path).
+            att_b = att_cache[b_idx] if att_cache is not None else None
+            if att_b is not None and att_b.shape[3] > 0:
+                x += att_b.sum(dim=(1, 2), keepdim=False).unsqueeze(1)
+            x = self.blocks[b_idx](x)
+            x = x + t
+            cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
+            dt = x.shape[1]
+            att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)
+        x = self.final_layer(x)
+        x = x.transpose(1, 2)
+        return x
+
+
+def _cfm_inputs(
+    batch_size: int, chunk_size: int, old_att_len: int, *, device: str = "cuda"
+) -> tuple[torch.Tensor, ...]:
+    depth = 2
+    hidden = 8
+    estimator_input = torch.randn(batch_size, 16, chunk_size, device=device)
+    time_emb = torch.randn(batch_size, 1, hidden, device=device)
+    cnn_cache = torch.randn(depth, batch_size, hidden, 2, device=device)
+    att_cache = torch.randn(depth, batch_size, 1, old_att_len, hidden, device=device)
+    cnn_out = torch.empty(depth, batch_size, hidden, 2, device=device)
+    att_out = torch.empty(depth, batch_size, 1, old_att_len + chunk_size, hidden, device=device)
+    return estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=32)
+
+    with torch.inference_mode():
+        for _, chunk_size, old_att_len in ((2, 10, 0), (2, 10, 5)):
+            inputs = _cfm_inputs(2, chunk_size, old_att_len)
+
+            eager_inputs = tuple(v.clone() for v in inputs)
+            with torch.no_grad():
+                eager_result = estimator.blocks_forward_chunk(
+                    eager_inputs[0],
+                    eager_inputs[1],
+                    None,
+                    eager_inputs[2],
+                    eager_inputs[3],
+                    eager_inputs[4],
+                    eager_inputs[5],
+                )
+
+            wrapper.replay(*inputs)
+            replay_inputs = tuple(v.clone() for v in inputs)
+            graph_result, graph_cnn, graph_att = wrapper.replay(*replay_inputs)
+
+            torch.testing.assert_close(graph_result, eager_result, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(graph_cnn, eager_inputs[4], rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(graph_att, eager_inputs[5], rtol=1e-4, atol=1e-5)
+
+    wrapper._capture_graph.cache_clear()
+
+
+def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -> CFMGraphWrapper:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    wrapper = object.__new__(CFMGraphWrapper)
+    wrapper.max_graphs = max_graphs
+    wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
+    wrapper.device = torch.device("cuda")
+
+    @lru_cache(maxsize=max_graphs)
+    def _capture_graph(key: tuple):
+        return wrapper._do_capture(key)
+
+    wrapper._capture_graph = _capture_graph
+    wrapper._do_capture = Mock(return_value=None)
+    return wrapper
+
+
+def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = _cfm_mock_wrapper(monkeypatch)
+    wrapper._capture_graph = Mock(return_value=None)
+
+    inputs = _cfm_inputs(2, 10, 0)
+    wrapper.replay(*inputs)
+
+    wrapper._capture_graph.assert_called_once()
+    wrapper.graph_fn.assert_called_once()
+
+
+def test_cfm_capture_failure_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = _cfm_mock_wrapper(monkeypatch)
+    wrapper._capture_graph = lru_cache(maxsize=1)(lambda key: None)
+
+    inputs = _cfm_inputs(2, 10, 0)
+    result = wrapper.replay(*inputs)
+
+    wrapper.graph_fn.assert_called_once()
+    assert result[0] is wrapper.graph_fn.return_value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that LRU cache evicts oldest entries when full."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=2)
+
+    with torch.inference_mode():
+        inputs_a = _cfm_inputs(2, 10, 0)
+        wrapper.replay(*inputs_a)
+        assert wrapper._capture_graph.cache_info().currsize == 1
+
+        inputs_b = _cfm_inputs(2, 12, 0)
+        wrapper.replay(*inputs_b)
+        assert wrapper._capture_graph.cache_info().currsize == 2
+
+        wrapper.replay(*inputs_a)
+        assert wrapper._capture_graph.cache_info().currsize == 2
+
+        inputs_c = _cfm_inputs(2, 14, 0)
+        wrapper.replay(*inputs_c)
+        assert wrapper._capture_graph.cache_info().currsize == 2
+
+        wrapper.replay(*inputs_b)
+        hits_before = wrapper._capture_graph.cache_info().hits
+        wrapper.replay(*inputs_b)
+        hits_after = wrapper._capture_graph.cache_info().hits
+        assert hits_after == hits_before + 1
+
+    wrapper._capture_graph.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_none_cache_parity_between_graph_and_eager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify that None→zeros (graph path) matches [None]*depth (eager path).
+
+    setup_batch calls _decode_cfm with cnn_cache=None on every request's
+    prompt pass. The graph path replaces None with zeros; the eager path
+    passes [None]*depth. Both must produce identical outputs.
+    """
+    torch.accelerator.synchronize()
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=32)
+
+    depth = len(estimator.blocks)
+    hidden = 8
+    batch_size = 2
+    chunk_size = 20
+
+    estimator_input = torch.randn(batch_size, 16, chunk_size, device="cuda")
+    time_emb = torch.randn(batch_size, 1, hidden, device="cuda")
+    cnn_out = torch.empty(depth, batch_size, hidden, 2, device="cuda")
+    att_out = torch.empty(depth, batch_size, 1, chunk_size, hidden, device="cuda")
+
+    # Eager path: cnn_cache=[None]*depth, att_cache=[None]*depth
+    eager_input = estimator_input.clone()
+    eager_time = time_emb.clone()
+    eager_cnn_out = torch.empty_like(cnn_out)
+    eager_att_out = torch.empty_like(att_out)
+    with torch.no_grad():
+        eager_result = estimator.blocks_forward_chunk(
+            eager_input,
+            eager_time,
+            None,
+            [None] * depth,
+            [None] * depth,
+            eager_cnn_out,
+            eager_att_out,
+        )
+
+    # Graph path: cnn_cache=zeros, att_cache=zero-length (simulating _estimator_step's None→zeros)
+    zero_cnn = torch.zeros_like(cnn_out)
+    zero_att = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+    wrapper.replay(estimator_input, time_emb, zero_cnn, zero_att, cnn_out, att_out)
+    graph_input = estimator_input.clone()
+    graph_time = time_emb.clone()
+    graph_cnn_out = torch.empty_like(cnn_out)
+    graph_att_out = torch.empty_like(att_out)
+    graph_zero_cnn = torch.zeros_like(cnn_out)
+    graph_zero_att = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+    graph_result, graph_cnn, graph_att = wrapper.replay(
+        graph_input,
+        graph_time,
+        graph_zero_cnn,
+        graph_zero_att,
+        graph_cnn_out,
+        graph_att_out,
+    )
+
+    torch.testing.assert_close(graph_result, eager_result, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_cnn, eager_cnn_out, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_att, eager_att_out, rtol=1e-4, atol=1e-5)

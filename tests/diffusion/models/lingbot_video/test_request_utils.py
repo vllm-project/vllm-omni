@@ -348,3 +348,53 @@ def test_normalize_lingbot_request_model_size_overrides_sampling_dimensions():
         num_frames=81,
     )
     assert (config.height, config.width) == (480, 480)
+
+
+def test_normalize_lingbot_request_reads_size_from_extra_args():
+    """Regression: /v1/videos delivers `extra_params` via sampling.extra_args.
+
+    The nightly TI2V case sends `extra_params={"size": "320x192"}` with no
+    height/width form fields; the size used to be dropped and the video came
+    out at the 480x480 default (build 2952, LingBot Video MoE Function Test).
+    """
+    config = _normalize(
+        {
+            "prompt": "motion",
+            "modalities": ["video"],
+            "multi_modal_data": {"image": Image.new("RGB", (320, 192))},
+        },
+        num_frames=9,
+        extra_args={"size": "320x192"},
+    )
+    assert config.mode is LingBotGenerationMode.TI2V
+    assert (config.height, config.width) == (192, 320)
+
+
+def test_normalize_lingbot_request_extra_args_size_overrides_sampling_dimensions():
+    config = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        width=480,
+        height=480,
+        num_frames=81,
+        extra_args={"size": "320x192"},
+    )
+    assert (config.height, config.width) == (192, 320)
+
+
+def test_normalize_lingbot_request_reads_width_height_from_extra_args():
+    # Parity with the pre-#5311 pipeline, which honored extra_args height/width.
+    config = _normalize(
+        {"prompt": "motion", "modalities": ["video"]},
+        num_frames=81,
+        extra_args={"width": 320, "height": 192},
+    )
+    assert (config.height, config.width) == (192, 320)
+
+
+def test_resolve_lingbot_output_dimensions_reads_extra_fields():
+    assert resolve_lingbot_output_dimensions(extra_fields={"size": "320x192"}) == (320, 192)
+    assert resolve_lingbot_output_dimensions(
+        sampling_width=480,
+        sampling_height=480,
+        extra_fields={"resolution": "720p", "ratio": "16:9"},
+    ) == (736, 1280)

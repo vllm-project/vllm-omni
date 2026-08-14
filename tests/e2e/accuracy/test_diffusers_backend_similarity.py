@@ -42,8 +42,29 @@ from tests.e2e.accuracy.helpers import (
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, OpenAIClientHandler
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import (
+    CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS,
+)
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+
+def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
+    """Walk the same backend chain the omni server's diffusers adapter walks.
+
+    The server side (--diffusion-load-format diffusers) resolves its attention
+    backend through the adapter's preference chain, skipping backends that are
+    unavailable on the image (e.g. the FA3 hub kernel has no build variant for
+    the image's torch — build 2953). The reference run must resolve to the
+    same backend or the similarity comparison measures kernel differences.
+    """
+    for backend in CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS:
+        try:
+            pipe.transformer.set_attention_backend(backend)
+            return
+        except Exception:
+            continue
+    pipe.transformer.set_attention_backend("native")
 
 
 PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
@@ -235,7 +256,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        _set_matched_attention_backend(pipe)
         _diffusers_dummy_run(pipe)
 
         latencies: list[float] = []

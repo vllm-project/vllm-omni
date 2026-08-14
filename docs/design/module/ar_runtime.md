@@ -7,6 +7,7 @@ owners:
   - "@yinpeiqi"
   - "@fake0fan"
   - "@Sy0307"
+  - "@Gaohan123"
 primary_code_paths:
   - vllm_omni/core/**
   - vllm_omni/worker/**

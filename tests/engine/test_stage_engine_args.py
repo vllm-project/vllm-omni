@@ -139,6 +139,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 engine_extras={
                     "model": str(stage_model),
                     "attention_backend": "FLASHINFER",
+                    "attention_config": {"use_trtllm_attention": False},
                     "hf_overrides": {"rope_scaling": {"factor": 2}},
                     "limit_mm_per_prompt": {"audio": 1},
                     "logits_processors": ["test.custom.LogitsProcessor"],
@@ -229,6 +230,7 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert thinker_args["omni_kv_config"] == {"need_send_cache": True}
     assert thinker_args["worker_cls"] == "test.custom.Worker"
     assert thinker_args["attention_backend"] == "FLASHINFER"
+    assert thinker_args["attention_config"] == {"use_trtllm_attention": False}
     assert thinker_args["trust_remote_code"] is True
     assert thinker_args["dtype"] == "float16"
     assert thinker_args["distributed_executor_backend"] == "mp"

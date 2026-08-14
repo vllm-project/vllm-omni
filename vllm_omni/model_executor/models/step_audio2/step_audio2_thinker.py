@@ -758,7 +758,11 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         audio_feature_lens = (audio_lens - 1) // 2 + 1
 
-        audio_feature_list = [audio_features[i, : audio_feature_lens[i]] for i in range(audio_features.size(0))]
+        # Single host sync; slicing with per-item 0-d cuda tensors syncs once per item.
+        # Safe: _process_audio_input runs in the eager multimodal-encoder prefill path,
+        # never inside a decode CUDA-graph capture, so this .tolist() host sync is fine.
+        audio_feature_lens_cpu = audio_feature_lens.tolist()
+        audio_feature_list = [audio_features[i, : audio_feature_lens_cpu[i]] for i in range(audio_features.size(0))]
 
         return audio_feature_list
 

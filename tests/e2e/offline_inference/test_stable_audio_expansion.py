@@ -62,9 +62,9 @@ def generate_stable_audio_short_clip(
     # Audio-output diffusion pipelines (those with ``support_audio_output = True``) now have
     # ``final_output_type="audio"`` set on the outer stage metadata as well as the inner request.
     assert first_output.final_output_type == "audio"
-    assert hasattr(first_output, "request_output") and first_output.request_output
+    assert isinstance(first_output, OmniRequestOutput) and first_output
 
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
