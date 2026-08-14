@@ -6,10 +6,11 @@ and both TP2 x Ulysses4 and TP1 x Ulysses8 on eight GPUs — plus an optional
 online FP8 route on eight GPUs. No configuration requires layerwise offload:
 the 141 GiB frame buffer keeps every partition resident.
 
-H20-3e pairs modest per-card compute with a full NVLink mesh. The eight-GPU
-routes reach 96% scaling efficiency and land within 2% of the per-step latency
-of a considerably faster PCIe-only card, so eight GPUs is the intended
-operating point for this platform.
+H20-3e pairs modest per-card compute with a full NVLink 4.0 mesh (`NV18`
+between every GPU pair, 18 links at 26.562 GB/s). The eight-GPU routes reach
+96% scaling efficiency and land within 2% of the per-step latency of a
+considerably faster PCIe-only card, so eight GPUs is the intended operating
+point for this platform
 
 ## Capacity requirements
 
@@ -26,18 +27,43 @@ time.
 
 ## NVLink topology
 
-Confirm the mesh before starting the server:
+H20-3e provides NVLink 4.0. Confirm the mesh before starting the server:
 
 ```bash
 nvidia-smi topo -m
+nvidia-smi nvlink -s
 ```
 
-On the validated host every GPU pair reports `NV18`, an eighteen-link bonded
-NVLink connection, with no PCIe fallback anywhere in the matrix. GPUs 0-3 are
-attached to NUMA node 0 and GPUs 4-7 to NUMA node 1, but GPU-to-GPU collectives
-never traverse the host interconnect, so no `CUDA_VISIBLE_DEVICES` reordering
-is needed. Unlike PCIe-only platforms, device order does not affect throughput
-here.
+The validated host reports `NV18` between every GPU pair, with no PCIe
+fallback anywhere in the matrix:
+
+| GPU | GPU0 | GPU1 | GPU2 | GPU3 | GPU4 | GPU5 | GPU6 | GPU7 | NUMA |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |
+| GPU0 | X | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | 0 |
+| GPU1 | NV18 | X | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | 0 |
+| GPU2 | NV18 | NV18 | X | NV18 | NV18 | NV18 | NV18 | NV18 | 0 |
+| GPU3 | NV18 | NV18 | NV18 | X | NV18 | NV18 | NV18 | NV18 | 0 |
+| GPU4 | NV18 | NV18 | NV18 | NV18 | X | NV18 | NV18 | NV18 | 1 |
+| GPU5 | NV18 | NV18 | NV18 | NV18 | NV18 | X | NV18 | NV18 | 1 |
+| GPU6 | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | X | NV18 | 1 |
+| GPU7 | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | NV18 | X | 1 |
+
+| Resource | Measured value |
+| --- | ---: |
+| NVLink generation | 4.0 |
+| Links per GPU | 18 |
+| Link rate | 26.562 GB/s |
+| Unidirectional aggregate per GPU | 478 GB/s |
+| GPU-to-GPU path | NV18 on every pair |
+| NUMA | GPUs 0-3 on node 0, GPUs 4-7 on node 1 |
+
+GPU-to-GPU collectives stay on NVLink and never traverse the host
+interconnect. Unlike the PCIe-only RTX PRO 5000 recipe, no
+`CUDA_VISIBLE_DEVICES` reordering is needed on this mesh. Do not assume the
+same scaling on a host that reports anything other than `NV18` between every
+pair, or fewer than 18 links at 26.562 GB/s in `nvidia-smi nvlink -s`.
+
+
 
 ## Shared memory
 
