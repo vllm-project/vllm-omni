@@ -69,6 +69,18 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  # The supported Qwen3-Omni ModelOpt checkpoint quantizes the thinker only. Clear the
+  # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
+  # profile before vLLM performs its normal quantization auto-detection.
+  musa:
+    stages:
+      - stage_id: 1
+        hf_overrides:
+          quantization_config: null
+      - stage_id: 2
+        hf_overrides:
+          quantization_config: null
+
   npu:
     stages:
       - stage_id: 0

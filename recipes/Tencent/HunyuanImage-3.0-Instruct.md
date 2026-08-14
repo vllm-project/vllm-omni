@@ -82,7 +82,7 @@ example and the DiT sections below.
 - Optional environment variables:
 
 ```bash
-export CACHE_DIT_VERSION=1.3.0
+export CACHE_DIT_VERSION=1.5.0
 ```
 
 HunyuanImage-3.0 sets the diffusion attention backend to `TORCH_SDPA`

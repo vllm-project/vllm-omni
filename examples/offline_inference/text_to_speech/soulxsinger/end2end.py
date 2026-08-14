@@ -99,7 +99,7 @@ def extract_audio(outputs) -> tuple[np.ndarray, int]:
     out = outputs[0]
     mm = getattr(out, "multimodal_output", None)
     if mm is None:
-        ro = getattr(out, "request_output", None)
+        ro = out
         if ro is not None:
             mm = getattr(ro, "multimodal_output", None)
             if mm is None and ro.outputs:

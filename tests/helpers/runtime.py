@@ -2635,7 +2635,7 @@ class OmniRunner:
         # affects the test runner wrapper.
         init_timeout: int = 1800,
         log_stats: bool = False,
-        stage_configs_path: str | None = None,
+        deploy_config: str | None = None,
         **kwargs,
     ) -> None:
         startup_t0 = time.perf_counter()
@@ -2653,7 +2653,7 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            stage_configs_path=stage_configs_path,
+            deploy_config=deploy_config,
             **kwargs,
         )
         startup_s = time.perf_counter() - startup_t0
@@ -2938,9 +2938,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output.outputs[0].text
+                    text_content = stage_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.outputs[0].multimodal_output["audio"]
             result.audio_content = audio_content
             result.text_content = text_content
             result.success = True
@@ -3080,7 +3080,7 @@ class OmniRunnerHandler:
         mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                mm_out = stage_out.outputs[0].multimodal_output
                 break
         if mm_out is None:
             raise AssertionError("No audio output from pipeline")
@@ -3232,7 +3232,7 @@ def iter_omni_runner(
         model = model_prefix + model
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
+        with OmniRunner(model, seed=42, deploy_config=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")

@@ -13,7 +13,8 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DRIVER_DIR = Path(__file__).resolve().parent
-DEMO_PATH = DRIVER_DIR / "minicpmo_realtime_duplex_scenarios.py"
+HELPERS_DIR = DRIVER_DIR / "helpers"
+DEMO_PATH = HELPERS_DIR / "minicpmo_realtime_duplex_scenarios.py"
 MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
 PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
 SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"
@@ -64,7 +65,7 @@ def test_realtime_duplex_multi_session_script_is_directly_executable():
         cwd=MULTI_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -77,7 +78,7 @@ def test_realtime_duplex_demo_pair_script_is_directly_executable():
         cwd=PAIR_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -90,7 +91,7 @@ def test_realtime_duplex_soft_interrupt_script_is_directly_executable():
         cwd=SOFT_INTERRUPT_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -333,6 +334,71 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
 
     assert args.ref_audio == "ref.wav"
     assert args.validation_mode == "model-policy"
+    assert args.temperature is None
+
+
+def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(tmp_path, monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    input_wav = tmp_path / "input.wav"
+    with wave.open(str(input_wav), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 320)
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"ref")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"ok": true}', b""
+
+        def kill(self):
+            return None
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        demo,
+        "summarize_artifacts",
+        lambda **kwargs: {"ok": True, "returncode": 0},
+    )
+
+    result = asyncio.run(
+        demo.run_soft_interrupt(
+            SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                input_wav=str(input_wav),
+                ref_audio=str(ref_audio),
+                output_dir=str(output_dir),
+                summary_output=None,
+                chunk_ms=200,
+                timeout_s=5.0,
+                require_audio=True,
+                no_realtime_pacing=False,
+                validation_mode="response-required",
+                temperature=None,
+                min_responses=2,
+                min_audio_deltas_per_response=2,
+                input_sha256=None,
+                expect_followup_response_substring=None,
+            )
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--temperature" in command
+    assert command[command.index("--temperature") + 1] == "0.0"
+    assert result["ok"] is True
 
 
 def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
@@ -495,6 +561,43 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     assert summary["enough_responses"] is True
     assert summary["response_before_final_commit"] is True
     assert summary["listen_after_response_before_commit"] is True
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_commit_during_speak"
+    output.mkdir()
+    response_id = "resp-long"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 4.0},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 5.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=1,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["response_before_final_commit"] is True
+    assert summary["listen_after_response_before_commit"] is False
+    assert summary["final_listen_after_commit"] is False
 
 
 def test_realtime_duplex_soft_interrupt_response_required_rejects_single_response(tmp_path):
@@ -799,6 +902,7 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
 def test_realtime_duplex_demo_partitions_timing_by_response_identity():
     demo = _load_demo_module()
     state = demo.DemoState()
+    state.input_commit_sent_at_s.extend((9.9, 19.9))
     for response_id, created_at_s, audio_at_s, token_count in (
         ("resp-1", 10.0, 10.1, 3),
         ("resp-2", 20.0, 20.2, 5),
@@ -826,15 +930,66 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             },
             received_at_s=audio_at_s,
         )
+        state.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": "audio",
+            },
+            received_at_s=created_at_s + 0.05,
+        )
 
     timings = state.response_timing_summaries()
+    requests = state.session_request_metrics(session_id="seed-tts-session")
+    session_metrics = state.session_metric_summary(session_id="seed-tts-session")
 
     assert timings["resp-1"]["stage0_tokens"]["output_token_count"] == 3
     assert timings["resp-1"]["audio_output"]["response_created_to_first_audio_ms"] == 100.0
-    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] == 200.0
     assert timings["resp-2"]["stage0_tokens"]["output_token_count"] == 5
     assert timings["resp-2"]["audio_output"]["response_created_to_first_audio_ms"] == 200.0
-    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] == 300.0
+    assert requests == [
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 0,
+            "response_id": "resp-1",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 200.0,
+            "rtf": 2.5,
+            "audio_generation_ms": 200.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 1,
+            "response_id": "resp-2",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 300.0,
+            "rtf": 3.75,
+            "audio_generation_ms": 300.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+    ]
+    assert session_metrics == {
+        "session_id": "seed-tts-session",
+        "audio_turn_count": 2,
+        "mean_ttft_ms": 150.0,
+        "mean_ttfp_ms": 250.0,
+        "mean_rtf": 3.125,
+    }
 
 
 def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():

@@ -284,6 +284,37 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
 
 
+def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
+    """Ensure startup distilled LoRA options reach the online diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "--omni",
+            "--lora-backend",
+            "distill",
+            "--lora-path",
+            "/models/high.safetensors",
+            "/models/low.safetensors",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert explicit_kwargs["lora_backend"] == "distill"
+    assert engine_args["lora_backend"] == "distill"
+    assert engine_args["lora_path"] == [
+        "/models/high.safetensors",
+        "/models/low.safetensors",
+    ]
+
+
 def test_serve_cli_forwards_distributed_offload_residency():
     """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
@@ -447,12 +478,11 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._strip_single_engine_args = lambda kwargs: kwargs
 
     _, stage_configs = engine._resolve_stage_configs(
         "dummy-model",
         {
-            "stage_configs_path": "dummy.yaml",
+            "deploy_config": "dummy.yaml",
             "additional_config": {"torchair_graph_config": {"enabled": True}},
         },
         trust_remote_code=False,
@@ -485,12 +515,11 @@ def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(
     )
 
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._strip_single_engine_args = lambda kwargs: kwargs
 
     _, stage_configs = engine._resolve_stage_configs(
         "dummy-model",
         {
-            "stage_configs_path": "dummy.yaml",
+            "deploy_config": "dummy.yaml",
             "quantization_config": {"method": "bitsandbytes"},
         },
         trust_remote_code=False,

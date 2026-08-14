@@ -180,10 +180,10 @@ def create_mock_audio_output_for_test(
     audio_tensor = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, num_samples))
     mock_request_output = MockRequestOutput(request_id=request_id, audio_tensor=audio_tensor)
 
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        mock_request_output,
         stage_id=0,
         final_output_type="audio",
-        request_output=mock_request_output,
     )
 
 
@@ -680,7 +680,7 @@ class TestSpeechAPI:
 
     @pytest.mark.asyncio
     async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
-        """Test that extra_params are correctly applied to sampling_params_list in diffusion mode."""
+        """Test public diffusion speech success and extra_params propagation."""
         # Mock the engine client
         mock_engine = mocker.MagicMock()
 
@@ -704,7 +704,11 @@ class TestSpeechAPI:
 
         req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
 
-        await server._create_diffusion_speech(req)
+        response = await server.create_speech(req)
+
+        assert response.status_code == 200
+        assert response.media_type == "audio/wav"
+        assert response.body == b"dummy"
 
         # Verify generate was called
         mock_engine.generate.assert_called_once()
@@ -737,11 +741,66 @@ class TestTTSMethods:
         yield server
         server.shutdown()
 
+    def test_diffusion_audio_encode_speed_skips_ar_adapter(self, mocker: MockerFixture):
+        """Pure-diffusion speech keeps generic speed handling outside AR adapters."""
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+        )
+        resolve_adapter = mocker.patch.object(serving_speech_module, "resolve_adapter")
+
+        speed = server._audio_encode_speed(OpenAICreateSpeechRequest(input="Hello", speed=1.25))
+
+        assert speed == 1.25
+        resolve_adapter.assert_not_called()
+
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
         # Fixture creates server with stage_configs = [] -> _is_tts should be False
         assert speech_server._is_tts is False
         assert speech_server._tts_stage is None
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected_speed"),
+        [("indextts2_5", 1.0), ("qwen3_tts", 2.0)],
+    )
+    def test_audio_encode_speed_respects_adapter_native_control(
+        self,
+        speech_server,
+        model_type,
+        expected_speed,
+    ):
+        speech_server._tts_model_type = model_type
+        request = OpenAICreateSpeechRequest(input="Hello", speed=2.0)
+
+        assert speech_server._audio_encode_speed(request) == expected_speed
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_native_speed_skips_generic_audio_adjustment(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        speech_server._tts_model_type = "indextts2_5"
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(return_value=("speech-native-speed", mock_generate(), {})),
+        )
+        create_audio = mocker.patch.object(
+            speech_server,
+            "create_audio",
+            return_value=SimpleNamespace(audio_data=b"dummy", media_type="audio/wav"),
+        )
+
+        await speech_server._generate_audio_bytes(OpenAICreateSpeechRequest(input="Hello", speed=2.0))
+
+        audio_obj = create_audio.call_args.args[0]
+        assert isinstance(audio_obj, CreateAudio)
+        assert audio_obj.speed == 1.0
 
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
@@ -2178,17 +2237,17 @@ class TestStreamingProtocolValidation:
         assert req.is_streaming() is False
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format in ('pcm', 'wav') and speed=1.0."""
+        """The request schema validates formats; model-aware speed checks happen in serving."""
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+        request = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+        assert request.speed == 2.0
 
     def test_stream_format_audio_validation_errors(self):
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
+        request = OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
+        assert request.speed == 2.0
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted as SSE."""
@@ -2250,10 +2309,10 @@ class TestStreamingResponse:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 
@@ -2271,6 +2330,18 @@ class TestStreamingResponse:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        speech_server._tts_model_type = None
+        speech_server._adapter = None
+        speech_server._diffusion_mode = False
+        mocker.patch.object(speech_server, "_uses_native_speed_control", return_value=False)
+        mocker.patch.object(
+            speech_server,
+            "create_error_response",
+            side_effect=lambda message, **_: JSONResponse(
+                status_code=400,
+                content={"error": {"message": message}},
+            ),
+        )
 
         original_create_speech = speech_server.create_speech
         sig = signature(original_create_speech)
@@ -2285,6 +2356,7 @@ class TestStreamingResponse:
 
         app = FastAPI()
         app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        app.state.speech_server = speech_server
         return app
 
     @staticmethod
@@ -2392,6 +2464,39 @@ class TestStreamingResponse:
 
         assert response.status_code in (400, 422)
         assert "audio/" not in response.headers.get("content-type", "")
+
+    @pytest.mark.parametrize("stream_format", ["sse", "audio"])
+    def test_native_speed_control_accepts_streaming_speed(
+        self,
+        streaming_app,
+        mocker: MockerFixture,
+        stream_format: str,
+    ):
+        speech_server = streaming_app.state.speech_server
+        speech_server._tts_model_type = "indextts2_5"
+        speech_server._uses_native_speed_control.return_value = True
+
+        async def prepare(request, request_id=None, **kwargs):
+            del kwargs
+            generator = speech_server.engine_client.generate(prompt={}, request_id=request_id)
+            return request_id, generator, {"duration_factor": [1.0 / request.speed]}
+
+        mocker.patch.object(speech_server, "_prepare_speech_generation", side_effect=prepare)
+
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "input": "Hello",
+                "stream_format": stream_format,
+                "response_format": "pcm",
+                "speed": 2.0,
+            },
+        )
+
+        assert response.status_code == 200
+        expected_media_type = "text/event-stream" if stream_format == "sse" else "audio/pcm"
+        assert expected_media_type in response.headers["content-type"]
 
     @pytest.fixture
     def erroring_streaming_app(self, mocker: MockerFixture):
@@ -2614,6 +2719,18 @@ def test_streaming_speech_session_config_accepts_non_streaming_mode():
     config = StreamingSpeechSessionConfig(non_streaming_mode=True)
 
     assert config.non_streaming_mode is True
+
+
+def test_streaming_speech_session_config_scopes_native_speed_to_http():
+    with pytest.raises(
+        ValidationError,
+        match="native speed control is only available through HTTP streaming",
+    ):
+        StreamingSpeechSessionConfig(
+            stream_audio=True,
+            response_format="pcm",
+            speed=1.5,
+        )
 
 
 class TestAsyncOmniSupportedTasks:
@@ -3341,10 +3458,10 @@ class TestWAVStreaming:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 

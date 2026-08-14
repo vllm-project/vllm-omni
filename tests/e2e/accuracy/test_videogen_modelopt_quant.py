@@ -141,8 +141,8 @@ def _extract_frames(result) -> list[Image.Image]:
 
     if isinstance(result, list):
         result = result[0] if result else None
-    if isinstance(result, OmniRequestOutput) and result.is_pipeline_output and result.request_output is not None:
-        result = result.request_output
+    if isinstance(result, OmniRequestOutput) and result.is_pipeline_output and result is not None:
+        result = result
     images = getattr(result, "images", None)
     if not images:
         raise AssertionError("Pipeline output had no images")

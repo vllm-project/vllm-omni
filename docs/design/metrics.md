@@ -1,6 +1,6 @@
 # Prometheus Metrics Design
 
-This document describes how vLLM-Omni exposes Prometheus metrics for multi-stage pipelines, the constraints that shaped the design, and how the pipeline-level metrics coexist with upstream vLLM per-engine metrics. This iteration covers the text and audio surface; diffusion / image / video families land in a follow-up.
+This document describes how vLLM-Omni exposes Prometheus metrics for multi-stage pipelines, the constraints that shaped the design, and how the pipeline-level metrics coexist with upstream vLLM per-engine metrics.
 
 ## Objectives
 

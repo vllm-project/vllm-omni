@@ -123,18 +123,29 @@ def _legacy_detectors(tree: ast.AST) -> list[tuple[int, str]]:
     return found
 
 
-def _check(label: str, path: Path, actual: int, budget: int, sample: list[str], budget_name: str) -> list[str]:
+def _check(
+    label: str,
+    path: Path,
+    actual: int,
+    budget: int,
+    sample: list[str],
+    budget_name: str,
+    notices: list[str],
+) -> list[str]:
     if actual > budget:
         listing = "\n".join(f"      {line}" for line in sample)
         return [
             f"{path}: {actual} {label} exceeds the budget of {budget}.\n{listing}\n\n{_GUIDANCE}\n",
         ]
     if actual < budget:
-        return [
-            f"{path}: {actual} {label}, down from a budget of {budget}. "
-            f"Lower {budget_name} to {actual} in {Path(__file__).relative_to(REPO_ROOT)} "
-            f"so the ratchet holds the new ground.",
-        ]
+        # Progress is never a build failure. Removing branches is the goal, so a
+        # PR that does it must not hand-edit this file to stay green -- nor break
+        # `main` for everyone else when it merges from a stale base.
+        notices.append(
+            f"{path}: {actual} {label}, below the budget of {budget}. "
+            f"Lower {budget_name} to {actual} in "
+            f"{Path(__file__).relative_to(REPO_ROOT)} to hold the new ground."
+        )
     return []
 
 
@@ -152,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"check_tts_adapter: expected file not found: {path}", file=sys.stderr)
             return 1
 
+    notices: list[str] = []
     branches = _model_type_branches(ast.parse(serving_path.read_text()))
     detectors = _legacy_detectors(ast.parse(adapters_path.read_text()))
 
@@ -162,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         MAX_MODEL_TYPE_BRANCHES,
         [f"line {lineno}: {src}" for lineno, src in branches],
         "MAX_MODEL_TYPE_BRANCHES",
+        notices,
     )
     errors += _check(
         "unmigrated model types in LEGACY_TTS_DETECTORS",
@@ -170,8 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         MAX_LEGACY_DETECTORS,
         [f"line {lineno}: {name}" for lineno, name in detectors],
         "MAX_LEGACY_DETECTORS",
+        notices,
     )
 
+    for notice in notices:
+        print(f"check_tts_adapter: {notice}", file=sys.stderr)
     for error in errors:
         print(f"check_tts_adapter: {error}", file=sys.stderr)
     return 1 if errors else 0

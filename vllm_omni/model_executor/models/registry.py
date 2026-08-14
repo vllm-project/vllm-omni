@@ -176,6 +176,23 @@ _OMNI_MODELS = {
         "personaplex_code2wav",
         "PersonaPlexCode2Wav",
     ),
+    ## nemotron_voicechat (NVIDIA-NemotronLabs-VoiceChat-11B, full-duplex S2S;
+    ## 3-stage offline speech->speech pipeline: thinker/talker/code2wav)
+    "NemotronVoiceChatThinkerForConditionalGeneration": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_thinker",
+        "NemotronVoiceChatThinkerForConditionalGeneration",
+    ),
+    "NemotronVoiceChatTalkerForConditionalGeneration": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_talker",
+        "NemotronVoiceChatTalkerForConditionalGeneration",
+    ),
+    "NemotronVoiceChatCode2Wav": (
+        "nemotron_voicechat",
+        "nemotron_voicechat_code2wav",
+        "NemotronVoiceChatCode2Wav",
+    ),
     ## higgs-audio v2
     "HiggsAudioV2ForConditionalGeneration": (
         "higgs_audio_v2",
@@ -284,6 +301,12 @@ _OMNI_MODELS = {
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
     ),
+    ## dots.tts
+    "DotsTTSForConditionalGeneration": (
+        "dots_tts",
+        "dots_tts_talker",
+        "DotsTTSForConditionalGeneration",
+    ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
         "voxtral_tts",
@@ -365,6 +388,17 @@ _OMNI_MODELS = {
         "IndexTTS2TalkerForConditionalGeneration",
     ),
     "IndexTTS2S2MelDecoder": (
+        "indextts2",
+        "indextts2_s2mel_decoder",
+        "IndexTTS2S2MelDecoder",
+    ),
+    ## IndexTTS 2.5 (shared implementations, versioned HF config)
+    "IndexTTS25TalkerForConditionalGeneration": (
+        "indextts2",
+        "indextts2_talker",
+        "IndexTTS2TalkerForConditionalGeneration",
+    ),
+    "IndexTTS25S2MelDecoder": (
         "indextts2",
         "indextts2_s2mel_decoder",
         "IndexTTS2S2MelDecoder",
