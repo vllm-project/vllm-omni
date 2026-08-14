@@ -16,7 +16,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
-import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
+from vllm_omni.worker import sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     GPUARModelRunner,
@@ -303,11 +303,11 @@ def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests(
 
 
 def test_sparse_mm_req_ids_requires_sparse_audio_marker():
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"]}}) is None
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta.req_id": ["r1"]}) is None
 
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
-    assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
 
 
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
@@ -1256,12 +1256,12 @@ class TestPromptIdsClampPaddingConvention:
 
 
 class TestSparseAudioMarkerRobustness:
-    """RFC #5450 C3: `_is_sparse_audio_marker` must not crash on tensor/array
+    """RFC #5450 C3: `sparse_audio.is_sparse_audio_marker` must not crash on tensor/array
     markers, and the combined prefix-cache payload builder must never ship one
     request's data as another's."""
 
     def test_marker_list_and_str_forms(self):
-        marker = GPUARModelRunner._is_sparse_audio_marker
+        marker = sparse_audio.is_sparse_audio_marker
         assert marker(["1"]) is True
         assert marker(["0"]) is False
         assert marker("true") is True
@@ -1270,8 +1270,8 @@ class TestSparseAudioMarkerRobustness:
     def test_marker_enforced_canonical_forms_no_error(self):
         # The designed carrier (list-of-str; bare str accepted) and marker
         # absence (None) are the ONLY silent forms.
-        marker = GPUARModelRunner._is_sparse_audio_marker
-        with patch.object(ar_runner_module.logger, "error") as err:
+        marker = sparse_audio.is_sparse_audio_marker
+        with patch.object(sparse_audio.logger, "error") as err:
             assert marker(["1"]) is True
             assert marker(["0"]) is False
             assert marker(["0", "1"]) is True
@@ -1282,22 +1282,23 @@ class TestSparseAudioMarkerRobustness:
 
     def test_marker_illegal_carriers_raise_one_error_per_type(self):
         # Enforcement, not normalization: any carrier outside the design
-        # contract is a producer bug - it raises _InvalidSparseDeclaration
-        # (caught only by _resolve_sparse_mm_routing, which fails closed)
+        # contract is a producer bug - it raises InvalidSparseDeclaration
+        # (caught inside the module by resolve_sparse_mm_routing, which
+        # fails closed)
         # and logs at error level once per offending type. Interpreting
         # deviants would need a second truth predicate, and predicate
         # divergence is exactly how the np.array(["0"])-routes-as-sparse bug
         # happened.
-        marker = GPUARModelRunner._is_sparse_audio_marker
+        marker = sparse_audio.is_sparse_audio_marker
         for value in (torch.tensor(1), torch.tensor([1, 1]), np.array(["1"]), 1, 1.0, True, ["1", 1]):
             with (
-                patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()),
-                patch.object(ar_runner_module.logger, "error") as err,
+                patch.object(sparse_audio, "_logged_offenders", set()),
+                patch.object(sparse_audio.logger, "error") as err,
             ):
-                with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                with pytest.raises(sparse_audio.InvalidSparseDeclaration):
                     marker(value)
                 assert err.call_count == 1, f"expected one error for {value!r}"
-                with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+                with pytest.raises(sparse_audio.InvalidSparseDeclaration):
                     marker(value)
                 assert err.call_count == 1  # deduped per type, not per step
 
@@ -1306,11 +1307,11 @@ class TestSparseAudioMarkerRobustness:
         # can never introduce a D2H sync here. Meta tensors hold no data -
         # any read (`.item()`/`bool()`) raises a RuntimeError, so seeing OUR
         # exception type (not RuntimeError) proves the data is never touched.
-        marker = GPUARModelRunner._is_sparse_audio_marker
-        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
-            with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+        marker = sparse_audio.is_sparse_audio_marker
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            with pytest.raises(sparse_audio.InvalidSparseDeclaration):
                 marker(torch.ones((), device="meta"))
-            with pytest.raises(ar_runner_module._InvalidSparseDeclaration):
+            with pytest.raises(sparse_audio.InvalidSparseDeclaration):
                 marker(torch.ones(3, device="meta"))
 
     def test_invalid_marker_fails_closed_at_routing(self):
@@ -1319,8 +1320,8 @@ class TestSparseAudioMarkerRobustness:
         # batch-index-assign its payloads to the WRONG requests. Routing
         # must fail closed: no payload routed for the step (empty sparse
         # set), never dense misrouting.
-        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
-            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
                 engine_output_type="audio",
                 req_ids_output_copy=["r0", "r1"],
                 downstream_req_ids=["r0", "r1"],
@@ -1336,8 +1337,8 @@ class TestSparseAudioMarkerRobustness:
     def test_sparse_marker_with_unusable_req_ids_fails_closed(self):
         # The marker says "sparse" but the alignment list is unusable - the
         # declaration as a whole is out of contract; same fail-closed shape.
-        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
-            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
                 engine_output_type="audio",
                 req_ids_output_copy=["r0"],
                 downstream_req_ids=["r0"],
@@ -1351,8 +1352,8 @@ class TestSparseAudioMarkerRobustness:
         # The flattened-encoding fallback must not ERASE the nested marker
         # (which used to silently demote the declaration to dense); this is
         # an unusable-req_id invalid declaration -> fail closed.
-        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
-            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
                 engine_output_type="audio",
                 req_ids_output_copy=["r0"],
                 downstream_req_ids=["r0"],
@@ -1364,8 +1365,8 @@ class TestSparseAudioMarkerRobustness:
     def test_invalid_marker_on_non_audio_pipeline_keeps_dense_routing(self):
         # Non-audio pipelines never consult sparse routing; the carrier
         # error is logged by the classifier but routing is unaffected.
-        with patch.object(GPUARModelRunner, "_non_canonical_marker_types_logged", set()):
-            downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
                 engine_output_type="latent",
                 req_ids_output_copy=["r0", "r1"],
                 downstream_req_ids=["r0", "r1"],
@@ -1375,7 +1376,7 @@ class TestSparseAudioMarkerRobustness:
         assert is_sparse is False
 
     def test_legal_marker_still_routes_sparse(self):
-        downstream, index, is_sparse = GPUARModelRunner._resolve_sparse_mm_routing(
+        downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
             engine_output_type="audio",
             req_ids_output_copy=["r0", "r1", "r2"],
             downstream_req_ids=["r0", "r1", "r2"],

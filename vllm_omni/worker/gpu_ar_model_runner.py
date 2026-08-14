@@ -56,6 +56,7 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
 
@@ -294,18 +295,6 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class _InvalidSparseDeclaration(ValueError):
-    """Sparse-audio metadata is PRESENT but out of contract (illegal marker
-    carrier, or marker set with an unusable ``meta.req_id``).
-
-    Private control signal: raised by the marker classifier / req-id
-    resolver and caught by the SINGLE routing call site
-    (`GPUARModelRunner._resolve_sparse_mm_routing`), which fails closed.
-    Must never escape the runner - v1 does not catch per-request exceptions,
-    so an uncaught escape would take down the stage.
-    """
-
-
 class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive GPU model runner that returns hidden states per request.
 
@@ -506,140 +495,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
-    @staticmethod
-    def _sparse_mm_req_ids(multimodal_outputs: Any) -> list[str] | None:
-        """Resolve the sparse request-id list.
-
-        Returns the request-id list when a legal sparse declaration is
-        present, and ``None`` when there is no sparse declaration (dense).
-        Raises `_InvalidSparseDeclaration` when the declaration is present
-        but out of contract (illegal marker carrier, or marker set with an
-        unusable ``meta.req_id``) - only `_resolve_sparse_mm_routing` may
-        call this; it catches the error and fails closed.
-        """
-        if not isinstance(multimodal_outputs, dict):
-            return None
-        meta = multimodal_outputs.get("meta")
-        req_ids = None
-        sparse_audio = False
-        if isinstance(meta, dict):
-            req_ids = meta.get("req_id")
-            sparse_audio = GPUARModelRunner._is_sparse_audio_marker(meta.get("sparse_audio"))
-        if req_ids is None:
-            req_ids = multimodal_outputs.get("meta.req_id")
-            # The flattened encoding must never ERASE a nested declaration:
-            # `{"meta": {"sparse_audio": ["1"]}}` with `req_id` missing used
-            # to have its marker overwritten by the absent flat marker and
-            # fall back to DENSE routing. Combine truthy-over-absent instead
-            # (an illegal carrier on either side raises out of the classify
-            # call - invalid wins over everything), so a nested marker with
-            # no usable req_id reaches the unusable-req_id path below.
-            flat_marker = GPUARModelRunner._is_sparse_audio_marker(multimodal_outputs.get("meta.sparse_audio"))
-            sparse_audio = sparse_audio or flat_marker
-        if not sparse_audio:
-            return None
-        if not isinstance(req_ids, list) or not all(isinstance(rid, str) for rid in req_ids):
-            dedup_key = f"req_id:{type(req_ids).__name__}"
-            if dedup_key not in GPUARModelRunner._non_canonical_marker_types_logged:
-                GPUARModelRunner._non_canonical_marker_types_logged.add(dedup_key)
-                logger.error(
-                    "Sparse-audio marker is set but meta.req_id is unusable (%s; must be a list of "
-                    "request-id strings). Failing closed.",
-                    type(req_ids).__name__,
-                )
-            raise _InvalidSparseDeclaration(
-                f"sparse marker set but meta.req_id is unusable: {type(req_ids).__name__}"
-            )
-        return list(req_ids)
-
-    @staticmethod
-    def _resolve_sparse_mm_routing(
-        *,
-        engine_output_type: str,
-        req_ids_output_copy: list[str],
-        downstream_req_ids: list[str],
-        multimodal_outputs: Any,
-    ) -> tuple[list[str], dict[str, int], bool]:
-        try:
-            sparse_mm_req_ids = GPUARModelRunner._sparse_mm_req_ids(multimodal_outputs)
-        except _InvalidSparseDeclaration:
-            if engine_output_type != "audio":
-                # Non-audio pipelines never consult sparse routing; the
-                # carrier error is already logged by the classifier.
-                return downstream_req_ids, {}, False
-            # FAIL CLOSED: a present-but-invalid sparse declaration most
-            # likely belongs to a producer that INTENDED sparse output;
-            # routing it as dense would batch-index-assign its payloads to
-            # the WRONG requests. Route no payload for this step instead -
-            # a visible, bounded gap rather than silent cross-request
-            # corruption. (Empty-sparse is an already-exercised path: the
-            # zero-audio sparse step ships req_id=[] through the same shape.)
-            if "routing-failed-closed" not in GPUARModelRunner._non_canonical_marker_types_logged:
-                GPUARModelRunner._non_canonical_marker_types_logged.add("routing-failed-closed")
-                logger.error(
-                    "Invalid sparse-audio declaration: failing closed - no multimodal payload is "
-                    "routed for the affected step(s). Fix the emitting model."
-                )
-            return [], {}, True
-        sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
-        if engine_output_type != "audio" or sparse_mm_req_ids is None:
-            return downstream_req_ids, sparse_mm_index, False
-
-        sparse_req_id_set = set(sparse_mm_req_ids)
-        sparse_downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
-        return sparse_downstream_req_ids, sparse_mm_index, True
-
-    # The DESIGNED marker carrier: a list of strings (e.g. `["1"]`; bare str
-    # also accepted). Truthiness of a string item:
-    _SPARSE_MARKER_TRUTHY = ("1", "true", "yes", "on")
-    # Per-process dedup so a broken producer logs once per offending type,
-    # not once per step:
-    _non_canonical_marker_types_logged: set[str] = set()
-
-    @staticmethod
-    def _is_sparse_audio_marker(value: Any) -> bool:
-        """Classify a ``meta.sparse_audio`` marker.
-
-        The carrier form is ENFORCED, not normalized. The design contract is
-        a list of strings (e.g. ``["1"]`` — what every in-tree producer
-        emits, and the form whose length-1 broadcast the prefix-cache merge
-        relies on); a bare string is also accepted. Legal carriers evaluate
-        against the literal truthy set (``None`` input means "marker absent"
-        → ``False``).
-
-        An ILLEGAL carrier (tensors, arrays, numbers, lists with non-string
-        items) is a producer bug: logged at error level once per offending
-        type, then raised as `_InvalidSparseDeclaration`, which the single
-        routing call site catches to FAIL CLOSED — a present-but-invalid
-        marker most likely belongs to a producer that intended sparse
-        output, and reading it as dense would misassign payloads across
-        requests. Deviant carriers are never read element-wise, so a device
-        tensor can never introduce a D2H sync here.
-
-        Why enforce instead of tolerate: interpreting deviant carriers needs
-        a second truth predicate, and predicate divergence is exactly how
-        `np.array(["0"])` came to route as sparse while `["0"]` routed as
-        dense; per the series' Policy A the runner<->model interface owes no
-        tolerance shim. The planned single sparse-protocol definition
-        (model-state series) turns this into a typed bool at one adapter
-        site.
-        """
-        if value is None:
-            return False
-        truthy = GPUARModelRunner._SPARSE_MARKER_TRUTHY
-        if isinstance(value, str):
-            return value.lower() in truthy
-        if isinstance(value, list) and all(isinstance(item, str) for item in value):
-            return any(item.lower() in truthy for item in value)
-        vtype = type(value).__name__
-        if vtype not in GPUARModelRunner._non_canonical_marker_types_logged:
-            GPUARModelRunner._non_canonical_marker_types_logged.add(vtype)
-            logger.error(
-                'Illegal sparse-audio marker of type %s: the marker MUST be a list of strings (e.g. ["1"]). '
-                "The emitting model is out of contract; routing fails closed for the affected step(s).",
-                vtype,
-            )
-        raise _InvalidSparseDeclaration(f"illegal sparse-audio marker carrier: {vtype}")
 
     def capture_model(self) -> int:
         result = super().capture_model()
@@ -2113,7 +1968,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         combined_multimodal_outputs = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
-        downstream_req_ids, sparse_mm_index, audio_sparse_output = self._resolve_sparse_mm_routing(
+        downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
             downstream_req_ids=downstream_req_ids,
