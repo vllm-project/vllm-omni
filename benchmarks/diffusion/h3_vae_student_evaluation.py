@@ -82,6 +82,8 @@ def _run(
     runs: int,
 ) -> tuple[torch.Tensor, list[float], float]:
     for _ in range(warmups):
+        # Decoder artifacts are allowed to mutate their input; isolate every
+        # offline measurement so both artifacts always receive identical data.
         runner(latent.clone())
     if latent.device.type != "cpu":
         torch.accelerator.reset_peak_memory_stats()
@@ -92,13 +94,21 @@ def _run(
         started = time.perf_counter()
         output = runner(latent.clone())
         _sync(latent.device)
-        durations.append(time.perf_counter() - started)
+        duration = time.perf_counter() - started
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError(f"decoder produced invalid measured duration: {duration}")
+        durations.append(duration)
     if not isinstance(output, torch.Tensor):
         raise TypeError(f"decoder returned {type(output).__name__}; expected torch.Tensor")
     peak_mb = 0.0
     if latent.device.type != "cpu":
         peak_mb = float(torch.accelerator.max_memory_reserved()) / (1024**2)
-    return output.detach().float().cpu(), durations, peak_mb
+    output = output.detach().float().cpu()
+    if not torch.isfinite(output).all():
+        raise ValueError("decoder output contains NaN or Infinity")
+    if not math.isfinite(peak_mb) or peak_mb < 0:
+        raise ValueError(f"decoder produced invalid peak memory: {peak_mb}")
+    return output, durations, peak_mb
 
 
 def evaluate(
@@ -110,6 +120,12 @@ def evaluate(
     runs: int,
     data_range: float,
 ) -> dict[str, Any]:
+    if runs < 1 or warmups < 0:
+        raise ValueError("runs must be >= 1 and warmups must be >= 0")
+    if not math.isfinite(data_range) or data_range <= 0:
+        raise ValueError("data_range must be finite and greater than zero")
+    if not torch.isfinite(latent).all():
+        raise ValueError("latent contains NaN or Infinity")
     reference_output, reference_times, reference_peak = _run(
         _load_runner(reference), latent, warmups=warmups, runs=runs
     )
@@ -121,10 +137,17 @@ def evaluate(
             f"student output shape mismatch: reference={tuple(reference_output.shape)}, "
             f"candidate={tuple(candidate_output.shape)}"
         )
-    delta = reference_output - candidate_output
+    if reference_output.numel() == 0:
+        raise ValueError("decoder output must not be empty")
+    delta = reference_output.double() - candidate_output.double()
     mse = float(torch.mean(delta.square()))
+    mae = float(torch.mean(delta.abs()))
+    max_abs = float(torch.max(delta.abs()))
+    if not all(math.isfinite(metric) for metric in (mse, mae, max_abs)):
+        raise ValueError("decoder comparison produced a non-finite quality metric")
     reference_median = statistics.median(reference_times)
     candidate_median = statistics.median(candidate_times)
+    exact_match = mse == 0
     return {
         "latent_shape": list(latent.shape),
         "output_shape": list(reference_output.shape),
@@ -134,9 +157,10 @@ def evaluate(
         "reference_peak_memory_mb": reference_peak,
         "candidate_peak_memory_mb": candidate_peak,
         "mse": mse,
-        "mae": float(torch.mean(delta.abs())),
-        "max_abs": float(torch.max(delta.abs())),
-        "psnr_db": math.inf if mse == 0 else 10 * math.log10((data_range**2) / mse),
+        "mae": mae,
+        "max_abs": max_abs,
+        "exact_match": exact_match,
+        "psnr_db": None if exact_match else 10 * math.log10((data_range**2) / mse),
     }
 
 
@@ -159,6 +183,11 @@ def main() -> int:
     args = parse_args()
     if args.runs < 1 or args.warmups < 0:
         raise ValueError("--runs must be >= 1 and --warmups must be >= 0")
+    for name in ("data_range", "min_psnr_db", "min_decoder_speedup"):
+        if not math.isfinite(float(getattr(args, name))):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    if args.data_range <= 0 or args.min_decoder_speedup < 0:
+        raise ValueError("--data-range must be > 0 and --min-decoder-speedup must be >= 0")
     reference = DecoderArtifact.load(args.reference_manifest)
     candidate = DecoderArtifact.load(args.candidate_manifest)
     latent = torch.load(args.latent, map_location=args.device, weights_only=True)
@@ -173,14 +202,14 @@ def main() -> int:
         data_range=args.data_range,
     )
     failures = []
-    if report["psnr_db"] < args.min_psnr_db:
+    if not report["exact_match"] and report["psnr_db"] < args.min_psnr_db:
         failures.append(f"PSNR {report['psnr_db']:.3f} dB is below {args.min_psnr_db:.3f} dB")
     if report["decoder_speedup"] < args.min_decoder_speedup:
         failures.append(f"decoder speedup {report['decoder_speedup']:.3f}x is below {args.min_decoder_speedup:.3f}x")
     report["gate_failures"] = failures
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, allow_nan=True), encoding="utf-8")
-    print(json.dumps(report, indent=2, allow_nan=True))
+    args.output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    print(json.dumps(report, indent=2, allow_nan=False))
     return 1 if failures else 0
 
 

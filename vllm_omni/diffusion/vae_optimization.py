@@ -268,10 +268,19 @@ def _install_component_observability(pipeline: Any) -> None:
 
 
 def _latent_sha256(latent: torch.Tensor) -> str:
-    """Fingerprint the exact diagnostic input without changing its dtype."""
+    """Fingerprint canonical tensor metadata and bytes for diagnostics."""
 
     payload = latent.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
-    return hashlib.sha256(payload).hexdigest()
+    metadata = json.dumps(
+        {"dtype": str(latent.dtype), "shape": list(latent.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    digest = hashlib.sha256()
+    digest.update(metadata)
+    digest.update(b"\0")
+    digest.update(payload)
+    return digest.hexdigest()
 
 
 def _install_decode_metadata_wrapper(
@@ -289,6 +298,9 @@ def _install_decode_metadata_wrapper(
         nonlocal calls
         cold = calls == 0
         calls += 1
+        # Capture the exact decoder input before any model or fallback path has
+        # a chance to mutate a caller-owned tensor.
+        latent_sha256 = _latent_sha256(latent)
         result = method(latent, *args, **kwargs)
         controller = getattr(pipeline, "_vae_stack_tiling_controller", None)
         stack_state = getattr(controller, "last_decision", None) or {
@@ -296,6 +308,7 @@ def _install_decode_metadata_wrapper(
             "tile_count": None,
             "decision": "disabled",
             "fallback": False,
+            "fallback_count": 0,
         }
         remote_model = getattr(video_vae, "model", None)
         ratio = int(getattr(remote_model, "vae_ratio", 1))
@@ -303,7 +316,7 @@ def _install_decode_metadata_wrapper(
             "component": "video_vae",
             "event": "decode",
             "latent_shape": list(latent.shape),
-            "latent_sha256": _latent_sha256(latent),
+            "latent_sha256": latent_sha256,
             "resolution": [int(latent.shape[-2]) * ratio, int(latent.shape[-1]) * ratio],
             "frame_count": int(result.shape[-3]) if isinstance(result, torch.Tensor) and result.ndim == 5 else None,
             "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
@@ -314,6 +327,7 @@ def _install_decode_metadata_wrapper(
             "tile_count": stack_state["tile_count"],
             "decision": stack_state["decision"],
             "fallback": bool(stack_state["fallback"]),
+            "fallback_count": int(stack_state["fallback_count"]),
             "cold": cold,
         }
         pipeline._vae_last_diagnostics = diagnostics
@@ -325,18 +339,47 @@ def _install_decode_metadata_wrapper(
 
 
 class _StackedTileController:
-    """Select stacked tiles per request and retry sequentially on failure."""
+    """Select stacked tiles and retry only pre-collective allocation failures."""
 
     _MIN_FREE_BYTES = 2 * 1024**3
 
-    def __init__(self, pipeline: Any, video_vae: Any, mode: VaeMode) -> None:
-        self.pipeline = pipeline
+    def __init__(self, video_vae: Any, mode: VaeMode) -> None:
         self.video_vae = video_vae
         self.remote_model = video_vae.model
         self.mode = mode
-        self.calls = 0
         self.fallbacks = 0
+        self._collective_entries = 0
+        self._collective_marker_available = False
         self.last_decision: dict[str, Any] | None = None
+
+    def _install_collective_marker(self) -> None:
+        """Track whether a decode entered tile communication before failing.
+
+        Replaying a decode after a collective has started is unsafe: peers may
+        have completed a different number of collectives and NCCL may already
+        have marked the process group unusable.  The marker lets allocation
+        failures that happened strictly before communication retry locally,
+        while collective and other runtime failures propagate to the worker's
+        normal request/process cleanup path.
+        """
+
+        collective = getattr(self.remote_model, "_all_gather_tiled_results", None)
+        if not callable(collective):
+            return
+        if getattr(collective, "_vllm_omni_vae_collective_marker", False):
+            # A previously configured controller already marks this method.
+            # Treat it as unavailable to this controller: its private counter
+            # cannot prove where this request failed, so an OOM must propagate.
+            return
+
+        @functools.wraps(collective)
+        def marked_collective(*args: Any, **kwargs: Any) -> Any:
+            self._collective_entries += 1
+            return collective(*args, **kwargs)
+
+        marked_collective._vllm_omni_vae_collective_marker = True  # type: ignore[attr-defined]
+        self.remote_model._all_gather_tiled_results = marked_collective
+        self._collective_marker_available = True
 
     def _tile_count(self, latent: torch.Tensor) -> int:
         ratio = int(self.remote_model.vae_ratio)
@@ -380,21 +423,24 @@ class _StackedTileController:
         return True, tile_count, "validated"
 
     def wrap(self) -> None:
+        self._install_collective_marker()
         original = self.video_vae.decode_latent
 
         @functools.wraps(original)
         def decode_with_stacked_tiles(latent: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
             stack, tile_count, decision = self.should_stack(latent)
-            previous = bool(self.remote_model.stack_tiling)
-            self.calls += 1
+            previous = self.remote_model.stack_tiling
             self.remote_model.stack_tiling = stack
             fallback = False
-            result = None
+            collective_entries_before = self._collective_entries
             try:
                 try:
-                    result = original(latent, *args, **kwargs)
-                except (RuntimeError, torch.OutOfMemoryError) as exc:
-                    if not stack:
+                    return original(latent, *args, **kwargs)
+                except torch.OutOfMemoryError as exc:
+                    parallel_size = max(1, int(getattr(self.video_vae, "parallel_size", 1)))
+                    collective_started = self._collective_entries != collective_entries_before
+                    can_prove_pre_collective = parallel_size == 1 or self._collective_marker_available
+                    if not stack or collective_started or not can_prove_pre_collective:
                         raise
                     fallback = True
                     self.fallbacks += 1
@@ -405,8 +451,7 @@ class _StackedTileController:
                         "Stacked VAE tiles failed (%s); retrying this request with sequential tiles.",
                         exc,
                     )
-                    result = original(latent, *args, **kwargs)
-                return result
+                    return original(latent, *args, **kwargs)
             finally:
                 self.remote_model.stack_tiling = previous
                 self.last_decision = {
@@ -414,8 +459,9 @@ class _StackedTileController:
                     "tile_count": tile_count,
                     "decision": decision,
                     "fallback": fallback,
+                    "fallback_count": self.fallbacks,
                 }
-                logger.info(
+                logger.debug(
                     "VAE stacked-tile decision: %s",
                     json.dumps(self.last_decision, separators=(",", ":")),
                 )
@@ -438,8 +484,10 @@ def configure_vae_runtime(pipeline: nn.Module, config: Any) -> ResolvedVaeOptimi
             if settings.stack_tiling == "true":
                 raise ValueError(f"video VAE is missing stacked-tile runtime attributes: {', '.join(missing)}")
             logger.info("VAE stacked tiling auto mode unavailable at runtime; using sequential tiles (%s).", missing)
+        elif getattr(getattr(video_vae, "decode_latent", None), "_vllm_omni_stack_tiling", False):
+            logger.debug("VAE stacked tiling is already configured; skipping duplicate wrapper installation.")
         else:
-            controller = _StackedTileController(pipeline, video_vae, settings.stack_tiling)
+            controller = _StackedTileController(video_vae, settings.stack_tiling)
             controller.wrap()
             pipeline._vae_stack_tiling_controller = controller
 

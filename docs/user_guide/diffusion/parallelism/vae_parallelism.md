@@ -197,10 +197,13 @@ vllm serve /path/to/MiniMax-H3/FL2VA \
 Both stacked-tile `auto` and explicit `true` validate the latent shape, ensure
 that each VAE rank has at least two tiles, and check accelerator memory
 headroom. An explicit request still takes the sequential path when a particular
-request shape or the available memory cannot safely use stacking. A stacked decode
-failure clears the failed allocation and retries sequentially for that request.
-The original tile mode is restored in a `finally` block, so subsequent requests
-do not inherit failed state.
+request shape or the available memory cannot safely use stacking. A stacked
+allocation failure that occurs before tile communication starts
+clears the failed allocation and retries sequentially for that request. Errors
+after a collective has started are not replayed on the same process group;
+they propagate to the worker cleanup/restart path because ranks may otherwise
+execute different collective sequences. The original tile mode is restored in
+a `finally` block, so subsequent requests do not inherit local wrapper state.
 
 VAE compilation is limited to repeated `TransformerBlock` regions of the H3
 video decoder. Audio VAE and tiling control flow remain eager. Each shape bucket
@@ -212,8 +215,9 @@ the qualified VAE regions.
 
 ## MiniMax-H3 Qualification
 
-Enable `diagnostic` to return component stage durations without adding profiler
-synchronization to the normal `safe` or `optimized` serving paths:
+Enable `diagnostic`, or explicitly add `--enable-diffusion-pipeline-profiler`
+to a `safe`/`optimized` qualification server, to return component stage
+durations without adding profiler synchronization to normal production paths:
 
 ```bash
 vllm serve /path/to/MiniMax-H3/FL2VA \
@@ -243,11 +247,17 @@ the safe reference and candidate. The qualification tool records cold/first and
 warm latency, component/VAE time, end-to-end time, peak memory, media hashes,
 video PSNR, audio MAE, and a post-run recovery request:
 
+Start both qualification servers with `--enable-diffusion-pipeline-profiler` so
+the safe and candidate reports contain request-scoped component timings and
+per-rank latent fingerprints. Keep this flag off for production measurements
+after a profile is qualified.
+
 ```bash
 # Run against the safe server first.
 python benchmarks/diffusion/vae_optimization_benchmark.py \
     --profile-name safe \
     --output-dir /tmp/h3-vae-safe \
+    --server-log /path/to/safe-server.log \
     --runs 3
 
 # Restart with the candidate profile, then compare against the safe report.
@@ -284,9 +294,11 @@ column as a tile seam.
 When both reports contain component timings, the report also computes VAE
 share, VAE speedup, Amdahl-predicted end-to-end speedup, and observed
 end-to-end speedup. This prevents a large decoder-only percentage from being
-presented as the total serving gain. When diagnostic logs are supplied for both
-runs, differing latent fingerprints fail qualification before output quality is
-interpreted.
+presented as the total serving gain. Each request captures its own diagnostic
+log suffix. When a reference report is used, both reports must contain complete
+per-rank fingerprints for the exact formal media runs being compared; missing
+or differing fingerprints fail qualification before output quality is
+interpreted. Different latent-producing request settings are also rejected.
 
 For Ref2VA, add `--task ref2va --input-reference /path/to/image-or-video`;
 repeat `--input-reference` for mixed/multiple references and optionally pass
@@ -295,8 +307,9 @@ inputs.
 
 Qualification must cover FL2VA and Ref2VA at every release-gated
 resolution/duration. Include offload on/off, VAE group sizes, cold/first/warm,
-tile seams, audio/video synchronization, and forced compile/OOM/collective
-failure recovery. Do not promote `optimized` merely because startup succeeds.
+tile seams, audio/video synchronization, pre-collective OOM fallback, and
+collective failure cleanup/restart. Do not promote `optimized` merely because
+startup succeeds.
 
 ### Decoder student research track
 

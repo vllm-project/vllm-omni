@@ -16,7 +16,7 @@ import mimetypes
 import re
 import statistics
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,8 @@ class RunResult:
     peak_memory_mb: float
     media_path: str
     sha256: str
+    rank_timings: dict[str, Any] = field(default_factory=dict)
+    vae_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def _json_header(response: httpx.Response, name: str) -> dict[str, float]:
@@ -41,7 +43,11 @@ def _json_header(response: httpx.Response, name: str) -> dict[str, float]:
     if not value:
         return {}
     parsed = json.loads(value)
-    return {str(key): float(duration) for key, duration in parsed.items()}
+    result = {str(key): float(duration) for key, duration in parsed.items()}
+    invalid = {key: duration for key, duration in result.items() if not math.isfinite(duration) or duration < 0}
+    if invalid:
+        raise ValueError(f"{name} contains invalid durations: {invalid}")
+    return result
 
 
 def _request(
@@ -83,14 +89,20 @@ def _request(
     elapsed = time.perf_counter() - started
     response.raise_for_status()
     output_path.write_bytes(response.content)
+    inference_s = float(response.headers.get("x-inference-time-s", elapsed))
+    peak_memory_mb = float(response.headers.get("x-peak-memory-mb", 0.0))
+    if not math.isfinite(inference_s) or inference_s <= 0:
+        raise ValueError(f"response contains invalid inference time: {inference_s}")
+    if not math.isfinite(peak_memory_mb) or peak_memory_mb < 0:
+        raise ValueError(f"response contains invalid peak memory: {peak_memory_mb}")
     return RunResult(
         index=index,
         cold=index == 0,
         http_status=response.status_code,
         end_to_end_s=elapsed,
-        inference_s=float(response.headers.get("x-inference-time-s", elapsed)),
+        inference_s=inference_s,
         stage_durations=_json_header(response, "x-stage-durations"),
-        peak_memory_mb=float(response.headers.get("x-peak-memory-mb", 0.0)),
+        peak_memory_mb=peak_memory_mb,
         media_path=str(output_path),
         sha256=hashlib.sha256(response.content).hexdigest(),
     )
@@ -106,23 +118,36 @@ def _decode_media(path: str) -> tuple[Any, Any, float, int]:
     video_frames = []
     audio_frames = []
     with av.open(path) as container:
+        if not container.streams.video:
+            raise ValueError(f"{path} has no video stream")
         video_rate = float(container.streams.video[0].average_rate or 0)
         for frame in container.decode(video=0):
             video_frames.append(frame.to_ndarray(format="rgb24"))
     with av.open(path) as container:
-        audio_rate = int(container.streams.audio[0].rate) if container.streams.audio else 0
-        if container.streams.audio:
-            for frame in container.decode(audio=0):
-                samples = frame.to_ndarray()
-                if samples.ndim == 1:
-                    samples = samples[None, :]
-                audio_frames.append(samples)
+        if not container.streams.audio:
+            raise ValueError(f"{path} has no audio stream")
+        audio_rate = int(container.streams.audio[0].rate)
+        for frame in container.decode(audio=0):
+            samples = frame.to_ndarray()
+            if samples.ndim == 1:
+                samples = samples[None, :]
+            audio_frames.append(samples)
+    if not video_frames or not audio_frames or video_rate <= 0 or audio_rate <= 0:
+        raise ValueError(f"{path} contains empty media or invalid stream rates")
     video = np.stack(video_frames).astype(np.float32)
-    audio = np.concatenate(audio_frames, axis=-1).astype(np.float32) if audio_frames else np.empty((0, 0))
+    audio = np.concatenate(audio_frames, axis=-1).astype(np.float32)
+    if not np.isfinite(video).all() or not np.isfinite(audio).all():
+        raise ValueError(f"{path} contains non-finite decoded samples")
     return video, audio, video_rate, audio_rate
 
 
 def _tile_boundaries(length: int, tile_size: int, overlap_min: int, vae_ratio: int) -> list[int]:
+    if length <= 0 or tile_size <= 0 or vae_ratio <= 0:
+        raise ValueError("length, tile_size, and vae_ratio must be positive")
+    if overlap_min < 0 or overlap_min >= tile_size:
+        raise ValueError("overlap_min must satisfy 0 <= overlap_min < tile_size")
+    if any(value % vae_ratio for value in (length, tile_size, overlap_min)):
+        raise ValueError("length, tile_size, and overlap_min must be divisible by vae_ratio")
     if tile_size >= length:
         return []
     count = math.ceil(length / tile_size)
@@ -148,7 +173,7 @@ def compare_media(
     decoder_tile_overlap_min: int = 64,
     vae_ratio: int = 16,
     seam_band_width: int = 4,
-) -> dict[str, float | int | list[int]]:
+) -> dict[str, Any]:
     import numpy as np
 
     ref_video, ref_audio, ref_video_rate, ref_audio_rate = _decode_media(reference)
@@ -162,10 +187,10 @@ def compare_media(
             "media rate mismatch: "
             f"reference={(ref_video_rate, ref_audio_rate)}, candidate={(cand_video_rate, cand_audio_rate)}"
         )
-    video_delta = ref_video - cand_video
+    video_delta = ref_video.astype(np.float64) - cand_video.astype(np.float64)
     video_abs = np.abs(video_delta)
     video_mse = float(np.mean(video_delta**2))
-    audio_delta = ref_audio - cand_audio
+    audio_delta = ref_audio.astype(np.float64) - cand_audio.astype(np.float64)
     video_duration_s = float(ref_video.shape[0]) / ref_video_rate if ref_video_rate else 0.0
     audio_duration_s = float(ref_audio.shape[-1]) / ref_audio_rate if ref_audio_rate and ref_audio.size else 0.0
     spatial_error = np.mean(video_abs, axis=(0, 3))
@@ -178,17 +203,22 @@ def compare_media(
         seam_mask[:, max(0, boundary - seam_band_width) : boundary + seam_band_width] = True
     seam_mae = float(np.mean(spatial_error[seam_mask])) if np.any(seam_mask) else 0.0
     nonseam_mae = float(np.mean(spatial_error[~seam_mask])) if np.any(~seam_mask) else 0.0
+    exact_video_match = video_mse == 0
+    seam_excess_ratio = 1.0 if seam_mae == 0 else None
+    if nonseam_mae > 0:
+        seam_excess_ratio = seam_mae / nonseam_mae
     return {
         "video_frames": int(ref_video.shape[0]),
         "video_rate": ref_video_rate,
         "video_duration_s": video_duration_s,
         "video_mse": video_mse,
         "video_mae": float(np.mean(video_abs)),
-        "video_psnr_db": math.inf if video_mse == 0 else 10 * math.log10((255.0**2) / video_mse),
+        "video_exact_match": exact_video_match,
+        "video_psnr_db": None if exact_video_match else 10 * math.log10((255.0**2) / video_mse),
         "video_max_abs": float(np.max(np.abs(video_delta))),
         "video_seam_band_mae": seam_mae,
         "video_nonseam_mae": nonseam_mae,
-        "video_seam_excess_ratio": seam_mae / nonseam_mae if nonseam_mae else 1.0,
+        "video_seam_excess_ratio": seam_excess_ratio,
         "video_tile_y_boundaries": y_boundaries,
         "video_tile_x_boundaries": x_boundaries,
         "audio_shape": list(ref_audio.shape),
@@ -219,7 +249,10 @@ def parse_rank_timings(path: Path, start_offset: int = 0) -> dict[str, Any]:
         event = json.loads(match.group(1))
         metric = str(event["metric"])
         rank = int(event["rank"])
-        by_metric.setdefault(metric, {}).setdefault(rank, []).append(float(event["duration_s"]))
+        duration = float(event["duration_s"])
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError(f"invalid {metric} duration for rank {rank}: {duration}")
+        by_metric.setdefault(metric, {}).setdefault(rank, []).append(duration)
 
     result: dict[str, Any] = {}
     for metric, per_rank in by_metric.items():
@@ -245,6 +278,122 @@ def parse_vae_diagnostics(path: Path, start_offset: int = 0) -> dict[str, Any]:
         event = json.loads(match.group(1))
         last_by_rank[str(int(event["rank"]))] = event
     return {"last_decode_by_rank": last_by_rank}
+
+
+def _server_log_offset(path: Path | None) -> int:
+    return path.stat().st_size if path is not None and path.exists() else 0
+
+
+def _request_with_observability(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    *,
+    index: int,
+    steps: int,
+    output_path: Path,
+) -> RunResult:
+    """Capture only the log records produced by this individual request."""
+
+    start_offset = _server_log_offset(args.server_log)
+    result = _request(client, args, index=index, steps=steps, output_path=output_path)
+    if args.server_log is None or not args.server_log.exists():
+        return result
+    return replace(
+        result,
+        rank_timings=parse_rank_timings(args.server_log, start_offset),
+        vae_diagnostics=parse_vae_diagnostics(args.server_log, start_offset),
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _request_contract(args: argparse.Namespace) -> dict[str, Any]:
+    """Return every latent-producing input used for reference comparison."""
+
+    return {
+        "prompt": args.prompt,
+        "task": args.task,
+        "seed": args.seed,
+        "width": args.width,
+        "height": args.height,
+        "aspect_ratio": args.aspect_ratio,
+        "fps": args.fps,
+        "duration": args.duration,
+        "steps": args.steps,
+        "flow_shift": args.flow_shift,
+        "audio_flow_shift": args.audio_flow_shift,
+        "input_reference_sha256": [_file_sha256(path) for path in args.input_reference or []],
+        "audio_reference": args.audio_reference,
+    }
+
+
+def _quality_run(report: dict[str, Any]) -> dict[str, Any]:
+    runs = report.get("runs")
+    if not isinstance(runs, list) or not runs or not isinstance(runs[-1], dict):
+        return {}
+    return runs[-1]
+
+
+def _quality_run_fingerprints(report: dict[str, Any]) -> dict[str, str]:
+    events = _quality_run(report).get("vae_diagnostics", {}).get("last_decode_by_rank", {})
+    if not isinstance(events, dict):
+        return {}
+    return {
+        str(rank): str(event["latent_sha256"])
+        for rank, event in events.items()
+        if isinstance(event, dict) and event.get("latent_sha256")
+    }
+
+
+def _validate_quality_run_fingerprints(report: dict[str, Any], label: str) -> tuple[dict[str, str], list[str]]:
+    events = _quality_run(report).get("vae_diagnostics", {}).get("last_decode_by_rank", {})
+    if not isinstance(events, dict) or not events:
+        return {}, [f"{label} quality run is missing per-rank VAE latent fingerprints"]
+
+    failures: list[str] = []
+    fingerprints = _quality_run_fingerprints(report)
+    ranks: set[int] = set()
+    parallel_sizes: set[int] = set()
+    metadata_valid = True
+    for rank_key, event in events.items():
+        if not isinstance(event, dict):
+            metadata_valid = False
+            continue
+        try:
+            rank = int(rank_key)
+            event_rank = int(event["rank"])
+            parallel_size = int(event["parallel_size"])
+        except (KeyError, TypeError, ValueError):
+            metadata_valid = False
+            continue
+        if rank < 0 or event_rank != rank or parallel_size < 1:
+            metadata_valid = False
+            continue
+        ranks.add(rank)
+        parallel_sizes.add(parallel_size)
+
+    if not metadata_valid or len(parallel_sizes) != 1:
+        failures.append(f"{label} quality run contains invalid or inconsistent VAE rank metadata")
+    else:
+        parallel_size = next(iter(parallel_sizes))
+        if ranks != set(range(parallel_size)):
+            failures.append(
+                f"{label} quality run has incomplete VAE rank diagnostics: "
+                f"expected {parallel_size} ranks, got {sorted(ranks)}"
+            )
+    if len(fingerprints) != len(events):
+        failures.append(f"{label} quality run is missing per-rank VAE latent fingerprints")
+    if any(re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None for fingerprint in fingerprints.values()):
+        failures.append(f"{label} quality run contains an invalid VAE latent SHA-256 fingerprint")
+    if len(set(fingerprints.values())) > 1:
+        failures.append(f"{label} VAE ranks received different latent inputs")
+    return fingerprints, failures
 
 
 def _warm_median(report: dict[str, Any], field: str) -> float:
@@ -279,13 +428,26 @@ def _apply_gates(
 ) -> list[str]:
     failures = []
     if reference is not None:
+        if reference.get("request") != report.get("request"):
+            failures.append("reference and candidate latent-producing request settings differ")
         reference_s = _warm_median(reference, "end_to_end_s")
         candidate_s = _warm_median(report, "end_to_end_s")
-        regression_pct = (candidate_s / reference_s - 1.0) * 100.0
-        report["end_to_end_regression_pct"] = regression_pct
+        valid_latency = all(math.isfinite(value) and value > 0 for value in (reference_s, candidate_s))
+        if not valid_latency:
+            failures.append("reference or candidate warm end-to-end latency is non-finite or non-positive")
+        else:
+            regression_pct = (candidate_s / reference_s - 1.0) * 100.0
+            report["end_to_end_regression_pct"] = regression_pct
+            if regression_pct > args.max_end_to_end_regression_pct:
+                failures.append(
+                    f"end-to-end regression {regression_pct:.3f}% exceeds {args.max_end_to_end_regression_pct:.3f}%"
+                )
         reference_vae_s = _warm_vae_median(reference)
         candidate_vae_s = _warm_vae_median(report)
-        if reference_vae_s > 0 and candidate_vae_s > 0:
+        valid_vae_latency = all(math.isfinite(value) and value > 0 for value in (reference_vae_s, candidate_vae_s))
+        if not valid_vae_latency:
+            failures.append("reference or candidate warm VAE component timing is missing, non-finite, or non-positive")
+        elif valid_latency:
             vae_share = min(1.0, reference_vae_s / reference_s)
             vae_speedup = reference_vae_s / candidate_vae_s
             report["amdahl"] = {
@@ -294,48 +456,81 @@ def _apply_gates(
                 "predicted_end_to_end_speedup": 1.0 / ((1.0 - vae_share) + vae_share / vae_speedup),
                 "observed_end_to_end_speedup": reference_s / candidate_s,
             }
-        if regression_pct > args.max_end_to_end_regression_pct:
-            failures.append(
-                f"end-to-end regression {regression_pct:.3f}% exceeds {args.max_end_to_end_regression_pct:.3f}%"
-            )
-        reference_fingerprints = {
-            str(rank): str(event["latent_sha256"])
-            for rank, event in reference.get("vae_diagnostics", {}).get("last_decode_by_rank", {}).items()
-            if event.get("latent_sha256")
-        }
-        candidate_fingerprints = {
-            str(rank): str(event["latent_sha256"])
-            for rank, event in report.get("vae_diagnostics", {}).get("last_decode_by_rank", {}).items()
-            if event.get("latent_sha256")
-        }
+        reference_fingerprints, reference_fingerprint_failures = _validate_quality_run_fingerprints(
+            reference, "reference"
+        )
+        candidate_fingerprints, candidate_fingerprint_failures = _validate_quality_run_fingerprints(report, "candidate")
+        failures.extend(reference_fingerprint_failures)
+        failures.extend(candidate_fingerprint_failures)
         if reference_fingerprints and candidate_fingerprints and reference_fingerprints != candidate_fingerprints:
             failures.append("reference and candidate VAE latent fingerprints differ")
     if quality is not None:
-        if float(quality["video_psnr_db"]) < args.min_video_psnr_db:
-            failures.append(f"video PSNR {quality['video_psnr_db']:.3f} dB is below {args.min_video_psnr_db:.3f} dB")
-        if float(quality.get("video_mae", 0.0)) > args.max_video_mae:
-            failures.append(f"video MAE {quality['video_mae']:.6f} exceeds {args.max_video_mae:.6f}")
-        if float(quality["audio_mae"]) > args.max_audio_mae:
-            failures.append(f"audio MAE {quality['audio_mae']:.8f} exceeds {args.max_audio_mae:.8f}")
-        if float(quality["video_seam_band_mae"]) > args.max_video_seam_band_mae:
-            failures.append(
-                f"video seam-band MAE {quality['video_seam_band_mae']:.8f} exceeds {args.max_video_seam_band_mae:.8f}"
+        required_quality = {
+            "video_exact_match",
+            "video_psnr_db",
+            "video_mae",
+            "audio_mae",
+            "video_seam_band_mae",
+            "video_seam_excess_ratio",
+            "av_sync_delta_s",
+        }
+        missing_quality = sorted(required_quality.difference(quality))
+        if missing_quality:
+            failures.append(f"quality report is missing required metrics: {missing_quality}")
+        else:
+            exact_match = quality["video_exact_match"] is True
+            psnr = quality["video_psnr_db"]
+            psnr_valid = exact_match and psnr is None
+            if not exact_match:
+                psnr_valid = isinstance(psnr, (int, float)) and math.isfinite(float(psnr))
+            metric_names = (
+                "video_mae",
+                "audio_mae",
+                "video_seam_band_mae",
+                "video_seam_excess_ratio",
+                "av_sync_delta_s",
             )
-        if float(quality.get("video_seam_excess_ratio", 1.0)) > args.max_video_seam_excess_ratio:
-            failures.append(
-                f"video seam excess ratio {quality['video_seam_excess_ratio']:.6f} exceeds "
-                f"{args.max_video_seam_excess_ratio:.6f}"
-            )
-        if float(quality.get("av_sync_delta_s", 0.0)) > args.max_av_sync_delta_s:
-            failures.append(
-                f"audio/video duration delta {quality['av_sync_delta_s']:.6f}s exceeds {args.max_av_sync_delta_s:.6f}s"
-            )
-    rank_timings = report.get("rank_timings", {})
+            invalid_metrics = [
+                name
+                for name in metric_names
+                if not isinstance(quality[name], (int, float)) or not math.isfinite(float(quality[name]))
+            ]
+            if not psnr_valid:
+                invalid_metrics.append("video_psnr_db")
+            if invalid_metrics:
+                failures.append(f"quality report contains non-finite or invalid metrics: {sorted(invalid_metrics)}")
+            else:
+                if not exact_match and float(psnr) < args.min_video_psnr_db:
+                    failures.append(f"video PSNR {psnr:.3f} dB is below {args.min_video_psnr_db:.3f} dB")
+                if float(quality["video_mae"]) > args.max_video_mae:
+                    failures.append(f"video MAE {quality['video_mae']:.6f} exceeds {args.max_video_mae:.6f}")
+                if float(quality["audio_mae"]) > args.max_audio_mae:
+                    failures.append(f"audio MAE {quality['audio_mae']:.8f} exceeds {args.max_audio_mae:.8f}")
+                if float(quality["video_seam_band_mae"]) > args.max_video_seam_band_mae:
+                    failures.append(
+                        f"video seam-band MAE {quality['video_seam_band_mae']:.8f} exceeds "
+                        f"{args.max_video_seam_band_mae:.8f}"
+                    )
+                if float(quality["video_seam_excess_ratio"]) > args.max_video_seam_excess_ratio:
+                    failures.append(
+                        f"video seam excess ratio {quality['video_seam_excess_ratio']:.6f} exceeds "
+                        f"{args.max_video_seam_excess_ratio:.6f}"
+                    )
+                if float(quality["av_sync_delta_s"]) > args.max_av_sync_delta_s:
+                    failures.append(
+                        f"audio/video duration delta {quality['av_sync_delta_s']:.6f}s exceeds "
+                        f"{args.max_av_sync_delta_s:.6f}s"
+                    )
+    rank_timings = _quality_run(report).get("rank_timings", {})
     video_ranks = rank_timings.get("video_vae.decode_latent")
-    if video_ranks and float(video_ranks["imbalance_pct"]) > args.max_rank_imbalance_pct:
-        failures.append(
-            f"video VAE rank imbalance {video_ranks['imbalance_pct']:.3f}% exceeds {args.max_rank_imbalance_pct:.3f}%"
-        )
+    if reference is not None and not video_ranks:
+        failures.append("candidate quality run is missing per-rank video VAE timings")
+    elif video_ranks:
+        imbalance = float(video_ranks["imbalance_pct"])
+        if not math.isfinite(imbalance) or imbalance < 0:
+            failures.append("video VAE rank imbalance is non-finite or negative")
+        elif imbalance > args.max_rank_imbalance_pct:
+            failures.append(f"video VAE rank imbalance {imbalance:.3f}% exceeds {args.max_rank_imbalance_pct:.3f}%")
     return failures
 
 
@@ -377,17 +572,69 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_benchmark_args(args: argparse.Namespace) -> None:
+    for name in ("width", "height", "fps", "steps", "runs", "postcheck_steps"):
+        if int(getattr(args, name)) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    for name in ("duration", "timeout"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and > 0")
+    for name in ("flow_shift", "audio_flow_shift"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    for name in (
+        "max_end_to_end_regression_pct",
+        "min_video_psnr_db",
+        "max_video_mae",
+        "max_video_seam_band_mae",
+        "max_video_seam_excess_ratio",
+        "max_audio_mae",
+        "max_av_sync_delta_s",
+        "max_rank_imbalance_pct",
+    ):
+        if not math.isfinite(float(getattr(args, name))):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    for name in (
+        "max_video_mae",
+        "max_video_seam_band_mae",
+        "max_video_seam_excess_ratio",
+        "max_audio_mae",
+        "max_av_sync_delta_s",
+        "max_rank_imbalance_pct",
+    ):
+        if float(getattr(args, name)) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+    if args.seam_band_width < 1:
+        raise ValueError("--seam-band-width must be >= 1")
+    _tile_boundaries(args.height, args.decoder_tile_size, args.decoder_tile_overlap_min, args.vae_ratio)
+    _tile_boundaries(args.width, args.decoder_tile_size, args.decoder_tile_overlap_min, args.vae_ratio)
+    for path in args.input_reference or []:
+        if not path.is_file():
+            raise ValueError(f"input reference does not exist or is not a file: {path}")
+
+
 def main() -> int:
     args = parse_args()
-    if args.runs < 1:
-        raise ValueError("--runs must be >= 1")
+    _validate_benchmark_args(args)
+    request_contract = _request_contract(args)
+    reference = None
+    if args.reference_report:
+        if args.server_log is None:
+            raise ValueError("--server-log is required when --reference-report enables identical-latent gates")
+        reference = json.loads(args.reference_report.read_text(encoding="utf-8"))
+        _, fingerprint_failures = _validate_quality_run_fingerprints(reference, "reference")
+        if fingerprint_failures:
+            raise ValueError("; ".join(fingerprint_failures))
+        if reference.get("request") != request_contract:
+            raise ValueError("reference report uses different latent-producing request settings")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    server_log_start = args.server_log.stat().st_size if args.server_log and args.server_log.exists() else 0
     runs = []
     with httpx.Client(timeout=args.timeout) as client:
         for index in range(args.runs):
             runs.append(
-                _request(
+                _request_with_observability(
                     client,
                     args,
                     index=index,
@@ -395,7 +642,7 @@ def main() -> int:
                     output_path=args.output_dir / f"{args.profile_name}-run-{index}.mp4",
                 )
             )
-        postcheck = _request(
+        postcheck = _request_with_observability(
             client,
             args,
             index=args.runs,
@@ -405,17 +652,7 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "profile": args.profile_name,
-        "request": {
-            "task": args.task,
-            "seed": args.seed,
-            "width": args.width,
-            "height": args.height,
-            "fps": args.fps,
-            "duration": args.duration,
-            "steps": args.steps,
-            "input_references": [str(path) for path in args.input_reference or []],
-            "audio_reference": args.audio_reference,
-        },
+        "request": request_contract,
         "runs": [asdict(run) for run in runs],
         "postcheck": asdict(postcheck),
         "summary": {
@@ -429,13 +666,12 @@ def main() -> int:
             "vae_decode_s": [_vae_time(run) for run in runs],
         },
     }
-    if args.server_log:
-        report["rank_timings"] = parse_rank_timings(args.server_log, server_log_start)
-        report["vae_diagnostics"] = parse_vae_diagnostics(args.server_log, server_log_start)
-    reference = None
+    # Keep top-level aliases for report readers while qualification uses the
+    # request-scoped copies embedded in the exact media run being compared.
+    report["rank_timings"] = runs[-1].rank_timings
+    report["vae_diagnostics"] = runs[-1].vae_diagnostics
     quality = None
-    if args.reference_report:
-        reference = json.loads(args.reference_report.read_text(encoding="utf-8"))
+    if reference is not None:
         reference_media = reference["runs"][-1]["media_path"]
         quality = compare_media(
             reference_media,
@@ -449,8 +685,8 @@ def main() -> int:
     failures = _apply_gates(report, reference, quality, args)
     report["gate_failures"] = failures
     report_path = args.output_dir / f"{args.profile_name}-report.json"
-    report_path.write_text(json.dumps(report, indent=2, allow_nan=True), encoding="utf-8")
-    print(json.dumps(report, indent=2, allow_nan=True))
+    report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    print(json.dumps(report, indent=2, allow_nan=False))
     return 1 if failures else 0
 
 

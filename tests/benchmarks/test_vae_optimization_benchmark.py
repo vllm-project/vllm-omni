@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from argparse import Namespace
 
 import pytest
 
@@ -12,9 +12,52 @@ from benchmarks.diffusion.vae_optimization_benchmark import (
     parse_vae_diagnostics,
 )
 
+_REFERENCE_HASH = "a" * 64
+_CANDIDATE_HASH = "b" * 64
 
-def _report(*times):
+
+def _gate_args() -> Namespace:
+    return Namespace(
+        max_end_to_end_regression_pct=5.0,
+        min_video_psnr_db=60.0,
+        max_video_mae=1.0,
+        max_video_seam_band_mae=1.0,
+        max_video_seam_excess_ratio=1.25,
+        max_audio_mae=1e-4,
+        max_av_sync_delta_s=0.1,
+        max_rank_imbalance_pct=15.0,
+    )
+
+
+def _quality(*, psnr=80.0, audio_mae=0.0, av_sync_delta_s=0.0):
     return {
+        "video_exact_match": False,
+        "video_psnr_db": psnr,
+        "video_mae": 0.0,
+        "video_seam_band_mae": 0.0,
+        "video_seam_excess_ratio": 1.0,
+        "audio_mae": audio_mae,
+        "av_sync_delta_s": av_sync_delta_s,
+    }
+
+
+def _report(*times, fingerprint=_REFERENCE_HASH):
+    return {
+        "request": {
+            "prompt": "prompt",
+            "task": "t2va",
+            "seed": 1,
+            "width": 16,
+            "height": 16,
+            "aspect_ratio": "1:1",
+            "fps": 24,
+            "duration": 1.0,
+            "steps": 2,
+            "flow_shift": 1.0,
+            "audio_flow_shift": 1.0,
+            "input_reference_sha256": [],
+            "audio_reference": None,
+        },
         "runs": [
             {
                 "cold": index == 0,
@@ -24,9 +67,21 @@ def _report(*times):
                     "video_vae.decode_latent": value * 0.2,
                     "audio_vae.decode_latent": value * 0.01,
                 },
+                "vae_diagnostics": {
+                    "last_decode_by_rank": {
+                        "0": {"rank": 0, "parallel_size": 2, "latent_sha256": fingerprint},
+                        "1": {"rank": 1, "parallel_size": 2, "latent_sha256": fingerprint},
+                    }
+                },
+                "rank_timings": {
+                    "video_vae.decode_latent": {
+                        "median_s_by_rank": {"0": value * 0.2, "1": value * 0.2},
+                        "imbalance_pct": 0.0,
+                    }
+                },
             }
             for index, value in enumerate(times)
-        ]
+        ],
     }
 
 
@@ -62,17 +117,8 @@ def test_vae_time_uses_separate_video_and_audio_components():
 def test_acceptance_gates(candidate_time, psnr, audio_mae, expected):
     report = _report(candidate_time, candidate_time)
     reference = _report(10.0, 10.0)
-    quality = {"video_psnr_db": psnr, "video_seam_band_mae": 0.0, "audio_mae": audio_mae}
-    args = SimpleNamespace(
-        max_end_to_end_regression_pct=5.0,
-        min_video_psnr_db=60.0,
-        max_video_mae=1.0,
-        max_video_seam_band_mae=1.0,
-        max_video_seam_excess_ratio=1.25,
-        max_audio_mae=1e-4,
-        max_av_sync_delta_s=0.1,
-        max_rank_imbalance_pct=15.0,
-    )
+    quality = _quality(psnr=psnr, audio_mae=audio_mae)
+    args = _gate_args()
 
     failures = _apply_gates(report, reference, quality, args)
 
@@ -138,52 +184,102 @@ def test_log_parsers_can_ignore_preexisting_requests(tmp_path):
 
 
 def test_gate_rejects_different_latent_inputs():
-    report = _report(10.0, 10.0)
-    reference = _report(10.0, 10.0)
-    report["vae_diagnostics"] = {"last_decode_by_rank": {"0": {"latent_sha256": "candidate"}}}
-    reference["vae_diagnostics"] = {"last_decode_by_rank": {"0": {"latent_sha256": "reference"}}}
-    quality = {"video_psnr_db": 80.0, "video_seam_band_mae": 0.0, "audio_mae": 0.0}
-    args = SimpleNamespace(
-        max_end_to_end_regression_pct=5.0,
-        min_video_psnr_db=60.0,
-        max_video_mae=1.0,
-        max_video_seam_band_mae=1.0,
-        max_video_seam_excess_ratio=1.25,
-        max_audio_mae=1e-4,
-        max_av_sync_delta_s=0.1,
-        max_rank_imbalance_pct=15.0,
-    )
+    report = _report(10.0, 10.0, fingerprint=_CANDIDATE_HASH)
+    reference = _report(10.0, 10.0, fingerprint=_REFERENCE_HASH)
+    quality = _quality()
+    args = _gate_args()
 
     failures = _apply_gates(report, reference, quality, args)
 
     assert "reference and candidate VAE latent fingerprints differ" in failures
 
 
+def test_gate_fails_closed_when_quality_run_fingerprint_is_missing():
+    report = _report(10.0, 10.0)
+    reference = _report(10.0, 10.0)
+    report["runs"][-1]["vae_diagnostics"] = {}
+    quality = _quality()
+    args = _gate_args()
+
+    failures = _apply_gates(report, reference, quality, args)
+
+    assert "candidate quality run is missing per-rank VAE latent fingerprints" in failures
+
+
+def test_gate_fails_closed_when_rank_diagnostics_are_incomplete():
+    report = _report(10.0, 10.0)
+    reference = _report(10.0, 10.0)
+    report["runs"][-1]["vae_diagnostics"]["last_decode_by_rank"].pop("1")
+
+    failures = _apply_gates(report, reference, _quality(), _gate_args())
+
+    assert any("incomplete VAE rank diagnostics" in failure for failure in failures)
+
+
+def test_gate_uses_formal_run_fingerprint_instead_of_postcheck_alias():
+    report = _report(10.0, 10.0, fingerprint=_REFERENCE_HASH)
+    reference = _report(10.0, 10.0, fingerprint=_REFERENCE_HASH)
+    report["vae_diagnostics"] = {"last_decode_by_rank": {"0": {"latent_sha256": "candidate-postcheck"}}}
+    reference["vae_diagnostics"] = {"last_decode_by_rank": {"0": {"latent_sha256": "reference-postcheck"}}}
+    quality = _quality()
+    args = _gate_args()
+
+    failures = _apply_gates(report, reference, quality, args)
+
+    assert not any("fingerprint" in failure for failure in failures)
+
+
 def test_gate_rejects_audio_video_duration_drift():
     report = _report(10.0, 10.0)
     reference = _report(10.0, 10.0)
-    quality = {
-        "video_psnr_db": 80.0,
-        "video_seam_band_mae": 0.0,
-        "audio_mae": 0.0,
-        "av_sync_delta_s": 0.2,
-    }
-    args = SimpleNamespace(
-        max_end_to_end_regression_pct=5.0,
-        min_video_psnr_db=60.0,
-        max_video_mae=1.0,
-        max_video_seam_band_mae=1.0,
-        max_video_seam_excess_ratio=1.25,
-        max_audio_mae=1e-4,
-        max_av_sync_delta_s=0.1,
-        max_rank_imbalance_pct=15.0,
-    )
+    quality = _quality(av_sync_delta_s=0.2)
+    args = _gate_args()
 
     failures = _apply_gates(report, reference, quality, args)
 
     assert any(failure.startswith("audio/video duration delta") for failure in failures)
 
 
+def test_gate_rejects_non_finite_quality_metric():
+    report = _report(10.0, 10.0)
+    reference = _report(10.0, 10.0)
+    quality = _quality(psnr=float("nan"))
+
+    failures = _apply_gates(report, reference, quality, _gate_args())
+
+    assert any("non-finite or invalid metrics" in failure for failure in failures)
+
+
+def test_gate_accepts_explicit_exact_video_match_without_infinite_json_number():
+    report = _report(10.0, 10.0)
+    reference = _report(10.0, 10.0)
+    quality = _quality(psnr=None)
+    quality["video_exact_match"] = True
+
+    failures = _apply_gates(report, reference, quality, _gate_args())
+
+    assert failures == []
+
+
+def test_gate_rejects_different_request_contract():
+    report = _report(10.0, 10.0)
+    reference = _report(10.0, 10.0)
+    report["request"]["seed"] += 1
+
+    failures = _apply_gates(report, reference, _quality(), _gate_args())
+
+    assert "reference and candidate latent-producing request settings differ" in failures
+
+
 def test_h3_tile_boundaries_match_native_split_algorithm():
     assert _tile_boundaries(576, 256, 64, 16) == [160, 320]
     assert _tile_boundaries(1024, 256, 64, 16) == [192, 384, 576, 768]
+
+
+@pytest.mark.parametrize(
+    ("tile_size", "overlap", "ratio"),
+    [(0, 0, 16), (256, 256, 16), (256, 64, 0), (255, 64, 16)],
+)
+def test_tile_boundaries_reject_invalid_geometry(tile_size, overlap, ratio):
+    with pytest.raises(ValueError):
+        _tile_boundaries(576, tile_size, overlap, ratio)
