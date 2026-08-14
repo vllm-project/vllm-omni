@@ -175,6 +175,19 @@ def assert_result(result, params, num_prompt) -> None:
         assert all(
             isinstance(metric, dict) and float(metric.get("mean_tpot_ms") or 0.0) > 0 for metric in session_metrics
         ), "Duplex session TPOT metrics are missing"
+        hardware = result.get("Hardware")
+        baselines = result.get("baseline")
+        hardware_baseline = (
+            baselines.get(hardware) if isinstance(baselines, dict) and isinstance(hardware, str) else None
+        )
+        if isinstance(hardware_baseline, dict):
+            for metric_name, threshold in hardware_baseline.items():
+                actual = float(result.get(metric_name) or 0.0)
+                expected = float(threshold)
+                if metric_name == "request_throughput":
+                    assert actual >= expected, f"{metric_name}={actual} is below baseline {expected} on {hardware}"
+                else:
+                    assert actual <= expected, f"{metric_name}={actual} exceeds baseline {expected} on {hardware}"
 
 
 @pytest.mark.benchmark

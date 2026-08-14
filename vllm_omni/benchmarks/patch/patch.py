@@ -1647,12 +1647,10 @@ async def async_request_openai_realtime_tts(
                 timeout_s=120.0,
             )
             turn_metrics: list[dict[str, object]] = []
-            turn_timings: list[dict[str, object]] = []
             turn_pcm_bytes: list[bytes] = []
             turn_transcripts: list[str] = []
             measurement_origin = {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
-                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "conversation.item.create client send to first audio packet",
                 "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
             }
@@ -1703,7 +1701,6 @@ async def async_request_openai_realtime_tts(
                 request_metrics = timing.get("request_metrics")
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
-                turn_timings.append(timing)
                 turn_metrics.append(
                     {
                         "session_id": session_id,
@@ -1722,12 +1719,7 @@ async def async_request_openai_realtime_tts(
                     )
                 )
                 turn_transcripts.append(client.events.response_text(response_id))
-                await client.acknowledge_playback(
-                    response_id=response_id,
-                    timeout_s=60.0,
-                    wait_for_history_committed=False,
-                    settle_s=2.0,
-                )
+                await client.acknowledge_playback()
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(
                 turn_metrics,
@@ -1744,20 +1736,6 @@ async def async_request_openai_realtime_tts(
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
-            output.output_tokens = sum(
-                int(stage0.get("output_token_count") or 0)
-                for timing in turn_timings
-                if isinstance((stage0 := timing.get("stage0_tokens")), dict)
-            )
-            mean_tpot_s = float(session_metrics.get("mean_tpot_ms") or 0.0) / 1000.0
-            if output.output_tokens > 1 and mean_tpot_s > 0:
-                # Preserve the benchmark's standard TPOT calculation while
-                # sourcing duplex token timing from Stage 0 engine metrics.
-                output.text_latency = output.ttft + mean_tpot_s * (output.output_tokens - 1)
-            elif output.text_latency <= 0:
-                # Avoid default text_latency=0 producing negative TPOT when
-                # Stage-0 metrics were unavailable for a successful session.
-                output.text_latency = max(output.latency, output.ttft)
             output.tts_turn_pcm_bytes = turn_pcm_bytes
             output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
             if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
@@ -1794,13 +1772,6 @@ def _seed_tts_turn_pcm16(turn: object, fallback_path: str) -> bytes:
     return pcm16
 
 
-def _pcm16_silence(duration_ms: int) -> bytes:
-    if duration_ms <= 0:
-        return b""
-    sample_count = PCM16_SAMPLE_RATE * int(duration_ms) // 1000
-    return b"\x00\x00" * max(0, sample_count)
-
-
 def _chunk_period_ms_from_events(events: list[dict[str, object]]) -> int | None:
     for event in reversed(events):
         session = event.get("session")
@@ -1830,49 +1801,7 @@ def _pad_pcm16_to_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bytes:
     remainder = len(pcm16) % unit_bytes
     if remainder == 0:
         return pcm16
-    return pcm16 + _pcm16_silence((unit_bytes - remainder) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE))
-
-
-async def _drain_quiet_duplex_responses(
-    client: RealtimeDuplexClient,
-    *,
-    settle_s: float,
-    timeout_s: float,
-) -> None:
-    """Wait until no response is in flight after a completed turn."""
-    deadline = time.monotonic() + max(0.0, timeout_s)
-    quiet_since: float | None = None
-    settle_s = max(0.0, settle_s)
-    while True:
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0:
-            return
-        created = client.events.count("response.created")
-        done_count = client.events.count("response.done")
-        if created <= done_count:
-            if quiet_since is None:
-                quiet_since = time.monotonic()
-            elif time.monotonic() - quiet_since >= settle_s:
-                return
-        else:
-            # Extra model-policy speak: ack completed audio so the next turn can start.
-            for response_id in list(client.events.response_ids):
-                if not client.events.audio_bytes(response_id):
-                    continue
-                done = any(
-                    event.get("type") == "response.done" and client.events.response_id(event) == response_id
-                    for event in client.events.events
-                )
-                if not done:
-                    continue
-                await client.acknowledge_playback(
-                    response_id=response_id,
-                    timeout_s=min(30.0, remaining_s),
-                    wait_for_history_committed=False,
-                    settle_s=0.0,
-                )
-            quiet_since = None
-        await asyncio.sleep(0.05)
+    return pcm16 + bytes(unit_bytes - remainder)
 
 
 async def async_request_openai_realtime_duplex(
@@ -1894,7 +1823,6 @@ async def async_request_openai_realtime_duplex(
         configured_turns = (
             SimpleNamespace(
                 utterance_id="",
-                ref_text=str(speech_extra.get("ref_text") or ""),
                 prompt_wav_path=getattr(request_func_input, "seed_tts_ref_wav_path", ""),
             ),
         )
@@ -1919,7 +1847,7 @@ async def async_request_openai_realtime_duplex(
 
     try:
         websocket_url = build_realtime_url(
-            request_func_input.api_url,
+            _realtime_websocket_url(request_func_input.api_url),
             model,
             autostart=False,
             session_id=session_id,
@@ -1958,7 +1886,6 @@ async def async_request_openai_realtime_duplex(
                 done_before = client.events.count("response.done")
                 errors_before = len(client.events.errors())
                 turn_started_at_s = time.monotonic()
-                transcript_hint = str(getattr(turn, "ref_text", "") or "").strip()
                 turn_pcm = _seed_tts_turn_pcm16(turn, fallback_path)
                 if max_input_ms_i is not None:
                     max_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * max_input_ms_i // 1000
@@ -1971,15 +1898,10 @@ async def async_request_openai_realtime_duplex(
                 chunk_period_ms = _chunk_period_ms_from_events(client.events.events)
                 if chunk_period_ms is not None:
                     turn_pcm = _pad_pcm16_to_model_unit(turn_pcm, chunk_period_ms=chunk_period_ms)
-                # Optional trailing silence (scenarios use ~500ms) after truncated prompts.
-                trailing_silence_ms = int(client_options.get("realtime_duplex_trailing_silence_ms", 0) or 0)
-                if trailing_silence_ms > 0:
-                    turn_pcm = turn_pcm + _pcm16_silence(trailing_silence_ms)
                 await client.stream_pcm16(
                     turn_pcm,
                     chunk_ms=chunk_ms,
                     realtime=realtime_pacing,
-                    hints={"transcript": transcript_hint} if transcript_hint else None,
                 )
                 commit_at_s = time.monotonic()
                 if first_commit_at_s is None:
@@ -2049,16 +1971,9 @@ async def async_request_openai_realtime_duplex(
                 )
                 await client.acknowledge_playback(
                     response_id=response_id,
-                    timeout_s=60.0,
-                    wait_for_history_committed=False,
-                    settle_s=0.0,
+                    timeout_s=30.0,
+                    wait_for_history_committed=True,
                 )
-                if request_index + 1 < len(configured_turns):
-                    await _drain_quiet_duplex_responses(
-                        client,
-                        settle_s=float(client_options.get("realtime_duplex_inter_turn_settle_s", 2.0)),
-                        timeout_s=120.0,
-                    )
 
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(turn_metrics, session_id=session_id)

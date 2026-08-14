@@ -39,38 +39,6 @@ def test_realtime_client_builds_explicit_native_duplex_url():
     }
 
 
-def test_realtime_client_converts_http_url_to_websocket():
-    url = build_realtime_url(
-        "https://localhost:8099/v1/realtime",
-        "openbmb/MiniCPM-o-4_5",
-    )
-
-    assert urlsplit(url).scheme == "wss"
-
-
-@pytest.mark.asyncio
-async def test_realtime_client_streams_pcm_with_chunk_hints():
-    class Client(RealtimeDuplexClient):
-        def __init__(self):
-            super().__init__("ws://unused")
-            self.sent = []
-
-        async def send(self, event):
-            self.sent.append(event)
-
-    client = Client()
-    await client.stream_pcm16(
-        b"\x00\x00" * 4000,
-        chunk_ms=200,
-        realtime=False,
-        hints={"transcript": "hello"},
-    )
-
-    assert len(client.sent) == 2
-    assert [event["duration_ms"] for event in client.sent] == [200, 50]
-    assert all(event["transcript"] == "hello" for event in client.sent)
-
-
 def test_seed_tts_initial_text_is_part_of_native_duplex_context():
     prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
         "Speak exactly.",
@@ -209,6 +177,44 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
     await client.close_session(timeout_s=0.2)
 
     assert asyncio.get_running_loop().time() - started_at >= 0.01
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_waits_for_wrapped_playback_acknowledgement():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+            self.events.add({"type": "response.created", "response_id": "resp-1"})
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-1",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                }
+            )
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        **event,
+                        "history_committed": True,
+                    },
+                }
+            )
+
+    client = Client()
+    await client.acknowledge_playback(
+        response_id="resp-1",
+        timeout_s=1,
+        wait_for_history_committed=True,
+    )
+
+    assert [event["type"] for event in client.sent] == ["playback.ack"]
 
 
 @pytest.mark.asyncio

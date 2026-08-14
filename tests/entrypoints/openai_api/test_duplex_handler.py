@@ -3849,14 +3849,6 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
                     }
                 }
             ],
-            "metrics": {
-                "stage_metrics": {
-                    "0": {
-                        "num_tokens_out": 5,
-                        "vllm_tpot_ms": 12.5,
-                    }
-                }
-            },
         },
         session.epoch,
         response_id,
@@ -3871,14 +3863,6 @@ async def test_duplex_chat_audio_stream_uses_output_audio_delta_event():
             "epoch": 0,
             "audio": "AAAA",
             "format": "wav",
-            "vllm_omni": {
-                "stage_metrics": {
-                    "0": {
-                        "num_tokens_out": 5,
-                        "vllm_tpot_ms": 12.5,
-                    }
-                }
-            },
         }
     ]
 

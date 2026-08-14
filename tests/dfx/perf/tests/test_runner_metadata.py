@@ -501,6 +501,31 @@ def test_omni_duplex_expected_audio_turns_accepts_complete_session():
     )
 
 
+@pytest.mark.parametrize(
+    ("metric_name", "actual", "threshold", "message"),
+    [
+        ("request_throughput", 0.009, 0.01, "below baseline"),
+        ("mean_e2el_ms", 90_000.0, 85_000.0, "exceeds baseline"),
+    ],
+)
+def test_omni_duplex_enforces_current_hardware_baseline(metric_name, actual, threshold, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match=message):
+        assert_result(
+            {
+                "completed": 1,
+                "Hardware": "H100",
+                "baseline": {"H100": {metric_name: threshold}},
+                metric_name: actual,
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+
 def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 

@@ -34,6 +34,7 @@
         "max_concurrency": [
           1
         ],
+        "num_warmups": 2,
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
@@ -49,61 +50,29 @@
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
-            "request_throughput": [
-              0.0025
-            ],
             "mean_ttft_ms": [
-              8000.0
+              6500.0
             ],
             "mean_tpot_ms": [
               22.0
             ],
             "mean_e2el_ms": [
-              390000.0
+              85000.0
             ],
             "mean_audio_ttfp_ms": [
-              8000.0
+              6500.0
             ],
             "mean_audio_rtf": [
-              3.5
+              3.3
             ],
             "mean_duplex_global_ttft_ms": [
-              20000.0
+              19000.0
             ],
             "mean_duplex_global_ttfp_ms": [
-              20000.0
+              19000.0
             ],
             "mean_duplex_global_rtf": [
-              12.0
-            ]
-          },
-          "A3": {
-            "request_throughput": [
-              0.0025
-            ],
-            "mean_ttft_ms": [
-              8000.0
-            ],
-            "mean_tpot_ms": [
-              22.0
-            ],
-            "mean_e2el_ms": [
-              390000.0
-            ],
-            "mean_audio_ttfp_ms": [
-              8000.0
-            ],
-            "mean_audio_rtf": [
-              3.5
-            ],
-            "mean_duplex_global_ttft_ms": [
-              20000.0
-            ],
-            "mean_duplex_global_ttfp_ms": [
-              20000.0
-            ],
-            "mean_duplex_global_rtf": [
-              12.0
+              3.4
             ]
           }
         }

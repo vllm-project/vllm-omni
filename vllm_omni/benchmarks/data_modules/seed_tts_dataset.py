@@ -65,7 +65,6 @@ class SeedTTSTurn:
 
     utterance_id: str
     target_text: str
-    ref_text: str = ""
     prompt_wav_path: str = ""
 
 
@@ -252,7 +251,6 @@ class SeedTTSDataset(BenchmarkDataset):
                 SeedTTSTurn(
                     utterance_id=row.utterance_id,
                     target_text=row.target_text,
-                    ref_text=row.ref_text,
                     prompt_wav_path=str(wav_path),
                 )
                 for row, wav_path in group

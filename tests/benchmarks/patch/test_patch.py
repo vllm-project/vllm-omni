@@ -9,7 +9,6 @@ import asyncio
 import base64
 import json
 import time
-import wave
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -23,7 +22,7 @@ from vllm_omni.benchmarks.patch.patch import (
     async_request_openai_realtime_duplex,
     async_request_openai_realtime_tts,
 )
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector, write_pcm16_wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -100,17 +99,7 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
                     "response_id": response_id,
                     "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
                     "sample_rate_hz": 24_000,
-                    "metadata": {
-                        "audio_duration_ms": 100,
-                        "vllm_omni": {
-                            "stage_metrics": {
-                                "0": {
-                                    "num_tokens_out": 5,
-                                    "vllm_tpot_ms": 12.0 + self.response_count,
-                                }
-                            }
-                        },
-                    },
+                    "metadata": {"audio_duration_ms": 100},
                 },
                 received_at_s=now + 0.03,
             )
@@ -119,7 +108,7 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
                 received_at_s=now + 0.04,
             )
 
-        async def acknowledge_playback(self, **_kwargs):
+        async def acknowledge_playback(self):
             self.ack_count += 1
 
         async def close_session(self, **_kwargs):
@@ -180,8 +169,6 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
-    assert output.output_tokens == 20
-    assert output.text_latency - output.ttft == pytest.approx(14.5e-3 * 19)
     assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
     assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
     session_id = output.duplex_request_metrics[0]["session_id"]
@@ -195,12 +182,10 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
             "source": "client_monotonic_receive",
             "measurement_origin": {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
-                "tpot": "Stage-0 engine mean time per output token",
                 "ttfp": "conversation.item.create client send to first audio packet",
                 "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
             },
             "ttft_ms": pytest.approx(20.0, abs=2.0),
-            "tpot_ms": 13.0 + index,
             "ttfp_ms": pytest.approx(30.0, abs=2.0),
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
@@ -210,7 +195,6 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
         "session_id": session_id,
         "audio_turn_count": 4,
         "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
-        "mean_tpot_ms": 14.5,
         "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
         "mean_rtf": pytest.approx(0.3, abs=0.03),
     }
@@ -221,11 +205,11 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     wav_paths = []
     for index in range(2):
         wav_path = tmp_path / f"input-{index}.wav"
-        with wave.open(str(wav_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16_000)
-            wav_file.writeframes(bytes([index, 0]) * 3200)
+        write_pcm16_wav(
+            wav_path,
+            bytes([index, 0]) * 3200,
+            sample_rate_hz=16_000,
+        )
         wav_paths.append(wav_path)
 
     class FakeRealtimeClient:
@@ -253,6 +237,12 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
         async def configure(self, model, **kwargs):
             assert model == "openbmb/MiniCPM-o-4_5"
             self.configure_kwargs = kwargs
+            self.events.add(
+                {
+                    "type": "session.created",
+                    "session": {"capabilities": {"chunk_period_ms": 1000}},
+                }
+            )
 
         async def stream_pcm16(self, pcm16, **kwargs):
             self.streams.append((pcm16, kwargs))
@@ -323,8 +313,6 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
             "realtime_duplex_chunk_ms": 200,
             "realtime_duplex_pacing": False,
             "realtime_duplex_max_input_ms": 100,
-            "realtime_duplex_trailing_silence_ms": 0,
-            "realtime_duplex_inter_turn_settle_s": 0,
             "temperature": 0.0,
         },
     )
@@ -332,7 +320,6 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
         SimpleNamespace(
             utterance_id=f"utt-{index}",
             target_text=f"tts target {index}",
-            ref_text=f"spoken input {index}",
             prompt_wav_path=str(wav_paths[index]),
         )
         for index in range(2)
@@ -355,11 +342,9 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     assert client.configure_kwargs["instructions"] == "Speak exactly."
     assert client.configure_kwargs["temperature"] == 0.0
     assert client.configure_kwargs["extra_body"] == {"return_stage_metrics": True}
-    assert [kwargs for _, kwargs in client.streams] == [
-        {"chunk_ms": 200, "realtime": False, "hints": {"transcript": f"spoken input {index}"}} for index in range(2)
-    ]
-    # 100ms @ 16kHz mono PCM16 = 3200 bytes (wavs are longer; max_input_ms truncates)
-    assert all(len(pcm16) == 3200 for pcm16, _ in client.streams)
+    assert [kwargs for _, kwargs in client.streams] == [{"chunk_ms": 200, "realtime": False} for _ in range(2)]
+    # 100ms input is padded to one complete 1000ms native model unit.
+    assert all(len(pcm16) == 32000 for pcm16, _ in client.streams)
     assert client.ack_count == 2
     assert output.success is True
     assert output.generated_text == "native turn 1 native turn 2"

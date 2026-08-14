@@ -69,14 +69,16 @@ def summarize_session_request_metrics(
         values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
         return round(sum(values) / len(values), digits) if values else None
 
-    return {
+    summary: dict[str, object] = {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
-        "mean_tpot_ms": mean("tpot_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
     }
+    if (mean_tpot_ms := mean("tpot_ms")) is not None:
+        summary["mean_tpot_ms"] = mean_tpot_ms
+    return summary
 
 
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
@@ -470,6 +472,13 @@ class RealtimeEventCollector:
             }
             request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
             if request_started_at_s is not None:
+                default_measurement_origin = {
+                    "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                    "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                }
+                if stage0_metrics is not None:
+                    default_measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
                 audio_duration_ms = (
                     max(cumulative_audio_ms)
                     if cumulative_audio_ms
@@ -483,20 +492,11 @@ class RealtimeEventCollector:
                 )
                 result["request_metrics"] = {
                     "source": "client_monotonic_receive",
-                    "measurement_origin": measurement_origin
-                    or {
-                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                        "tpot": "Stage-0 engine mean time per output token",
-                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
-                    },
+                    "measurement_origin": measurement_origin or default_measurement_origin,
                     "ttft_ms": (
                         _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
                         if first_text_received_at_s is not None
                         else None
-                    ),
-                    "tpot_ms": (
-                        float(stage0_metrics.get("vllm_tpot_ms") or 0.0) if stage0_metrics is not None else None
                     ),
                     "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
                     "rtf": round(
@@ -511,6 +511,10 @@ class RealtimeEventCollector:
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
                 }
+                if stage0_metrics is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["tpot_ms"] = float(stage0_metrics.get("vllm_tpot_ms") or 0.0)
         return result
 
 
@@ -651,7 +655,6 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
-        hints: dict[str, object] | None = None,
     ) -> None:
         chunk_bytes = max(
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
@@ -660,7 +663,6 @@ class RealtimeDuplexClient:
         await self.stream_av_units(
             ((pcm16[offset : offset + chunk_bytes], None) for offset in range(0, len(pcm16), chunk_bytes)),
             realtime=realtime,
-            hints=hints,
         )
 
     async def stream_av_units(
@@ -668,11 +670,9 @@ class RealtimeDuplexClient:
         units: Any,
         *,
         realtime: bool = True,
-        hints: dict[str, object] | None = None,
     ) -> None:
         """Stream PCM16 units, optionally attaching a JPEG to each unit."""
         audio_end_ms = 0
-        chunk_hints = dict(hints or {})
         for chunk, frame in units:
             if not chunk:
                 continue
@@ -689,7 +689,6 @@ class RealtimeDuplexClient:
             }
             if frame is not None:
                 event["video_frames"] = [base64.b64encode(frame).decode("ascii") if isinstance(frame, bytes) else frame]
-            event.update(chunk_hints)
             await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
@@ -711,8 +710,11 @@ class RealtimeDuplexClient:
             acknowledged += 1
             if acknowledged <= after_count:
                 continue
-            if event.get("item_id") == item_id or event.get("response_id") == response_id:
-                return event
+            payload = event.get("event")
+            if not isinstance(payload, dict):
+                payload = event
+            if payload.get("item_id") == item_id or payload.get("response_id") == response_id:
+                return payload
         return None
 
     def _playback_history_committed(self, response_id: str, *, after_count: int) -> bool:
@@ -723,17 +725,10 @@ class RealtimeDuplexClient:
         self,
         *,
         response_id: str | None = None,
-        timeout_s: float = 30.0,
-        wait_for_history_committed: bool = True,
-        settle_s: float = 0.0,
+        timeout_s: float = 0.0,
+        wait_for_history_committed: bool = False,
     ) -> None:
-        """Ack playback for one or all audio responses.
-
-        Multi-turn native duplex should wait for ``playback.acknowledged`` before
-        the next input stream/commit. Prefer ``history_committed=true`` when the
-        server provides it; otherwise still proceed after the ack event so later
-        turns are not blocked forever on a soft commit miss.
-        """
+        """Ack one or all audio responses, optionally waiting for confirmation."""
         targets = [response_id] if response_id is not None else list(self.events.response_ids)
         for rid in targets:
             if not isinstance(rid, str) or not rid:
@@ -748,35 +743,15 @@ class RealtimeDuplexClient:
             await self.send_playback_ack(rid, played_ms)
             if timeout_s <= 0:
                 continue
-            try:
-                await wait_for(
-                    lambda rid=rid, before_ack=before_ack: self._playback_ack_event(rid, after_count=before_ack)
-                    is not None,
-                    timeout_s=timeout_s,
-                    label=f"playback.acknowledged for {rid}",
-                )
-            except TimeoutError:
-                if wait_for_history_committed:
-                    raise
-                continue
-            if wait_for_history_committed and not self._playback_history_committed(rid, after_count=before_ack):
-                # Soft-commit miss: retry once after a short settle.
-                await asyncio.sleep(0.5)
-                before_retry = self.events.count("playback.acknowledged")
-                await self.send_playback_ack(rid, played_ms)
-                try:
-                    await wait_for(
-                        lambda rid=rid, before_retry=before_retry: self._playback_history_committed(
-                            rid, after_count=before_retry
-                        )
-                        or self._playback_ack_event(rid, after_count=before_retry) is not None,
-                        timeout_s=min(timeout_s, 30.0),
-                        label=f"playback.acknowledged retry for {rid}",
-                    )
-                except TimeoutError:
-                    pass
-        if settle_s > 0:
-            await asyncio.sleep(settle_s)
+            await wait_for(
+                lambda rid=rid, before_ack=before_ack: (
+                    self._playback_history_committed(rid, after_count=before_ack)
+                    if wait_for_history_committed
+                    else self._playback_ack_event(rid, after_count=before_ack) is not None
+                ),
+                timeout_s=timeout_s,
+                label=f"playback.acknowledged for {rid}",
+            )
 
     async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
         await self.send(
