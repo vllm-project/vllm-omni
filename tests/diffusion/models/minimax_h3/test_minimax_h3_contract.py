@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1428,32 +1429,217 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
     assert transcode_calls[0][1]["target_frame_count"] == 209
 
 
-def test_ref2va_qwen_sampling_decodes_prepared_video_once(monkeypatch):
+def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    decoded = np.arange(25 * 2 * 2 * 3, dtype=np.uint8).reshape(25, 2, 2, 3)
-    load_calls = []
+    decoded = np.arange(3 * 2 * 2 * 3, dtype=np.uint8).reshape(3, 2, 2, 3)
+    decode_calls = []
     monkeypatch.setattr(
         reference_video_module,
         "_probe_video",
-        lambda _path: {"frame_count": len(decoded)},
+        lambda _path: {
+            "frame_count": 25,
+            "width": 2,
+            "height": 2,
+        },
     )
     monkeypatch.setattr(
         reference_video_module,
-        "load_video_frames",
-        lambda path: load_calls.append(path) or decoded,
+        "_decode_video_frames_ffmpeg",
+        lambda path, **kwargs: decode_calls.append((path, kwargs)) or decoded,
     )
 
     sampled = reference_video_module.sample_reference_video_frames("prepared.mp4")
 
-    assert load_calls == ["prepared.mp4"]
-    for frame, expected in zip(
-        sampled["frames"],
-        (decoded[0], decoded[12], decoded[24]),
-        strict=True,
-    ):
+    assert decode_calls == [
+        (
+            "prepared.mp4",
+            {
+                "frame_count": 25,
+                "indices": [0, 12, 24],
+                "width": 2,
+                "height": 2,
+            },
+        )
+    ]
+    for frame, expected in zip(sampled["frames"], decoded, strict=True):
         np.testing.assert_array_equal(frame, expected)
     assert sampled["block_timestamps"] == [0.25, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("indices", "frame_count"),
+    [([0, 12], 25), (None, 2)],
+)
+def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame_count):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    expected = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
+    observed = []
+
+    def fake_run(command, **kwargs):
+        observed.append((command, kwargs))
+        return SimpleNamespace(stdout=expected.tobytes())
+
+    monkeypatch.setattr(reference_video_module.subprocess, "run", fake_run)
+
+    actual = reference_video_module._decode_video_frames_ffmpeg(
+        "prepared.mp4",
+        frame_count=frame_count,
+        indices=indices,
+        width=3,
+        height=2,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    command, kwargs = observed[0]
+    assert command[0] == "ffmpeg"
+    assert command[command.index("-frames:v") + 1] == "2"
+    if indices is None:
+        assert "-vf" not in command
+    else:
+        assert command[command.index("-vf") + 1] == "select=eq(n\\,0)+eq(n\\,12)"
+    assert command[-1] == "pipe:1"
+    assert kwargs == {"check": True, "capture_output": True}
+
+
+def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
+    decode_calls = []
+    monkeypatch.setitem(sys.modules, "decord", None)
+    monkeypatch.setattr(
+        reference_video_module,
+        "_probe_video",
+        lambda _path: {
+            "frame_count": 2,
+            "width": 3,
+            "height": 2,
+        },
+    )
+    monkeypatch.setattr(
+        reference_video_module,
+        "_decode_video_frames_ffmpeg",
+        lambda path, **kwargs: decode_calls.append((path, kwargs)) or expected,
+    )
+
+    actual = reference_video_module.load_video_frames("prepared.mp4")
+
+    assert actual is expected
+    assert decode_calls == [
+        (
+            "prepared.mp4",
+            {
+                "frame_count": 2,
+                "width": 3,
+                "height": 2,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"frame_count": 0, "width": 3, "height": 2}, "video has no frames"),
+        ({"frame_count": 1, "width": 0, "height": 2}, "invalid dimensions"),
+        (
+            {"frame_count": 1, "indices": [], "width": 3, "height": 2},
+            "invalid frame indices",
+        ),
+    ],
+)
+def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match=message):
+        reference_video_module._decode_video_frames_ffmpeg("prepared.mp4", **kwargs)
+
+
+def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    calls = []
+    probe = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 4,
+                "height": 2,
+                "r_frame_rate": "24/1",
+                "nb_frames": "3",
+                "duration": "0.125",
+                "sample_aspect_ratio": "1:1",
+            }
+        ],
+        "format": {"duration": "0.125", "size": "123"},
+    }
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)) or SimpleNamespace(stdout=json.dumps(probe)),
+    )
+
+    metadata = reference_video_module._probe_video("prepared.mp4")
+
+    assert metadata["frame_count"] == 3
+    assert len(calls) == 1
+    assert "-count_frames" not in calls[0][0]
+
+
+def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    calls = []
+    stream = {
+        "codec_type": "video",
+        "width": 4,
+        "height": 2,
+        "r_frame_rate": "24/1",
+        "duration": "0.125",
+        "sample_aspect_ratio": "1:1",
+    }
+    first_probe = {
+        "streams": [stream],
+        "format": {"duration": "0.125", "size": "123"},
+    }
+    second_probe = {
+        "streams": [{**stream, "nb_read_frames": "3"}],
+        "format": {"duration": "0.125", "size": "123"},
+    }
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs))
+        or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe)),
+    )
+
+    metadata = reference_video_module._probe_video("prepared.mp4")
+
+    assert metadata["frame_count"] == 3
+    assert len(calls) == 2
+    assert "-count_frames" in calls[1][0]
+
+
+def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+    from vllm_omni.errors import OmniClientError
+
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=b"short"),
+    )
+
+    with pytest.raises(OmniClientError, match="decoded 5 bytes.*expected 18"):
+        reference_video_module._decode_video_frames_ffmpeg(
+            "prepared.mp4",
+            frame_count=1,
+            width=3,
+            height=2,
+        )
 
 
 def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_path):
