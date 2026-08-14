@@ -5,13 +5,11 @@ from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer im
 )
 from vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image import (
     HiDreamO1ImagePipeline,
-    build_hidream_o1_scheduler,
     get_hidream_o1_image_post_process_func,
 )
 
 __all__ = [
     "HiDreamO1ImageTransformer",
     "HiDreamO1ImagePipeline",
-    "build_hidream_o1_scheduler",
     "get_hidream_o1_image_post_process_func",
 ]
