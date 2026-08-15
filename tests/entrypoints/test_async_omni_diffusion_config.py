@@ -330,6 +330,14 @@ def test_serve_cli_forwards_distributed_offload_residency():
             "--dlo-no-use-allgather",
             "--dlo-resident-layers",
             "20",
+            "--dlo-host-memory-budget-gib",
+            "8",
+            "--dlo-host-cache-dir",
+            "/tmp/dlo-cache",
+            "--dlo-pinned-staging-buffer-count",
+            "3",
+            "--dlo-prefetch-depth",
+            "4",
         ]
     )
 
@@ -340,9 +348,17 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert args.enable_distributed_layerwise_offload is True
     assert args.dlo_use_allgather is False
     assert args.dlo_resident_layers == 20
+    assert args.dlo_host_memory_budget_gib == 8
+    assert args.dlo_host_cache_dir == "/tmp/dlo-cache"
+    assert args.dlo_pinned_staging_buffer_count == 3
+    assert args.dlo_prefetch_depth == 4
     assert engine_args["enable_distributed_layerwise_offload"] is True
     assert engine_args["dlo_use_allgather"] is False
     assert engine_args["dlo_resident_layers"] == 20
+    assert engine_args["dlo_host_memory_budget_gib"] == 8
+    assert engine_args["dlo_host_cache_dir"] == "/tmp/dlo-cache"
+    assert engine_args["dlo_pinned_staging_buffer_count"] == 3
+    assert engine_args["dlo_prefetch_depth"] == 4
 
 
 def test_serve_cli_accepts_diffusion_compile_controls():

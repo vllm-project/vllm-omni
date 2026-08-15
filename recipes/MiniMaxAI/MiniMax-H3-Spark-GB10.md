@@ -31,10 +31,14 @@ at a time.
 On GB10 the CPU and GPU share one physical memory pool, which changes the capacity
 math relative to the RTX and datacenter recipes:
 
-- **Do not use `--enable-distributed-layerwise-offload`.** DLO stages rank-local
-  weights into pinned host memory, which on GB10 is the same pool the weights are
-  already in. Peak usage roughly doubles and the process is killed by the OOM
-  killer (`Exit code: -9`) shortly after `Enabling offloader backend`.
+- **Do not use `--enable-distributed-layerwise-offload`.** Default DLO stages
+  rank-local weights into pinned host memory, which on GB10 is the same pool the
+  weights are already in. Peak usage roughly doubles and the process is killed
+  by the OOM killer (`Exit code: -9`) shortly after
+  `Enabling offloader backend`. Optional file-backed bounded staging is not a
+  workaround here: the regular loader's BF16 startup still exceeds the unified
+  pool, while the required online FP8 path is incompatible with layerwise
+  offload.
 - **Do not use `--enable-cpu-offload`.** Moving weights from "VRAM" to "host RAM"
   frees nothing here.
 - **`--quantization fp8` is mandatory.** A BF16 partition is 135 GiB and does not

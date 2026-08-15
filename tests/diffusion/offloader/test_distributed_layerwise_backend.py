@@ -3,10 +3,12 @@
 
 """Unit tests for DistributedLayerwiseOffloadHook and backend utilities."""
 
+import errno
 import gc
 import json
 import os
 import socket
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -45,8 +47,14 @@ class DummyStream:
 
 
 class DummyEvent:
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+
     def record(self, _stream) -> None:
         return None
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
 
 
 @contextmanager
@@ -384,6 +392,233 @@ class TestDistributedLayerwiseOffloadHook:
         hook.initialize_hook(block)
 
         assert torch.equal(hook.cpu_shards[torch.float32], torch.tensor([0.0, 1.0]))
+
+
+class TestBoundedHostStaging:
+    def test_file_backed_shard_uses_two_shared_staging_slots(
+        self,
+        tmp_path,
+        dist_group,
+        patched_offload_runtime,
+    ):
+        store = dist_backend_module.FileBackedShardStore(tmp_path)
+        current_block = TinyBlock(_make_values(1.0))
+        next_block = TinyBlock(_make_values(10.0))
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+            host_shard_store=store,
+        )
+
+        hook.initialize_hook(current_block)
+        pool = dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+            [hook.cpu_shards],
+            pin_memory=False,
+            budget_bytes=32,
+        )
+        hook.host_staging_pool = pool
+
+        assert store.allocated_bytes == 16
+        assert len(list(store.cache_dir.iterdir())) == 1
+        assert not hook.cpu_shards[torch.float32].is_pinned()
+        assert len(pool.buffers) == 2
+        assert pool.allocated_bytes == 32
+
+        first_slot_ptr = pool.buffers[0][torch.float32].data_ptr()
+        hook.prefetch_layer(slot=0, non_blocking=False)
+        assert torch.equal(next_block.weight.to_local(), _make_values(10.0))
+
+        first_event = pool.slot_events[0]
+        hook.prefetch_layer(slot=0, non_blocking=False)
+        hook.prefetch_layer(slot=0, non_blocking=False)
+        assert pool.buffers[0][torch.float32].data_ptr() == first_slot_ptr
+        assert first_event.synchronize_calls == 1
+
+    def test_background_prepare_stages_next_shard_without_blocking(
+        self,
+        monkeypatch,
+    ):
+        pool = dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+            [{torch.float32: torch.arange(4, dtype=torch.float32)}],
+            pin_memory=False,
+            budget_bytes=32,
+        )
+        source = {torch.float32: torch.arange(4, dtype=torch.float32)}
+        copy_started = threading.Event()
+        allow_copy = threading.Event()
+        original_stage_into = pool._stage_into
+
+        def blocked_stage_into(slot, sources):
+            copy_started.set()
+            assert allow_copy.wait(timeout=5)
+            return original_stage_into(slot, sources)
+
+        monkeypatch.setattr(pool, "_stage_into", blocked_stage_into)
+
+        assert pool.prepare([source]) == 1
+        assert copy_started.wait(timeout=5)
+        assert pool.pending_count == 1
+        allow_copy.set()
+
+        slot, staged = pool.stage(source)
+        assert torch.equal(staged[torch.float32], source[torch.float32])
+        assert pool.prefetch_hits == 1
+        assert pool.staging_misses == 0
+        pool.mark_in_flight(slot, DummyEvent())
+        pool.close()
+
+    def test_prepare_waits_for_h2d_event_off_the_caller_thread(self):
+        class BlockingEvent:
+            def __init__(self):
+                self.synchronize_started = threading.Event()
+                self.allow_reuse = threading.Event()
+
+            def synchronize(self):
+                self.synchronize_started.set()
+                assert self.allow_reuse.wait(timeout=5)
+
+        sources = [{torch.float32: torch.full((4,), value, dtype=torch.float32)} for value in range(3)]
+        pool = dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+            sources,
+            pin_memory=False,
+            budget_bytes=32,
+        )
+
+        first_slot, _ = pool.stage(sources[0])
+        blocking_event = BlockingEvent()
+        pool.mark_in_flight(first_slot, blocking_event)
+        second_slot, _ = pool.stage(sources[1])
+        pool.mark_in_flight(second_slot, DummyEvent())
+
+        # The worker owns the event wait; prepare itself must return.
+        assert pool.prepare([sources[2]]) == 1
+        assert blocking_event.synchronize_started.wait(timeout=5)
+        blocking_event.allow_reuse.set()
+
+        staged_slot, staged = pool.stage(sources[2])
+        assert staged_slot == first_slot
+        assert torch.equal(staged[torch.float32], sources[2][torch.float32])
+        pool.mark_in_flight(staged_slot, DummyEvent())
+        pool.close()
+
+    def test_prepare_keeps_one_slot_for_unexpected_request(self):
+        sources = [{torch.float32: torch.full((4,), value, dtype=torch.float32)} for value in range(3)]
+        pool = dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+            sources,
+            pin_memory=False,
+            budget_bytes=32,
+        )
+
+        assert pool.prepare(sources[:2]) == 1
+        slot, staged = pool.stage(sources[2])
+        assert torch.equal(staged[torch.float32], sources[2][torch.float32])
+        assert pool.staging_misses == 1
+        pool.mark_in_flight(slot, DummyEvent())
+        assert pool.pending_count == 0
+        assert pool.prefetch_discarded == 1
+        pool.close()
+
+    def test_file_backed_store_removes_ephemeral_cache_on_close(self, tmp_path):
+        store = dist_backend_module.FileBackedShardStore(tmp_path)
+        shard = store.allocate(4, torch.float32)
+        shard.copy_(torch.arange(4, dtype=torch.float32))
+        store.finalize(shard)
+        cache_dir = store.cache_dir
+
+        del shard
+        gc.collect()
+        store.close()
+
+        assert not cache_dir.exists()
+
+    def test_file_backed_store_fails_cleanly_when_cache_is_full(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        if not hasattr(os, "posix_fallocate"):
+            pytest.skip("posix_fallocate is unavailable")
+
+        store = dist_backend_module.FileBackedShardStore(tmp_path)
+
+        def fail_reservation(_fd, _offset, _length):
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        monkeypatch.setattr(os, "posix_fallocate", fail_reservation)
+        with pytest.raises(OSError) as exc_info:
+            store.allocate(4, torch.float32)
+
+        assert exc_info.value.errno == errno.ENOSPC
+        assert not any(store.cache_dir.iterdir())
+        store.close()
+
+    def test_staging_budget_rejects_two_slots_larger_than_limit(
+        self,
+        tmp_path,
+        dist_group,
+        patched_offload_runtime,
+    ):
+        store = dist_backend_module.FileBackedShardStore(tmp_path)
+        current_block = TinyBlock(_make_values(1.0))
+        next_block = TinyBlock(_make_values(10.0))
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            host_shard_store=store,
+        )
+        hook.initialize_hook(current_block)
+
+        with pytest.raises(ValueError, match="2 pinned host staging slots require 32 bytes"):
+            dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+                [hook.cpu_shards],
+                pin_memory=False,
+                budget_bytes=31,
+            )
+
+    def test_resident_layers_reuse_bounded_staging_pool(self, tmp_path, patched_offload_runtime):
+        store = dist_backend_module.FileBackedShardStore(tmp_path)
+        blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        expected = []
+        for index, block in enumerate(blocks):
+            block.weight.data.fill_(index + 1)
+            block.bias.data.fill_(index + 3)
+            expected.append((block.weight.detach().clone(), block.bias.detach().clone()))
+
+        group = PinnedResidentLayerGroup(
+            blocks,
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            host_shard_store=store,
+        )
+        pool = dist_backend_module.PinnedHostStagingPool.from_shard_sets(
+            group.host_shard_sets,
+            pin_memory=False,
+            budget_bytes=48,
+        )
+        group.host_staging_pool = pool
+
+        assert pool.allocated_bytes == 48
+        group.load()
+        for block, (weight, bias) in zip(blocks, expected):
+            assert torch.equal(block.weight, weight)
+            assert torch.equal(block.bias, bias)
+
+        group.offload()
+        group.load()
+        for block, (weight, bias) in zip(blocks, expected):
+            assert torch.equal(block.weight, weight)
+            assert torch.equal(block.bias, bias)
 
 
 class TestPinnedResidentLayerGroup:
@@ -1050,6 +1285,100 @@ class TestMmapValidation:
 
 class TestConfigValidation:
     """Tests for configuration validation in OffloadConfig / execute_request."""
+
+    def test_bounded_host_staging_converts_gib_budget_to_bytes(self, tmp_path):
+        od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=False,
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=False,
+            dlo_resident_layers=0,
+            dlo_host_memory_budget_gib=1.5,
+            dlo_host_cache_dir=str(tmp_path),
+            dlo_pinned_staging_buffer_count=3,
+            dlo_prefetch_depth=4,
+            pin_cpu_memory=True,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                sequence_parallel_size=1,
+                use_hsdp=False,
+            ),
+            model="/fake/path",
+        )
+
+        config = OffloadConfig.from_od_config(od_config)
+
+        assert config.dlo_host_memory_budget_bytes == int(1.5 * 1024**3)
+        assert config.dlo_host_cache_dir == str(tmp_path)
+        assert config.dlo_pinned_staging_buffer_count == 3
+        assert config.dlo_prefetch_depth == 4
+
+    def test_bounded_host_staging_requires_cache_directory(self):
+        od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=False,
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=False,
+            dlo_resident_layers=0,
+            dlo_host_memory_budget_gib=1.0,
+            dlo_host_cache_dir=None,
+            pin_cpu_memory=True,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                sequence_parallel_size=1,
+                use_hsdp=False,
+            ),
+            model="/fake/path",
+        )
+
+        with pytest.raises(ValueError, match="dlo_host_cache_dir is required"):
+            OffloadConfig.from_od_config(od_config)
+
+    def test_bounded_host_staging_rejects_allgather_mode(self, tmp_path):
+        od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=False,
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+            dlo_resident_layers=0,
+            dlo_host_memory_budget_gib=1.0,
+            dlo_host_cache_dir=str(tmp_path),
+            pin_cpu_memory=True,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=2,
+                sequence_parallel_size=1,
+                use_hsdp=False,
+            ),
+            model="/fake/path",
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="bounded DLO host staging currently requires --dlo-no-use-allgather",
+        ):
+            OffloadConfig.from_od_config(od_config)
+
+    @pytest.mark.parametrize("budget_gib", [0, -1, float("inf"), float("nan")])
+    def test_bounded_host_staging_rejects_invalid_budget(self, tmp_path, budget_gib):
+        od_config = SimpleNamespace(
+            enable_cpu_offload=False,
+            enable_layerwise_offload=False,
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=False,
+            dlo_resident_layers=0,
+            dlo_host_memory_budget_gib=budget_gib,
+            dlo_host_cache_dir=str(tmp_path),
+            pin_cpu_memory=True,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=1,
+                sequence_parallel_size=1,
+                use_hsdp=False,
+            ),
+            model="/fake/path",
+        )
+
+        with pytest.raises(ValueError, match="dlo_host_memory_budget_gib must be finite and > 0"):
+            OffloadConfig.from_od_config(od_config)
 
     def test_hsdp_with_allgather_rejected(self):
         """HSDP + DLO + AllGather should raise ValueError (double sharding)."""

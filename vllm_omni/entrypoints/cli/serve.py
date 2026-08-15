@@ -729,6 +729,39 @@ class OmniServeCommand(CLISubcommand):
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
         )
+        omni_config_group.add_argument(
+            "--dlo-host-memory-budget-gib",
+            type=float,
+            default=None,
+            help="Enable bounded rank-local DLO host staging and cap its private "
+            "transfer-buffer allocation in GiB. Requires "
+            "--dlo-no-use-allgather and --dlo-host-cache-dir. This limit excludes "
+            "OS page cache, initial checkpoint loading, encoders, and VAEs.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-host-cache-dir",
+            type=str,
+            default=None,
+            help="Local SSD/NVMe directory for ephemeral file-backed rank-local "
+            "DiT shards used by bounded DLO host staging. Avoid tmpfs and network "
+            "filesystems; files are removed on clean shutdown.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-pinned-staging-buffer-count",
+            type=int,
+            default=2,
+            help="Number of shared host transfer buffers for bounded DLO staging "
+            "(default: 2, minimum: 2). The configured host budget must fit all "
+            "buffers at the largest per-rank layer-shard size.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-prefetch-depth",
+            type=int,
+            default=2,
+            help="Number of upcoming file-backed layer shards submitted for "
+            "best-effort OS readahead (default: 2). This may increase reclaimable "
+            "page-cache residency but not private pinned staging allocation.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

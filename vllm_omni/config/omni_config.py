@@ -577,6 +577,10 @@ class _DiffusionConfigProjection:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
+    dlo_host_memory_budget_gib: float | None = Field(default=None, gt=0)
+    dlo_host_cache_dir: str | None = None
+    dlo_pinned_staging_buffer_count: int = Field(default=2, ge=2)
+    dlo_prefetch_depth: int = Field(default=2, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)

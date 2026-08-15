@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -31,6 +32,10 @@ class OffloadConfig:
     # rank-local tensors (including TP-local shards) with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    dlo_host_memory_budget_bytes: int | None = None
+    dlo_host_cache_dir: str | None = None
+    dlo_pinned_staging_buffer_count: int = 2
+    dlo_prefetch_depth: int = 2
     model_path: str | None = None  # checkpoint path for mmap weight loading
 
     @classmethod
@@ -111,6 +116,32 @@ class OffloadConfig:
                 "resident blocks use weights prepared by the standard TP-aware loader"
             )
 
+        staging_buffer_count = int(getattr(od_config, "dlo_pinned_staging_buffer_count", 2))
+        if staging_buffer_count < 2:
+            raise ValueError(f"dlo_pinned_staging_buffer_count must be >= 2, got {staging_buffer_count}")
+        prefetch_depth = int(getattr(od_config, "dlo_prefetch_depth", 2))
+        if prefetch_depth < 0:
+            raise ValueError(f"dlo_prefetch_depth must be >= 0, got {prefetch_depth}")
+
+        budget_gib = getattr(od_config, "dlo_host_memory_budget_gib", None)
+        budget_bytes: int | None = None
+        host_cache_dir = getattr(od_config, "dlo_host_cache_dir", None)
+        if budget_gib is not None:
+            try:
+                budget_gib = float(budget_gib)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("dlo_host_memory_budget_gib must be finite and > 0") from exc
+            if not math.isfinite(budget_gib) or budget_gib <= 0:
+                raise ValueError("dlo_host_memory_budget_gib must be finite and > 0")
+            if not enable_distributed_layerwise_offload:
+                raise ValueError("dlo_host_memory_budget_gib requires enable_distributed_layerwise_offload")
+            if dlo_use_allgather:
+                raise ValueError("bounded DLO host staging currently requires --dlo-no-use-allgather")
+            if host_cache_dir is None or not str(host_cache_dir).strip():
+                raise ValueError("dlo_host_cache_dir is required when dlo_host_memory_budget_gib is set")
+            host_cache_dir = str(host_cache_dir)
+            budget_bytes = int(budget_gib * 1024**3)
+
         # If dlo_use_allgather=False, force dp_size=1 (each rank independent)
         if enable_distributed_layerwise_offload and not dlo_use_allgather:
             dp_size = 1
@@ -137,6 +168,10 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_host_memory_budget_bytes=budget_bytes,
+            dlo_host_cache_dir=host_cache_dir,
+            dlo_pinned_staging_buffer_count=staging_buffer_count,
+            dlo_prefetch_depth=prefetch_depth,
             model_path=getattr(od_config, "model", None),
         )
 

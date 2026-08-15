@@ -710,6 +710,14 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Optional bounded private host staging. Persistent rank-local DiT shards
+    # are file-backed; only a fixed ring of transfer buffers is pinned.
+    dlo_host_memory_budget_gib: float | None = None
+    dlo_host_cache_dir: str | None = None
+    dlo_pinned_staging_buffer_count: int = 2
+    # Number of upcoming file-backed layer shards submitted for best-effort
+    # OS readahead. This does not reserve equivalent anonymous RAM.
+    dlo_prefetch_depth: int = 2
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

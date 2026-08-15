@@ -383,6 +383,10 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    dlo_host_memory_budget_gib: float | None = None
+    dlo_host_cache_dir: str | None = None
+    dlo_pinned_staging_buffer_count: int | None = None
+    dlo_prefetch_depth: int | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

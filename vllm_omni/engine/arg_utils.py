@@ -544,6 +544,10 @@ class OrchestratorArgs:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
+    dlo_host_memory_budget_gib: float | None = None
+    dlo_host_cache_dir: str | None = None
+    dlo_pinned_staging_buffer_count: int = 2
+    dlo_prefetch_depth: int = 2
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

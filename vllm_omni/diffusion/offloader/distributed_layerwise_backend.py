@@ -30,6 +30,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import get_blocks_from_dit
+from .host_staging import FileBackedShardStore, PinnedHostStagingPool
 from .module_collector import ModuleDiscovery
 from .offload_plan import OffloadPlan, get_offload_plan, supports_mmap_loading
 from .tensor_utils import (
@@ -74,6 +75,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         comm_stream: Any | None = None,
         pin_memory: bool = True,
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
+        host_shard_store: FileBackedShardStore | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -83,6 +85,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.dp_size = dp_size
         self.rank = rank
         self.pin_memory = pin_memory
+        self.host_shard_store = host_shard_store
+        self.host_staging_pool: PinnedHostStagingPool | None = None
+        self.host_prefetch_shards: list[dict[torch.dtype, torch.Tensor]] = []
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -161,6 +166,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self.dp_size,
             self.rank,
             self.pin_memory,
+            self.host_shard_store,
         )
 
         # Allocate device buffers only if not using shared buffers from backend
@@ -206,6 +212,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         dp_size: int,
         rank: int,
         pin_memory: bool,
+        host_shard_store: FileBackedShardStore | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
@@ -254,7 +261,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             # Allocate ONLY the shard (1/dp_size), zero-padded to ceil.
             # Avoids materialising the full block on CPU.
-            shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
+            if host_shard_store is None:
+                shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
+            else:
+                shard = host_shard_store.allocate(shard_size, dtype)
 
             current_offset = 0
             for (
@@ -315,7 +325,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 )
                 current_offset += storage_numel
 
-            if pin_memory:
+            if host_shard_store is not None:
+                host_shard_store.finalize(shard)
+            elif pin_memory:
                 shard = shard.pin_memory()
 
             cpu_shards[dtype] = shard
@@ -357,25 +369,41 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         """
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
+        if self.host_shard_store is not None and self.host_prefetch_shards:
+            self.host_shard_store.prefetch(self.host_prefetch_shards)
+
+        staging_pool = self.host_staging_pool
+        host_slot: int | None = None
+        copy_sources = self.cpu_shards
+        if staging_pool is not None:
+            host_slot, copy_sources = staging_pool.stage(self.cpu_shards)
+
         evt = current_omni_platform.Event()
         gpu_weights = self.gpu_buffers[slot]
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
 
         if self.dp_size <= 1 or self.dp_group is None:
             with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in self.cpu_shards.items():
+                for dtype, cpu_shard in copy_sources.items():
                     gw = gpu_weights[dtype]
                     gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=non_blocking)
                 evt.record(self.copy_stream)
+            if host_slot is not None:
+                staging_pool.mark_in_flight(host_slot, evt)
         else:
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
             assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
             with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in self.cpu_shards.items():
+                for dtype, cpu_shard in copy_sources.items():
                     gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
                     gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
                     gpu_shards[dtype] = gpu_shard
+                if host_slot is not None:
+                    h2d_evt = current_omni_platform.Event()
+                    h2d_evt.record(self.copy_stream)
+            if host_slot is not None:
+                staging_pool.mark_in_flight(host_slot, h2d_evt)
 
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
@@ -395,6 +423,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         group=self.dp_group,
                     )
                 evt.record(self.comm_stream)
+
+        if staging_pool is not None and len(self.host_prefetch_shards) > 1:
+            # Copy the next file-backed shard into the other pinned slot
+            # while this layer's H2D/compute proceeds. prepare leaves one
+            # emergency slot free for cache skips and module-group switches.
+            staging_pool.prepare(self.host_prefetch_shards[1:])
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -513,6 +547,7 @@ def apply_distributed_block_hook(
     comm_stream: Any | None = None,
     pin_memory: bool = True,
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
+    host_shard_store: FileBackedShardStore | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -526,6 +561,7 @@ def apply_distributed_block_hook(
         comm_stream=comm_stream,
         pin_memory=pin_memory,
         shared_buffers=shared_buffers,
+        host_shard_store=host_shard_store,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -563,10 +599,15 @@ class PinnedResidentLayerGroup:
         device: torch.device,
         copy_stream: Any,
         pin_memory: bool,
+        host_shard_store: FileBackedShardStore | None = None,
+        host_prefetch_depth: int = 0,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
         self.loaded = False
+        self.host_shard_store = host_shard_store
+        self.host_staging_pool: PinnedHostStagingPool | None = None
+        self.host_prefetch_depth = host_prefetch_depth
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
 
@@ -580,6 +621,7 @@ class PinnedResidentLayerGroup:
                 dp_size=1,
                 rank=0,
                 pin_memory=pin_memory,
+                host_shard_store=host_shard_store,
             )
             self._states.append(
                 {
@@ -588,6 +630,10 @@ class PinnedResidentLayerGroup:
                     "metadata": metadata,
                 }
             )
+
+    @property
+    def host_shard_sets(self) -> list[dict[torch.dtype, torch.Tensor]]:
+        return [state["cpu_shards"] for state in self._states]
 
     def load(self) -> None:
         if self.loaded:
@@ -609,10 +655,30 @@ class PinnedResidentLayerGroup:
 
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
         ready = current_omni_platform.Event()
-        with current_omni_platform.stream(self.copy_stream):
-            for state, block_buffers in zip(self._states, gpu_buffers):
-                for dtype, cpu_shard in state["cpu_shards"].items():
+        staging_pool = self.host_staging_pool
+        for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
+            if self.host_shard_store is not None and self.host_prefetch_depth:
+                end = min(index + self.host_prefetch_depth, len(self._states))
+                self.host_shard_store.prefetch(candidate["cpu_shards"] for candidate in self._states[index:end])
+            if staging_pool is not None and self.host_prefetch_depth:
+                end = min(index + self.host_prefetch_depth, len(self._states))
+                staging_pool.prepare(candidate["cpu_shards"] for candidate in self._states[index:end])
+
+            host_slot: int | None = None
+            copy_sources = state["cpu_shards"]
+            if staging_pool is not None:
+                host_slot, copy_sources = staging_pool.stage(copy_sources)
+
+            with current_omni_platform.stream(self.copy_stream):
+                for dtype, cpu_shard in copy_sources.items():
                     block_buffers[dtype].copy_(cpu_shard, non_blocking=True)
+                if host_slot is not None:
+                    h2d_evt = current_omni_platform.Event()
+                    h2d_evt.record(self.copy_stream)
+            if host_slot is not None:
+                staging_pool.mark_in_flight(host_slot, h2d_evt)
+
+        with current_omni_platform.stream(self.copy_stream):
             ready.record(self.copy_stream)
 
         for state, block_buffers in zip(self._states, gpu_buffers):
@@ -647,6 +713,12 @@ class PinnedResidentLayerGroup:
         self._gpu_buffers.clear()
         self.loaded = False
 
+    def release_host_storage(self) -> None:
+        for state in self._states:
+            state["cpu_shards"].clear()
+        self.host_staging_pool = None
+        self.host_shard_store = None
+
 
 # ---------------------------------------------------------------------- #
 #  Backend                                                                #
@@ -679,6 +751,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
         self._resident_blocks: list[nn.Module] = []
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
+        self._host_shard_store: FileBackedShardStore | None = None
+        self._host_staging_pool: PinnedHostStagingPool | None = None
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
@@ -1314,6 +1388,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.comm_stream,
             self.config.pin_cpu_memory,
             shared_buffers=[None, None],
+            host_shard_store=self._host_shard_store,
         )
         sub_hooks = [last_hook]
         for i, block in enumerate(blocks[:-1]):
@@ -1329,6 +1404,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.comm_stream,
                 self.config.pin_cpu_memory,
                 shared_buffers=[None, None],
+                host_shard_store=self._host_shard_store,
             )
             sub_hooks.append(hook)
 
@@ -1423,6 +1499,56 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             if buffer is not None:
                 buffer.data = buffer.data.to(self.device, non_blocking=True)
 
+    def _configure_bounded_host_staging(
+        self,
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> None:
+        store = self._host_shard_store
+        if store is None:
+            return
+
+        shard_sets = [hook.cpu_shards for hook in hooks]
+        if self._resident_layer_group is not None:
+            shard_sets.extend(self._resident_layer_group.host_shard_sets)
+        if not shard_sets:
+            return
+
+        budget_bytes = self.config.dlo_host_memory_budget_bytes
+        assert budget_bytes is not None
+        pool = PinnedHostStagingPool.from_shard_sets(
+            shard_sets,
+            pin_memory=self.config.pin_cpu_memory,
+            budget_bytes=budget_bytes,
+            buffer_count=self.config.dlo_pinned_staging_buffer_count,
+        )
+        self._host_staging_pool = pool
+        for hook in hooks:
+            hook.host_staging_pool = pool
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.host_staging_pool = pool
+
+        prefetch_depth = self.config.dlo_prefetch_depth
+        for group in self._all_hook_groups:
+            group_depth = min(prefetch_depth, len(group))
+            for index, hook in enumerate(group):
+                hook.host_prefetch_shards = [
+                    group[(index + offset) % len(group)].cpu_shards for offset in range(group_depth)
+                ]
+
+        saved_pinned_bytes = max(store.allocated_bytes - pool.allocated_bytes, 0)
+        logger.info(
+            "Bounded DLO host staging enabled: file-backed shards=%.2f GiB, "
+            "private staging=%.2f GiB (%d buffers), pinned payload reduction=%.2f GiB (%.1f%%), "
+            "prefetch_depth=%d. "
+            "OS page cache and initial checkpoint-loader memory are not bounded.",
+            store.allocated_bytes / 1024**3,
+            pool.allocated_bytes / 1024**3,
+            len(pool.buffers),
+            saved_pinned_bytes / 1024**3,
+            100.0 * saved_pinned_bytes / store.allocated_bytes,
+            prefetch_depth,
+        )
+
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
@@ -1439,6 +1565,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not modules.dits:
             logger.warning("No DiT/transformer modules found, skipping distributed layer-wise offloading")
             return
+        if self.config.dlo_host_memory_budget_bytes is not None:
+            assert self.config.dlo_host_cache_dir is not None
+            self._host_shard_store = FileBackedShardStore(self.config.dlo_host_cache_dir)
+            logger.info(
+                "Bounded DLO host staging cache: %s",
+                self._host_shard_store.cache_dir,
+            )
 
         # Retrieve optional declarative OffloadPlan from the pipeline.
         # When present, replaces heuristic block discovery.
@@ -1577,6 +1710,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.comm_stream,
                 self.config.pin_cpu_memory,
                 shared_buffers=[None, None],
+                host_shard_store=self._host_shard_store,
             )
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
@@ -1593,6 +1727,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.comm_stream,
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
+                    host_shard_store=self._host_shard_store,
                 )
                 block_hooks.append(hook)
 
@@ -1621,12 +1756,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                host_shard_store=self._host_shard_store,
+                host_prefetch_depth=self.config.dlo_prefetch_depth,
             )
             pipeline._dlo_residency_controller = self
-
-        if not self._all_hook_groups:
-            self.enabled = bool(self._resident_blocks)
-            return
 
         # Unified allocation: 2 shared output buffers + 2 shared shard buffers
         # sized to the max block across ALL module groups (gen_layers +
@@ -1634,6 +1767,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         all_hooks: list[DistributedLayerwiseOffloadHook] = []
         for group in self._all_hook_groups:
             all_hooks.extend(group)
+        self._configure_bounded_host_staging(all_hooks)
+
+        if not self._all_hook_groups:
+            self.enabled = bool(self._resident_blocks)
+            if self.enabled:
+                self._release_mmap_handles()
+                self._cleanup_after_loading()
+            elif self._host_shard_store is not None:
+                self._host_shard_store.close()
+                self._host_shard_store = None
+            return
 
         unified_buffers = self._allocate_shared_buffers(all_hooks)
         unified_shard_buffers = None
@@ -1722,6 +1866,40 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         except Exception:
             pass
 
+    def _release_host_storage(self) -> None:
+        current_omni_platform.synchronize()
+        if self._host_staging_pool is not None:
+            pool = self._host_staging_pool
+            logger.info(
+                "Bounded DLO host staging runtime: staged=%.2f GiB, prefetched=%d, "
+                "prefetch_hits=%d, discarded=%d, synchronous_misses=%d, staging_wait=%.3fs",
+                pool.staged_bytes / 1024**3,
+                pool.prefetch_scheduled,
+                pool.prefetch_hits,
+                pool.prefetch_discarded,
+                pool.staging_misses,
+                pool.stage_wait_seconds,
+            )
+            # Pending workers still reference mmap-backed shard dictionaries.
+            # Stop them before clearing hooks or closing the backing mappings.
+            pool.close()
+        self._host_staging_pool = None
+
+        for group in self._all_hook_groups:
+            for hook in group:
+                hook.cpu_shards.clear()
+                hook.host_prefetch_shards.clear()
+                hook.host_staging_pool = None
+                hook.host_shard_store = None
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.release_host_storage()
+        if self._host_shard_store is not None:
+            import gc
+
+            gc.collect()
+            self._host_shard_store.close()
+            self._host_shard_store = None
+
     def disable(self) -> None:
         if not self.enabled:
             return
@@ -1736,6 +1914,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._on_demand_shard_infos = []
 
         self.offload_resident_layers()
+        self._release_host_storage()
         self._blocks.clear()
         self._all_hook_groups.clear()
         self._resident_blocks.clear()

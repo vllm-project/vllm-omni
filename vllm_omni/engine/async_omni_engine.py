@@ -998,6 +998,10 @@ class AsyncOmniEngine:
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
+            "dlo_host_memory_budget_gib": kwargs.get("dlo_host_memory_budget_gib"),
+            "dlo_host_cache_dir": kwargs.get("dlo_host_cache_dir"),
+            "dlo_pinned_staging_buffer_count": kwargs.get("dlo_pinned_staging_buffer_count", 2),
+            "dlo_prefetch_depth": kwargs.get("dlo_prefetch_depth", 2),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"
