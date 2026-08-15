@@ -476,7 +476,7 @@ class TestLoadAndResolveStageConfigs:
 
 
 class TestLoadStageConfigsFromModel:
-    def test_unresolved_model_does_not_fall_back_to_yaml(self, mocker: MockerFixture):
+    def test_unresolved_model_does_not_fall_back_to_yaml(self, mocker: MockerFixture, caplog):
         mocker.patch(
             "vllm_omni.entrypoints.utils.StageConfigFactory.create_legacy_stage_configs_from_model",
             return_value=(None, None),
@@ -487,6 +487,8 @@ class TestLoadStageConfigsFromModel:
 
         assert result == ([], None)
         resolve_path.assert_not_called()
+        assert "No registered PipelineConfig resolved" in caplog.text
+        assert "deploy_config" in caplog.text
 
 
 class TestCumulativeStreamingCoercion:

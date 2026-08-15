@@ -1382,7 +1382,8 @@ stages:
         assert async_stages[1].custom_process_input_func is None
 
     def test_no_bundled_legacy_stage_config_yamls(self):
-        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        repo_root = Path(__file__).resolve().parents[2]
+        stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"
         assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):

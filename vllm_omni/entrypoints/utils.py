@@ -417,6 +417,16 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
+    strategy_note = ""
+    if strategy_config_path is not None:
+        strategy_note = f" Strategy config {strategy_config_path!r} was not applied."
+    logger.warning(
+        "No registered PipelineConfig resolved for model %r. Legacy `stage_args` "
+        "YAMLs are no longer supported; register the pipeline and provide deployment "
+        "overrides through `deploy_config`.%s",
+        model,
+        strategy_note,
+    )
     return [], None
 
 
