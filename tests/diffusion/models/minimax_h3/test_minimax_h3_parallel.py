@@ -89,6 +89,27 @@ def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
 
 
+def test_mlp_uses_fused_swiglu(init_fake_tp_group):
+    del init_fake_tp_group
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3MLP,
+    )
+
+    mlp = MiniMaxH3MLP(
+        MiniMaxH3DiTArchConfig(
+            hidden_size=4,
+            ffn_hidden_size=8,
+        ),
+        quant_config=None,
+        prefix="blocks.0.mlp",
+    )
+
+    assert isinstance(mlp.act_fn, SiluAndMul)
+
+
 @pytest.mark.parametrize(
     ("tp_size", "message"),
     [
