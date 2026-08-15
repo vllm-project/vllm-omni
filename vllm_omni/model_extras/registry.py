@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from PIL import Image
@@ -96,6 +97,19 @@ XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int
 OutputTensorRange = Literal["negative_one_to_one", "zero_to_one"]
 
 
+@dataclass(frozen=True)
+class ModelExtraSpec:
+    """Typed model-specific request/output option declaration."""
+
+    extra_body_params: frozenset[str] = field(default_factory=frozenset)
+    extra_output_params: frozenset[str] = field(default_factory=frozenset)
+    init_extra_args_for_non_diffusion_stages: bool = False
+    output_tensor_range: OutputTensorRange | None = None
+    text_to_image_prompt_builder: TextToImagePromptBuilder | None = None
+    image_to_image_prompt_builder: ImageToImagePromptBuilder | None = None
+    image_to_video_prompt_builder: ImageToVideoPromptBuilder | None = None
+
+
 def default_x_to_text_prompt(
     model: str,
     prompt: str,
@@ -155,78 +169,78 @@ def default_image_to_image_prompt(
     return result
 
 
-_EXTRA_SPECS: dict[str, dict[str, Any]] = {
-    "AudioXPipeline": {
-        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
-        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
-    },
-    "BagelPipeline": {
-        "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
-        "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
-        "init_extra_args_for_non_diffusion_stages": BAGEL_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-        "text_to_image_prompt_builder": build_bagel_text_to_image_prompt,
-        "image_to_image_prompt_builder": build_bagel_image_to_image_prompt,
-    },
-    "SenseNovaU1Pipeline": {
-        "extra_body_params": SENSENOVA_U1_EXTRA_BODY_PARAMS,
-        "extra_output_params": SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
-    },
-    "Cosmos3OmniDiffusersPipeline": {
-        "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
-        "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+_EXTRA_SPECS: dict[str, ModelExtraSpec] = {
+    "AudioXPipeline": ModelExtraSpec(
+        extra_body_params=AUDIOX_EXTRA_BODY_PARAMS,
+        extra_output_params=AUDIOX_EXTRA_OUTPUT_PARAMS,
+    ),
+    "BagelPipeline": ModelExtraSpec(
+        extra_body_params=BAGEL_EXTRA_BODY_PARAMS,
+        extra_output_params=BAGEL_EXTRA_OUTPUT_PARAMS,
+        init_extra_args_for_non_diffusion_stages=BAGEL_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        text_to_image_prompt_builder=build_bagel_text_to_image_prompt,
+        image_to_image_prompt_builder=build_bagel_image_to_image_prompt,
+    ),
+    "SenseNovaU1Pipeline": ModelExtraSpec(
+        extra_body_params=SENSENOVA_U1_EXTRA_BODY_PARAMS,
+        extra_output_params=SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
+    ),
+    "Cosmos3OmniDiffusersPipeline": ModelExtraSpec(
+        extra_body_params=COSMOS3_EXTRA_BODY_PARAMS,
+        extra_output_params=COSMOS3_EXTRA_OUTPUT_PARAMS,
         # The shared T2I example already supplies modalities=["image"].
-    },
-    "Cosmos3OmniPipeline": {
-        "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
-        "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
-    },
-    "MagiHumanPipeline": {
-        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
-    },
-    "HeliosPipeline": {
-        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
-        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
-    },
-    "HeliosPyramidPipeline": {
-        "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
-        "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
-    },
-    "LingBotVideoPipeline": {
-        "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
-        "output_tensor_range": "zero_to_one",
+    ),
+    "Cosmos3OmniPipeline": ModelExtraSpec(
+        extra_body_params=COSMOS3_EXTRA_BODY_PARAMS,
+        extra_output_params=COSMOS3_EXTRA_OUTPUT_PARAMS,
+    ),
+    "MagiHumanPipeline": ModelExtraSpec(
+        extra_body_params=MAGI_HUMAN_EXTRA_BODY_PARAMS,
+        extra_output_params=MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+    ),
+    "HeliosPipeline": ModelExtraSpec(
+        extra_body_params=HELIOS_EXTRA_BODY_PARAMS,
+        extra_output_params=HELIOS_EXTRA_OUTPUT_PARAMS,
+    ),
+    "HeliosPyramidPipeline": ModelExtraSpec(
+        extra_body_params=HELIOS_EXTRA_BODY_PARAMS,
+        extra_output_params=HELIOS_EXTRA_OUTPUT_PARAMS,
+    ),
+    "LingBotVideoPipeline": ModelExtraSpec(
+        extra_body_params=LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
+        output_tensor_range="zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
         # pipeline owns model-specific validation and normalization.
-    },
+    ),
     **{
-        model_class_name: {
-            "extra_body_params": LTX_EXTRA_BODY_PARAMS,
-            "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
-        }
+        model_class_name: ModelExtraSpec(
+            extra_body_params=LTX_EXTRA_BODY_PARAMS,
+            extra_output_params=LTX_EXTRA_OUTPUT_PARAMS,
+        )
         for model_class_name in (
             "LTX2Pipeline",
             "LTX2TwoStagePipeline",
             "LTX2DistilledPipeline",
         )
     },
-    "WanVACEPipeline": {
-        "extra_body_params": VACE_EXTRA_BODY_PARAMS,
-        "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
-        "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
-    },
-    "MammothModa2DiTPipeline": {
-        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
-        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
-    },
-    "MingImagePipeline": {
-        "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
-        "extra_output_params": MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
-        "init_extra_args_for_non_diffusion_stages": MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-        "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
-        "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
-    },
+    "WanVACEPipeline": ModelExtraSpec(
+        extra_body_params=VACE_EXTRA_BODY_PARAMS,
+        extra_output_params=VACE_EXTRA_OUTPUT_PARAMS,
+        image_to_video_prompt_builder=build_vace_image_to_video_prompt,
+    ),
+    "MammothModa2DiTPipeline": ModelExtraSpec(
+        extra_body_params=MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        extra_output_params=MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        init_extra_args_for_non_diffusion_stages=MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        text_to_image_prompt_builder=build_mammothmoda2_text_to_image_prompt,
+    ),
+    "MingImagePipeline": ModelExtraSpec(
+        extra_body_params=MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
+        extra_output_params=MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
+        init_extra_args_for_non_diffusion_stages=MING_FLASH_OMNI_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        text_to_image_prompt_builder=build_ming_flash_omni_text_to_image_prompt,
+        image_to_image_prompt_builder=build_ming_flash_omni_image_to_image_prompt,
+    ),
 }
 
 # Multi-stage discovery reports the top-level wrapper rather than its DiT
@@ -235,7 +249,7 @@ _EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa
 _EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
-def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
+def _get_spec(model_class_name: str | None) -> ModelExtraSpec | None:
     if not model_class_name:
         return None
     return _EXTRA_SPECS.get(model_class_name)
@@ -257,12 +271,12 @@ def get_model_class_name(omni: Any) -> str | None:
 
 def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
-    return spec.get("extra_body_params", frozenset()) if spec is not None else frozenset()
+    return spec.extra_body_params if spec is not None else frozenset()
 
 
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
-    return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+    return spec.extra_output_params if spec is not None else frozenset()
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
@@ -274,12 +288,12 @@ def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
     spec = _get_spec(model_class_name)
     if spec is None:
         return "negative_one_to_one"
-    return spec.get("output_tensor_range", "negative_one_to_one")
+    return spec.output_tensor_range or "negative_one_to_one"
 
 
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
     spec = _get_spec(model_class_name)
-    return bool(spec and spec.get("init_extra_args_for_non_diffusion_stages", False))
+    return bool(spec and spec.init_extra_args_for_non_diffusion_stages)
 
 
 def build_text_to_image_prompt(
@@ -290,7 +304,9 @@ def build_text_to_image_prompt(
 ) -> dict[str, Any]:
     """Build a model-specific T2I prompt from an example-owned envelope."""
     spec = _get_spec(model_class_name)
-    builder: TextToImagePromptBuilder | None = spec.get("text_to_image_prompt_builder") if spec else None
+    builder: TextToImagePromptBuilder | None = None
+    if spec is not None:
+        builder = spec.text_to_image_prompt_builder
     if builder is None:
         return prompt
     return builder(
@@ -310,11 +326,9 @@ def build_image_to_image_prompt(
     width: int | None = None,
 ) -> dict[str, Any]:
     spec = _get_spec(model_class_name)
-    builder: ImageToImagePromptBuilder = (
-        spec.get("image_to_image_prompt_builder", default_image_to_image_prompt)
-        if spec is not None
-        else default_image_to_image_prompt
-    )
+    builder: ImageToImagePromptBuilder = default_image_to_image_prompt
+    if spec is not None:
+        builder = spec.image_to_image_prompt_builder or builder
     return builder(prompt, negative_prompt, input_image, height, width)
 
 
@@ -327,7 +341,9 @@ def build_image_to_video_prompt(
 ) -> dict[str, Any]:
     """Build a model-specific I2V prompt from an example-owned envelope."""
     spec = _get_spec(model_class_name)
-    builder: ImageToVideoPromptBuilder | None = spec.get("image_to_video_prompt_builder") if spec else None
+    builder: ImageToVideoPromptBuilder | None = None
+    if spec is not None:
+        builder = spec.image_to_video_prompt_builder
     if builder is None:
         return prompt
     media_inputs = prompt.get("multi_modal_data") or {}
