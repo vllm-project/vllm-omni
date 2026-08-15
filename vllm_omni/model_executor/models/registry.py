@@ -295,11 +295,23 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    ## Gepard-1.0 (nineninesix) — single-stage native-AR FSQ/NanoCodec TTS
+    "GepardTalkerForConditionalGeneration": (
+        "gepard",
+        "gepard_talker",
+        "GepardTalkerForConditionalGeneration",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
+    ),
+    ## dots.tts
+    "DotsTTSForConditionalGeneration": (
+        "dots_tts",
+        "dots_tts_talker",
+        "DotsTTSForConditionalGeneration",
     ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (

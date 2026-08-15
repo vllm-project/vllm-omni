@@ -199,7 +199,7 @@ def _generate_bagel_image(
     config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
-        "stage_configs_path": config_path,
+        "deploy_config": config_path,
         "stage_init_timeout": 300,
     }
     if diffusion_quantization_config:

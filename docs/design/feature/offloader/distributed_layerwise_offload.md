@@ -7,7 +7,7 @@ either shard those host-side weights across an existing parallel group or keep
 the standard loader's rank-local weights and avoid an additional collective.
 
 For user-facing commands, see the
-[distributed layerwise offloading guide](../../user_guide/diffusion/cpu_offload.md)
+[distributed layerwise offloading guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md)
 and the [Cosmos3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md).
 
 ## Status
@@ -56,7 +56,7 @@ AllGather:                [full N+1]             [full N+2]
 Buffers:    [current slot]       [prefetch slot]       [current slot]
 ```
 
-![DLO double-buffer prefetch pipeline](../figures/dlo/dlo_pipeline.gif)
+![DLO double-buffer prefetch pipeline](../../figures/dlo/dlo_pipeline.gif)
 
 The backend uses two shared device buffers, so accelerator weight residency is
 bounded by the largest streamed blocks rather than the complete model.

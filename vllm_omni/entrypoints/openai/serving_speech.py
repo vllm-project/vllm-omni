@@ -134,6 +134,13 @@ _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 _MING_DEFAULT_PROMPT = MING_DEFAULT_PROMPT
+_DEFAULT_VOICE_NAME = "default"
+
+
+def _is_default_voice(voice, supported_speakers):
+    """Check if a lowercased voice name is the placeholder default and not
+    an actual registered/built-in speaker."""
+    return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -470,7 +477,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
-        logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
+        if self.supported_speakers:
+            logger.info(
+                "Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers)
+            )
+        else:
+            logger.info(
+                "No built-in speakers configured; only '%s' and uploaded voices are available", _DEFAULT_VOICE_NAME
+            )
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
@@ -758,6 +772,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 3. Default fallback
         return _TTS_MAX_INSTRUCTIONS_LENGTH
+
+    def _get_available_voices(self) -> set[str]:
+        """Get all voice names accepted by the API, including the placeholder default."""
+        return self.supported_speakers | self.uploaded_speakers.keys() | {_DEFAULT_VOICE_NAME}
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -3557,6 +3575,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
 
+    def _get_normalized_voice(self, voice: str | None) -> str | None:
+        """Get the normalized voice to be used; currently this means that
+        the voice is a:
+            - lowercase str if it's a valid supported/uploaded speaker
+            - None if the voice is the placeholder default or not provided
+        """
+        if voice is not None:
+            voice = voice.lower()
+            if voice not in self.uploaded_speakers and voice not in self.supported_speakers:
+                raise ValueError(
+                    f"Invalid voice '{voice}'. Supported: {', '.join(sorted(self._get_available_voices()))}"
+                )
+        return voice
+
     async def _create_diffusion_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -3573,11 +3605,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if fmt_err:
                     return self._diffusion_error_response(fmt_err, status_code=400)
 
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
-                    all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
-                    raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
+            request.voice = self._get_normalized_voice(request.voice)
 
             has_inline_ref_audio = request.ref_audio is not None
             err = self._apply_uploaded_speaker(request)
@@ -3592,10 +3620,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text
             if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = voice_lower
-                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = request.voice
+                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
@@ -3734,6 +3761,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
         decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
+        if request.voice is not None:
+            if _is_default_voice(request.voice.lower(), self.supported_speakers):
+                request.voice = None
+
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)
 

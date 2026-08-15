@@ -52,7 +52,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def omni() -> Generator[Omni, None, None]:
     with OmniRunner(
         MODEL_NAME,
-        stage_configs_path=str(STAGE_CONFIG_PATH),
+        deploy_config=str(STAGE_CONFIG_PATH),
         trust_remote_code=True,
     ) as runner:
         yield runner.omni

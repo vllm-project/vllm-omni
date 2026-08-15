@@ -490,10 +490,10 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a deploy config YAML.",
     )
     parser.add_argument(
         "--audio-path",

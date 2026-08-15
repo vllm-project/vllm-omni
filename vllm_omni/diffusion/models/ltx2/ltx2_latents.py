@@ -117,7 +117,9 @@ def create_noised_state(
         device=latents.device,
         dtype=latents.dtype,
     )
-    return noise_scale * noise + (1 - noise_scale) * latents
+    if isinstance(noise_scale, torch.Tensor):
+        noise_scale = noise_scale.float()
+    return torch.lerp(latents.float(), noise.float(), noise_scale).to(latents.dtype)
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -133,6 +135,16 @@ def unpack_audio_latents(
 
 def unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
     return latents[:, :num_frames]
+
+
+def clear_audio_padding(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Keep Omni's SP-only audio padding outside the sampler state."""
+    if not 0 < num_frames <= latents.shape[1]:
+        raise ValueError(f"Audio frame count must be in [1, {latents.shape[1]}], got {num_frames}.")
+    if num_frames == latents.shape[1]:
+        return latents
+    padding = latents.new_zeros(latents.shape[0], latents.shape[1] - num_frames, latents.shape[2])
+    return torch.cat([latents[:, :num_frames], padding], dim=1)
 
 
 def get_sp_padded_audio_latent_length(audio_latent_length: int, sp_size: int) -> int:
@@ -205,7 +217,12 @@ def prepare_video_latents(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    # Official LTX samples the 5D video latent first and then patchifies it,
+    # leaving token-major storage behind the [B, tokens, channels] view.  The
+    # logical values are unchanged, but preserving that layout is important:
+    # CUDA selects a different bf16 GEMM path for a contiguous token tensor.
+    return latents.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def prepare_audio_latents(
@@ -226,6 +243,16 @@ def prepare_audio_latents(
     sp_size = getattr(pipeline.od_config.parallel_config, "sequence_parallel_size", 1) or 1
     padded_latent_length = get_sp_padded_audio_latent_length(original_latent_length, int(sp_size))
 
+    def pad_logical_latents(logical_latents: torch.Tensor) -> torch.Tensor:
+        if padded_latent_length == original_latent_length:
+            return logical_latents
+        padding = logical_latents.new_zeros(
+            logical_latents.shape[0],
+            padded_latent_length - original_latent_length,
+            logical_latents.shape[2],
+        )
+        return torch.cat([logical_latents, padding], dim=1)
+
     if latents is not None:
         if latents.ndim == 4:
             latents = pack_audio_latents(latents)
@@ -237,29 +264,24 @@ def prepare_audio_latents(
                 pipeline.audio_vae.latents_mean,
                 pipeline.audio_vae.latents_std,
             )
-        latents = create_noised_state(latents, noise_scale, generator)
 
         if latents.shape[1] not in {original_latent_length, padded_latent_length}:
             raise ValueError(
                 "Provided `audio_latents` has incompatible audio frame count "
                 f"{latents.shape[1]}; expected {original_latent_length} or {padded_latent_length}."
             )
-        if latents.shape[1] == original_latent_length and padded_latent_length > original_latent_length:
-            padding = torch.zeros(
-                latents.shape[0],
-                padded_latent_length - original_latent_length,
-                latents.shape[2],
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, padding], dim=1)
+        # Padding is an Omni implementation detail, not part of the official
+        # audio state. Draw request RNG only for logical tokens so later phases
+        # remain seed-invariant across SP degrees, then append deterministic 0s.
+        latents = create_noised_state(latents[:, :original_latent_length], noise_scale, generator)
+        latents = pad_logical_latents(latents)
         return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
-    shape = (batch_size, padded_latent_length, num_channels_latents * latent_mel_bins)
+    shape = (batch_size, original_latent_length, num_channels_latents * latent_mel_bins)
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    latents = pad_logical_latents(randn_tensor(shape, generator=generator, device=device, dtype=dtype))
     return latents, original_latent_length, padded_latent_length

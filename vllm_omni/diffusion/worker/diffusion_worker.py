@@ -1087,6 +1087,10 @@ class WorkerProc:
             result["wave_id"] = wave_id
         return result, should_reply
 
+    def recv_message(self) -> Any:
+        """Receive one complete broadcast message without dropping overflow data."""
+        return self.mq.dequeue(indefinite=True)
+
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
@@ -1094,7 +1098,7 @@ class WorkerProc:
         while self._running:
             msg = None
             try:
-                msg = self.mq.dequeue(timeout=1.0)
+                msg = self.recv_message()
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()

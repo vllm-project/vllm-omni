@@ -22,6 +22,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    _try_resolve_omni_model_type,
     coerce_param_message_types,
     filter_dataclass_kwargs,
     filter_stages,
@@ -371,6 +372,48 @@ class TestResolveModelConfigPath:
         assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert sender["extra"]["connector_get_max_wait"] == 300
 
+    def test_object_storage_uri_resolves_via_materialized_configs(
+        self,
+        mocker: MockerFixture,
+        tmp_path,
+    ):
+        """An object-storage URI must not reach HF helpers; resolution reads the
+        locally materialized config files instead."""
+        hf_config = SimpleNamespace(
+            model_type="qwen3_omni_moe",
+            architectures=["Qwen3OmniMoeForConditionalGeneration"],
+        )
+        uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
+        materialize = mocker.patch(
+            "vllm_omni.entrypoints.utils._materialize_object_storage_configs",
+            return_value=str(tmp_path),
+        )
+        get_config = mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            return_value=hf_config,
+        )
+
+        result = resolve_model_config_path(uri)
+
+        materialize.assert_called_once_with(uri)
+        get_config.assert_called_once()
+        assert get_config.call_args[0][0] == str(tmp_path)
+        assert result is not None
+        assert Path(result).as_posix().endswith("qwen3_omni_moe.yaml")
+
+
+class TestTryResolveOmniModelType:
+    """Name matching must only scan the last path component."""
+
+    def test_uri_bucket_name_cannot_hijack_pipeline(self):
+        # "qwen3-tts-models" normalizes to "qwen3ttsmodels", which contains the
+        # registered key "qwen3tts" — only the basename may participate, so a
+        # misleadingly named bucket selects nothing.
+        assert _try_resolve_omni_model_type("s3://qwen3-tts-models/plain-checkpoint") is None
+
+    def test_basename_still_matches_pipeline(self):
+        assert _try_resolve_omni_model_type("gs://any-bucket/Fun-CosyVoice3-0.5B-2512") == "cosyvoice3"
+
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
@@ -381,7 +424,6 @@ class TestLoadAndResolveStageConfigs:
 
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="black-forest-labs/FLUX.2-klein-4B",
-            stage_configs_path=None,
             kwargs=kwargs,
             trust_remote_code=False,
             default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
@@ -390,9 +432,7 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
-    def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
-        self, tmp_path, mocker: MockerFixture
-    ):
+    def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"
         deploy_path.write_text(
             'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
@@ -413,18 +453,23 @@ class TestLoadAndResolveStageConfigs:
             "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
             return_value=(returned_stage_configs, None),
         )
+        cli_overrides = {
+            "interleave_mm_strings": True,
+            "media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}},
+            "gpu_memory_utilization": 0.55,
+        }
 
         config_path, stage_configs, _ = load_and_resolve_stage_configs(
             model="dummy-model",
-            stage_configs_path=str(deploy_path),
-            kwargs={},
+            kwargs=cli_overrides,
             trust_remote_code=True,
+            deploy_config_path=str(deploy_path),
         )
 
         load_stage_configs.assert_called_once_with(
             "dummy-model",
             trust_remote_code=True,
-            base_engine_args={},
+            base_engine_args=cli_overrides,
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
             strategy_config_path=None,

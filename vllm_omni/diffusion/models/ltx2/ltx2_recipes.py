@@ -24,6 +24,7 @@ LTX_DEFAULT_NEGATIVE_PROMPT = (
 
 LTX_DISTILLED_SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
 LTX_STAGE_2_DISTILLED_SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
+LTX_DISTILLED_ADAPTER_SLOT = "ltx_distilled"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class LTXPhaseRecipe:
     sigmas: tuple[float, ...] | None = None
     noise_scale: float = 0.0
     input_transform: Literal["initial", "spatial_upsample"] = "initial"
+    adapter_slot: str | None = None
     allow_guidance_override: bool = True
     use_official_sigma_schedule: bool = True
 
@@ -157,11 +159,59 @@ LTX2_DISTILLED_TWO_STAGE_RECIPE = LTXPipelineRecipe(
     fixed_num_inference_steps=True,
 )
 
+# LTX-2.3 full-distilled uses the same official fixed 8 + 3 sigma schedules
+# and request contract. Its distinct component profile selects the 22B merged
+# distilled Transformer, BWE vocoder, and matching spatial upsampler; no
+# distilled LoRA is loaded for either phase.
+LTX23_DISTILLED_TWO_STAGE_RECIPE = LTX2_DISTILLED_TWO_STAGE_RECIPE
+
+
+def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipelineRecipe:
+    return LTXPipelineRecipe(
+        height=one_stage_recipe.height * 2,
+        width=one_stage_recipe.width * 2,
+        num_frames=one_stage_recipe.num_frames,
+        frame_rate=one_stage_recipe.frame_rate,
+        num_inference_steps=one_stage_recipe.num_inference_steps,
+        negative_prompt=one_stage_recipe.negative_prompt,
+        phases=(
+            LTXPhaseRecipe(
+                name="generate_lowres",
+                guidance=one_stage_recipe.request_guidance,
+                spatial_downscale=2,
+                noise_scale=1.0,
+            ),
+            LTXPhaseRecipe(
+                name="refine",
+                guidance=LTXGuidanceSpec.positive_only(),
+                sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
+                noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
+                input_transform="spatial_upsample",
+                adapter_slot=LTX_DISTILLED_ADAPTER_SLOT,
+                allow_guidance_override=False,
+                use_official_sigma_schedule=False,
+            ),
+        ),
+        video_output_phase=1,
+        # The official second stage refines video only and deliberately
+        # discards its audio result. Decode the full-context Stage-1 audio.
+        audio_output_phase=0,
+        allow_request_sigmas=False,
+        allow_request_latents=False,
+    )
+
+
+LTX2_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX2_ONE_STAGE_RECIPE)
+LTX23_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX23_ONE_STAGE_RECIPE)
+
 
 _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("one_stage", "2"): LTX2_ONE_STAGE_RECIPE,
     ("one_stage", "2.3"): LTX23_ONE_STAGE_RECIPE,
+    ("two_stage", "2"): LTX2_TWO_STAGE_RECIPE,
+    ("two_stage", "2.3"): LTX23_TWO_STAGE_RECIPE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_TWO_STAGE_RECIPE,
+    ("distilled_two_stage", "2.3"): LTX23_DISTILLED_TWO_STAGE_RECIPE,
     ("dmd2", "2"): LTX_POSITIVE_ONLY_RECIPE,
     ("dmd2", "2.3"): LTX_POSITIVE_ONLY_RECIPE,
 }

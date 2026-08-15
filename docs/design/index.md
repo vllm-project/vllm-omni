@@ -53,15 +53,22 @@ implementation contract; it is not, by itself, a general support claim.
 #### Attention optimization
 
 The [Diffusion Attention Backends](../user_guide/diffusion/attention_backends.md)
-guide lists all selectable backends and their platform defaults. Skip-Softmax
-is the backend-related optimization with a standalone feature-design contract:
+guides list selectable backends, platform defaults, installation, and tuning.
+The design contracts separate selection mechanics from backend algorithms:
 
+- [Attention Backend Selection](feature/attention_backend_selection.md)
 - [Skip-Softmax](feature/skip_softmax.md)
+
+#### CPU offloading
+
+- [Overview and Shared Contracts](feature/offloader/README.md)
+- [Model-Level Offload](feature/offloader/cpu_offload.md)
+- [Layerwise Offload](feature/offloader/layerwise_offload.md)
+- [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
-- [Distributed Layerwise Offload](feature/distributed_layerwise_offload.md)
 
 ## Infrastructure and Performance
 
