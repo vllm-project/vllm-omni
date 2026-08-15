@@ -186,7 +186,7 @@ Distributed layerwise offload has an additional boundary: its sharded mmap
 AllGather path is not compatible with online quantization because the path
 expects already materialized checkpoint weights. Use the rank-local
 `--dlo-no-use-allgather` path or a compatible pre-quantized checkpoint when
-combining these features. See the [DLO design document](distributed_layerwise_offload.md)
+combining these features. See the [DLO design document](offloader/distributed_layerwise_offload.md)
 for the full compatibility matrix.
 
 ## Adding a quantization backend

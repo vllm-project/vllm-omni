@@ -327,6 +327,99 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 - Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` nightly runs on main.
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
 
+### Per-model coverage
+
+Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-merge.yml` uploads
+per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS Base
+Test". It runs on a single GPU so the pilot is cheap to reproduce. (A second
+diffusion pilot, "Diffusion · Bagel Test", was retired from merge; reintroduce
+another diffusion coverage job if a second pilot is needed again.) This is a
+pilot, not a rollout: no dashboard/visualization lives in this repo, and nothing
+is gated on coverage.
+
+**Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
+`<model_id>` is the model's directory name under
+`vllm_omni/diffusion/models/<model_id>/` or
+`vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
+`<mode>` is `online` or `offline`, and `<step_id>` is `BUILDKITE_STEP_ID`
+(`local` outside Buildkite). `gunzip` before feeding a report to a Cobertura
+consumer.
+
+Reports are gzipped because `--cov=vllm_omni` sets coverage's `source`, which
+makes it walk the package and emit one `<line>` element per statement for every
+file — including the ones a single model's tests never import. That inventory,
+not the coverage, is the size: a Bagel report is 7.1 MB, of which 96.5% is
+`<line>` elements and 77% belongs to the 840 of 1169 files that run never
+imported. A run covering zero lines produces the same 7 MB. gzip takes it to
+roughly 410 KB and changes nothing about the data.
+
+`<step_id>` is what keeps two steps that cover the same model apart. Artifacts are
+scoped to the build, and a nightly build carries the ready, merge and nightly tiers
+at once, so several same-model steps land in one namespace — `qwen3_tts` already has
+both a Base and a CustomVoice job, and `minicpmo_4_5` a base and a duplex one. Two
+uploads on one path do not fail loudly: an exact-name download can report the path
+as ambiguous, and a glob download fetches every match concurrently and renames each
+onto the same destination, so whichever finishes last wins. The step id remains the
+logical step identifier across retries, while Buildkite's default artifact lookup
+selects only the latest attempt — `BUILDKITE_JOB_ID` would instead give every
+attempt its own filename, leaving a failed attempt's partial report to be picked up
+alongside the real one. A step using `parallelism`/matrix would need
+`BUILDKITE_PARALLEL_JOB` added, since its jobs share a step id; neither pilot is
+one.
+
+**Opting in a new model**: replace the job's combined `pytest` command with
+[`run_cov_split.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/run_cov_split.sh),
+which runs each mode, names the reports, uploads them, and fails the step if
+either half or the upload failed:
+
+```yaml
+commands:
+  - |
+    .buildkite/common/scripts/run_cov_split.sh \
+      --model-id <model_id> \
+      --offline <offline test path> \
+      --online <online test path> \
+      -- <the job's existing pytest flags, e.g. -m '...' --run-level '...'>
+```
+
+Everything after `--` is forwarded verbatim to both runs with quoting preserved,
+so an expression like `-m 'advanced_model and cuda'` survives intact and a job can
+pass anything else it needs. `--offline`/`--online` are repeatable and only one is
+required, so a job with tests in a single mode runs just that half. Runtime is
+bounded solely by the step's `timeout_in_minutes` — raise it, since the split
+loads the model once per mode.
+
+Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
+
+Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
+`cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
+test asking for more GPUs than the preset provides is silently skipped and its
+coverage artifact comes back empty. Splitting such a job produces a file that
+looks fine and measures nothing — "Diffusion · Z Image Test" is the current
+example (online tests want 4 cards, the job runs on `l4_1`), which is why it is
+not a coverage pilot.
+
+Online-mode coverage depends on the `[tool.coverage.run]` `patch`/`sigterm`
+settings in `pyproject.toml`: online tests launch the server with
+`subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
+reflects only the pytest parent process, not the server's code paths.
+
+The upload depends on `buildkite-agent` being callable inside the container. The
+`kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
+only do because they set `mount-buildkite-agent: true`. A new docker preset that
+runs a coverage job needs the same.
+
+List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
+`source_file_dependencies` — both change what the job measures, so without them a
+change there is filtered out of normal PR builds and only surfaces in a later
+nightly. `tests/buildkite/test_upload_pipeline.py` covers the filter behavior with
+a synthetic job (it does not pin real merge labels).
+Editing only the surrounding CI YAML still does not schedule them, so a PR that
+touches just the wiring needs a full E2E run (or the commands run on a GPU host)
+to produce artifacts. When checking a new model's
+artifacts, compare `lines-covered` between the online and offline XML rather than
+just confirming both files exist.
+
 ### Validation checklist
 
 | Check | Command / location |
