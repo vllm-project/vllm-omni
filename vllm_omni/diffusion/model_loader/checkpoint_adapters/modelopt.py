@@ -121,9 +121,10 @@ class ModelOptFp8CheckpointAdapter:
             return name, name
 
         if callable(self._checkpoint_key_mapper):
-            candidate = self._checkpoint_key_mapper(name)
+            remapped = self._checkpoint_key_mapper(name)
+            candidate, output_name = remapped if isinstance(remapped, tuple) else (remapped, remapped)
             if candidate in self._loadable_tensors:
-                return candidate, candidate
+                return candidate, output_name
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
@@ -209,6 +210,20 @@ class ModelOptFp8CheckpointAdapter:
             return None
         return target_dtype
 
+    def _check_full_precision_source_target(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        target_name: str | None,
+    ) -> None:
+        if target_name is None or not name.endswith(".weight") or self._is_fp8_tensor(tensor):
+            return
+        if self._loadable_tensors[target_name].dtype in FP8_DTYPES:
+            raise ValueError(
+                f"Full-precision ModelOpt checkpoint weight {name!r} maps to FP8 runtime parameter "
+                f"{target_name!r}; the checkpoint precision plan was not applied"
+            )
+
     def _maybe_dequantize_or_defer_weight(
         self,
         name: str,
@@ -259,6 +274,7 @@ class ModelOptFp8CheckpointAdapter:
                 yield from self._handle_scale_tensor(name, output_name, tensor, target_name, state)
                 continue
 
+            self._check_full_precision_source_target(name, tensor, target_name)
             target_dtype = self._target_dtype_for_dequantization(tensor, target_name)
             if target_dtype is not None:
                 tensor = self._maybe_dequantize_or_defer_weight(name, output_name, tensor, target_dtype, state)

@@ -750,6 +750,98 @@ audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
 resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
 reduction.
 
+### Start the serialized ModelOpt Mixed9 FP8 checkpoint
+
+The validated FL2VA-only checkpoint is
+`feizhai123/MiniMax-H3-ModelOpt-Mixed9-Dynamic-FP8`. It supports `t2va`
+and `fl2va`; it does not contain the Ref2VA DiT.
+
+Start a single-GPU resident server with CUTLASS FP8 linear kernels:
+
+```bash
+export MODEL=feizhai123/MiniMax-H3-ModelOpt-Mixed9-Dynamic-FP8
+export PORT=8091
+
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type t2va \
+  --num-gpus 1 \
+  --enforce-eager \
+  --force-cutlass-fp8 \
+  --stage-init-timeout 1800 \
+  --init-timeout 2400
+```
+
+This resident configuration needs a high-memory GPU; the measured 1344x768
+T2VA peak was 86,178 MiB. Add `--enable-cpu-offload` when the active
+components do not fit in HBM, with additional host-memory and transfer-latency
+cost. Do not add `--use-hsdp`: serialized ModelOpt FP8 with HSDP is not part
+of this deployment path.
+
+### Serialized ModelOpt Mixed9 regression
+
+The serialized ModelOpt Mixed9 checkpoint is checked against BF16 generated
+by vLLM-Omni with the same request and serving topology. This short regression
+uses eager execution without HSDP; the FP8 run additionally forces CUTLASS.
+
+| Setting | Value |
+|---------|-------|
+| Partition / task | `FL2VA` / `t2va` |
+| Prompt | `In a snowy blue-purple forest, a small white spirit carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes softly.` |
+| Resolution | 672x384 |
+| Frame rate / output | 24 FPS / 107 frames |
+| Requested duration | 4.0 seconds |
+| Denoising steps | 10 |
+| Flow shifts | video 12 / audio 3 |
+| Seed | 1101 |
+| Parallelism | U4, text-encoder TP4, VAE patch parallel 4, no HSDP |
+
+The validated Mixed9 sample measured **0.858496 SSIM** and **24.7968 dB
+PSNR** against BF16. The CI regression requires SSIM >= 0.72 and PSNR >=
+20 dB:
+
+```bash
+pytest -s -v \
+  tests/e2e/accuracy/minimax_h3/test_minimax_h3_t2va_similarity.py::test_minimax_h3_modelopt_fp8_t2va_matches_bf16
+```
+
+### Serialized ModelOpt FP8 deployment measurements
+
+The following single-GPU, no-offload measurements use vLLM 0.26.0 and
+vLLM-Omni `0.1.dev2403+g67c54777b`. Peak VRAM is the sampled `nvidia-smi`
+process peak. The FP8 runs use CUTLASS; the BF16 runs use native BF16.
+
+The T2VA workload used the white-spirit prompt above at 1344x768 and 24 FPS,
+with a 5.0-second requested duration (124 output frames), 50 denoising steps,
+flow shifts 12/3, seed 1101, concurrency 1, one 2-step warmup, and three
+sequential measured requests.
+
+| Config | Backend | Mean | P90 | P99 | Peak VRAM | vs BF16 mean | vs BF16 VRAM | SSIM vs BF16 |
+|--------|---------|-----:|----:|----:|----------:|--------------:|--------------:|--------------:|
+| BF16 | Native BF16 | 148.411 s | 148.779 s | 148.921 s | 134,004 MiB | baseline | baseline | 1.000000 |
+| ModelOpt Mixed9 Dynamic FP8 | CUTLASS | 142.325 s | 142.407 s | 142.426 s | 86,178 MiB | **4.1% faster** | **35.7% lower** | 0.705210 |
+
+The Ref2VA workload used the white-cat reference image and audio at 1344x768
+and 24 FPS, with a 5.0-second requested duration (124 output frames), 50
+denoising steps, flow shifts 12/3, seed 3101, concurrency 1, one 2-step warmup,
+and one measured request.
+
+| Config | Backend | Latency | Peak VRAM | vs BF16 latency | vs BF16 VRAM | Video SSIM | Video PSNR | Audio cosine |
+|--------|---------|--------:|----------:|----------------:|--------------:|-----------:|-----------:|-------------:|
+| BF16 | Native BF16 | 243.39 s | 140,570 MiB | baseline | baseline | reference | reference | reference |
+| ModelOpt GlobalGrad 9.25-bit FP8 | CUTLASS | 234.28 s | 93,388 MiB | **3.89% faster** | **33.56% lower** | 0.752975 | 20.30 dB | 0.997015 |
+
+At 1344x768, the memory savings remain substantial but the pixel-aligned
+similarity is lower than in the 672x384 short regression. For
+quality-sensitive 1344x768 generation, prefer BF16. Use serialized mixed FP8
+at this resolution only after validating the intended prompts and reference
+inputs; 672x384 is the recommended FP8 starting point.
 ## TeaCache acceleration
 
 TeaCache reuses DiT block residuals across denoising steps when consecutive
@@ -813,6 +905,65 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --cache-backend tea_cache \
   --cache-config '{"rel_l1_thresh":0.17}'
 ```
+
+## Serialized ModelOpt Mixed9 regression
+
+The serialized ModelOpt Mixed9 checkpoint is checked against BF16 generated
+by vLLM-Omni with the same request and serving topology. This short regression
+uses eager execution without HSDP; the FP8 run additionally forces CUTLASS.
+
+| Setting | Value |
+|---------|-------|
+| Partition / task | `FL2VA` / `t2va` |
+| Prompt | `In a snowy blue-purple forest, a small white spirit carefully walks past a sleeping giant; footsteps crunch in the snow while the creature breathes softly.` |
+| Resolution | 672x384 |
+| Frame rate / output | 24 FPS / 107 frames |
+| Requested duration | 4.0 seconds |
+| Denoising steps | 10 |
+| Flow shifts | video 12 / audio 3 |
+| Seed | 1101 |
+| Parallelism | U4, text-encoder TP4, VAE patch parallel 4, no HSDP |
+
+The validated Mixed9 sample measured **0.858496 SSIM** and **24.7968 dB
+PSNR** against BF16. The CI regression requires SSIM >= 0.72 and PSNR >=
+20 dB:
+
+```bash
+pytest -s -v \
+  tests/e2e/accuracy/minimax_h3/test_minimax_h3_t2va_similarity.py::test_minimax_h3_modelopt_fp8_t2va_matches_bf16
+```
+
+### Serialized ModelOpt FP8 deployment measurements
+
+The following single-GPU, no-offload measurements use vLLM 0.26.0 and
+vLLM-Omni `0.1.dev2403+g67c54777b`. Peak VRAM is the sampled `nvidia-smi`
+process peak. The FP8 runs use CUTLASS; the BF16 runs use native BF16.
+
+The T2VA workload used the white-spirit prompt above at 1344x768 and 24 FPS,
+with a 5.0-second requested duration (124 output frames), 50 denoising steps,
+flow shifts 12/3, seed 1101, concurrency 1, one 2-step warmup, and three
+sequential measured requests.
+
+| Config | Backend | Mean | P90 | P99 | Peak VRAM | vs BF16 mean | vs BF16 VRAM | SSIM vs BF16 |
+|--------|---------|-----:|----:|----:|----------:|--------------:|--------------:|--------------:|
+| BF16 | Native BF16 | 148.411 s | 148.779 s | 148.921 s | 134,004 MiB | baseline | baseline | 1.000000 |
+| ModelOpt Mixed9 Dynamic FP8 | CUTLASS | 142.325 s | 142.407 s | 142.426 s | 86,178 MiB | **4.1% faster** | **35.7% lower** | 0.705210 |
+
+The Ref2VA workload used the white-cat reference image and audio at 1344x768
+and 24 FPS, with a 5.0-second requested duration (124 output frames), 50
+denoising steps, flow shifts 12/3, seed 3101, concurrency 1, one 2-step warmup,
+and one measured request.
+
+| Config | Backend | Latency | Peak VRAM | vs BF16 latency | vs BF16 VRAM | Video SSIM | Video PSNR | Audio cosine |
+|--------|---------|--------:|----------:|----------------:|--------------:|-----------:|-----------:|-------------:|
+| BF16 | Native BF16 | 243.39 s | 140,570 MiB | baseline | baseline | reference | reference | reference |
+| ModelOpt GlobalGrad 9.25-bit FP8 | CUTLASS | 234.28 s | 93,388 MiB | **3.89% faster** | **33.56% lower** | 0.752975 | 20.30 dB | 0.997015 |
+
+At 1344x768, the memory savings remain substantial but the pixel-aligned
+similarity is lower than in the 672x384 short regression. For
+quality-sensitive 1344x768 generation, prefer BF16. Use serialized mixed FP8
+at this resolution only after validating the intended prompts and reference
+inputs; 672x384 is the recommended FP8 starting point.
 
 ## Known limitations
 

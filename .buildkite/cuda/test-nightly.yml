@@ -472,6 +472,12 @@ steps:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_4
 
+      - label: ":full_moon: Diffusion X2V · MiniMax H3 BF16 + ModelOpt FP8 Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_t2va_similarity.py -m full_model --run-level full_model
+        mirror_hardwares: h100_4
+
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
         timeout_in_minutes: 180
         commands:

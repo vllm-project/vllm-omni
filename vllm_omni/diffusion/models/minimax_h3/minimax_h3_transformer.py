@@ -9,6 +9,7 @@ layout.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -71,6 +72,24 @@ class MiniMaxH3DiTArchConfig:
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
+        aliases = {
+            "num_refiner_layers": "token_refiner_num_layers",
+            "ffn_dim": "ffn_hidden_size",
+            "in_channels": "latents_dim",
+            "audio_in_channels": "audio_latents_dim",
+            "freq_dim": "timestep_input_dim",
+            "time_embed_hidden_dim": "time_embed_hidden_size",
+            "rope_freq_dim": "rope_inv_freq_len",
+        }
+        config = dict(config)
+        for source, target in aliases.items():
+            if target not in config and source in config:
+                config[target] = config[source]
+        config.setdefault("adaln_out_features", 18 * int(config.get("hidden_size", cls.hidden_size)))
+        config.setdefault(
+            "final_adaln_out_features",
+            2 * int(config.get("hidden_size", cls.hidden_size)),
+        )
         fields = cls.__dataclass_fields__
         values = {name: config[name] for name in fields if name in config}
         if "patch_size" in values:
@@ -221,9 +240,13 @@ class MiniMaxH3Rope(nn.Module):
 
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
+        # Diffusers checkpoints derive and omit this buffer, while the native
+        # H3 checkpoint serializes it. Initialize it so both layouts are safe.
+        exponents = torch.arange(inv_freq_len, dtype=_FP32_DTYPE) / inv_freq_len
+        inv_freq = 1.0 / (10000.0**exponents)
         self.register_buffer(
             "inv_freq",
-            torch.empty(inv_freq_len, dtype=_FP32_DTYPE),
+            inv_freq,
             persistent=True,
         )
 
@@ -1024,12 +1047,26 @@ class MiniMaxH3DiTModel(nn.Module):
         params.update(dict(self.named_buffers()))
         loaded: set[str] = set()
         for name, loaded_weight in weights:
-            param = params.get(name)
+            target_name = name
+            qkv_shard_id = None
+            qkv_match = re.search(r"\.attn\.qkv_proj\.to_([qkv])\.(weight|weight_scale|input_scale)$", name)
+            if qkv_match is not None:
+                qkv_shard_id, suffix = qkv_match.groups()
+                target_name = name[: qkv_match.start()] + f".attn.qkv_proj.{suffix}"
+
+            fc1_match = re.search(r"\.mlp\.fc1\.diffusers_(weight(?:_scale)?)$", name)
+            diffusers_fc1 = fc1_match is not None
+            if fc1_match is not None:
+                target_name = name[: fc1_match.start()] + f".mlp.fc1.{fc1_match.group(1)}"
+
+            param = params.get(target_name)
             if param is None:
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if name.endswith(".attn.qkv_proj.weight"):
+            if qkv_shard_id is not None:
+                weight_loader(param, loaded_weight, qkv_shard_id)
+            elif target_name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
@@ -1039,18 +1076,39 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 )
                 weight_loader(param, loaded_weight)
-            elif name.endswith(".mlp.fc1.weight"):
-                if loaded_weight.shape[0] % 2:
+            elif target_name.endswith((".attn.qkv_proj.weight_scale", ".attn.qkv_proj.input_scale")):
+                # ModelOpt exports one shared scalar after strict QKV amax
+                # fusion, while vLLM represents a fused QKV layer as three
+                # logical scale shards until post-load processing.
+                shards = ("q", "k", "v")
+                scales = loaded_weight.reshape(-1)
+                if scales.numel() not in (1, len(shards)):
                     raise ValueError(
-                        "MiniMax H3 fc1 checkpoint rows must split evenly into "
-                        f"gate/up matrices, got {tuple(loaded_weight.shape)}"
+                        f"MiniMax H3 fused QKV scale must contain 1 or 3 values, got {tuple(loaded_weight.shape)}"
                     )
-                gate, up = loaded_weight.chunk(2, dim=0)
+                shard_scales = scales.expand(len(shards)) if scales.numel() == 1 else scales
+                for shard_id, scale in zip(shards, shard_scales, strict=True):
+                    weight_loader(param, scale, shard_id)
+            elif target_name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale", ".mlp.fc1.input_scale")):
+                is_weight = target_name.endswith(".weight")
+                is_input_scale = target_name.endswith(".input_scale")
+                values = loaded_weight if is_weight else loaded_weight.reshape(-1)
+                static_scale = not is_weight and values.numel() in (1, 2)
+                split_size = 2 if static_scale and values.numel() == 1 else values.shape[0]
+                can_split = split_size > 0 and split_size % 2 == 0 and (not is_input_scale or static_scale)
+                if not can_split:
+                    tensor_kind = target_name.rpartition(".")[2]
+                    raise ValueError(
+                        f"MiniMax H3 fused fc1 {tensor_kind} cannot split into gate/up shards: "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                first, second = (values[0], values[-1]) if static_scale else values.chunk(2, dim=0)
+                gate, up = (second, first) if diffusers_fc1 else (first, second)
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
-            loaded.add(name)
+            loaded.add(target_name)
         return loaded
 
     @staticmethod

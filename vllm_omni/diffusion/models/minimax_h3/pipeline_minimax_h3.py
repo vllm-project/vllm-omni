@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ import torch.nn as nn
 from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
@@ -156,6 +158,7 @@ def _resolve_minimax_h3_model_root(
         if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
             return path.parent
         return path
+
     allow_patterns = (
         MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
     )
@@ -168,6 +171,60 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
+
+_MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".attn.norm_q": ".attn.q_norm",
+        ".attn.norm_k": ".attn.k_norm",
+        ".attn.to_out.0": ".attn.out_proj",
+        ".ff.net.0.proj": ".mlp.fc1",
+        ".ff.net.2": ".mlp.fc2",
+    },
+    orig_to_new_prefix={
+        "audio_proj_in": "audio_patch_proj",
+        "audio_proj_out": "final_layer.audio_out",
+        "context_embedder": "condition_proj",
+        "norm_out.linear": "final_layer.adaln_proj.linear",
+        "norm_out.norm": "final_layer.norm",
+        "proj_in": "video_patch_proj",
+        "proj_out": "final_layer.video_out",
+        "time_embedder.linear_1": "time_embedder.proj_in",
+        "time_embedder.linear_2": "time_embedder.proj_out",
+        "token_refiner.refiner_blocks": "token_refiner.blocks",
+        "transformer_blocks": "blocks",
+    },
+)
+
+_MINIMAX_H3_QUANT_IGNORE_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper(
+    orig_to_new_substr={
+        ".attn.to_out": ".attn.out_proj",
+        ".ff.net.0": ".mlp.fc1",
+        ".ff": ".mlp",
+    }
+)
+
+
+def _remap_minimax_h3_checkpoint_key(key: str) -> str | tuple[str, str] | None:
+    """Map a Diffusers H3 key while preserving packed-loader routing."""
+    component, separator, source = key.partition(".")
+    if not separator or component not in {"transformer", "transformers_ref"}:
+        return None
+
+    target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
+    output = target
+
+    qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
+    if qkv_match:
+        shard_id, suffix = qkv_match.groups()
+        stem = f"{target[: qkv_match.start()]}.attn.qkv_proj"
+        target, output = f"{stem}.{suffix}", f"{stem}.to_{shard_id}.{suffix}"
+    elif ".ff.net.0.proj." in source and target.endswith((".weight", ".weight_scale")):
+        stem, _, suffix = target.rpartition(".")
+        output = f"{stem}.diffusers_{suffix}"
+
+    target, output = f"{component}.{target}", f"{component}.{output}"
+    return target if target == output else (target, output)
 
 
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
@@ -552,6 +609,12 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    hf_to_vllm_mapper = _MINIMAX_H3_QUANT_IGNORE_MAPPER
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+        "fc1": ["gate_proj", "up_proj"],
+    }
+    remap_checkpoint_key = staticmethod(_remap_minimax_h3_checkpoint_key)
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -648,6 +711,16 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        ref_transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformers_ref",
+        )
+        if transformer_quant_config is not None:
+            transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+            transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
+        if ref_transformer_quant_config is not None and ref_transformer_quant_config is not transformer_quant_config:
+            ref_transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+            ref_transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
@@ -655,7 +728,7 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
-                quant_config=transformer_quant_config,
+                quant_config=ref_transformer_quant_config,
             )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
