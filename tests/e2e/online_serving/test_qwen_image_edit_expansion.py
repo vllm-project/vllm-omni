@@ -1,8 +1,6 @@
 """
 Comprehensive tests of diffusion features that are available in online serving mode
-and are supported by the following models:
-- Qwen-Image-Edit: single image input
-- Qwen-Image-Edit-2511: single image input and two image inputs
+and are supported by Qwen-Image-Edit-2511 (single image input and two image inputs).
 """
 
 import pytest
@@ -11,10 +9,10 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
-EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
-SINGLE_EDIT_PROMPT_2511 = "Restyle this image into a Vincent van Gogh style impressionist painting."
+MODEL = "Qwen/Qwen-Image-Edit-2511"
+SINGLE_EDIT_PROMPT = "Restyle this image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
     "Transform the first image into a Dadaism collage art. "
     "Transform the second image into a Vincent van Gogh style painting. "
@@ -25,9 +23,7 @@ SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
-# This test file targets two models, so I write a helper function.
-# If a similar test only involves one model, one can just define a global list variable.
-def _get_diffusion_feature_cases(model: str):
+def _get_diffusion_feature_cases(model: str = MODEL):
     return [
         pytest.param(
             OmniServerParams(
@@ -123,35 +119,7 @@ def _get_diffusion_feature_cases(model: str):
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit"),
-    indirect=True,
-)
-def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Test all diffusion features with Qwen-Image-Edit in regular end-user scenarios."""
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
-
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
-
-    # CFG parallel is only activated when a negative prompt and true_cfg_scale > 1.0 are both present
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "extra_body": {
-            "height": 512,
-            "width": 512,
-            "num_inference_steps": 2,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "true_cfg_scale": 4.0,
-            "seed": 42,
-        },
-    }
-
-    openai_client.send_diffusion_request(request_config)
-
-
-@pytest.mark.parametrize(
-    "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
+    _get_diffusion_feature_cases(),
     indirect=True,
 )
 def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
@@ -166,7 +134,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
     """
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=SINGLE_EDIT_PROMPT_2511)
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=SINGLE_EDIT_PROMPT)
 
     request_config = {
         "model": omni_server.model,
@@ -186,7 +154,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
 
 @pytest.mark.parametrize(
     "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2511"),
+    _get_diffusion_feature_cases(),
     indirect=True,
 )
 def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):

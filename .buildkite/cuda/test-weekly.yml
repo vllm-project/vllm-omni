@@ -149,4 +149,4 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_4
