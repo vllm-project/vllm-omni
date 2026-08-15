@@ -56,7 +56,11 @@ def _create_hsdp_mesh(
     replicate_size: int,
     shard_pg: torch.distributed.ProcessGroup,
 ) -> DeviceMesh:
-    """Create a 2D DeviceMesh for HSDP using an existing ProcessGroup for the shard dimension.
+    """Create a DeviceMesh for HSDP using an existing ProcessGroup for the shard dimension.
+
+    Depending on replicate_size, this will create either a 1D DeviceMesh with
+    dimension ("shard",) (for replicate_size == 1) or a 2D DeviceMesh with
+    dimensions ("replicate", "shard") (for replicate_size > 1).
 
     Args:
         device_type: The device type (e.g., "cuda", "npu")
@@ -64,14 +68,20 @@ def _create_hsdp_mesh(
         shard_pg: The ProcessGroup for the shard dimension (from FS GroupCoordinator)
 
     Returns:
-        A 2D DeviceMesh with dimensions ("replicate", "shard")
+        A DeviceMesh representing the HSDP topology.
     """
+    if replicate_size <= 0:
+        raise ValueError(f"Invalid replicate_size: {replicate_size}. HSDP replica size must be a positive integer.")
+
     shard_size = torch.distributed.get_world_size(shard_pg)
     world_size = replicate_size * shard_size
 
-    # Build 2D mesh tensor: shape (replicate_size, shard_size)
+    # Build mesh tensor: shape (replicate_size, shard_size) for 2D, or (shard_size,) for 1D.
     # Ranks are arranged so that each row is a shard group
-    mesh_tensor = torch.arange(world_size).reshape(replicate_size, shard_size)
+    if replicate_size > 1:
+        mesh_tensor = torch.arange(world_size).reshape(replicate_size, shard_size)
+    else:
+        mesh_tensor = torch.arange(world_size)
 
     # Create DeviceMesh with the shard ProcessGroup
     # For the shard dimension, we reuse the existing FS ProcessGroup
@@ -81,12 +91,15 @@ def _create_hsdp_mesh(
             mesh_shape=(replicate_size, shard_size),
             mesh_dim_names=("replicate", "shard"),
         )
-    else:
+    elif replicate_size == 1:
         device_mesh = init_device_mesh(
             device_type,
             mesh_shape=(shard_size,),
             mesh_dim_names=("shard",),
         )
+    else:
+        # Safeguard (technically unreachable due to early check)
+        raise ValueError(f"Invalid replicate_size: {replicate_size}. HSDP replica size must be a positive integer.")
 
     # Note: init_device_mesh creates new ProcessGroups internally.
     # For consistency, we verify the mesh structure matches our FS group.
@@ -170,8 +183,9 @@ def apply_hsdp_to_model(
 
     device_type = current_omni_platform.device_type
 
-    # Create 2D DeviceMesh for HSDP using the FS group's ProcessGroup for shard dimension
-    # The mesh shape is (replicate, shard) where:
+    # Create DeviceMesh for HSDP (1D if replicate_size == 1, 2D if replicate_size > 1)
+    # using the FS group's ProcessGroup for shard dimension.
+    # The mesh shape is (replicate, shard) for 2D where:
     # - replicate: groups of ranks that hold the same shard (for gradient all-reduce in training)
     # - shard: groups of ranks that each hold different shards (for parameter all-gather)
     device_mesh = _create_hsdp_mesh(
