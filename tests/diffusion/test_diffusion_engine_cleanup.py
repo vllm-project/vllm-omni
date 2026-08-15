@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import concurrent.futures
 import queue
 import threading
 from types import SimpleNamespace
@@ -43,6 +44,141 @@ def _make_engine() -> DiffusionEngine:
     engine.stop_event = None
     engine.worker_thread = None
     return engine
+
+
+def test_async_output_timeout_defaults_to_30_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", raising=False)
+
+    assert diffusion_engine_module._get_async_output_timeout() == 30.0
+
+
+def test_async_output_timeout_uses_video_sync_timeout_as_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "1800")
+
+    assert diffusion_engine_module._get_async_output_timeout() == 1800.0
+
+
+def test_async_output_timeout_prefers_specific_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", "1800")
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", "45.5")
+
+    assert diffusion_engine_module._get_async_output_timeout() == 45.5
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "inf", "nan"])
+def test_async_output_timeout_rejects_nonpositive_or_nonfinite_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT", value)
+
+    with pytest.raises(ValueError, match="positive finite"):
+        diffusion_engine_module._get_async_output_timeout()
+
+
+@pytest.mark.asyncio
+async def test_step_streaming_uses_configured_async_output_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _make_engine()
+    engine._async_output_timeout = 45.5
+    engine.pre_process_func = None
+
+    async def check_background_loop() -> None:
+        return None
+
+    engine._check_and_start_background_loop = check_background_loop
+
+    pending = DiffusionOutput(async_output_id="output-1")
+    ready = DiffusionOutput(output="ready")
+    future: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+    future.set_result(ready)
+    waited_ids: list[str] = []
+
+    def wait_output_ready(output_id: str):
+        waited_ids.append(output_id)
+        return future
+
+    engine.executor = SimpleNamespace(wait_output_ready=wait_output_ready)
+
+    async def stream_response(_request):
+        yield pending
+
+    engine.async_add_req_and_stream_response = stream_response
+    engine.postprocess_output = lambda _request, output: [] if output is ready else None
+
+    observed_timeouts: list[float | None] = []
+    original_wait_for = asyncio.wait_for
+
+    async def capture_wait_for(awaitable, timeout):
+        observed_timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", capture_wait_for)
+
+    batches = [batch async for batch in engine.step_streaming(_make_request("async-timeout"))]
+
+    assert batches == [[]]
+    assert waited_ids == ["output-1"]
+    assert observed_timeouts == [45.5]
+
+
+def test_sync_output_wait_uses_configured_async_output_timeout() -> None:
+    engine = _make_engine()
+    engine._async_output_timeout = 72.0
+    pending = DiffusionOutput(async_output_id="output-2")
+    ready = DiffusionOutput(output="ready")
+
+    class FakeScheduler:
+        @staticmethod
+        def add_request(_request):
+            return "request-1"
+
+        @staticmethod
+        def schedule():
+            return SimpleNamespace(
+                is_empty=False,
+                scheduled_request_ids=["request-1"],
+            )
+
+        @staticmethod
+        def update_from_output(_sched_output, _runner_output):
+            return {"request-1"}
+
+    class FakeRunnerOutput:
+        @staticmethod
+        def get_request_output(_request_id):
+            return pending
+
+        def __len__(self):
+            return 1
+
+    class TimeoutRecordingFuture:
+        timeout = None
+
+        def result(self, *, timeout):
+            self.timeout = timeout
+            return ready
+
+    future = TimeoutRecordingFuture()
+    engine.scheduler = FakeScheduler()
+    engine.execute_fn = lambda _sched_output: FakeRunnerOutput()
+    engine._process_aborts_queue = lambda: None
+    engine._finalize_finished_request = lambda *_args, **_kwargs: pending
+    engine.executor = SimpleNamespace(wait_output_ready=lambda _output_id: future)
+
+    output = engine.add_req_and_wait_for_response(_make_request("sync-timeout"))
+
+    assert output is ready
+    assert future.timeout == 72.0
 
 
 def test_close_completes_pending_output_streams() -> None:

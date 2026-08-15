@@ -65,6 +65,18 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
+Long video requests have two relevant timeouts:
+
+- `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` controls API-side video synchronization.
+- `VLLM_OMNI_DIFFUSION_OUTPUT_TIMEOUT` controls the engine's wait for
+  background device-to-host transfer and shared-memory output packaging.
+
+The diffusion output timeout defaults to 30 seconds. When its dedicated
+variable is unset, it inherits `VLLM_OMNI_VIDEO_SYNC_TIMEOUT`; therefore the
+commands below set both waits to 1800 seconds. Set the dedicated variable when
+the background-output wait needs a different limit. Both values must be
+positive finite numbers.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
