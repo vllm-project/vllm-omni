@@ -47,6 +47,7 @@ from .ltx2_guidance import (
     LTXGuidanceExecutor,
     LTXGuidancePlan,
 )
+from .ltx2_phase_adapter import LTXPhaseAdapterRuntime, build_ltx_phase_adapter
 from .ltx2_recipes import (
     LTXPhaseRecipe,
     LTXPipelineRecipe,
@@ -137,9 +138,21 @@ class LTXRuntime(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
+        parallel_config = getattr(od_config, "parallel_config", None)
+        if getattr(parallel_config, "ulysses_mode", "strict") == "advanced_uaa":
+            raise ValueError(
+                f"{self.__class__.__name__} does not support ulysses_mode='advanced_uaa'. "
+                "Use the default ulysses_mode='strict' for LTX sequence parallelism."
+            )
         self.model_version = detect_ltx_model_version(od_config.model)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        if getattr(od_config, "cache_backend", "none") == "cache_dit" and len(self.pipeline_recipe.phases) > 1:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support cache_backend='cache_dit'. "
+                "Cache-DiT currently supports only one-stage LTX recipes; multi-stage recipes require "
+                "phase-aware cache enable and refresh."
+            )
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)
@@ -150,6 +163,7 @@ class LTXRuntime(
         super().__init__()
         self._guidance_plan = LTXGuidancePlan.build(self.pipeline_recipe.request_guidance)
         initialize_pipeline_components(self, od_config)
+        self._phase_adapter: LTXPhaseAdapterRuntime | None = build_ltx_phase_adapter(self)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -205,6 +219,8 @@ class LTXRuntime(
             max_sequence_length=max_sequence_length,
         )
         image = self._resolve_request_image(req, image, request_inputs)
+        if image is not None and not self.support_image_input:
+            raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
         request_sigmas = self._resolve_request_sigmas(req, sigmas)
         validate_pipeline_request(
             request_inputs,
@@ -214,6 +230,13 @@ class LTXRuntime(
             pipeline_name=self.__class__.__name__,
             request_sigmas=request_sigmas,
         )
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None and any(
+            getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
+        ):
+            raise ValueError(
+                f"{self.__class__.__name__} cannot compose a request LoRA with its internal phase adapter."
+            )
         return self._run_recipe(req, request_inputs, request_sigmas=request_sigmas, image=image)
 
     def _run_recipe(
@@ -258,8 +281,20 @@ class LTXRuntime(
         return self.decode_phase(output_phase)
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
-        """Hook for a future phase-weight strategy."""
         self._active_phase_name = phase.name
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is None:
+            if phase.adapter_slot is not None:
+                raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
+            return
+        phase_adapter.activate(phase.adapter_slot)
+
+    def eval(self):
+        result = super().eval()
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None:
+            phase_adapter.finalize()
+        return result
 
     def prepare_latents(
         self,
@@ -692,6 +727,7 @@ class LTXRuntime(
             noise_pred_audio,
             timestep,
         )
+        audio = latent_ops.clear_audio_padding(audio, forward_ctx.original_audio_num_frames)
         return latent_ops.LTXAVState(video=video, audio=audio)
 
     def _unpack_and_denormalize_stage(

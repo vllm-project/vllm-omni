@@ -1772,6 +1772,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
+                # Output-token cap, so a model that must ship a payload on the
+                # request's final step can tell which step that is. A finished
+                # request drops out of req_ids_output_copy, and downstream
+                # routing keys off that list, so a payload produced after its
+                # last step never reaches the caller.
+                sampling_params = getattr(req_state, "sampling_params", None)
+                req_infos["_omni_max_tokens"] = getattr(sampling_params, "max_tokens", None)
+                # Seed, so a model that samples inside forward() can be
+                # reproducible: vLLM's own sampler seeding does not reach it.
+                req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
                 if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue

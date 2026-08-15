@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "pytest-mock==3.15.1",
+    "pytest-shard==0.1.2",
     "websockets==16.1",
     "pytest-subtests==0.15.0",
     "datasets==3.6.0",
@@ -300,6 +301,21 @@ filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
     "ignore:.*does not have '__bases__' attribute.*:UserWarning",
 ]
+
+[tool.coverage.run]
+core = "sysmon"
+source = ["vllm_omni"]
+# Online-serving tests launch the server via subprocess.Popen and stop it with
+# SIGTERM. pytest-cov no longer instruments subprocesses implicitly, and a
+# SIGTERM-ed process discards its data, so without patch/sigterm a coverage run
+# over an online test measures only the pytest parent.
+patch = ["subprocess"]
+concurrency = ["multiprocessing", "thread"]
+sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [

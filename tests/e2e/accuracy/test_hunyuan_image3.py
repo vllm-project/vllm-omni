@@ -328,7 +328,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
     images = None
     cot_text = ""
     for out in outputs:
-        ro = getattr(out, "request_output", None)
+        ro = out
         if ro and getattr(ro, "outputs", None):
             cot_text = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not cot_text:
@@ -467,7 +467,7 @@ def _extract_image(outputs) -> Image.Image:
     assert outputs, "Pipeline produced no outputs"
     for output in outputs:
         images = getattr(output, "images", None)
-        request_output = getattr(output, "request_output", None)
+        request_output = output
         if not images and request_output is not None:
             images = getattr(request_output, "images", None)
         if images:

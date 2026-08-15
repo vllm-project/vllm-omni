@@ -16,7 +16,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
-from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+from vllm_omni.model_extras import get_extra_body_params, get_model_class_name, get_output_tensor_range
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -80,6 +80,17 @@ _MODEL_PRESETS = {
         "fps": 16,
         "output": "helios_output.mp4",
     },
+    "lingbot": {
+        "model_class_name": "LingBotVideoPipeline",
+        "height": 192,
+        "width": 320,
+        "num_frames": 9,
+        "num_inference_steps": 2,
+        "guidance_scale": 3.0,
+        "fps": 24,
+        "flow_shift": 3.0,
+        "output": "lingbot_video_output.mp4",
+    },
     "ltx2": {
         "height": 512,
         "width": 768,
@@ -110,25 +121,49 @@ _MODEL_PRESETS = {
 def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
     class_lower = (model_class_name or "").lower()
-    if "distilled" in class_lower or "distilled" in model_lower:
-        return _MODEL_PRESETS["ltx2_distilled"]
-    if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
-        return _MODEL_PRESETS["ltx23"]
-    if "ltx2" in class_lower or "ltx-2" in model_lower or "ltx_2" in model_lower:
+    if "lingbot" in model_lower or "lingbotvideo" in class_lower:
+        return _MODEL_PRESETS["lingbot"]
+    if "ltx" in class_lower or "ltx" in model_lower:
+        if "distilled" in class_lower or "distilled" in model_lower:
+            return _MODEL_PRESETS["ltx2_distilled"]
+        if "ltx23" in class_lower or "ltx-2.3" in model_lower or "ltx_2.3" in model_lower:
+            return _MODEL_PRESETS["ltx23"]
         return _MODEL_PRESETS["ltx2"]
-    if "vace" in model_lower:
+    if "vace" in model_lower or "vace" in class_lower:
         return _MODEL_PRESETS["vace"]
     # Edge must be matched before the generic cosmos branch (its "cosmos" substring would
     # otherwise pick up the Nano/Super 720p / gs 6.0 / flow_shift 10.0 preset).
     if ("cosmos" in model_lower or "cosmos" in class_lower) and ("edge" in model_lower or "edge" in class_lower):
         return _MODEL_PRESETS["cosmos3_edge"]
-    if "cosmos" in model_lower:
+    if "cosmos" in model_lower or "cosmos" in class_lower:
         return _MODEL_PRESETS["cosmos"]
-    if "hunyuan" in model_lower:
+    if "hunyuan" in model_lower or "hunyuan" in class_lower:
         return _MODEL_PRESETS["hunyuan"]
-    if "helios" in model_lower:
+    if "helios" in model_lower or "helios" in class_lower:
         return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
+
+
+def build_text_to_video_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared T2V example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["video"],
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
+def _normalize_float_tensor(tensor: torch.Tensor, source_range: str) -> torch.Tensor:
+    """Normalize decoded frames according to the pipeline's output contract."""
+    if not tensor.is_floating_point():
+        return tensor
+    if source_range == "negative_one_to_one":
+        return tensor.clamp(-1, 1) * 0.5 + 0.5
+    if source_range == "zero_to_one":
+        return tensor.clamp(0, 1)
+    raise ValueError(f"Unsupported floating-point tensor range: {source_range!r}")
 
 
 def parse_profiler_config(value: str) -> dict[str, Any]:
@@ -160,7 +195,7 @@ def parse_extra_body(value: str) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, Helios, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -390,7 +425,7 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
     val = getattr(result, "peak_memory_mb", 0.0)
     if not val:
-        inner = getattr(result, "request_output", None)
+        inner = result
         if isinstance(inner, list):
             inner = inner[0] if inner else None
         val = getattr(inner, "peak_memory_mb", 0.0)
@@ -408,6 +443,7 @@ def main():
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
+    model_class_name = args.model_class_name
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     # Cache-dit config (Wan2.2 only)
@@ -480,6 +516,7 @@ def main():
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name
     declared_extra_body_params = get_extra_body_params(model_class_name)
+    output_tensor_range = get_output_tensor_range(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -513,12 +550,11 @@ def main():
             lora_path=lora_path,
         )
 
-    prompt_dict = {"prompt": args.prompt}
-    if args.negative_prompt is not None:
-        prompt_dict["negative_prompt"] = args.negative_prompt
-    elif preset not in (_MODEL_PRESETS["ltx2"], _MODEL_PRESETS["ltx23"]):
+    negative_prompt = args.negative_prompt
+    if negative_prompt is None and all(preset is not _MODEL_PRESETS[name] for name in ("lingbot", "ltx2", "ltx23")):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
-        prompt_dict["negative_prompt"] = ""
+        negative_prompt = ""
+    prompt_dict = build_text_to_video_prompt(args.prompt, negative_prompt)
 
     extra_args = {}
     if lora_request:
@@ -575,8 +611,8 @@ def main():
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
@@ -630,8 +666,7 @@ def main():
                 frame_tensor = frame_tensor[0]
             if frame_tensor.dim() == 3 and frame_tensor.shape[0] in (3, 4):
                 frame_tensor = frame_tensor.permute(1, 2, 0)
-            if frame_tensor.is_floating_point():
-                frame_tensor = frame_tensor.clamp(-1, 1) * 0.5 + 0.5
+            frame_tensor = _normalize_float_tensor(frame_tensor, output_tensor_range)
             return frame_tensor.float().numpy()
         if isinstance(frame, np.ndarray):
             frame_array = frame
@@ -683,8 +718,7 @@ def main():
                 video_tensor = video_tensor[0]
         elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
             video_tensor = video_tensor.permute(1, 2, 3, 0)
-        if video_tensor.is_floating_point():
-            video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
+        video_tensor = _normalize_float_tensor(video_tensor, output_tensor_range)
         video_array = video_tensor.float().numpy()
     elif isinstance(frames, np.ndarray):
         video_array = frames
