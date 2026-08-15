@@ -64,6 +64,16 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
     ),
+    "LongCatImageEditPipeline": DiffusionModelTestOpts(
+        model="meituan-longcat/LongCat-Image-Edit",
+        builder=diff_model_builders.tiny_longcat_image_edit_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
+        extra_test_groups=[
+            [DiffusionAccs.TEA_CACHE],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
+            [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
+        ],
+    ),
     "FluxPipeline": DiffusionModelTestOpts(
         model="black-forest-labs/FLUX.1-schnell",
         builder=diff_model_builders.tiny_flux_builder,
