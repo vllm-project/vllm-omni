@@ -121,8 +121,8 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 
 ### Reliability, Lifecycle & Timeout Behavior
 
-1. **Drain Before Memory Release (`drain_async_outputs`)**:
-   When workers transition into sleep states (`handle_sleep_task`) or invoke memory-releasing methods, `WorkerProc.drain_async_outputs()` blocks up to `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S` (10.0s) until all in-flight background D2H/SHM packing tasks finish. This prevents worker sleep cycles from releasing device tensors while the side CUDA stream is still reading them.
+1. **Drain Before Memory Release (`drain_async_outputs` / `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S`)**:
+   When workers transition into sleep states (`handle_sleep_task`) or invoke memory-releasing methods, `WorkerProc.drain_async_outputs()` blocks up to `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S` (10.0s) until all in-flight background D2H/SHM packing tasks finish. This acts as a synchronization barrier preventing worker sleep cycles from releasing device tensors while the side CUDA stream is still actively reading them. Draining typically completes within 10–50 ms under normal operation.
 
 2. **Timeout Diagnostics (`_ASYNC_OUTPUT_TIMEOUT`)**:
    The engine waits for `wait_output_ready()` with a timeout of `_ASYNC_OUTPUT_TIMEOUT` (30.0s). If a timeout occurs, the executor logs detailed diagnostic bookkeeping (pending futures, cached outputs, and batch split maps) to identify whether the stall occurred in the worker, pump, or waiter.

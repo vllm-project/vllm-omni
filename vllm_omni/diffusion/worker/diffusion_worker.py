@@ -65,6 +65,10 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
+# Maximum time (in seconds) to wait for pending background D2H / SHM packing
+# to drain before the worker executes memory-releasing lifecycle tasks
+# (e.g. during sleep/wake transitions). This barrier prevents device tensors
+# from being freed while the side CUDA stream is still actively reading them.
 _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 
 # Worker entry points that release device memory. Background D2H/SHM packing
