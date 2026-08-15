@@ -9,7 +9,8 @@ import inspect
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -19,7 +20,9 @@ from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
-from transformers import AutoTokenizer, Gemma3ForConditionalGeneration
+from safetensors import safe_open
+from safetensors.torch import load_file
+from transformers import AutoModelForImageTextToText, AutoTokenizer, Gemma3ForConditionalGeneration
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
@@ -32,6 +35,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
     apply_interleaved_rotary_emb,
@@ -43,6 +47,14 @@ try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
 except ImportError:
     LTX2VocoderWithBWE = None
+
+try:
+    from transformers import Gemma4UnifiedForConditionalGeneration as _Gemma4UnifiedForConditionalGeneration
+except ImportError:
+    _Gemma4UnifiedForConditionalGeneration = None
+
+
+_LTX25_TEXT_ENCODER_CLS = AutoModelForImageTextToText if _Gemma4UnifiedForConditionalGeneration is not None else None
 
 
 _LTX_COMPONENT_SUBFOLDERS = (
@@ -69,7 +81,15 @@ class LTXComponentProfile:
     resident_modules: tuple[str, ...] = ()
     video_vae_cls: type = AutoencoderKLLTX2Video
     vocoder_cls: type = LTX2Vocoder
+    text_encoder_cls: type | None = Gemma3ForConditionalGeneration
     vocoder_fallback_cls: type | None = None
+    artifact_repo_id: str | None = None
+    latent_upsampler_filename: str | None = None
+    distilled_lora_filename: str | None = None
+    transformer_subfolder: str = "transformer"
+    scheduler_use_dynamic_shifting: bool = False
+    scheduler_shift_terminal: float | None = None
+    preserve_connector_attention_mask: bool = False
 
 
 LTX2_COMPONENT_PROFILE = LTXComponentProfile(
@@ -92,6 +112,23 @@ LTX23_COMPONENT_PROFILE = LTXComponentProfile(
     vocoder_fallback_cls=LTX2Vocoder,
 )
 
+LTX25_FULL_COMPONENT_PROFILE = LTXComponentProfile(
+    name="ltx2_5_full",
+    dit_modules=("transformer",),
+    encoder_modules=("text_encoder", "connectors"),
+    vae_modules=("vae", "audio_vae"),
+    resident_modules=("vocoder",),
+    video_vae_cls=DistributedAutoencoderKLLTX2Video,
+    vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
+    vocoder_fallback_cls=LTX2Vocoder,
+    text_encoder_cls=_LTX25_TEXT_ENCODER_CLS,
+    transformer_subfolder="transformer_full",
+    scheduler_use_dynamic_shifting=True,
+    scheduler_shift_terminal=0.1,
+    preserve_connector_attention_mask=True,
+)
+
+
 LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     name="ltx2_distilled",
     dit_modules=("transformer",),
@@ -101,14 +138,152 @@ LTX2_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
 )
 
+LTX25_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
+    name="ltx2_5_distilled",
+    dit_modules=("transformer",),
+    encoder_modules=("text_encoder", "connectors"),
+    vae_modules=("vae", "audio_vae"),
+    resident_modules=("vocoder", "latent_upsampler"),
+    video_vae_cls=DistributedAutoencoderKLLTX2Video,
+    vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
+    vocoder_fallback_cls=LTX2Vocoder,
+    text_encoder_cls=_LTX25_TEXT_ENCODER_CLS,
+    preserve_connector_attention_mask=True,
+)
+
+LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE = replace(
+    LTX2_DISTILLED_COMPONENT_PROFILE,
+    name="ltx2_distilled_one_stage",
+    resident_modules=LTX2_COMPONENT_PROFILE.resident_modules,
+)
+
+LTX25_DISTILLED_ONE_STAGE_COMPONENT_PROFILE = replace(
+    LTX25_DISTILLED_COMPONENT_PROFILE,
+    name="ltx2_5_distilled_one_stage",
+    resident_modules=LTX25_FULL_COMPONENT_PROFILE.resident_modules,
+)
+
+
+LTX23_DISTILLED_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_distilled",
+    resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2.3",
+    latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+)
+
+LTX23_DISTILLED_ONE_STAGE_COMPONENT_PROFILE = replace(
+    LTX23_DISTILLED_COMPONENT_PROFILE,
+    name="ltx2_3_distilled_one_stage",
+    resident_modules=LTX23_COMPONENT_PROFILE.resident_modules,
+)
+
+LTX2_TWO_STAGE_COMPONENT_PROFILE = replace(
+    LTX2_COMPONENT_PROFILE,
+    name="ltx2_two_stage",
+    resident_modules=(*LTX2_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2",
+    latent_upsampler_filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
+    distilled_lora_filename="ltx-2-19b-distilled-lora-384.safetensors",
+)
+
+LTX23_TWO_STAGE_COMPONENT_PROFILE = replace(
+    LTX23_COMPONENT_PROFILE,
+    name="ltx2_3_two_stage",
+    resident_modules=(*LTX23_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2.3",
+    latent_upsampler_filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+    distilled_lora_filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+)
+
+
+LTX25_TWO_STAGE_COMPONENT_PROFILE = replace(
+    LTX25_FULL_COMPONENT_PROFILE,
+    name="ltx2_5_two_stage",
+    resident_modules=(*LTX25_FULL_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
+    artifact_repo_id="Lightricks/LTX-2.5",
+    latent_upsampler_filename=("latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
+    distilled_lora_filename="loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+)
 
 _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("one_stage", "2"): LTX2_COMPONENT_PROFILE,
     ("one_stage", "2.3"): LTX23_COMPONENT_PROFILE,
+    ("one_stage", "2.5"): LTX25_FULL_COMPONENT_PROFILE,
+    ("two_stage", "2"): LTX2_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage", "2.5"): LTX25_TWO_STAGE_COMPONENT_PROFILE,
+    ("distilled_one_stage", "2"): LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
+    ("distilled_one_stage", "2.3"): LTX23_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
+    ("distilled_one_stage", "2.5"): LTX25_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     ("distilled_two_stage", "2"): LTX2_DISTILLED_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2.3"): LTX23_DISTILLED_COMPONENT_PROFILE,
+    ("distilled_two_stage", "2.5"): LTX25_DISTILLED_COMPONENT_PROFILE,
     ("dmd2", "2"): LTX2_COMPONENT_PROFILE,
     ("dmd2", "2.3"): LTX23_COMPONENT_PROFILE,
 }
+
+
+def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
+    """Derive checkpoint requirements from the execution contract."""
+    if pipeline_kind in {"one_stage", "two_stage"}:
+        return "regular"
+    if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
+        return "distilled"
+    if pipeline_kind == "dmd2":
+        return None
+    raise ValueError(f"Unsupported LTX pipeline kind: {pipeline_kind!r}.")
+
+
+def resolve_ltx_artifact(
+    model: str,
+    repo_id: str,
+    filename: str,
+) -> str:
+    """Resolve an official LTX sidecar from the model root or its Hub repository."""
+    candidate = Path(model) / filename
+    if candidate.is_file():
+        return str(candidate)
+
+    try:
+        return hf_hub_download(repo_id=repo_id, filename=filename)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Unable to resolve LTX artifact {filename!r}. Searched {candidate}; "
+            f"place the file in the model root or make {repo_id} available."
+        ) from exc
+
+
+def _load_ltx_latent_upsampler_single_file(path: str, dtype: torch.dtype) -> LTX2LatentUpsamplerModel:
+    """Load an official single-file upsampler into the Diffusers module."""
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+    raw_config = json.loads(metadata.get("config", "{}"))
+    config = {
+        "in_channels": raw_config.get("in_channels", 128),
+        "mid_channels": raw_config.get("mid_channels", 1024),
+        "num_blocks_per_stage": raw_config.get("num_blocks_per_stage", 4),
+        "dims": raw_config.get("dims", 3),
+        "spatial_upsample": raw_config.get("spatial_upsample", True),
+        "temporal_upsample": raw_config.get("temporal_upsample", False),
+        "rational_spatial_scale": raw_config.get("spatial_scale", 2.0),
+        "use_rational_resampler": raw_config.get("rational_resampler", False),
+    }
+    with torch.device("cpu"):
+        upsampler = LTX2LatentUpsamplerModel(**config).to(dtype=dtype)
+
+    state_dict = load_file(path, device="cpu")
+    if "upsampler.0.weight" in state_dict and hasattr(upsampler.upsampler, "conv"):
+        state_dict["upsampler.conv.weight"] = state_dict.pop("upsampler.0.weight")
+        state_dict["upsampler.conv.bias"] = state_dict.pop("upsampler.0.bias")
+    missing, unexpected = upsampler.load_state_dict(state_dict, strict=False)
+    unresolved_missing = set(missing) - {"upsampler.blur_down.kernel"}
+    if unresolved_missing or unexpected:
+        raise ValueError(
+            f"Invalid LTX latent upsampler {path}: missing={sorted(unresolved_missing)}, "
+            f"unexpected={sorted(unexpected)}."
+        )
+    return upsampler
 
 
 def resolve_ltx_component_profile(pipeline_kind: str, model_version: str) -> LTXComponentProfile:
@@ -119,7 +294,7 @@ def resolve_ltx_component_profile(pipeline_kind: str, model_version: str) -> LTX
         raise ValueError(f"Unsupported LTX component kind/version: {pipeline_kind!r}/{model_version!r}.") from exc
 
 
-def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
+def _load_ltx_metadata_json(model: str, filename: str, revision: str | None = None) -> dict[str, Any]:
     """Load small checkpoint metadata without relying on repository names."""
     if os.path.isdir(model):
         path = os.path.join(model, filename)
@@ -127,7 +302,7 @@ def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
             return {}
     else:
         try:
-            path = hf_hub_download(repo_id=model, filename=filename)
+            path = hf_hub_download(repo_id=model, filename=filename, revision=revision)
         except Exception:
             return {}
     try:
@@ -138,16 +313,33 @@ def _load_ltx_metadata_json(model: str, filename: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def detect_ltx_model_version(model: str) -> str:
-    """Detect LTX-2 versus LTX-2.3 from checkpoint component metadata.
+def detect_ltx_model_version(model: str, revision: str | None = None) -> str:
+    """Detect the LTX model version from checkpoint component metadata."""
+    model_index = _load_ltx_metadata_json(model, "model_index.json", revision)
+    model_version = str(model_index.get("model_version", ""))
+    if model_version.startswith("2.5"):
+        return "2.5"
 
-    Official checkpoints use ``model_version`` metadata. Diffusers repositories
-    expose the equivalent distinction through the BWE vocoder introduced by
-    LTX-2.3. Unknown conversions retain the official LTX-2 fallback.
-    """
-    model_index = _load_ltx_metadata_json(model, "model_index.json")
-    if str(model_index.get("model_version", "")).startswith("2.3"):
+    text_encoder_entry = model_index.get("text_encoder")
+    if isinstance(text_encoder_entry, (list, tuple)) and text_encoder_entry:
+        text_encoder_class = str(text_encoder_entry[-1])
+    elif isinstance(text_encoder_entry, dict):
+        text_encoder_class = str(text_encoder_entry.get("_class_name", ""))
+    else:
+        text_encoder_class = ""
+    if text_encoder_class == "Gemma4UnifiedForConditionalGeneration":
+        return "2.5"
+
+    text_encoder_config = _load_ltx_metadata_json(model, "text_encoder/config.json", revision)
+    if text_encoder_config.get("model_type") in ("gemma4_unified", "gemma4"):
+        return "2.5"
+
+    if model_version.startswith("2.3"):
         return "2.3"
+
+    transformer_config = _load_ltx_metadata_json(model, "transformer/config.json", revision)
+    if transformer_config.get("ff_bias") is False:
+        return "2.5"
 
     vocoder_entry = model_index.get("vocoder")
     if isinstance(vocoder_entry, (list, tuple)) and vocoder_entry:
@@ -159,21 +351,32 @@ def detect_ltx_model_version(model: str) -> str:
     if vocoder_class == "LTX2VocoderWithBWE":
         return "2.3"
 
-    vocoder_config = _load_ltx_metadata_json(model, "vocoder/config.json")
+    vocoder_config = _load_ltx_metadata_json(model, "vocoder/config.json", revision)
     if str(vocoder_config.get("model_version", "")).startswith("2.3"):
         return "2.3"
     if vocoder_config.get("_class_name") == "LTX2VocoderWithBWE":
         return "2.3"
-
-    logger.info("Using LTX-2 defaults for checkpoint %s", model)
+    if "bwe" in vocoder_config or "bwe_config" in vocoder_config:
+        return "2.3"
     return "2"
+
+
+def preserves_reference_image_size(*, model: str | None, revision: str | None = None) -> bool:
+    """Preserve source geometry only for the LTX-2.5 CRF-18 I2V path."""
+    return model is not None and detect_ltx_model_version(model, revision=revision) == "2.5"
 
 
 class _LTXConnectorAttnProcessor:
     """Preserve official connector math around Omni attention dispatch."""
 
-    def __init__(self, *, has_learned_registers: bool) -> None:
+    def __init__(
+        self,
+        *,
+        has_learned_registers: bool = False,
+        preserve_learned_register_mask: bool = False,
+    ) -> None:
         self.has_learned_registers = has_learned_registers
+        self.preserve_learned_register_mask = preserve_learned_register_mask
 
     def __call__(
         self,
@@ -187,12 +390,20 @@ class _LTXConnectorAttnProcessor:
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         gate_logits = attn.to_gate_logits(hidden_states) if attn.to_gate_logits is not None else None
 
-        query = attn.norm_q(attn.to_q(hidden_states))
-        key = attn.norm_k(attn.to_k(encoder_hidden_states))
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
+        # Offload hooks may execute affine-free Q/K norms in FP32. Restore the
+        # projection dtype before attention, matching the fully resident path.
+        query = attn.norm_q(query).to(dtype=value.dtype)
+        key = attn.norm_k(key).to(dtype=value.dtype)
 
         if query_rotary_emb is not None:
+            # Diffusers builds connector RoPE in FP32, while the official
+            # connector materializes it in the hidden-state dtype.
+            query_rotary_emb = tuple(component.to(value.dtype) for component in query_rotary_emb)
             key_rotary_emb = key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
+            key_rotary_emb = tuple(component.to(value.dtype) for component in key_rotary_emb)
             if attn.rope_type == "interleaved":
                 query = apply_interleaved_rotary_emb(query, query_rotary_emb)
                 key = apply_interleaved_rotary_emb(key, key_rotary_emb)
@@ -202,6 +413,10 @@ class _LTXConnectorAttnProcessor:
             else:
                 raise ValueError(f"Unsupported LTX connector RoPE type: {attn.rope_type}")
 
+        # Keep Q/K in the projection dtype expected by the attention backend.
+        query = query.to(dtype=value.dtype)
+        key = key.to(dtype=value.dtype)
+
         batch_size, _, inner_dim = query.shape
         head_dim = inner_dim // attn.heads
         kv_heads = attn.inner_kv_dim // attn.head_dim
@@ -209,10 +424,10 @@ class _LTXConnectorAttnProcessor:
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        # The connector replaces padding tokens with learned registers before
-        # entering its blocks, so every key is valid and the old padding mask
-        # becomes an all-keep no-op.
-        if self.has_learned_registers:
+        # LTX-2/2.3 replace padding tokens with learned registers, so their
+        # old padding mask becomes a no-op. LTX-2.5 preserves that all-zero
+        # additive mask to match the official masked-SDPA dispatch.
+        if self.has_learned_registers and not self.preserve_learned_register_mask:
             attention_mask = None
         elif attention_mask is not None and attn.omni_attention.attn_backend.get_name().upper() == "FLASH_ATTN":
             attention_mask = to_ltx_padding_mask(attention_mask)
@@ -229,7 +444,11 @@ class _LTXConnectorAttnProcessor:
         return attn.to_out[1](hidden_states)
 
 
-def _install_connector_attention(connectors: LTX2TextConnectors) -> None:
+def _install_connector_attention(
+    connectors: LTX2TextConnectors,
+    *,
+    preserve_learned_register_mask: bool = False,
+) -> None:
     for connector_name in ("video_connector", "audio_connector"):
         connector = getattr(connectors, connector_name, None)
         has_learned_registers = getattr(connector, "learnable_registers", None) is not None
@@ -248,15 +467,20 @@ def _install_connector_attention(connectors: LTX2TextConnectors) -> None:
                     skip_sequence_parallel=True,
                     disable_kv_quant=True,
                 )
-                attention.set_processor(_LTXConnectorAttnProcessor(has_learned_registers=has_learned_registers))
+                attention.set_processor(
+                    _LTXConnectorAttnProcessor(
+                        has_learned_registers=has_learned_registers,
+                        preserve_learned_register_mask=preserve_learned_register_mask,
+                    )
+                )
 
 
-def _detect_vocoder_output_sample_rate(model: str) -> int | None:
+def _detect_vocoder_output_sample_rate(model: str, revision: str | None = None) -> int | None:
     """Read the generated waveform sample rate from the vocoder config."""
     vocoder_config_path = os.path.join(model, "vocoder", "config.json")
     if not os.path.exists(vocoder_config_path):
         try:
-            vocoder_config_path = hf_hub_download(model, "vocoder/config.json")
+            vocoder_config_path = hf_hub_download(model, "vocoder/config.json", revision=revision)
         except Exception:
             return None
     try:
@@ -268,7 +492,10 @@ def _detect_vocoder_output_sample_rate(model: str) -> int | None:
 
 def get_ltx2_post_process_func(od_config: Any):
     """Build the common LTX engine-output adapter."""
-    output_sample_rate = _detect_vocoder_output_sample_rate(od_config.model)
+    output_sample_rate = _detect_vocoder_output_sample_rate(
+        od_config.model,
+        revision=getattr(od_config, "revision", None),
+    )
 
     def post_process_func(output: tuple[torch.Tensor, torch.Tensor] | torch.Tensor):
         if not (isinstance(output, tuple) and len(output) == 2):
@@ -291,6 +518,7 @@ def _load_component(
     *,
     local_files_only: bool,
     dtype: torch.dtype,
+    revision: str | None,
 ) -> Any:
     return from_pretrained_with_prefetch(
         component_cls.from_pretrained,
@@ -298,6 +526,7 @@ def _load_component(
         subfolder=subfolder,
         prefetch_list=_LTX_COMPONENT_SUBFOLDERS,
         local_files_only=local_files_only,
+        revision=revision,
         torch_dtype=dtype,
     )
 
@@ -324,31 +553,36 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     pipeline.device = get_local_device()
     dtype = getattr(od_config, "dtype", torch.bfloat16)
     model = od_config.model
+    revision = getattr(od_config, "revision", None)
     local_files_only = os.path.exists(model)
 
     pipeline.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(
             model_or_path=model,
-            subfolder="transformer",
-            revision=None,
+            subfolder=profile.transformer_subfolder,
+            revision=revision,
             prefix="transformer.",
             fall_back_to_pt=True,
         ),
     ]
-    prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only)
+    prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only, revision=revision)
 
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
         model,
         subfolder="tokenizer",
         local_files_only=local_files_only,
+        revision=revision,
     )
+    if profile.text_encoder_cls is None:
+        raise ImportError("LTX-2.5 requires Gemma4UnifiedForConditionalGeneration; install transformers>=5.10.1,<5.15.")
     with torch.device("cpu"):
         pipeline.text_encoder = _load_component(
-            Gemma3ForConditionalGeneration,
+            profile.text_encoder_cls,
             model,
             "text_encoder",
             local_files_only=local_files_only,
             dtype=dtype,
+            revision=revision,
         )
     pipeline.connectors = _load_component(
         LTX2TextConnectors,
@@ -356,14 +590,19 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         "connectors",
         local_files_only=local_files_only,
         dtype=dtype,
+        revision=revision,
     )
-    _install_connector_attention(pipeline.connectors)
+    _install_connector_attention(
+        pipeline.connectors,
+        preserve_learned_register_mask=profile.preserve_connector_attention_mask,
+    )
     pipeline.vae = _load_component(
         profile.video_vae_cls,
         model,
         "vae",
         local_files_only=local_files_only,
         dtype=dtype,
+        revision=revision,
     )
     pipeline.audio_vae = _load_component(
         AutoencoderKLLTX2Audio,
@@ -371,6 +610,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         "audio_vae",
         local_files_only=local_files_only,
         dtype=dtype,
+        revision=revision,
     )
     try:
         pipeline.vocoder = _load_component(
@@ -379,6 +619,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             "vocoder",
             local_files_only=local_files_only,
             dtype=dtype,
+            revision=revision,
         )
     except (TypeError, OSError, ValueError):
         if profile.vocoder_fallback_cls is None or profile.vocoder_fallback_cls is profile.vocoder_cls:
@@ -389,21 +630,43 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             "vocoder",
             local_files_only=local_files_only,
             dtype=dtype,
+            revision=revision,
         )
 
     if "latent_upsampler" in profile.resident_modules:
-        # BlurDownsample constructs an integer kernel that must be initialized
-        # on CPU; component placement is handled uniformly after construction.
-        with torch.device("cpu"):
-            pipeline.latent_upsampler = _load_component(
-                LTX2LatentUpsamplerModel,
+        upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
+        if os.path.isfile(upsampler_config) or not local_files_only:
+            try:
+                pipeline.latent_upsampler = _load_component(
+                    LTX2LatentUpsamplerModel,
+                    model,
+                    "latent_upsampler",
+                    local_files_only=local_files_only,
+                    dtype=dtype,
+                    revision=revision,
+                )
+            except (OSError, ValueError):
+                if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
+                    raise
+                upsampler_path = resolve_ltx_artifact(
+                    model,
+                    profile.artifact_repo_id,
+                    profile.latent_upsampler_filename,
+                )
+                pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
+        else:
+            if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
+                raise FileNotFoundError(f"LTX latent upsampler component not found under {model}.")
+            upsampler_path = resolve_ltx_artifact(
                 model,
-                "latent_upsampler",
-                local_files_only=local_files_only,
-                dtype=dtype,
+                profile.artifact_repo_id,
+                profile.latent_upsampler_filename,
             )
+            pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
-    transformer_config = load_transformer_config(model, "transformer", local_files_only)
+    transformer_config = load_transformer_config(
+        model, profile.transformer_subfolder, local_files_only, revision=revision
+    )
     quant_config = getattr(od_config, "quantization_config", None)
     pipeline.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
     _place_aux_components(pipeline)
@@ -411,6 +674,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         model,
         subfolder="scheduler",
         local_files_only=local_files_only,
+        revision=revision,
+    )
+    if profile.scheduler_use_dynamic_shifting:
+        pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipeline.scheduler.config,
+            use_dynamic_shifting=True,
+            shift_terminal=profile.scheduler_shift_terminal,
+        )
+    validate_ltx_checkpoint(
+        pipeline.scheduler.config,
+        expected_kind=resolve_ltx_checkpoint_kind(pipeline.pipeline_kind),
+        pipeline_name=type(pipeline).__name__,
     )
 
     pipeline.vae_spatial_compression_ratio = pipeline.vae.spatial_compression_ratio
@@ -438,6 +713,8 @@ def load_transformer_config(
     model_path: str,
     subfolder: str = "transformer",
     local_files_only: bool = True,
+    *,
+    revision: str | None = None,
 ) -> dict:
     """Load an LTX transformer config from a local model or the HF Hub."""
     if local_files_only:
@@ -448,6 +725,7 @@ def load_transformer_config(
         config_path = hf_hub_download(
             repo_id=model_path,
             filename=f"{subfolder}/config.json",
+            revision=revision,
         )
     with open(config_path) as config_file:
         return json.load(config_file)

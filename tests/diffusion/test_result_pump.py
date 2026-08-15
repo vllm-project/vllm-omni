@@ -6,6 +6,7 @@ import concurrent.futures
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -264,6 +265,119 @@ class TestResultPumpDispatch:
         fut = executor.wait_output_ready(async_output_id)
         assert fut.done()
         assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+
+    def test_output_ready_atomic_resolution_when_future_already_waiting(self):
+        """When OUTPUT_READY arrives and a future is already waiting, resolve it directly."""
+        executor = _make_executor()
+        async_output_id = "abc123"
+        output = DiffusionOutput(output="waiting")
+        fut = executor.wait_output_ready(async_output_id)
+        assert not fut.done()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=async_output_id,
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.done()
+        assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+        assert async_output_id not in executor._completed_outputs
+
+
+class _FakeBatchOutput:
+    """Batch-level output exposing per-request results."""
+
+    def __init__(self, results):
+        self._results = results
+
+    def get_request_output(self, req_id):
+        result = self._results.get(req_id)
+        if result is None:
+            return None
+        return SimpleNamespace(result=result)
+
+
+def _make_scheduler_output(req_ids):
+    return SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=rid, req=SimpleNamespace()) for rid in req_ids]
+    )
+
+
+class TestBatchSplitDelivery:
+    """execute_batch must resolve per-request futures in either arrival order."""
+
+    @staticmethod
+    def _run(executor, req_ids, batch_id, deliver_early):
+        # Keep execute_batch on the fused request-batch path (not DLO DP).
+        executor.od_config.parallel_config.data_parallel_size = 1
+        executor.od_config.enable_distributed_layerwise_offload = False
+        executor._ensure_open = lambda: None
+
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+
+        def fake_collective_rpc(*args, **kwargs):
+            if deliver_early:
+                # Worker's background D2H/SHM thread wins the race: OUTPUT_READY
+                # is pumped before execute_batch registers the split map.
+                _feed_one_msg_to_pump(executor, ready)
+            return AsyncDiffusionOutput(
+                kind=AsyncOutputKind.COMPUTE_DONE,
+                rpc_id="1",
+                async_output_id=batch_id,
+            )
+
+        executor.collective_rpc = fake_collective_rpc
+        batch = executor.execute_batch(_make_scheduler_output(req_ids))
+        if not deliver_early:
+            _feed_one_msg_to_pump(executor, ready)
+        return batch, outputs
+
+    def test_output_ready_after_split_map(self):
+        executor = _make_executor()
+        req_ids = ["r0", "r1", "r2"]
+        _, outputs = self._run(executor, req_ids, "batch-1", deliver_early=False)
+
+        for rid in req_ids:
+            fut = executor.wait_output_ready(f"batch-1/{rid}")
+            assert fut.done()
+            assert fut.result(timeout=1.0) is outputs[rid]
+
+    def test_output_ready_before_split_map(self):
+        """Regression: the whole batch used to be lost, hanging every request."""
+        executor = _make_executor()
+        req_ids = ["r0", "r1", "r2"]
+        _, outputs = self._run(executor, req_ids, "batch-1", deliver_early=True)
+
+        for rid in req_ids:
+            fut = executor.wait_output_ready(f"batch-1/{rid}")
+            assert fut.done(), f"request {rid} never resolved"
+            assert fut.result(timeout=1.0) is outputs[rid]
+
+        # No stale batch-level state left behind.
+        assert executor._batch_split_map == {}
+        assert executor._completed_outputs == {}
+
+    def test_engine_waiter_before_output_is_resolved(self):
+        """Consumers already blocked in wait_output_ready must be woken."""
+        executor = _make_executor()
+        req_ids = ["r0", "r1"]
+        batch_id = "batch-2"
+        futures = {rid: executor.wait_output_ready(f"{batch_id}/{rid}") for rid in req_ids}
+
+        _, outputs = self._run(executor, req_ids, batch_id, deliver_early=True)
+
+        for rid in req_ids:
+            assert futures[rid].done(), f"request {rid} never resolved"
+            assert futures[rid].result(timeout=1.0) is outputs[rid]
 
 
 class TestShutdownCleansUpFutures:

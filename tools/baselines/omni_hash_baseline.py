@@ -147,7 +147,7 @@ def _run_once(model: str, yaml_path: str, *, async_mode: bool) -> list[dict]:
     # (see tests/e2e/accuracy/qwen3_omni). Confirm the exact knob at bench time.
     omni = Omni(
         model,
-        stage_configs_path=yaml_path,
+        deploy_config=yaml_path,
         stage_init_timeout=1800,
         init_timeout=3600,
         async_chunk=async_mode,
@@ -159,11 +159,10 @@ def _run_once(model: str, yaml_path: str, *, async_mode: bool) -> list[dict]:
             wav: bytes = b""
             # Batch size 1: submit a single prompt so scheduling is deterministic.
             for step in omni.generate([_text_prompt(question)], _sampling_params(), py_generator=False):
-                out = step.request_output
                 if step.final_output_type == "text":
-                    text = out.outputs[0].text  # exact text, no strip -> truly bit-identical
+                    text = step.outputs[0].text  # exact text, no strip -> truly bit-identical
                 elif step.final_output_type == "audio":
-                    wav = _audio_bytes(out.outputs[0].multimodal_output["audio"])
+                    wav = _audio_bytes(step.outputs[0].multimodal_output["audio"])
             if text is None:
                 raise RuntimeError(f"prompt_id={prompt_id} async={async_mode}: produced no text output")
             if not wav:

@@ -126,7 +126,7 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
     ]
 
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+# (model, deploy_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
 _cosy_deployment = get_deploy_config_path("cosyvoice3.yaml")
 _cosy_model_path = str(_resolve_model_dir())
 _OMNI_RUNNER_PARAMS = [

@@ -68,7 +68,7 @@ async def test_abort():
     with ExitStack() as after:
         engine = AsyncOmni(
             model=model,
-            stage_configs_path=stage_config,
+            deploy_config=stage_config,
         )
         after.callback(engine.shutdown)
 

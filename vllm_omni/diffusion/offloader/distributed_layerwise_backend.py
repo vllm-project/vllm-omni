@@ -178,7 +178,16 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         if m["name"] in self.next_block_parameters
                         else self.next_block_buffers[m["name"]]
                     )
-                    repoint.append((target, dtype, m["offset"], m["numel"], m["shape"]))
+                    repoint.append(
+                        (
+                            target,
+                            dtype,
+                            m["offset"],
+                            m["numel"],
+                            m["shape"],
+                            m["stride"],
+                        )
+                    )
             self._cached_repoint.append(repoint)
 
         # Pre-compute AG output sizes (avoid sum() per layer).
@@ -228,9 +237,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     # parameter as an mmap view avoids a private full-model
                     # copy in every worker.
                     local_t = mmap_transform(local_t)
-                weights_with_local.append((name, t, local_t))
+                stride = local_t.stride()
+                storage_numel = (
+                    0
+                    if local_t.numel() == 0
+                    else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(local_t.shape, stride))
+                )
+                weights_with_local.append((name, t, local_t, storage_numel, stride))
 
-            total_numel = sum(local.numel() for _, _, local in weights_with_local)
+            total_numel = sum(storage_numel for _, _, _, storage_numel, _ in weights_with_local)
 
             # Equal-sized shards (ceil division) for all_gather_into_tensor
             shard_size = (total_numel + dp_size - 1) // dp_size  # ceil
@@ -242,8 +257,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
 
             current_offset = 0
-            for name, original_tensor, local_tensor in weights_with_local:
-                numel = local_tensor.numel()
+            for (
+                name,
+                original_tensor,
+                local_tensor,
+                storage_numel,
+                stride,
+            ) in weights_with_local:
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 # Offsets remain relative to the FULL flattened buffer
@@ -252,27 +272,48 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     {
                         "name": name,
                         "offset": current_offset,
-                        "numel": numel,
+                        "numel": storage_numel,
                         "shape": local_tensor.shape,
+                        "stride": stride,
                     }
                 )
 
                 # Copy ONLY the portion within [shard_start, shard_end)
                 overlap_start = max(current_offset, shard_start)
-                overlap_end = min(current_offset + numel, shard_end)
+                overlap_end = min(current_offset + storage_numel, shard_end)
                 if overlap_start < overlap_end:
+                    if local_tensor.is_contiguous():
+                        flat_storage = local_tensor.flatten()
+                    else:
+                        # Online FP8 stores Cutlass weights as transposed views
+                        # (e.g. stride=(1, K)). Flattening such a tensor in
+                        # logical order and later rebuilding it with .view()
+                        # changes its layout and makes scaled_mm reject it.
+                        # Pack the physical storage order and preserve the
+                        # original stride for zero-copy reconstruction.
+                        flat_storage = torch.zeros(
+                            storage_numel,
+                            dtype=dtype,
+                            device=local_tensor.device,
+                        )
+                        physical_view = torch.as_strided(
+                            flat_storage,
+                            size=local_tensor.shape,
+                            stride=stride,
+                        )
+                        physical_view.copy_(local_tensor)
                     src_start = overlap_start - current_offset
                     src_end = overlap_end - current_offset
                     dst_start = overlap_start - shard_start
                     dst_end = overlap_end - shard_start
-                    shard[dst_start:dst_end].copy_(local_tensor.flatten()[src_start:src_end])
+                    shard[dst_start:dst_end].copy_(flat_storage[src_start:src_end])
 
                 # Replace original tensor with placeholder (frees CPU storage)
                 set_tensor_storage(
                     original_tensor,
                     make_offload_placeholder(original_tensor),
                 )
-                current_offset += numel
+                current_offset += storage_numel
 
             if pin_memory:
                 shard = shard.pin_memory()
@@ -365,10 +406,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._shared_slot_group[slot] = self._group_id
 
         # Re-point using cached metadata (avoids per-layer dict lookups).
-        for target, dtype, offset, numel, shape in self._cached_repoint[slot]:
+        for target, dtype, offset, numel, shape, stride in self._cached_repoint[slot]:
             set_tensor_storage(
                 target,
-                gpu_weights[dtype][offset : offset + numel].view(shape),
+                torch.as_strided(
+                    gpu_weights[dtype][offset : offset + numel],
+                    size=shape,
+                    stride=stride,
+                ),
             )
 
     def get_weights(self, slot: int) -> dict[torch.dtype, torch.Tensor] | None:
@@ -577,7 +622,11 @@ class PinnedResidentLayerGroup:
                 for meta in metas:
                     set_tensor_storage(
                         targets[meta["name"]],
-                        gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]].view(meta["shape"]),
+                        torch.as_strided(
+                            gpu_buffer[meta["offset"] : meta["offset"] + meta["numel"]],
+                            size=meta["shape"],
+                            stride=meta["stride"],
+                        ),
                     )
 
         current_omni_platform.current_stream().wait_event(ready)

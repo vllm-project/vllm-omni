@@ -10,6 +10,7 @@ import huggingface_hub
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -64,6 +65,14 @@ def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
 
 def omni_snapshot_download(model_id: str) -> str:
     if os.path.exists(model_id):
+        return model_id
+
+    # Object-storage models must remain URIs until each stage constructs its
+    # ModelConfig. vLLM then materializes only config/tokenizer files locally
+    # and keeps the URI in model_weights for Run:AI streaming. Treating the URI
+    # as a Hugging Face repo here either fails validation or downloads through
+    # the wrong backend before the stage processes are created.
+    if is_runai_obj_uri(model_id):
         return model_id
 
     # TODO: this is just a workaround for quickly use modelscope, we should support
@@ -568,6 +577,7 @@ class OmniBase(PDDisaggregationMixin):
             msg_id = id(result)
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
 

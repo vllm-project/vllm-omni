@@ -251,7 +251,7 @@ def test_bagel_img2img_shared_memory_connector(run_level):
     config_path = _resolve_deploy_config(BAGEL_CI_DEPLOY, run_level)
     with OmniRunner(
         "ByteDance-Seed/BAGEL-7B-MoT",
-        stage_configs_path=config_path,
+        deploy_config=config_path,
     ) as runner:
         generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
@@ -266,7 +266,7 @@ def test_bagel_text2img_shared_memory_connector(run_level):
     config_path = _resolve_deploy_config(BAGEL_CI_DEPLOY, run_level)
     with OmniRunner(
         "ByteDance-Seed/BAGEL-7B-MoT",
-        stage_configs_path=config_path,
+        deploy_config=config_path,
     ) as runner:
         generated_image = _generate_bagel_text2img(runner.omni)
         if run_level == "advanced_model":

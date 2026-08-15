@@ -139,6 +139,41 @@ class TestDistributedLayerwiseOffloadHook:
         assert shard.numel() == 4
         assert torch.equal(shard, _make_values(10.0))
 
+    def test_prefetch_preserves_transposed_weight_stride(
+        self,
+        dist_group,
+        patched_offload_runtime,
+    ):
+        """Online-FP8 Cutlass weights must retain their transposed layout."""
+
+        class StridedBlock(nn.Module):
+            def __init__(self, start: float):
+                super().__init__()
+                base = torch.arange(start, start + 12).reshape(3, 4)
+                self.weight = nn.Parameter(base.t(), requires_grad=False)
+
+        current_block = StridedBlock(1.0)
+        next_block = StridedBlock(20.0)
+        expected = next_block.weight.detach().clone()
+        expected_stride = next_block.weight.stride()
+        assert expected_stride == (1, 4)
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        hook.initialize_hook(current_block)
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert next_block.weight.stride() == expected_stride
+        assert torch.equal(next_block.weight, expected)
+
     def test_dtensor_wrapper_preserved_across_prefetch_and_offload(self, dist_group, patched_offload_runtime):
         """DTensor wrapper should be preserved through prefetch/offload cycle."""
         current_block = TinyBlock(_make_values(1.0))
@@ -384,6 +419,24 @@ class TestPinnedResidentLayerGroup:
             assert torch.equal(block.weight, weight)
             assert torch.equal(block.bias, bias)
 
+        group.offload()
+
+    def test_load_preserves_noncontiguous_weight_stride(self, patched_offload_runtime):
+        block = nn.Module()
+        weight = torch.arange(6, dtype=torch.float32).reshape(2, 3).t()
+        expected = weight.detach().clone()
+        expected_stride = weight.stride()
+        block.weight = nn.Parameter(weight)
+        group = PinnedResidentLayerGroup(
+            [block],
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+        )
+
+        group.load()
+        assert torch.equal(block.weight, expected)
+        assert block.weight.stride() == expected_stride
         group.offload()
 
     def test_mmap_loader_attrs_survive_to_empty_parameter_replacement(self):

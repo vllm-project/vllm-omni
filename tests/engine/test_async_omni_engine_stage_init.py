@@ -161,6 +161,17 @@ def _make_diffusion_plan(
     )
 
 
+def _make_stage_runtime() -> StageRuntime:
+    return StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+
 def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
     import vllm_omni.engine.stage_engine_core_client as client_mod
@@ -231,6 +242,48 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     )
 
     assert cleanup_clients == [shared, extra]
+
+
+def test_initialize_local_diffusion_replica_scopes_runtime_env(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+
+    runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    device_env_var = current_omni_platform.device_control_env_var
+    runtime._init_visible_devices_baseline = "0,1"
+    plan.metadata.runtime_cfg = {
+        "devices": "0",
+        "env": {runtime_env_var: "stage-value"},
+    }
+    monkeypatch.delenv(runtime_env_var, raising=False)
+    monkeypatch.setenv(device_env_var, "0,1")
+
+    captured: dict[str, str | None] = {}
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+
+    def _capture_launch_diffusion_stage_replica(**_kwargs):
+        captured["runtime_env"] = os.environ.get(runtime_env_var)
+        captured["device_env"] = os.environ.get(device_env_var)
+        raise RuntimeError("stop after capturing launch environment")
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        _capture_launch_diffusion_stage_replica,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after capturing launch environment"):
+        runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert captured == {
+        "runtime_env": "stage-value",
+        "device_env": "0",
+    }
+    assert runtime_env_var not in os.environ
+    assert os.environ[device_env_var] == "0,1"
 
 
 def test_initialize_local_diffusion_replica_restores_device_visibility_after_local_init(monkeypatch):
@@ -309,6 +362,41 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         "use_inline": True,
         "omni_master_server": None,
     }
+
+
+def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=object()).replicas[0]
+    plan.engine_args_dict = {}
+
+    runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    plan.metadata.runtime_cfg = {
+        "devices": "0",
+        "env": {runtime_env_var: "stage-value"},
+    }
+    monkeypatch.setenv(runtime_env_var, "parent-value")
+
+    captured: dict[str, str | None] = {}
+
+    @contextlib.contextmanager
+    def _capture_launch_stage_replica(*, stage_visible_devices, **_kwargs):
+        captured["runtime_env"] = os.environ.get(runtime_env_var)
+        captured["stage_visible_devices"] = stage_visible_devices
+        yield None
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
+
+    with pytest.raises(RuntimeError, match="launcher returned no resources"):
+        runtime._initialize_local_llm_replica(plan, stage_init_timeout=1)
+
+    assert captured == {
+        "runtime_env": "stage-value",
+        "stage_visible_devices": "0",
+    }
+    assert os.environ[runtime_env_var] == "parent-value"
 
 
 def test_stage_runtime_initializes_stage_pools(monkeypatch):
