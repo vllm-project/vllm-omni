@@ -70,10 +70,10 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
         max_in_flight_tokens=128,
     )
     worker_configs = [object(), object()]
-    scheduler_config = object()
+    scheduler_kv_cache_config = object()
     profile_request = object()
     monkeypatch.setattr(initialization, "create_diffusion_vllm_config", lambda *args, **kwargs: vllm_config)
-    build = Mock(return_value=(worker_configs, scheduler_config))
+    build = Mock(return_value=(worker_configs, scheduler_kv_cache_config))
     monkeypatch.setattr(
         initialization,
         "build_native_kv_cache_configs",
@@ -89,7 +89,7 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     )
 
     build.assert_called_once_with(vllm_config, executor.specs, executor.memory)
-    assert result == (scheduler_config, 16, 16, vllm_config)
+    assert result == (scheduler_kv_cache_config, 16, 16, vllm_config)
     assert executor.configs == worker_configs
     assert executor.profile_request is profile_request
 
@@ -143,7 +143,7 @@ def test_native_config_builder_produces_matching_worker_and_scheduler_pools() ->
     )
     num_blocks = 32
 
-    worker_configs, scheduler_config = initialization.build_native_kv_cache_configs(
+    worker_configs, scheduler_kv_cache_config = initialization.build_native_kv_cache_configs(
         vllm_config,
         [{"layer0": spec}],
         [spec.page_size_bytes * num_blocks],
@@ -151,8 +151,8 @@ def test_native_config_builder_produces_matching_worker_and_scheduler_pools() ->
 
     assert len(worker_configs) == 1
     assert worker_configs[0].num_blocks == num_blocks
-    assert scheduler_config.num_blocks == num_blocks
-    assert worker_configs[0].kv_cache_groups == scheduler_config.kv_cache_groups
+    assert scheduler_kv_cache_config.num_blocks == num_blocks
+    assert worker_configs[0].kv_cache_groups == scheduler_kv_cache_config.kv_cache_groups
 
 
 def test_native_control_plane_config_initializes_scheduler() -> None:
@@ -165,7 +165,7 @@ def test_native_control_plane_config_initializes_scheduler() -> None:
         dtype=torch.bfloat16,
         non_causal=True,
     )
-    _, scheduler_config = initialization.build_native_kv_cache_configs(
+    _, scheduler_kv_cache_config = initialization.build_native_kv_cache_configs(
         vllm_config,
         [{"layer0": spec}],
         [spec.page_size_bytes * 32],
@@ -174,7 +174,7 @@ def test_native_control_plane_config_initializes_scheduler() -> None:
     scheduler = RequestScheduler()
     scheduler.initialize(
         od_config,
-        kv_cache_config=scheduler_config,
+        kv_cache_config=scheduler_kv_cache_config,
         scheduler_block_size=spec.block_size,
         hash_block_size=spec.block_size,
         kv_vllm_config=vllm_config,

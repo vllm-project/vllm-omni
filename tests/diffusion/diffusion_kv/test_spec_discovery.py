@@ -154,6 +154,43 @@ def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch
     worker.model_runner.profile_run.assert_called_once_with(profile_request)
 
 
+@pytest.mark.parametrize("non_kv_cache_memory", [750, 800])
+def test_worker_rejects_non_positive_profiled_kv_memory(monkeypatch, non_kv_cache_memory: int) -> None:
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 0
+    worker.init_snapshot = SimpleNamespace(free_memory=900)
+    worker.requested_memory = 750
+    worker.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None,
+            gpu_memory_utilization=0.75,
+        )
+    )
+    worker.model_runner = SimpleNamespace(profile_run=Mock(), model_memory_usage=100)
+    monkeypatch.setattr(diffusion_worker_module, "_all_gather_rank_values", lambda value: [value])
+    profile_result = SimpleNamespace(
+        non_kv_cache_memory=non_kv_cache_memory,
+        after_profile=SimpleNamespace(free_memory=100),
+    )
+    monkeypatch.setattr(
+        diffusion_worker_module,
+        "memory_profiling",
+        lambda snapshot, weights_memory: nullcontext(profile_result),
+    )
+    profile_request = object()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "rank 0: RuntimeError: No memory remains for Diffusion KV cache after profiling: "
+            f"requested_memory=750 bytes, non_kv_cache_memory={non_kv_cache_memory} bytes"
+        ),
+    ):
+        worker.determine_available_kv_memory(profile_request)
+
+    worker.model_runner.profile_run.assert_called_once_with(profile_request)
+
+
 def test_worker_profiles_activation_headroom_instead_of_current_residency(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 0

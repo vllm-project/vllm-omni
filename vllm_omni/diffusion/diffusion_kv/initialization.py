@@ -64,18 +64,18 @@ def initialize_diffusion_kv_control_plane(
             "Diffusion KV initialization rank count mismatch: "
             f"expected={od_config.num_gpus}, specs={len(worker_specs)}, memory={len(available_memory)}"
         )
-    worker_configs, scheduler_config = build_native_kv_cache_configs(
+    worker_configs, scheduler_kv_cache_config = build_native_kv_cache_configs(
         vllm_config,
         worker_specs,
         available_memory,
     )
     scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-        scheduler_config,
+        scheduler_kv_cache_config,
         vllm_config,
     )
     executor.set_kv_cache_configs(worker_configs)
     return (
-        scheduler_config,
+        scheduler_kv_cache_config,
         scheduler_block_size,
         hash_block_size,
         vllm_config,

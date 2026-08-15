@@ -394,6 +394,13 @@ class DiffusionWorker:
                 self.model_runner.profile_run(profile_request)
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
+            if available_memory <= 0:
+                raise RuntimeError(
+                    "No memory remains for Diffusion KV cache after profiling: "
+                    f"requested_memory={self.requested_memory} bytes, "
+                    f"non_kv_cache_memory={profile_result.non_kv_cache_memory} bytes. "
+                    "Increase gpu_memory_utilization or reduce the maximum profile request shape."
+                )
             free_gpu_memory = profile_result.after_profile.free_memory
             unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
             logger.debug(
