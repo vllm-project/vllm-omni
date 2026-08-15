@@ -564,6 +564,7 @@ class _DiffusionConfigProjection:
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
+    materialize_safetensors_weights: bool = False
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None

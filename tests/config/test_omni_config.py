@@ -1041,6 +1041,40 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
         )
 
 
+def test_stage_yaml_materialize_safetensors_weights_reaches_loader(tmp_path):
+    from vllm.config.load import LoadConfig
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+    deploy_path = tmp_path / "dreamzero_materialize_safetensors.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    materialize_safetensors_weights: true",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+    ).stage_by_id(0)
+    diffusion_kwargs = {
+        config_field.name: getattr(stage.diffusion_config, config_field.name)
+        for config_field in fields(stage.diffusion_config)
+    }
+    od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert loader.od_config.materialize_safetensors_weights is True
+
+
 def test_diffusion_config_field_classification_covers_current_fields():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
