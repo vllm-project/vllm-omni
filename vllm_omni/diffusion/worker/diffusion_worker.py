@@ -65,7 +65,7 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
-_ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 60.0
+_ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
