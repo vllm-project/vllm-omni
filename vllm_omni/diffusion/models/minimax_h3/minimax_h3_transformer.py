@@ -1108,9 +1108,11 @@ class MiniMaxH3DiTModel(nn.Module):
         )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
-        embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
-        embeddings.index_add_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
-        embeddings.index_add_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
+        # Every used packed row belongs to exactly one modality, so direct
+        # assignment avoids the atomic addition required by index_add_.
+        embeddings.index_copy_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
+        embeddings.index_copy_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
+        embeddings.index_copy_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
 
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
