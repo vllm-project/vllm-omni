@@ -301,3 +301,25 @@ class TestRequestOutputFieldParity:
         assert omni.ec_transfer_params is None
         assert omni.num_cached_tokens is None
         assert omni.num_cache_creation_tokens is None
+
+    def test_transfer_param_fields_are_copied_from_the_stage_output(self) -> None:
+        """Declaring the fields is not enough — they must also be copied.
+
+        ``from_stage_output`` only carries the names listed in
+        ``_REQUEST_OUTPUT_CONTENT_ATTRS``. With the fields declared but absent
+        from that list the endpoint stops raising ``AttributeError`` while
+        silently dropping external-connector metadata and cache-creation
+        accounting, which is harder to notice than the crash it replaced.
+        """
+        source = _make_text_request_output()
+        source.num_cache_creation_tokens = 7
+        source.ec_transfer_params = {"connector": "shm", "handle": "abc"}
+        source.num_cached_tokens = 3
+        source.kv_transfer_params = {"role": "producer"}
+
+        omni = OmniRequestOutput.from_stage_output(source, stage_id=1)
+
+        assert omni.num_cache_creation_tokens == 7
+        assert omni.ec_transfer_params == {"connector": "shm", "handle": "abc"}
+        assert omni.num_cached_tokens == 3
+        assert omni.kv_transfer_params == {"role": "producer"}

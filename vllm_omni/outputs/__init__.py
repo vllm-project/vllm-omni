@@ -85,7 +85,9 @@ _REQUEST_OUTPUT_CONTENT_ATTRS = (
     "encoder_prompt",
     "encoder_prompt_token_ids",
     "num_cached_tokens",
+    "num_cache_creation_tokens",
     "kv_transfer_params",
+    "ec_transfer_params",
 )
 
 # Omni-specific content copied when the wrapped stage output is itself an
