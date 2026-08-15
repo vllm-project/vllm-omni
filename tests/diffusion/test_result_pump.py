@@ -265,6 +265,27 @@ class TestResultPumpDispatch:
         fut = executor.wait_output_ready(async_output_id)
         assert fut.done()
         assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+
+    def test_output_ready_atomic_resolution_when_future_already_waiting(self):
+        """When OUTPUT_READY arrives and a future is already waiting, resolve it directly."""
+        executor = _make_executor()
+        async_output_id = "abc123"
+        output = DiffusionOutput(output="waiting")
+        fut = executor.wait_output_ready(async_output_id)
+        assert not fut.done()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=async_output_id,
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.done()
+        assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+        assert async_output_id not in executor._completed_outputs
 
 
 class _FakeBatchOutput:

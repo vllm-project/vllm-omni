@@ -880,33 +880,34 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         logger.exception("SHM unpack failed for batch %s", batch_id)
                     self._deliver_batch_split(per_req_map, msg.output, msg.error)
                 else:
-                    with self._futures_lock:
-                        fut = self._output_futures.pop(batch_id, None) if batch_id else None
-                    if fut is not None and not fut.done():
-                        if msg.error:
-                            fut.set_exception(RuntimeError(msg.error))
-                        else:
-                            try:
-                                unpack_diffusion_output_shm(msg.output)
-                            except Exception as e:
-                                logger.exception("SHM unpack failed in result pump")
-                                fut.set_exception(e)
-                                continue
-                            fut.set_result(msg.output)
-                    elif batch_id:
-                        fut = concurrent.futures.Future()
-                        if msg.error:
-                            fut.set_exception(RuntimeError(msg.error))
-                        else:
-                            try:
-                                unpack_diffusion_output_shm(msg.output)
-                            except Exception as e:
-                                logger.exception("SHM unpack failed in result pump (cached)")
-                                fut.set_exception(e)
-                            else:
-                                fut.set_result(msg.output)
+                    # Single-request result: unpack SHM first, then resolve or cache atomically.
+                    output_result: DiffusionOutput | None = None
+                    exc: Exception | None = None
+                    if msg.error:
+                        exc = RuntimeError(msg.error)
+                    else:
+                        try:
+                            unpack_diffusion_output_shm(msg.output)
+                            output_result = msg.output
+                        except Exception as e:
+                            logger.exception("SHM unpack failed in result pump")
+                            exc = e
+
+                    if batch_id:
                         with self._futures_lock:
-                            self._completed_outputs[batch_id] = fut
+                            pending = self._output_futures.pop(batch_id, None)
+                            if pending is not None and not pending.done():
+                                if exc is not None:
+                                    pending.set_exception(exc)
+                                else:
+                                    pending.set_result(output_result)
+                            else:
+                                fut = concurrent.futures.Future()
+                                if exc is not None:
+                                    fut.set_exception(exc)
+                                else:
+                                    fut.set_result(output_result)
+                                self._completed_outputs[batch_id] = fut
 
     def _deliver_batch_split(
         self,
