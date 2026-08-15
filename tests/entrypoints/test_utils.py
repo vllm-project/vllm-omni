@@ -22,6 +22,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    _try_resolve_omni_model_type,
     coerce_param_message_types,
     filter_dataclass_kwargs,
     filter_stages,
@@ -370,6 +371,48 @@ class TestResolveModelConfigPath:
         assert sender["extra"]["connector_get_sleep_s"] == 0.01
         assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert sender["extra"]["connector_get_max_wait"] == 300
+
+    def test_object_storage_uri_resolves_via_materialized_configs(
+        self,
+        mocker: MockerFixture,
+        tmp_path,
+    ):
+        """An object-storage URI must not reach HF helpers; resolution reads the
+        locally materialized config files instead."""
+        hf_config = SimpleNamespace(
+            model_type="qwen3_omni_moe",
+            architectures=["Qwen3OmniMoeForConditionalGeneration"],
+        )
+        uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
+        materialize = mocker.patch(
+            "vllm_omni.entrypoints.utils._materialize_object_storage_configs",
+            return_value=str(tmp_path),
+        )
+        get_config = mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            return_value=hf_config,
+        )
+
+        result = resolve_model_config_path(uri)
+
+        materialize.assert_called_once_with(uri)
+        get_config.assert_called_once()
+        assert get_config.call_args[0][0] == str(tmp_path)
+        assert result is not None
+        assert Path(result).as_posix().endswith("qwen3_omni_moe.yaml")
+
+
+class TestTryResolveOmniModelType:
+    """Name matching must only scan the last path component."""
+
+    def test_uri_bucket_name_cannot_hijack_pipeline(self):
+        # "qwen3-tts-models" normalizes to "qwen3ttsmodels", which contains the
+        # registered key "qwen3tts" — only the basename may participate, so a
+        # misleadingly named bucket selects nothing.
+        assert _try_resolve_omni_model_type("s3://qwen3-tts-models/plain-checkpoint") is None
+
+    def test_basename_still_matches_pipeline(self):
+        assert _try_resolve_omni_model_type("gs://any-bucket/Fun-CosyVoice3-0.5B-2512") == "cosyvoice3"
 
 
 class TestLoadAndResolveStageConfigs:

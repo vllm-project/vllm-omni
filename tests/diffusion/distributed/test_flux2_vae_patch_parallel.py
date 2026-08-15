@@ -53,14 +53,10 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 def _extract_single_image(outputs) -> Image.Image:
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
+    if not isinstance(first_output, OmniRequestOutput):
+        raise ValueError(f"Expected an OmniRequestOutput, got {type(first_output).__name__}")
 
-    req_out = first_output.request_output
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
-
-    images = req_out.images
+    images = first_output.images
     if images is None or len(images) != 1:
         raise ValueError(f"Expected 1 image, got {0 if images is None else len(images)}")
     return images[0]

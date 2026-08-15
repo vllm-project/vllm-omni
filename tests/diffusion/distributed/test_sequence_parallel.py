@@ -416,8 +416,8 @@ def test_sp_correctness_advanced(model_name: str):
 
 
 @pytest.mark.skipif(
-    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
-    reason="Only tested on CUDA and XPU",
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA, ROCM and XPU",
 )
 @pytest.mark.diffusion
 @pytest.mark.parallel
@@ -447,8 +447,8 @@ def test_local_sp_padding_mask(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.skipif(
-    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
-    reason="Only tested on CUDA and XPU",
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA, ROCM and XPU",
 )
 @pytest.mark.diffusion
 @pytest.mark.parallel
@@ -468,8 +468,8 @@ def test_local_sp_padding_mask_no_padding(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.skipif(
-    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
-    reason="Only tested on CUDA and XPU",
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_xpu()),
+    reason="Only tested on CUDA, ROCM and XPU",
 )
 @pytest.mark.diffusion
 @pytest.mark.parallel

@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
@@ -394,6 +395,58 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 - See `qwen3_tts/end2end.py` for the prompt-length-estimation logic the Talker uses.
 
 ---
+
+## Gepard-1.0
+
+Single-stage native AR TTS at 22.05 kHz. Pipeline: `Qwen3.5 backbone → 32 FSQ codebook heads (one frame/step) → NeMo NanoCodec`. Backbone runs under vLLM paged attention; the 32-head sampling + learned embedding feedback ride the native-AR runner hooks. `enforce_eager` (CUDA graph is a perf follow-up).
+
+### Prerequisites
+The NanoCodec decoder needs NeMo (NVIDIA Open Model License), installed separately:
+
+```bash
+uv pip install "nemo_toolkit[tts]==2.7.3" \
+    --overrides <(printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0")
+```
+
+The overrides are what make that command work. `nemo_toolkit[tts]` declares
+`transformers~=4.57.0`, so a plain install downgrades the version
+`requirements/common.txt` pins and takes `huggingface-hub` back to 0.x with it — after
+which `import vllm` fails. Both packages are named here rather than left to resolve on
+their own: transformers 5.x happens to require `huggingface-hub` 1.x, but relying on
+that would make the second repair an accident of the first. `--constraint` cannot be
+used instead, since it narrows a version range rather than overriding a dependency a
+package declares, and the two sets never intersect. NeMo 2.7.3 decodes correctly
+against transformers 5.x, so nothing is lost by holding it there.
+
+(The same clash is why this is documented here rather than declared in
+`pyproject.toml`: an extra resolves together with the base dependencies, so
+`vllm-omni[gepard]` would be unsatisfiable rather than opt-in. SoulX-Singer English
+SVS documents `nemo_toolkit[asr]` the same way.)
+
+On a host whose CUDA toolkit cannot build kernels for the GPU — no `nvcc`/`ninja`, or a
+consumer Blackwell (`sm_120`) card — also set `VLLM_USE_FLASHINFER_SAMPLER=0`. vLLM's
+sampler JIT-compiles through FlashInfer on first use, and where that build fails the engine
+dies inside `profile_run` long after every import has succeeded, which reads as a model
+failure rather than an environment one. The PyTorch sampler it falls back to costs nothing
+here.
+
+### Quick start (zero-shot, default voice)
+```bash
+python examples/offline_inference/text_to_speech/gepard/end2end.py \
+    --text "Hello, this is a Gepard demo."
+```
+
+### Voice cloning
+Not yet — PR1 is zero-shot only (the learned `null_prefix` default voice). Reference-audio cloning (`ref_compressor` speaker prefix) is a follow-up PR.
+
+### Notes
+- Output: 22.05 kHz mono WAV.
+- First run downloads two checkpoints, not one: the model itself, and the NanoCodec decoder it names in `codec_id` (`nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` by default). Both are fetched automatically; expect the first startup to be correspondingly slower.
+- Offline only for now; the `/v1/audio/speech` adapter is a follow-up PR.
+- Deploy config: `vllm_omni/deploy/gepard.yaml` (the example's default; copy it and pass `--deploy-config` to change it).
+- Generation length and reproducibility are stage settings, not script flags. One output token is one audio frame, so `max_tokens` in the YAML is the frame budget; `seed` makes the in-model 32-head sampling reproducible. The script deliberately passes no `SamplingParams`: one supplied by a caller replaces the stage defaults wholesale rather than merging, which would drop the pipeline's stop token and run every request to `max_tokens`.
+- Text length: short texts are repeated internally to match the training layout (the checkpoint's `text_repetition` block); the upper bound is the stage's `max_model_len`, enforced by the engine. Empty text is rejected rather than voiced.
+- `VLLM_GEPARD_GREEDY=1` swaps the 32-head Gumbel-max sampling for argmax, for reproducible comparisons that do not depend on a seed.
 
 ## VoxCPM2
 
