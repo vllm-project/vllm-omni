@@ -381,8 +381,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
-            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {"duplex": update_result}
+            # A failed append must not feed the scheduler's placeholder
+            # <unit>/</unit> embeddings into the KV. Returning the span as-is
+            # lets the reserved placeholder slots embed through the runner and
+            # land in the KV, measurably corrupting the model's listen/speak
+            # decision (see MiniCPMO45DuplexPolicy framing note). Return an
+            # empty span so the runner's overlay copies nothing and the
+            # request simply does not advance this step.
+            empty = input_ids.new_empty(0)
+            return empty, empty, {"duplex": update_result}
 
         target_dtype = (
             input_embeds.dtype if input_embeds is not None else self.get_input_embeddings(input_ids[:1]).dtype

@@ -222,7 +222,28 @@ class MiniCPMO45Stage0DuplexRuntime:
             audio_embeds = self._stage_audio_embeddings(batch_feature, state=state)
             if audio_embeds is None:
                 if units_built == 0:
-                    return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
+                    # The encoder emitted no stable frames for this chunk (the
+                    # first streaming window needs more samples than the buffer
+                    # holds, or the tail residual is shorter than one unit).
+                    # Consume the attempted chunk and keep looping instead of
+                    # returning early: an early return leaves the consumed-but-
+                    # unadvanced cursor in the next append, and the scheduler's
+                    # placeholder <unit> slots then fall into the KV and pin the
+                    # model's listen/speak decision (see policy.py note). Keep
+                    # audio_chunk_idx unchanged: no unit was built, so the next
+                    # successful emit is still the first unit (no </unit>
+                    # closure, first-chunk consumption).
+                    consumed_samples = self._consumed_audio_samples(
+                        state.audio_chunk_idx,
+                        chunk_size,
+                        processor=processor,
+                    )
+                    if consumed_samples <= 0:
+                        # Degenerate guard: never spin on a zero-advance chunk.
+                        break
+                    state.audio_buffer = state.audio_buffer[min(consumed_samples, len(state.audio_buffer)) :]
+                    chunk_size = self._streaming_chunk_size(processor)
+                    continue
                 break
             consumed_samples = self._consumed_audio_samples(
                 state.audio_chunk_idx,
@@ -272,6 +293,13 @@ class MiniCPMO45Stage0DuplexRuntime:
                 start_time,
                 f"{len(frame_blocks)} video frame(s) left without a matching audio unit",
             )
+        if units_built == 0:
+            # The encoder produced no unit for this append (e.g. the serving
+            # layer emitted a short first window that cannot complete one
+            # 1035 ms unit, or a tail residual below one chunk). Report a
+            # failed append; the scheduler's zero-budget planning keeps the
+            # placeholder tokens out of the KV.
+            return self._stage_prefill_result(False, start_time, "no model unit built for this append")
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are

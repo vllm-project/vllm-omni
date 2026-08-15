@@ -111,9 +111,18 @@ def build_duplex_data_plane_prompt(
     token_budget = duplex_scheduler_token_budget(payload)
     if seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
-        token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
-        if first_units is not None:
+        if first_units is None:
+            # The first append carries no whole model chunk, so Stage0 cannot
+            # build a unit from it. Reserving placeholder slots here would
+            # turn the budget into <unit>/</unit> pad embeddings inside the KV
+            # and corrupt the model's listen/speak decision (see
+            # MiniCPMO45DuplexPolicy framing note). Reserve zero tokens; the
+            # worker reports the failed append and nothing enters the KV.
+            token_budget = 0
+        else:
+            # One first unit is <unit> + 10 audio embeddings (11 tokens);
+            # every further unit adds </unit> + <unit> + 10 (12 tokens).
             token_budget = (
                 context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
             )
