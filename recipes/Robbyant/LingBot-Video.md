@@ -33,18 +33,18 @@ parallel, cache, quantized, or expert-kernel backends.
 ## Hardware Support
 
 This recipe documents the CUDA single-GPU dense and BF16 MoE checkpoint paths.
-Multi-GPU parallelism, Cache-DiT, quantization, and CPU offload are not
-validated for LingBot-Video in this PR.
+Multi-GPU parallelism, Cache-DiT, and quantization are not validated for
+LingBot-Video in this PR.
 
 ## GPU
 
 ### 1 x NVIDIA L20X
 
 Both checkpoints have been smoke-tested on one NVIDIA L20X at `192x320`,
-9 frames, and 2 steps. The MoE smoke reserved approximately `67.70 GiB` of GPU
-memory, so use a GPU with at least about 70 GiB of available memory for this
-small validation shape. Larger resolutions, frame counts, or concurrent
-requests require additional headroom.
+9 frames, and 2 steps. Without offload the MoE smoke reserved approximately
+`67.70 GiB` of GPU memory, so use a GPU with at least about 70 GiB of available
+memory for this small validation shape. Larger resolutions, frame counts, or
+concurrent requests require additional headroom.
 
 The MoE path is validated with BF16 expert weights.
 
@@ -108,6 +108,27 @@ vllm serve robbyant/lingbot-video-moe-30b-a3b \
   --port 8091
 ```
 
+#### Offload
+
+Both offload flags are supported on this card. `--enable-cpu-offload` swaps the
+text encoder against the whole DiT, so it frees the encoder footprint while the
+transformer stays resident. `--enable-layerwise-offload` streams the DiT blocks
+instead and is the flag to use on smaller cards. They are mutually exclusive;
+layerwise takes priority when both are set.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve robbyant/lingbot-video-moe-30b-a3b \
+  --omni \
+  --model-class-name LingBotVideoPipeline \
+  --enable-cpu-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
+  --port 8091
+```
+
 These stage defaults match the LingBot reference pipeline. Request-level
 values continue to override them, so the smaller smoke request below remains
 unchanged.
@@ -145,6 +166,54 @@ done
 
 curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o lingbot_t2v.mp4
 ```
+
+### 1 x NVIDIA RTX 5090 32GB
+
+Layerwise offload streams the DiT blocks from host memory, so the MoE checkpoint
+also serves on a 32 GiB card.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: NVIDIA CUDA environment with a 32 GiB RTX 5090 GPU
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Command
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve robbyant/lingbot-video-moe-30b-a3b \
+  --omni \
+  --model-class-name LingBotVideoPipeline \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
+  --port 8091
+```
+
+#### Verification
+
+Submit the same text-to-video job as above, with
+`model=robbyant/lingbot-video-moe-30b-a3b`.
+
+#### Notes
+
+- Memory usage: `13892 MiB` peak reserved for 9 frames at `192x320` in 2 steps,
+  `14558 MiB` for 25 frames at `480x480` in 20 steps. Peak is dominated by the
+  resident text encoder, the VAE, the non-block DiT modules, and the prefetched
+  block, so it grows slowly with the request shape.
+- Key flags: `--enable-layerwise-offload` is required on this card.
+  `--vae-use-tiling` and `--vae-use-slicing` keep decode memory flat at larger
+  shapes. The host holds the offloaded weights, so size host memory for the full
+  BF16 checkpoint.
+- Known limitations: `--enable-cpu-offload` moves the complete DiT to the GPU for
+  the first denoising forward, so it fails on this card with a CUDA
+  out-of-memory error. With the default startup warmup that forward runs before
+  the server reports ready. Use `--enable-layerwise-offload` instead.
 
 ## Key Parameters
 
@@ -193,6 +262,22 @@ Local MoE validation on one NVIDIA L20X used checkpoint revision
   `69326 MiB` (`67.70 GiB`) peak reserved GPU memory.
 - The online `/v1/videos` smoke created, polled, and downloaded the generated
   MP4 successfully (`1 passed`).
+
+Local MoE offload validation on one RTX 5090 (32 GiB), serving with
+`--enable-layerwise-offload --vae-use-tiling --vae-use-slicing`:
+
+- 9 frames at `192x320` in 2 steps: `13892 MiB` (`13.6 GiB`) peak reserved GPU
+  memory, `6.0s` request time.
+- 25 frames at `480x480` in 20 steps: `14558 MiB` (`14.2 GiB`) peak reserved GPU
+  memory, `45.0s` request time.
+- Both requests returned a playable MP4 through `/v1/videos`.
+- The same server started with `--enable-cpu-offload` instead hits a CUDA
+  out-of-memory error on the first denoising forward, because model-level
+  offload moves the complete DiT to the GPU. With the default startup warmup
+  that forward is the dummy run, so the server never reports ready.
+
+The e2e coverage for both offload flags lives in
+[`tests/e2e/online_serving/test_lingbot_video_offload.py`](../../tests/e2e/online_serving/test_lingbot_video_offload.py).
 
 Do not treat these as production benchmarks; they are functional smoke plus
 controlled numerical-parity evidence for small validation inputs.
@@ -252,8 +337,14 @@ bitwise correctness oracle.
   optional `refiner/` transformer are not supported by this PR.
 - Only the BF16 MoE checkpoint is validated in this first integration.
 - No HSDP, tensor, sequence, expert, or CFG parallelism is claimed.
-- No Cache-DiT, TeaCache, CPU offload, VAE patch parallelism, or quantized
-  inference is claimed.
+- No Cache-DiT, TeaCache, VAE patch parallelism, or quantized inference is
+  claimed.
+- CPU and layerwise offload are supported. Only layerwise offload brings the 30B
+  checkpoint onto a 32 GiB card; model-level CPU offload keeps the DiT resident
+  and still needs the `70 GiB` class card.
+- Distributed layerwise offload (`--enable-distributed-layerwise-offload`) is
+  rejected at startup: its AllGather path requires request-batch forward, which
+  this pipeline does not implement.
 - Optional Triton, SGLang, FP8, and alternative fused-expert backends from the
   upstream project are not included.
 - Only one request per LingBot pipeline batch is currently supported.

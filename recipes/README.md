@@ -59,7 +59,7 @@ recipes/
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
-| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |

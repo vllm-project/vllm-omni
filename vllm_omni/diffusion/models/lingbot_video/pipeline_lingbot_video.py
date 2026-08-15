@@ -301,6 +301,13 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _resolve_construction_device(od_config: OmniDiffusionConfig, execution_device: torch.device) -> torch.device:
+    """Build on host when offload is enabled so the backend manages residency."""
+    if getattr(od_config, "enable_layerwise_offload", False) or getattr(od_config, "enable_cpu_offload", False):
+        return torch.device("cpu")
+    return execution_device
+
+
 class LingBotVideoPipeline(
     nn.Module,
     SupportImageInput,
@@ -324,8 +331,15 @@ class LingBotVideoPipeline(
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            raise ValueError(
+                "LingBot-Video does not support distributed layerwise offload: the AllGather "
+                "path requires request-batch forward, which this pipeline does not implement. "
+                "Use --enable-layerwise-offload instead."
+            )
         self.od_config = od_config
         self.device = get_local_device()
+        load_device = _resolve_construction_device(od_config, self.device)
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
         self.token_length = TOKEN_LENGTH
@@ -353,7 +367,7 @@ class LingBotVideoPipeline(
             subfolder=transformer_subfolder,
             torch_dtype=transformer_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(load_device)
         text_encoder_kwargs: dict[str, Any] = {
             "dtype": text_encoder_dtype,
             "local_files_only": local_files_only,
@@ -362,7 +376,7 @@ class LingBotVideoPipeline(
             model,
             subfolder=text_encoder_subfolder,
             **text_encoder_kwargs,
-        ).to(self.device)
+        ).to(load_device)
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
             subfolder=processor_subfolder,
@@ -373,7 +387,7 @@ class LingBotVideoPipeline(
             subfolder=vae_subfolder,
             torch_dtype=vae_dtype,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(load_device)
         self.scheduler = FlowUniPCMultistepScheduler.from_pretrained(
             model,
             subfolder=scheduler_subfolder,
