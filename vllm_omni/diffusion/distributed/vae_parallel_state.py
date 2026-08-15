@@ -54,10 +54,6 @@ def validate_independent_vae_parallel_config(
         raise ValueError(
             f"DiT process group size must be in [1, diffusion world_size={world_size}], got {dit_group_size}"
         )
-    if world_size % dit_group_size != 0:
-        raise ValueError(
-            f"DiT process group size ({dit_group_size}) must evenly divide diffusion world_size ({world_size})"
-        )
     if group_size > dit_group_size:
         raise ValueError(
             f"vae_patch_parallel_size ({group_size}) cannot exceed DiT process group size ({dit_group_size})"
@@ -65,6 +61,11 @@ def validate_independent_vae_parallel_config(
     if dit_group_size % group_size != 0:
         raise ValueError(
             f"vae_patch_parallel_size ({group_size}) must evenly divide DiT process group size ({dit_group_size})"
+        )
+    if dit_group_size != world_size:
+        raise ValueError(
+            "independent MiniMax-H3 VAE process groups currently require "
+            f"DiT process group size ({dit_group_size}) to equal diffusion world_size ({world_size})"
         )
     if mode != "tile":
         raise ValueError(f"independent MiniMax-H3 VAE process groups support tile mode only, got {mode!r}")

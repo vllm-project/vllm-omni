@@ -34,15 +34,15 @@ def test_independent_h3_group_rejects_spatial_sharding():
         validate_independent_vae_parallel_config(4, 4, 2, "spatial_shard_height")
 
 
-def test_independent_group_accepts_subgroup_within_dit_partition():
-    validate_independent_vae_parallel_config(8, 4, 2, "tile")
+def test_independent_group_accepts_subgroup_within_dit_world():
+    validate_independent_vae_parallel_config(4, 4, 2, "tile")
 
 
 @pytest.mark.parametrize(
     ("world_size", "dit_group_size", "group_size", "message"),
     [
         (8, 9, 2, "DiT process group size"),
-        (8, 6, 2, "evenly divide diffusion"),
+        (8, 4, 2, "equal diffusion world_size"),
         (8, 4, 8, "cannot exceed DiT"),
         (12, 6, 4, "evenly divide DiT"),
     ],

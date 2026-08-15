@@ -149,11 +149,10 @@ vllm serve /path/to/MiniMax-H3/FL2VA \
 
 The following constraints are validated before distributed initialization:
 
-- `vae_patch_parallel_size` must be positive, no greater than the diffusion
-  world size or DiT process-group size, and evenly divide both. This keeps
-  every contiguous VAE subgroup inside one DiT rank partition.
-- The DiT process-group size must itself evenly divide the diffusion world
-  size.
+- The worker world size must equal the DiT process-group size. Multiple DiT
+  partitions within one worker world are not supported by this path.
+- `vae_patch_parallel_size` must be positive, no greater than the DiT
+  process-group size, and evenly divide it.
 - Only `vae_parallel_mode=tile` is supported for MiniMax-H3. H3 spatial
   sharding remains unsupported.
 - Every rank creates every subgroup in the same order. Each rank then retains
