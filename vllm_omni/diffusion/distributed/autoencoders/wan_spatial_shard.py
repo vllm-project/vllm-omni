@@ -52,6 +52,11 @@ _SPATIAL_SHARD_CONTEXT: ContextVar[SpatialShardContext | None] = ContextVar(
 )
 
 
+def _active_spatial_shard_split_dim() -> str | None:
+    context = _SPATIAL_SHARD_CONTEXT.get()
+    return context.split_dim if context is not None else None
+
+
 def _spatial_dim(split_dim: str) -> int:
     if split_dim == "height":
         return -2
@@ -332,21 +337,27 @@ class WanDistZeroPad2d(nn.Module):
         padding: tuple[int, int, int, int],
         group: dist.ProcessGroup,
         *,
-        split_dim: str = "height",
-        split_padding: tuple[int, int] | None = None,
+        defer_split_after_padding: bool = False,
     ) -> None:
         super().__init__()
         self.padding = padding
-        self.split_dim = split_dim
-        default_split_padding = (padding[2], padding[3]) if split_dim == "height" else (padding[0], padding[1])
-        self.split_padding = split_padding or default_split_padding
+        self.defer_split_after_padding = defer_split_after_padding
         self.group = group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        split_dim = _active_spatial_shard_split_dim()
+        if split_dim is None:
+            return F.pad(x, self.padding)
+
         rank, world_size = _rank_world(self.group)
         left, right, top, bottom = self.padding
+        if self.defer_split_after_padding:
+            if split_dim == "height":
+                bottom = 0
+            else:
+                right = 0
         if world_size > 1:
-            if self.split_dim == "height":
+            if split_dim == "height":
                 top = top if rank == 0 else 0
                 bottom = bottom if rank == world_size - 1 else 0
             else:
@@ -360,8 +371,7 @@ class WanDistConv2d(nn.Conv2d):
         self,
         source: nn.Conv2d,
         group: dist.ProcessGroup,
-        split_dim: str = "height",
-        split_padding: tuple[int, int] | None = None,
+        deferred_padding: tuple[int, int, int, int] | None = None,
     ):
         super().__init__(
             source.in_channels,
@@ -378,75 +388,117 @@ class WanDistConv2d(nn.Conv2d):
         )
         self.load_state_dict(source.state_dict())
         self.group = group
-        self.split_dim = split_dim
-        self.split_tensor_dim = _spatial_dim(split_dim)
-        kernel_extent = self.kernel_size[-2] if split_dim == "height" else self.kernel_size[-1]
-        self.halo_size = (kernel_extent - 1) // 2
-        pad_h = source.padding[-2] if isinstance(source.padding, tuple) else source.padding
-        pad_w = source.padding[-1] if isinstance(source.padding, tuple) else source.padding
-        if split_dim == "height":
-            if split_padding is None:
-                split_padding = (pad_h, pad_h)
-            self._non_split_padding = (pad_w, pad_w, 0, 0)
-            self.kernel_extent = self.kernel_size[-2]
-            self.stride_extent = self.stride[-2]
-        else:
-            if split_padding is None:
-                split_padding = (pad_w, pad_w)
-            self._non_split_padding = (0, 0, pad_h, pad_h)
-            self.kernel_extent = self.kernel_size[-1]
-            self.stride_extent = self.stride[-1]
-        self.split_pad_left, self.split_pad_right = split_padding
-        self._halo_recv_top_buf: torch.Tensor | None = None
-        self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self._trim_cache: dict[int, tuple[int, int, int]] = {}
+        self._direct_padding = source.padding
+        self._direct_padding_mode = source.padding_mode
+        self._direct_reversed_padding = source._reversed_padding_repeated_twice
+        self._deferred_padding = deferred_padding
+        source_padding = source.padding if isinstance(source.padding, tuple) else (source.padding, source.padding)
+        if len(source_padding) != 2 or not all(isinstance(value, int) for value in source_padding):
+            raise ValueError(f"Wan spatial-shard Conv2d requires integer padding, got {source.padding!r}.")
+        self._spatial_pad_h = int(source_padding[-2])
+        self._spatial_pad_w = int(source_padding[-1])
+        self.register_buffer("_halo_recv_top_buf", None, persistent=False)
+        self.register_buffer("_halo_recv_bottom_buf", None, persistent=False)
+        self._trim_cache: dict[tuple[str, int], tuple[int, int, int]] = {}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, self._non_split_padding)
+        split_dim = _active_spatial_shard_split_dim()
+        if split_dim is None:
+            if self._direct_padding_mode != "zeros":
+                x = F.pad(x, self._direct_reversed_padding, mode=self._direct_padding_mode)
+                padding: str | tuple[int, int] = (0, 0)
+            else:
+                padding = self._direct_padding
+            return F.conv2d(x, self.weight, self.bias, self.stride, padding, self.dilation, self.groups)
+
+        split_tensor_dim = _spatial_dim(split_dim)
+        if split_dim == "height":
+            kernel_extent = self.kernel_size[-2]
+            stride_extent = self.stride[-2]
+            non_split_padding = (self._spatial_pad_w, self._spatial_pad_w, 0, 0)
+            default_split_padding = (self._spatial_pad_h, self._spatial_pad_h)
+            deferred_split_padding = (
+                (self._deferred_padding[2], self._deferred_padding[3]) if self._deferred_padding is not None else None
+            )
+        else:
+            kernel_extent = self.kernel_size[-1]
+            stride_extent = self.stride[-1]
+            non_split_padding = (0, 0, self._spatial_pad_h, self._spatial_pad_h)
+            default_split_padding = (self._spatial_pad_w, self._spatial_pad_w)
+            deferred_split_padding = (
+                (self._deferred_padding[0], self._deferred_padding[1]) if self._deferred_padding is not None else None
+            )
+        split_pad_left, split_pad_right = deferred_split_padding or default_split_padding
+        halo_size = (kernel_extent - 1) // 2
+
+        x = F.pad(x, non_split_padding)
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
             group=self.group,
-            halo_size=self.halo_size,
-            split_dim=self.split_dim,
+            halo_size=halo_size,
+            split_dim=split_dim,
             recv_top_buf=self._halo_recv_top_buf,
             recv_bottom_buf=self._halo_recv_bottom_buf,
         )
-        shift, start, upper_bound = self._get_trim_params(x.shape[self.split_tensor_dim])
+        shift, start, upper_bound = self._get_trim_params(
+            x.shape[split_tensor_dim],
+            split_dim=split_dim,
+            halo_size=halo_size,
+            split_pad_left=split_pad_left,
+            split_pad_right=split_pad_right,
+            kernel_extent=kernel_extent,
+            stride_extent=stride_extent,
+        )
         if shift:
             x_padded = _narrow_along_dim(
                 x_padded,
-                self.split_tensor_dim,
+                split_tensor_dim,
                 shift,
-                x_padded.shape[self.split_tensor_dim] - shift,
+                x_padded.shape[split_tensor_dim] - shift,
             )
         out = super().forward(x_padded)
-        out = _trim_local_conv_output(out, self.halo_size, start, upper_bound, split_dim=self.split_dim)
-        return _zero_invalid_extent(out, split_dim=self.split_dim)
+        out = _trim_local_conv_output(out, halo_size, start, upper_bound, split_dim=split_dim)
+        return _zero_invalid_extent(out, split_dim=split_dim)
 
-    def _get_trim_params(self, local_extent: int) -> tuple[int, int, int]:
-        trim_params = self._trim_cache.get(local_extent)
+    def _get_trim_params(
+        self,
+        local_extent: int,
+        *,
+        split_dim: str,
+        halo_size: int,
+        split_pad_left: int,
+        split_pad_right: int,
+        kernel_extent: int,
+        stride_extent: int,
+    ) -> tuple[int, int, int]:
+        cache_key = (split_dim, local_extent)
+        trim_params = self._trim_cache.get(cache_key)
         if trim_params is None:
             rank, world_size = _rank_world(self.group)
             trim_params = _compute_conv_trim_params(
                 local_extent=local_extent,
                 rank=rank,
                 world_size=world_size,
-                halo_size=self.halo_size,
-                pad_before=self.split_pad_left,
-                pad_after=self.split_pad_right,
-                kernel_extent=self.kernel_extent,
-                stride_extent=self.stride_extent,
+                halo_size=halo_size,
+                pad_before=split_pad_left,
+                pad_after=split_pad_right,
+                kernel_extent=kernel_extent,
+                stride_extent=stride_extent,
             )
-            self._trim_cache[local_extent] = trim_params
+            self._trim_cache[cache_key] = trim_params
         return trim_params
 
 
 class WanDistCausalConv3d(nn.Conv3d):
+    # Cross-PR compatibility contract for the lossless Wan data-movement
+    # installer: it may fuse the no-context direct path, but must leave this
+    # wrapper in control whenever a spatial-shard context is active.
+    _vllm_omni_dynamic_spatial_shard_conv = True
+
     def __init__(
         self,
         source: nn.Conv3d,
         group: dist.ProcessGroup,
-        split_dim: str = "height",
     ):
         super().__init__(
             source.in_channels,
@@ -463,88 +515,98 @@ class WanDistCausalConv3d(nn.Conv3d):
         )
         self.load_state_dict(source.state_dict())
         self.group = group
-        self.split_dim = split_dim
-        self.split_tensor_dim = _spatial_dim(split_dim)
         source_padding = getattr(source, "_padding", None)
         if source_padding is None:
             p_t, p_h, p_w = source.padding
             source_padding = (p_w, p_w, p_h, p_h, 2 * p_t, 0)
         self._source_padding = tuple(source_padding)
-        if split_dim == "height":
-            self.split_pad_left = int(self._source_padding[2])
-            self.split_pad_right = int(self._source_padding[3])
-            self.kernel_extent = self.kernel_size[-2]
-            self.stride_extent = self.stride[-2]
-            padding = (
-                self._source_padding[0],
-                self._source_padding[1],
-                0,
-                0,
-                self._source_padding[4],
-                self._source_padding[5],
-            )
-        else:
-            self.split_pad_left = int(self._source_padding[0])
-            self.split_pad_right = int(self._source_padding[1])
-            self.kernel_extent = self.kernel_size[-1]
-            self.stride_extent = self.stride[-1]
-            padding = (
-                0,
-                0,
-                self._source_padding[2],
-                self._source_padding[3],
-                self._source_padding[4],
-                self._source_padding[5],
-            )
-        self.halo_size = (self.kernel_extent - 1) // 2
-        self._padding = padding if self.halo_size > 0 else self._source_padding
-        self._halo_recv_top_buf: torch.Tensor | None = None
-        self._halo_recv_bottom_buf: torch.Tensor | None = None
-        self._trim_cache: dict[int, tuple[int, int, int]] = {}
+        self.register_buffer("_halo_recv_top_buf", None, persistent=False)
+        self.register_buffer("_halo_recv_bottom_buf", None, persistent=False)
+        self._trim_cache: dict[tuple[str, int], tuple[int, int, int]] = {}
 
     def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
-        padding = list(self._padding)
+        split_dim = _active_spatial_shard_split_dim()
+        padding = list(self._source_padding)
         if cache_x is not None and padding[4] > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
 
+        if split_dim is None:
+            return super().forward(F.pad(x, padding))
+
+        split_tensor_dim = _spatial_dim(split_dim)
+        if split_dim == "height":
+            split_pad_left = int(padding[2])
+            split_pad_right = int(padding[3])
+            kernel_extent = self.kernel_size[-2]
+            stride_extent = self.stride[-2]
+            padding[2] = 0
+            padding[3] = 0
+        else:
+            split_pad_left = int(padding[0])
+            split_pad_right = int(padding[1])
+            kernel_extent = self.kernel_size[-1]
+            stride_extent = self.stride[-1]
+            padding[0] = 0
+            padding[1] = 0
+        halo_size = (kernel_extent - 1) // 2
+
         x = F.pad(x, padding)
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,
             group=self.group,
-            halo_size=self.halo_size,
-            split_dim=self.split_dim,
+            halo_size=halo_size,
+            split_dim=split_dim,
             recv_top_buf=self._halo_recv_top_buf,
             recv_bottom_buf=self._halo_recv_bottom_buf,
         )
-        shift, start, upper_bound = self._get_trim_params(x.shape[self.split_tensor_dim])
+        shift, start, upper_bound = self._get_trim_params(
+            x.shape[split_tensor_dim],
+            split_dim=split_dim,
+            halo_size=halo_size,
+            split_pad_left=split_pad_left,
+            split_pad_right=split_pad_right,
+            kernel_extent=kernel_extent,
+            stride_extent=stride_extent,
+        )
         if shift:
             x_padded = _narrow_along_dim(
                 x_padded,
-                self.split_tensor_dim,
+                split_tensor_dim,
                 shift,
-                x_padded.shape[self.split_tensor_dim] - shift,
+                x_padded.shape[split_tensor_dim] - shift,
             )
         out = super().forward(x_padded)
-        out = _trim_local_conv_output(out, self.halo_size, start, upper_bound, split_dim=self.split_dim)
-        return _zero_invalid_extent(out, split_dim=self.split_dim)
+        out = _trim_local_conv_output(out, halo_size, start, upper_bound, split_dim=split_dim)
+        return _zero_invalid_extent(out, split_dim=split_dim)
 
-    def _get_trim_params(self, local_extent: int) -> tuple[int, int, int]:
-        trim_params = self._trim_cache.get(local_extent)
+    def _get_trim_params(
+        self,
+        local_extent: int,
+        *,
+        split_dim: str,
+        halo_size: int,
+        split_pad_left: int,
+        split_pad_right: int,
+        kernel_extent: int,
+        stride_extent: int,
+    ) -> tuple[int, int, int]:
+        cache_key = (split_dim, local_extent)
+        trim_params = self._trim_cache.get(cache_key)
         if trim_params is None:
             rank, world_size = _rank_world(self.group)
             trim_params = _compute_conv_trim_params(
                 local_extent=local_extent,
                 rank=rank,
                 world_size=world_size,
-                halo_size=self.halo_size,
-                pad_before=self.split_pad_left,
-                pad_after=self.split_pad_right,
-                kernel_extent=self.kernel_extent,
-                stride_extent=self.stride_extent,
+                halo_size=halo_size,
+                pad_before=split_pad_left,
+                pad_after=split_pad_right,
+                kernel_extent=kernel_extent,
+                stride_extent=stride_extent,
             )
-            self._trim_cache[local_extent] = trim_params
+            self._trim_cache[cache_key] = trim_params
         return trim_params
 
 
@@ -591,12 +653,15 @@ def _trim_local_conv_output(
     return out
 
 
-def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup, split_dim: str) -> None:
+def _patch_attention_block(module: nn.Module, group: dist.ProcessGroup) -> None:
     if getattr(module, "_vllm_omni_spatial_shard_attention", False):
         return
     orig_forward = module.forward
 
     def _forward(self: nn.Module, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        split_dim = _active_spatial_shard_split_dim()
+        if split_dim is None:
+            return orig_forward(x, *args, **kwargs)
         _, world_size = _rank_world(group)
         if world_size <= 1:
             return orig_forward(x, *args, **kwargs)
@@ -630,7 +695,6 @@ def _replace_child(
     name: str,
     child: nn.Module,
     group: dist.ProcessGroup,
-    split_dim: str,
 ) -> None:
     if child.__class__.__name__ == "WanCausalConv3d":
         setattr(
@@ -639,51 +703,39 @@ def _replace_child(
             WanDistCausalConv3d(
                 child,
                 group,
-                split_dim=split_dim,
             ),
         )
         return
     if isinstance(child, nn.ZeroPad2d):
         padding = tuple(int(p) for p in child.padding)
-        module_padding = padding
-        if parent.__class__.__name__ == "Sequential":
-            # Let the following WanDistConv2d account for global after-edge
-            # padding; this module handles the non-split dimension and before edge.
-            if split_dim == "height":
-                module_padding = (padding[0], padding[1], padding[2], 0)
-            else:
-                module_padding = (padding[0], 0, padding[2], padding[3])
         setattr(
             parent,
             name,
             WanDistZeroPad2d(
-                module_padding,
+                padding,
                 group,
-                split_dim=split_dim,
-                split_padding=(padding[2], padding[3]) if split_dim == "height" else (padding[0], padding[1]),
+                defer_split_after_padding=parent.__class__.__name__ == "Sequential",
             ),
         )
         return
     if isinstance(child, nn.Conv2d):
-        split_padding = None
+        deferred_padding = None
         if name == "1" and parent.__class__.__name__ == "Sequential":
             # WanResample downsample uses ZeroPad2d((0, 1, 0, 1)) before a
             # stride-2 conv with padding=0.  Only the last rank should see the
             # bottom/right global padding, which is approximated by split_padding.
             prev = getattr(parent, "0", None)
             if isinstance(prev, WanDistZeroPad2d):
-                split_padding = prev.split_padding
+                deferred_padding = prev.padding
             elif isinstance(prev, nn.ZeroPad2d):
-                pad = prev.padding
-                split_padding = (int(pad[2]), int(pad[3])) if split_dim == "height" else (int(pad[0]), int(pad[1]))
+                deferred_padding = tuple(int(value) for value in prev.padding)
         setattr(
             parent,
             name,
             WanDistConv2d(
                 child,
                 group,
-                split_dim=split_dim,
-                split_padding=split_padding,
+                deferred_padding=deferred_padding,
             ),
         )
 
@@ -691,21 +743,20 @@ def _replace_child(
 def _patch_decoder_modules(
     module: nn.Module,
     group: dist.ProcessGroup,
-    split_dim: str,
     inside_attention: bool = False,
 ) -> None:
     if module.__class__.__name__ == "WanAttentionBlock":
-        _patch_attention_block(module, group, split_dim)
+        _patch_attention_block(module, group)
         inside_attention = True
 
     for name, child in list(module.named_children()):
         if child.__class__.__name__ == "WanCausalConv3d":
-            _replace_child(module, name, child, group, split_dim)
+            _replace_child(module, name, child, group)
             continue
         if isinstance(child, nn.Conv2d) and not inside_attention:
-            _replace_child(module, name, child, group, split_dim)
+            _replace_child(module, name, child, group)
             continue
-        _patch_decoder_modules(child, group, split_dim, inside_attention=inside_attention)
+        _patch_decoder_modules(child, group, inside_attention=inside_attention)
 
 
 def _decoder_upsample_count(decoder: nn.Module) -> int:
@@ -716,16 +767,25 @@ def _decoder_upsample_count(decoder: nn.Module) -> int:
     return count
 
 
+def _clear_wan_spatial_shard_runtime_buffers(vae: Any) -> None:
+    decoder = getattr(vae, "decoder", None)
+    if decoder is None:
+        return
+    for module in decoder.modules():
+        if "_halo_recv_top_buf" in module._buffers:
+            module._halo_recv_top_buf = None
+        if "_halo_recv_bottom_buf" in module._buffers:
+            module._halo_recv_bottom_buf = None
+
+
 def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_dim: str = "height") -> None:
     """Patch ``vae.decoder`` once for spatially-sharded decode.
 
     This mutates the already-loaded decoder in place by swapping its spatial
-    convolutions/padding for halo-exchanging variants and wrapping
-    ``decoder.forward``. The patch is permanent for the lifetime of the VAE
-    instance and is applied only once (subsequent calls are no-ops). A given
-    instance is bound to a single ``split_dim``; switching between
-    ``"height"`` and ``"width"`` requires a fresh VAE instance and raises here
-    otherwise.
+    convolutions/padding for context-aware variants and attaching a dedicated
+    spatial forward. Outside that forward the replacements execute their exact
+    local PyTorch behavior, so a later auto-selected tile request remains safe.
+    The same installed decoder can alternate height and width sharding.
 
     Only group-relative rank 0 assembles the final decoded frame, mirroring the
     distributed tiled-decode ``broadcast_result=False`` contract; the other ranks
@@ -733,18 +793,12 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
     """
     _spatial_dim(split_dim)
     if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
-        installed_split_dim = getattr(vae, "_vllm_omni_wan_spatial_shard_split_dim", "height")
-        if installed_split_dim != split_dim:
-            raise ValueError(
-                "Wan spatial-shard VAE decoder was already patched for "
-                f"{installed_split_dim!r} split; create a fresh VAE instance to use {split_dim!r} split."
-            )
         return
     decoder = getattr(vae, "decoder", None)
     if decoder is None:
         raise ValueError("Wan spatial-shard VAE decode requires a decoder module.")
 
-    _patch_decoder_modules(decoder, group, split_dim)
+    _patch_decoder_modules(decoder, group)
     upsample_count = _decoder_upsample_count(decoder)
     orig_forward = decoder.forward
 
@@ -754,6 +808,8 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
         feat_cache: list[torch.Tensor] | None = None,
         feat_idx: list[int] | None = None,
         first_chunk: bool = False,
+        *,
+        split_dim: str,
     ) -> torch.Tensor:
         if feat_idx is None:
             feat_idx = [0]
@@ -781,10 +837,9 @@ def install_wan_spatial_shard_decode(vae: Any, group: dist.ProcessGroup, split_d
             _SPATIAL_SHARD_CONTEXT.reset(token)
         return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
 
-    decoder.forward = MethodType(_forward, decoder)
+    decoder._vllm_omni_spatial_shard_forward = MethodType(_forward, decoder)
     vae._vllm_omni_wan_spatial_shard_installed = True
-    vae._vllm_omni_wan_spatial_shard_split_dim = split_dim
-    logger.info("Installed Wan VAE %s-sharded decode.", split_dim)
+    logger.info("Installed Wan VAE dynamic-axis spatial-shard decode.")
 
 
 def spatial_shard_decode(
@@ -813,11 +868,12 @@ def spatial_shard_decode(
             decoded_chunks = []
             for i in range(z.shape[2]):
                 vae._conv_idx = [0]
-                chunk = vae.decoder(
+                chunk = vae.decoder._vllm_omni_spatial_shard_forward(
                     x[:, :, i : i + 1, :, :],
                     feat_cache=vae._feat_map,
                     feat_idx=vae._conv_idx,
                     first_chunk=(i == 0),
+                    split_dim=split_dim,
                 )
                 if produce_output:
                     decoded_chunks.append(chunk)
@@ -831,6 +887,10 @@ def spatial_shard_decode(
                 out = z.new_zeros(0)
     finally:
         vae.clear_cache()
+        # Halo buffers are request-shape scratch space allocated outside the
+        # tagged weight pool. Drop live references so sleep/offload never has
+        # to preserve or discard them as model state.
+        _clear_wan_spatial_shard_runtime_buffers(vae)
 
     if not return_dict:
         return (out,)

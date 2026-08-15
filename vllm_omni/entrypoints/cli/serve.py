@@ -790,9 +790,10 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "auto", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
-            "'tile' (default) uses patch/tile parallel decode; "
+            "'tile' (default) uses patch/tile decode; 'auto' selects the longer spatial-shard axis for "
+            "validated Wan tiled decodes on a full DiT group, then falls back to patch/tile decode; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
             "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "

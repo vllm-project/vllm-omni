@@ -398,7 +398,7 @@ the source for configuration, compatibility, and implementation details.
 * **Composable parallelism:** Diffusion stages can combine [CFG-Parallel](feature/cfg_parallel.md),
   [Expert Parallel](feature/expert_parallel.md), [HSDP](feature/hsdp.md),
   [Pipeline Parallel](feature/pipeline_parallel.md), [Sequence Parallel](feature/sequence_parallel.md),
-  [Tensor Parallel](feature/tensor_parallel.md), and [VAE Patch Parallelism](feature/vae_parallel.md)
+  [Tensor Parallel](feature/tensor_parallel.md), and [VAE Parallel](feature/vae_parallel.md)
   according to the pipeline and hardware topology.
 * **Attention and cache acceleration:** [Skip-Softmax](feature/skip_softmax.md),
   [Cache-DiT](feature/cache_dit.md), and [TeaCache](feature/teacache.md)

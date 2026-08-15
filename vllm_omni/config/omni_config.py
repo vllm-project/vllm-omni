@@ -475,9 +475,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
-        if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
+        if self.vae_parallel_mode not in {"tile", "auto", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
-                "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+                "vae_parallel_mode must be one of "
+                "{'tile', 'auto', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
 

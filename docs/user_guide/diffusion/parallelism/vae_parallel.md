@@ -1,4 +1,4 @@
-# VAE Parallelism Guide
+# VAE Parallel Guide
 
 
 ## Table of Content
@@ -113,7 +113,7 @@ In `DiffusionParallelConfig`:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. Should typically match `tensor_parallel_size` as they share the same process group. |
-| `vae_parallel_mode` | str | `"tile"` | VAE parallel decode strategy: `"tile"` (default tile/patch parallel decode), `"spatial_shard_height"`, or `"spatial_shard_width"` (spatially-sharded decode, Wan only). See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
+| `vae_parallel_mode` | str | `"tile"` | VAE parallel decode strategy: `"tile"`, `"auto"` (Wan request-shape selection), `"spatial_shard_height"`, or `"spatial_shard_width"`. Spatial sharding is currently Wan-only. See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
 
 Additional requirements:
 
@@ -128,7 +128,7 @@ Additional requirements:
 
 ## Spatially-Sharded Decode (Wan)
 
-The default `vae_parallel_mode="tile"` distributes whole tiles across ranks. For the **Wan** VAE there is an alternative decode strategy, **spatially-sharded decode**, selected via `vae_parallel_mode="spatial_shard_height"` or `vae_parallel_mode="spatial_shard_width"`.
+The default `vae_parallel_mode="tile"` keeps patch/tile parallel decode unchanged. For Wan, set `vae_parallel_mode="auto"` to select spatial-shard decode only after a request is already large enough to enter Diffusers' tiled-decode path and the VAE uses the full DiT decode group. Auto mode splits the longer eligible spatial axis to reduce halo traffic. Direct-decode requests and partial groups fall back to tile decode. Use `"spatial_shard_height"` or `"spatial_shard_width"` to force an axis.
 
 Instead of assigning independent tiles to ranks, spatial-shard decode shards the decoder feature maps along the height (`spatial_shard_height`) or width (`spatial_shard_width`) dimension and exchanges halo rows/columns between neighboring ranks around the spatial convolutions. This keeps the receptive field correct across shard boundaries, so the result matches the single-GPU decode within numerical tolerance.
 
@@ -141,7 +141,7 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(
         tensor_parallel_size=2,
         vae_patch_parallel_size=2,               # must match the DiT group size
-        vae_parallel_mode="spatial_shard_width", # or "spatial_shard_height"
+        vae_parallel_mode="auto",                # opt in to Wan request-shape selection
     ),
 )
 ```
@@ -152,14 +152,14 @@ Or from the CLI / serving entrypoint:
 vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
     --tensor-parallel-size 2 \
     --vae-patch-parallel-size 2 \
-    --vae-parallel-mode spatial_shard_width
+    --vae-parallel-mode auto
 ```
 
 **Constraints and behavior:**
 
-- Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
-- It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime.
-- `spatial_shard_height` and `spatial_shard_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
+- Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other VAE families retain their existing mode handling and may reject explicit Wan spatial modes.
+- It requires `vae_patch_parallel_size` to **match the DiT process group size**. `auto` quietly falls back to tile decode for a partial group; an explicitly forced spatial mode logs a warning.
+- The decoder's context-aware wrappers retain the direct path, so one process can alternate small/large and portrait/landscape requests safely.
 
 For end-to-end latency/throughput, launch serving with the desired `vae_parallel_mode` and use the existing diffusion serving benchmark:
 

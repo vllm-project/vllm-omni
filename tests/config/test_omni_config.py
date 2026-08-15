@@ -583,7 +583,11 @@ def test_diffusion_parallel_config_keeps_current_diffusion_parallel_surface():
     assert cfg.data_parallel_size == 3
     assert cfg.cfg_parallel_size == 3
     assert cfg.mask_sp_padding is True
+    assert cfg.vae_parallel_mode == "tile"
     assert cfg.world_size == 72
+
+    auto_cfg = OmniStageDiffusionParallelConfig(vae_parallel_mode="auto")
+    assert auto_cfg.vae_parallel_mode == "auto"
 
 
 def test_parallel_config_derived_fields_are_not_init_inputs():

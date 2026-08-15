@@ -71,7 +71,7 @@ nav:
         - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
-        - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
+        - VAE Parallel: user_guide/diffusion/parallelism/vae_parallel.md
       - Attention Backends: user_guide/diffusion/attention_backends.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
@@ -123,7 +123,7 @@ nav:
           - Pipeline Parallel: design/feature/pipeline_parallel.md
           - Sequence Parallel: design/feature/sequence_parallel.md
           - Tensor Parallel: design/feature/tensor_parallel.md
-          - VAE Patch Parallelism: design/feature/vae_parallel.md
+          - VAE Parallel: design/feature/vae_parallel.md
         - Attention Optimization:
           - Skip-Softmax: design/feature/skip_softmax.md
         - Cache-DiT: design/feature/cache_dit.md

@@ -76,6 +76,18 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_defaults_vae_parallel_mode_to_tile_and_accepts_auto() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    default_args = parser.parse_args(["serve", "fake-model", "--omni"])
+    auto_args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-parallel-mode", "auto"])
+
+    assert default_args.vae_parallel_mode == "tile"
+    assert auto_args.vae_parallel_mode == "auto"
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

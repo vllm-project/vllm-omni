@@ -1,42 +1,57 @@
-# VAE Patch Parallelism
+# VAE Parallel
 
-This document describes how to add **VAE Patch Parallelism** support to a diffusion model.
-We use **Qwen-Image** as the reference implementation for decode parallel, and **Wan2.2** for encode parallel.
+This document defines the VAE parallelism strategy contract and describes how to
+add a strategy to a diffusion model. Tile/patch parallelism is the portable
+baseline. Spatial-shard parallelism is a model-specific decode strategy that can
+be selected explicitly or through a request-aware policy.
+
+We use **Qwen-Image** as the reference implementation for tile-parallel decode,
+**Wan2.2** for tile-parallel encode, and **Wan2.2** as the first spatial-shard
+decode implementation. Other VAE families can add spatial strategies later
+without changing the public mode meanings defined here.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Step-by-Step Implementation (Decode)](#step-by-step-implementation-decode)
-- [Encode Parallel Implementation](#encode-parallel-implementation)
+- [Strategy Selection Contract](#strategy-selection-contract)
+- [Tile/Patch Implementation (Decode)](#tilepatch-implementation-decode)
+- [Tile/Patch Encode Implementation](#tilepatch-encode-implementation)
 - [Testing](#testing)
 - [Reference Implementations](#reference-implementations)
+- [Spatially-Sharded Decode](#spatially-sharded-decode)
+- [Adding Another VAE Strategy](#adding-another-vae-strategy)
 - [Summary](#summary)
 
 ---
 
 ## Overview
 
-### What is Vae Patch parallel?
+### What is VAE parallelism?
 
-**VAE Patch Parallelism** is an acceleration technique for both **encoding** and **decoding**. Instead of processing the entire tensor at once, the tensor is:
+VAE parallelism distributes VAE **encoding** or **decoding** across multiple
+ranks. The implementation currently has two strategy families:
 
-+ Split into multiple spatial tiles
+| Strategy | Unit of work | Communication | Current scope |
+|----------|--------------|---------------|---------------|
+| Tile/patch | Independent overlapping tiles | Gather, stitch, and optionally broadcast | Encode and decode across supported distributed VAEs |
+| Spatial shard | One feature map sharded along a spatial axis | Per-layer halo exchange followed by output gather | Wan decode |
 
-+ Distributed across multiple ranks
+Both strategies preserve the model-specific receptive field and reconstruct the
+same logical output as single-rank execution. They differ in how work is divided:
+tile parallelism assigns complete overlapping tiles to ranks, while spatial
+sharding keeps one logical feature map partitioned throughout the decoder.
 
-+ Encoded/Decoded in parallel
+This approach can:
 
-+ Merged to reconstruct the final output
++ Distribute computation across multiple devices
++ Reduce peak memory usage per device
++ Accelerate encoding or decoding latency
 
-This approach:
-
-+ Distributes computation across multiple devices
-
-+ Reduces peak memory usage per device
-
-+ Accelerates encoding/decoding latency
+The actual benefit depends on shape, topology, communication cost, and VAE
+architecture. A strategy must not become the global default without parity and
+performance evidence on its supported models.
 
 ### When to Use Encode vs Decode Parallel
 
@@ -45,8 +60,16 @@ This approach:
 | **Decode Parallel** | Text-to-Image, Text-to-Video | Latent → Image/Video |
 | **Encode Parallel** | Image-to-Video (I2V) | Image → Latent (for conditioning) |
 
-### Architecture
-We introduce **DistributedVaeExecutor** as the core component responsible for distributed VAE encoding/decoding.
+### Architecture and ownership
+
+`DiffusionParallelConfig.vae_parallel_mode` carries the public strategy request.
+The shared registry forwards that value to the VAE, but each distributed VAE
+adapter owns its supported modes, request-shape selection, topology validation,
+and fallback behavior. Model-specific policy must not be added to the shared
+runner or registry.
+
+**DistributedVaeExecutor** is the model-agnostic core for tile-parallel VAE
+encoding and decoding.
 
 The executor is model-agnostic and accepts three function parameters:
 
@@ -76,6 +99,11 @@ This design separates:
 
 + Model-specific tiling and merging logic
 
+Spatial-shard implementations use the same configured VAE process group but do
+not use the tile task executor. They keep the feature map sharded across decoder
+layers and own their halo-exchange and final-gather contracts inside the model's
+distributed autoencoder implementation.
+
 #### Why split / exec / merge is necessary?
 
 The latent tensor cannot be arbitrarily partitioned.
@@ -92,7 +120,34 @@ Therefore:
 
 + Merge must perform blending to avoid seams
 
-## Step-by-Step Implementation (Decode)
+## Strategy Selection Contract
+
+`vae_parallel_mode="tile"` is the compatibility-preserving global default.
+Other values are stable strategy requests, but support remains model-specific.
+
+| Mode | Meaning | Current implementation | Unsupported or ineligible request |
+|------|---------|------------------------|-----------------------------------|
+| `tile` | Use the existing tile/patch executor | All distributed VAE adapters | Not applicable |
+| `auto` | Let the VAE adapter select a validated strategy for each request | Wan decode selects height or width spatial sharding | Wan uses tile when ineligible; unsupported VAE families reject or document their fallback |
+| `spatial_shard_height` | Force spatial-shard decode along height | Wan decode | Wan warns and uses tile when ineligible; unsupported VAE families reject |
+| `spatial_shard_width` | Force spatial-shard decode along width | Wan decode | Wan warns and uses tile when ineligible; unsupported VAE families reject |
+
+The shared configuration layer validates the mode name. It does not decide
+whether a model supports that mode. A VAE adapter adding a mode must:
+
+1. Keep `tile` as an exact feature-off path.
+2. Select a strategy per request rather than from stale process-global state.
+3. Validate input rank/shape and process-group membership before collectives.
+4. Reject or explicitly fall back from unsupported combinations; never silently
+   reinterpret one forced strategy as another.
+5. Preserve direct encode/decode behavior when Diffusers does not select a tiled
+   path.
+
+`auto` is a policy hook, not a universal heuristic. Each VAE family may select
+from only the strategies it has validated. Adding another family must not change
+Wan's selector or the meanings of the explicit modes.
+
+## Tile/Patch Implementation (Decode)
 
 ### Step 1: Implement DistributedAutoencoderKLQwenImage
 `QwenImagePipeline` use `AutoencoderKLQwenImage` for vae, so implement a distributed version:
@@ -251,7 +306,7 @@ class YourModelPipeline(nn.Module):
 +       ).to(self.device)
 ```
 
-## Encode Parallel Implementation
+## Tile/Patch Encode Implementation
 
 For models that require VAE encoding (e.g., Image-to-Video), you can also parallelize the encode operation. We use **Wan2.2** as the reference implementation.
 
@@ -449,18 +504,24 @@ Complete examples in the codebase:
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode
 
-The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
+The tile-parallel executor above assigns independent spatial **tiles** to ranks.
+A spatial-shard backend instead partitions one global decoder feature map along
+height or width. Wan is the first supported implementation.
+
+`DiffusionParallelConfig.vae_parallel_mode="tile"` remains the default. For Wan,
+opt into request-shape selection with `"auto"`, or force an axis with
+`"spatial_shard_height"` or `"spatial_shard_width"`.
 
 ### How it differs from tile parallel
 
-| Aspect | Tile parallel (`"tile"`) | Spatially-sharded (`"spatial_shard_height"`/`"spatial_shard_width"`) |
-|--------|--------------------------|-----------------------------------------------|
-| Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
-| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
-| Output assembly | Blend overlapping tiles | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
-| Scope | Decode + encode | Decode only |
+| Aspect | Tile parallel (`"tile"`) | Automatic (`"auto"`) | Spatially-sharded (`"spatial_shard_height"`/`"spatial_shard_width"`) |
+|--------|--------------------------|----------------------|-----------------------------------------------|
+| Unit of work | Independent overlapping tiles | Chooses tile or a spatial shard per request | A single global feature map sharded along H or W |
+| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Depends on the selected path | Per-conv **halo exchange** of boundary rows/cols (P2P) |
+| Output assembly | Blend overlapping tiles | Depends on the selected path | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
+| Scope | Decode + encode | Wan decode selection; encode remains tiled | Wan decode only |
 
 Spatial-shard decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_spatial_shard.py`.
 
@@ -476,21 +537,65 @@ serve.py (--vae-parallel-mode) / OmniEngineArgs
   -> DistributedAutoencoderKLWan.tiled_decode dispatch
 ```
 
-`DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. Otherwise it logs a warning and falls back to tile-parallel decode.
+`DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it
+requires distributed decode to be enabled, a 5D latent, and
+`vae_patch_parallel_size == DiT group size`. The method is reached only after
+Diffusers has selected tiled decode for the request. In `auto` mode the longer
+axis that can cover every rank is selected, with width winning ties. If neither
+axis can cover the group, auto mode uses tile decode. This policy is cached only
+through normal kernel shape caches; it is reevaluated for every request.
 
 ### Notes
 
-- The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
+- The decoder is patched **in place** the first time spatial-shard decode runs. Its wrappers consult a context-local split dimension and retain an exact direct fallback, allowing later requests to select tile, height, or width safely.
 - Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `distributed_cuda`).
+
+## Adding Another VAE Strategy
+
+Add future strategies through the distributed autoencoder that owns the model
+semantics. Do not add model-name dispatch to the shared runner, registry, or
+`DistributedVaeExecutor`.
+
+For a new VAE family:
+
+1. **Declare capability**: document which modes, operations, shapes, dtypes, and
+   process-group layouts the adapter supports.
+2. **Implement model-local selection**: keep `auto` policy and explicit-mode
+   dispatch in the distributed autoencoder. The selector may use request shape,
+   but must be deterministic and side-effect free.
+3. **Preserve the baseline**: retain exact tile/direct fallbacks and state-dict
+   compatibility. Structural wrappers must not register duplicate parameters or
+   alter checkpoint names.
+4. **Define communication**: derive shards from the configured VAE group, keep
+   collectives symmetric, specify padding/halo ownership, and return the same
+   output placement as the tile path.
+5. **Bound request state**: make the selected axis and scratch buffers
+   request-scoped, release temporary buffers on success and failure, and support
+   alternating modes in one long-lived worker.
+6. **Validate independently**: compare each explicit strategy against the
+   single-rank reference, then test `auto`, tile fallback, unsupported topology,
+   and a mixed request sequence. Record per-rank peak memory and decode latency
+   before documenting a preferred mode.
+
+Promote a selector into shared infrastructure only after at least two VAE
+families use the same inputs, invariants, fallback behavior, and lifecycle. Until
+then, shared code owns transport and configuration while each model adapter owns
+policy.
 
 ---
 
 ## Summary
 
-Adding VAE Patch Parallel support to diffusion model:
+Adding VAE parallel support to a diffusion model:
 
-1. **Implement Distributed VAE** - Inherit from base VAE class and `DistributedVaeMixin`
-2. **Decode Parallel** - Refactor `tiled_decode` into `tile_split`/`tile_exec`/`tile_merge`
-3. **Encode Parallel** (optional) - Implement `encode_tile_split`/`encode_tile_exec`/`encode_tile_merge` for I2V models
-4. **Change VAE model in pipeline** - Use the distributed version
-5. **Test** - Verify numerical consistency with `vae_patch_parallel_size=1` vs `N`
+1. **Implement the distributed VAE** - Inherit from the base VAE class and
+   `DistributedVaeMixin`.
+2. **Keep tile as the baseline** - For tile decode, refactor `tiled_decode` into
+   `tile_split`/`tile_exec`/`tile_merge`.
+3. **Add encode parallelism when needed** - Implement
+   `encode_tile_split`/`encode_tile_exec`/`encode_tile_merge` for I2V models.
+4. **Add model-specific strategies locally** - Own selectors, topology checks,
+   communication, and fallback in the distributed autoencoder.
+5. **Wire the pipeline** - Replace the pipeline VAE with its distributed version.
+6. **Test strategy and lifecycle parity** - Compare one rank with every supported
+   strategy, including feature-off, fallback, and mixed-request sequences.

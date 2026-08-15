@@ -48,7 +48,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Pipeline Parallel](feature/pipeline_parallel.md)
 - [Sequence Parallel](feature/sequence_parallel.md)
 - [Tensor Parallel](feature/tensor_parallel.md)
-- [VAE Patch Parallelism](feature/vae_parallel.md)
+- [VAE Parallel](feature/vae_parallel.md)
 
 #### Attention optimization
 
