@@ -532,6 +532,47 @@ class TestRequestScheduler:
 
         assert finished == {"impossible", "schedulable"}
 
+    def test_impossible_diffusion_kv_capacity_does_not_block_waiters_under_load(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=4, max_num_seqs=2)
+        running = _make_request("running")
+        _attach_diffusion_kv(running)
+        self.scheduler.add_request(running)
+        assert _new_ids(self.scheduler.schedule()) == ["running"]
+
+        impossible = _make_request("impossible")
+        impossible.diffusion_kv_requests = tuple(
+            DiffusionKVRequest(
+                f"impossible/diffusion-kv/{sequence_id}",
+                sequence_id=sequence_id,
+                prefix_len=0,
+                target_len=4,
+                seq_len=4,
+            )
+            for sequence_id in range(4)
+        )
+        schedulable = _make_request("schedulable")
+        schedulable.diffusion_kv_requests = (
+            DiffusionKVRequest(
+                "schedulable/diffusion-kv/0",
+                sequence_id=0,
+                prefix_len=0,
+                target_len=4,
+                seq_len=4,
+            ),
+        )
+        self.scheduler.add_request(impossible)
+        self.scheduler.add_request(schedulable)
+
+        sched_output = self.scheduler.schedule()
+
+        failed_state = self.scheduler.get_request_state("impossible")
+        assert failed_state is not None
+        assert failed_state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert failed_state.error is not None
+        assert "required_blocks=4, available_blocks=3" in failed_state.error
+        assert sched_output.finished_req_ids == {"impossible"}
+        assert _new_ids(sched_output) == ["schedulable"]
+
     def test_diffusion_kv_internal_allocation_error_finishes_request(self, monkeypatch) -> None:
         _initialize_paged_scheduler(self.scheduler)
         request = _make_request("native-error")

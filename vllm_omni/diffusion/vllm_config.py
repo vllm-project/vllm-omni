@@ -85,9 +85,6 @@ class _DiffusionVllmModelConfig:
     def is_quantized(self) -> bool:
         return self.quantization is not None
 
-    def is_model_moe(self) -> bool:
-        return self.is_moe
-
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
 

@@ -189,6 +189,11 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        # Set after the paged-KV profile request has gone through model-owned
+        # preprocessing. Real requests are admitted only within this measured
+        # activation envelope: (max execution sequences, max seq_len,
+        # max target_len).
+        self._diffusion_kv_profile_limits: tuple[int, int, int] | None = None
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
@@ -744,9 +749,36 @@ class DiffusionEngine:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
         pre_process_func = getattr(self, "pre_process_func", None)
-        if pre_process_func is None:
-            return request
-        return pre_process_func(request)
+        if pre_process_func is not None:
+            request = pre_process_func(request)
+        self._validate_diffusion_kv_profile_limits(request)
+        return request
+
+    def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
+        """Keep admitted paged-KV requests within the profiled activation shape."""
+
+        profile_limits = getattr(self, "_diffusion_kv_profile_limits", None)
+        if profile_limits is None:
+            return
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            return
+
+        request_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        if any(actual > profiled for actual, profiled in zip(request_limits, profile_limits, strict=True)):
+            request_sequences, request_seq_len, request_target_len = request_limits
+            profile_sequences, profile_seq_len, profile_target_len = profile_limits
+            raise ValueError(
+                f"Diffusion KV request {request.request_id!r} exceeds the startup memory-profile envelope: "
+                f"sequences={request_sequences} (profiled={profile_sequences}), "
+                f"max_seq_len={request_seq_len} (profiled={profile_seq_len}), "
+                f"max_target_len={request_target_len} (profiled={profile_target_len}). "
+                "Reduce the request shape or extend the model's paged-KV profile recipe."
+            )
 
     def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
         """Admit a request whose model-owned preprocessing is complete."""
@@ -953,10 +985,13 @@ class DiffusionEngine:
 
         The profile executes directly on each Worker before the Scheduler and
         its KV manager exist. Hunyuan is currently the only model integrated
-        with ``paged_scheduler``; its supported default 1024x1024 image size
-        and enabled CFG exercise the first-step activation peak. Future paged
-        model integrations must extend this recipe for their serving limits
-        (for example, video frame count) rather than reusing it silently.
+        with ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum
+        advertised reference-image count exercise its first-step activation
+        peak. Admission compares each preprocessed request's CFG count and
+        tokenized sequence/target shape with the resulting profile envelope.
+        Future paged model integrations must extend this recipe for their
+        serving limits (for example, video frame count) rather than reusing it
+        silently.
         """
 
         if (
@@ -973,6 +1008,14 @@ class DiffusionEngine:
         if request is None:
             raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
         request = self._prepare_request_for_admission(request)
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            raise RuntimeError("paged_scheduler profile preprocessing must produce Diffusion KV requests")
+        self._diffusion_kv_profile_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
         # Preprocessing owns request geometry and prepared model inputs, but
         # its native KV requests remain Scheduler-only mutable state. The
         # profile bypasses Scheduler admission and must not send them to the

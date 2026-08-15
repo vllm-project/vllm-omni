@@ -56,6 +56,32 @@ class DiffusionKVCacheManager:
         self._internal_request_ids: set[str] = set()
         self._next_allocation_generation = 1
 
+    def _get_empty_pool_required_blocks(self, requests: Sequence[DiffusionKVRequest]) -> int:
+        """Return the native full-sequence reservation for one public request.
+
+        vLLM performs this calculation inside ``allocate_slots`` when
+        ``full_sequence_must_fit`` is enabled. Diffusion CFG adds one semantic
+        requirement that native requests do not have: every execution sequence
+        must fit atomically. Sum the native per-sequence result so a request
+        that can never fit is rejected independently of current pool usage.
+        """
+
+        coordinator = self.native_manager.coordinator
+        empty_blocks = self.native_manager.empty_kv_cache_blocks.blocks
+        return sum(
+            coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=request.num_tokens,
+                new_computed_blocks=empty_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=0,
+                num_local_computed_tokens=0,
+                num_tokens_main_model=request.num_tokens,
+                apply_admission_cap=True,
+            )
+            for request in requests
+        )
+
     def has_request(self, public_request_id: str) -> bool:
         return public_request_id in self._requests
 
@@ -96,12 +122,16 @@ class DiffusionKVCacheManager:
                     f"seq_len={request.seq_len}, max_model_len={self.max_model_len}"
                 )
 
+        required_blocks = self._get_empty_pool_required_blocks(requests)
+        if required_blocks > self._empty_pool_num_free_blocks:
+            raise DiffusionKVAdmissionError(
+                f"Diffusion KV request {public_request_id!r} cannot fit even when the block pool is empty: "
+                f"required_blocks={required_blocks}, available_blocks={self._empty_pool_num_free_blocks}; "
+                "increase KV cache capacity or reduce the request sequence count/length"
+            )
+
         allocated: list[DiffusionKVRequest] = []
         sequence_metadata: list[DiffusionKVSequenceMetadata] = []
-        pool_was_empty = (
-            not self._requests
-            and self.native_manager.block_pool.get_num_free_blocks() == self._empty_pool_num_free_blocks
-        )
         try:
             for request in requests:
                 blocks = self.native_manager.allocate_slots(
@@ -113,11 +143,6 @@ class DiffusionKVCacheManager:
                 if blocks is None:
                     self._rollback(allocated)
                     allocated.clear()
-                    if pool_was_empty:
-                        raise DiffusionKVAdmissionError(
-                            f"Diffusion KV request {public_request_id!r} cannot fit even when the block pool is empty; "
-                            "increase KV cache capacity or reduce the request sequence count/length"
-                        )
                     return None
                 allocated.append(request)
                 sequence_metadata.append(

@@ -87,6 +87,21 @@ def test_impossible_cfg_allocation_rolls_back_and_fails_fast() -> None:
     assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
 
 
+def test_impossible_cfg_allocation_fails_fast_while_pool_is_busy() -> None:
+    manager = _manager(5)
+    assert manager.reserve_request("running", (_request("running", 0),)) is not None
+    free_before = manager.native_manager.block_pool.get_num_free_blocks()
+
+    with pytest.raises(DiffusionKVAdmissionError, match="required_blocks=6, available_blocks=4"):
+        manager.reserve_request(
+            "impossible",
+            tuple(_request("impossible", sequence_id) for sequence_id in range(3)),
+        )
+
+    assert manager.has_request("impossible") is False
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_before
+
+
 def test_temporary_capacity_pressure_returns_none() -> None:
     manager = _manager(3)
     assert manager.reserve_request("running", (_request("running", 0),)) is not None

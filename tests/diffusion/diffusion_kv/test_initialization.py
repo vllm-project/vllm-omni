@@ -239,6 +239,8 @@ def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     assert model_config.quantization == "modelopt"
     assert model_config.quantization_config is quantization_config
     assert model_config.is_quantized
+    assert model_config.is_moe is False
+    assert model_config.is_nvfp4_quantized() is False
     assert model_config.original_max_model_len == model_config.max_model_len
 
     unquantized_model_config = diffusion_vllm_config._make_diffusion_vllm_model_config(

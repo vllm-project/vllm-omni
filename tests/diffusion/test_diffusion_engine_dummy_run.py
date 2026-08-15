@@ -9,6 +9,7 @@ import pytest
 from vllm_omni.diffusion import io_support
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -91,7 +92,22 @@ def test_paged_kv_profile_request_is_preprocessed_without_scheduler_state() -> N
     )
     engine._make_dummy_request = Mock(return_value=request)
     prepared_layout = object()
-    scheduler_kv_state = (object(),)
+    scheduler_kv_state = (
+        DiffusionKVRequest(
+            "profile-request/diffusion-kv/0",
+            sequence_id=0,
+            prefix_len=3,
+            target_len=8,
+            seq_len=12,
+        ),
+        DiffusionKVRequest(
+            "profile-request/diffusion-kv/1",
+            sequence_id=1,
+            prefix_len=4,
+            target_len=8,
+            seq_len=13,
+        ),
+    )
 
     def preprocess(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
         req.prepared_layout = prepared_layout
@@ -105,6 +121,7 @@ def test_paged_kv_profile_request_is_preprocessed_without_scheduler_state() -> N
     assert result is request
     assert result.prepared_layout is prepared_layout
     assert result.diffusion_kv_requests is None
+    assert engine._diffusion_kv_profile_limits == (2, 13, 8)
     engine._make_dummy_request.assert_called_once_with(
         height=1024,
         width=1024,
@@ -112,3 +129,62 @@ def test_paged_kv_profile_request_is_preprocessed_without_scheduler_state() -> N
         num_image_inputs=3,
     )
     engine._prepare_request_for_admission.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize(
+    ("num_sequences", "seq_len", "target_len"),
+    [
+        (3, 16, 8),
+        (1, 17, 8),
+        (1, 16, 9),
+    ],
+)
+def test_paged_kv_admission_rejects_shape_beyond_profile_envelope(
+    num_sequences: int,
+    seq_len: int,
+    target_len: int,
+) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine._diffusion_kv_profile_limits = (2, 16, 8)
+    engine.pre_process_func = lambda request: request
+    request = OmniDiffusionRequest(
+        prompt="too large",
+        request_id="too-large",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        diffusion_kv_requests=tuple(
+            DiffusionKVRequest(
+                f"too-large/diffusion-kv/{sequence_id}",
+                sequence_id=sequence_id,
+                prefix_len=0,
+                target_len=target_len,
+                seq_len=seq_len,
+            )
+            for sequence_id in range(num_sequences)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds the startup memory-profile envelope"):
+        engine._prepare_request_for_admission(request)
+
+
+def test_paged_kv_admission_accepts_shape_at_profile_envelope() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine._diffusion_kv_profile_limits = (2, 16, 8)
+    engine.pre_process_func = lambda request: request
+    request = OmniDiffusionRequest(
+        prompt="fits",
+        request_id="fits",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        diffusion_kv_requests=tuple(
+            DiffusionKVRequest(
+                f"fits/diffusion-kv/{sequence_id}",
+                sequence_id=sequence_id,
+                prefix_len=8,
+                target_len=8,
+                seq_len=16,
+            )
+            for sequence_id in range(2)
+        ),
+    )
+
+    assert engine._prepare_request_for_admission(request) is request
