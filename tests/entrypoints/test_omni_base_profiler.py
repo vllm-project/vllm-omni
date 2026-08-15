@@ -1,5 +1,6 @@
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -260,3 +261,18 @@ class TestAsyncOmniProfilerSignatureConsistency:
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         assert inspect.iscoroutinefunction(AsyncOmni.stop_profile)
+
+
+def test_weak_shutdown_engine_records_finalizer_path(mocker: MockerFixture):
+    from vllm_omni.entrypoints.omni_base import _weak_shutdown_engine, logger
+
+    engine = mocker.MagicMock()
+    startup_span = mocker.patch(
+        "vllm_omni.entrypoints.omni_base.startup_span",
+        return_value=nullcontext(),
+    )
+
+    _weak_shutdown_engine(engine)
+
+    startup_span.assert_called_once_with(logger, "engine.shutdown", trigger="finalizer")
+    engine.shutdown.assert_called_once_with()
