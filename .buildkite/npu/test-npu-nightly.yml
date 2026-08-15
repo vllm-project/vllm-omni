@@ -96,33 +96,6 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-  - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
-    key: nightly-diffusion-x2iat-group
-    depends_on: upload-nightly-pipeline
-    if: >-
-      build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2iat-test"
-    steps:
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-Edit-2511"
-        key: nightly-diffusion-x2iat-performance-qwen-image-edit-2511
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_8
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - export CACHE_DIT_VERSION=1.5.0
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2511_vllm_omni.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
-            exit $$EXIT
   - group: ":card_index_dividers: Diffusion I2I Model Test"
     key: nightly-HunyuanImage3-x2i-test-group
     depends_on: upload-nightly-pipeline
