@@ -34,7 +34,7 @@ logger = init_logger(__name__)
 _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
 _MAX_AUDIO_TOKENS = 2048
-_AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+_AUDIO_TOKENS_PER_TEXT_TOKEN = 15
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
 _CODEC_SEED = 42
