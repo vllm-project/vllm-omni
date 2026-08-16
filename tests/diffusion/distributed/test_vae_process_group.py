@@ -29,6 +29,33 @@ def test_h3_requires_dedicated_group_only_when_smaller_than_dit_group():
     assert not requires_independent_vae_process_group("WanPipeline", 4, 2)
 
 
+@pytest.mark.parametrize(
+    ("dit_group_size", "group_size", "label"),
+    [
+        (4, 1, "rank-local VAE"),
+        (4, 4, "VAE reuses the DiT group"),
+    ],
+)
+def test_configs_without_a_dedicated_group_are_not_subject_to_the_contract(dit_group_size, group_size, label):
+    """Neither mode creates a dedicated group, so neither may be validated.
+
+    Both are accepted on main; gating validation on model capability alone
+    made them fail in ``init_device`` for a feature that was never requested.
+    """
+    del label
+    assert not requires_independent_vae_process_group("MiniMaxH3Pipeline", dit_group_size, group_size)
+    # Guard why this matters: the contract rejects these topologies outright.
+    with pytest.raises(ValueError, match="equal diffusion world_size"):
+        validate_independent_vae_parallel_config(8, dit_group_size, 2, "tile")
+
+
+def test_dedicated_group_requests_are_still_validated():
+    """The composition found in self-review must keep failing closed."""
+    assert requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 2)
+    with pytest.raises(ValueError, match="equal diffusion world_size"):
+        validate_independent_vae_parallel_config(8, 4, 2, "tile")
+
+
 def test_independent_h3_group_rejects_spatial_sharding():
     with pytest.raises(ValueError, match="tile mode only"):
         validate_independent_vae_parallel_config(4, 4, 2, "spatial_shard_height")

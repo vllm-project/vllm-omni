@@ -50,7 +50,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.vae_parallel_state import (
     initialize_vae_parallel_group,
     requires_independent_vae_process_group,
-    supports_independent_vae_process_group,
     validate_independent_vae_parallel_config,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
@@ -271,20 +270,24 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
         parallel_config = self.od_config.parallel_config
-        supports_independent_vae_group = supports_independent_vae_process_group(self.od_config.model_class_name)
-        if supports_independent_vae_group:
+        use_independent_vae_group = requires_independent_vae_process_group(
+            self.od_config.model_class_name,
+            parallel_config.world_size,
+            parallel_config.vae_patch_parallel_size,
+        )
+        if use_independent_vae_group:
             # Composition errors must fail before any collective or model load.
+            # Gate on the same predicate that decides whether a dedicated group
+            # is actually created, not on model capability: a supporting model
+            # that keeps the VAE rank-local, or that reuses the DiT group at
+            # vae == DiT size, depends on neither the DiT-equals-WORLD rule nor
+            # tile mode, and must keep the behavior it has on main.
             validate_independent_vae_parallel_config(
                 world_size,
                 parallel_config.world_size,
                 parallel_config.vae_patch_parallel_size,
                 parallel_config.vae_parallel_mode,
             )
-        use_independent_vae_group = requires_independent_vae_process_group(
-            self.od_config.model_class_name,
-            parallel_config.world_size,
-            parallel_config.vae_patch_parallel_size,
-        )
 
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
