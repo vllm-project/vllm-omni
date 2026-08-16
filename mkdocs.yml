@@ -81,6 +81,10 @@ plugins:
         user_guide/quantization/index.md: user_guide/quantization/overview.md
         design/feature/diffusion_request_level_batching.md: design/feature/diffusion_continuous_batching.md
         design/feature/diffusion_step_execution.md: design/feature/diffusion_continuous_batching.md
+        design/feature/cpu_offloading.md: design/feature/offloader/README.md
+        design/feature/model_level_offload.md: design/feature/offloader/cpu_offload.md
+        design/feature/layerwise_offload.md: design/feature/offloader/layerwise_offload.md
+        design/feature/distributed_layerwise_offload.md: design/feature/offloader/distributed_layerwise_offload.md
   - glightbox
   - git-revision-date-localized:
       # exclude files

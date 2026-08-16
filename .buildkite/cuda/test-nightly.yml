@@ -459,6 +459,12 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_ltx.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · LTX-2.5 Online Test"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_ltx25.py -m "full_model and cuda" --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         timeout_in_minutes: 180
         commands:
@@ -485,6 +491,13 @@ steps:
         commands:
           - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
           - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]' -m full_model --run-level full_model
+        mirror_hardwares: h100_1
+
+      - label: ":full_moon: Diffusion X2V · LTX-2.5 Official Parity Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_distilled_two_stage_matches_official -m full_model --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official -m full_model --run-level full_model
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Perf Test"

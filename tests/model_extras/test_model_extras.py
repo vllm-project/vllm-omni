@@ -20,6 +20,7 @@ from vllm_omni.model_extras import (
     get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
+    should_preserve_reference_image_size,
 )
 
 
@@ -230,16 +231,60 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
             "audio_rescale_scale",
             "video_stg_blocks",
             "audio_stg_blocks",
+            "sigmas",
+            "stage_1_sigmas",
+            "stage_2_sigmas",
+            "image_crf",
         }
     )
 
     for pipeline_name in (
         "LTX2Pipeline",
         "LTX2TwoStagePipeline",
+        "LTX2DistilledOneStagePipeline",
+        "LTX2DistilledTwoStagePipeline",
         "LTX2DistilledPipeline",
     ):
         assert get_extra_body_params(pipeline_name) == expected
         assert get_extra_output_params(pipeline_name) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("model_version", "expected"),
+    [("2", False), ("2.3", False), ("2.5", True)],
+)
+def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected: bool) -> None:
+    (tmp_path / "model_index.json").write_text(
+        '{"_class_name": "LTX2Pipeline", "model_version": "' + model_version + '"}'
+    )
+
+    assert (
+        should_preserve_reference_image_size(
+            None,
+            model=str(tmp_path),
+        )
+        is expected
+    )
+
+
+def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_policy(*, model, revision=None):
+        captured.update(model=model, revision=revision)
+        return True
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_components.preserves_reference_image_size",
+        fake_policy,
+    )
+
+    assert should_preserve_reference_image_size(
+        "LTX2Pipeline",
+        model="org/model",
+        revision="pinned-revision",
+    )
+    assert captured == {"model": "org/model", "revision": "pinned-revision"}
 
 
 @pytest.mark.core_model
@@ -424,6 +469,13 @@ def test_vace_extra_registry_has_no_pipeline_params() -> None:
 def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
     assert get_extra_output_params("UnknownPipeline") == frozenset()
+    assert (
+        should_preserve_reference_image_size(
+            "UnknownPipeline",
+            model="org/model",
+        )
+        is False
+    )
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
 
 

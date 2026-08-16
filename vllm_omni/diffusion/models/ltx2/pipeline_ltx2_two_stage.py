@@ -40,9 +40,13 @@ class LTX2TwoStagePipeline(_LTX2TwoStageBase):
     pipeline_recipe = LTX2_TWO_STAGE_RECIPE
 
 
-class LTX2DistilledPipeline(_LTX2TwoStageBase):
-    """Unified LTX-2/LTX-2.3 full-distilled two-stage T2V/I2V entry."""
+class LTX2DistilledTwoStagePipeline(_LTX2TwoStageBase):
+    """Merged-distilled checkpoint with latent upsampling and refinement."""
 
     pipeline_kind = "distilled_two_stage"
     component_profile = LTX2_DISTILLED_COMPONENT_PROFILE
     pipeline_recipe = LTX2_DISTILLED_TWO_STAGE_RECIPE
+
+
+# Backwards-compatible name retained for existing LTX-2/LTX-2.3 recipes.
+LTX2DistilledPipeline = LTX2DistilledTwoStagePipeline

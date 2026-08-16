@@ -19,6 +19,10 @@ ALLOWED_FILES = {
     "tests/helpers/process.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",
+    # Measures the wire size of diffusion outputs. The transport pickles them,
+    # and only pickle reproduces the per-view storage duplication under test
+    # (torch.save deduplicates shared storages). No untrusted data is loaded.
+    "tests/diffusion/test_diffusion_ipc.py",
 }
 
 PICKLE_RE = re.compile(
