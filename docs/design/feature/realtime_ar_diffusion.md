@@ -151,13 +151,23 @@ reports the measured 603 MiB per-session Wan VAE causal-convolution state.
 The current runner executes one request at a time:
 
 - `max_num_seqs` must be one;
-- request batching and diffusion step execution are rejected;
-- one AR block is generated per engine request; and
-- an AR-Diffusion stage must have exactly one replica.
+- request batching and diffusion step execution are rejected; and
+- one AR block is generated per engine request.
 
-The single-replica restriction is intentional. Multi-replica support requires
-session-affine routing so every tick, reset, and close reaches the worker that
-owns the session. Random or round-robin routing is not correct.
+An AR-Diffusion stage may be replicated. Each tick carries its `session_id`
+into dispatch, and `StagePool` pins a session to the replica that owns its
+state: the first tick is placed by the stage's ordinary load-balancing policy,
+every later tick is routed back to that replica, and the route is released on
+session reset or close. Reset and close themselves fan out to every live
+replica through the existing collective RPC and are idempotent for unknown
+session ids, so they reach the owner without the caller tracking placement.
+
+Placement is fail-closed. Session state is worker-local and is neither
+migrated nor rebuilt, so if the owning replica dies, later ticks for that
+session raise `SessionOwnerLostError` (a `StageUnavailableError`, so the
+orchestrator fails just that request) instead of silently landing on a replica
+that holds none of its state. The session stays in that state until it is
+explicitly reset or closed.
 
 Multiple resident sessions may share one runner. Capacity selection accounts
 for all persistent pools, and the runner performs LRU eviction through the same
@@ -186,7 +196,9 @@ This contract does not currently provide:
   frontend is tracked separately in
   [#5527](https://github.com/vllm-project/vllm-omni/pull/5527));
 - camera/action semantics shared by every world model;
-- session migration or replication across workers;
+- session-state migration between replicas, or rebuild/recovery after the
+  owning replica is lost;
+- byte-aware or HBM-aware session admission and placement;
 - retry of an ambiguous partially executed chunk;
 - cross-stage KV transfer; or
 - stateful streaming VAE decode.
@@ -204,7 +216,10 @@ CPU contract tests cover:
 - capacity one under the default fraction for shipped LingBot geometry;
 - capacity expansion under a tuned fraction;
 - DreamZero model-owned state accounting;
-- runner session reuse, reset, close, LRU eviction, and forward cleanup; and
+- runner session reuse, reset, close, LRU eviction, and forward cleanup;
+- session-to-replica affinity: stickiness across ticks on both dispatch paths,
+  release on reset/close, fail-closed routing after the owner is lost, and a
+  single owner under concurrent first ticks; and
 - LingBot model registration, imports, camera/action reduction, and one-block
   output metadata.
 

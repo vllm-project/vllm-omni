@@ -31,7 +31,10 @@ class ARDiffusionGenerateClient(Protocol):
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]: ...
+
+    def release_session_affinity(self, session_id: str, *, stage_ids: Sequence[int] | None = None) -> None: ...
 
 
 def _metadata_mapping(output: OmniRequestOutput) -> Mapping[str, Any]:
@@ -111,12 +114,6 @@ class ARDiffusionOmniTickConsumer:
         replica_count = getattr(stage_pools[diffusion_stage_id], "num_replicas", None)
         if isinstance(replica_count, bool) or not isinstance(replica_count, int) or replica_count < 1:
             raise ValueError("The selected AR-Diffusion stage must expose a positive num_replicas.")
-        if replica_count != 1:
-            raise ValueError(
-                "AR-Diffusion realtime sessions currently require exactly one "
-                "replica for the selected diffusion stage; session-affine "
-                f"routing is not implemented (got num_replicas={replica_count})."
-            )
         self._engine_client = engine_client
         self._prompt_provider = prompt_provider
         self._sampling_params_templates = templates
@@ -139,11 +136,15 @@ class ARDiffusionOmniTickConsumer:
     async def execute_tick(self, tick: ARDiffusionTickRequest) -> OmniRequestOutput:
         prompt = self._prompt_provider(tick)
         final_output: OmniRequestOutput | None = None
+        # Passing session_id pins every tick of this session to the replica
+        # holding its persistent AR state; the first tick is placed by the
+        # stage's ordinary load-balancing policy.
         async for output in self._engine_client.generate(
             prompt,
             request_id=tick.request_id,
             sampling_params_list=self._sampling_params_for_tick(tick),
             output_modalities=self._output_modalities,
+            session_id=tick.session_id,
         ):
             if output.stage_id != self._diffusion_stage_id:
                 continue
@@ -166,3 +167,13 @@ class ARDiffusionOmniTickConsumer:
 
     def chunk_metadata(self, output: OmniRequestOutput) -> ARDiffusionChunkMetadata:
         return _parse_chunk_metadata(output)
+
+    def release_session_route(self, session_id: str) -> None:
+        """Free the replica route pinned to ``session_id``; idempotent.
+
+        Wire this as the lifecycle's ``route_release`` so that a reset session
+        is re-placed by the load balancer and a closed one leaves no affinity
+        entry behind. Scoped to the diffusion stage this consumer submits to,
+        which is the only stage whose route it owns.
+        """
+        self._engine_client.release_session_affinity(session_id, stage_ids=[self._diffusion_stage_id])
