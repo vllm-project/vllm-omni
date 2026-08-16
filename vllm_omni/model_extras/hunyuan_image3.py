@@ -47,27 +47,6 @@ def build_x_to_text_prompt(
     )
 
 
-def build_text_to_image_prompt(
-    prompt: str,
-    negative_prompt: str | None,
-    height: int | None = None,
-    width: int | None = None,
-) -> dict[str, Any]:
-    """Build a HunyuanImage-3.0 text-to-image engine prompt.
-
-    Returns a lightweight payload only. The AR-stage prompt token-ids and
-    stop-token-ids are sourced inside the model's AR input path (driven by the
-    ``bot_task`` / ``use_system_prompt`` knobs that flow via ``extra_body`` ->
-    ``extra_args``), mirroring the MammothModa2 pattern -- the example no longer
-    tokenizes. ``height`` / ``width`` travel through OmniDiffusionSamplingParams.
-    """
-    del height, width
-    out: dict[str, Any] = {"prompt": prompt, "modalities": ["image"]}
-    if negative_prompt is not None:
-        out["negative_prompt"] = negative_prompt
-    return out
-
-
 def build_image_to_image_prompt(
     prompt: str,
     negative_prompt: str | None,

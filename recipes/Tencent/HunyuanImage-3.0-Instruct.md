@@ -8,7 +8,7 @@
 
 - Vendor: Tencent Hunyuan
 - Model: `tencent/HunyuanImage-3.0-Instruct`
-- Task: Text-to-image generation; text-to-text and image-to-text understanding
+- Task: Text-to-image generation, image editing; text-to-text and image-to-text understanding
 - Mode: Offline understanding, online serving, and performance benchmarking
 - Maintainer: Community
 
@@ -31,8 +31,12 @@ FP8/NVFP4 configuration:
 ## References
 
 - Model: <https://huggingface.co/tencent/HunyuanImage-3.0-Instruct>
-- Existing model-specific offline example:
-  [`examples/offline_inference/hunyuan_image3`](../../examples/offline_inference/hunyuan_image3)
+- Full-featured offline script (streaming CoT, KV-cache dtype control):
+  [`examples/offline_inference/hunyuan_image3/end2end.py`](../../examples/offline_inference/hunyuan_image3/end2end.py)
+- Shared T2I example:
+  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- Shared IT2I example:
+  [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py)
 - Shared T2T/I2T example:
   [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Related PRs:
@@ -66,8 +70,56 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 ```
 
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
-layout. Image-output tasks remain documented by the existing model-specific
-example and the DiT sections below.
+layout.
+
+### Shared T2I/IT2I offline examples
+
+Text-to-image and image-editing route through the shared task examples, with
+all HunyuanImage-3.0-specific knobs (`bot_task`, `use_system_prompt`,
+`system_prompt`, `negative_prompt`) declared in
+`vllm_omni/model_extras/hunyuan_image3.py` and passed via `--extra-body` /
+`--extra-args`:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
+  --trust-remote-code \
+  --prompt "A cute cat sitting on a windowsill watching the sunset" \
+  --height 1024 --width 1024 \
+  --guidance-scale 5.0 --num-inference-steps 50 --seed 42 \
+  --extra-body '{"bot_task": "think", "use_system_prompt": "en_recaption"}' \
+  --output hunyuan_t2i.png
+```
+
+```bash
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
+  --trust-remote-code \
+  --image /path/to/image.png \
+  --prompt "Make the petals neon pink" \
+  --guidance-scale 5.0 --num-inference-steps 50 --seed 42 \
+  --extra-args '{"bot_task": "think"}' \
+  --output hunyuan_edit.png
+```
+
+`image_edit.py` accepts up to 3 reference images (repeat `--image`) for
+HunyuanImage-3.0's multi-image fusion. All four shared-script paths (t2i,
+it2i, i2t, t2t) build the AR prefill and stop tokens through the same
+declarative seam (`build_ar_stage_inputs` / `build_x_to_text_prompt`, both
+wrapping `prompt_utils.build_ar_prompt_inputs`), so prompt formatting is
+identical across them. The OpenAI server's `serving_chat.py` does not go
+through this seam yet -- see that function's docstring for the resulting
+`bot_task`-resolution divergence risk when omitted from `extra_body`.
+
+### Full-featured offline script
+
+`examples/offline_inference/hunyuan_image3/end2end.py` predates the shared
+task examples above and still covers functionality they don't: streaming
+chain-of-thought display, and diffusion KV-cache dtype / skip-steps controls.
+Use it when you need those; use the shared examples above for the standard
+four-modality path otherwise.
 
 ### 4x H100/H800 80GB
 

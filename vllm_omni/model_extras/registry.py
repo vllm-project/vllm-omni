@@ -43,9 +43,6 @@ from vllm_omni.model_extras.hunyuan_image3 import (
 from vllm_omni.model_extras.hunyuan_image3 import (
     build_image_to_image_prompt as build_hunyuan_image3_image_to_image_prompt,
 )
-from vllm_omni.model_extras.hunyuan_image3 import (
-    build_text_to_image_prompt as build_hunyuan_image3_text_to_image_prompt,
-)
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
@@ -261,7 +258,6 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
         "extra_output_params": HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
         "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-        "text_to_image_prompt_builder": build_hunyuan_image3_text_to_image_prompt,
         "image_to_image_prompt_builder": build_hunyuan_image3_image_to_image_prompt,
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
         "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,

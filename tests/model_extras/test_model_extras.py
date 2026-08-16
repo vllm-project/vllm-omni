@@ -722,36 +722,6 @@ def test_hunyuan_image3_extra_registry_matches_runtime_model_class_name() -> Non
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_hunyuan_image3_text_to_image_prompt_builder() -> None:
-    # Lightweight payload only: AR token-ids / stop-tokens are sourced in the AR
-    # input path, so the builder just selects the image modality and forwards the
-    # negative prompt. height/width travel via OmniDiffusionSamplingParams.
-    assert build_text_to_image_prompt(
-        "HunyuanImage3Pipeline",
-        prompt="a red panda",
-        negative_prompt="blurry",
-        height=1024,
-        width=1024,
-    ) == {
-        "prompt": "a red panda",
-        "modalities": ["image"],
-        "negative_prompt": "blurry",
-    }
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_hunyuan_image3_text_to_image_prompt_builder_omits_negative_when_none() -> None:
-    out = build_text_to_image_prompt(
-        "HunyuanImage3Pipeline",
-        prompt="a red panda",
-        negative_prompt=None,
-    )
-    assert out == {"prompt": "a red panda", "modalities": ["image"]}
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_hunyuan_image3_image_to_image_prompt_builder() -> None:
     img = Image.new("RGB", (64, 64))
     out = build_image_to_image_prompt(
