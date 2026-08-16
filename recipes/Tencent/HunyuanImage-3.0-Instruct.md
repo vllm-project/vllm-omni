@@ -31,8 +31,6 @@ FP8/NVFP4 configuration:
 ## References
 
 - Model: <https://huggingface.co/tencent/HunyuanImage-3.0-Instruct>
-- Full-featured offline script (streaming CoT, KV-cache dtype control):
-  [`examples/offline_inference/hunyuan_image3/end2end.py`](../../examples/offline_inference/hunyuan_image3/end2end.py)
 - Shared T2I example:
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 - Shared IT2I example:
@@ -112,14 +110,6 @@ wrapping `prompt_utils.build_ar_prompt_inputs`), so prompt formatting is
 identical across them. The OpenAI server's `serving_chat.py` does not go
 through this seam yet -- see that function's docstring for the resulting
 `bot_task`-resolution divergence risk when omitted from `extra_body`.
-
-### Full-featured offline script
-
-`examples/offline_inference/hunyuan_image3/end2end.py` predates the shared
-task examples above and still covers functionality they don't: streaming
-chain-of-thought display, and diffusion KV-cache dtype / skip-steps controls.
-Use it when you need those; use the shared examples above for the standard
-four-modality path otherwise.
 
 ### 4x H100/H800 80GB
 
