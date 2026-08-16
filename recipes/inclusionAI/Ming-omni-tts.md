@@ -40,7 +40,7 @@ Other hardware is welcome as community validation lands.
 Launch the two-stage talker:
 
 ```bash
-vllm-omni serve inclusionAI/Ming-omni-tts-16.8B-A3B --omni --port 8091
+vllm serve inclusionAI/Ming-omni-tts-16.8B-A3B --omni --port 8091
 ```
 
 #### Verification

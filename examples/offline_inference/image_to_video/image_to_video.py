@@ -68,6 +68,7 @@ from vllm_omni.model_extras import (
 from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
+    should_preserve_reference_image_size,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -454,7 +455,13 @@ def main():
 
     media_inputs: dict[str, Any] = {}
     if image is not None:
-        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        preserve_image_size = should_preserve_reference_image_size(
+            model_class_name,
+            model=args.model,
+        )
+        media_inputs["image"] = (
+            image if preserve_image_size else image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        )
     if last_image is not None:
         media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if mask_image is not None:

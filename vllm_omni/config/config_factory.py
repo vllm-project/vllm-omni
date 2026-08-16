@@ -15,6 +15,7 @@ from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
@@ -43,6 +44,39 @@ logger = init_logger(__name__)
 # defaults can't drift apart. This is the light slice; the full device-layout
 # centralization is tracked as a follow-up.
 _DEFAULT_PARALLEL_DEGREE = 1
+
+
+@functools.cache
+def _materialize_object_storage_configs(model: str) -> str:
+    """Materialize an object-storage model URI's config files locally.
+
+    vLLM's Run:AI streamer keeps ``s3://``/``gs://``/``az://`` URIs opaque until
+    each stage builds its ``ModelConfig``; parent-process resolution (HF config
+    lookup, pipeline/pipeline-key matching) would instead hand the URI to
+    ``huggingface_hub`` helpers, which reject it with ``HFValidationError``.
+    Pull the lightweight files once into vLLM's deterministic
+    ``model_streamer/<hash>`` directory so config reads work here, and so the
+    stage processes' own pull lands in that same directory.
+
+    Returns the input unchanged for non object-storage paths.
+    """
+    if not is_runai_obj_uri(model):
+        return model
+    object_storage_model = ObjectStorageModel(url=model)
+    object_storage_model.pull_files(model, allow_pattern=["*.model", "*.py", "*.json"])
+    logger.info("Materialized object-storage configs for %s at %s", model, object_storage_model.dir)
+    return object_storage_model.dir
+
+
+def _name_match_candidate(model: str) -> str:
+    """Last path component of a model reference, used for name-based matching.
+
+    Object-storage URIs and HF repo ids carry non-model segments (bucket name,
+    organization) that must not participate in substring matching; e.g. a
+    bucket named ``qwen3-tts-models`` holding a ``Qwen3-Omni`` checkpoint must
+    not resolve to the ``qwen3_tts`` pipeline.
+    """
+    return model.rstrip("/").rsplit("/", 1)[-1]
 
 
 def with_trust_remote_code_override(
@@ -117,7 +151,7 @@ class StageConfigFactory:
         """
         hf_config = None
         try:
-            return get_config(model, trust_remote_code=trust_remote_code)
+            return get_config(_materialize_object_storage_configs(model), trust_remote_code=trust_remote_code)
         except Exception as e:
             logger.debug(f"`get_config` failed with exception {e}; inferred HF config is None")
         return hf_config
@@ -163,10 +197,12 @@ class StageConfigFactory:
         if hf_config is not None:
             return hf_config.model_type
 
+        config_source = _materialize_object_storage_configs(model)
+
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
         try:
-            config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+            config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
             if config_dict:
                 if "model_type" in config_dict:
                     return config_dict["model_type"]
@@ -183,7 +219,7 @@ class StageConfigFactory:
         # model_index.json with _class_name that maps to a pipeline key via
         # PipelineConfig.diffusers_class_name.
         try:
-            model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+            model_index = get_hf_file_to_dict("model_index.json", config_source, revision=None)
             if model_index and "_class_name" in model_index:
                 class_name = model_index["_class_name"]
                 for obj in OMNI_PIPELINES.values():
@@ -203,8 +239,10 @@ class StageConfigFactory:
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path
         # basename against registered pipeline keys — longest match wins
-        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9).
-        model_lower = model.lower().replace("-", "").replace("_", "")
+        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9). Only
+        # the basename is scanned so URI segments such as the bucket name
+        # cannot select an unrelated pipeline.
+        model_lower = _name_match_candidate(model).lower().replace("-", "").replace("_", "")
         best: str | None = None
         best_len = 0
         for registered_key in OMNI_PIPELINES.keys():

@@ -298,6 +298,60 @@ class DiffusersPipelineLoader:
         for source in sources:
             yield from self._get_weights_iterator(source, model=model)
 
+    @staticmethod
+    def _stream_online_quant_weights_to_cpu(
+        model: nn.Module,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Offload each online-quantized layer as soon as it is complete.
+
+        Upstream vLLM's online layerwise loader materializes and quantizes a
+        layer synchronously while consuming ``weights``.  Generator execution
+        resumes after that weight has been consumed, which gives us a safe
+        point to move completed layers to CPU before the next layer is loaded.
+        This bounds accelerator residency during CPU-offloaded model startup
+        instead of retaining the entire quantized model until loading ends.
+        """
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            get_layerwise_info,
+        )
+
+        pending = {
+            module
+            for module in model.modules()
+            if getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
+            and get_layerwise_info(module).can_load()
+        }
+        offloaded = 0
+
+        def offload_completed() -> None:
+            nonlocal offloaded
+            for module in tuple(pending):
+                if get_layerwise_info(module).can_load():
+                    continue
+                module.to("cpu")
+                pending.remove(module)
+                offloaded += 1
+
+        for weight in weights:
+            # This runs after the consumer has handled the previous yield.
+            offload_completed()
+            yield weight
+        offload_completed()
+
+        # Quantization workspaces and the old accelerator-side parameter
+        # storages are now reusable cache blocks.  Release them before the
+        # remaining (unquantized) model tensors are copied to CPU; otherwise
+        # the cached quantization footprint and final offload overlap in the
+        # process-level startup peak.
+        if offloaded:
+            torch.accelerator.empty_cache()
+
+        logger.info(
+            "Stream-offloaded %d online-quantized layers to CPU during weight loading",
+            offloaded,
+        )
+
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
             cast(
@@ -403,7 +457,10 @@ class DiffusersPipelineLoader:
                     if load_format == "diffusers":
                         cast(DiffusersAdapterPipeline, model).load_weights()
                     else:
-                        self.load_weights(model)
+                        if offload_after_quant:
+                            self.load_weights(model, stream_online_quant_to_cpu=True)
+                        else:
+                            self.load_weights(model)
                     self._process_weights_after_loading(model, target_device)
 
             if offload_after_quant:
@@ -498,6 +555,14 @@ class DiffusersPipelineLoader:
                 continue
 
             if has_online_quant:
+                # finalize_layerwise_processing() and the synchronous online
+                # loader already processed these layers.  Avoid moving their
+                # quantized CPU weights back to the accelerator merely to call
+                # an idempotent no-op; doing so rebuilds a large CUDA allocator
+                # cache and defeats streaming CPU offload's startup-memory bound.
+                if getattr(module, "_already_called_process_weights_after_loading", False):
+                    continue
+
                 # Online quant may leave straggler params on the ``meta`` device.
                 # Move only real (non-meta) params onto the target device for
                 # processing and restore them afterward, mirroring upstream vLLM's
@@ -535,9 +600,17 @@ class DiffusersPipelineLoader:
                 if needs_device_move:
                     module.to(module_device)
 
-    def load_weights(self, model: nn.Module) -> None:
+    def load_weights(
+        self,
+        model: nn.Module,
+        *,
+        stream_online_quant_to_cpu: bool = False,
+    ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
-        loaded_weights = model.load_weights(self.get_all_weights(model))
+        weights = self.get_all_weights(model)
+        if stream_online_quant_to_cpu:
+            weights = self._stream_online_quant_weights_to_cpu(model, weights)
+        loaded_weights = model.load_weights(weights)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

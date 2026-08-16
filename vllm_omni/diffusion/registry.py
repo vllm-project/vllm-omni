@@ -76,6 +76,16 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_two_stage",
         "LTX2TwoStagePipeline",
     ),
+    "LTX2DistilledOneStagePipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2DistilledOneStagePipeline",
+    ),
+    "LTX2DistilledTwoStagePipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2DistilledTwoStagePipeline",
+    ),
     "LTX2DistilledPipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
@@ -125,6 +135,11 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2_i2v",
         "WanI2VDMD2Pipeline",
+    ),
+    "LingBotWorldCausalDMDPipeline": (
+        "lingbot_world",
+        "pipeline",
+        "LingBotWorldCausalDMDPipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -343,6 +358,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    "LingBotWorldCausalDMDPipeline",
 }
 
 
@@ -522,6 +538,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
@@ -535,6 +553,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
@@ -595,6 +614,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",

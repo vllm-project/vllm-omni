@@ -110,6 +110,85 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_stream_online_quant_weights_offloads_layers_after_processing():
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        get_layerwise_info,
+    )
+
+    events: list[str] = []
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _TrackedLayer(nn.Linear):
+        def __init__(self, name: str):
+            super().__init__(2, 2, bias=False)
+            self.name = name
+            self.quant_method = _OnlineQuantMethod()
+            get_layerwise_info(self).load_numel_total = self.weight.numel()
+
+        def to(self, *args, **kwargs):
+            events.append(self.name)
+            return super().to(*args, **kwargs)
+
+    class _StreamingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = _TrackedLayer("first")
+            self.second = _TrackedLayer("second")
+
+    model = _StreamingModel()
+    weights = iter(
+        [
+            ("first.weight", torch.zeros((2, 2))),
+            ("second.weight", torch.zeros((2, 2))),
+        ]
+    )
+    streamed = DiffusersPipelineLoader._stream_online_quant_weights_to_cpu(model, weights)
+
+    assert next(streamed)[0] == "first.weight"
+    get_layerwise_info(model.first).reset()
+    assert next(streamed)[0] == "second.weight"
+    assert events == ["first"]
+
+    get_layerwise_info(model.second).reset()
+    with pytest.raises(StopIteration):
+        next(streamed)
+    assert events == ["first", "second"]
+
+
+def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _TrackedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2, bias=False)
+            self.to_calls: list[object] = []
+
+        def to(self, *args, **kwargs):
+            self.to_calls.append(args[0] if args else kwargs.get("device"))
+            return super().to(*args, **kwargs)
+
+    model = nn.Module()
+    model.layer = _TrackedLayer()
+    quant_method = Mock(spec=QuantizeMethodBase)
+    quant_method.uses_meta_device = True
+    model.layer.quant_method = quant_method
+    model.layer._already_called_process_weights_after_loading = True
+    finalize = Mock()
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+
+    loader = _make_loader_with_weights([])
+    loader._process_weights_after_loading(model, torch.device("cuda"))
+
+    finalize.assert_called_once_with(model, model_config=None)
+    quant_method.process_weights_after_loading.assert_not_called()
+    assert model.layer.to_calls == []
+
+
 class _ConfigAwareModel(nn.Module):
     def __init__(self, *, od_config):
         super().__init__()

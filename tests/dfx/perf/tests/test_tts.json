@@ -424,10 +424,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              82.1886
+              82.6344
             ],
             "median_audio_rtf": [
-              0.1241
+              0.1277
             ]
           }
         }
@@ -453,13 +453,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              160.9168
+              170.3737
             ],
             "median_audio_rtf": [
-              0.1907
+              0.2076
             ],
             "audio_throughput": [
-              39.2332
+              37.0834
             ]
           }
         }
@@ -485,13 +485,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              100.1265
+              101.0293
             ],
             "median_audio_rtf": [
-              0.1437
+              0.1498
             ],
             "audio_throughput": [
-              11.7605
+              10.1186
             ]
           }
         }
