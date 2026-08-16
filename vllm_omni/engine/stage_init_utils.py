@@ -1110,6 +1110,8 @@ def build_engine_args_dict_from_omni_stage_config(
         has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
         sampling_extra_args_keys=_sampling_extra_args_keys(stage_config.model_config.default_sampling_params),
     )
+
+
 def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
     """Fail early when a stage's world size cannot fit its assigned ``devices``.
 
@@ -1151,6 +1153,8 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
             "Or omit the top-level --tensor-parallel-size and set it only in "
             "stage-0's override."
         ) from e
+
+
 def build_vllm_config(
     stage_config: Any,
     model: str,

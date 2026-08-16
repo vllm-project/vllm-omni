@@ -12,10 +12,12 @@ tensor_parallel_size=4 while still holding a single-GPU deploy default. Without
 import json
 import re
 import types
+from unittest import mock
 
 import pytest
 
-from vllm_omni.engine.stage_init_utils import _check_stage_device_layout
+from vllm_omni.engine import stage_init_utils
+from vllm_omni.engine.stage_init_utils import _check_stage_device_layout, build_vllm_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -91,3 +93,58 @@ def test_replica_pool_layout_passes():
     """Pool mode: num_replicas=2 x tp=2 => 4 devices is a valid pool shape."""
     stage = _stage(0, devices="0,1,2,3", num_replicas=2)
     _check_stage_device_layout(stage, {"tensor_parallel_size": 2})
+
+
+def test_build_vllm_config_fails_before_engine_config_on_mismatch():
+    """Pin the production wiring: ``build_vllm_config`` must run the device-layout
+    guard *before* ``create_engine_config``. If the guard call is dropped or moved
+    after engine-config creation, #5003 regresses while the unit tests above stay
+    green — so assert here that a mismatched stage raises and that neither
+    ``create_engine_config`` nor ``Executor.get_class`` is reached."""
+    stage = _stage(0, devices="0")
+    with (
+        mock.patch.object(stage_init_utils.OmniEngineArgs, "create_engine_config") as create_engine_config,
+        mock.patch.object(stage_init_utils.Executor, "get_class") as get_class,
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            build_vllm_config(
+                stage,
+                model="dummy-model",
+                engine_args_dict={
+                    "tensor_parallel_size": 4,
+                    "data_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                },
+            )
+    msg = str(excinfo.value)
+    assert "Stage 0" in msg
+    assert "--stage-overrides" in msg
+    # Guard fired early: worker/config construction was never reached.
+    create_engine_config.assert_not_called()
+    get_class.assert_not_called()
+
+
+def test_build_vllm_config_proceeds_on_consistent_layout():
+    """The guard must not false-positive: a consistent single-GPU stage flows past
+    it and reaches ``create_engine_config`` / ``Executor.get_class`` as usual."""
+    stage = _stage(1, devices="1")
+    fake_config = types.SimpleNamespace(
+        quant_config=None,
+        model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
+    )
+    sentinel_executor = object()
+    with (
+        mock.patch.object(
+            stage_init_utils.OmniEngineArgs, "create_engine_config", return_value=fake_config
+        ) as create_engine_config,
+        mock.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor),
+        mock.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant),
+    ):
+        vllm_config, executor_class = build_vllm_config(
+            stage,
+            model="dummy-model",
+            engine_args_dict={"tensor_parallel_size": 1},
+        )
+    create_engine_config.assert_called_once()
+    assert vllm_config is fake_config
+    assert executor_class is sentinel_executor
