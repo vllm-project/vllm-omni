@@ -333,6 +333,15 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
     return _extract_generated_image(outputs)
 
 
+# A floor for "this is recognizably the same generation" against each
+# case's precomputed reference embedding, not a quality bar -- catches a
+# gross migration regression (wrong/blank/garbage image, or the wrong
+# system prompt applied) without being flaky on run-to-run sampling noise.
+# Matches the threshold test_shared_script_ar_path_reaches_generation uses
+# for its own (seed=1234, en_recaption) comparison below.
+MIN_SEMANTIC_SIMILARITY = 0.5
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)
 def test_system_prompt_scores(
@@ -347,6 +356,12 @@ def test_system_prompt_scores(
     score = compare_semantic(expected_embedding, generated_image, clip_model, clip_processor)
 
     print(f"{system_prompt_name}: CLIP cosine similarity = {score:.6f}")
+    assert score >= MIN_SEMANTIC_SIMILARITY, (
+        f"{system_prompt_name}: CLIP similarity {score:.4f} is below "
+        f"{MIN_SEMANTIC_SIMILARITY} against the reference (seed=1234) embedding -- "
+        "the migrated path may have diverged from the reference HunyuanImage-3.0 "
+        f"output for use_system_prompt={use_system_prompt!r}."
+    )
 
 
 def _load_text_to_image_module():
@@ -438,15 +453,10 @@ def test_shared_script_ar_path_reaches_generation(
     generated_image = _extract_generated_image(outputs)
     score = compare_semantic(SYSTEM_EN_RECAPTION, generated_image, clip_model, clip_processor)
     print(f"shared-script AR path (en_recaption): CLIP cosine similarity = {score:.6f}")
-    # test_system_prompt_scores exercises this same (seed=1234, en_recaption)
-    # case through the hand-constructed extra_args path but only prints its
-    # score, so there's no in-repo reference value for this exact comparison
-    # to calibrate against. MIN_SEMANTIC_SIMILARITY is deliberately loose --
-    # a floor for "this is recognizably the same generation," not a quality
-    # bar -- so it catches a gross migration regression (wrong/blank/garbage
-    # image) without being flaky on run-to-run sampling noise. Tighten once
-    # a live run gives us a real score to calibrate against.
-    MIN_SEMANTIC_SIMILARITY = 0.5
+    # test_system_prompt_scores now asserts this same (seed=1234, en_recaption)
+    # case through the hand-constructed extra_args path against the same
+    # module-level MIN_SEMANTIC_SIMILARITY floor, so this reuses it too rather
+    # than picking an independent threshold for the same comparison.
     assert score >= MIN_SEMANTIC_SIMILARITY, (
         f"shared-script AR path (en_recaption) CLIP similarity {score:.4f} is below "
         f"{MIN_SEMANTIC_SIMILARITY} -- the migrated get_ar_input_builder path may have "

@@ -3017,11 +3017,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ar_image_size: str | None = None
             if height is not None and width is not None:
                 ar_image_size = f"{width}x{height}"
+            # Reuse build_kwargs's own (possibly-omitted) "bot_task" entry rather
+            # than the raw outer `bot_task` variable: build_prompt_tokens/build_prompt
+            # above default an omitted bot_task per-task (e.g. "think" for t2i), and
+            # resolve_stop_token_ids must normalize from that same omitted-or-not
+            # starting point to agree on which stop tokens apply -- passing the raw
+            # `bot_task` (still None when omitted) made the two calls disagree.
+            ar_stop_kwargs: dict[str, Any] = {}
+            if "bot_task" in build_kwargs:
+                ar_stop_kwargs["bot_task"] = build_kwargs["bot_task"]
             ar_stop_token_ids = resolve_stop_token_ids(
                 task=ar_task,
-                bot_task=bot_task,
                 tokenizer=tokenizer,
                 image_size=ar_image_size,
+                **ar_stop_kwargs,
             )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}

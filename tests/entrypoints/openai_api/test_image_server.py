@@ -2202,3 +2202,56 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
         assert captured_prompt["prompt"].count("<img>") == 2, (
             f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
         )
+
+
+def test_image_edits_omitted_bot_task_stop_tokens_match_prompt_default(
+    async_omni_stage_configs_only_client,
+):
+    """Regression: an omitted bot_task must resolve identically for the AR
+    prompt and its stop_token_ids.
+
+    build_prompt/build_prompt_tokens default an omitted bot_task per-task
+    (e.g. "think" for the base "it2i" task, since it isn't itself a key in
+    _TASK_PRESETS). resolve_stop_token_ids must land on that same default
+    to compute the matching stop set. Passing the raw (still-None) outer
+    bot_task variable to resolve_stop_token_ids -- instead of mirroring
+    build_kwargs's own omitted-or-not "bot_task" entry -- made it normalize
+    bot_task=None instead of "think", so it fell through to the full
+    <img_ratio_*> stop range instead of the think/recaption-only pair.
+
+    An explicit (non-"auto") size is required to reach this: with
+    need_ratio=True (size="auto"), resolve_stop_token_ids returns the full
+    ratio range regardless of bot_task, so the two code paths only visibly
+    disagree once a concrete size selects the narrower think/recaption stop
+    set.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+
+    img = make_test_image_bytes((64, 64))
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", img)],
+        data={
+            "prompt": "make it neon",
+            "size": "512x512",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+
+    ar_params = captured[0]
+    expected_stop_token_ids = [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+    ]
+    assert ar_params.stop_token_ids == expected_stop_token_ids, (
+        f"omitted bot_task with an explicit size must resolve stop_token_ids "
+        f"for the default 'think' bot_task ({expected_stop_token_ids}); got "
+        f"{ar_params.stop_token_ids} -- this is the full ratio range, meaning "
+        "resolve_stop_token_ids disagreed with build_prompt_tokens's default."
+    )
