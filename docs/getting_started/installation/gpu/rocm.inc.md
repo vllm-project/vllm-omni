@@ -1,6 +1,6 @@
 # --8<-- [start:requirements]
 
-- GPU: Validated on gfx942 (It should be supported on the AMD GPUs that are supported by vLLM.)
+- GPU: Validated on gfx942 and gfx1151 (AMD Ryzen AI Max / Strix Halo).
 
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
@@ -109,6 +109,28 @@ docker run --rm -it \
 --entrypoint bash \
 vllm-omni-rocm
 ```
+
+#### gfx1151
+
+For gfx1151, set `VLLM_ROCM_USE_AITER=0` before running vLLM-Omni. When using
+Docker, pass the setting into the container:
+
+```bash
+docker run --rm \
+  --group-add=video \
+  --ipc=host \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --env VLLM_ROCM_USE_AITER=0 \
+  -p 8091:8091 \
+  vllm-omni-rocm \
+  --model <model> --port 8091
+```
+
+gfx1151 systems use unified memory. Adjust the VRAM allocation and
+`gpu_memory_utilization` settings for the memory available on the system.
 
 # --8<-- [end:build-docker]
 
