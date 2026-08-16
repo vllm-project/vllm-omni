@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -11,6 +10,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.utils.dynamic_import import load_callable
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -64,9 +64,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
-            module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            self.custom_process_next_stage_input_func = getattr(module, func_name)
+            self.custom_process_next_stage_input_func = load_callable(
+                custom_process_next_stage_input_func,
+                context="OmniChunkTransferAdapter.__init__ custom_process_next_stage_input_func",
+            )
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)

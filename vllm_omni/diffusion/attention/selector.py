@@ -10,7 +10,6 @@ This module resolves diffusion attention backends from:
 
 from __future__ import annotations
 
-import importlib
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -19,6 +18,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
 )
+from vllm_omni.utils.dynamic_import import load_callable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
@@ -36,15 +36,7 @@ def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
     Returns:
         The loaded backend class
     """
-    module_path, class_name = cls_path.rsplit(".", 1)
-    try:
-        module = importlib.import_module(module_path)
-        backend_class = getattr(module, class_name)
-        return backend_class
-    except ImportError as e:
-        raise ImportError(f"Failed to import module {module_path}: {e}")
-    except AttributeError as e:
-        raise AttributeError(f"Class {class_name} not found in module: {e}")
+    return load_callable(cls_path, context=f"diffusion attention backend {cls_path!r}")
 
 
 @cache

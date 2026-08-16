@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import importlib
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -16,6 +15,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.dynamic_import import load_callable
 
 logger = init_logger(__name__)
 
@@ -708,8 +708,10 @@ def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
     else:
         # Built-in model (relative path convention)
         module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
-    module = importlib.import_module(module_name)
-    func = getattr(module, func_name)
+    func = load_callable(
+        f"{module_name}.{func_name}",
+        context=f"_load_process_func({od_config.model_class_name!r}) {func_name}",
+    )
     return func(od_config)
 
 

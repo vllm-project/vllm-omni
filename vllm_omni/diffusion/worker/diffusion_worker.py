@@ -28,7 +28,6 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.transformers_utils.config import get_hf_text_config
-from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -60,6 +59,7 @@ from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
+from vllm_omni.utils.dynamic_import import load_callable
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
@@ -257,7 +257,9 @@ class DiffusionWorker:
             model_runner_cls_path = engine_runner
         else:
             model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
-        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        model_runner_cls = load_callable(
+            model_runner_cls_path, context="DiffusionWorker.__init__(rank={self.rank}) diffusion_model_runner_cls"
+        )
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
@@ -907,7 +909,10 @@ class WorkerProc:
     ) -> "WorkerWrapperBase":
         """Create a worker instance. Override in subclasses for different worker types."""
         worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
-        base_worker_class = resolve_obj_by_qualname(worker_cls_path)
+        base_worker_class = load_callable(
+            worker_cls_path,
+            context="WorkerProc._create_worker diffusion_worker_cls",
+        )
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
@@ -1410,7 +1415,10 @@ class WorkerWrapperBase:
 
         if self.worker_extension_cls:
             if isinstance(self.worker_extension_cls, str):
-                worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+                worker_extension_cls = load_callable(
+                    self.worker_extension_cls,
+                    context="WorkerWrapperBase._prepare_worker_class worker_extension_cls",
+                )
             else:
                 worker_extension_cls = self.worker_extension_cls
             extended_calls = []

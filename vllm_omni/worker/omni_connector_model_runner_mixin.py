@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
 )
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.utils.dynamic_import import load_callable
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
     merge_tensor_spans,
@@ -2165,20 +2166,20 @@ class OmniConnectorModelRunnerMixin:
                 continue
             tried.add(func_path)
             try:
-                module_path, func_name = func_path.rsplit(".", 1)
-                module = importlib.import_module(module_path)
-                func = getattr(module, func_name, None)
-                if callable(func):
-                    if not OmniConnectorModelRunnerMixin._is_connector_payload_builder(func):
-                        logger.debug(
-                            "Skipping incompatible connector payload hook %s; signature=%s",
-                            func_path,
-                            inspect.signature(func),
-                        )
-                        continue
-                    return func_path, func
-            except Exception:
+                func = load_callable(func_path, context=f"_load_connector_payload_builder {func_path!r}")
+            except ValueError:
+                # candidates may include derived probe paths (e.g. _full_payload, _batch
+                # suffixes) that are not guaranteed to exist; silently skip missing ones.
                 logger.warning("Failed to load custom func: %s", func_path, exc_info=True)
+                continue
+            if not OmniConnectorModelRunnerMixin._is_connector_payload_builder(func):
+                logger.debug(
+                    "Skipping incompatible connector payload hook %s; signature=%s",
+                    func_path,
+                    inspect.signature(func),
+                )
+                continue
+            return func_path, func
 
         return None, None
 

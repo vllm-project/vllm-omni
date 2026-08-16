@@ -18,7 +18,6 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
-from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
@@ -49,6 +48,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.dynamic_import import load_callable
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
@@ -90,10 +90,10 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
     if isinstance(pipeline_cls, type):
         return pipeline_cls
     if isinstance(pipeline_cls, str):
-        try:
-            return resolve_obj_by_qualname(pipeline_cls)
-        except (AttributeError, ImportError, ValueError) as exc:
-            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+        return load_callable(
+            pipeline_cls,
+            context="_resolve_custom_pipeline_cls pipeline_class",
+        )
     raise TypeError(
         f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
         f"got {type(pipeline_cls).__name__}"
@@ -668,12 +668,10 @@ class DiffusionEngine:
         if backend == "default":
             return DiffusionEngine
         if isinstance(backend, str):
-            try:
-                engine_class = resolve_obj_by_qualname(backend)
-            except (ImportError, ValueError) as e:
-                raise ValueError(
-                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid python path. Error: {e}"
-                ) from e
+            engine_class = load_callable(
+                backend,
+                context="DiffusionEngine.resolve_engine_class engine_backend",
+            )
             if not issubclass(engine_class, DiffusionEngine):
                 raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
             return engine_class

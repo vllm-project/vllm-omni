@@ -4,9 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm.utils.import_utils import resolve_obj_by_qualname
-
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.utils.dynamic_import import load_callable
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -43,13 +42,10 @@ class DiffusionExecutor(ABC):
         elif distributed_executor_backend == "external_launcher":
             raise NotImplementedError("external_launcher backend is not yet supported.")
         elif isinstance(distributed_executor_backend, str):
-            try:
-                executor_class = resolve_obj_by_qualname(distributed_executor_backend)
-            except (ImportError, ValueError) as e:
-                raise ValueError(
-                    f"Failed to load executor backend '{distributed_executor_backend}'. "
-                    f"Ensure it is a valid python path. Error: {e}"
-                ) from e
+            executor_class = load_callable(
+                distributed_executor_backend,
+                context="DiffusionExecutor.__init__ distributed_executor_backend",
+            )
 
             if not issubclass(executor_class, DiffusionExecutor):
                 raise TypeError(

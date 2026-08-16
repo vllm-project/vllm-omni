@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import copy
 import fcntl
-import importlib
 import multiprocessing as mp
 import os
 import time
@@ -42,6 +41,7 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
+from vllm_omni.utils.dynamic_import import load_callable
 
 logger = init_logger(__name__)
 
@@ -413,20 +413,26 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
     if _cpif_path:
-        mod_path, fn_name = _cpif_path.rsplit(".", 1)
-        custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
+        custom_process_input_func = load_callable(
+            _cpif_path,
+            context=f"extract_stage_metadata stage {stage_id} custom_process_input_func",
+        )
 
     prompt_expand_func: Callable | None = None
     _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
     if _pef_path:
-        _mod, _fn = _pef_path.rsplit(".", 1)
-        prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
+        prompt_expand_func = load_callable(
+            _pef_path,
+            context=f"extract_stage_metadata stage {stage_id} prompt_expand_func",
+        )
 
     cfg_kv_collect_func: Callable | None = None
     _ckf_path = _get_attr_or_item(stage_config, "cfg_kv_collect_func")
     if _ckf_path:
-        _mod, _fn = _ckf_path.rsplit(".", 1)
-        cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
+        cfg_kv_collect_func = load_callable(
+            _ckf_path,
+            content=f"extract_stage_metadata stage {stage_id} cfg_kv_collect_func",
+        )
 
     model_stage = engine_args.get("model_stage")
 

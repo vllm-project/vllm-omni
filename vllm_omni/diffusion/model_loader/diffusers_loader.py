@@ -25,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import file_exists
-from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -42,6 +41,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.utils.dynamic_import import load_callable
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -99,7 +99,10 @@ def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> typ
     if custom_pipeline_name is None:
         raise ValueError("custom_pipeline_name is required for load_format='custom_pipeline'")
     if isinstance(custom_pipeline_name, str):
-        return resolve_obj_by_qualname(custom_pipeline_name)
+        return load_callable(
+            custom_pipeline_name,
+            context="_resolve_custom_pipeline_cls custom_pipeline_name",
+        )
     if isinstance(custom_pipeline_name, type):
         return custom_pipeline_name
     raise TypeError(
