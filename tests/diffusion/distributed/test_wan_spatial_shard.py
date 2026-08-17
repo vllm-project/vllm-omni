@@ -6,18 +6,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     DistributedAutoencoderKLWan,
 )
 from vllm_omni.platforms import current_omni_platform
 
-# Module-level markers apply to the CPU unit tests below. The multi-GPU
-# correctness test at the end of the file adds the nightly/distributed markers
-# and a skip guard so it only runs where >= 2 CUDA devices are available.
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+# CPU unit tests are marked core_model + cpu. The multi-GPU correctness test at
+# the end uses hardware_test (H100 x2) plus full_model / diffusion / parallel.
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_pads_uneven_height():
     x = torch.arange(1 * 1 * 1 * 5 * 2, dtype=torch.float32).reshape(1, 1, 1, 5, 2)
 
@@ -34,6 +35,8 @@ def test_split_for_parallel_decode_pads_uneven_height():
     assert torch.equal(local[..., 1, :], torch.zeros_like(local[..., 1, :]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_pads_uneven_width():
     x = torch.arange(1 * 1 * 1 * 2 * 5, dtype=torch.float32).reshape(1, 1, 1, 2, 5)
 
@@ -51,6 +54,8 @@ def test_split_for_parallel_decode_pads_uneven_width():
     assert torch.equal(local[..., :, 1], torch.zeros_like(local[..., :, 1]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_invalid_split_dim():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -64,6 +69,8 @@ def test_split_for_parallel_decode_rejects_invalid_split_dim():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_zero_world_size():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -76,6 +83,8 @@ def test_split_for_parallel_decode_rejects_zero_world_size():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_for_parallel_decode_rejects_rank_out_of_range():
     x = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
 
@@ -88,6 +97,8 @@ def test_split_for_parallel_decode_rejects_rank_out_of_range():
         )
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_height(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -104,6 +115,8 @@ def test_gather_and_trim_height(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_width(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -120,6 +133,8 @@ def test_gather_and_trim_width(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 3))
 
@@ -136,6 +151,8 @@ def test_gather_and_trim_rank0_only_assembles_on_rank0(monkeypatch: pytest.Monke
     assert torch.equal(out.flatten(), torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (1, 3))
 
@@ -156,6 +173,8 @@ def test_gather_and_trim_rank0_only_returns_empty_on_non_zero_rank(monkeypatch: 
     assert out.numel() == 0
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_reshard_from_trimmed_height_pads_invalid_rows(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (2, 3))
 
@@ -183,6 +202,8 @@ def test_reshard_from_trimmed_height_pads_invalid_rows(monkeypatch: pytest.Monke
     assert torch.equal(out.flatten(), torch.tensor([4.0, 0.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_reshard_from_trimmed_width_pads_invalid_columns(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (2, 3))
 
@@ -210,6 +231,130 @@ def test_reshard_from_trimmed_width_pads_invalid_columns(monkeypatch: pytest.Mon
     assert torch.equal(out.flatten(), torch.tensor([4.0, 0.0]))
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["height", "width"])
+@pytest.mark.parametrize(
+    ("full_extent", "world_size"),
+    [
+        pytest.param(5, 4, id="four-ranks-empty-tail"),
+        pytest.param(20, 8, id="production-eight-ranks-empty-tail"),
+        pytest.param(39, 2, id="two-ranks-partial-tail"),
+    ],
+)
+def test_reshard_from_trimmed_extent_clamps_and_reconstructs(
+    monkeypatch: pytest.MonkeyPatch,
+    split_dim: str,
+    full_extent: int,
+    world_size: int,
+):
+    local_extent = (full_extent + world_size - 1) // world_size
+    shape = (1, 1, 1, full_extent, 1) if split_dim == "height" else (1, 1, 1, 1, full_extent)
+    x = torch.arange(full_extent, dtype=torch.float32).reshape(shape)
+    outputs = []
+
+    for rank in range(world_size):
+        monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group, rank=rank: (rank, world_size))
+        token = wan_spatial_shard._SPATIAL_SHARD_CONTEXT.set(
+            wan_spatial_shard.SpatialShardContext(
+                input_extent=full_extent,
+                local_input_extent=local_extent,
+                split_dim=split_dim,
+                rank=rank,
+                world_size=world_size,
+            )
+        )
+        try:
+            out = wan_spatial_shard.reshard_from_trimmed_extent(
+                x,
+                local_extent=local_extent,
+                split_dim=split_dim,
+                group=object(),
+            )
+        finally:
+            wan_spatial_shard._SPATIAL_SHARD_CONTEXT.reset(token)
+
+        start = rank * local_extent
+        valid_extent = min(local_extent, max(0, full_extent - start))
+        expected = torch.zeros(local_extent, dtype=torch.float32)
+        if valid_extent:
+            expected[:valid_extent] = torch.arange(start, start + valid_extent, dtype=torch.float32)
+        assert out.shape[_spatial_dim_for_test(split_dim)] == local_extent
+        assert torch.equal(out.flatten(), expected)
+        outputs.append(out)
+
+    reconstructed = torch.cat(outputs, dim=_spatial_dim_for_test(split_dim))
+    reconstructed = reconstructed.narrow(_spatial_dim_for_test(split_dim), 0, full_extent)
+    assert torch.equal(reconstructed, x)
+
+
+def _spatial_dim_for_test(split_dim: str) -> int:
+    return -2 if split_dim == "height" else -1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reshard_from_trimmed_extent_rejects_rank_mismatch(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (1, 2))
+    x = torch.zeros((1, 1, 1, 1, 4), dtype=torch.float32)
+    token = wan_spatial_shard._SPATIAL_SHARD_CONTEXT.set(
+        wan_spatial_shard.SpatialShardContext(
+            input_extent=4,
+            local_input_extent=2,
+            split_dim="width",
+            rank=0,
+            world_size=2,
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="group_rank=1, context_rank=0"):
+            wan_spatial_shard.reshard_from_trimmed_extent(
+                x,
+                local_extent=2,
+                split_dim="width",
+                group=object(),
+            )
+    finally:
+        wan_spatial_shard._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_attention_wrapper_rejects_spatial_extent_change(monkeypatch: pytest.MonkeyPatch):
+    class ShrinkingWanAttentionBlock(torch.nn.Module):
+        def forward(self, x):
+            return x[..., :-1]
+
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 2))
+    monkeypatch.setattr(
+        wan_spatial_shard,
+        "all_gather_along_dim",
+        lambda x, *, group, dim, dst=None: torch.cat([x, x], dim=dim),
+    )
+    module = ShrinkingWanAttentionBlock()
+    wan_spatial_shard._patch_attention_block(module, group=object(), split_dim="width")
+    x = torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32)
+    token = wan_spatial_shard._SPATIAL_SHARD_CONTEXT.set(
+        wan_spatial_shard.SpatialShardContext(
+            input_extent=4,
+            local_input_extent=2,
+            split_dim="width",
+            rank=0,
+            world_size=2,
+        )
+    )
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=r"local_extent=2, gathered_extent=4, trimmed_extent=4, output_extent=3",
+        ):
+            module(x)
+    finally:
+        wan_spatial_shard._SPATIAL_SHARD_CONTEXT.reset(token)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
 
@@ -225,6 +370,8 @@ def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):
     assert recv_bottom is None
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_dist_zero_pad_only_applies_global_height_edges(monkeypatch: pytest.MonkeyPatch):
     x = torch.ones((1, 1, 2, 2))
 
@@ -239,6 +386,8 @@ def test_dist_zero_pad_only_applies_global_height_edges(monkeypatch: pytest.Monk
     assert last.shape == (1, 1, 3, 3)
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_dist_zero_pad_only_applies_global_width_edges(monkeypatch: pytest.MonkeyPatch):
     x = torch.ones((1, 1, 2, 2))
 
@@ -253,6 +402,8 @@ def test_dist_zero_pad_only_applies_global_width_edges(monkeypatch: pytest.Monke
     assert last.shape == (1, 1, 2, 3)
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_spatial_shard_height_gate_falls_back_for_partial_group(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.dist.get_world_size",
@@ -270,6 +421,8 @@ def test_spatial_shard_height_gate_falls_back_for_partial_group(monkeypatch: pyt
     assert vae._spatial_shard_decode_enabled(z) is False
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_spatial_shard_width_gate_selects_width(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.dist.get_world_size",
@@ -286,6 +439,8 @@ def test_spatial_shard_width_gate_selects_width(monkeypatch: pytest.MonkeyPatch)
     assert vae._spatial_shard_decode_enabled(z) is True
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_tile_mode_disables_spatial_shard_decode():
     vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
     vae.distributed_executor = SimpleNamespace(group=object(), parallel_size=2, parallel_mode="tile")
@@ -298,7 +453,7 @@ def test_tile_mode_disables_spatial_shard_decode():
 
 
 # =============================================================================
-# Multi-GPU numerical-correctness test (nightly / full_model, distributed CUDA)
+# Multi-GPU numerical-correctness test (nightly Diffusion Test group, H100 x2)
 #
 # Spawns a small process group and verifies that spatial_shard_height/spatial_shard_width decode match
 # a single-process (non-distributed) reference decode of the same latent within
@@ -383,11 +538,7 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@pytest.mark.distributed_cuda
-@pytest.mark.skipif(
-    current_omni_platform.get_device_count() < _SPATIAL_SHARD_WORLD_SIZE,
-    reason="Requires >= 2 accelerator devices",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
 @pytest.mark.parametrize("split_dim", ["height", "width"])
 def test_spatial_shard_decode_matches_reference(split_dim: str):
     manager = mp.get_context("spawn").Manager()

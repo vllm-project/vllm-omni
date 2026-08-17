@@ -8,6 +8,8 @@ A unified script for text-to-video generation. Supports multiple models with mod
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
+| `robbyant/lingbot-video-dense-1.3b` / `robbyant/lingbot-video-moe-30b-a3b` | 192x320 | 9 | 2 | 3.0 | ~68 GiB (MoE smoke) |
+| `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
@@ -54,21 +56,45 @@ python text_to_video.py \
   --output vace_t2v_output.mp4
 ```
 
-LTX2 example:
+### LingBot-Video
+
+The shared runner recognizes the official dense and MoE checkpoint IDs, selects
+`LingBotVideoPipeline`, and builds the canonical video request envelope:
 
 ```bash
 python text_to_video.py \
-  --model "Lightricks/LTX-2" \
-  --prompt "A cinematic close-up of ocean waves at golden hour." \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --output ltx2_out.mp4
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a robotic arm picks up a red block" \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
+  --output lingbot_t2v.mp4
 ```
+
+Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
+checkpoint. Requested frame counts are rounded upward to the causal
+VAE's `4n+1` grid. For a local checkpoint path whose name does not contain
+`lingbot`, pass `--model-class-name LingBotVideoPipeline`.
+
+LingBot-only options such as `batch_cfg` and `output_type` use the shared
+model-extra channel, for example:
+
+```bash
+python text_to_video.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --extra-body '{"batch_cfg": true, "output_type": "np"}'
+```
+
+### LTX-2
+
+```bash
+python text_to_video.py \
+  --model Lightricks/LTX-2 \
+  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
+  --output ltx2_output.mp4
+```
+
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, I2V, defaults, and advanced options.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -187,6 +213,7 @@ python text_to_video.py \
 ### Common
 
 - `--model`: Diffusers model ID or local path.
+- `--model-class-name`: Optional explicit pipeline override.
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution. Default depends on model.
 - `--num-frames`: number of frames. Default depends on model.
@@ -202,9 +229,12 @@ python text_to_video.py \
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
+- `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
+- `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
+- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
+- `--lora-scale`: scale factor for LoRA weights.
+- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
 - `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
 
 ### Wan2.2-specific

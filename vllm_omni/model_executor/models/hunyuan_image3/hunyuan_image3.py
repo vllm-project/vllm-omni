@@ -29,7 +29,7 @@ from vllm.distributed import (
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -222,14 +222,8 @@ class HunyuanModel(HunYuanModel):
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
-
+            # KV-cache scales are renamed to .attn.{k,v,q}_scale by the
+            # quant_config mapper in the outer AutoWeightsLoader.
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

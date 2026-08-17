@@ -71,20 +71,25 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
-    "LTX2ImageToVideoPipeline": (
+    "LTX2TwoStagePipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
-        "LTX2ImageToVideoPipeline",
+        "pipeline_ltx2_two_stage",
+        "LTX2TwoStagePipeline",
     ),
-    "LTX2TwoStagesPipeline": (
+    "LTX2DistilledOneStagePipeline": (
         "ltx2",
         "pipeline_ltx2",
-        "LTX2TwoStagesPipeline",
+        "LTX2DistilledOneStagePipeline",
     ),
-    "LTX2ImageToVideoTwoStagesPipeline": (
+    "LTX2DistilledTwoStagePipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
-        "LTX2ImageToVideoTwoStagesPipeline",
+        "pipeline_ltx2_two_stage",
+        "LTX2DistilledTwoStagePipeline",
+    ),
+    "LTX2DistilledPipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2DistilledPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
         "ltx2",
@@ -93,18 +98,18 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2I2VDMD2Pipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
     ),
-    "LTX23Pipeline": (
-        "ltx2",
-        "pipeline_ltx2_3",
-        "LTX23Pipeline",
+    "MiniMaxH3Pipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
     ),
-    "LTX23ImageToVideoPipeline": (
-        "ltx2",
-        "pipeline_ltx2_3_image2video",
-        "LTX23ImageToVideoPipeline",
+    "MiniMaxH3ModularPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
     ),
     "StableAudioPipeline": (
         "stable_audio",
@@ -131,15 +136,30 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "WanI2VDMD2Pipeline",
     ),
+    "LingBotWorldCausalDMDPipeline": (
+        "lingbot_world",
+        "pipeline",
+        "LingBotWorldCausalDMDPipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
         "LongCatImagePipeline",
     ),
+    "LongCatVideoAvatarPipeline": (
+        "longcat_video",
+        "pipeline_longcat_video_avatar",
+        "LongCatVideoAvatarPipeline",
+    ),
     "BagelPipeline": (
         "bagel",
         "pipeline_bagel",
         "BagelPipeline",
+    ),
+    "BooguImagePipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImagePipeline",
     ),
     "LancePipeline": (
         "lance",
@@ -256,6 +276,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
     ),
+    "LingBotVideoPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video",
+        "LingBotVideoPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -272,6 +297,11 @@ _DIFFUSION_MODELS = {
         "OmniVoicePipeline",
     ),
     "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "Cosmos3OmniPipeline": (
         "cosmos3",
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
@@ -306,6 +336,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sdxl",
         "StableDiffusionXLPipeline",
     ),
+    "Krea2Pipeline": (
+        "krea2",
+        "pipeline_krea2",
+        "Krea2Pipeline",
+    ),
 }
 
 
@@ -323,6 +358,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    "LingBotWorldCausalDMDPipeline",
 }
 
 
@@ -422,14 +458,16 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         if sp_size <= 1:
             return
 
-        # Find transformer model(s) in the pipeline that have _sp_plan
-        # Include transformer_2 for two-stage models (e.g., Wan MoE)
-        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+        # Prefer the pipeline's declared DiT components so custom component
+        # names receive the same SP hooks as conventional transformer names.
+        transformer_attrs = getattr(model, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
         applied_count = 0
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # Some pipelines have recursive
                 # modules that have the transformer
                 module = find_module_with_attr(model, attr)
                 if module is None:
@@ -444,18 +482,25 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # Create SP config
-            sp_config = SequenceParallelConfig(
-                ulysses_degree=od_config.parallel_config.ulysses_degree,
-                ring_degree=od_config.parallel_config.ring_degree,
-            )
+            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
+            allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
+            if allgather_degree > 1:
+                sp_config = SequenceParallelConfig(
+                    allgather_degree=allgather_degree,
+                )
+                mode = "allgather_kv"
+            else:
+                sp_config = SequenceParallelConfig(
+                    ulysses_degree=od_config.parallel_config.ulysses_degree,
+                    ring_degree=od_config.parallel_config.ring_degree,
+                )
+                # Apply hooks according to the plan
+                mode = (
+                    "hybrid"
+                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
+                )
 
-            # Apply hooks according to the plan
-            mode = (
-                "hybrid"
-                if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-            )
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
                 f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
@@ -488,16 +533,18 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "BooguImagePipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
-    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
-    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledPipeline": "get_ltx2_post_process_func",
     "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
-    "LTX23Pipeline": "get_ltx2_post_process_func",
-    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
@@ -506,7 +553,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
@@ -526,20 +575,18 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
-}
-
-_DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
-    # arch: action_post_process_func
-    # `action_post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
-    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
-    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_action_post_process_func",
+    "Krea2Pipeline": "get_krea2_post_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
 }
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
@@ -547,6 +594,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -554,9 +602,11 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "GlmImagePipeline": "get_glm_image_pre_process_func",
+    "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
@@ -564,13 +614,16 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
@@ -582,8 +635,8 @@ def register_diffusion_model(
     class_name: str,
     pre_process_func_name: str | None = None,
     post_process_func_name: str | None = None,
-    action_post_process_func_name: str | None = None,
     ir_op_priority_func_name: str | None = None,
+    action_post_process_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -602,13 +655,23 @@ def register_diffusion_model(
         post_process_func_name: Optional name of the post-process function
             located in *module_name*.  Pass ``None`` to keep the existing
             entry when replacing a built-in model.
-        action_post_process_func_name: Optional name of the action post-process
-            function located in *module_name*.  Pass ``None`` to keep the
-            existing entry when replacing a built-in model.
         ir_op_priority_func_name: Optional name of the IR op priority merge
             function located in *module_name*. Pass ``None`` to keep the
             existing entry when replacing a built-in model.
+        action_post_process_func_name: Deprecated compatibility-only keyword
+            for out-of-tree plugins. Action postprocess hooks are no longer
+            registered separately; move action handling into
+            ``post_process_func_name`` and return a payload/metadata envelope.
     """
+    if action_post_process_func_name is not None:
+        logger.warning(
+            "Ignoring deprecated action_post_process_func_name=%r for diffusion "
+            "model %s. Move action postprocess logic into post_process_func_name "
+            "and return payload/metadata output.",
+            action_post_process_func_name,
+            model_arch,
+        )
+
     # Register model class in DiffusionModelRegistry
     DiffusionModelRegistry.register_model(
         model_arch,
@@ -625,8 +688,6 @@ def register_diffusion_model(
         _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
     if post_process_func_name is not None:
         _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
-    if action_post_process_func_name is not None:
-        _DIFFUSION_ACTION_POST_PROCESS_FUNCS[model_arch] = action_post_process_func_name
     if ir_op_priority_func_name is not None:
         _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
 
@@ -656,13 +717,6 @@ def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
-    return _load_process_func(od_config, func_name)
-
-
-def get_diffusion_action_post_process_func(od_config: OmniDiffusionConfig):
-    if od_config.model_class_name not in _DIFFUSION_ACTION_POST_PROCESS_FUNCS:
-        return None
-    func_name = _DIFFUSION_ACTION_POST_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
 
 

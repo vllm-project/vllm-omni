@@ -39,7 +39,13 @@ def _audiox_server_cases(model: str):
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _audiox_server_cases(AUDIOX_TEST_MODEL), indirect=True)
 def test_audiox_t2a_online(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    """AudioX text-to-audio: chat completion returns a non-empty WAV in `message.audio.data`."""
+    """AudioX text-to-audio: chat completion returns a non-empty WAV in `message.audio.data`.
+
+    AudioX is registered in ``vllm_omni/model_extras`` (``AudioXPipeline``), so the
+    ``audiox_task`` / ``seconds_*`` / ``sigma_*`` keys below flow through the standard
+    ``apply_declared_extra_args`` server path into ``sampling_params.extra_args`` rather
+    than the old top-level ``extra_args`` escape hatch.
+    """
     request_config = {
         "model": omni_server.model,
         "messages": dummy_messages_from_mix_data(content_text=T2A_PROMPT),
@@ -50,6 +56,8 @@ def test_audiox_t2a_online(omni_server: OmniServer, openai_client: OpenAIClientH
             "audiox_task": "t2a",
             "seconds_start": 0.0,
             "seconds_total": 2.0,
+            "sigma_min": 0.03,
+            "sigma_max": 1000.0,
         },
     }
     openai_client.send_diffusion_request(request_config)

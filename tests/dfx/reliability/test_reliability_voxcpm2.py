@@ -43,6 +43,9 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "server_params": {
             "model": "openbmb/VoxCPM2",
             "stage_config_name": "voxcpm2.yaml",
+            # VoxCPM2 uses a custom HF tokenizer; CLI default trust_remote_code=False
+            # would otherwise override deploy YAML settings during server startup.
+            "server_args": ["--trust-remote-code", "--disable-log-stats"],
         },
     },
 ]

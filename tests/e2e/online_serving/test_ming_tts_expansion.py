@@ -90,6 +90,7 @@ def test_text_to_audio_streaming_001(omni_server, openai_client) -> None:
         "input": get_prompt("zh_short"),
         "voice": "灵小甄",
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "timeout": 300.0,
     }

@@ -9,11 +9,14 @@ import ssl
 import sys
 import time
 import traceback
+import uuid
 import wave
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import numpy as np
@@ -35,10 +38,14 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-logger = init_logger(__name__)
-
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
+    DailyOmniDataset,
+    DailyOmniSampleRequest,
+    daily_omni_local_qa_json,
+    daily_omni_local_videos_dir,
+    resolve_daily_omni_local_root,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -49,11 +56,17 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.experimental.fullduplex.client import (
+    RealtimeDuplexClient,
+    summarize_session_request_metrics,
+    wait_for,
+)
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.utils import coerce_positive_int_scalar
+
+logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
-_AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
-_AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
@@ -111,30 +124,28 @@ def _audio_continuity_threshold_s() -> float:
     return max(value, 0.0)
 
 
-def _audio_pcm_format() -> tuple[int, int]:
-    """Return ``(sample_rate, channels)`` of the streamed PCM response.
+def _pcm_s16le_to_seed_tts_wer_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    """Normalize streamed raw PCM to the 24 kHz mono PCM used by Seed-TTS WER."""
+    if not pcm_bytes:
+        return b""
+    channels = max(1, int(channels))
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if channels > 1:
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable].reshape(-1, channels).mean(axis=1)
+    pcm_f32 = pcm.astype(np.float32) / 32767.0
+    if int(sample_rate) != 24000 and pcm_f32.size:
+        from vllm.multimodal.audio import AudioResampler
 
-    Defaults to 24 kHz mono (Qwen3-TTS / VoxCPM2 / most MOSS-TTS variants).
-    Override for models with a different codec output format (e.g.
-    MOSS-TTS-Local-Transformer-v1.5, which streams 48 kHz stereo PCM) via
-    ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` / ``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` -
-    getting this wrong silently skews audio_duration/audio_rtf/underrun stats.
-    """
-    sample_rate = 24000
-    channels = 1
-    raw_sr = os.environ.get(_AUDIO_SAMPLE_RATE_ENV)
-    if raw_sr:
-        try:
-            sample_rate = int(raw_sr)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_SAMPLE_RATE_ENV, raw_sr, sample_rate)
-    raw_ch = os.environ.get(_AUDIO_CHANNELS_ENV)
-    if raw_ch:
-        try:
-            channels = int(raw_ch)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_CHANNELS_ENV, raw_ch, channels)
-    return sample_rate, channels
+        resampler = AudioResampler(target_sr=24000)
+        pcm_f32 = resampler.resample(pcm_f32, orig_sr=int(sample_rate))
+    pcm_f32 = np.clip(pcm_f32, -1.0, 1.0)
+    return (pcm_f32 * 32767).astype(np.int16).tobytes()
 
 
 get_samples_old = datasets.get_samples
@@ -191,6 +202,9 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     # Mark for PCM capture (WER / UTMOS eval) regardless of extra body presence.
     setattr(rfi, "seed_tts_row", True)
     sys_prompt = (sample.seed_tts_system_prompt or "").strip() or SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
+    setattr(rfi, "seed_tts_system_prompt", sys_prompt)
+    setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
+    setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
     setattr(
         rfi,
         "omni_chat_messages",
@@ -238,7 +252,12 @@ def get_samples(args, tokenizer):
     )
 
     # Check if we need to handle omni-related backends/datasets
-    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
+    is_omni_backend = args.backend in [
+        "openai-chat-omni",
+        "openai-audio-speech",
+        "openai-realtime-duplex",
+        "daily-omni",
+    ]
     is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
@@ -270,6 +289,26 @@ def get_samples(args, tokenizer):
         if isinstance(qa_json, str):
             qa_json = qa_json.strip() or None
 
+        # A local mirror of the dataset repo (plain directory or HF hub cache dir) is used
+        # directly: no Hub round-trip, so offline / air-gapped runs work without extra flags.
+        local_root: Path | None = None
+        if qa_json is None:
+            local_root = resolve_daily_omni_local_root(getattr(args, "dataset_path", None)) or (
+                resolve_daily_omni_local_root(getattr(args, "hf_name", None))
+            )
+            if local_root is not None:
+                local_qa = daily_omni_local_qa_json(local_root)
+                if local_qa is not None:
+                    qa_json = str(local_qa)
+                    if video_dir is None:
+                        video_dir = daily_omni_local_videos_dir(local_root)
+                    logger.info("Using local Daily-Omni mirror: root=%s", local_root)
+                else:
+                    logger.info(
+                        "Local Daily-Omni path %s has no qa.json; loading it with `datasets` instead",
+                        local_root,
+                    )
+
         if qa_json is not None:
             logger.info(
                 "Loading Daily-Omni dataset: qa_json=%s, video_dir=%s (Hub not used for QA)",
@@ -283,6 +322,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 disable_shuffle=getattr(args, "disable_shuffle", False),
@@ -291,7 +331,8 @@ def get_samples(args, tokenizer):
             repo_id = _daily_omni_repo_from_args(args)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
-                    repo_id = _DEFAULT_DAILY_OMNI_REPO
+                    # Prefer an on-disk copy over the Hub id so offline runs keep working.
+                    repo_id = str(local_root) if local_root is not None else _DEFAULT_DAILY_OMNI_REPO
             elif repo_id is None:
                 raise ValueError(
                     "Daily-Omni with --dataset-name hf requires "
@@ -313,6 +354,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 no_stream=getattr(args, "no_stream", False),
@@ -335,10 +377,17 @@ def get_samples(args, tokenizer):
         return input_requests
 
     if is_seed_tts:
-        if args.backend not in ("openai-audio-speech", "openai-chat-omni"):
+        if args.backend not in (
+            "openai-audio-speech",
+            "openai-chat-omni",
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
-                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text). "
+                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
+                "--backend openai-realtime-duplex or openai-realtime-tts "
+                "(WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
         repo_id = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -346,6 +395,14 @@ def get_samples(args, tokenizer):
             raise ValueError(
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
+            )
+        turns_per_session = int(getattr(args, "seed_tts_turns_per_session", 1))
+        if turns_per_session > 1 and args.backend not in {
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        }:
+            raise ValueError(
+                f"--seed-tts-turns-per-session > 1 requires a Realtime Seed-TTS backend. Got backend={args.backend!r}."
             )
 
         _cls_map = {
@@ -376,6 +433,7 @@ def get_samples(args, tokenizer):
             output_len=out_len,
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
+            turns_per_session=turns_per_session,
         )
 
     # Handle random-mm dataset (Omni's synthetic multimodal dataset)
@@ -431,10 +489,14 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
+    #: Per-turn 24 kHz mono PCM for grouped Realtime Seed-TTS WER.
+    tts_turn_pcm_bytes: list[bytes] | None = None
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
+    duplex_request_metrics: list[dict[str, object]] | None = None
+    duplex_session_metrics: dict[str, object] | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -528,16 +590,8 @@ def _add_image_edit_extra_body_to_form(form: aiohttp.FormData, extra_body: dict[
             form.add_field(key, str(value))
 
 
-def _coerce_positive_int(value: Any) -> int | None:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None
-    return coerced if coerced > 0 else None
-
-
 def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
-    top_level_tokens = _coerce_positive_int(metrics.get(defs.NUM_TOKENS_OUT))
+    top_level_tokens = coerce_positive_int_scalar(metrics.get(defs.NUM_TOKENS_OUT))
     if top_level_tokens is not None:
         return top_level_tokens
 
@@ -549,7 +603,7 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     for info in stage_snapshot.values():
         if not isinstance(info, dict):
             continue
-        num_tokens_out = _coerce_positive_int(info.get(defs.NUM_TOKENS_OUT))
+        num_tokens_out = coerce_positive_int_scalar(info.get(defs.NUM_TOKENS_OUT))
         if num_tokens_out is None:
             continue
         if info.get("final_output_type") == "text" or info.get("output_unit_type") == "token":
@@ -560,9 +614,9 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
 
 def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
     """Apply OpenAI ``usage`` fields to the benchmark output."""
-    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+    if (pt := coerce_positive_int_scalar(usage.get("prompt_tokens"))) is not None:
         output.prompt_len = pt
-    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    completion_tokens = coerce_positive_int_scalar(usage.get("completion_tokens"))
     if completion_tokens is not None:
         output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
     return completion_tokens
@@ -905,12 +959,22 @@ async def async_request_openai_chat_omni_completions(
                     audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        frame_width = sample_width * channels
-                        if frame_width > 0:
-                            audio_frames = len(wav_pcm_buffer) // frame_width
-                            audio_duration_sec = audio_frames / frame_rate
+                        audio_frames = defs.compute_audio_frames(
+                            len(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            channels=channels,
+                        )
+                        if audio_frames > 0 and frame_rate > 0:
+                            audio_duration_sec = audio_frames / float(frame_rate)
                         else:
-                            logger.warning("Audio frame width is zero")
+                            logger.warning(
+                                "Unable to derive audio frames/duration from wav pcm "
+                                "(pcm_nbytes=%d, sample_width=%d, channels=%d, sample_rate=%d)",
+                                len(wav_pcm_buffer),
+                                sample_width,
+                                channels,
+                                frame_rate,
+                            )
                     elif audio_bytes_buffer:
                         try:
                             from vllm.multimodal.audio import get_audio_duration
@@ -929,10 +993,8 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        if audio_duration > 0:
-                            output.audio_rtf = audio_generate_time / output.audio_duration
-                        else:
-                            output.audio_rtf = 0
+                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
@@ -1133,9 +1195,9 @@ async def async_request_openai_audio_speech(
 ) -> MixRequestFuncOutput:
     """Streaming request to /v1/audio/speech endpoint.
 
-    Sends ``stream=true`` with ``response_format=pcm`` so the server returns
-    raw PCM chunks as they are decoded. This allows measuring TTFP (time to
-    first audio packet) separately from E2EL.
+    Sends ``stream=true`` with ``stream_format=audio`` and ``response_format=pcm``
+    so the server returns raw PCM chunks as they are decoded. This allows measuring
+    TTFP (time to first audio packet) separately from E2EL.
     """
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
@@ -1144,12 +1206,14 @@ async def async_request_openai_audio_speech(
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "input": request_func_input.prompt,
         "stream": True,
+        "stream_format": "audio",
         "response_format": "pcm",
     }
     _update_payload_common(payload, request_func_input)
     # Seed-TTS + WER: ``--extra-body`` may set stream=false / other formats; speech must stream PCM.
     if getattr(request_func_input, "seed_tts_row", False) and _seed_tts_capture_pcm_for_wer():
         payload["stream"] = True
+        payload["stream_format"] = "audio"
         payload["response_format"] = "pcm"
 
     headers = {
@@ -1161,10 +1225,9 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed; sample_rate/channels are model-dependent
-    # (see _audio_pcm_format docstring).
-    sample_rate, channels = _audio_pcm_format()
-    sample_width = 2  # 16-bit = 2 bytes
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    sample_rate, channels = defs.stream_pcm_format_from_env()
+    sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
     st = time.perf_counter()
     output.start_time = st
@@ -1193,13 +1256,17 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
 
-                total_samples = total_pcm_bytes // (sample_width * channels)
-                output.audio_duration = total_samples / sample_rate
+                total_samples = defs.compute_audio_frames(
+                    total_pcm_bytes,
+                    sample_width=sample_width,
+                    channels=channels,
+                )
                 output.audio_frames = total_samples
-                if output.audio_duration > 0:
-                    output.audio_rtf = output.latency / output.audio_duration
-                else:
-                    output.audio_rtf = 0
+                output.audio_duration = (
+                    float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
+                )
+                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
                 continuity = compute_continuity_stats(
@@ -1214,12 +1281,20 @@ async def async_request_openai_audio_speech(
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
-                    output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    try:
+                        output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
+                            bytes(pcm_capture),
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                    except Exception as ex:
+                        logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
+                        output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
                         "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
+                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
                         ct,
                         api_url,
                     )
@@ -1237,6 +1312,180 @@ async def async_request_openai_audio_speech(
     return output
 
 
+def _realtime_websocket_url(api_url: str) -> str:
+    parts = urlsplit(api_url)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.setdefault("duplex", "1")
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+async def async_request_openai_realtime_duplex(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Run one or more Seed-TTS turns through one explicit Realtime TTS session."""
+    del session
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
+    if not isinstance(speech_extra, dict):
+        speech_extra = {}
+    configured_turns = getattr(request_func_input, "seed_tts_turns", ())
+    turn_prompts = [
+        (
+            str(getattr(turn, "utterance_id", "") or ""),
+            str(getattr(turn, "target_text", "") or ""),
+        )
+        for turn in configured_turns
+        if str(getattr(turn, "target_text", "") or "").strip()
+    ]
+    if not turn_prompts:
+        turn_prompts = [("", request_func_input.prompt)]
+    session_id = f"seed-tts-{request_func_input.request_id or uuid.uuid4().hex}"
+    try:
+        async with RealtimeDuplexClient(_realtime_websocket_url(request_func_input.api_url)) as client:
+            await client.configure(
+                request_func_input.model_name or request_func_input.model,
+                output_audio_format="pcm16",
+                instructions=getattr(
+                    request_func_input,
+                    "seed_tts_system_prompt",
+                    SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+                ),
+                native_duplex=False,
+                auto_response=False,
+                extra_body=speech_extra,
+                session_id=session_id,
+                timeout_s=120.0,
+            )
+            turn_metrics: list[dict[str, object]] = []
+            turn_timings: list[dict[str, object]] = []
+            turn_pcm_bytes: list[bytes] = []
+            turn_transcripts: list[str] = []
+            measurement_origin = {
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+            }
+            for request_index, (utterance_id, target_text) in enumerate(turn_prompts):
+                response_offset = len(client.events.response_ids)
+                done_before = client.events.count("response.done")
+                errors_before = len(client.events.errors())
+                turn_started_at_s = time.monotonic()
+                await client.send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": target_text}],
+                        },
+                    }
+                )
+                await client.send({"type": "response.create"})
+                await wait_for(
+                    lambda: client.events.count("response.done") > done_before
+                    or len(client.events.errors()) > errors_before,
+                    timeout_s=180.0,
+                    label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
+                )
+                errors = client.events.errors()
+                if len(errors) > errors_before:
+                    raise RuntimeError(f"Seed-TTS Realtime TTS server error: {errors[-1]}")
+                new_audio_response_ids = [
+                    response_id
+                    for response_id in client.events.response_ids[response_offset:]
+                    if client.events.audio_bytes(response_id)
+                ]
+                if len(new_audio_response_ids) != 1:
+                    raise RuntimeError(
+                        f"Seed-TTS Realtime TTS turn {request_index} expected one audio response, "
+                        f"got {len(new_audio_response_ids)}"
+                    )
+                response_id = new_audio_response_ids[0]
+                timing = client.events.timing_summary(
+                    after_s=turn_started_at_s,
+                    input_committed_at_s=turn_started_at_s,
+                    response_id=response_id,
+                    measurement_origin=measurement_origin,
+                )
+                request_metrics = timing.get("request_metrics")
+                if not isinstance(request_metrics, dict):
+                    raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
+                turn_timings.append(timing)
+                turn_metrics.append(
+                    {
+                        "session_id": session_id,
+                        "request_index": request_index,
+                        "utterance_id": utterance_id or None,
+                        "response_id": response_id,
+                        **request_metrics,
+                    }
+                )
+                response_audio = client.events.audio_bytes(response_id)
+                turn_pcm_bytes.append(
+                    _pcm_s16le_to_seed_tts_wer_bytes(
+                        response_audio,
+                        sample_rate=client.events.output_sample_rate_hz,
+                        channels=1,
+                    )
+                )
+                turn_transcripts.append(
+                    "".join(
+                        str(event.get("delta") or "")
+                        for event in client.events.events
+                        if client.events.response_id(event) == response_id
+                        and event.get("type")
+                        in {
+                            "response.audio_transcript.delta",
+                            "response.output_text.delta",
+                            "response.text.delta",
+                        }
+                    )
+                )
+                await client.acknowledge_playback()
+            request_finished_at = time.perf_counter()
+            session_metrics = summarize_session_request_metrics(
+                turn_metrics,
+                session_id=session_id,
+            )
+            await client.close_session(timeout_s=30.0)
+
+            output.generated_text = " ".join(filter(None, turn_transcripts))
+            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
+            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
+            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.audio_duration = (
+                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+            )
+            output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
+            output.latency = request_finished_at - output.start_time
+            output.tts_turn_pcm_bytes = turn_pcm_bytes
+            output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
+            if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+                output.duplex_request_metrics = turn_metrics
+                output.duplex_session_metrics = session_metrics
+            output.output_tokens = sum(
+                int(stage0.get("output_token_count") or 0)
+                for timing in turn_timings
+                if isinstance((stage0 := timing.get("stage0_tokens")), dict)
+            )
+            output.success = True
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(
+            "Seed-TTS Realtime TTS request failed: %s",
+            output.error,
+        )
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
@@ -1244,6 +1493,13 @@ if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
 if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
+
+ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
+if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
+if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
 
 ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edits_omni
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
@@ -1269,6 +1525,19 @@ from vllm_omni.benchmarks.metrics.metrics import (
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
+    """Merge benchmark extra_body with per-request overrides.
+
+    vLLM 0.24 removed the private helper from ``vllm.benchmarks.serve``.
+    Keep the same shallow-merge behavior here, with request overrides winning.
+    """
+    if not base and not overrides:
+        return None
+    merged = dict(base or {})
+    merged.update(overrides or {})
+    return merged
 
 
 async def benchmark(
@@ -1301,6 +1570,7 @@ async def benchmark(
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
+    probe_request_rate: float = 0.0,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1332,6 +1602,8 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
+    test_chat_messages = input_requests[0].chat_messages
 
     assert (
         test_mm_content is None
@@ -1349,7 +1621,8 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=extra_body,
+        extra_body=test_extra_body,
+        chat_messages=test_chat_messages,
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
@@ -1413,7 +1686,8 @@ async def benchmark(
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
@@ -1441,6 +1715,31 @@ async def benchmark(
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
             return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
+
+    # Ported from upstream vLLM v0.27.0 (vllm/benchmarks/serve.py), which added
+    # the probe_request_rate background probe; this file is the patched copy of
+    # that module and tracks its upstream base.
+    probe_outputs: list[MixRequestFuncOutput] = []
+    probe_stop = asyncio.Event()
+
+    async def probe_loop():
+        probe_input = replace(
+            test_input,
+            prompt="Hi",
+            prompt_len=1,
+            output_len=1,
+            multi_modal_content=None,
+            chat_messages=None,
+        )
+        interval = 1 / probe_request_rate
+        while not probe_stop.is_set():
+            probe_outputs.append(await request_func(request_func_input=probe_input, session=session))
+            await asyncio.sleep(interval)
+
+    probe_task: asyncio.Task | None = None
+    if probe_request_rate > 0:
+        print(f"Probe request rate: {probe_request_rate} req/s")
+        probe_task = asyncio.create_task(probe_loop())
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -1479,6 +1778,7 @@ async def benchmark(
             request.multi_modal_data,
             request.request_id,
         )
+        per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -1495,8 +1795,9 @@ async def benchmark(
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             extra_headers=extra_headers,
-            extra_body=extra_body,
+            extra_body=per_request_extra_body,
             request_id=request_id,
+            chat_messages=request.chat_messages,
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
@@ -1504,6 +1805,10 @@ async def benchmark(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if probe_task is not None:
+        probe_stop.set()
+        await probe_task
 
     if pbar is not None:
         pbar.close()
@@ -1572,6 +1877,22 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
+    # RequestFuncOutput objects without the Mix duplex fields; read them
+    # tolerantly or the whole benchmark result is discarded ("fallback to
+    # template", completed=0) after every request already succeeded.
+    duplex_request_metrics = [
+        metric for output in outputs for metric in (getattr(output, "duplex_request_metrics", None) or [])
+    ]
+    if duplex_request_metrics:
+        result["duplex_request_metrics"] = duplex_request_metrics
+    duplex_session_metrics = [
+        session_metrics
+        for output in outputs
+        if (session_metrics := getattr(output, "duplex_session_metrics", None)) is not None
+    ]
+    if duplex_session_metrics:
+        result["duplex_session_metrics"] = duplex_session_metrics
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,
@@ -1668,6 +1989,8 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            extra_body=test_extra_body,
+            chat_messages=test_chat_messages,
         )
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:

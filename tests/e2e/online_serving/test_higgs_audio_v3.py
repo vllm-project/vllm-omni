@@ -59,8 +59,7 @@ _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know w
 class TestHiggsAudioV3OnlineHappyPath:
     """Plain-text -> audio happy paths against the live HTTP server."""
 
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_wav(self, omni_server, openai_client) -> None:
@@ -72,10 +71,14 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # whisper-small mishears this short clip ~0.5% of the time; on a
+                # failed match re-verify with this stronger ASR before failing so
+                # the gate is not flaky. Local-only key (not forwarded to server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_with_max_new_tokens(self, omni_server, openai_client) -> None:
@@ -93,8 +96,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_concurrent_plain_text(self, omni_server, openai_client) -> None:
@@ -111,7 +113,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
@@ -123,7 +125,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sits below the typical speech-noise floor so the
+        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
         check still catches catastrophic codec failure (silence, white noise, sample
         scramble all give HNR << 0) while allowing for the sliding-window codec's
         slightly-noisier-than-sync output. The default 1.0 dB threshold has only
@@ -135,6 +137,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "model": omni_server.model,
                 "input": "The quick brown fox jumps over the lazy dog.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_hnr_db": 0.0,
@@ -142,7 +145,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
@@ -160,6 +163,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "model": omni_server.model,
                 "input": "She sells seashells by the seashore.",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_hnr_db": -2.0,
@@ -183,7 +187,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     They do not assert audio quality (out of scope for CI).
     """
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_emotion_and_expressive(self, omni_server, openai_client) -> None:
@@ -199,7 +203,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_style_whispering(self, omni_server, openai_client) -> None:
@@ -215,7 +219,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_prosody_speed_and_pitch(self, omni_server, openai_client) -> None:
@@ -233,7 +237,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_pause_mid_text(self, omni_server, openai_client) -> None:
@@ -249,7 +253,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_sfx_with_onomatopoeia(self, omni_server, openai_client) -> None:
@@ -273,8 +277,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
 class TestHiggsAudioV3OnlineVoiceClone:
     """Voice clone via the two payload shapes the model serves."""
 
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_ref_text(self, omni_server, openai_client) -> None:
@@ -291,7 +294,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_references_alias(self, omni_server, openai_client) -> None:

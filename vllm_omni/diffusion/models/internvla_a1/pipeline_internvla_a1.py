@@ -16,7 +16,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
     wrap_methods_by_paths,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .config import (
     DEFAULT_QWEN3_VL_MODEL,
@@ -228,7 +228,7 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning("InternVLAA1Pipeline only supports a single prompt/request; taking the first sample.")
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
@@ -247,11 +247,13 @@ class InternVLAA1Pipeline(nn.Module, DiffusionPipelineProfilerMixin):
             noise=extra_args.get("noise"),
             decode_image=bool(extra_args.get("decode_image", False)),
         )
-        custom_output: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
         if decoded is not None:
-            custom_output["decoded"] = decoded
+            metadata["actions"] = {"decoded": decoded}
         return DiffusionOutput(
-            output=output,
-            custom_output=custom_output,
+            output={
+                "payload": {"actions": output},
+                "metadata": metadata,
+            },
             post_process_func=get_internvla_a1_post_process_func(self.od_config),
         )

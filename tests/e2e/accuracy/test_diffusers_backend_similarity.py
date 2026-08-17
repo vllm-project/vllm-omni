@@ -42,8 +42,29 @@ from tests.e2e.accuracy.helpers import (
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, OpenAIClientHandler
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import (
+    CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS,
+)
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+
+def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
+    """Walk the same backend chain the omni server's diffusers adapter walks.
+
+    The server side (--diffusion-load-format diffusers) resolves its attention
+    backend through the adapter's preference chain, skipping backends that are
+    unavailable on the image (e.g. the FA3 hub kernel has no build variant for
+    the image's torch — build 2953). The reference run must resolve to the
+    same backend or the similarity comparison measures kernel differences.
+    """
+    for backend in CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS:
+        try:
+            pipe.transformer.set_attention_backend(backend)
+            return
+        except Exception:
+            continue
+    pipe.transformer.set_attention_backend("native")
 
 
 PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
@@ -55,6 +76,10 @@ TRUE_CFG_SCALE = 4.0
 SEED = 42
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
+
+# A single-shot latency measurement on this benchmark is dominated by CI variance
+# (see issue #5108). Warm up once, then report the median of several timed runs.
+NUM_TIMED_RUNS = 2
 
 VIDEO_PROMPT = "The bear in the image dances happily"
 VIDEO_WIDTH = 832
@@ -181,25 +206,38 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         # "--enable-diffusion-pipeline-profiler",
     ]
     with OmniServer(model, server_args, use_omni=True) as omni_server:
-        start_time = time.perf_counter()
-        response = requests.post(
-            f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
-            json={
-                "model": omni_server.model,
-                "prompt": PROMPT,
-                "size": f"{WIDTH}x{HEIGHT}",
-                "n": 1,
-                "response_format": "b64_json",
-                "negative_prompt": NEGATIVE_PROMPT,
-                "num_inference_steps": NUM_INFERENCE_STEPS,
-                "true_cfg_scale": TRUE_CFG_SCALE,
-                "seed": SEED,
-            },
-            timeout=600,
-        )
-        end_time = time.perf_counter()
-        e2e_latency = end_time - start_time
-        response.raise_for_status()
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/images/generations"
+        request_json = {
+            "model": omni_server.model,
+            "prompt": PROMPT,
+            "size": f"{WIDTH}x{HEIGHT}",
+            "n": 1,
+            "response_format": "b64_json",
+            "negative_prompt": NEGATIVE_PROMPT,
+            "num_inference_steps": NUM_INFERENCE_STEPS,
+            "true_cfg_scale": TRUE_CFG_SCALE,
+            "seed": SEED,
+        }
+
+        def _timed_request() -> tuple[requests.Response, float]:
+            start_time = time.perf_counter()
+            response = requests.post(url, json=request_json, timeout=600)
+            end_time = time.perf_counter()
+            response.raise_for_status()
+            return response, end_time - start_time
+
+        # Warm up the client request path so first-request lazy init is not charged
+        # to the measurement, mirroring _diffusers_dummy_run on the diffusers side.
+        _timed_request()
+
+        latencies: list[float] = []
+        response: requests.Response | None = None
+        for _ in range(NUM_TIMED_RUNS):
+            response, latency = _timed_request()
+            latencies.append(latency)
+        e2e_latency = float(np.median(latencies))
+
+        assert response is not None
         payload = response.json()
         assert len(payload["data"]) == 1
         image_bytes = base64.b64decode(payload["data"][0]["b64_json"])
@@ -218,23 +256,28 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        _set_matched_attention_backend(pipe)
         _diffusers_dummy_run(pipe)
 
-        generator = torch.Generator(device="cuda").manual_seed(SEED)
+        latencies: list[float] = []
+        result = None
         with torch.inference_mode():
-            start_time = time.perf_counter()
-            result = pipe(  # pyright: ignore[reportCallIssue]
-                prompt=PROMPT,
-                negative_prompt=NEGATIVE_PROMPT,
-                width=WIDTH,
-                height=HEIGHT,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                true_cfg_scale=TRUE_CFG_SCALE,
-                generator=generator,
-            )
-            end_time = time.perf_counter()
-        e2e_latency = end_time - start_time
+            for _ in range(NUM_TIMED_RUNS):
+                generator = torch.Generator(device="cuda").manual_seed(SEED)
+                start_time = time.perf_counter()
+                result = pipe(  # pyright: ignore[reportCallIssue]
+                    prompt=PROMPT,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    width=WIDTH,
+                    height=HEIGHT,
+                    num_inference_steps=NUM_INFERENCE_STEPS,
+                    true_cfg_scale=TRUE_CFG_SCALE,
+                    generator=generator,
+                )
+                end_time = time.perf_counter()
+                latencies.append(end_time - start_time)
+        e2e_latency = float(np.median(latencies))
+        assert result is not None
         output_image = result.images[0].convert("RGB")
         output_image.save(output_path)
         return output_image, e2e_latency
@@ -276,8 +319,14 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
     )
+    # Latency is checked against a warmed median of NUM_TIMED_RUNS runs (see the
+    # _run_* helpers), so the assertion reflects steady-state rather than a single
+    # cold shot -- which is what previously made this check flaky (issue #5108).
+    # Correctness is additionally gated by the SSIM/PSNR assertions above.
     assert vllm_latency <= latency_threshold, (
-        f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."
+        f"VLLM latency ({vllm_latency:.2f}ms) is greater than "
+        f"{latency_threshold_factor * 100}% more than Diffusers latency "
+        f"({diffusers_latency:.2f}ms)."
     )
 
 

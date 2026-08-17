@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import math
 import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
+import huggingface_hub
 import torch
 from PIL import Image
 from pydantic import Field, model_validator
@@ -18,7 +21,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.diffusion_kv.config import (
+    DiffusionKVCacheMode,
+    parse_diffusion_kv_cache_mode,
+)
+from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -155,13 +164,18 @@ class DiffusionParallelConfig:
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
 
     sequence_parallel_size: int | None = None
-    """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
+    """Number of sequence parallel groups.
+    sequence_parallel_size = ulysses_degree * ring_degree, or allgather_degree
+    when AllGather-KV is enabled."""
 
     ulysses_degree: int = 1
     """Number of GPUs used for ulysses sequence parallelism."""
 
     ring_degree: int = 1
     """Number of GPUs used for ring sequence parallelism."""
+
+    allgather_degree: int = 1
+    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
 
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
@@ -178,10 +192,20 @@ class DiffusionParallelConfig:
     """
 
     cfg_parallel_size: int = 1
-    """Number of Classifier Free Guidance (CFG) parallel groups."""
+    """Number of ranks used to execute guidance passes in parallel."""
 
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
+    text_encoder_tp_size: int = 1
+    """Number of ranks used to tensor-parallel shard the diffusion text encoder.
+
+    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
+    which keeps the encoder fully resident on the DiT main rank (historical
+    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
+    ranks and run the encode with distributed collectives over the encoder
+    process group.
+    """
 
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
@@ -224,18 +248,24 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
+        assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2, 3], (
-            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
-        )
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
             "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
-        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
-            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
-            f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        if self.allgather_degree > 1:
+            assert self.ulysses_degree == 1 and self.ring_degree == 1, (
+                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+                f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
+                f"allgather_degree={self.allgather_degree}."
+            )
+        expected_sp_size = (
+            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        )
+        assert self.sequence_parallel_size == expected_sp_size, (
+            f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
         )
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
@@ -249,15 +279,16 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+            self.sequence_parallel_size = (
+                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+            )
 
         # Calculate world_size from other parallelism dimensions
         other_parallel_world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
             * self.tensor_parallel_size
-            * self.ulysses_degree
-            * self.ring_degree
+            * self.sequence_parallel_size
             * self.cfg_parallel_size
         )
 
@@ -386,14 +417,14 @@ class DiffusionCacheConfig:
         >>> # Access via attribute
         >>> print(config.rel_l1_thresh)  # 0.3 (from dict)
         >>> print(config.Fn_compute_blocks)  # 8 (default)
-        >>> # Empty dict uses all defaults
+        >>> # Empty dict defers model-specific defaults to the TeaCache backend
         >>> default_config = DiffusionCacheConfig.from_dict({})
-        >>> print(config.rel_l1_thresh)  # 0.2 (default)
+        >>> print(default_config.rel_l1_thresh)  # None
     """
 
     # TeaCache parameters [tea_cache only]
-    # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
-    rel_l1_thresh: float = 0.2
+    # None defers to the model-specific TeaCache default (0.2 fallback).
+    rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
 
     # MagCache parameters [mag_cache only]
@@ -507,7 +538,11 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
-def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
+def resolve_model_class_name(
+    model: str | None,
+    diffusion_load_format: str = "default",
+    revision: str | None = None,
+) -> str | None:
     """Resolve the diffusion pipeline class name from the model config.
 
     Read-only counterpart of ``OmniDiffusionConfig.enrich_config``, safe to call
@@ -515,16 +550,14 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+
     if not model:
         return None
-
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from model_index.json.
-    try:
-        model_index = get_hf_file_to_dict("model_index.json", model)
-    except Exception:
-        model_index = None
+    # Diffusers models: read _class_name from the pipeline index.
+    model_index = get_diffusion_model_index(model, revision=revision)
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -532,7 +565,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     # Other models: map model_type / architecture from config.json.
     try:
-        cfg = get_hf_file_to_dict("config.json", model) or {}
+        cfg = get_hf_file_to_dict("config.json", model, revision=revision) or {}
     except Exception:
         cfg = {}
     model_type = cfg.get("model_type")
@@ -577,6 +610,10 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Optional model-defined startup task. Pipelines may use this to select
+    # task-specific components or weights before serving requests.
+    task_type: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)
@@ -584,6 +621,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    fa_deterministic: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -609,9 +647,33 @@ class OmniDiffusionConfig:
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = 32
 
+    # Opt-in: route per-session world-model state through the shared
+    # SessionStateManager (RFC #4480) instead of the model's bespoke cache.
+    # Default off; the bespoke path remains the default. A *set*
+    # OMNI_DIFFUSION_SESSION_STATE_MANAGER environment variable overrides this
+    # in both directions. See docs/features/session_state_manager.md.
+    enable_session_state_manager: bool = False
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
+
+    # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
+    # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
+    # "default" -> DiffusionEngine, or an import path (set e.g. by a deploy
+    # config). Programmatic callers may pass a DiffusionEngine subclass
+    # directly — hence ``str | type`` (structured-config mirrors should expose
+    # the string form only).
+    engine_backend: str | type = "default"
+
+    # Local Diffusion KV ownership and cache-layout mode.
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+
+    # Optional override for the diffusion model runner class (import path).
+    # Precedence in the worker: this override > the runner declared by the
+    # selected engine class (``default_diffusion_model_runner_cls``) > the
+    # platform default. Never mutated by engines.
+    diffusion_model_runner_cls: str | None = None
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -624,8 +686,9 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    lora_path: str | None = None
-    lora_scale: float = 1.0
+    lora_path: str | list[str] | None = None
+    lora_scale: float | list[float] = 1.0
+    lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -637,6 +700,16 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
+    enable_distributed_layerwise_offload: bool = False
+    # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
+    # concurrent requests in DP mode). If False: each rank streams the standard
+    # loader's rank-local tensors (including TP-local shards) via H2D only.
+    # This avoids AllGather synchronization, while host memory follows the
+    # loader's existing rank-local layout instead of adding a second DP shard.
+    dlo_use_allgather: bool = True
+    # Leading main-DiT blocks kept resident by distributed layerwise offload.
+    dlo_resident_layers: int = 0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -649,8 +722,15 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
+    # MoE kernel backend selection
+    moe_backend: str = "auto"
+
     # Compilation
     enforce_eager: bool = False
+    # Controls the generic compilation path used when a pipeline does not
+    # provide its own setup_compile() implementation.
+    diffusion_compile_granularity: str = "regional"
+    diffusion_compile_dynamic: bool = True
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -724,6 +804,7 @@ class OmniDiffusionConfig:
     # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
 
     log_level: str = "info"
 
@@ -769,6 +850,12 @@ class OmniDiffusionConfig:
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
+
+    # Request-mode batch admission: wait briefly for compatible requests to
+    # accumulate in the scheduler waiting queue before the first schedule() of
+    # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
+    # 0 disables admission (default; no added latency).
+    request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
@@ -841,7 +928,35 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.diffusion_compile_granularity not in {"regional", "full"}:
+            raise ValueError(
+                "diffusion_compile_granularity must be 'regional' or 'full', "
+                f"got {self.diffusion_compile_granularity!r}"
+            )
+        if not isinstance(self.diffusion_compile_dynamic, bool):
+            raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+
+        if self.omni_kv_config is None:
+            self.omni_kv_config = {}
+        elif isinstance(self.omni_kv_config, Mapping):
+            self.omni_kv_config = dict(self.omni_kv_config)
+        else:
+            raise TypeError("omni_kv_config must be a mapping")
+        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
+            "need_recv_cache", False
+        ):
+            raise ValueError(
+                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
+                "disable need_recv_cache until connector-aware admission is implemented"
+            )
+
         self.master_port = self._resolve_master_port()
+        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
+        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+            raise ValueError(
+                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
+            )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -872,6 +987,23 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
             )
+
+        if self.diffusion_compile_granularity == "full":
+            incompatible_features = []
+            if self.parallel_config.use_hsdp:
+                incompatible_features.append("HSDP")
+            if self.parallel_config.sequence_parallel_size > 1:
+                incompatible_features.append("sequence parallelism")
+            if self.enable_cpu_offload:
+                incompatible_features.append("CPU offload")
+            if self.enable_layerwise_offload:
+                incompatible_features.append("layerwise offload")
+            if incompatible_features:
+                features = ", ".join(incompatible_features)
+                raise ValueError(
+                    "diffusion_compile_granularity='full' is incompatible with "
+                    f"{features}; use 'regional' compilation instead"
+                )
 
         # Convert string dtype to torch.dtype if needed
         if isinstance(self.dtype, str):
@@ -937,6 +1069,18 @@ class OmniDiffusionConfig:
                 "valid together with diffusion_load_format=diffusers"
             )
 
+        # when use hf offline, replace model to local model path
+        # align with ar stage behavior, see vllm/engine/arg_utils.py
+        if huggingface_hub.constants.HF_HUB_OFFLINE and self.model:
+            model_id = self.model
+            self.model = get_model_path(self.model, self.revision)
+            if model_id != self.model:
+                logger.info(
+                    "HF_HUB_OFFLINE is True, replace model_id [%s] to model_path [%s]",
+                    model_id,
+                    self.model,
+                )
+
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:
             return
@@ -993,6 +1137,19 @@ class OmniDiffusionConfig:
         """
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
+        self._propagate_skip_softmax_calibration(tf_config)
+
+    def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
+        cfg = getattr(self, "diffusion_attention_config", None)
+        if not isinstance(cfg, AttentionConfig):
+            return
+        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
+
+        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            propagate_skip_softmax_calibration,
+        )
+
+        propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
     def update_multimodal_support(self) -> None:
         # Resolve serving-visible multimodal behavior from shared metadata
@@ -1000,6 +1157,7 @@ class OmniDiffusionConfig:
         metadata = get_diffusion_model_metadata(self.model_class_name)
         self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+        self.supports_mixed_reference_inputs = metadata.supports_mixed_reference_inputs
 
     @staticmethod
     def _looks_like_lance_subfolder(model: str | None) -> bool:
@@ -1019,18 +1177,23 @@ class OmniDiffusionConfig:
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
-        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Diffusers-style models expose a pipeline index with ``_class_name``.
         Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
         so we fall back to reading that and mapping model_type manually.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 
         # Default model_class_name for diffusers adapter
         if self.model_class_name is None and self.diffusion_load_format == "diffusers":
             self.model_class_name = "DiffusersAdapterPipeline"
 
         try:
-            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            config_dict = get_diffusion_model_index(
+                self.model,
+                revision=self.revision,
+            )
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1045,34 +1208,45 @@ class OmniDiffusionConfig:
                         self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
                     except (KeyError, AttributeError) as exc:
                         logger.warning(
-                            "Could not find valid _class_name for diffusers pipeline in model_index.json: %s. "
+                            "Could not find a valid _class_name in the Diffusers pipeline index: %s. "
                             "Without the underlying pipeline class the dummy run may omit required inputs.",
                             exc,
                         )
                 else:
-                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                    from vllm_omni.model_extras import get_transformer_config_subfolder
+
+                    transformer_subfolder = get_transformer_config_subfolder(
+                        self.model_class_name,
+                        model=self.model,
+                        revision=self.revision,
+                    )
+                    tf_config_dict = get_hf_file_to_dict(
+                        f"{transformer_subfolder}/config.json",
+                        self.model,
+                        revision=self.revision,
+                    )
                     if tf_config_dict is None:
-                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
                     if tf_config_dict is not None:
                         self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
                     else:
                         self.set_tf_model_config(TransformerConfig())
             else:
-                raise FileNotFoundError("model_index.json not found")
+                raise FileNotFoundError("Diffusers pipeline index not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
-                    "Could not find valid model_index.json per diffusers format. "
+                    "Could not find a valid pipeline index per Diffusers format. "
                     "This model is likely unsupported by the diffusers backend. "
-                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
+                    "Also, without knowing the underlying pipeline class from its index, "
                     "the dummy run will input only text prompt, which may cause errors for pipelines "
                     "that require additional inputs."
                 )
             else:
-                cfg = get_hf_file_to_dict("config.json", self.model)
+                cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
@@ -1083,7 +1257,7 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
                         return
-                    raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+                    raise ValueError(f"Could not find config.json or a Diffusers pipeline index for {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 model_type = cfg.get("model_type")
@@ -1164,7 +1338,8 @@ class OmniDiffusionConfig:
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
-        return cls(**filtered_kwargs)
+        instance = cls(**filtered_kwargs)
+        return instance
 
 
 @dataclass
@@ -1173,12 +1348,15 @@ class DiffusionOutput:
     Final output (after pipeline completion)
     """
 
-    # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
     output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
+
+    # Legacy compatibility fields. New pipeline-specific payloads should be
+    # carried by output["payload"] instead.
     trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1187,10 +1365,6 @@ class DiffusionOutput:
 
     post_process_func: Callable[..., Any] | None = None
 
-    # Extra custom output data (e.g. latent trajectories, prompt embeds)
-    # passed through to OmniRequestOutput.custom_output
-    custom_output: dict[str, Any] = field(default_factory=dict)
-
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
 
@@ -1198,6 +1372,9 @@ class DiffusionOutput:
     finished: bool = True
     chunk_index: int = 0
     total_chunks: int = 1
+    started_event_ids: list[str] = field(default_factory=list)
+    active_event_ids: list[str] = field(default_factory=list)
+    completed_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
@@ -1205,10 +1382,9 @@ class DiffusionOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
-    # When True, move all tensor fields (including tensors inside
-    # ``custom_output``) to CPU at construction time. Useful when the output
-    # is shipped across process boundaries (e.g. step-execution mode) and the
-    # receiving side must not initialise a stray CUDA context.
+    # When True, move tensor fields to CPU at construction time. Useful when
+    # the output is shipped across process boundaries (e.g. step-execution
+    # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
 
     def __post_init__(self) -> None:
@@ -1218,14 +1394,18 @@ class DiffusionOutput:
         def _maybe_to_cpu(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
                 return value.detach().cpu()
+            if isinstance(value, dict):
+                return {key: _maybe_to_cpu(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_maybe_to_cpu(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_maybe_to_cpu(item) for item in value)
             return value
 
         self.output = _maybe_to_cpu(self.output)
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
-        if self.custom_output:
-            self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
@@ -1237,27 +1417,205 @@ class DiffusionOutput:
         )
 
 
+class AsyncOutputKind(Enum):
+    """Message kind for ``AsyncDiffusionOutput`` — routes async results.
+
+    * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
+    * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
+    * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
+      is available via ``async_output_id``
+    """
+
+    RPC_RESULT = "rpc_result"
+    COMPUTE_DONE = "compute_done"
+    OUTPUT_READY = "output_ready"
+
+
+@dataclass
+class AsyncDiffusionOutput:
+    """Async protocol envelope for ``result_mq`` messages.
+
+    In request-mode (``step_execution=False``), all ``result_mq``
+    messages use this envelope.  The ``kind`` field routes the message
+    to the correct consumer.
+    """
+
+    kind: AsyncOutputKind
+    rpc_id: str | None = None
+    async_output_id: str | None = None
+    result: Any | None = None
+    output: DiffusionOutput | None = None
+    error: str | None = None
+
+
 class DiffusionRequestAbortedError(RuntimeError):
     """Raised when a diffusion request ends via user-visible abort."""
 
 
+def _in_range(value: Any, name: str, lo: float, hi: float | None) -> float | None:
+    """Validate an optional numeric control at config-parse time."""
+    if value is None:
+        return None
+    x = float(value)
+    if not math.isfinite(x) or x < lo or (hi is not None and x > hi):
+        rng = f"in [{lo}, {hi}]" if hi is not None else f">= {lo}"
+        raise ValueError(f"{name} must be finite and {rng}; got {value!r}.")
+    return x
+
+
+@dataclass
+class SkipSoftmaxSpec:
+    """User-facing skip-softmax controls for the TRTLLM_ATTN backend.
+
+    ``target_sparsity`` uses the checkpoint's calibrated curve (a·exp(b·s)); ``threshold``
+    is the calibration-free absolute skip threshold. They are mutually exclusive.
+    """
+
+    target_sparsity: float | None = None
+    threshold: float | None = None
+    disabled_until_timestep: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.target_sparsity = _in_range(self.target_sparsity, "skip_softmax.target_sparsity", 0.0, 1.0)
+        self.threshold = _in_range(self.threshold, "skip_softmax.threshold", 0.0, None)
+        self.disabled_until_timestep = (
+            _in_range(self.disabled_until_timestep, "skip_softmax.disabled_until_timestep", 0.0, 1.0) or 0.0
+        )
+        if self.target_sparsity is not None and self.threshold is not None:
+            raise ValueError("skip_softmax: set either target_sparsity or threshold, not both.")
+
+    @property
+    def enabled(self) -> bool:
+        return self.threshold is not None or self.target_sparsity is not None
+
+
+@dataclass
+class AttnQuantSpec:
+    dtype_qk: str | None = None
+    dtype_vo: str | None = None
+    q_block_size: int = 1
+    k_block_size: int = 16
+    flashinfer_backend: str | None = None
+
+    _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
+    _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
+
+    def __post_init__(self) -> None:
+        for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
+            if v is not None and v not in self._VALID_DTYPES:
+                raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
+        for name, v in (("q_block_size", self.q_block_size), ("k_block_size", self.k_block_size)):
+            if v not in self._VALID_BLOCK_SIZES:
+                raise ValueError(
+                    f"quant.{name}={v!r} unsupported; kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
+                )
+
+    @property
+    def enabled(self) -> bool:
+        return self.dtype_qk is not None or self.dtype_vo is not None
+
+
+# Backends that select key blocks instead of attending densely, and so accept
+# a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
+BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
+
+
+@dataclass
+class BlockSparseSpec:
+    """User-facing controls shared by block-sparse attention backends.
+
+    ``sparsity`` is the nominal fraction of key blocks dropped per query block;
+    ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
+    index selector such as "0-3,38") exempts individual DiT blocks. Those two are
+    the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    """
+
+    sparsity: float = 0.8
+    start_step: int = 0
+    skip_layers: str | list[int] | None = None
+    skip_layer_indices: set[int] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
+        if self.start_step < 0:
+            raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
+
+
 @dataclass
 class AttentionSpec:
-    """Specifies a backend and its backend-specific parameters for one attention role."""
+    """Specifies a backend and its typed backend-specific config for one attention role."""
 
-    backend: str  # registry name, e.g. "FLASH_ATTN"
-    extra: dict[str, Any] = field(default_factory=dict)  # backend-specific kwargs
+    backend: str
+    skip_softmax: SkipSoftmaxSpec | None = None
+    quant: AttnQuantSpec | None = None
+    block_sparse: BlockSparseSpec | None = None
+    skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
+        self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
+            raise ValueError(
+                f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
+                "Remove skip_softmax or set backend to TRTLLM_ATTN."
+            )
+        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+            raise ValueError(
+                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                f"backend={self.backend!r}. Remove quant or set a supported backend."
+            )
+        if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
+            # Selecting the backend is the opt-in; without an explicit block the
+            # defaults apply rather than silently running dense.
+            self.block_sparse = self.block_sparse or BlockSparseSpec()
+        elif self.block_sparse is not None:
+            raise ValueError(
+                f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
+                f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
 
-        if self.extra is None:
-            self.extra = {}
-        elif isinstance(self.extra, Mapping):
-            self.extra = dict(self.extra)
-        else:
-            raise TypeError(f"Expected dict for AttentionSpec.extra, got {type(self.extra)!r}")
+    @staticmethod
+    def _coerce(value: Any, cls: type, field_name: str) -> Any:
+        if value is None or isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            return cls(**dict(value))
+        raise TypeError(f"Expected dict or {cls.__name__} for {field_name}, got {type(value)!r}")
+
+    def backend_kwargs(self) -> dict[str, Any] | None:
+        """Serialize typed backend config into the kwargs dict the backend impl consumes."""
+        kw: dict[str, Any] = {}
+        if self.skip_softmax is not None:
+            ss = self.skip_softmax
+            if ss.threshold is not None:
+                kw["skip_softmax_threshold"] = ss.threshold
+            if ss.target_sparsity is not None:
+                kw["target_sparsity"] = ss.target_sparsity
+            if ss.disabled_until_timestep:
+                kw["disabled_until_timestep"] = ss.disabled_until_timestep
+        if self.quant is not None and self.quant.enabled:
+            q = self.quant
+            quant_kw: dict[str, Any] = {
+                "dtype_qk": q.dtype_qk,
+                "q_block_size": q.q_block_size,
+                "k_block_size": q.k_block_size,
+            }
+            if q.dtype_vo is not None:
+                quant_kw["dtype_vo"] = q.dtype_vo
+            if q.flashinfer_backend is not None:
+                quant_kw["flashinfer_backend"] = q.flashinfer_backend
+            kw["quant"] = quant_kw
+        if self.block_sparse is not None:
+            bs = self.block_sparse
+            kw["sparsity"] = bs.sparsity
+            kw["start_step"] = bs.start_step
+            if bs.skip_layer_indices:
+                kw["skip_layers"] = sorted(bs.skip_layer_indices)
+        return kw or None
 
 
 @dataclass
@@ -1326,13 +1684,13 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "extra"}
+        spec_keys = {"backend", "skip_softmax", "quant", "block_sparse"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
             if not node_keys <= spec_keys:
                 raise ValueError(
-                    f"Invalid per_role entry for role {role!r}: cannot mix backend/extra with nested role keys."
+                    f"Invalid per_role entry for role {role!r}: cannot mix backend/skip_softmax with nested role keys."
                 )
             normalized[role] = node_dict
             return
@@ -1462,6 +1820,13 @@ class OmniWakeTask:
 
     task_id: str
     tags: list[str] | None = None
+
+
+class CuMemTag(str, Enum):
+    """Tags representing specific CuMem allocations for sleep/wake state tracking."""
+
+    WEIGHTS = "weights"
+    KV_CACHE = "kv_cache"
 
 
 # Special message broadcast via scheduler queues to signal worker shutdown.

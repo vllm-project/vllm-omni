@@ -16,10 +16,11 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
+    resolve_component_quant_config,
 )
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
-pytestmark = [pytest.mark.core_model]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +346,24 @@ class TestTalkerVisualRouting:
 # ===================================================================
 # 4. ComponentQuantizationConfig.resolve
 # ===================================================================
+
+
+class TestResolveComponentQuantConfig:
+    def test_global_config_applies_to_each_quantization_aware_component(self):
+        config = _MockQuantConfig("fp8")
+
+        assert resolve_component_quant_config(config, "transformer") is config
+        assert resolve_component_quant_config(config, "text_encoder") is config
+
+    def test_component_map_is_the_only_scope_override(self):
+        transformer = _MockQuantConfig("fp8")
+        config = ComponentQuantizationConfig(
+            component_configs={"transformer": transformer},
+            default_config=None,
+        )
+
+        assert resolve_component_quant_config(config, "transformer") is transformer
+        assert resolve_component_quant_config(config, "text_encoder") is None
 
 
 class TestComponentResolve:

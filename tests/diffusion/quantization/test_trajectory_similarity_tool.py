@@ -22,6 +22,8 @@ from vllm_omni.quantization.tools.compare_diffusion_trajectory_similarity import
     summarize_output_image_metrics,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def test_compute_tensor_metrics_identical_tensors():
     metrics = compute_tensor_metrics(torch.ones(2, 3), torch.ones(2, 3))
@@ -71,11 +73,9 @@ def test_run_summary_reports_worker_peak_memory():
     assert summary["per_run_peak_memory_mb"] == [100.0, 150.0]
 
 
-def test_request_peak_memory_prefers_inner_diffusion_output():
-    inner = type("InnerOutput", (), {"peak_memory_mb": 321.0})()
-    outer = type("OuterOutput", (), {"request_output": inner, "peak_memory_mb": 123.0})()
-
-    assert _request_peak_memory_mb(outer) == 321.0
+def test_request_peak_memory_reads_peak_memory_mb_directly():
+    result = type("Output", (), {"peak_memory_mb": 123.0})()
+    assert _request_peak_memory_mb(result) == 123.0
 
 
 def test_metric_guidance_describes_thresholds():
@@ -99,7 +99,6 @@ def test_candidate_model_can_point_to_offline_checkpoint_without_online_quantiza
         candidate_quantization_config_json=None,
         candidate_ignored_layers=None,
         ignored_layers=None,
-        candidate_gguf_model=None,
         candidate_load_format="default",
     )
 

@@ -7,6 +7,7 @@ E2E Online tests for Qwen3-Omni model.
 import os
 
 import pytest
+from openai import BadRequestError
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -40,11 +41,21 @@ def get_batch_token_config(default_path):
     Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
     ``stage_args.<id>.engine_args.<field>`` path no longer applies because
     the deploy YAML doesn't nest engine fields under ``engine_args:``.
+
+    Note:
+        64 was the original value but caused a GPU hang (NVIDIA watchdog killed
+        the process after ~2 s) when 5 concurrent requests arrived, due to an
+        upstream scheduler change (``throttle_prefills`` API in vLLM commit
+        0b131b16c). 512 was first tried but caused output quality degradation for
+        long audio (~120 s) inputs. 2048 gives the scheduler enough token budget
+        to handle 5 concurrent requests even with multi-second audio prefill,
+        while still being well below the default 32768.
+        If the upstream scheduler changes again, this value may need adjustment.
     """
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {0: {"max_num_batched_tokens": 64}, 1: {"max_num_batched_tokens": 64}},
+            "stages": {0: {"max_num_batched_tokens": 2048}, 1: {"max_num_batched_tokens": 2048}},
         },
     )
 
@@ -402,12 +413,70 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_one_word_prompt_001(omni_server, openai_client) -> None:
+def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_client) -> None:
     """
+    Regression: ``use_audio_in_video`` with default video loader sampling (no
+    ``media_io_kwargs.video.fps``) after a prior request that pinned fps.
+
+    Before the fix the second request could partial-hit mm-cache (audio cached,
+    video re-processed without audio) and fail with ``StopIteration`` in
+    ``replace_multimodal_special_tokens``.
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 128, embed_audio=True)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text="Reply with one word: OK.",
+    )
+
+    base_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "use_audio_in_video": True,
+        "modalities": ["text"],
+    }
+
+    # Prime mm-cache with explicit loader fps (historical failure mode).
+    openai_client.send_omni_request(
+        {
+            **base_config,
+            "extra_body": {"media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}}},
+        }
+    )
+
+    # Default loader sampling: must succeed without explicit media_io fps.
+    openai_client.send_omni_request(dict(base_config))
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_one_word_prompt_001(omni_server, openai_client) -> None:
+    """Catastrophic-regression gate on one-word pronunciation.
+
+    Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
+    talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1),
+    so asserting it per request gates on a random variable, which is what the old 10-retry
+    loop was compensating for.
+
+    Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
+    word. 85.6% is a predeclared minimum acceptable success probability, taken from a
+    measured HF reference run (77/90); vLLM-Omni itself measured 92.2%. Assuming 40
+    independent Bernoulli trials, >=29/40 has a nominal rejection probability of 0.9%
+    at p=.856, with 92.9% power at p=.60 and 55.9% at p=.70.
+
+    Those are conditional on p, not a measured false-failure rate for this CI: 77/90 is
+    one point estimate (Wilson 76.8%-91.4%), and at the low end of that interval the gate
+    would reject about 20% of runs. Pinning down a real rate would take repeated
+    report-only runs on the target hardware.
+
+    A drop to 70% is caught only about half the time, so this is a smoke gate for gross
+    pipeline breakage, not a quality tracker -- resolving moderate drift needs ~80+
+    samples and belongs in an accuracy benchmark. See #5395.
+
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
     Input Setting: stream=True
-    Datasets: single request
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -419,19 +488,19 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["london"]},
+        # A one-word English clip is too short for whisper's language detection to
+        # be stable; unpinned it renders "London" as 런던 / ランデ / 梁敦 and the
+        # containment check then fails on correct audio.
+        "transcript_language": "en",
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
-    _similarity_assert_msg = "The audio content is not same as the text"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    # The judge runs per request so mismatches can be counted, which also transcribes
+    # concurrently where the previous request_num=5 path judged serially -- worth watching
+    # on tighter cards, since each judge loads whisper on the same device as the talker and
+    # code2wav stages.
+    openai_client.send_omni_request(
+        request_config, request_num=40, min_successes=29, max_concurrency=get_max_batch_size()
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -562,3 +631,21 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params[:1], indirect=True)
+def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:
+    """Ensure invalid audio format is rejected with 400 before streaming starts."""
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    with pytest.raises(BadRequestError, match="audio format"):
+        openai_client.client.chat.completions.create(
+            model=omni_server.model,
+            messages=messages,
+            modalities=["text", "audio"],
+            audio={"voice": "alloy", "format": "aac"},
+            stream=True,
+        )

@@ -14,6 +14,8 @@ stages:
     max_num_seqs: 1
     enforce_eager: false
     model_class_name: DreamZeroPipeline
+    # DreamZero runs on the AR-Diffusion engine (engine-level paged KV cache).
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     model_config:
       default_robot_embodiment: roboarena
       policy_server_config:

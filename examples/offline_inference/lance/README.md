@@ -1,4 +1,4 @@
-# Lance (ByteDance) — offline inference
+# Lance: Offline inference
 
 [Lance](https://huggingface.co/bytedance-research/Lance) is a 3B unified
 autoregressive + diffusion multimodal model on a Qwen2.5-VL backbone. It is

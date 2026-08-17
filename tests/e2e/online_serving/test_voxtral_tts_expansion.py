@@ -30,7 +30,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_speech_english_basic(omni_server, openai_client) -> None:
     """Test basic English TTS generation."""
     openai_client.send_audio_speech_request(
@@ -46,7 +46,7 @@ def test_speech_english_basic(omni_server, openai_client) -> None:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_speech_english_streaming(omni_server, openai_client) -> None:
     """Test basic streaming English TTS generation (PCM via streaming API)."""
     openai_client.send_audio_speech_request(
@@ -56,6 +56,7 @@ def test_speech_english_streaming(omni_server, openai_client) -> None:
             "voice": "casual_female",
             "language": "English",
             "stream": True,
+            "stream_format": "audio",
             "response_format": "pcm",
             "timeout": 120.0,
             "min_audio_bytes": _MIN_AUDIO_BYTES_BASIC,
@@ -117,6 +118,17 @@ def test_speech_instructions(omni_server, openai_client) -> None:
                 "response_format": "wav",
                 "timeout": 120.0,
                 "instructions": instruction,
+                # Re-grade a below-threshold result with whisper large-v3 before
+                # failing, so a miss is attributable rather than ambiguous. Same
+                # opt-in as test_higgs_audio_v3.py.
+                #
+                # Note: for this input it does NOT rescue the check — small and
+                # large-v3 both transcribe "The boy was there when sun rose."
+                # (sim=0.87 each) against an input of "...when the sun rose.",
+                # i.e. the TTS really does drop the article. That is the value
+                # here: two independent ASR models agreeing rules out a grader
+                # flake and points at the model.
+                "transcript_escalation_model": "large-v3",
             }
         )
 

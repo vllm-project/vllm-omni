@@ -1,4 +1,4 @@
-# Step-Audio2 Online Serving
+# Step-Audio2: Online serving
 
 This directory contains examples for running Step-Audio2 with vLLM-Omni's online serving API.
 
@@ -10,15 +10,15 @@ Please refer to [README.md](../../../README.md)
 
 ```bash
 # Async chunk mode (recommended — lower first-packet latency for TTS)
-vllm serve stepfun-ai/Step-Audio2-mini --omni --port 8092 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/step_audio_2_async_chunk.yaml \
+vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
+    --deploy-config vllm_omni/deploy/step_audio_2_async_chunk.yaml \
     --trust-remote-code --enforce-eager
 ```
 
 Sequential mode:
 ```bash
-vllm serve stepfun-ai/Step-Audio2-mini --omni --port 8092 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/step_audio_2.yaml \
+vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
+    --deploy-config vllm_omni/deploy/step_audio_2.yaml \
     --trust-remote-code --enforce-eager
 ```
 
@@ -51,7 +51,7 @@ Or via curl:
 ```bash
 curl -X POST http://localhost:8092/v1/audio/speech \
     -H "Content-Type: application/json" \
-    -d '{"model":"stepfun-ai/Step-Audio2-mini","input":"你好世界","voice":"default"}' \
+    -d '{"model":"stepfun-ai/Step-Audio-2-mini","input":"你好世界","voice":"default"}' \
     --output output.wav
 ```
 
@@ -139,7 +139,7 @@ Step-Audio2 uses the OpenAI-compatible chat completions API:
 
 ```json
 {
-  "model": "stepfun-ai/Step-Audio2-mini",
+  "model": "stepfun-ai/Step-Audio-2-mini",
   "messages": [
     {
       "role": "system",

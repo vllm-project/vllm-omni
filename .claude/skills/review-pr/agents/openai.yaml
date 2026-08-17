@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM-Omni PR Review"
+  short_description: "Review vLLM-Omni PRs and route owner requests"
+  default_prompt: "Use $review-pr to review this vLLM-Omni pull request with owner-specific rules and evidence-backed findings."

@@ -33,6 +33,7 @@ from .config_ming_tts import (
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
+from .constants import SPEAKER_EMBEDDING_DIM
 from .flowloss_head import FlowLoss
 from .patch_emission import (
     MING_STOP_REASON_CODES,
@@ -57,10 +58,20 @@ _CFM_STEPS = 10
 
 
 class MingLLMModel(nn.Module):
+    # Drop the tensor on purpose, otherwise upstream vLLM would reject.
+    # The vendor never reaches them either (audio_gate/image_gate never fire)
+    # dropping them keeps routing identical to the reference implementation.
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py#L427-L428
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailing_moe.py#L510-L520
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".mlp.audio_gate.": None,
+            ".mlp.image_gate.": None,
+        },
         orig_to_new_prefix={
+            "model.lm_head.": None,
             "model.model.": "model.",
-        }
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -91,7 +102,7 @@ class MingLLMModel(nn.Module):
             **self.ming_config.ditar_config,
         )
         self.stop_head = nn.Linear(self.ming_config.llm_hidden_size, 2, bias=True)
-        self.spk_head = nn.Linear(192, self.ming_config.llm_hidden_size, bias=True)
+        self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.ming_config.llm_hidden_size, bias=True)
         self.flowloss.to(dtype=self.fm_dtype)
         self.linear_proj_audio.to(dtype=self.fm_dtype)
         self.stop_head.to(dtype=self.fm_dtype)
@@ -325,6 +336,28 @@ class MingLLMModel(nn.Module):
             return self._cfm_graph
         try:
             from .fm.cfm_cudagraph import CFMGraphExecutor, CFMSampler
+
+            # TODO(perf):
+            #   (1) compile per-block (dit_model.blocks) instead of the
+            #   whole forward for tighter fusion / fewer graph breaks;
+            #   (2) move the compile + a synthetic warmup forward to a post-weight-load hook
+            dit_model = self.flowloss.cfm.model
+            if not getattr(dit_model, "_ming_compiled", False):
+                try:
+                    # Scoped options (avoid mutating global inductor config).
+                    dit_model.forward = torch.compile(
+                        dit_model.forward,
+                        fullgraph=False,
+                        dynamic=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
+                    dit_model._ming_compiled = True
+                    logger.info("Ming CFM DiT torch.compile enabled (inductor cudagraphs off).")
+                except Exception as exc:
+                    logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
             self._cfm_graph = CFMGraphExecutor(

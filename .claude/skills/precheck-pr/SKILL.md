@@ -1,6 +1,6 @@
 ---
 name: precheck-pr
-description: Self-check your branch before creating a PR — catch dead code, verify accuracy/perf claims, validate PR title format, and confirm merge readiness. Use when the user says "precheck", "self review", "pre-submit check", or "check my PR before I open it." Never posts to GitHub.
+description: Self-check your branch before creating a PR — catch dead code, prevent new model-specific Python examples, verify accuracy/perf claims, validate PR title format, and confirm merge readiness. Use when the user says "precheck", "self review", "pre-submit check", or "check my PR before I open it." Never posts to GitHub.
 ---
 
 # PR Pre-Check
@@ -65,6 +65,8 @@ Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type
 
 **Also run the Code-Quality sweep on every PR**, regardless of type or mode: the five diff-scoped checks in [references/code-quality.md](references/code-quality.md) — kwargs fragility, broad-except swallow, `Any`/wrong type hints, hot-path `.clone()`/`deepcopy`, and event-loop blocking — plus the advisory conventions (log level, structured logging, synchronization, cleanup, dependencies, naming) in [checklists.md](references/checklists.md). These count only lines the PR *adds* — the pre-existing backlog across the repo is out of scope.
 
+**Also run the Examples-Policy check on every PR** using [references/examples-policy.md](references/examples-policy.md). Inspect only Python paths introduced by the diff. Treat a new model-, checkpoint-, vendor-, or family-specific Python example as blocking; do not report pre-existing example debt.
+
 ### Step 5: Print Report
 
 ```
@@ -77,6 +79,7 @@ Pre-check report for <branch>
   ─────────────────  ──────
   PR title format    ✓
   Code quality       ⚠ 1 broad except, 2 Any hints
+  Examples policy    ✗ new model-specific Python example
   PR desc integrity  ✓
   Registry/config    ✓
   Dead code          ⚠ 2 warnings

@@ -127,7 +127,7 @@ def _validate_ming_decode_window(
             continue
         max_steps = _resolve_runtime_int(info, KEY_MAX_DECODE_STEPS, default_max_decode_steps)
         min_steps = _resolve_optional_runtime_int(info, KEY_MIN_DECODE_STEPS, 0)
-        min_required = max(min_stop_step + 1, min_steps)
+        min_required = max(min_stop_step + 2, min_steps)
         if max_steps < min_required:
             req_id = info.get(KEY_REQUEST_ID, f"idx={i}")
             raise ValueError(
@@ -148,7 +148,7 @@ def _resolve_ming_stop_decision(
     audio_dummy_token_id: int,
     text_eos_token_id: int,
 ) -> tuple[str, bool, bool, int, int]:
-    min_required_decode_steps = max(min_stop_step + 1, min_decode_steps)
+    min_required_decode_steps = max(min_stop_step + 2, min_decode_steps)
     if max_decode_steps < min_required_decode_steps:
         raise RuntimeError(
             "Invalid Ming decode window: "

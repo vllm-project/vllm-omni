@@ -80,6 +80,7 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "task_type": "Base",
         "voice": "clone",

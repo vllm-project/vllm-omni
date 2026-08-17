@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, cast
 from urllib.parse import quote
 
+import numpy as np
 import psutil
 import requests
 import soundfile as sf
@@ -37,16 +38,20 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 
 from tests.helpers.assertions import (
+    SuccessRateGate,
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_images_generations_response,
     assert_omni_response,
+    collect_at_success_rate,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
 )
+from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -596,7 +601,7 @@ class OmniServerStageCli(OmniServer):
             "serve",
             self.model,
             "--omni",
-            "--stage-configs-path",
+            "--deploy-config",
             self.stage_config_path,
             "--stage-id",
             str(stage_id),
@@ -637,7 +642,10 @@ class OmniServerStageCli(OmniServer):
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            # Must be repo root (not tests/): after Docker deps-cache installs an empty
+            # vllm_omni stub into site-packages, cwd on sys.path[0] is what makes
+            # ``python -m vllm_omni.entrypoints...`` resolve the real package.
+            cwd=_omni_subprocess_cwd(),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
@@ -796,6 +804,189 @@ class WebSocketJsonResponse:
     """First JSON object delivered as a text WebSocket frame (streaming endpoints)."""
 
     json_body: dict[str, Any]
+
+
+@dataclass
+class OpenPIWebSocketResponse:
+    """Msgpack WebSocket session against ``/v1/realtime/robot/openpi``."""
+
+    server_metadata: dict[str, Any]
+    operation_responses: list[Any]
+    actions: dict[str, np.ndarray] | None = None
+    action_tensors: list[np.ndarray] | None = None
+
+
+def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[str, Any]:
+    """Build a minimal DROID-style observation payload for the OpenPI robot endpoint."""
+    identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
+    identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    return {
+        "session_id": session_id,
+        "video": {
+            "exterior_image_1_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+            "wrist_image_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+        },
+        "state": {
+            "eef_9d": identity_eef_9d,
+            "gripper_position": np.zeros((1, 1, 1), dtype=np.float32),
+            "joint_position": np.zeros((1, 1, 7), dtype=np.float32),
+        },
+        "language": {"annotation.language.language_instruction": [["pick up the object"]]},
+    }
+
+
+DREAMZERO_DEFAULT_PROMPT = (
+    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
+)
+DREAMZERO_ACTION_HORIZON = 24
+DREAMZERO_ACTION_DIM = 8
+DREAMZERO_CAMERA_FILES = {
+    "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
+    "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
+    "observation/wrist_image_left": "wrist_image_left.mp4",
+}
+
+
+def _require_opencv() -> Any:
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - optional e2e dependency
+        raise ModuleNotFoundError("DreamZero OpenPI test dependencies are missing: opencv-python") from exc
+    return cv2
+
+
+def load_dreamzero_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
+    cv2 = _require_opencv()
+    camera_frames: dict[str, np.ndarray] = {}
+    for camera_key, file_name in DREAMZERO_CAMERA_FILES.items():
+        video_path = video_dir / file_name
+        if not video_path.exists():
+            raise FileNotFoundError(f"Missing DreamZero test asset: {video_path}")
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames:
+            raise RuntimeError(f"No frames loaded from {video_path}")
+        camera_frames[camera_key] = np.stack(frames, axis=0)
+    return camera_frames
+
+
+def build_dreamzero_demo_observations(
+    camera_frames: dict[str, np.ndarray],
+    *,
+    prompt: str,
+    session_id: str,
+    num_chunks: int = 2,
+) -> list[dict[str, Any]]:
+    if num_chunks < 1:
+        raise ValueError("num_chunks must be at least 1")
+
+    relative_offsets = [-23, -16, -8, 0]
+    total_frames = min(frames.shape[0] for frames in camera_frames.values())
+    frame_schedules = [[0]]
+    current_frame = 23
+    for _ in range(num_chunks - 1):
+        indices = [max(current_frame + offset, 0) for offset in relative_offsets]
+        if indices[-1] >= total_frames:
+            break
+        frame_schedules.append(indices)
+        current_frame += DREAMZERO_ACTION_HORIZON
+
+    observations: list[dict[str, Any]] = []
+    for frame_indices in frame_schedules:
+        obs: dict[str, Any] = {}
+        for camera_key, all_frames in camera_frames.items():
+            selected = all_frames[frame_indices]
+            obs[camera_key] = selected[0] if len(frame_indices) == 1 else selected
+        obs["observation/joint_position"] = np.zeros(7, dtype=np.float32)
+        obs["observation/cartesian_position"] = np.zeros(6, dtype=np.float32)
+        obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
+        obs["prompt"] = prompt
+        obs["session_id"] = session_id
+        observations.append(obs)
+    return observations
+
+
+class OpenPIWebSocketSession:
+    """Persistent msgpack session for ``/v1/realtime/robot/openpi``."""
+
+    DEFAULT_PING_INTERVAL_SECS = 300
+    DEFAULT_PING_TIMEOUT_SECS = 3600
+
+    @staticmethod
+    def _require_dependencies() -> tuple[Any, Any]:
+        try:
+            import websockets.sync.client as websockets_client
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
+        try:
+            from openpi_client import msgpack_numpy
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        return websockets_client, msgpack_numpy
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        ping_interval: float = DEFAULT_PING_INTERVAL_SECS,
+        ping_timeout: float = DEFAULT_PING_TIMEOUT_SECS,
+        open_timeout: float = 120.0,
+        close_timeout: float = 120.0,
+    ) -> None:
+        websockets_client, msgpack_numpy = self._require_dependencies()
+        self._msgpack_numpy = msgpack_numpy
+        self._packer = msgpack_numpy.Packer()
+        self._conn = websockets_client.connect(
+            uri,
+            compression=None,
+            max_size=None,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=open_timeout,
+            close_timeout=close_timeout,
+        )
+        server_metadata = msgpack_numpy.unpackb(self._conn.recv())
+        if not isinstance(server_metadata, dict):
+            raise TypeError(f"Expected dict metadata from {uri}, got {type(server_metadata)!r}")
+        self._server_metadata = server_metadata
+
+    def get_server_metadata(self) -> dict[str, Any]:
+        return dict(self._server_metadata)
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
+        response = self._send_operation("infer", obs)
+        if not isinstance(response, dict):
+            raise TypeError(f"Expected dict infer response, got {type(response)!r}")
+        return {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+
+    def reset(self, reset_info: dict[str, Any] | None = None) -> str:
+        response = self._send_operation("reset", dict(reset_info or {}))
+        return str(response["status"])
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def _send_operation(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        body = dict(payload)
+        body["endpoint"] = endpoint
+        self._conn.send(self._packer.pack(body))
+        raw = self._conn.recv()
+        if isinstance(raw, str):
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {raw}")
+        decoded = self._msgpack_numpy.unpackb(raw)
+        if isinstance(decoded, dict) and decoded.get("type") == "error":
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {decoded.get('message')}")
+        if endpoint == "reset":
+            if not isinstance(decoded, dict) or decoded.get("status") != "reset successful":
+                raise RuntimeError(f"Unexpected OpenPI reset response: {decoded!r}")
+            return decoded
+        return decoded
 
 
 def _merge_http_expectation_kwargs(
@@ -1064,6 +1255,51 @@ class OpenAIClientHandler:
         )
         return [resp]
 
+    def send_batched_chat_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """Post to batched chat completions."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/chat/completions/batch", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/completions`` with ``json`` or ``raw_body``."""
+        # TODO (Alex): A lot of these helpers should be consolidated as they differ only by endpoint
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/completions", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
     def send_omni_sleep_http_request(
         self,
         request_config: dict[str, Any],
@@ -1271,6 +1507,11 @@ class OpenAIClientHandler:
             err_code=cfg.get("err_code"),
             err_message=cfg.get("err_message"),
         )
+        if cfg.get("err_code") is None:
+            assert resp.success, resp.error_message
+            payload = resp.json_body
+            assert isinstance(payload, dict)
+            assert_images_generations_response(payload, cfg, run_level=self.run_level)
         return [resp]
 
     def send_images_edits_http_request(
@@ -1566,8 +1807,106 @@ class OpenAIClientHandler:
         )
         return self._send_websocket_first_json_request("/v1/realtime", cfg)
 
-    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
-        """Chat completions via the OpenAI Python SDK (not raw HTTP)."""
+    def send_robot_openpi_ws_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+    ) -> list[OpenPIWebSocketResponse]:
+        """WebSocket ``/v1/realtime/robot/openpi`` — msgpack metadata plus optional infer/reset ops.
+
+        ``request_config`` keys:
+
+        - ``operations``: optional sequence of ``{"endpoint": "infer"|"reset", "payload": {...}}``.
+        - ``run_default_policy_session``: when true and ``operations`` is omitted, run infer then reset
+          using :func:`build_openpi_droid_observation`.
+        - ``run_dreamzero_policy_session``: when true and ``operations`` is omitted, run the DreamZero
+          infer/reset/infer sequence using :func:`build_dreamzero_demo_observations`.
+        - ``video_dir``: required for ``run_dreamzero_policy_session``.
+        - ``prompt``: language instruction for DreamZero observations (optional).
+        - ``session_id``: used by the default policy session observation builder.
+        - ``num_chunks``: DreamZero chunk count (default ``2``).
+        - ``timeout``: seconds to wait for each inbound msgpack frame (default ``120``).
+        - ``ping_interval`` / ``ping_timeout``: forwarded to :func:`websockets.sync.client.connect`.
+        """
+        cfg = dict(request_config or {})
+        operations_cfg = cfg.get("operations")
+        if operations_cfg is not None:
+            operations = [dict(op) for op in operations_cfg]
+        elif cfg.get("run_dreamzero_policy_session"):
+            video_dir = cfg.get("video_dir")
+            if video_dir is None:
+                raise ValueError("run_dreamzero_policy_session requires video_dir")
+            session_id = str(cfg.get("session_id", "dreamzero-smoke"))
+            prompt = str(cfg.get("prompt", DREAMZERO_DEFAULT_PROMPT))
+            num_chunks = int(cfg.get("num_chunks", 2))
+            observations = build_dreamzero_demo_observations(
+                load_dreamzero_camera_frames(Path(video_dir)),
+                prompt=prompt,
+                session_id=session_id,
+                num_chunks=num_chunks,
+            )
+            operations = [{"endpoint": "infer", "payload": obs} for obs in observations]
+            operations.append({"endpoint": "reset", "payload": {}})
+            operations.append({"endpoint": "infer", "payload": observations[0]})
+        elif cfg.get("run_default_policy_session"):
+            session_id = str(cfg.get("session_id", "gr00t-smoke"))
+            operations = [
+                {"endpoint": "infer", "payload": build_openpi_droid_observation(session_id=session_id)},
+                {"endpoint": "reset", "payload": {}},
+            ]
+        else:
+            operations = []
+        timeout = float(cfg.get("timeout", 120.0))
+        ping_interval = float(cfg.get("ping_interval", OpenPIWebSocketSession.DEFAULT_PING_INTERVAL_SECS))
+        ping_timeout = float(cfg.get("ping_timeout", OpenPIWebSocketSession.DEFAULT_PING_TIMEOUT_SECS))
+
+        uri = self._build_ws_url("/v1/realtime/robot/openpi")
+        session = OpenPIWebSocketSession(
+            uri,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=timeout,
+            close_timeout=timeout,
+        )
+        try:
+            operation_responses: list[Any] = []
+            actions: dict[str, np.ndarray] | None = None
+            action_tensors: list[np.ndarray] = []
+            for operation in operations:
+                endpoint = str(operation["endpoint"])
+                payload = dict(operation.get("payload") or {})
+                response = session._send_operation(endpoint, payload)
+                operation_responses.append(response)
+                if endpoint == "infer":
+                    if isinstance(response, dict):
+                        actions = {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+                    else:
+                        action_tensors.append(np.asarray(response, dtype=np.float32))
+        finally:
+            session.close()
+
+        return [
+            OpenPIWebSocketResponse(
+                server_metadata=session.get_server_metadata(),
+                operation_responses=operation_responses,
+                actions=actions,
+                action_tensors=action_tensors or None,
+            )
+        ]
+
+    def send_omni_request(
+        self,
+        request_config: dict[str, Any],
+        request_num: int = 1,
+        *,
+        min_successes: int | None = None,
+        max_concurrency: int | None = None,
+    ) -> list[OmniResponse]:
+        """Chat completions via the OpenAI Python SDK (not raw HTTP).
+
+        ``min_successes`` gates the batch on how many of the ``request_num`` requests pass
+        rather than requiring each one to, and returns only the successes; ``max_concurrency``
+        caps how many are in flight at once. See ``SuccessRateGate``.
+        """
         responses: list[OmniResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
@@ -1598,22 +1937,6 @@ class OpenAIClientHandler:
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
-        if request_num == 1:
-            wall_start = time.perf_counter()
-            chat_completion = self.client.chat.completions.create(**create_kwargs)
-            resp = (
-                self._process_stream_omni_response(chat_completion, wall_start=wall_start)
-                if stream
-                else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
-            )
-            assert_omni_response(resp, request_config, run_level=self.run_level)
-            if resp.e2e_latency is not None:
-                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
-            else:
-                self._print_client_stat("[omni] request#1 completed")
-            responses.append(resp)
-            return responses
-
         def _one():
             wall_start = time.perf_counter()
             chat_completion = self.client.chat.completions.create(**create_kwargs)
@@ -1622,6 +1945,33 @@ class OpenAIClientHandler:
                 if stream
                 else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
             )
+
+        if min_successes is not None:
+            gate = SuccessRateGate(min_successes=min_successes, concurrency=max_concurrency)
+
+            def _sample() -> OmniResponse:
+                resp = _one()
+                assert_omni_response(resp, request_config, run_level=self.run_level)
+                return resp
+
+            # Not _print_client_stat: the count is the gate's verdict, so it has to survive
+            # log_stats=False.
+            return collect_at_success_rate(
+                _sample,
+                gate,
+                request_num=request_num,
+                report=lambda line: print(f"[omni] {line}", flush=True),
+            )
+
+        if request_num == 1:
+            resp = _one()
+            assert_omni_response(resp, request_config, run_level=self.run_level)
+            if resp.e2e_latency is not None:
+                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[omni] request#1 completed")
+            responses.append(resp)
+            return responses
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
             futures = {executor.submit(_one): i + 1 for i in range(request_num)}
@@ -1770,6 +2120,8 @@ class OpenAIClientHandler:
             "seed",
             "instructions",
             "speed",
+            "stream_format",
+            "x_vector_only_mode",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]
@@ -2307,9 +2659,8 @@ class OmniRunner:
         # production default in AsyncOmniEngine remains 600s; this only
         # affects the test runner wrapper.
         init_timeout: int = 1800,
-        shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
-        stage_configs_path: str | None = None,
+        deploy_config: str | None = None,
         **kwargs,
     ) -> None:
         startup_t0 = time.perf_counter()
@@ -2327,8 +2678,7 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            shm_threshold_bytes=shm_threshold_bytes,
-            stage_configs_path=stage_configs_path,
+            deploy_config=deploy_config,
             **kwargs,
         )
         startup_s = time.perf_counter() - startup_t0
@@ -2397,6 +2747,10 @@ class OmniRunner:
         video_padding_token = "<|VIDEO|>"
         image_padding_token = "<|IMAGE|>"
         audio_padding_token = "<|AUDIO|>"
+        # Default wrapping for Qwen-style models (bos/eos around the placeholder).
+        audio_fmt = "<|audio_bos|>{p}<|audio_eos|>"
+        image_fmt = "<|vision_bos|>{p}<|vision_eos|>"
+        video_fmt = "<|vision_bos|>{p}<|vision_eos|>"
         if "Qwen3-Omni-30B-A3B-Instruct" in self.model_name:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
@@ -2405,6 +2759,15 @@ class OmniRunner:
             video_padding_token = "<VIDEO>"
             image_padding_token = "<IMAGE>"
             audio_padding_token = "<AUDIO>"
+        elif "MiniCPM" in self.model_name:
+            # MiniCPM-o expects the bare placeholder literals (with parens and ./),
+            # not Qwen-style bos/eos wrapping.
+            video_padding_token = "(<video>./</video>)"
+            image_padding_token = "(<image>./</image>)"
+            audio_padding_token = "(<audio>./</audio>)"
+            audio_fmt = "{p}"
+            image_fmt = "{p}"
+            video_fmt = "{p}"
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -2465,28 +2828,28 @@ class OmniRunner:
             if audio is not None:
                 if isinstance(audio, list):
                     for _ in audio:
-                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                        user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
                 else:
-                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
                     for _ in image:
-                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                        user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
                 else:
-                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
             video = videos_list[i]
             if video is not None:
                 if isinstance(video, list):
                     for _ in video:
-                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                        user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
                 else:
-                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
             user_content += prompt_text
 
@@ -2600,9 +2963,9 @@ class OmniRunnerHandler:
             audio_content = None
             for stage_output in outputs:
                 if getattr(stage_output, "final_output_type", None) == "text":
-                    text_content = stage_output.request_output.outputs[0].text
+                    text_content = stage_output.outputs[0].text
                 if getattr(stage_output, "final_output_type", None) == "audio":
-                    audio_content = stage_output.request_output.outputs[0].multimodal_output["audio"]
+                    audio_content = stage_output.outputs[0].multimodal_output["audio"]
             result.audio_content = audio_content
             result.text_content = text_content
             result.success = True
@@ -2742,7 +3105,7 @@ class OmniRunnerHandler:
         mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                mm_out = stage_out.outputs[0].multimodal_output
                 break
         if mm_out is None:
             raise AssertionError("No audio output from pipeline")
@@ -2791,11 +3154,24 @@ def iter_omni_server(
 
     with omni_fixture_lock:
         params: OmniServerParams = request.param
-        model = model_prefix + params.model
+        # For now, when a tiny model is substituted, we preserve the original model
+        # name via --served-model-name (so that the server still accepts requests with
+        # the original name). We also do the same for server.model so that tests reading
+        # server.model send the correct name in requests.
+        #
+        # TODO: core models on this path currently do not clean up tiny models, although
+        # tiny model paths are deterministic, so it's not a huge footprint. Still, it would
+        # be ideal to cleanup consistently everywhere.
+        original_model = model_prefix + params.model
+        model = original_model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
         port = params.port
         stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
 
         server_args = params.server_args or []
+        if model != original_model:
+            server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni and params.stage_init_timeout is not None:
             server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
         else:
@@ -2812,7 +3188,7 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
+            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -2821,12 +3197,14 @@ def iter_omni_server(
                 port=port,
                 env_dict=params.env_dict,
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
+                server_args += ["--deploy-config", stage_config_path]
 
             with (
                 OmniServer(
@@ -2844,6 +3222,8 @@ def iter_omni_server(
                     use_omni=params.use_omni,
                 )
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2875,7 +3255,9 @@ def iter_omni_runner(
             extra_omni_kwargs = dict(extra) if extra is not None else {}
         stage_config_path = stage_config_path_for_run_level(stage_config_path, run_level)
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
+        with OmniRunner(model, seed=42, deploy_config=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")
@@ -2887,6 +3269,14 @@ __all__ = [
     "DiffusionResponse",
     "HttpResponse",
     "WebSocketJsonResponse",
+    "OpenPIWebSocketResponse",
+    "build_openpi_droid_observation",
+    "build_dreamzero_demo_observations",
+    "DREAMZERO_ACTION_DIM",
+    "DREAMZERO_ACTION_HORIZON",
+    "DREAMZERO_CAMERA_FILES",
+    "load_dreamzero_camera_frames",
+    "OpenPIWebSocketSession",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",

@@ -164,11 +164,11 @@ class SoulXPreprocessPipeline(nn.Module, SupportAudioInput, SupportsComponentDis
                 sample_rate=self.target_sr,
             )
 
-        # Non-None placeholder so DiffusionEngine forwards custom_output to stage-1
-        # (output=None triggers an early return that drops handoff).
         return DiffusionOutput(
-            output=torch.zeros(0),
-            custom_output={SOULX_PREPROCESSED_KEY: payload},
+            output={
+                "payload": {},
+                "metadata": {SOULX_PREPROCESSED_KEY: payload},
+            },
             to_cpu=True,
         )
 

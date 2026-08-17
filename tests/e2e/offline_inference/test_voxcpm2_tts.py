@@ -14,8 +14,8 @@ VOXCPM2_MODEL = "openbmb/VoxCPM2"
 DEPLOY_CONFIG = get_deploy_config_path("voxcpm2.yaml")
 SAMPLE_RATE = 48000
 
-# (model, stage_config_path) — see ``omni_runner`` in tests.helpers.fixtures.runtime
-_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG)
+# VoxCPM2 ships a custom tokenizer, so remote code must be explicitly enabled.
+_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG, {"trust_remote_code": True})
 
 pytestmark = pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 
@@ -39,8 +39,7 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     return audio
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
@@ -53,8 +52,7 @@ def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
@@ -95,8 +93,7 @@ def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_prefill_decode_mixed_batch_003(omni_runner: OmniRunner) -> None:

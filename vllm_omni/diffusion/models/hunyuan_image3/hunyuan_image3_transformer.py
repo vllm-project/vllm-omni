@@ -29,7 +29,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
@@ -60,8 +60,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -75,10 +76,12 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -424,22 +427,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep).
-    Input:  (batch, seqlen, num_key_value_heads, head_dim)
-    Output: (batch, seqlen, num_attention_heads, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-
-    if n_rep == 1:
-        return hidden_states
-
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 def default(value, default_value):
@@ -957,6 +944,7 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
+        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -1099,6 +1087,12 @@ class ImageKVCacheManager:
 
         neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
         self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
+        logger.debug(
+            "[AR KV Reuse] neg branch: reused shared_prefix_len=%d, neg_kv_total_len=%d (q_len_actual=%d)",
+            shared_prefix_len,
+            key.shape[1],
+            q_len_actual,
+        )
         return key, value
 
     def __call__(
@@ -1124,6 +1118,7 @@ class ImageKVCacheManager:
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
         repeat_num = head_num_per_rank // kv_head_num_per_rank
+        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1165,11 +1160,12 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        if not keep_kv_compressed:
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 
@@ -1624,7 +1620,8 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
-        self.experts = HunyuanFusedMoE(
+        enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
+        self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -1635,7 +1632,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            pcp_size=1,
+            pcp_size=None if enable_expert_parallel else 1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2104,7 +2101,7 @@ class HunyuanImage3Model(nn.Module):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = HunyuanFusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
@@ -2234,13 +2231,8 @@ class HunyuanImage3Model(nn.Module):
             # processed with quantization, LoRA, fine-tuning, etc.
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
+            # KV-cache scales are renamed via maybe_remap_kv_scale_name below;
+            # quant_config.get_cache_scale was removed in vLLM v0.23.0 (see #4810).
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -2390,6 +2382,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
+        current_omni_platform.reset_diffusion_fused_moe_forward_context()
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2923,6 +2917,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
+            logger.debug(
+                "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
+                cfg_rank,
+            )
             return input_ids, 0
 
         # 1. positive prefix len
@@ -3235,8 +3233,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
             image = image.squeeze(2)
 
-        do_denormalize = [True] * image.shape[0]
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        # Denormalize + PIL moved to engine post_process_func for overlap with next request.
 
         if not return_dict:
             return (image,)

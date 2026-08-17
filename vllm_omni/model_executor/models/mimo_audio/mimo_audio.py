@@ -793,9 +793,21 @@ class MiMoAudioForConditionalGeneration(
                 **kwargs,
             )
 
+            # next_speech_tokens is request-indexed (num_reqs, 1, 8, 4), not
+            # token-indexed, so ship it as a per-request list. The payload
+            # builder slices batched tensors by token offsets (start:end),
+            # which only coincides with the request index in pure-decode
+            # steps; in a mixed prefill+decode batch every request would
+            # receive the whole batch tensor, leaking codes across requests
+            # and crashing the downstream ragged-list conversion.
+            if next_speech_tokens is not None:
+                speech_token_payload = list(next_speech_tokens.split(1, dim=0))
+            else:
+                speech_token_payload = None
+
             return OmniOutput(
                 text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
-                multimodal_outputs={"codes": {"audio": next_speech_tokens}},
+                multimodal_outputs={"codes": {"audio": speech_token_payload}},
             )
 
         if self.model_stage == "code2wav":

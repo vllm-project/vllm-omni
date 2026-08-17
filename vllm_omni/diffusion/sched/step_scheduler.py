@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -27,8 +27,8 @@ class _StepProgress:
     total_steps: int
 
 
-class StepScheduler(_BaseScheduler):
-    """Placeholder scheduler that advances a request one denoise step per update."""
+class StepScheduler(BaseScheduler):
+    """Scheduler that advances each request by one denoise step per update."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -62,9 +62,6 @@ class StepScheduler(_BaseScheduler):
         )
         return request_id
 
-    def schedule(self) -> DiffusionSchedulerOutput:
-        return super().schedule()
-
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
         if not scheduled_request_ids:
@@ -88,6 +85,10 @@ class StepScheduler(_BaseScheduler):
                 continue
 
             req_result = req_output.result
+            if req_result is not None and req_result.aborted:
+                terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ABORTED
+                terminal_errors[request_id] = None
+                continue
             output_error = req_result.error if req_result is not None else None
             if output_error is not None:
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_ERROR

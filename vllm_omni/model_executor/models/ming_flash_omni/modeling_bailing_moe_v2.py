@@ -32,7 +32,10 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -329,7 +332,7 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -341,7 +344,7 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-        self.experts.expert_mapping = FusedMoE.make_expert_params_mapping(
+        self.experts.expert_mapping = fused_moe_make_expert_params_mapping(
             self.experts,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",

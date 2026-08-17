@@ -16,7 +16,7 @@ from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -62,6 +62,7 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "voice": "default",
@@ -73,7 +74,6 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-@pytest.mark.skip(reason="#4335")
 def test_response_format_001(omni_server, openai_client) -> None:
     """
     Test voice-clone non-stream PCM output via OpenAI API.
@@ -92,5 +92,6 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "voice": "default",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": _MIN_AUDIO_BYTES,
+        "min_hnr_db": -2.0,
     }
     openai_client.send_audio_speech_request(request_config)

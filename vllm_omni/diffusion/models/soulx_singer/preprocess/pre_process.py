@@ -159,35 +159,38 @@ def attach_preprocess_for_diffusion_request(
         kind,
         dict(getattr(request.sampling_params, "extra_args", None) or {}),
     )
-    for i, prompt in enumerate(request.prompts):
-        prompt = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
+    prompt = request.prompt
+    prompt = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
 
-        if is_warmup_request(request):
-            request.sampling_params.num_inference_steps = 1
-            payload = build_warmup_payload(
-                kind,
-                metadata_processor=metadata_processor,
-                device=device,
-                sample_rate=sample_rate,
-            )
-        elif get_soulx_preprocessed_payload(prompt):
-            request.prompts[i] = prompt
-            continue
-        elif has_precomputed(extra_args, kind):
-            payload = build_precomputed_payload(
-                kind,
-                extra_args,
-                metadata_processor=metadata_processor,
-                sample_rate=sample_rate,
-                device=device,
-            )
-        else:
-            raise _preprocess_inputs_missing_error(kind)
+    if is_warmup_request(request):
+        request.sampling_params.num_inference_steps = 1
+        payload = build_warmup_payload(
+            kind,
+            metadata_processor=metadata_processor,
+            device=device,
+            sample_rate=sample_rate,
+        )
+    elif get_soulx_preprocessed_payload(prompt):
+        request.prompt = prompt
+        if kind == "svs":
+            extra_args = normalize_svs_control_extra_args(extra_args)
+        request.sampling_params.extra_args = extra_args
+        return request
+    elif has_precomputed(extra_args, kind):
+        payload = build_precomputed_payload(
+            kind,
+            extra_args,
+            metadata_processor=metadata_processor,
+            sample_rate=sample_rate,
+            device=device,
+        )
+    else:
+        raise _preprocess_inputs_missing_error(kind)
 
-        if payload.get("kind") != kind:
-            raise ValueError(f"Invalid {kind} preprocess payload kind: {payload.get('kind')}")
-        prompt.setdefault("additional_information", {})[SOULX_PREPROCESSED_KEY] = payload
-        request.prompts[i] = prompt
+    if payload.get("kind") != kind:
+        raise ValueError(f"Invalid {kind} preprocess payload kind: {payload.get('kind')}")
+    prompt.setdefault("additional_information", {})[SOULX_PREPROCESSED_KEY] = payload
+    request.prompt = prompt
 
     if kind == "svs":
         extra_args = normalize_svs_control_extra_args(extra_args)

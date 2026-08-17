@@ -10,6 +10,7 @@ Tests cover:
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import PIL.Image
 import pytest
 import torch
 
@@ -17,6 +18,21 @@ import vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 as t2
 import vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5_i2v as i2v_module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_i2v_pre_process_uses_single_request_prompt():
+    preprocess = i2v_module.get_hunyuan_video_15_i2v_pre_process_func(SimpleNamespace())
+    image = PIL.Image.new("RGB", (640, 320))
+    request = SimpleNamespace(
+        prompt={"prompt": "turn this into a video", "multi_modal_data": {"image": image}},
+        sampling_params=SimpleNamespace(height=None, width=None),
+    )
+
+    result = preprocess(request)
+
+    assert result is request
+    assert request.sampling_params.height == 448
+    assert request.sampling_params.width == 896
 
 
 class TestHunyuanVideoQuantConfigPropagation:

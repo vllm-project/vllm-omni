@@ -41,7 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -1044,7 +1044,7 @@ class Flux2Transformer2DModel(nn.Module):
             name = original_name
             if name not in params_dict and ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
-            # Some GGUF checkpoints include quantized tensors for modules that
+            # Some quantized checkpoints include tensors for modules that
             # are intentionally left unquantized in this model.
             param = params_dict.get(name)
             if param is None:

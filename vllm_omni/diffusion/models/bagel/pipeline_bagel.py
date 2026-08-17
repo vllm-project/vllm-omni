@@ -29,7 +29,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
@@ -341,7 +341,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         )
 
     @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -610,7 +610,8 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             # cfg_text_context: update with negative prompt (no text condition).
             # When empty, keep cfg_text_context as-is (kv_lens=0) to match
             # original BAGEL.
-            neg_prompt = extra_args.get("negative_prompt", "")
+            prompt_negative = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
+            neg_prompt = prompt_negative if prompt_negative is not None else extra_args.get("negative_prompt", "")
             if neg_prompt:
                 neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
                     curr_kvlens=cfg_text_context["kv_lens"],
@@ -739,8 +740,10 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         text_output = text_output.split("<|im_start|>")[-1]
 
             return DiffusionOutput(
-                output=text_output,
-                custom_output={"text_output": text_output},
+                output={
+                    "payload": {"text": text_output},
+                    "metadata": {"text": {"text_output": text_output}},
+                },
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
@@ -847,22 +850,28 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         if trajectory_log_probs:
             trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
 
-        custom = {}
+        payload = {"image": img}
+        metadata = {}
         if think_text is not None:
-            custom["think_text"] = think_text
-        # Mirror the PIL image into ``custom_output`` so callers reading via
-        # the orchestrator IPC boundary (which strips the bare ``output``
-        # field) can still recover the result.  ``video_frames`` already
-        # uses this pattern.
-        custom["image"] = img
+            metadata["text"] = {"think_text": think_text}
+        trajectory_payload = {}
+        if trajectory_latents_stacked is not None:
+            trajectory_payload["latents"] = trajectory_latents_stacked
+        if trajectory_timesteps_stacked is not None:
+            trajectory_payload["timesteps"] = trajectory_timesteps_stacked
+        if trajectory_log_probs_stacked is not None:
+            trajectory_payload["log_probs"] = trajectory_log_probs_stacked
+        if trajectory_decoded is not None:
+            trajectory_payload["decoded"] = trajectory_decoded
+        if trajectory_payload:
+            payload["trajectory"] = trajectory_payload
+            metadata["trajectory"] = {"type": "denoising"}
 
         return DiffusionOutput(
-            output=img,
-            trajectory_latents=trajectory_latents_stacked,
-            trajectory_timesteps=trajectory_timesteps_stacked,
-            trajectory_log_probs=trajectory_log_probs_stacked,
-            trajectory_decoded=trajectory_decoded,
-            custom_output=custom,
+            output={
+                "payload": payload,
+                "metadata": metadata,
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

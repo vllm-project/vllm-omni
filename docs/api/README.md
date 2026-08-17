@@ -46,23 +46,22 @@ Engine classes for offline and online inference.
 - [vllm_omni.engine.PromptEmbedsPayload][]
 - [vllm_omni.engine.arg_utils.OmniEngineArgs][]
 - [vllm_omni.engine.async_omni_engine.AsyncOmniEngine][]
-- [vllm_omni.engine.mm_outputs.MultimodalCompletionOutput][]
-- [vllm_omni.engine.mm_outputs.MultimodalPayload][]
 - [vllm_omni.engine.orchestrator.Orchestrator][]
 - [vllm_omni.engine.orchestrator.OrchestratorRequestState][]
-- [vllm_omni.engine.output_modality.OutputModality][]
-- [vllm_omni.engine.output_modality.TensorAccumulationStrategy][]
-- [vllm_omni.engine.output_processor.MultimodalOutputProcessor][]
-- [vllm_omni.engine.output_processor.OmniRequestState][]
 - [vllm_omni.engine.stage_engine_core_client.StageEngineCoreClient][]
 - [vllm_omni.engine.stage_init_utils.StageMetadata][]
 - [vllm_omni.engine.stage_init_utils.StartedLlmStage][]
+- [vllm_omni.outputs.mm_outputs.MultimodalCompletionOutput][]
+- [vllm_omni.outputs.mm_outputs.MultimodalPayload][]
+- [vllm_omni.outputs.output_modality.OutputModality][]
+- [vllm_omni.outputs.output_modality.TensorAccumulationStrategy][]
+- [vllm_omni.outputs.output_processor.MultimodalOutputProcessor][]
+- [vllm_omni.outputs.output_processor.OmniRequestState][]
 
 ## Core
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
@@ -131,7 +130,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
-- [vllm_omni.diffusion.worker.utils.DiffusionRequestState][]
+- [vllm_omni.diffusion.worker.utils.StepRequestState][]
 - [vllm_omni.diffusion.worker.utils.RunnerOutput][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]

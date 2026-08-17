@@ -11,11 +11,11 @@ Adds per-component quantization for multi-stage models.
     config = build_quant_config({"transformer": {"method": "fp8"}, "vae": None})
 """
 
-from .component_config import ComponentQuantizationConfig
-from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config
+from .component_config import ComponentQuantizationConfig, resolve_component_quant_config
+from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config, register_quantization_override
 from .inc_config import OmniINCConfig
 
-# Heavy configs (GGUF, MXFP8) are NOT imported here to avoid pulling in
+# Heavy configs are NOT imported here to avoid pulling in
 # optional dependencies (pynvml, torch_npu) at module load time.
 # Import them directly when needed:
 #   from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
@@ -23,6 +23,8 @@ from .inc_config import OmniINCConfig
 __all__ = [
     "build_quant_config",
     "ComponentQuantizationConfig",
+    "resolve_component_quant_config",
     "OmniINCConfig",
     "SUPPORTED_QUANTIZATION_METHODS",
+    "register_quantization_override",
 ]

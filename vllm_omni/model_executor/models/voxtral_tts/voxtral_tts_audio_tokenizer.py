@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import math
 from copy import deepcopy
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from vllm.config import VllmConfig
 
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
@@ -485,9 +487,10 @@ class Attention(nn.Module):
                 )
             return slopes  # shape [n_heads], values in (2^-8, 1]
 
+        # Keep alibi slopes in fp32 so `forward` can skip the per-call `.to(fp32)` cast.
         self.register_buffer(
             "alibi_slopes",
-            get_alibi_slopes(self.n_local_heads),
+            get_alibi_slopes(self.n_local_heads).to(torch.float32).contiguous(),
             persistent=False,
         )
 
@@ -552,8 +555,8 @@ class Attention(nn.Module):
         # rel_pos[i, j] = j - i
         rel_pos = positions.unsqueeze(0) - positions.unsqueeze(1)  # (S, S)
 
-        # Alibi bias: slope * (j - i), shape (H, S, S)
-        alibi_slopes = self.alibi_slopes.to(dtype=xq.dtype, device=xq.device)
+        # Alibi bias: slope * (j - i), shape (H, S, S). Cast only to xq dtype (already on device).
+        alibi_slopes = self.alibi_slopes.to(dtype=xq.dtype)
         attn_bias = alibi_slopes.view(H, 1, 1) * rel_pos.unsqueeze(0).to(xq.dtype)
 
         # Causal mask: mask out j > i (future positions)
@@ -584,7 +587,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.args.head_dim)
 
         if HAS_FLASH_ATTN:
-            alibi_slopes = self.alibi_slopes.to(torch.float32)
+            # alibi_slopes already fp32 — avoid per-call cast.
             output = flash_attn_func(
                 xq,
                 xk,
@@ -594,7 +597,7 @@ class Attention(nn.Module):
                     self.sliding_window,
                     0 if self.args.causal else self.sliding_window,
                 ),
-                alibi_slopes=alibi_slopes,
+                alibi_slopes=self.alibi_slopes,
             )
         else:
             output = self._native_attention(xq, xk, xv)
@@ -1052,14 +1055,15 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         """
         chunk_size = 375  # TODO(chenyos): Hardcode. Fix it
 
-        # Pre-process: find EOA and unshift tokens
-        processed = []
-        for codes in codes_list:
-            eoa_mask = codes[:, 0] == 1
-            eoa_indices = eoa_mask.nonzero(as_tuple=False)
-            cutting_point = eoa_indices[0].item() if len(eoa_indices) > 0 else len(codes)
-            audio_tokens = codes[:cutting_point] - 2
-            processed.append(audio_tokens)
+        # Compute per-request EOA cutting points in a single D2H instead of one sync per request.
+        flags = []
+        for c in codes_list:
+            eoa_mask = c[:, 0] == 1
+            flags.append(torch.stack([eoa_mask.any().to(torch.long), eoa_mask.long().argmax()]))
+        resolved = torch.stack(flags).cpu().tolist() if flags else []
+        cutting_points = [int(idx) if has else c.shape[0] for (has, idx), c in zip(resolved, codes_list)]
+
+        processed = [c[:cp] - 2 for c, cp in zip(codes_list, cutting_points)]
 
         # Separate empty and non-empty
         results: list[torch.Tensor | None] = [None] * len(processed)
@@ -1087,25 +1091,19 @@ class VoxtralTTSAudioTokenizer(nn.Module):
             chunk_map.append((orig_idx, req_chunk_indices))
 
         # Pad chunks to max length and batch decode
-        max_chunk_len = max(chunk_lengths)
-        K = all_chunks[0].shape[1]
-        padded = torch.zeros(
-            len(all_chunks),
-            max_chunk_len,
-            K,
-            dtype=all_chunks[0].dtype,
-            device=all_chunks[0].device,
-        )
-        for i, chunk in enumerate(all_chunks):
-            padded[i, : len(chunk)] = chunk
+        padded = pad_sequence(all_chunks, batch_first=True, padding_value=0.0)
 
         audio_codes = padded.to(device=current_omni_platform.device_type)  # [B, T, K]
         audio_values = self.decode(audio_codes.transpose(1, 2), dtype=torch.bfloat16)  # [B, 1, T_out]
         audio_values = audio_values.detach().cpu().float().squeeze(1)  # [B, T_out]
-        if torch.min(audio_values) < -1.0:
-            logger.warning("Min value of decoded waveform signal is %s", torch.min(audio_values))
-        if torch.max(audio_values) > 1.0:
-            logger.warning("Max value of decoded waveform signal is %s", torch.max(audio_values))
+        # Gate min/max reductions behind logger level.
+        if logger.isEnabledFor(logging.WARNING):
+            amin = float(audio_values.min())
+            amax = float(audio_values.max())
+            if amin < -1.0:
+                logger.warning("Min value of decoded waveform signal is %s", amin)
+            if amax > 1.0:
+                logger.warning("Max value of decoded waveform signal is %s", amax)
 
         # Trim padding and reassemble per request
         for orig_idx, chunk_indices in chunk_map:

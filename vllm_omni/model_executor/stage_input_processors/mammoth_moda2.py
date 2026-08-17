@@ -3,10 +3,32 @@
 from collections.abc import Mapping
 from typing import Any
 
-import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+
+def _as_dict(prompt: Any) -> dict[str, Any]:
+    """Coerce an original-stage prompt to a dict.
+
+    It may arrive as a dict, a NamedTuple/object, or a bare string depending on
+    the calling flow (the shared text_to_image example vs the bespoke script).
+    """
+    if isinstance(prompt, dict):
+        return prompt
+    if hasattr(prompt, "_asdict"):
+        return prompt._asdict()
+    if hasattr(prompt, "__dict__"):
+        return vars(prompt)
+    return {}
+
+
+def _coerce_dim(value: Any, default: int) -> int:
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return default
+    return iv if iv > 0 else default
 
 
 def ar2dit(
@@ -17,21 +39,33 @@ def ar2dit(
     """Convert AR stage outputs to DiT stage inputs."""
     ar_outputs = source_outputs
 
-    # Normalize prompts to list
+    # The shared text_to_image example forwards a single prompt (not a list); normalize
+    # so a lone dict isn't iterated as its keys. Mirrors glm_image.ar2diffusion.
     if not isinstance(prompts, list):
         prompts = [prompts] if prompts is not None else [{}]
 
     dit_inputs: list[OmniTokensPrompt] = []
-    for ar_output, prompt in zip(ar_outputs, prompts):
-        addi_info = prompt["additional_information"]
-        image_height = addi_info["image_height"][0]
-        image_width = addi_info["image_width"][0]
-        text_guidance_scale = addi_info["text_guidance_scale"][0]
-        cfg_range = addi_info["cfg_range"]
-        num_inference_steps = addi_info["num_inference_steps"][0]
-        gen_vocab_start_index = addi_info["visual_token_start_id"][0]
-        # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
-        visual_ids = addi_info["visual_ids"]
+    for i, ar_output in enumerate(ar_outputs):
+        prompt_dict = _as_dict(prompts[i] if i < len(prompts) else {})
+        addi_info = prompt_dict.get("additional_information") or {}
+        mm_kwargs = prompt_dict.get("mm_processor_kwargs") or {}
+
+        # Image size: prefer mm_processor_kwargs target_h/target_w (set by the serving
+        # layer), fall back to additional_information, then a 1024 default.
+        image_height = _coerce_dim(
+            mm_kwargs.get("target_h"),
+            _coerce_dim((addi_info.get("image_height") or [None])[0], 1024),
+        )
+        image_width = _coerce_dim(
+            mm_kwargs.get("target_w"),
+            _coerce_dim((addi_info.get("image_width") or [None])[0], 1024),
+        )
+
+        # Sampling knobs arrive on the DiT stage via extra_body -> extra_args; these are
+        # defensive fallbacks (defaults mirror the former bespoke script's argparse).
+        text_guidance_scale = (addi_info.get("text_guidance_scale") or [9.0])[0]
+        cfg_range = addi_info.get("cfg_range") or [0.0, 1.0]
+        num_inference_steps = (addi_info.get("num_inference_steps") or [50])[0]
 
         prompt_token_ids = ar_output.prompt_token_ids
         # exclude the last token because it has no corresponding hidden state
@@ -52,36 +86,16 @@ def ar2dit(
             f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
         )
 
-        mask_device = full_hidden_states.device
-        full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
-        attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
-
-        pos = torch.arange(full_token_ids_t.shape[0], device=mask_device)
-        answer_start_index = len(prompt_token_ids)
-        questions_mask = pos < answer_start_index
-        answers_mask = ~questions_mask
-
-        gen_token_mask = full_token_ids_t >= gen_vocab_start_index
-
-        visual_token_mask = torch.isin(
-            full_token_ids_t,
-            torch.tensor(visual_ids, dtype=torch.long, device=mask_device),
-        )
-
-        text_condition_token_mask = questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
-        image_condition_token_mask = answers_mask & gen_token_mask & attention_mask
-
-        text_condition = full_hidden_states[text_condition_token_mask]
-        image_condition = full_hidden_states[image_condition_token_mask]
-
-        text_prompt_embeds = text_condition.to(dtype=torch.float32).contiguous()
-        image_prompt_embeds = image_condition.to(dtype=torch.float32).contiguous()
-
+        # The text/image condition split is performed in the DiT pipeline, which sources
+        # the distinguishing token ids (gen_vocab_start_index, vision placeholder ids)
+        # from the model config. Pass through the raw AR hidden states + token ids and
+        # the question/answer boundary so the pipeline can reconstruct the masks.
         additional_information = {
-            "text_prompt_embeds": text_prompt_embeds,
-            "text_prompt_embeds_shape": list(text_prompt_embeds.shape),
-            "image_prompt_embeds": image_prompt_embeds,
-            "image_prompt_embeds_shape": list(image_prompt_embeds.shape),
+            # float32 so the tensor crosses the stage boundary (the serializer uses
+            # numpy, which has no bf16); the DiT re-casts to the model dtype.
+            "full_hidden_states": full_hidden_states.float().contiguous(),
+            "full_token_ids": full_token_ids,
+            "answer_start_index": [len(prompt_token_ids)],
             "image_height": [int(image_height)],
             "image_width": [int(image_width)],
             "text_guidance_scale": [float(text_guidance_scale)],

@@ -5,6 +5,7 @@ and are supported by the FluxKontext model.
 
 import pytest
 
+from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
@@ -13,20 +14,15 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
+BASE_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
 
 
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--tensor-parallel-size",
-                    "2",
-                    "--enable-cpu-offload",
-                ],
-            ),
-            id="parallel_001",
+            OmniServerParams(model=model),
+            id="base",
+            marks=BASE_FEATURE_MARKS,
         ),
     ]
 
