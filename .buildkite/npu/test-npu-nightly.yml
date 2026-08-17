@@ -69,6 +69,12 @@ steps:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
+          # Pin the Seed-TTS scorer to the second card: _get_eval_device() otherwise
+          # auto-picks npu:0, which the omni server under test already fills with its
+          # KV cache, so Whisper OOMs on `.to(device)` and every clip reports
+          # "ASR / WER failed".
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_EVAL_DEVICE=npu:1
           - |
             set +e
             pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
