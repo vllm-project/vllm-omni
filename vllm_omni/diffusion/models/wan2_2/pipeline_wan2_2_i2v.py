@@ -403,10 +403,9 @@ class Wan22I2VPipeline(
                 self._current_timestep = t
 
                 # Select model and guidance scale based on timestep
-                current_model = self.transformer
+
                 current_guidance_scale = guidance_low
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
                     current_guidance_scale = guidance_high
 
                 self.record_denoise_step(step_idx, t)
