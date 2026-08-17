@@ -188,6 +188,12 @@ class StagePipelineConfig:
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    # Dotted path to the class that bridges this stage to the OpenPI robot
+    # endpoint: observation -> prompt, generated tokens -> action array, and the
+    # handshake values. Only needed by policies whose actions are generated
+    # tokens; a diffusion policy carries its own transforms in its pipeline and
+    # returns actions on ``multimodal_output`` instead.
+    robot_adapter: str | None = None
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
@@ -819,6 +825,8 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.robot_adapter:
+        engine_args["robot_adapter"] = ps.robot_adapter
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:

@@ -1177,7 +1177,13 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
-    state.openai_serving_realtime_robot = None
+    # A robot policy does not have to be a diffusion pipeline: OpenVLA is an AR
+    # stage whose tokens are the action. `create_policy_server` returns None for
+    # every model that is neither, so this is a no-op for existing deployments.
+    state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=engine_client,
+        model_name=model_name,
+    )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
