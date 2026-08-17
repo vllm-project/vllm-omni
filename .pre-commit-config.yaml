@@ -95,6 +95,13 @@ repos:
       language: python
       types_or: [python, rust, proto]
 
+    - id: check-forbidden-imports
+      name: Check forbidden imports
+      entry: python tools/pre_commit/check_forbidden_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
@@ -103,10 +110,3 @@ repos:
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry
-
-    - id: check-pickle-imports
-      name: Prevent new pickle/cloudpickle imports
-      entry: python tools/pre_commit/check_pickle_imports.py
-      language: python
-      types: [python]
-      additional_dependencies: [regex]
