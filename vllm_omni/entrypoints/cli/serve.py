@@ -803,6 +803,25 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
+        # PiD (Pixel Diffusion) super-resolution decoder arguments.
+        omni_config_group.add_argument(
+            "--pid-enable",
+            action="store_true",
+            default=False,
+            help="Enable PiD super-resolution decode for the diffusion pipeline.",
+        )
+        omni_config_group.add_argument(
+            "--pid-checkpoint",
+            type=str,
+            default=None,
+            help="Path to the PiD decoder checkpoint (.pth).",
+        )
+        omni_config_group.add_argument(
+            "--pid-gemma",
+            type=str,
+            default="Efficient-Large-Model/gemma-2-2b-it",
+            help="Gemma text encoder used by PiD.",
+        )
         # Diffusion KV-cache quantization uses dedicated flags so we do not reuse
         # vLLM's --kv-cache-dtype (AR cache dtype, default "auto").
         omni_config_group.add_argument(
