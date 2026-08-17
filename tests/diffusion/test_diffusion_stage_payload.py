@@ -14,10 +14,12 @@ HANDLE_KEY = DiffusionModelRunner._STAGE_PAYLOAD_HANDLE_KEY
 
 
 class _FakeConnector:
-    def __init__(self, payload=None, *, raises=False):
+    def __init__(self, payload=None, *, raises=False, put_result=(True, 128, {"schema_version": 1})):
         self._payload = payload
         self._raises = raises
+        self._put_result = put_result
         self.calls: list[tuple[str, str, str, object]] = []
+        self.put_calls: list[tuple[str, str, str, object]] = []
 
     def get(self, from_stage, to_stage, get_key, metadata=None):
         self.calls.append((from_stage, to_stage, get_key, metadata))
@@ -27,11 +29,18 @@ class _FakeConnector:
             return None
         return self._payload, 0
 
+    def put(self, from_stage, to_stage, put_key, data):
+        self.put_calls.append((from_stage, to_stage, put_key, data))
+        if self._raises:
+            raise RuntimeError("transfer failed")
+        return self._put_result
+
 
 class _FakeKVTransferManager:
-    def __init__(self, connector, recv_stages=("0", "1")):
+    def __init__(self, connector, recv_stages=("0", "1"), send_stages=("0", "1")):
         self.connector = connector
         self.recv_stages = recv_stages
+        self.send_stages = send_stages
         self.sender_info_calls: list[tuple[dict, str | None]] = []
 
     def update_sender_info(self, sender_info, sender_stage_id=None):
@@ -46,6 +55,19 @@ def _make_runner(connector, *, payload_keys=("text_encoder_output",), recv_stage
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, recv_stages=recv_stages)
     return runner
+
+
+def _make_sender(connector, *, payload_keys=("prompt_embeds",), send_stages=("0", "1")):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(stage_output_payload_keys=payload_keys, stage_id=0)
+    runner.device = torch.device("cpu")
+    runner.pipeline = None
+    runner.kv_transfer_manager = _FakeKVTransferManager(connector, send_stages=send_stages)
+    return runner
+
+
+def _make_output(**custom):
+    return SimpleNamespace(custom_output=dict(custom))
 
 
 def _make_request(prompt, *, request_id="req-7", kv_sender_info=None):
@@ -228,3 +250,123 @@ def test_non_dict_prompt_is_left_alone():
 
     assert connector.calls == []
     assert req.prompt == "a cat"
+
+
+def test_send_puts_declared_keys_and_attaches_a_handle():
+    connector = _FakeConnector()
+    runner = _make_sender(connector)
+    req = _make_request({"prompt": "a cat"})
+    output = _make_output(prompt_embeds=torch.zeros(2, 8), latents=torch.zeros(1, 4))
+
+    runner._maybe_send_stage_payload([req], [output])
+
+    from_stage, to_stage, put_key, data = connector.put_calls[0]
+    assert (from_stage, to_stage, put_key) == ("0", "1", "req-7_0_0")
+    # Only declared keys travel over the connector.
+    assert set(data) == {"prompt_embeds"}
+    handle = output.custom_output[HANDLE_KEY]
+    assert handle["key"] == "req-7_0_0"
+    assert handle["metadata"] == {"schema_version": 1}
+    assert handle["payload_keys"] == ["prompt_embeds"]
+    # The inline payload stays put as the fallback.
+    assert "prompt_embeds" in output.custom_output
+
+
+def test_send_key_matches_the_receive_key_convention():
+    sender_connector = _FakeConnector()
+    sender = _make_sender(sender_connector)
+    req = _make_request({"prompt": "a cat"})
+    sender._maybe_send_stage_payload([req], [_make_output(prompt_embeds=torch.zeros(2, 8))])
+
+    recv_connector = _FakeConnector(_conditioning())
+    receiver = _make_runner(recv_connector)
+    receiver._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
+
+    assert sender_connector.put_calls[0][2] == recv_connector.calls[0][2]
+
+
+def test_stage_without_declared_output_keys_never_puts():
+    connector = _FakeConnector()
+    runner = _make_sender(connector, payload_keys=())
+    output = _make_output(prompt_embeds=torch.zeros(2, 8))
+
+    runner._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    assert connector.put_calls == []
+    assert HANDLE_KEY not in output.custom_output
+
+
+def test_missing_outgoing_edge_is_reported_not_sent():
+    connector = _FakeConnector()
+    runner = _make_sender(connector, send_stages=(None, None))
+    output = _make_output(prompt_embeds=torch.zeros(2, 8))
+
+    runner._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    assert connector.put_calls == []
+    assert HANDLE_KEY not in output.custom_output
+
+
+def test_output_without_the_declared_keys_is_skipped():
+    connector = _FakeConnector()
+    runner = _make_sender(connector)
+    output = _make_output(latents=torch.zeros(1, 4))
+
+    runner._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    assert connector.put_calls == []
+    assert HANDLE_KEY not in output.custom_output
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        _FakeConnector(raises=True),
+        _FakeConnector(put_result=(False, 0, None)),
+    ],
+    ids=["raises", "rejected"],
+)
+def test_failed_send_leaves_the_inline_payload_unannotated(connector):
+    runner = _make_sender(connector)
+    output = _make_output(prompt_embeds=torch.zeros(2, 8))
+
+    runner._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    assert HANDLE_KEY not in output.custom_output
+    assert "prompt_embeds" in output.custom_output
+
+
+class _FakeTPGroup:
+    def __init__(self, rank_in_group, world_size=2):
+        self.rank_in_group = rank_in_group
+        self.world_size = world_size
+        self.broadcast_calls: list[object] = []
+        self.leader_packet: object = None
+
+    def broadcast_object(self, obj, src=0):
+        self.broadcast_calls.append(obj)
+        return obj if self.rank_in_group == src else self.leader_packet
+
+
+@pytest.mark.parametrize("rank_in_group", [0, 1], ids=["leader", "follower"])
+def test_send_puts_only_on_the_tp_leader(monkeypatch, rank_in_group):
+    connector = _FakeConnector()
+    runner = _make_sender(connector)
+    tp_group = _FakeTPGroup(rank_in_group)
+    expected_handle = {
+        "key": "req-7_0_0",
+        "from_stage": "0",
+        "to_stage": "1",
+        "metadata": {"schema_version": 1},
+        "payload_keys": ["prompt_embeds"],
+    }
+    tp_group.leader_packet = {"req-7": expected_handle}
+    monkeypatch.setattr(DiffusionModelRunner, "_get_local_tp_group", staticmethod(lambda: tp_group))
+    output = _make_output(prompt_embeds=torch.zeros(2, 8))
+
+    runner._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    assert len(connector.put_calls) == (1 if rank_in_group == 0 else 0)
+    # Every rank ends up reporting the same handle, leader or not.
+    assert output.custom_output[HANDLE_KEY] == expected_handle
+    assert len(tp_group.broadcast_calls) == 1
