@@ -775,6 +775,14 @@ class AsyncOmniEngine:
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
+            # Same restore the parent request gets: the upstream input
+            # processor drops omni-only prompt fields, so without this the
+            # companion reaches the worker with no additional_information at
+            # all. That is where ``global_request_id`` lives, and it is what
+            # was just injected above, so skipping it silently undoes the
+            # injection: the model sees the companion row with no id and
+            # cannot match it to its conditioned partner.
+            request = upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
             # Companions are stage-0-final for ordinary downstream payloads,
             # but diffusion still needs their CFG KV caches.
