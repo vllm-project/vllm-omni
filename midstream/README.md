@@ -4,32 +4,37 @@ This directory contains midstream-only content for `nm-vllm-omni-ent`. Nothing h
 
 ## Build Pipeline
 
-Omni builds use a three-step pipeline that runs in [nm-cicd](https://github.com/neuralmagic/nm-cicd) (branch: `vllm-omni-build`):
+Omni builds run in [nm-cicd](https://github.com/neuralmagic/nm-cicd) via `omni-pipeline.yml`:
 
 ```
-Step 1: vLLM wheel       (nm-vllm-ent)         → build-whl.yml
-Step 2: vllm-omni wheel  (nm-vllm-omni-ent)    → build-whl.yml  (needs step 1 run ID)
-Step 3: Docker image      (nm-vllm-omni-ent)    → build-image.yml (needs step 1+2 run IDs)
+accept-sync (wheel + image + partition tests) → OCP model validation
 ```
 
-Each step produces a run ID that feeds into the next step.
+The base vLLM wheel is reused via `midstream/vllm-wheels.yml` (`vllm_run_id`).
 
 ### Triggering Builds
 
-Use the **Midstream Build** workflow from the [Actions tab](../../actions/workflows/midstream-build.yml):
+Use the **Omni release** workflow from the [Actions tab](../../actions/workflows/omni-release.yml):
 
-| Build Step | What It Does | Required Inputs |
-|------------|-------------|-----------------|
-| **full-chain** | Builds omni wheel, waits for it to finish, then triggers the docker image build | `vllm_run_id` (auto-resolved from mapping) |
-| **vllm-wheel** | Builds the base vLLM wheel from nm-vllm-ent | — |
-| **omni-wheel** | Builds the vllm-omni wheel | `vllm_run_id` |
-| **docker-image** | Builds the container image | `vllm_run_id` + `omni_run_id` |
+| Trigger | What happens |
+|---------|--------------|
+| Push tag `omni-*` | Full pipeline in nm-cicd: accept-sync + OCP validation (`wf_category=RELEASE`) |
+| Manual **Omni release** | Dispatch to nm-cicd `omni-pipeline.yml` — choose ref, category, and whether to run OCP validation |
 
-Each job dispatches to nm-cicd and prints a clickable link to the triggered run in the job summary.
+The Ent workflow dispatches once (GitHub App token). The full build+test cycle runs as a **single nm-cicd workflow run** — no cross-repo polling.
+
+**Legacy:** [Midstream Build](../../actions/workflows/midstream-build.yml) (`midstream-build.yml`) is deprecated; use **Omni release** instead.
+
+| Build Step (legacy) | Replacement |
+|---------------------|-------------|
+| **full-chain** | Omni release (tag or manual with `run_ocp_validation=true`) |
+| **omni-wheel** | nm-cicd `accept-sync.yml` with `build_image=false` |
+| **docker-image** | nm-cicd `accept-sync.yml` with existing `vllm_run_id` + `omni_run_id` |
+| **vllm-wheel** | nm-cicd `build-whl.yml` for `neuralmagic/nm-vllm-ent` |
 
 ### Tag-Based Triggers (Full Chain)
 
-Pushing a tag matching `omni-*` runs **full-chain** automatically — omni wheel + docker image, fully hands-off. The workflow reads `midstream/vllm-version` and looks up the vLLM wheel run ID from `midstream/vllm-wheels.yml`.
+Pushing a tag matching `omni-*` runs the **Omni release** workflow, which triggers nm-cicd `omni-pipeline.yml` — accept-sync (wheel + image + partitions) and OCP model validation in one run. The workflow reads `midstream/vllm-version` and looks up the vLLM wheel run ID from `midstream/vllm-wheels.yml`.
 
 ```bash
 # Tag and push — that's it, full build kicks off
@@ -39,7 +44,11 @@ git push origin omni-v0.20.0-rc1
 
 The tag name is freeform — use whatever makes sense: `omni-v0.20.0`, `omni-doug-feature-foo`, `omni-ricky-demo-2026-05-15`, etc. The vLLM wheel version is determined by the code at the tagged commit, not the tag name.
 
-The full-chain job polls nm-cicd every 3 minutes until the omni wheel build completes (up to ~3 hours), then automatically triggers the docker image build.
+## Secret: CICD_APP_ID / CICD_APP_PRIVATE_KEY
+
+The **Omni release** workflow uses the org GitHub App (`CICD_APP_ID`, `CICD_APP_PRIVATE_KEY`) to dispatch nm-cicd workflows — the same pattern as `nm-vllm-ent` release.
+
+**Legacy:** `midstream-build.yml` used `CICD_OMNI_PAT`; that path is deprecated.
 
 ## vLLM Version Mapping
 
@@ -124,10 +133,6 @@ gh workflow run build-image.yml --repo neuralmagic/nm-cicd \
 Workflows in `.github/workflows/` are a mix of upstream and midstream:
 
 - **Upstream workflows** (e.g. `build_wheel.yml`, `pre-commit.yml`) — carried forward from `vllm-project/vllm-omni`
-- **Midstream workflows** (prefixed `midstream-`) — added by us, never in upstream
+- **Midstream workflows** — `omni-release.yml` (trigger), `midstream-build.yml` (deprecated)
 
 See [.github-upstream-policy.md](.github-upstream-policy.md) for rebase guidelines.
-
-## Secret: CICD_OMNI_PAT
-
-The midstream build workflow uses an org-level secret `CICD_OMNI_PAT` — a fine-grained GitHub PAT with Actions (read/write) + Contents (read) permissions on `neuralmagic/nm-cicd`. This allows cross-repo workflow dispatch.

@@ -1,0 +1,134 @@
+# Triggers the omni-pipeline workflow in nm-cicd for tags matching omni-*,
+# or manually via workflow_dispatch.
+#
+# On tag push, defaults are fixed:
+#   - cicd_ref=main
+#   - wf_category=RELEASE
+#   - run_ocp_validation=true
+#   - python=3.12
+#
+# This workflow dispatches once and exits — the full build+test cycle runs in
+# nm-cicd as a single workflow run (no cross-repo polling).
+
+name: omni release
+run-name: Omni ${{ github.event_name == 'push' && github.ref_name || inputs.ref }} - ${{ github.actor }}
+
+on:
+  push:
+    tags:
+      - "omni-*"
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to build (default: current ref)"
+        type: string
+        required: false
+      cicd_ref:
+        description: "Branch or ref of nm-cicd"
+        type: string
+        default: "main"
+      python:
+        description: "Python version"
+        type: string
+        default: "3.12"
+      vllm_run_id:
+        description: "Override vLLM wheel run ID (auto-resolved from midstream/vllm-wheels.yml when empty)"
+        type: string
+        required: false
+        default: ""
+      wf_category:
+        description: "Workflow category"
+        type: choice
+        options:
+          - DEBUG
+          - NIGHTLY
+          - RELEASE
+        default: DEBUG
+      run_ocp_validation:
+        description: "Run OCP model validation after accept-sync"
+        type: boolean
+        default: true
+      model_validation_configs_ref:
+        description: "git ref for model-validation-configs"
+        type: string
+        default: "main"
+      testing_options_flags:
+        description: "Options for get_testing_options.py (e.g. --tags-include tiny)"
+        type: string
+        required: false
+        default: ""
+
+env:
+  REF: ${{ github.event_name == 'push' && github.ref_name || inputs.ref || github.ref_name }}
+  CICD_REF: ${{ github.event_name == 'push' && 'main' || inputs.cicd_ref }}
+  PYTHON: ${{ inputs.python || '3.12' }}
+  VLLM_RUN_ID: ${{ inputs.vllm_run_id || '' }}
+  WF_CATEGORY: ${{ github.event_name == 'push' && 'RELEASE' || inputs.wf_category || 'DEBUG' }}
+  RUN_OCP: ${{ github.event_name == 'push' && 'true' || inputs.run_ocp_validation }}
+  MODEL_VAL_REF: ${{ inputs.model_validation_configs_ref || 'main' }}
+  TESTING_OPTIONS: ${{ inputs.testing_options_flags || '' }}
+
+jobs:
+  trigger-omni-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CICD_APP_ID }}
+          private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
+          owner: neuralmagic
+
+      - name: Trigger nm-cicd omni-pipeline workflow
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=(
+            workflow run omni-pipeline.yml
+            --repo neuralmagic/nm-cicd
+            --ref "$CICD_REF"
+            -f "repo=${{ github.repository }}"
+            -f "ref=$REF"
+            -f "python=$PYTHON"
+            -f "target_device=cuda"
+            -f "wf_category=$WF_CATEGORY"
+            -f "run_ocp_validation=$RUN_OCP"
+            -f "model_validation_configs_ref=$MODEL_VAL_REF"
+            -f "testing_options_flags=$TESTING_OPTIONS"
+            -f "source_run_id=${{ github.run_id }}"
+            -f "source_repo=${{ github.repository }}"
+          )
+
+          if [[ -n "$VLLM_RUN_ID" ]]; then
+            ARGS+=(-f "vllm_run_id=$VLLM_RUN_ID")
+          fi
+
+          gh "${ARGS[@]}"
+
+          PIPELINE_URL="https://github.com/neuralmagic/nm-cicd/actions/workflows/omni-pipeline.yml"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ### Triggered nm-cicd omni pipeline
+
+          | Parameter | Value |
+          |-----------|-------|
+          | Workflow | \`neuralmagic/nm-cicd / omni-pipeline.yml\` |
+          | Pipeline runs | [View in nm-cicd](${PIPELINE_URL}) |
+          | nm-cicd ref | \`$CICD_REF\` |
+          | Omni repo | \`${{ github.repository }}\` |
+          | Omni ref | \`$REF\` |
+          | python | \`$PYTHON\` |
+          | wf_category | \`$WF_CATEGORY\` |
+          | run_ocp_validation | \`$RUN_OCP\` |
+          | vllm_run_id | \`${VLLM_RUN_ID:-auto from midstream/vllm-wheels.yml}\` |
+          | model_validation_configs_ref | \`$MODEL_VAL_REF\` |
+          | testing_options_flags | \`$TESTING_OPTIONS\` |
+
+          The full build cycle (wheel → image → accept-sync partitions → OCP validation) runs in a **single nm-cicd workflow run**.
+          EOF

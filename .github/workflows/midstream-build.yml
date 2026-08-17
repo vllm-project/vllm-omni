@@ -1,4 +1,8 @@
-name: "Midstream Build"
+name: "Midstream Build (deprecated)"
+
+# Deprecated: use omni-release.yml instead. This workflow polls nm-cicd via gh CLI
+# and holds an Ent runner for hours. omni-release.yml dispatches omni-pipeline.yml
+# once; the full DAG runs in nm-cicd.
 
 on:
   push:
@@ -36,7 +40,7 @@ on:
       nm_cicd_ref:
         description: "nm-cicd branch to run workflow from"
         required: false
-        default: "feature/vllm-omni-tp"
+        default: "feature/vllm-omni"
         type: string
       target_device:
         description: "Target device"
@@ -108,7 +112,7 @@ jobs:
 
           NM_CICD_REF="${{ inputs.nm_cicd_ref }}"
           if [[ -z "${NM_CICD_REF}" ]]; then
-            NM_CICD_REF="feature/vllm-omni-tp"
+            NM_CICD_REF="feature/vllm-omni"
           fi
 
           TARGET_DEVICE="${{ inputs.target_device }}"
@@ -507,6 +511,9 @@ jobs:
           echo "before_ts=${BEFORE_TS}" >> "${GITHUB_OUTPUT}"
 
           BAKE_TARGETS="${{ needs.resolve.outputs.target_device }}"
+          if [[ "${BAKE_TARGETS}" == "cuda" ]]; then
+            BAKE_TARGETS="cuda cuda-develsdk cuda-test"
+          fi
 
           gh workflow run build-image.yml \
             --repo "${NM_CICD_REPO}" \
@@ -626,9 +633,9 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # smoke-test — validate built image across models
-  # Triggers ocp-test.yml on nm-cicd after docker-image completes.
-  # Single cuda variant (flashinfer-jit-cache covers supported GPUs).
+  # smoke-test — validate built images across models and CUDA variants
+  # Triggers test-vllm-omni.yml on nm-cicd after docker-image completes.
+  # Bake builds both cuda + cuda-develsdk tags from one IMAGE_RUN_ID.
   # Polling matches on vllm_image input to avoid race with parallel matrix jobs.
   # ---------------------------------------------------------------------------
   smoke-test:
@@ -642,34 +649,68 @@ jobs:
       matrix:
         include:
           - model: Tongyi-MAI/Z-Image-Turbo
-            model_capabilities: image_generation
+            validation_type: image_gen
             variant: cuda
             label_suffix: img-cuda
           - model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-            model_capabilities: speech_generation
+            validation_type: tts
             variant: cuda
             label_suffix: tts-cuda
+            tts_voice: vivian
+          - model: Tongyi-MAI/Z-Image-Turbo
+            validation_type: image_gen
+            variant: cuda-develsdk
+            label_suffix: img-devsdk
+          - model: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+            validation_type: tts
+            variant: cuda-develsdk
+            label_suffix: tts-devsdk
+            tts_voice: vivian
           - model: black-forest-labs/FLUX.1-schnell
-            model_capabilities: image_generation
+            validation_type: image_gen
             variant: cuda
             label_suffix: flux1-cuda
+          - model: black-forest-labs/FLUX.1-schnell
+            validation_type: image_gen
+            variant: cuda-develsdk
+            label_suffix: flux1-devsdk
           - model: black-forest-labs/FLUX.2-klein-4B
-            model_capabilities: image_generation
+            validation_type: image_gen
             variant: cuda
             label_suffix: flux2klein-cuda
+          - model: black-forest-labs/FLUX.2-klein-4B
+            validation_type: image_gen
+            variant: cuda-develsdk
+            label_suffix: flux2klein-devsdk
           - model: black-forest-labs/FLUX.2-dev
-            model_capabilities: image_generation
+            validation_type: image_gen
             variant: cuda
             label_suffix: flux2dev-cuda
             tensor_parallel_size: "2"
+          - model: black-forest-labs/FLUX.2-dev
+            validation_type: image_gen
+            variant: cuda-develsdk
+            label_suffix: flux2dev-devsdk
+            tensor_parallel_size: "2"
           - model: mistralai/Voxtral-4B-TTS-2603
-            model_capabilities: speech_generation
+            validation_type: tts
             variant: cuda
             label_suffix: voxtral-cuda
+            tts_voice: neutral_female
+          - model: mistralai/Voxtral-4B-TTS-2603
+            validation_type: tts
+            variant: cuda-develsdk
+            label_suffix: voxtral-devsdk
+            tts_voice: neutral_female
           - model: Qwen/Qwen3-Omni-30B-A3B-Instruct
-            model_capabilities: omni_chat
+            validation_type: omni
             variant: cuda
             label_suffix: qwen3omni-cuda
+            gpu_count: "2"
+          - model: Qwen/Qwen3-Omni-30B-A3B-Instruct
+            validation_type: omni
+            variant: cuda-develsdk
+            label_suffix: qwen3omni-devsdk
             gpu_count: "2"
     name: "smoke-test (${{ matrix.label_suffix }})"
 
@@ -689,27 +730,23 @@ jobs:
           echo "Triggering smoke test:"
           echo "  Image: ${VLLM_IMAGE}"
           echo "  Model: ${{ matrix.model }}"
-          echo "  Capabilities: ${{ matrix.model_capabilities }}"
+          echo "  Validation: ${{ matrix.validation_type }}"
 
           BEFORE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "before_ts=${BEFORE_TS}" >> "${GITHUB_OUTPUT}"
 
-          gh workflow run ocp-test.yml \
+          gh workflow run test-vllm-omni.yml \
             --repo "${NM_CICD_REPO}" \
             --ref "${NM_CICD_REF}" \
             -f vllm_image="${VLLM_IMAGE}" \
             -f model="${{ matrix.model }}" \
             -f target_device=cuda \
-            -f model_capabilities="${{ matrix.model_capabilities }}" \
-            -f deployment_type=vllm-omni \
-            -f test_type=smoke \
-            -f config_ref=main \
-            -f ocp_host_url=https://api.modelsibm.ibmmodel.rh-ods.com:6443 \
+            -f validation_type="${{ matrix.validation_type }}" \
             -f label=ibm-wdc-k8s-h100-util \
             -f timeout=60 \
             -f tensor_parallel_size=${{ matrix.tensor_parallel_size || '1' }} \
             -f gpu_count=${{ matrix.gpu_count || '' }} \
-            -f wf_category=DEBUG
+            -f tts_voice=${{ matrix.tts_voice || '' }}
 
           echo "vllm_image=${VLLM_IMAGE}" >> "${GITHUB_OUTPUT}"
 
@@ -732,7 +769,7 @@ jobs:
 
             CANDIDATE_IDS=$(gh run list \
               --repo "${NM_CICD_REPO}" \
-              --workflow ocp-test.yml \
+              --workflow test-vllm-omni.yml \
               --branch "${NM_CICD_REF}" \
               --limit 20 \
               --json databaseId,displayTitle,createdAt \
@@ -807,7 +844,7 @@ jobs:
             echo "| **nm-cicd run** | [${SMOKE_RUN_ID}](${RUN_URL}) |"
             echo "| **Image** | \`${{ steps.trigger.outputs.vllm_image }}\` |"
             echo "| **Model** | ${{ matrix.model }} |"
-            echo "| **Capabilities** | ${{ matrix.model_capabilities }} |"
+            echo "| **Validation** | ${{ matrix.validation_type }} |"
             echo "| **Result** | ${CONCLUSION:-timeout} |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
