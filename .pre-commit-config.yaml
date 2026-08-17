@@ -24,7 +24,7 @@ repos:
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: typos-dict-v0.13.13
+    rev: v1.49.0
     hooks:
       - id: typos
         # only for staged files

@@ -343,6 +343,8 @@ extend-ignore-identifiers-re = [
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
+    # setuptools-scm / git-describe local versions, e.g. 0.26.1.dev14+gae6577ea
+    "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
@@ -367,3 +369,5 @@ Leary = "Leary"
 fo = "fo"
 ba = "ba"
 SER = "SER"
+# NumPy ndarray.flags.writeable (canonical flag name, not "writable").
+writeable = "writeable"
