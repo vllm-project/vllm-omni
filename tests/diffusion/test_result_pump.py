@@ -46,14 +46,16 @@ def _make_executor(step_execution=False):
     return executor
 
 
-def _feed_one_msg_to_pump(executor, msg):
-    """Run _result_pump in a daemon thread, feed one *msg*, then stop."""
-    call_count = [0]
+def _feed_msgs_to_pump(executor, msgs):
+    """Run _result_pump in a daemon thread, feed *msgs* in order, then stop.
+
+    Returns the pump thread so callers can assert it survived.
+    """
+    pending = list(msgs)
 
     def mock_dequeue(timeout=None):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return msg
+        if pending:
+            return pending.pop(0)
         executor._pump_stop.set()
         time.sleep(0.05)
         raise TimeoutError
@@ -62,6 +64,12 @@ def _feed_one_msg_to_pump(executor, msg):
     t = threading.Thread(target=executor._result_pump, daemon=True)
     t.start()
     t.join(timeout=2.0)
+    return t
+
+
+def _feed_one_msg_to_pump(executor, msg):
+    """Run _result_pump in a daemon thread, feed one *msg*, then stop."""
+    return _feed_msgs_to_pump(executor, [msg])
 
 
 @pytest.fixture(autouse=True)
@@ -492,3 +500,177 @@ class TestResultPumpCancelledFutureRace:
         assert cancelled_fut.cancelled()
         assert healthy_fut.done()
         assert healthy_fut.result(timeout=1.0) is outputs["r-healthy"]
+
+
+class TestResultPumpDispatchIsGuarded:
+    """A pump thread is the sole reader of its worker's result queue, so an
+    exception escaping the dispatch half costs every later result, not just the
+    message that caused it. One bad message must cost one message.
+    """
+
+    def test_dispatch_failure_does_not_kill_the_pump(self):
+        executor = _make_executor()
+
+        exploding_buffer = MagicMock()
+        exploding_buffer.put.side_effect = RuntimeError("sync buffer exploded")
+        executor._sync_result_buffer = exploding_buffer
+
+        fut = executor.wait_output_ready("abc123")
+        output = DiffusionOutput(output="after the bad message")
+        good = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="abc123",
+            output=output,
+        )
+
+        # SimpleNamespace is not an AsyncDiffusionOutput, so it takes the
+        # sync-buffer path and raises there.
+        pump = _feed_msgs_to_pump(executor, [SimpleNamespace(bad=True), good])
+
+        assert not pump.is_alive()
+        assert fut.done(), "pump died on the bad message and never delivered the next one"
+        assert fut.result(timeout=1.0) is output
+
+    def test_batch_split_failure_does_not_kill_the_pump(self):
+        executor = _make_executor()
+
+        class _ExplodingBatchOutput:
+            def get_request_output(self, req_id):
+                raise RuntimeError("corrupt batch output")
+
+        with executor._futures_lock:
+            executor._batch_split_map["batch-1"] = {"batch-1/r-0": "r-0"}
+        doomed = executor.wait_output_ready("batch-1/r-0")
+
+        fut = executor.wait_output_ready("abc123")
+        output = DiffusionOutput(output="after the bad batch")
+        msgs = [
+            AsyncDiffusionOutput(
+                kind=AsyncOutputKind.OUTPUT_READY,
+                async_output_id="batch-1",
+                output=_ExplodingBatchOutput(),
+            ),
+            AsyncDiffusionOutput(
+                kind=AsyncOutputKind.OUTPUT_READY,
+                async_output_id="abc123",
+                output=output,
+            ),
+        ]
+        pump = _feed_msgs_to_pump(executor, msgs)
+
+        assert not pump.is_alive()
+        assert not doomed.done()  # that one message is lost, as expected
+        assert fut.done(), "one corrupt batch must not wedge the queue"
+        assert fut.result(timeout=1.0) is output
+
+
+class TestResultPumpDropsOutputForAbandonedWaiter:
+    """_completed_outputs exists for results that arrive before the caller asks
+    for them. A caller that has already cancelled will never ask, so caching for
+    it pins the unpacked output — a decoded video, for a t2va request — for the
+    lifetime of the process.
+    """
+
+    def test_cancelled_waiter_output_is_not_cached(self):
+        executor = _make_executor()
+        fut = executor.wait_output_ready("abc123")
+        assert fut.cancel()
+        assert fut.cancelled()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="abc123",
+            output=DiffusionOutput(output="nobody is waiting for this"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert executor._completed_outputs == {}
+        assert executor._output_futures == {}
+
+    def test_cancelled_waiter_batch_split_output_is_not_cached(self):
+        executor = _make_executor()
+        with executor._futures_lock:
+            executor._batch_split_map["batch-1"] = {
+                "batch-1/r-aborted": "r-aborted",
+                "batch-1/r-healthy": "r-healthy",
+            }
+        aborted = executor.wait_output_ready("batch-1/r-aborted")
+        healthy = executor.wait_output_ready("batch-1/r-healthy")
+        assert aborted.cancel()
+
+        outputs = {
+            "r-aborted": DiffusionOutput(output="dropped"),
+            "r-healthy": DiffusionOutput(output="ok"),
+        }
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="batch-1",
+            output=_FakeBatchOutput(outputs),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert executor._completed_outputs == {}
+        assert healthy.done()
+        assert healthy.result(timeout=1.0) is outputs["r-healthy"]
+
+    def test_output_with_no_waiter_is_still_cached(self):
+        """The pre-existing early-arrival path must keep working."""
+        executor = _make_executor()
+        output = DiffusionOutput(output="arrived early")
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="abc123",
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert executor.wait_output_ready("abc123").result(timeout=1.0) is output
+
+
+class TestCheckHealthDetectsDeadPump:
+    """Regression for the zombie-server half of #5793/#5821: when a pump thread
+    dies, every process is alive and every request still runs on the GPU, so
+    /health stayed 200 while no request could ever return again.
+    """
+
+    @staticmethod
+    def _dead_thread():
+        t = threading.Thread(target=lambda: None, name="DiffusionResultPump-0")
+        t.start()
+        t.join()
+        assert not t.is_alive()
+        return t
+
+    def test_dead_pump_thread_marks_engine_dead(self):
+        from vllm.v1.engine.exceptions import EngineDeadError
+
+        executor = _make_executor()
+        executor._pump_running = True
+        executor._result_pump_threads = [self._dead_thread()]
+
+        with pytest.raises(EngineDeadError, match="DiffusionResultPump-0"):
+            executor.check_health()
+        assert executor._is_failed
+
+    def test_live_pump_thread_is_healthy(self):
+        executor = _make_executor()
+        executor._pump_running = True
+        pump = threading.Thread(target=executor._pump_stop.wait, name="DiffusionResultPump-0")
+        pump.start()
+        executor._result_pump_threads = [pump]
+        try:
+            executor.check_health()
+            assert not executor._is_failed
+        finally:
+            executor._pump_stop.set()
+            pump.join(timeout=2.0)
+
+    def test_stopped_pump_is_not_reported_dead(self):
+        """Shutdown stops the pump on purpose; that is not an engine failure."""
+        executor = _make_executor()
+        executor._pump_running = True
+        executor._pump_stop.set()
+        executor._result_pump_threads = [self._dead_thread()]
+
+        executor.check_health()
+        assert not executor._is_failed

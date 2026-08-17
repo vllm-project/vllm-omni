@@ -857,60 +857,82 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     break
                 continue
 
-            if not isinstance(msg, AsyncDiffusionOutput):
-                # Non-async message: place into the sync buffer for
-                # collective_rpc() to consume via Path 2.
-                self._sync_result_buffer.put(msg)
-                continue
+            # This thread is the only reader of result_mq, so an escaping
+            # exception costs the whole queue, not just this message: every
+            # later result goes undelivered while the server keeps reporting
+            # healthy. Contain the blast radius to one message.
+            try:
+                self._dispatch_result(msg)
+            except Exception:
+                logger.exception("Result pump failed to dispatch a message; dropping it")
 
-            if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
-                with self._futures_lock:
-                    fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
-                if fut is not None and not fut.done():
-                    if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
-                    else:
-                        try_set_result(fut, msg)
-            elif msg.kind == AsyncOutputKind.OUTPUT_READY:
-                batch_id = msg.async_output_id
-                with self._futures_lock:
-                    per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
-                if per_req_map is not None:
-                    # Batch result: split into per-request DiffusionOutputs.
+    def _dispatch_result(self, msg: object) -> None:
+        """Route one dequeued message to whoever is waiting for it."""
+        if not isinstance(msg, AsyncDiffusionOutput):
+            # Non-async message: place into the sync buffer for
+            # collective_rpc() to consume via Path 2.
+            self._sync_result_buffer.put(msg)
+            return
+
+        if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
+            with self._futures_lock:
+                fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
+            if fut is not None and not fut.done():
+                if msg.error:
+                    try_set_exception(fut, RuntimeError(msg.error))
+                else:
+                    try_set_result(fut, msg)
+        elif msg.kind == AsyncOutputKind.OUTPUT_READY:
+            batch_id = msg.async_output_id
+            with self._futures_lock:
+                per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
+            if per_req_map is not None:
+                # Batch result: split into per-request DiffusionOutputs.
+                try:
+                    unpack_diffusion_output_shm(msg.output)
+                except Exception:
+                    logger.exception("SHM unpack failed for batch %s", batch_id)
+                self._deliver_batch_split(per_req_map, msg.output, msg.error)
+            else:
+                # Single-request result: unpack SHM first, then resolve or cache atomically.
+                output_result: DiffusionOutput | None = None
+                exc: Exception | None = None
+                if msg.error:
+                    exc = RuntimeError(msg.error)
+                else:
                     try:
                         unpack_diffusion_output_shm(msg.output)
-                    except Exception:
-                        logger.exception("SHM unpack failed for batch %s", batch_id)
-                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
-                else:
-                    # Single-request result: unpack SHM first, then resolve or cache atomically.
-                    output_result: DiffusionOutput | None = None
-                    exc: Exception | None = None
-                    if msg.error:
-                        exc = RuntimeError(msg.error)
-                    else:
-                        try:
-                            unpack_diffusion_output_shm(msg.output)
-                            output_result = msg.output
-                        except Exception as e:
-                            logger.exception("SHM unpack failed in result pump")
-                            exc = e
+                        output_result = msg.output
+                    except Exception as e:
+                        logger.exception("SHM unpack failed in result pump")
+                        exc = e
 
-                    if batch_id:
-                        with self._futures_lock:
-                            pending = self._output_futures.pop(batch_id, None)
-                            if pending is not None and not pending.done():
-                                if exc is not None:
-                                    try_set_exception(pending, exc)
-                                else:
-                                    try_set_result(pending, output_result)
+                if batch_id:
+                    with self._futures_lock:
+                        pending = self._output_futures.pop(batch_id, None)
+                        if pending is not None and not pending.done():
+                            if exc is not None:
+                                try_set_exception(pending, exc)
                             else:
-                                fut = concurrent.futures.Future()
-                                if exc is not None:
-                                    fut.set_exception(exc)
-                                else:
-                                    fut.set_result(output_result)
-                                self._completed_outputs[batch_id] = fut
+                                try_set_result(pending, output_result)
+                        elif pending is not None:
+                            # The waiter resolved itself first — cancelled by an
+                            # inter-output timeout, or aborted. Nothing will ever
+                            # collect a cached copy for it, so drop the result
+                            # instead of pinning the unpacked output (a whole
+                            # decoded video, for a t2va request) until shutdown.
+                            logger.debug(
+                                "Dropping output for %s: waiter already %s",
+                                batch_id,
+                                "cancelled" if pending.cancelled() else "resolved",
+                            )
+                        else:
+                            fut = concurrent.futures.Future()
+                            if exc is not None:
+                                fut.set_exception(exc)
+                            else:
+                                fut.set_result(output_result)
+                            self._completed_outputs[batch_id] = fut
 
     def _deliver_batch_split(
         self,
@@ -932,6 +954,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 pending = self._output_futures.pop(per_req_id, None)
                 if pending is not None and not pending.done():
                     try_set_result(pending, per_req_result)
+                elif pending is not None:
+                    # Waiter gave up (cancelled/aborted); see _dispatch_result.
+                    logger.debug(
+                        "Dropping batch-split output for %s: waiter already %s",
+                        per_req_id,
+                        "cancelled" if pending.cancelled() else "resolved",
+                    )
                 else:
                     fut: concurrent.futures.Future = concurrent.futures.Future()
                     fut.set_result(per_req_result)
@@ -975,6 +1004,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not p.is_alive():
                 self._is_failed = True
                 raise EngineDeadError(f"Worker process {p.name} is dead")
+        # A pump thread is the sole reader of its worker's result queue. If one
+        # dies, every process is still alive and every request still runs on the
+        # GPU — the results simply never come back. Without this check the
+        # engine reports healthy forever and only a restart recovers it.
+        if self._pump_running and not self._pump_stop.is_set():
+            for thread in getattr(self, "_result_pump_threads", []):
+                if not thread.is_alive():
+                    self._is_failed = True
+                    raise EngineDeadError(f"Result pump thread {thread.name} is dead")
 
     def shutdown(self) -> None:
         self._closed = True
