@@ -72,7 +72,16 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
     Supports CUDA_VISIBLE_DEVICES with integer indices, UUIDs, or MIG IDs.
 
     Returns:
-        Memory in bytes used by this process, or None if NVML unavailable.
+        Memory in bytes used by this process, or None when NVML cannot answer.
+
+        None covers two cases: NVML is unavailable, and this process's PID is
+        absent from the device's compute-process list. The miss is reported as
+        None rather than 0 because NVML cannot distinguish "this process holds
+        no device memory" from "this process is not visible to NVML" -- a PID
+        namespace mismatch is the usual cause, and only the caller knows whether
+        a device context is expected to exist by this point. Callers read a
+        returned int as an authoritative measurement, so 0 would size budgets as
+        though the process were empty; None routes them to their own fallback.
 
     Raises:
         RuntimeError: If device validation fails (invalid index or UUID).
@@ -111,7 +120,14 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
         for proc in nvmlDeviceGetComputeRunningProcesses(handle):
             if proc.pid == my_pid:
                 return proc.usedGpuMemory
-        return 0
+        logger.warning(
+            "PID %d is not in the NVML compute-process list for GPU %d, so per-process "
+            "memory cannot be measured (a PID namespace mismatch is the usual cause); "
+            "will use profiling fallback.",
+            my_pid,
+            local_rank,
+        )
+        return None
     except RuntimeError:
         raise
     except Exception as e:

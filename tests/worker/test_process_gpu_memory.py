@@ -1,6 +1,7 @@
 """Tests for process-scoped GPU memory accounting."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
@@ -80,7 +81,13 @@ class TestGetProcessGpuMemory:
         with pytest.raises(RuntimeError, match="Invalid GPU device"):
             get_process_gpu_memory(5)
 
-    def test_returns_zero_when_process_not_found(self, mocker: MockerFixture):
+    def test_returns_none_when_process_not_found(self, mocker: MockerFixture):
+        """A PID lookup miss is absence, not zero.
+
+        Returning 0 here reads to callers as "this process holds no device
+        memory", which sizes the KV cache as if the weights were free. None
+        routes them to their conservative fallback instead.
+        """
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
@@ -88,6 +95,30 @@ class TestGetProcessGpuMemory:
         mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
+
+        memory = get_process_gpu_memory(0)
+        assert memory is None
+
+    def test_returns_zero_when_process_found_holding_nothing(self, mocker: MockerFixture):
+        """A *found* record reporting 0 bytes is a measurement and is kept as 0.
+
+        This pins the distinction the fix rests on: the change is about the PID
+        being absent from the list, not about the value 0 being suspicious.
+        """
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+        # A co-tenant is listed ahead of us: a shared GPU rarely lists us first.
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[
+                SimpleNamespace(pid=os.getpid() + 1, usedGpuMemory=5 * 1024**3),
+                SimpleNamespace(pid=os.getpid(), usedGpuMemory=0),
+            ],
+        )
 
         memory = get_process_gpu_memory(0)
         assert memory == 0
@@ -102,11 +133,20 @@ class TestGetProcessGpuMemory:
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
         mock_by_uuid = mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetHandleByUUID", return_value=mock_handle)
-        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
+        # Scan a handle that carries this process, so the assertion below is about
+        # the UUID path returning a real reading rather than about miss behaviour.
+        mock_procs = mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[
+                SimpleNamespace(pid=os.getpid() + 1, usedGpuMemory=8192),
+                SimpleNamespace(pid=os.getpid(), usedGpuMemory=4096),
+            ],
+        )
 
         memory = get_process_gpu_memory(0)
-        assert memory == 0
+        assert memory == 4096
         mock_by_uuid.assert_called_once_with(uuid)
+        mock_procs.assert_called_once_with(mock_handle)
 
     def test_raises_on_invalid_uuid(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
