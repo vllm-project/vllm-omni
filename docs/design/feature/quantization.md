@@ -76,6 +76,12 @@ equivalent. `auto-round` and `auto_round` use the Omni INC/AutoRound adapter.
 ModelOpt checkpoint metadata is detected from its method, producer metadata, or
 `quant_algo`, then mapped to the corresponding vLLM ModelOpt configuration.
 
+Unless the input is a per-component dictionary, the resolved configuration is
+passed unchanged to every quantization-aware component constructed by the
+pipeline. It affects only layers supported by that component's quantization
+method; it does not rewrite arbitrary `torch.nn` modules. A per-component
+dictionary narrows this global scope through runtime layer-prefix routing.
+
 The factory uses Omni-specific overrides for methods whose diffusion behavior
 or platform dispatch is not provided by the vLLM registry. The current override
 set includes INT8, BitsAndBytes, MXFP8, MXFP4, MXFP4 dual-scale, and INC/
@@ -154,9 +160,11 @@ quantizable vLLM layers. Each method configuration is responsible for:
 Model code must keep precision-sensitive or unsupported modules unquantized.
 The shared `safe_quant_config()` helper is used by model integrations for
 normalization and modulation layers where a generic FP8 configuration would be
-unsafe. Text encoders, audio/vision encoders, VAEs, schedulers, and tokenizers
-are not implicitly quantized just because the main transformer is quantized;
-they require explicit component routing and method support.
+unsafe. Encoders exposed through the quantization factory receive a global
+configuration just like the main transformer, but only their supported vLLM
+quantizable layers are affected. Ordinary `torch.nn` encoder layers, VAEs,
+schedulers, and tokenizers are not rewritten automatically. A component map can
+select a narrower scope, but it cannot add quantization support to a layer.
 
 Weight quantization and quantized KV cache are separate paths. The former is
 resolved through `quantization_config`; runtime attention/KV-cache quantization
@@ -186,7 +194,7 @@ Distributed layerwise offload has an additional boundary: its sharded mmap
 AllGather path is not compatible with online quantization because the path
 expects already materialized checkpoint weights. Use the rank-local
 `--dlo-no-use-allgather` path or a compatible pre-quantized checkpoint when
-combining these features. See the [DLO design document](distributed_layerwise_offload.md)
+combining these features. See the [DLO design document](offloader/distributed_layerwise_offload.md)
 for the full compatibility matrix.
 
 ## Adding a quantization backend

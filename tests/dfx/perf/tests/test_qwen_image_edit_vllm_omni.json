@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-device baseline",
@@ -73,7 +73,7 @@
           "num_cards": 4
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Ulysses SP=2 + CFG=2 + VAE patch parallel=4",
@@ -121,7 +121,7 @@
           "num_cards": 4
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Ulysses SP=2 + CFG=2 + CacheDiT",

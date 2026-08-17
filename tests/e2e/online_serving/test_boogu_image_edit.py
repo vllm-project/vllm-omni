@@ -19,7 +19,7 @@ reference image is supported.
 From ``tests/``::
 
     pytest -s -v e2e/online_serving/test_boogu_image_edit.py \
-        -m "full_model and diffusion and H100" --run-level=full_model
+        -m "slow and diffusion and H100"
 """
 
 import base64
@@ -35,7 +35,7 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 EDIT_PROMPT = "Change the style to a colored pencil drawing."
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})

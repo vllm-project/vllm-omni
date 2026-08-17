@@ -5,7 +5,7 @@ import json
 import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -363,8 +363,18 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     if expected_partition == "ref2va":
         assert pipeline._transformer_for_task("ref2va") is pipeline.transformer
     assert [source.model_or_path for source in pipeline.weights_sources] == [
-        str(tmp_path / partition_name) for partition_name in source_partitions
+        *(str(tmp_path / partition_name) for partition_name in source_partitions),
+        str(component_path),
     ]
+    assert [source.subfolder for source in pipeline.weights_sources] == [
+        *("transformer" for _ in source_partitions),
+        "text_encoder",
+    ]
+    expected_prefixes = ["transformer."]
+    if expected_dits == 2:
+        expected_prefixes.append("transformers_ref.")
+    expected_prefixes.append("text_encoder.")
+    assert [source.prefix for source in pipeline.weights_sources] == expected_prefixes
     expected_patterns = (
         pipeline_module.MINIMAX_H3_DOWNLOAD_PATTERNS
         if expected_partition == "combined"
@@ -936,6 +946,66 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     assert list(encoder.named_parameters()) == []
 
 
+def test_global_quant_config_is_shared_by_dit_and_encoder():
+    from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
+
+    global_config = build_quant_config("fp8")
+
+    assert resolve_component_quant_config(global_config, "transformer") is global_config
+    assert resolve_component_quant_config(global_config, "text_encoder") is global_config
+
+
+def test_minimax_h3_fp8_component_selection():
+    from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
+
+    dit_only = build_quant_config({"transformer": {"method": "fp8"}})
+    encoder_only = build_quant_config({"text_encoder": {"method": "fp8"}})
+
+    assert resolve_component_quant_config(dit_only, "transformer").get_name() == "fp8"
+    assert resolve_component_quant_config(dit_only, "text_encoder") is None
+    assert resolve_component_quant_config(encoder_only, "transformer") is None
+    assert resolve_component_quant_config(encoder_only, "text_encoder").get_name() == "fp8"
+
+
+def test_text_encoder_rejects_serialized_fp8():
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _validate_encoder_quant_config
+
+    config = SimpleNamespace(
+        get_name=lambda: "fp8",
+        is_checkpoint_fp8_serialized=True,
+    )
+    with pytest.raises(ValueError, match="online FP8 only"):
+        _validate_encoder_quant_config(config)
+
+
+def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    import vllm_omni.diffusion.models.minimax_h3.encoder as encoder_module
+
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    method = UnquantizedLinearMethod()
+    quant_config = Mock()
+    quant_config.get_quant_method.return_value = method
+    prefix = "text_encoder.text_model.layers.0.mlp.gate_up_proj"
+
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        linear = encoder_module.MiniMaxH3Qwen3VLMergedColumnParallelLinear(
+            group,
+            input_size=4,
+            intermediate_size=8,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    assert linear.quant_method is method
+    quant_config.get_quant_method.assert_called_once_with(linear, prefix=prefix)
+
+
 def test_no_offload_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -978,15 +1048,21 @@ def test_model_offload_uses_hooked_text_encoder_call():
     pipeline.text_encoder.load_to_device.assert_not_called()
 
 
-def test_layerwise_offload_releases_text_encoder():
+@pytest.mark.parametrize(
+    "offload_flag",
+    ["enable_layerwise_offload", "enable_distributed_layerwise_offload"],
+)
+def test_layerwise_offload_releases_text_encoder(offload_flag):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
-        enable_layerwise_offload=True,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
     )
+    setattr(pipeline.od_config, offload_flag, True)
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
     pipeline.text_encoder.encode_ids.return_value = expected
@@ -1988,21 +2064,25 @@ def _one_layer_text_encoder():
     group = _SingleRankEncoderGroup(0)
     layer = nn.Module()
     layer.self_attn = nn.Module()
-    layer.self_attn.qkv_proj = MiniMaxH3Qwen3VLQKVParallelLinear(
-        group,
-        hidden_size=_ENCODER_HIDDEN,
-        num_heads=_ENCODER_NUM_HEADS,
-        num_kv_heads=_ENCODER_NUM_KV_HEADS,
-        head_dim=_ENCODER_HEAD_DIM,
-        dtype=torch.float32,
-    )
     layer.mlp = nn.Module()
-    layer.mlp.gate_up_proj = MiniMaxH3Qwen3VLMergedColumnParallelLinear(
-        group,
-        input_size=_ENCODER_HIDDEN,
-        intermediate_size=_ENCODER_INTERMEDIATE,
-        dtype=torch.float32,
-    )
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        layer.self_attn.qkv_proj = MiniMaxH3Qwen3VLQKVParallelLinear(
+            group,
+            hidden_size=_ENCODER_HIDDEN,
+            num_heads=_ENCODER_NUM_HEADS,
+            num_kv_heads=_ENCODER_NUM_KV_HEADS,
+            head_dim=_ENCODER_HEAD_DIM,
+            dtype=torch.float32,
+        )
+        layer.mlp.gate_up_proj = MiniMaxH3Qwen3VLMergedColumnParallelLinear(
+            group,
+            input_size=_ENCODER_HIDDEN,
+            intermediate_size=_ENCODER_INTERMEDIATE,
+            dtype=torch.float32,
+        )
     layer.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(_ENCODER_HIDDEN)
 
     encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
@@ -2035,6 +2115,7 @@ def _write_text_encoder_checkpoint(path, *, omit=()):
     safetensors.torch.save_file(tensors, str(path / "model.safetensors"))
     index = {"weight_map": dict.fromkeys(tensors, "model.safetensors")}
     (path / "model.safetensors.index.json").write_text(json.dumps(index))
+    return tensors
 
 
 @pytest.mark.parametrize(
@@ -2056,10 +2137,10 @@ def test_encoder_load_reports_missing_fused_source_shards(
     tmp_path, omitted_sources, expected_detail, unreported_target
 ):
     encoder = _one_layer_text_encoder()
-    _write_text_encoder_checkpoint(tmp_path, omit=omitted_sources)
+    weights = _write_text_encoder_checkpoint(tmp_path, omit=omitted_sources)
 
     with pytest.raises(RuntimeError) as excinfo:
-        encoder._load_weights(str(tmp_path))
+        encoder.load_weights(weights.items())
 
     message = str(excinfo.value)
     assert expected_detail in message
@@ -2068,17 +2149,17 @@ def test_encoder_load_reports_missing_fused_source_shards(
 
 def test_encoder_load_rejects_unloaded_plain_param(tmp_path):
     encoder = _one_layer_text_encoder()
-    _write_text_encoder_checkpoint(tmp_path, omit=("input_layernorm.weight",))
+    weights = _write_text_encoder_checkpoint(tmp_path, omit=("input_layernorm.weight",))
 
     with pytest.raises(RuntimeError, match=r"weights not loaded.*input_layernorm"):
-        encoder._load_weights(str(tmp_path))
+        encoder.load_weights(weights.items())
 
 
 def test_encoder_load_places_every_source_in_its_own_rows(tmp_path):
     encoder = _one_layer_text_encoder()
-    _write_text_encoder_checkpoint(tmp_path)
+    weights = _write_text_encoder_checkpoint(tmp_path)
 
-    encoder._load_weights(str(tmp_path))
+    encoder.load_weights(weights.items())
 
     params = dict(encoder.named_parameters())
     q_rows = _ENCODER_NUM_HEADS * _ENCODER_HEAD_DIM

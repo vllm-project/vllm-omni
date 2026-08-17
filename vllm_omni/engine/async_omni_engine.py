@@ -982,6 +982,9 @@ class AsyncOmniEngine:
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
+            # Default-stage construction bypasses the structured projection.
+            # Runner selection remains owned by the selected engine/platform.
+            "engine_backend": kwargs.get("engine_backend", "default"),
             "model_class_name": kwargs.get("model_class_name", None),
             "task_type": kwargs.get("task_type", None),
             "model_config": kwargs.get("model_config", None),
@@ -1115,15 +1118,13 @@ class AsyncOmniEngine:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
+        for legacy_arg in ("stage_configs_path", "stage_configs"):
+            if legacy_arg in kwargs:
+                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        explicit_stage_configs = kwargs.pop("stage_configs", None)
-        if explicit_stage_configs is not None:
-            logger.warning(
-                "`stage_configs` is not part of the public API. "
-                "Ignoring it and resolving stages from deploy_config/model factory."
-            )
 
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)

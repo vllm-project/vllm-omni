@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.engine import FinishReason
 
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    DEFAULT_INPUT_WAIT_TIMEOUT_S,
+    OmniSchedulerMixin,
+)
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -22,13 +25,25 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
     scheduler.requests = {"request": object()}
     scheduler._consume_pending_connector_output = lambda mode: calls.append(("consume", mode))
     scheduler._process_pending_input_timeouts = lambda: calls.append(("timeouts",))
+
+    def _collect_timed_out(timeout_s):
+        calls.append(("chunk-timeouts", timeout_s))
+        return set()
+
+    def _collect_failed_sends():
+        calls.append(("failed-sends",))
+        return {}
+
     scheduler.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
         process_pending_chunks=lambda waiting, running, scheduler_requests: calls.append(
             ("process", waiting, running, scheduler_requests)
         ),
         restore_queues=lambda waiting, running, scheduler_requests: calls.append(
             ("restore-chunks", waiting, running, scheduler_requests)
         ),
+        collect_timed_out_request_ids=_collect_timed_out,
+        collect_failed_send_request_ids=_collect_failed_sends,
     )
     scheduler.input_coordinator = SimpleNamespace(
         restore_queues=lambda waiting: calls.append(("restore-full", waiting))
@@ -41,6 +56,10 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         ("consume", "ar"),
         ("timeouts",),
         ("process", scheduler.waiting, scheduler.running, scheduler.requests),
+        # The chunk deadline runs after chunks are applied, so a chunk that
+        # arrived this cycle resets the clock before it is measured (R1.1).
+        ("chunk-timeouts", DEFAULT_INPUT_WAIT_TIMEOUT_S),
+        ("failed-sends",),
         ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
         ("restore-full", scheduler.waiting),
     ]

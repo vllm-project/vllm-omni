@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -94,6 +95,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        # Monotonic timestamp of when each request last began waiting for a
+        # chunk, refreshed every time one arrives.  Read by
+        # collect_timed_out_request_ids() so a stream that stops advancing
+        # becomes a client-visible error instead of parking forever.  Mirrors
+        # OmniSchedulingCoordinator._waiting_since on the full-payload path.
+        self._waiting_since: dict[str, float] = {}
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -383,6 +390,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
                 self.cleanup(request.request_id, external_req_id)
+        else:
+            # R1.2 of #4855. connector.put returning False is a silent drop: no
+            # exception, no retry, and the caller's `if success:` block simply
+            # does not run. /dev/shm exhaustion in SharedMemoryConnector.put is
+            # one way to get here. Record it so the request fails now rather
+            # than parking in WAITING_FOR_CHUNK until the deadline.
+            logger.error(
+                "Chunk send failed for %s (stage %s -> %s); giving up on this chunk",
+                external_req_id,
+                stage_id,
+                next_stage_id,
+            )
+            # Key on the scheduler-side id. `external_req_id` is the user-facing id
+            # (InputProcessor renames request_id to an internal UUID and keeps the
+            # original in external_req_id, see async_omni_engine.py), while
+            # `self.requests` -- and therefore `finish_requests` -- is keyed by the
+            # internal one.
+            self.record_send_failure(request.request_id, "connector.put reported failure")
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
@@ -438,6 +463,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+        self._waiting_since.pop(request_id, None)
 
     @staticmethod
     def _discard_from_chunk_deque(deque_list: deque[Any], request_id: str) -> None:
@@ -579,6 +605,42 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._active_streams[request_id] = request
         return True
 
+    def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
+        """Return IDs whose chunk wait has exceeded *timeout_s*.
+
+        The async-chunk path had no deadline of any kind: a request parks in
+        ``WAITING_FOR_CHUNK`` and the receiver re-queues it on every failed
+        poll (``transfer_adapter/base.py``) with no attempt counter, so a
+        producer that crashed, gave up after its send retries, or simply never
+        emitted a terminal chunk left the request waiting forever
+        (vllm-project/vllm-omni#3833).  The full-payload path has had a net
+        since ``OmniSchedulingCoordinator.collect_timed_out_request_ids``; this
+        is its async-chunk counterpart, and both are driven by the same
+        ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S``.
+
+        The clock measures *stall* time, not stream lifetime: it starts when a
+        request begins waiting for a chunk and resets each time one arrives, so
+        a long but healthy stream is never failed.
+
+        Clears ``_waiting_since`` for the expired IDs.  The caller marks them
+        ``FINISHED_ERROR`` via the scheduler's ``finish_requests``, which routes
+        back through this adapter's own ``finish_requests`` and releases the
+        rest of the per-request state.
+        """
+        if timeout_s <= 0 or not self._waiting_since:
+            return set()
+        now = time.monotonic()
+        timed_out_ids = {req_id for req_id, started in self._waiting_since.items() if now - started > timeout_s}
+        for req_id in timed_out_ids:
+            self._waiting_since.pop(req_id, None)
+            logger.warning(
+                "[Stage-%s] Request %s timed out waiting for a chunk (stalled > %.0fs)",
+                self.connector.stage_id,
+                req_id,
+                timeout_s,
+            )
+        return timed_out_ids
+
     @property
     def num_running_waiting_for_chunk(self) -> int:
         """Count running requests temporarily removed while awaiting a chunk."""
@@ -624,11 +686,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    # A chunk landed: restart the clock for the next one, so the
+                    # deadline measures stall time rather than total stream time.
+                    self._waiting_since.pop(request.request_id, None)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -767,11 +833,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    # A chunk landed: restart the clock for the next one, so the
+                    # deadline measures stall time rather than total stream time.
+                    self._waiting_since.pop(request.request_id, None)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -826,5 +896,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.upstream_exhausted_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+            self._waiting_since.pop(req_id, None)
 
         return []
