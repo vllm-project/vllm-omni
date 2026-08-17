@@ -1272,7 +1272,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         max_tokens is NOT computed dynamically — it uses the deploy YAML default.
 
         Args:
-            default_params: Default SamplingParams from stage config YAML.
+            default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
             request: The chat completion request containing user-provided values.
 
         Returns:
