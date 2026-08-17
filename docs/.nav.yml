@@ -43,6 +43,7 @@ nav:
     - Overview: features/README.md
     - Runtime and Stage Execution:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
+      - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Sleep Mode: features/sleep_mode.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
