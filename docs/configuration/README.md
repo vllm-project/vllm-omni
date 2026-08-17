@@ -14,10 +14,6 @@ For introduction, please check [Introduction for stage config](./stage_configs.m
 
 - **[GPU Memory Calculation and Configuration](./gpu_memory_utilization.md)** - Guide on how to calculate memory requirements and set up `gpu_memory_utilization` for optimal performance
 
-## Multi-Stage Recipes
-
-- **[Prefill-Decode Disaggregation](./pd_disaggregation.md)** - How to derive a PD-aware Qwen3-Omni stage config from the default config without introducing another bundled YAML
-
 ## Optimization Features
 
 - **[Diffusion Features Overview](../user_guide/diffusion_features.md)** - Complete overview of all diffusion model features and supported models
