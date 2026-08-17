@@ -972,7 +972,7 @@ Common failures and fixes:
 | `check-torch-cuda-call` | New `torch.cuda.*` call site | Use `current_omni_platform`; do not grow `ALLOWED_FILES` without review |
 | `check-tts-adapter-migration` | New `_tts_model_type` branch in `serving_speech.py` | Put logic in `tts_adapters/`; lower `MAX_MODEL_TYPE_BRANCHES` when removing branches |
 | `check-test-ci-coverage` | Test file missing level or hardware mark | Add `core_model`/… plus `cpu`/`cuda`/`hardware_test(` |
-| `shellcheck` | Native binary missing (macOS/Windows) or script warning | Install shellcheck locally; see [Linting](../README.md#linting) |
+| `shellcheck` | Native `shellcheck` missing, or script warning | Install via apt/dnf/brew (or `shellcheck.exe` on Windows). See [Linting](../README.md#linting) |
 | `mypy-3.10` / `markdownlint-cli2` / `check-buildkite` | Types, docs markdown, or Buildkite YAML | See [Linting](../README.md#linting) |
 
 ### DCO sign-off

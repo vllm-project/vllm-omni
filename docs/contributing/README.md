@@ -117,17 +117,17 @@ Prefer `current_omni_platform` / `OmniPlatform`. Platform adapters under
 
 #### shellcheck
 
-Linux x86_64 can auto-install a binary under
-`~/.cache/vllm-omni/shellcheck-stable`. **macOS and Windows do not auto-install.**
-Install a native `shellcheck` yourself, then re-run the hook:
+The hook does **not** download a binary. Install `shellcheck` with a signed
+package manager, then re-run:
 
+- Debian/Ubuntu/WSL: `sudo apt-get install shellcheck`
+- Fedora: `sudo dnf install ShellCheck`
 - macOS: `brew install shellcheck`
-- Windows: put `shellcheck.exe` on `PATH` (Scoop, Chocolatey, or a Git Bash
-  install). The wrapper accepts `shellcheck.exe`; it will not use a Linux
-  ELF binary via WSL path hacks.
+- Git Bash (MINGW): `scoop install shellcheck` so `shellcheck.exe` is on PATH.
+  WSL is Linux: use `apt-get`, not a Windows `.exe`.
 
-If no native binary is found, the wrapper prints
-[the upstream install page](https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing)
+If no native binary is found, the wrapper prints those commands (and
+[the upstream install page](https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing))
 and exits 1. AMD and other vendor scripts are **not** excluded.
 
 #### mypy

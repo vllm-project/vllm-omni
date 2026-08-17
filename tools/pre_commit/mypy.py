@@ -37,6 +37,10 @@ EXCLUDE = [
 ]
 
 
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/")
+
+
 def group_files(changed_files: list[str]) -> dict[str, list[str]]:
     """Group changed files into different mypy calls."""
     exclude_pattern = re.compile(f"^{'|'.join(EXCLUDE)}.*")
@@ -45,6 +49,7 @@ def group_files(changed_files: list[str]) -> dict[str, list[str]]:
     # Longest path first so a sub-directory is not shadowed by its parent.
     separate_groups = sorted(SEPARATE_GROUPS, key=len, reverse=True)
     for changed_file in changed_files:
+        changed_file = _normalize_path(changed_file)
         if exclude_pattern.match(changed_file):
             continue
         for directory in separate_groups:

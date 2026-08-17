@@ -38,7 +38,7 @@ but the changes are correct — stage the modified files and re-commit.
 | `mypy-3.10` | Type error on changed `vllm_omni/` files | Fix the types; model trees are excluded. Extra versions: `pre-commit run --hook-stage manual mypy-3.12` |
 | `markdownlint-cli2` | Docs/README markdown lint | Accept auto-fix under `docs/` / `recipes/` / root README |
 | `check-buildkite` | Invalid `.buildkite/*.yml` | Fix the YAML; do not grow `SKIP_FILES` without review |
-| `shellcheck` | No native binary on macOS/Windows, or script warning | Install shellcheck (`brew install shellcheck` / `shellcheck.exe` on PATH). Linux x86_64 auto-installs |
+| `shellcheck` | No `shellcheck` on PATH, or script warning | `apt-get`/`dnf`/`brew install shellcheck`, or `shellcheck.exe` on Windows PATH |
 
 Canonical policy, CI `SKIP` list, and allowlist locations:
 [docs/contributing/README.md](../../../docs/contributing/README.md#linting).

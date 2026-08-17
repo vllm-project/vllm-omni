@@ -2,27 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
-# Based on vllm/tools/pre_commit/shellcheck.sh: install shellcheck if needed
-# and lint bash scripts for undefined vars, quoting, and similar bugs.
+# Lint bash scripts for undefined vars, quoting, and similar bugs.
+# Do not download a binary: use a distro/package-manager install so the
+# artifact is signed (apt/dnf/brew) or at least an explicit local install.
 set -euo pipefail
-
-scversion="stable"
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vllm-omni/shellcheck-${scversion}"
 
 is_windows_exe() {
     [[ "$1" == *.exe ]]
 }
 
+is_git_bash() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 find_native_shellcheck() {
     local cand
-    if [ -x "${cache_dir}/shellcheck" ]; then
-        echo "${cache_dir}/shellcheck"
-        return 0
-    fi
-    if [ -x "$(pwd)/shellcheck-${scversion}/shellcheck" ]; then
-        echo "$(pwd)/shellcheck-${scversion}/shellcheck"
-        return 0
-    fi
     cand="$(command -v shellcheck 2>/dev/null || true)"
     if [ -n "$cand" ] && ! is_windows_exe "$cand"; then
         echo "$cand"
@@ -31,22 +28,22 @@ find_native_shellcheck() {
     return 1
 }
 
-install_linux_x86_64() {
-    mkdir -p "$cache_dir"
-    wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${scversion}/shellcheck-${scversion}.linux.x86_64.tar.xz" |
-        tar -xJ --strip-components=1 -C "$cache_dir"
+install_hint() {
+    echo "Please install shellcheck with your package manager, then re-run:"
+    echo "  Debian/Ubuntu/WSL: sudo apt-get install shellcheck"
+    echo "  Fedora:            sudo dnf install ShellCheck"
+    echo "  macOS:             brew install shellcheck"
+    echo "  Git Bash:          scoop install shellcheck"
+    echo "  https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing"
 }
 
 SHELLCHECK_BIN=""
 if SHELLCHECK_BIN="$(find_native_shellcheck)"; then
     :
-elif [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
-    install_linux_x86_64
-    SHELLCHECK_BIN="${cache_dir}/shellcheck"
-elif SHELLCHECK_BIN="$(command -v shellcheck.exe 2>/dev/null || true)" && [ -n "$SHELLCHECK_BIN" ]; then
+elif is_git_bash && SHELLCHECK_BIN="$(command -v shellcheck.exe 2>/dev/null || true)" && [ -n "$SHELLCHECK_BIN" ]; then
     :
 else
-    echo "Please install shellcheck: https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing"
+    install_hint
     exit 1
 fi
 
