@@ -39,6 +39,32 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def validate_media_inputs(
+    model_type: str,
+    *,
+    image: str | None,
+    audio: str | None,
+    extra_body: dict[str, Any],
+) -> None:
+    """Fail early when the media a pipeline needs was not supplied.
+
+    An official LongCat Avatar JSON case carries its own reference image and
+    speaker tracks, so both flags become optional -- but only in that mode.
+    ``input_json`` means nothing to Wan2.2 S2V, so it must not relax the checks
+    there.
+    """
+    is_longcat_avatar = model_type == "longcat-video-avatar"
+    has_input_json = is_longcat_avatar and bool(extra_body.get("input_json"))
+    if audio is None and not has_input_json:
+        raise ValueError("--audio is required (only a LongCat Avatar --extra-body input_json can supply it).")
+    if image is None and not has_input_json:
+        if not is_longcat_avatar:
+            raise ValueError(f"--image is required for --model-type {model_type}.")
+        # LongCat Avatar AT2V is driven by audio alone; AI2V needs the image.
+        if str(extra_body.get("stage", "")).lower() == "ai2v":
+            raise ValueError("--image is required for LongCat Avatar AI2V.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a talking-head video from a reference image and audio (Wan2.2 S2V)."
@@ -254,18 +280,7 @@ def main():
     num_frames = args.num_frames if args.num_frames is not None else (93 if is_longcat_avatar else 80)
     fps = args.fps if args.fps is not None else (25 if is_longcat_avatar else 16)
     extra_body = json.loads(args.extra_body) if args.extra_body else {}
-    # LongCat Avatar AT2V is driven by audio alone; every other path needs a
-    # reference image.
-    # An official LongCat Avatar JSON case carries its own reference image and
-    # speaker tracks, so both media flags become optional in that mode only.
-    has_input_json = bool(extra_body.get("input_json"))
-    if args.audio is None and not (is_longcat_avatar and has_input_json):
-        raise ValueError("--audio is required (only a LongCat Avatar --extra-body input_json can supply it).")
-    if args.image is None and not has_input_json:
-        if not is_longcat_avatar:
-            raise ValueError("--image is required for --model-type wan-s2v.")
-        if str(extra_body.get("stage", "")).lower() == "ai2v":
-            raise ValueError("--image is required for LongCat Avatar AI2V.")
+    validate_media_inputs(args.model_type, image=args.image, audio=args.audio, extra_body=extra_body)
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
