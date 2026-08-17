@@ -102,6 +102,13 @@ repos:
       types: [python]
       additional_dependencies: [regex]
 
+    - id: check-torch-cuda-call
+      name: Prevent new torch.cuda API calls
+      entry: python tools/pre_commit/check_torch_cuda.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
