@@ -225,7 +225,7 @@ ignore = [
 "torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
-python_version = "3.12, 3.13"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

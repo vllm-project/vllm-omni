@@ -66,6 +66,44 @@ repos:
       verbose: true
       stages: [commit-msg]
 
+    # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup
+    # is less awkward. Local wrapper groups files so follow_imports=skip on
+    # tests does not leak into library code.
+    # mypy-3.10 runs on git commit (changed files). CI SKIPs all mypy-3.x
+    # because --all-files is not clean yet. Extra versions are opt-in:
+    #   pre-commit run --hook-stage manual mypy-3.12
+    - id: mypy-3.10
+      name: Run mypy for Python 3.10
+      entry: python tools/pre_commit/mypy.py "3.10"
+      <<: &mypy_common
+        language: python
+        types_or: [python, pyi]
+        require_serial: true
+        additional_dependencies:
+          - mypy==1.11.1
+          - regex
+          - types-cachetools
+          - types-setuptools
+          - types-PyYAML
+          - types-requests
+          - types-torch
+          - pydantic
+    - id: mypy-3.11
+      name: Run mypy for Python 3.11
+      entry: python tools/pre_commit/mypy.py "3.11"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.12
+      name: Run mypy for Python 3.12
+      entry: python tools/pre_commit/mypy.py "3.12"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.13
+      name: Run mypy for Python 3.13
+      entry: python tools/pre_commit/mypy.py "3.13"
+      <<: *mypy_common
+      stages: [manual]
+
     - id: check-test-ci-coverage
       name: Ensure test files have pytestmarks
       entry: python tools/pre_commit/check_test_marks.py
