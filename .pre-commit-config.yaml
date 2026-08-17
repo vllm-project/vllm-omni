@@ -134,7 +134,8 @@ repos:
       name: Check SPDX headers
       entry: python tools/pre_commit/check_spdx_header.py
       language: python
-      types_or: [python, rust, proto]
+      types_or: [python, rust, proto, shell]
+      files: \.(py|pyi|rs|proto|sh)$
 
     - id: check-forbidden-imports
       name: Check forbidden imports

@@ -4,7 +4,9 @@
 """Require SPDX license headers on source files.
 
 Ported from vllm/tools/pre_commit/check_spdx_header.py. The copyright line
-uses the vLLM-Omni project name rather than upstream vLLM.
+uses the vLLM-Omni project name rather than upstream vLLM. Shell scripts
+(``.sh``) are included so wrappers such as ``shellcheck.sh`` cannot keep a
+stale upstream copyright that Python/Rust/proto files would have rewritten.
 """
 
 import sys
@@ -39,6 +41,7 @@ LICENSE_TEXT = "SPDX-License-Identifier: Apache-2.0"
 COPYRIGHT_TEXT = "SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project"
 FILE_STYLES = {
     ".py": HeaderStyle("#", preserve_shebang=True),
+    ".sh": HeaderStyle("#", preserve_shebang=True),
     ".rs": HeaderStyle("//"),
     ".proto": HeaderStyle("//"),
 }
@@ -163,6 +166,8 @@ def main():
     files_missing_license = []
 
     for file_path in sys.argv[1:]:
+        if Path(file_path).suffix not in FILE_STYLES:
+            continue
         status = check_spdx_header_status(file_path)
 
         if status == SPDXStatus.MISSING_BOTH:

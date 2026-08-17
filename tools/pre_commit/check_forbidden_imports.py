@@ -53,9 +53,9 @@ CHECK_IMPORTS = {
         allowed_files={
             # STOP AND READ BEFORE YOU ADD ANYTHING ELSE TO THIS LIST:
             # pickle/cloudpickle are unsafe when deserializing untrusted data.
+            "tests/diffusion/attention/test_attention_sp.py",
             "tests/helpers/process.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
-            "tests/diffusion/attention/test_attention_sp.py",
         },
     ),
     "base64": ForbiddenImport(
@@ -188,6 +188,7 @@ CHECK_IMPORTS = {
             "vllm_omni/diffusion/models/ltx2/ltx2_components.py",
             "vllm_omni/diffusion/models/magi_human/pipeline_magi_human.py",
             "vllm_omni/diffusion/models/omnivoice/pipeline_omnivoice.py",
+            "vllm_omni/diffusion/models/pi0/pipeline_pi0.py",
             "vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py",
             "vllm_omni/diffusion/models/soulx_singer/utils.py",
             "vllm_omni/diffusion/models/utils.py",
@@ -196,6 +197,7 @@ CHECK_IMPORTS = {
             "vllm_omni/engine/stage_init_utils.py",
             "vllm_omni/entrypoints/openai/api_server.py",
             "vllm_omni/entrypoints/openai/serving_speech.py",
+            "vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py",
             "vllm_omni/experimental/fullduplex/personaplex/runtime.py",
             "vllm_omni/experimental/fullduplex/personaplex/serving/server.py",
             "vllm_omni/model_executor/model_loader/weight_utils.py",

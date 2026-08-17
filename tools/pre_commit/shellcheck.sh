@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Based on vllm/tools/pre_commit/shellcheck.sh: install shellcheck if needed
 # and lint bash scripts for undefined vars, quoting, and similar bugs.
