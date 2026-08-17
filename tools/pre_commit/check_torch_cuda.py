@@ -15,7 +15,10 @@ import regex as re
 # platform equivalents. CUDAGraph / is_available / stream capture are not in
 # this list (same split as upstream vLLM).
 _TORCH_CUDA_PATTERNS = [
-    r"\btorch\.cuda\.(empty_cache|synchronize|device_count|current_device|memory_reserved|memory_allocated|max_memory_allocated|max_memory_reserved|reset_peak_memory_stats|memory_stats|mem_get_info|set_device|device\()\b",
+    r"\btorch\.cuda\.(empty_cache|synchronize|device_count|current_device|memory_reserved|memory_allocated|max_memory_allocated|max_memory_reserved|reset_peak_memory_stats|memory_stats|mem_get_info|set_device)\b",
+    # Match torch.cuda.device(...) including args. `device\()\b` misses
+    # `device()` (no word char after `)`) and `device(0)`.
+    r"\btorch\.cuda\.device\s*\(",
     r"\btorch\.cuda\.(manual_seed|manual_seed_all)\b",
     r"\bwith\storch\.cuda\.device\b",
     # Calls torch.cuda.{_is_compiled/_device_count_amdsmi/_device_count_nvml} internally

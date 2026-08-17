@@ -22,18 +22,9 @@ import sys
 
 import regex as re
 
-# Paths verified clean under follow_imports="silent". Matched before
-# SEPARATE_GROUPS, so these files join the default group and are checked at
-# the stricter setting even while a parent directory remains in
-# SEPARATE_GROUPS.
-#
-# Fixing a directory means moving it from SEPARATE_GROUPS to here. Without
-# that move the fixes are not enforced because "tests" claims every file
-# below it.
-SILENT_GROUPS: list[str] = []
-
-# After fixing errors resulting from changing follow_imports from "skip" to
-# "silent", move its directory to SILENT_GROUPS.
+# tests/ uses follow_imports=skip so third-party and library errors do not
+# leak into test type-checking. After a directory is clean under skip, it
+# can join the default group (follow_imports from pyproject.toml).
 SEPARATE_GROUPS = [
     "tests",
 ]
@@ -49,16 +40,12 @@ EXCLUDE = [
 def group_files(changed_files: list[str]) -> dict[str, list[str]]:
     """Group changed files into different mypy calls."""
     exclude_pattern = re.compile(f"^{'|'.join(EXCLUDE)}.*")
-    silent_pattern = re.compile(f"^({'|'.join(SILENT_GROUPS)}).*") if SILENT_GROUPS else None
     file_groups: dict[str, list[str]] = {"": []}
     file_groups.update({k: [] for k in SEPARATE_GROUPS})
     # Longest path first so a sub-directory is not shadowed by its parent.
     separate_groups = sorted(SEPARATE_GROUPS, key=len, reverse=True)
     for changed_file in changed_files:
         if exclude_pattern.match(changed_file):
-            continue
-        if silent_pattern is not None and silent_pattern.match(changed_file):
-            file_groups[""].append(changed_file)
             continue
         for directory in separate_groups:
             if re.match(f"^{directory}.*", changed_file):

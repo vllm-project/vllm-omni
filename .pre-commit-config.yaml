@@ -69,8 +69,9 @@ repos:
     # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup
     # is less awkward. Local wrapper groups files so follow_imports=skip on
     # tests does not leak into library code.
-    # mypy-3.10 runs on git commit (changed files). CI SKIPs all mypy-3.x
-    # because --all-files is not clean yet. Extra versions are opt-in:
+    # mypy-3.10 runs on git commit (changed files). CI SKIPs it because
+    # --all-files is not clean yet. Extra versions are manual-stage only
+    # (not in default `pre-commit run --all-files`):
     #   pre-commit run --hook-stage manual mypy-3.12
     - id: mypy-3.10
       name: Run mypy for Python 3.10
@@ -134,7 +135,7 @@ repos:
       name: Check SPDX headers
       entry: python tools/pre_commit/check_spdx_header.py
       language: python
-      types_or: [python, rust, proto, shell]
+      types_or: [python, pyi, rust, proto, shell]
       files: \.(py|pyi|rs|proto|sh)$
 
     - id: check-forbidden-imports

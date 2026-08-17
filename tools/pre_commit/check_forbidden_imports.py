@@ -46,7 +46,7 @@ class ForbiddenImport:
 CHECK_IMPORTS = {
     "pickle/cloudpickle": ForbiddenImport(
         pattern=(
-            r"^\s*(import\s+(pickle|cloudpickle)(\s|$|\sas)"
+            r"^\s*(import\s+(?:[\w.]+\s*(?:as\s+\w+)?\s*,\s*)*(pickle|cloudpickle)\b"
             r"|from\s+(pickle|cloudpickle)\s+import\b)"
         ),
         tip=("Avoid using pickle or cloudpickle or add this file to tools/pre_commit/check_forbidden_imports.py."),
@@ -288,6 +288,12 @@ def test_regex():
         ("    import pickle", True),
         ("\timport cloudpickle", True),
         ("from pickle import loads", True),
+        ("import pickle, os", True),
+        ("import os, pickle", True),
+        ("import os, pickle as pkl", True),
+        ("import pickle as pkl, os", True),
+        ("import os.path, cloudpickle", True),
+        ("import cloudpickle, json", True),
         # Should not match
         ("import somethingelse", False),
         ("from somethingelse import pickle", False),

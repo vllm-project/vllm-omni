@@ -7,6 +7,7 @@ Ported from vllm/tools/pre_commit/check_spdx_header.py. The copyright line
 uses the vLLM-Omni project name rather than upstream vLLM. Shell scripts
 (``.sh``) are included so wrappers such as ``shellcheck.sh`` cannot keep a
 stale upstream copyright that Python/Rust/proto files would have rewritten.
+``.pyi`` stubs use the same ``#`` header style as ``.py``.
 """
 
 import sys
@@ -41,6 +42,7 @@ LICENSE_TEXT = "SPDX-License-Identifier: Apache-2.0"
 COPYRIGHT_TEXT = "SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project"
 FILE_STYLES = {
     ".py": HeaderStyle("#", preserve_shebang=True),
+    ".pyi": HeaderStyle("#"),
     ".sh": HeaderStyle("#", preserve_shebang=True),
     ".rs": HeaderStyle("//"),
     ".proto": HeaderStyle("//"),
