@@ -10,8 +10,10 @@ import base64
 import binascii
 import os
 import tempfile
+from collections.abc import Iterator
+from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import numpy as np
@@ -34,6 +36,20 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     UrlVideoReference,
     VideoReference,
 )
+
+if TYPE_CHECKING:
+    import av
+
+
+@dataclass(frozen=True)
+class VideoResponseEncodingConfig:
+    """Resolved, process-local policy for non-streaming video responses."""
+
+    optimized: bool = False
+
+
+LEGACY_VIDEO_RESPONSE_ENCODING = VideoResponseEncodingConfig()
+OPTIMIZED_VIDEO_RESPONSE_ENCODING = VideoResponseEncodingConfig(optimized=True)
 
 
 class VideoFrames(list[Image.Image]):
@@ -520,23 +536,129 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     return frames_u8
 
 
-def _encode_video_bytes(
+def _prepare_video_frames(video: Any) -> tuple[list[np.ndarray], tuple[int, ...], np.dtype]:
+    """Normalize and validate frames before entering the optimized encoder."""
+    frames = _coerce_video_to_frames(video)
+    if not frames:
+        raise ValueError("No frames found to encode.")
+
+    frame_shape = frames[0].shape
+    if any(frame.shape != frame_shape for frame in frames[1:]):
+        raise ValueError("All video frames must have the same shape.")
+
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
+    return frames, frame_shape, common_dtype
+
+
+def _supports_direct_planar_mux(frames: list[np.ndarray], frame_shape: tuple[int, ...]) -> bool:
+    if len(frame_shape) != 3 or frame_shape[-1] not in (3, 4):
+        return False
+    return all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3))
+
+
+def _iter_planar_video_frames(
+    frames: list[np.ndarray],
+    common_dtype: np.dtype,
+) -> Iterator[av.VideoFrame]:
+    """Yield planar PyAV frames while retaining only one channel scratch buffer."""
+    import av
+
+    height, width = frames[0].shape[:2]
+    scratch_dtype = np.float64 if np.issubdtype(common_dtype, np.bool_) else common_dtype
+    scratch = None if common_dtype == np.uint8 else np.empty((height, width), dtype=scratch_dtype)
+
+    for frame in frames:
+        av_frame = av.VideoFrame(width, height, format="gbrp")
+        for plane, channel in zip(av_frame.planes, (1, 2, 0)):
+            if plane.height < height or plane.line_size < width:
+                raise ValueError("PyAV video plane is smaller than the requested frame dimensions.")
+            plane_view = np.frombuffer(
+                plane,
+                dtype=np.uint8,
+                count=plane.height * plane.line_size,
+            ).reshape(plane.height, plane.line_size)
+            plane_view.fill(0)
+            if frame.dtype == np.uint8:
+                plane_view[:height, :width] = frame[..., channel]
+            else:
+                scratch_buffer = cast(np.ndarray, scratch)
+                np.copyto(scratch_buffer, frame[..., channel], casting="unsafe")
+                np.clip(scratch_buffer, 0.0, 1.0, out=scratch_buffer)
+                scratch_buffer *= 255.0
+                np.rint(scratch_buffer, out=scratch_buffer)
+                plane_view[:height, :width] = scratch_buffer
+        yield av_frame
+
+
+def _encode_video_bytes_legacy(
     video: Any,
     fps: int,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
-    """Encode a video payload into MP4 bytes, optionally muxing audio."""
+    """Encode through the compatibility path used before planar encoding."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
-
     return mux_video_audio_bytes(
         _coerce_video_to_uint8_frames(video),
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or 24000,
+        video_codec_options=video_codec_options,
+    )
+
+
+def _encode_video_bytes_optimized(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
+    """Use planar PyAV frames when the complete input layout is compatible."""
+    from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
+
+    frames, frame_shape, common_dtype = _prepare_video_frames(video)
+    if not _supports_direct_planar_mux(frames, frame_shape):
+        # Fall back before opening a PyAV container. Once encoding starts,
+        # errors propagate instead of retrying and potentially duplicating work.
+        return _encode_video_bytes_legacy(
+            video,
+            fps,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
+
+    audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+    return mux_av_video_audio_bytes(
+        _iter_planar_video_frames(frames, common_dtype),
+        width=frame_shape[1],
+        height=frame_shape[0],
+        audio_waveform=audio_np,
+        fps=float(fps),
+        audio_sample_rate=audio_sample_rate or 24000,
+        video_codec_options=video_codec_options,
+    )
+
+
+def _encode_video_bytes(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+    encoding_config: VideoResponseEncodingConfig = LEGACY_VIDEO_RESPONSE_ENCODING,
+) -> bytes:
+    """Encode a video payload using the resolved server-side policy."""
+    encoder = _encode_video_bytes_optimized if encoding_config.optimized else _encode_video_bytes_legacy
+    return encoder(
+        video,
+        fps,
+        audio=audio,
+        audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
     )
 
@@ -596,9 +718,15 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    encoding_config: VideoResponseEncodingConfig = LEGACY_VIDEO_RESPONSE_ENCODING,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
-        video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate, video_codec_options=video_codec_options
+        video,
+        fps=fps,
+        audio=audio,
+        audio_sample_rate=audio_sample_rate,
+        video_codec_options=video_codec_options,
+        encoding_config=encoding_config,
     )
     return base64.b64encode(video_bytes).decode("utf-8")

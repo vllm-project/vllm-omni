@@ -76,6 +76,28 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_defaults_to_legacy_video_response_encoding() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+
+    assert args.video_response_encoding_mode == "legacy"
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy", "optimized"])
+def test_serve_parser_accepts_video_response_encoding_mode(mode: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--video-response-encoding-mode", mode])
+
+    assert args.video_response_encoding_mode == mode
+    assert args.get_explicit_kwargs_dict()["video_response_encoding_mode"] == mode
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

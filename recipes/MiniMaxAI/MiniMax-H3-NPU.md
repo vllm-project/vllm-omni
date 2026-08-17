@@ -118,6 +118,23 @@ On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
 above) or HSDP — see
 [§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
 
+### CPU MP4 response encoding (Atlas A2)
+
+Use `--video-response-encoding-mode auto` to select the optimized CPU MP4
+response encoder only for a single diffusion stage whose metadata identifies
+`MiniMaxH3Pipeline` or `MiniMaxH3ModularPipeline`. Unknown model metadata or a
+multi-stage service resolves to the `legacy` path. `legacy` is the compatibility
+fallback; `optimized` may be selected explicitly for other models, but each
+model must be validated independently. If the input layout is incompatible with
+direct planar encoding, the encoder falls back to `legacy` before opening the
+PyAV container.
+
+Current performance and correctness validation is limited to one Atlas A2 host
+with 8x Ascend 910B4-1 NPUs, the `FL2VA`/`t2va` partition, one request at a
+time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
+only changes CPU MP4 response encoding; it does not change DiT execution or
+stage 0.
+
 ### Optional optimizations
 
 Two independent optimizations may be enabled on top of the configuration
