@@ -24,8 +24,7 @@ jobs:
           python-version: "3.12"
           cache: 'pip'
       - uses: pre-commit/action@v3.0.1
-        # Don't run the pytest mark check or markdownlint against everything
-        # in CI yet: many tests still lack marks, and many docs still fail
-        # markdownlint. Both hooks still run locally on changed files.
+        # Don't run historical-debt hooks against the whole tree in CI yet.
+        # They still run locally on changed files.
         env:
-          SKIP: check-test-ci-coverage,markdownlint-cli2
+          SKIP: check-test-ci-coverage,markdownlint-cli2,shellcheck

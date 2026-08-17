@@ -80,6 +80,15 @@ repos:
       # pre-commit hides output from passing hooks unless the hook is verbose.
       verbose: true
 
+    - id: shellcheck
+      name: Lint shell scripts
+      # language: script breaks on Windows (shebang path loses slashes).
+      # Invoke the vLLM-style wrapper with bash so Linux CI and Win/Git Bash work.
+      entry: bash
+      args: [tools/pre_commit/shellcheck.sh]
+      language: system
+      types: [shell]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
