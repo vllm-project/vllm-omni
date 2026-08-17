@@ -78,7 +78,7 @@ Profile before optimizing.
 new TTS model must pass all three levels:
 
 | Layer | Catches | Tool |
-|-------|---------|------|
+| ------- | --------- | ------ |
 | Offline RTF / duration | Throughput regressions, missing audio, wrong sample rate | `end2end.py`, pytest e2e |
 | Browser streaming playback | Delta-vs-cumulative bugs, chunk boundary glitches, TTFP regressions | Gradio demo over `/v1/audio/speech?stream=true` |
 | Concurrent requests | Per-request state leaks, codec window round-robin gaps | `max_num_seqs>1` smoke with 4+ parallel prompts |
@@ -94,10 +94,10 @@ the symptom is crosstalk or truncation under load, nothing in single-request tes
 vLLM-Omni supports TTS models as multi-stage pipelines where each stage runs independently
 and can be placed on different devices. Qwen3-TTS has two stages:
 
-| Stage | Name | Input | Output |
-|-------|------|-------|--------|
-| 0 | Code Predictor (AR) | Text tokens | Discrete RVQ codec codes |
-| 1 | Code2Wav (Decoder) | RVQ codec codes | Audio waveform |
+| Stage | Name                | Input           | Output                   |
+| ----- | ------------------- | --------------- | ------------------------ |
+| 0     | Code Predictor (AR) | Text tokens     | Discrete RVQ codec codes |
+| 1     | Code2Wav (Decoder)  | RVQ codec codes | Audio waveform           |
 
 Each stage is a separate model class configured independently via YAML. The two stages
 are connected by the `async_chunk` framework, which enables inter-stage streaming for
@@ -170,7 +170,7 @@ and Qwen3-Omni).
 
 When adding a new TTS model, create the following structure:
 
-```
+```text
 vllm_omni/model_executor/models/
   your_model_name/
     __init__.py
@@ -201,7 +201,7 @@ it would not be picked up — the hub README is the documented surface.
 **Qwen3-TTS reference files:**
 
 | File | Purpose |
-|------|---------|
+| ------ | --------- |
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Stage 0 - optimized AR |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Stage 1 - decoder |
@@ -437,7 +437,7 @@ Each stage has a `worker_type` that determines how it is scheduled:
 Key configuration fields:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `model_stage` | Which stage to initialize (`ar_stage`, `decoder`, etc.) |
 | `model_arch` | Architecture name, must match `registry.py` |
 | `engine_input_source` | List of upstream stage IDs that provide input (e.g. `[0]`) |
@@ -547,9 +547,9 @@ Understanding what's available in stage outputs:
 - `stage_list[source_id].engine_outputs` - list of `EngineCoreOutput` objects
 - Each `EngineCoreOutput` has `outputs` - list of `RequestOutput` objects
 - Each `RequestOutput` has:
-  - `token_ids` - generated token IDs
-  - `multimodal_output` - dict with keys matching your model's `OmniOutput.multimodal_outputs`
-  - `prompt_token_ids` - original prompt token IDs
+    - `token_ids` - generated token IDs
+    - `multimodal_output` - dict with keys matching your model's `OmniOutput.multimodal_outputs`
+    - `prompt_token_ids` - original prompt token IDs
 
 ### Batch mode (non-streaming)
 
@@ -629,6 +629,7 @@ def ar2decoder_async_chunk(
 ```
 
 Key points:
+
 - `transfer_manager` is the `OmniChunkTransferAdapter` that owns the chunk lifecycle
 - Each call appends one AR decode step's output; a chunk is emitted every `chunk_size` steps
 - The final (possibly partial) chunk is flushed when `is_finished` is true
@@ -683,6 +684,7 @@ Create `vllm_omni/entrypoints/openai/tts_adapters/your_model.py`:
 
 ```python
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """YourModel serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -821,7 +823,7 @@ directly from the model's own generator.
 
 ### Directory structure
 
-```
+```text
 vllm_omni/model_executor/models/your_model_name/
     __init__.py
     modeling_your_model_name.py    # unified class: load_weights + forward + streaming
@@ -961,10 +963,17 @@ is correct. Stage the modified files and commit again — do not revert the chan
 Common failures and fixes:
 
 | Check | Cause | Fix |
-|-------|-------|-----|
+| ------- | ------- | ----- |
 | `ruff F841` | Local variable assigned but never used | Remove the extraction or forward it to the model call |
 | `ruff E402` | Module-level import not at top of file | Move import to the top-level import block |
 | `ruff format` | Line length, spacing, or quote style | Accept the auto-fix, stage, and re-commit |
+| `check-spdx-header` | Missing header, or copyright still says `vLLM project` | Use `Copyright contributors to the vLLM-Omni project`; restage the rewrite |
+| `check-forbidden-imports` | Stdlib `re`/`base64`, pickle, Hugging Face Hub API, or direct Triton/TileLang | `import regex as re` and `pybase64`; do not grow the allowlist without review |
+| `check-torch-cuda-call` | New `torch.cuda.*` call site | Use `current_omni_platform`; do not grow `ALLOWED_FILES` without review |
+| `check-tts-adapter-migration` | New `_tts_model_type` branch in `serving_speech.py` | Put logic in `tts_adapters/`; lower `MAX_MODEL_TYPE_BRANCHES` when removing branches |
+| `check-test-ci-coverage` | Test file missing level or hardware mark | Add `core_model`/… plus `cpu`/`cuda`/`hardware_test(` |
+| `shellcheck` | Native binary missing (macOS/Windows) or script warning | Install shellcheck locally; see [Linting](../README.md#linting) |
+| `mypy-3.10` / `markdownlint-cli2` / `check-buildkite` | Types, docs markdown, or Buildkite YAML | See [Linting](../README.md#linting) |
 
 ### DCO sign-off
 
@@ -1019,7 +1028,7 @@ Adding a TTS model to vLLM-Omni involves:
 ### Qwen3-TTS Reference Files
 
 | File | Purpose |
-|------|---------|
+| ------ | --------- |
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | AR stage with vLLM fused ops |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Decoder stage with `chunked_decode_streaming()` |

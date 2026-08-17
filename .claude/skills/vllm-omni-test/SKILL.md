@@ -274,6 +274,7 @@ def test_text_to_video_001(omni_server, openai_client) -> None:
 
 **3. Cross-cutting rules**
 
+- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** mark/helper (`check-test-ci-coverage` runs locally; GHA skips it). Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
 - Reuse existing fixtures for the chosen scenario; do not mix “online client” assumptions into offline `OmniRunner` tests without a clear reason.
 - Avoid external network dependency in assertions unless the scenario is explicitly “online serving” or doc examples that require a model hub (then align with CI secrets/cache).
 - Keep **one test function = one intent** (one modality combo, one endpoint contract, or one acceleration combo).
