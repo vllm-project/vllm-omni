@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -42,11 +43,40 @@ class LTXRequestInputs:
     output_type: str
     max_sequence_length: int
     audio_latents_normalized: bool = False
+    image_crf: int | None = None
 
     @property
     def guidance_scale(self) -> float:
         """Compatibility view for callers that only understand video CFG."""
         return self.guidance.video.cfg_scale
+
+
+LTXCheckpointKind = Literal["distilled", "regular"]
+
+
+def validate_ltx_checkpoint(
+    scheduler_config: Mapping[str, Any],
+    *,
+    expected_kind: LTXCheckpointKind | None,
+    pipeline_name: str,
+) -> None:
+    """Ensure scheduler metadata matches the checkpoint required by a profile."""
+    if expected_kind is None:
+        return
+
+    if expected_kind == "distilled":
+        if scheduler_config.get("use_dynamic_shifting", True) or scheduler_config.get("shift_terminal") is not None:
+            raise ValueError(
+                f"{pipeline_name} requires a merged distilled LTX2 checkpoint; "
+                "the loaded scheduler metadata describes a non-distilled checkpoint."
+            )
+        return
+
+    if not scheduler_config.get("use_dynamic_shifting", False) or scheduler_config.get("shift_terminal") is None:
+        raise ValueError(
+            f"{pipeline_name} requires a regular non-distilled LTX checkpoint; "
+            "the loaded scheduler metadata describes a distilled checkpoint."
+        )
 
 
 def validate_pipeline_request(
@@ -57,6 +87,7 @@ def validate_pipeline_request(
     vae_temporal_compression_ratio: int,
     pipeline_name: str,
     request_sigmas: list[float] | None = None,
+    request_phase_sigmas: tuple[list[float] | None, ...] | None = None,
 ) -> None:
     """Validate the request capabilities declared by an execution recipe."""
     alignment = vae_spatial_compression_ratio * pipeline_recipe.max_spatial_downscale
@@ -79,9 +110,28 @@ def validate_pipeline_request(
 
     if not pipeline_recipe.allow_request_sigmas and request_sigmas is not None:
         raise ValueError(f"{pipeline_name} uses fixed phase sigma schedules.")
+    if request_sigmas is not None and len(request_sigmas) < 2:
+        raise ValueError("A custom LTX sigma schedule must contain at least two values.")
 
-    if pipeline_recipe.fixed_num_inference_steps and (
-        request_inputs.num_inference_steps != pipeline_recipe.num_inference_steps
+    has_phase_sigmas = request_phase_sigmas is not None and any(item is not None for item in request_phase_sigmas)
+    if request_sigmas is not None and has_phase_sigmas:
+        raise ValueError("Use either `sigmas` or per-stage sigma schedules, not both.")
+    if has_phase_sigmas and not pipeline_recipe.allow_request_phase_sigmas:
+        raise ValueError(f"{pipeline_name} does not accept per-stage sigma schedules.")
+    if request_phase_sigmas is not None and len(request_phase_sigmas) != len(pipeline_recipe.phases):
+        raise ValueError(
+            f"{pipeline_name} has {len(pipeline_recipe.phases)} phases but received "
+            f"{len(request_phase_sigmas)} per-stage sigma schedules."
+        )
+    for index, phase_sigmas in enumerate(request_phase_sigmas or ()):
+        if phase_sigmas is not None and len(phase_sigmas) < 2:
+            raise ValueError(f"`stage_{index + 1}_sigmas` must contain at least two values.")
+
+    if (
+        request_sigmas is None
+        and (request_phase_sigmas is None or request_phase_sigmas[0] is None)
+        and pipeline_recipe.fixed_num_inference_steps
+        and (request_inputs.num_inference_steps != pipeline_recipe.num_inference_steps)
     ):
         raise ValueError(
             f"{pipeline_name} uses {pipeline_recipe.num_inference_steps} fixed Stage 1 denoise steps; "
@@ -134,6 +184,16 @@ def _get_extra_arg(sampling: Any, *names: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _normalize_image_crf(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("`image_crf` must be an integer from 0 through 51.")
+    if not 0 <= value <= 51:
+        raise ValueError("`image_crf` must be an integer from 0 through 51.")
+    return value
 
 
 def _normalize_stg_blocks(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -245,6 +305,7 @@ class LTXRequestMixin:
         req: DiffusionRequestBatch,
         *,
         image: Any | None = None,
+        image_crf: int | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -253,6 +314,8 @@ class LTXRequestMixin:
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
+        stage_1_sigmas: list[float] | None = None,
+        stage_2_sigmas: list[float] | None = None,
         timesteps: list[int] | None = None,
         guidance_scale: float | None = None,
         guidance_rescale: float | None = None,
@@ -286,6 +349,7 @@ class LTXRequestMixin:
         return self._forward_request(
             req,
             image=image,
+            image_crf=image_crf,
             prompt=prompt,
             negative_prompt=negative_prompt,
             height=height,
@@ -294,6 +358,8 @@ class LTXRequestMixin:
             frame_rate=frame_rate,
             num_inference_steps=num_inference_steps,
             sigmas=sigmas,
+            stage_1_sigmas=stage_1_sigmas,
+            stage_2_sigmas=stage_2_sigmas,
             guidance_scale=guidance_scale,
             num_videos_per_prompt=num_videos_per_prompt,
             generator=generator,
@@ -314,11 +380,29 @@ class LTXRequestMixin:
         req: DiffusionRequestBatch,
         fallback: list[float] | None,
     ) -> list[float] | None:
-        request_sigmas = [sampling.sigmas for sampling in req.sampling_params_list]
+        request_sigmas = [
+            sampling.sigmas if sampling.sigmas is not None else _get_extra_arg(sampling, "sigmas")
+            for sampling in req.sampling_params_list
+        ]
         first = request_sigmas[0] if request_sigmas else None
         if any(item != first for item in request_sigmas[1:]):
             raise ValueError("Batched LTX requests must use identical custom sigmas.")
         return first if first is not None else fallback
+
+    @staticmethod
+    def _resolve_request_phase_sigmas(
+        req: DiffusionRequestBatch,
+        stage_1_fallback: list[float] | None,
+        stage_2_fallback: list[float] | None,
+    ) -> tuple[list[float] | None, list[float] | None] | None:
+        resolved: list[list[float] | None] = []
+        for name, fallback in (("stage_1_sigmas", stage_1_fallback), ("stage_2_sigmas", stage_2_fallback)):
+            values = [_get_extra_arg(sampling, name) for sampling in req.sampling_params_list]
+            first = values[0] if values else None
+            if any(item != first for item in values[1:]):
+                raise ValueError(f"Batched LTX requests must use identical `{name}` values.")
+            resolved.append(first if first is not None else fallback)
+        return tuple(resolved) if any(item is not None for item in resolved) else None
 
     def check_inputs(
         self,
@@ -379,6 +463,7 @@ class LTXRequestMixin:
         decode_noise_scale: float | list[float] | None,
         output_type: str,
         max_sequence_length: int | None,
+        image_crf: int | None = None,
     ) -> LTXRequestInputs:
         sampling_params_list = req.sampling_params_list
         for sampling in sampling_params_list:
@@ -391,6 +476,12 @@ class LTXRequestMixin:
                 )
             if _get_extra_arg(sampling, "flow_shift") is not None:
                 raise ValueError("LTX does not support `flow_shift`; use `sigmas` for a custom schedule.")
+
+        request_image_crfs = [_get_extra_arg(item, "image_crf") for item in sampling_params_list]
+        first_image_crf = request_image_crfs[0] if request_image_crfs else None
+        if any(item != first_image_crf for item in request_image_crfs[1:]):
+            raise ValueError("Batched LTX requests must use identical `image_crf` values.")
+        image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
 
         sampling = sampling_params_list[0]
         is_dummy_run = req.is_dummy_run()
@@ -522,4 +613,5 @@ class LTXRequestMixin:
             decode_noise_scale=decode_noise_scale,
             output_type=output_type,
             max_sequence_length=int(max_sequence_length),
+            image_crf=image_crf,
         )

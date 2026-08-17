@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.errors import GuardrailViolationError
@@ -459,6 +459,51 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     input_image = prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (96, 64)
+
+
+def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
+    engine = FakeAsyncOmni()
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model="org/model",
+        model_class_name="ExamplePipeline",
+        revision="pinned-revision",
+    )
+    captured = {}
+
+    def fake_policy(model_class_name, *, model, revision=None):
+        captured.update(
+            model_class_name=model_class_name,
+            model=model,
+            revision=revision,
+        )
+        return True
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_video.should_preserve_reference_image_size",
+        fake_policy,
+    )
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="fallback/model",
+    )
+    image = Image.new("RGB", (48, 32))
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+            "pipeline-owned-resize",
+            reference_image=ReferenceImage(image),
+        )
+    )
+
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 32)
+    assert captured == {
+        "model_class_name": "ExamplePipeline",
+        "model": "org/model",
+        "revision": "pinned-revision",
+    }
 
 
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):

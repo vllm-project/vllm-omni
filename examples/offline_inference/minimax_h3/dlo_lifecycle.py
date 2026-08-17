@@ -1,21 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reproduce MiniMax-H3 request-mode and DLO/DP2 lifecycle behavior.
+"""Validate MiniMax-H3 request-mode and DLO lifecycle behavior.
+
+The DLO modes accept any positive data-parallel size.  With AllGather enabled,
+the script submits one complete DP wave and verifies recovery after an invalid
+wave.  It also checks that every mode shuts down all worker processes cleanly.
 
 Examples:
 
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
     VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=600 \
+    CUDA_VISIBLE_DEVICES=0,1,2,3 \
+    python examples/offline_inference/minimax_h3/dlo_lifecycle.py \
+        --model /path/to/MiniMax-H3/FL2VA --mode dlo --dp-size 4
+
+    # Rank-local mmap storage, with no DLO collective or DP wave scheduling.
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
     CUDA_VISIBLE_DEVICES=0,1 \
-    python examples/offline_inference/minimax_h3/dlo_dp2_lifecycle.py \
-        --model /path/to/MiniMax-H3/FL2VA --mode dlo-dp2
+    python examples/offline_inference/minimax_h3/dlo_lifecycle.py \
+        --model /path/to/MiniMax-H3/FL2VA --mode dlo-no-allgather --dp-size 2
 
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
     CUDA_VISIBLE_DEVICES=0,1 \
-    python examples/offline_inference/minimax_h3/dlo_dp2_lifecycle.py \
-        --model /path/to/MiniMax-H3/FL2VA --mode request
+    python examples/offline_inference/minimax_h3/dlo_lifecycle.py \
+        --model /path/to/MiniMax-H3/FL2VA --mode request --tp-size 2
 """
 
 from __future__ import annotations
@@ -40,14 +51,33 @@ DEFAULT_PROMPTS = (
 )
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Path to MiniMax-H3/FL2VA")
     parser.add_argument(
         "--mode",
-        choices=("dlo-dp2", "request"),
+        choices=("dlo", "dlo-no-allgather", "request"),
         required=True,
-        help="DLO AllGather DP2 or ordinary non-DLO TP2 request mode",
+        help="DLO (with or without AllGather) or ordinary non-DLO request mode",
+    )
+    parser.add_argument(
+        "--dp-size",
+        type=positive_int,
+        default=2,
+        help="DLO data-parallel size (for example 1, 2, 4, or 8; default: 2)",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=positive_int,
+        default=2,
+        help="Tensor-parallel size used only by request mode (default: 2)",
     )
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--duration", type=float, default=5.0)
@@ -60,10 +90,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    is_dlo = args.mode in {"dlo", "dlo-no-allgather"}
     common: dict[str, Any] = {
         "model": args.model,
         "trust_remote_code": True,
-        "num_gpus": 2,
+        "num_gpus": args.dp_size if is_dlo else args.tp_size,
         "usp": 1,
         "ring": 1,
         "vae_parallel_mode": "tile",
@@ -74,22 +105,22 @@ def engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "stage_init_timeout": args.init_timeout,
         "init_timeout": args.init_timeout,
     }
-    if args.mode == "dlo-dp2":
+    if is_dlo:
         common.update(
             tensor_parallel_size=1,
-            data_parallel_size=2,
+            data_parallel_size=args.dp_size,
             text_encoder_tp_size=1,
             vae_patch_parallel_size=1,
             enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=True,
+            dlo_use_allgather=args.mode == "dlo",
             dlo_resident_layers=0,
         )
     else:
         common.update(
-            tensor_parallel_size=2,
+            tensor_parallel_size=args.tp_size,
             data_parallel_size=1,
-            text_encoder_tp_size=2,
-            vae_patch_parallel_size=2,
+            text_encoder_tp_size=args.tp_size,
+            vae_patch_parallel_size=args.tp_size,
             enable_distributed_layerwise_offload=False,
         )
     return common
@@ -172,7 +203,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "engine_kwargs": engine_kwargs(args),
     }
     try:
-        if args.mode == "dlo-dp2":
+        uses_dp_wave = args.mode == "dlo" and args.dp_size > 1
+        if uses_dp_wave:
             started = time.perf_counter()
             asymmetric = await asyncio.gather(
                 generate_one(
@@ -182,12 +214,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     prompt="",
                     seed=1001,
                 ),
-                generate_one(
-                    engine,
-                    args,
-                    request_id="invalid-peer",
-                    prompt=DEFAULT_PROMPTS[0],
-                    seed=1002,
+                *(
+                    generate_one(
+                        engine,
+                        args,
+                        request_id=f"invalid-peer-{index}",
+                        prompt=DEFAULT_PROMPTS[index % len(DEFAULT_PROMPTS)],
+                        seed=1001 + index,
+                    )
+                    for index in range(1, args.dp_size)
                 ),
                 return_exceptions=True,
             )
@@ -195,18 +230,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             summary["asymmetric_errors"] = [
                 f"{type(result).__name__}: {result}" for result in asymmetric if isinstance(result, BaseException)
             ]
-            if len(summary["asymmetric_errors"]) != 2:
-                raise RuntimeError("Both requests in the asymmetric DP wave must fail before dispatch")
+            if len(summary["asymmetric_errors"]) != args.dp_size:
+                raise RuntimeError("Every request in the asymmetric DP wave must fail before dispatch")
 
         started = time.perf_counter()
-        request_count = 2 if args.mode == "dlo-dp2" else 1
+        request_count = args.dp_size if uses_dp_wave else 1
         outputs = await asyncio.gather(
             *(
                 generate_one(
                     engine,
                     args,
                     request_id=f"recovery-{index}",
-                    prompt=DEFAULT_PROMPTS[index],
+                    prompt=DEFAULT_PROMPTS[index % len(DEFAULT_PROMPTS)],
                     seed=2000 + index,
                 )
                 for index in range(request_count)

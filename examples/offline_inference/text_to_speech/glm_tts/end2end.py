@@ -145,7 +145,7 @@ def main(args):
 
     omni = Omni(
         model=args.model,
-        stage_configs_path=deploy_config_path,
+        deploy_config=deploy_config_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )

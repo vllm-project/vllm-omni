@@ -39,7 +39,7 @@ Other hardware is welcome as community validation lands.
 Launch the two-stage talker:
 
 ```bash
-vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
+vllm serve inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --omni \
     --port 8091 \

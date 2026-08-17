@@ -180,10 +180,10 @@ def create_mock_audio_output_for_test(
     audio_tensor = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, num_samples))
     mock_request_output = MockRequestOutput(request_id=request_id, audio_tensor=audio_tensor)
 
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        mock_request_output,
         stage_id=0,
         final_output_type="audio",
-        request_output=mock_request_output,
     )
 
 
@@ -680,7 +680,7 @@ class TestSpeechAPI:
 
     @pytest.mark.asyncio
     async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
-        """Test that extra_params are correctly applied to sampling_params_list in diffusion mode."""
+        """Test public diffusion speech success and extra_params propagation."""
         # Mock the engine client
         mock_engine = mocker.MagicMock()
 
@@ -704,7 +704,11 @@ class TestSpeechAPI:
 
         req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
 
-        await server._create_diffusion_speech(req)
+        response = await server.create_speech(req)
+
+        assert response.status_code == 200
+        assert response.media_type == "audio/wav"
+        assert response.body == b"dummy"
 
         # Verify generate was called
         mock_engine.generate.assert_called_once()
@@ -736,6 +740,19 @@ class TestTTSMethods:
         )
         yield server
         server.shutdown()
+
+    def test_diffusion_audio_encode_speed_skips_ar_adapter(self, mocker: MockerFixture):
+        """Pure-diffusion speech keeps generic speed handling outside AR adapters."""
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+        )
+        resolve_adapter = mocker.patch.object(serving_speech_module, "resolve_adapter")
+
+        speed = server._audio_encode_speed(OpenAICreateSpeechRequest(input="Hello", speed=1.25))
+
+        assert speed == 1.25
+        resolve_adapter.assert_not_called()
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
@@ -2292,10 +2309,10 @@ class TestStreamingResponse:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 
@@ -3441,10 +3458,10 @@ class TestWAVStreaming:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
-            return OmniRequestOutput(
+            return OmniRequestOutput.from_stage_output(
+                MockRequestOutput(audio_tensor=chunk),
                 stage_id=0,
                 final_output_type="audio",
-                request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
             )
 

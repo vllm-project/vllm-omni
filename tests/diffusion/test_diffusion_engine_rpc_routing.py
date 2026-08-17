@@ -123,6 +123,7 @@ class _ConcurrencyTrackingExecutor:
 def _make_request(tag: str):
     sampling_params = dict(_SAMPLING_KEY_DEFAULTS)
     sampling_params["num_inference_steps"] = 1
+    sampling_params["extra_args"] = {}
     return SimpleNamespace(
         request_id=tag,
         prompt=f"prompt_{tag}",
