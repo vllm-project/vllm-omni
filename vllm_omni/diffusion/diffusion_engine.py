@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import os
 import queue
 import threading
 import time
@@ -55,7 +56,24 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+
+
+def _async_output_timeout() -> float:
+    """Seconds to wait for one step's background D2H/SHM copy.
+
+    The copy itself finishes in milliseconds, but it is queued behind the GPU
+    work for that step, so the wall-clock wait tracks step time — a single-GPU
+    box legitimately runs tens of seconds per step on large shapes. A tight
+    bound therefore does not catch a hung engine (worker death and a dead
+    result pump are surfaced by the worker monitor and ``check_health``); it
+    only aborts renders that are still making progress, throwing away the
+    denoise that already completed. The default matches
+    ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+    """
+    return float(os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV, _ASYNC_OUTPUT_TIMEOUT_DEFAULT))
+
 
 __all__ = [
     "DiffusionEngine",
@@ -339,13 +357,16 @@ class DiffusionEngine:
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
+                timeout = _async_output_timeout()
                 try:
-                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
                 except (TimeoutError, asyncio.TimeoutError):
                     describe = getattr(self.executor, "describe_pending_state", None)
                     logger.error(
-                        "Timed out after %.0fs waiting for async output; executor state: %s",
-                        _ASYNC_OUTPUT_TIMEOUT,
+                        "Timed out after %.0fs waiting for async output (raise %s to allow slower "
+                        "steps); executor state: %s",
+                        timeout,
+                        _ASYNC_OUTPUT_TIMEOUT_ENV,
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
@@ -815,7 +836,7 @@ class DiffusionEngine:
                     )
                     if output.async_output_id:
                         fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                        output = fut.result(timeout=_async_output_timeout())
                     return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
