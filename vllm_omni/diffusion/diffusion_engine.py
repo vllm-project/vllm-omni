@@ -71,8 +71,34 @@ def _async_output_timeout() -> float:
     only aborts renders that are still making progress, throwing away the
     denoise that already completed. The default matches
     ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+
+    Resolved here rather than at import so a malformed value degrades to the
+    default instead of raising on the request path: this runs inside
+    ``step_streaming``/``add_req_and_wait_for_response``, where a typo in the
+    environment must not start failing generations.
     """
-    return float(os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV, _ASYNC_OUTPUT_TIMEOUT_DEFAULT))
+    raw = os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV)
+    if raw is None:
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: not a number. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning_once(
+            "Ignoring %s=%r: must be positive. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    return timeout
 
 
 __all__ = [
@@ -363,8 +389,8 @@ class DiffusionEngine:
                 except (TimeoutError, asyncio.TimeoutError):
                     describe = getattr(self.executor, "describe_pending_state", None)
                     logger.error(
-                        "Timed out after %.0fs waiting for async output (raise %s to allow slower "
-                        "steps); executor state: %s",
+                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                        "to allow slower steps. Executor state: %s",
                         timeout,
                         _ASYNC_OUTPUT_TIMEOUT_ENV,
                         describe(output.async_output_id) if describe else "unavailable",
