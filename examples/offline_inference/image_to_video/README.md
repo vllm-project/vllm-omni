@@ -96,7 +96,7 @@ if __name__ == "__main__":
         ),
     )
     from diffusers.utils import export_to_video
-    frames = outputs[0].request_output.images
+    frames = outputs[0].images
     export_to_video(frames, "quick_test_i2v.mp4", fps=16)
 ```
 

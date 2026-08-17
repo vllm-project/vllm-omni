@@ -33,8 +33,16 @@ import types
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    Fp8PerTensorOnlineLinearMethod,
+)
 
 logger = init_logger(__name__)
+
+_FP8_TRANSPOSED_WEIGHT_METHODS = (
+    Fp8LinearMethod,
+    Fp8PerTensorOnlineLinearMethod,
+)
 
 
 def _build_transposed_get_layer_params(original_bound_method):
@@ -55,9 +63,8 @@ def _build_transposed_get_layer_params(original_bound_method):
 def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     """Make online-FP8 linear layers in ``model`` FSDP2-compatible.
 
-    For every layer whose ``quant_method`` is an :class:`Fp8LinearMethod`
-    and whose weight is currently a non-contiguous transpose view, this
-    function:
+    For every layer whose quantization method stores FP8 weights as a
+    non-contiguous transpose view, this function:
 
     1. Replaces ``layer.weight`` with the underlying ``(out, in)`` row-major
        contiguous storage so FSDP2 ``fully_shard`` accepts it.
@@ -76,7 +83,7 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     patched_kernel_ids: set[int] = set()
     for module in model.modules():
         qm = getattr(module, "quant_method", None)
-        if not isinstance(qm, Fp8LinearMethod):
+        if not isinstance(qm, _FP8_TRANSPOSED_WEIGHT_METHODS):
             continue
 
         weight = getattr(module, "weight", None)

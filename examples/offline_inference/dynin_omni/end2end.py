@@ -876,7 +876,7 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--task", type=str, required=True, choices=TASK_CHOICES)
     parser.add_argument("--model", type=str, required=True, help="HF repo id or local model directory.")
     parser.add_argument(
-        "--stage-config-path",
+        "--deploy-config",
         type=str,
         default=str(repo_root / "vllm_omni/deploy/dynin_omni.yaml"),
         help="Path to deploy config yaml.",
@@ -1394,8 +1394,8 @@ def main() -> None:
 
     from vllm_omni.entrypoints.omni import Omni
 
-    stage_config_path = str(Path(args.stage_config_path).expanduser())
-    omni = Omni(model=model_source, stage_configs_path=stage_config_path, dtype=args.dtype)
+    deploy_config_path = str(Path(args.deploy_config).expanduser())
+    omni = Omni(model=model_source, deploy_config=deploy_config_path, dtype=args.dtype)
     sampling_params_list = [
         SamplingParams(max_tokens=int(args.max_tokens_per_stage), temperature=0.0, top_p=1.0, detokenize=False)
         for _ in range(omni.num_stages)

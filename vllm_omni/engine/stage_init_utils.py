@@ -1441,6 +1441,7 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    od_config.max_num_seqs = batch_size
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
