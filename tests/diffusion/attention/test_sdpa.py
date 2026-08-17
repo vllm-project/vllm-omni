@@ -57,7 +57,7 @@ def test_sdpa_keeps_compressed_kv_when_native_gqa_kernel_is_available(monkeypatc
     assert output.shape == (1, 3, 4, 8)
 
 
-def test_sdpa_npu_uses_native_gqa_without_cuda_capability_check(monkeypatch):
+def test_sdpa_npu_uses_native_causal_gqa_without_cuda_capability_check(monkeypatch):
     calls = []
 
     def fake_sdpa(query, key, value, **kwargs):
@@ -70,7 +70,7 @@ def test_sdpa_npu_uses_native_gqa_without_cuda_capability_check(monkeypatch):
     monkeypatch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", unexpected_capability_check)
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
 
-    impl = SDPAImpl(num_heads=4, num_kv_heads=2, head_size=8, softmax_scale=0.5)
+    impl = SDPAImpl(num_heads=4, num_kv_heads=2, head_size=8, softmax_scale=0.5, causal=True)
     output = impl.forward_npu(
         torch.randn(1, 3, 4, 8),
         torch.randn(1, 3, 2, 8),
@@ -81,6 +81,8 @@ def test_sdpa_npu_uses_native_gqa_without_cuda_capability_check(monkeypatch):
     assert query_shape == (1, 4, 3, 8)
     assert key_shape == value_shape == (1, 2, 3, 8)
     assert kwargs["enable_gqa"] is True
+    assert kwargs["is_causal"] is True
+    assert kwargs["scale"] == 0.5
     assert output.shape == (1, 3, 4, 8)
 
 
