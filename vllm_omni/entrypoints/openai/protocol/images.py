@@ -166,6 +166,12 @@ class ImageGenerationRequest(BaseModel):
         ),
     )
 
+    # PiD (Pixel Diffusion) super-resolution decode override.
+    pid_decode: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request PiD decode configuration. Keys: enabled, scale, num_steps, seed, degrade_sigma.",
+    )
+
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")

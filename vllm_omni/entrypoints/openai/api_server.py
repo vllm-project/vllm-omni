@@ -1715,6 +1715,8 @@ async def generate_images(
                 extra_body["use_system_prompt"] = request.use_system_prompt
             if request.system_prompt is not None:
                 extra_body["system_prompt"] = request.system_prompt
+            if request.pid_decode is not None:
+                extra_body["pid_decode"] = request.pid_decode
             if request.return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
 
@@ -1797,6 +1799,7 @@ async def generate_images(
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
+        _update_if_not_none(gen_params, "pid_decode", request.pid_decode)
 
         request_id = f"img_gen-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
