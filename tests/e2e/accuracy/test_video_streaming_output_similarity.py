@@ -11,7 +11,7 @@ from tests.e2e.accuracy.helpers import assert_video_similarity_metrics, probe_vi
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import DiffusionResponse, OmniServer, OpenAIClientHandler
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "BestWishYsh/Helios-Distilled"
 PROMPT = "A serene lakeside sunrise with mist over the water."

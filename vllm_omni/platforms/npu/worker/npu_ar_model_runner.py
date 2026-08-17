@@ -730,7 +730,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        clear_kv_metadata = self.speculative_config is None
+        defer_kv_connector_finalize = self.speculative_config is not None and (
+            get_pp_group().is_last_rank or self.broadcast_pp_output
+        )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -744,13 +746,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 model_instance=self.model,
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
-                input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
-                    {"defer_finalize": not clear_kv_metadata}
+                    {"defer_finalize": defer_kv_connector_finalize}
                 ),
             ) as kv_connector_output,
         ):

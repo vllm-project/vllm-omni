@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
     _filter_mrope_kwargs_for_model,
@@ -689,6 +690,49 @@ def test_full_payload_output_accumulation_hook_matrix():
         runner = _make_full_payload_accumulation_runner(model_arch=model_arch)
         runner._custom_process_func = None
         assert not runner._should_accumulate_full_payload_output()
+
+
+def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
+    runner.omni_prefix_cache = prefix_cache
+    runner.model_config = SimpleNamespace(
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
+        model_stage="indextts2_5_talker",
+        async_chunk=False,
+        final_output=False,
+        custom_process_next_stage_input_func="module.full_payload",
+    )
+    runner._custom_process_func = object()
+    runner._pending_full_payload_send = {}
+    runner._stage_id = 0
+    runner._omni_connector = object()
+    return runner
+
+
+def test_request_end_payload_d2h_gate_requires_opt_in_and_no_prefix_cache():
+    assert _make_request_end_payload_runner()._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(enabled=False)._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(prefix_cache=object())._should_defer_full_payload_d2h()
+
+
+def test_request_end_payload_suppresses_per_step_multimodal_outputs():
+    runner = _make_request_end_payload_runner()
+
+    def unexpected_build(_payload):
+        raise AssertionError("request-end payloads must stay inside the GPU accumulator")
+
+    runner._build_multimodal_outputs = unexpected_build
+    pooler_inter = [{"codes.mel": torch.tensor([[7]])}]
+
+    inter_stage, client = runner._build_omni_step_outputs(
+        pooler_inter,
+        pooler_inter,
+        defer_full_payload_d2h=True,
+    )
+
+    assert inter_stage is None
+    assert client is None
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():

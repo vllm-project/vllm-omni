@@ -162,6 +162,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
         }
+        self._cfm_graph_config = {
+            "enabled": bool(extra.get("enable_cfm_graph", False)),
+            "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+        }
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -802,4 +806,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             trt_stepper=trt_stepper,
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
+            cfm_graph_config=self._cfm_graph_config,
         )

@@ -3,6 +3,8 @@
 """Unit tests for WorkerProc async output logic."""
 
 import queue
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,7 +31,57 @@ def _make_worker_proc(step_execution=False):
     proc._running = True
     proc._async_output_queue = queue.Queue() if not step_execution else None
     proc._async_output_thread = None
+    proc._async_output_done = threading.Condition()
+    proc._async_output_pending = 0
+    proc._result_mq_lock = threading.Lock()
     return proc
+
+
+class _OverlapDetectingQueue:
+    """Fails if two threads are inside enqueue() at the same time.
+
+    Mirrors vLLM's MessageQueue, whose acquire_write() reads current_idx,
+    writes that block, then advances it. Overlapping writers can target the
+    same ring block and silently drop a message.
+    """
+
+    def __init__(self):
+        self._active = 0
+        self._guard = threading.Lock()
+        self.overlaps = 0
+        self.messages = []
+
+    def enqueue(self, msg, timeout=None):
+        with self._guard:
+            self._active += 1
+            if self._active > 1:
+                self.overlaps += 1
+        time.sleep(0.001)  # widen the window a real ring-buffer write would have
+        with self._guard:
+            self.messages.append(msg)
+            self._active -= 1
+
+
+class TestResultQueueSingleWriter:
+    """Worker must serialize writes to the single-writer result queue."""
+
+    def test_concurrent_enqueues_do_not_overlap(self):
+        proc = _make_worker_proc(step_execution=False)
+        detector = _OverlapDetectingQueue()
+        proc.result_mq = detector
+
+        def writer(tag):
+            for i in range(20):
+                proc._enqueue_result(f"{tag}-{i}")
+
+        threads = [threading.Thread(target=writer, args=(tag,)) for tag in ("compute", "output")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert detector.overlaps == 0, f"{detector.overlaps} overlapping writes to result_mq"
+        assert len(detector.messages) == 40
 
 
 class TestGenerateAsyncOutputId:
@@ -190,6 +242,87 @@ class TestAsyncOutputLoopLogic:
             for c in proc.result_mq.enqueue.call_args_list
         )
         assert output_ready_enqueued, "Expected OUTPUT_READY with async_output_id='abc123' in enqueue calls"
+
+
+class TestDrainAsyncOutputs:
+    """Async outputs must finish packing before device memory is released."""
+
+    def test_drain_returns_immediately_when_nothing_in_flight(self):
+        proc = _make_worker_proc(step_execution=False)
+
+        assert proc.drain_async_outputs(timeout=0.01) is True
+
+    def test_return_result_keeps_output_pending_until_loop_completes(self, mocker):
+        """_return_result marks work pending; the bg loop clears it."""
+        proc = _make_worker_proc(step_execution=False)
+
+        mock_platform = mocker.MagicMock()
+        mock_platform.record_device_event.return_value = MagicMock()
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform",
+            mock_platform,
+        )
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.pack_diffusion_output_shm")
+        mock_torch = mocker.MagicMock()
+        mock_torch.accelerator.current_accelerator.return_value.type = "cpu"
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.torch", mock_torch)
+
+        proc._return_result(DiffusionOutput(output="data"), rpc_id="1")
+
+        # Packing has not run yet, so a sleep here would free tensors in flight.
+        assert proc._async_output_pending == 1
+        assert proc.drain_async_outputs(timeout=0.05) is False
+
+        thread = threading.Thread(target=proc._async_output_loop, daemon=True)
+        thread.start()
+        try:
+            assert proc.drain_async_outputs(timeout=5.0) is True
+        finally:
+            proc._async_output_queue.put(None)
+            thread.join(timeout=2.0)
+
+    def test_sleep_rpc_drains_before_releasing_memory(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        proc.worker = MagicMock()
+
+        call_order: list[str] = []
+        mocker.patch.object(
+            proc,
+            "drain_async_outputs",
+            side_effect=lambda *a, **kw: call_order.append("drain") or True,
+        )
+        proc.worker.execute_method.side_effect = lambda *a, **kw: call_order.append("sleep")
+
+        proc._execute_rpc(
+            {
+                "method": "handle_sleep_task",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": False,
+                "collect_rank_status": False,
+            }
+        )
+
+        assert call_order == ["drain", "sleep"]
+
+    def test_non_sleep_rpc_does_not_drain(self, mocker):
+        proc = _make_worker_proc(step_execution=False)
+        proc.worker = MagicMock()
+        drain = mocker.patch.object(proc, "drain_async_outputs", return_value=True)
+
+        proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": False,
+                "collect_rank_status": False,
+            }
+        )
+
+        drain.assert_not_called()
 
 
 class TestWorkerProcShutdown:

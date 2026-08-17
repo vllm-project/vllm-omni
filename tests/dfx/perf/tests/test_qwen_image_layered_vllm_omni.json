@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-device baseline",

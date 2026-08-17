@@ -137,7 +137,7 @@ def main(args) -> None:
     params_list = sampling_params
 
     for stage_outputs in omni.generate(inputs, params_list):
-        for i, req_output in enumerate(stage_outputs.request_output):
+        for i, req_output in enumerate(stage_outputs):
             for j, out in enumerate(req_output.outputs):
                 mm = out.multimodal_output
                 if mm is None:
