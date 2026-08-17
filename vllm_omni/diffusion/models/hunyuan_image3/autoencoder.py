@@ -15,6 +15,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import Tensor, nn
 
+# ResnetBlock is platform-dispatched in the package __init__: CUDA gets a fused
+# GroupNorm+SiLU kernel, every other backend gets the plain PyTorch block.
+from vllm_omni.diffusion.models.hunyuan_image3 import ResnetBlock
+
 
 class DiagonalGaussianDistribution:
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
@@ -140,35 +144,6 @@ class AttnBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.proj_out(self.attention(x))
-
-
-class ResnetBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        if self.in_channels != self.out_channels:
-            self.nin_shortcut = Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = swish(h)
-        h = self.conv1(h)
-
-        h = self.norm2(h)
-        h = swish(h)
-        h = self.conv2(h)
-
-        if self.in_channels != self.out_channels:
-            x = self.nin_shortcut(x)
-        return x + h
 
 
 class DownsampleDCAE(nn.Module):
