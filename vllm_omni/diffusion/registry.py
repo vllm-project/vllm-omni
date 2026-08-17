@@ -181,6 +181,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "Pi0Pipeline": (
+        "pi0",
+        "pipeline_pi0",
+        "Pi0Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -358,6 +363,11 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
+    # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
+    # to it; list it here so a stray cache_backend override disables gracefully
+    # instead of erroring.
+    "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
 }
 
@@ -560,6 +570,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
+    "Pi0Pipeline": "get_pi0_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
