@@ -1,0 +1,18 @@
+# Wan2.x single-stage full diffusion pipeline.
+#
+# This deploy config is the AGG/full-pipeline counterpart to the opt-in
+# ``wan2_2_eg`` disaggregated encode/generation topology. Use it when each
+# worker should load UMT5 + DiT + VAE and serve the complete video request.
+
+pipeline: wan2_2
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    distributed_executor_backend: "mp"
+    devices: "0"
+    default_sampling_params:
+      seed: 42

@@ -117,6 +117,7 @@ def format_empty_diffusion_outputs(
             latents=None,
             custom_output=custom_output,
             finished=finished,
+            custom_output=custom_output or {},
         )
     ]
 
