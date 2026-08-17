@@ -755,6 +755,13 @@ class OmniDiffusionConfig:
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
 
+    # Scheduler injection: registry name (see vllm_omni.diffusion.models.schedulers)
+    # or dotted class path of a scheduler class to use instead of the pipeline's
+    # default scheduler. Constructed via cls.from_pretrained(model, subfolder="scheduler").
+    scheduler: str | None = None
+    # Extra kwargs forwarded to the injected scheduler's from_pretrained().
+    scheduler_kwargs: dict[str, Any] | None = None
+
     # Diffusion model loading format
     # "default", "custom_pipeline", "dummy", "diffusers" (HF diffusers adapter)
     diffusion_load_format: str = "default"

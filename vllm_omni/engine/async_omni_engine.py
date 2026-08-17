@@ -1015,6 +1015,8 @@ class AsyncOmniEngine:
             "lora_scale": kwargs.get("lora_scale", 1.0),
             "lora_backend": kwargs.get("lora_backend", "peft"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+            "scheduler": kwargs.get("scheduler", None),
+            "scheduler_kwargs": kwargs.get("scheduler_kwargs", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
             "distributed_executor_backend": (

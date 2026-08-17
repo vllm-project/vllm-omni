@@ -30,6 +30,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import Dis
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
 if TYPE_CHECKING:
@@ -512,10 +513,13 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     quant_config = getattr(od_config, "quantization_config", None)
     pipeline.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
     _place_aux_components(pipeline)
-    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model,
-        subfolder="scheduler",
-        local_files_only=local_files_only,
+    pipeline.scheduler = build_pipeline_scheduler(
+        od_config,
+        default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+        ),
     )
     expected_checkpoint_kind: LTXCheckpointKind | None = None
     if pipeline.pipeline_kind == "two_stage":

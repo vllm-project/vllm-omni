@@ -31,7 +31,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler, build_pipeline_scheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -427,7 +427,10 @@ class Wan22Pipeline(
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+        )
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
@@ -660,9 +663,20 @@ class Wan22Pipeline(
         sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
         flow_shift = resolve_wan_flow_shift(req, self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+            if self.od_config.scheduler is not None:
+                # An injected scheduler owns stepping; rebuilding from
+                # per-request sample_solver/flow_shift would replace it.
+                logger.warning(
+                    "Ignoring per-request sample_solver=%s/flow_shift=%s: an injected scheduler "
+                    "(od_config.scheduler=%r) is active and is left untouched.",
+                    sample_solver,
+                    flow_shift,
+                    self.od_config.scheduler,
+                )
+            else:
+                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+                self._sample_solver = sample_solver
+                self._flow_shift = flow_shift
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
