@@ -47,7 +47,7 @@ if __name__ == "__main__":
     omni = Omni(model="Tongyi-MAI/Z-Image-Turbo")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -75,8 +75,7 @@ if __name__ == "__main__":
     ]
     omni_outputs = omni.generate(prompts)
     for i_prompt, prompt_output in enumerate(omni_outputs):
-        this_request_output = prompt_output.request_output
-        this_images = this_request_output.images
+        this_images = prompt_output.images
         for i_image, image in enumerate(this_images):
             image.save(f"p{i_prompt}-img{i_image}.jpg")
             print("saved to", f"p{i_prompt}-img{i_image}.jpg")
@@ -87,9 +86,8 @@ if __name__ == "__main__":
 
 !!! info
 
-    For diffusion request-level batching controls such as `max_num_seqs` and
-    `request_batch_max_wait_ms`, see
-    [Request-Level Batching](../user_guide/diffusion/request_batching.md).
+    For diffusion request batching, step execution, and streaming controls, see
+    [Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 

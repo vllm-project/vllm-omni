@@ -83,11 +83,16 @@ class SyntheticAcousticTransformer(nn.Module):
         # time_embedding: (B, 1) -> (B, dim)
         self.time_embedding = nn.Linear(1, HIDDEN_DIM, bias=False)
 
-        # _predict_velocity: takes x_t (B, C), llm_output (B, D), t_emb (B, D) -> (B, C)
+        # Identities: callers pass pre-projected inputs; the synthetic transformer folds
+        # everything into _velocity_proj.
+        self.llm_projection = nn.Identity()
+        self.time_projection = nn.Identity()
+
+        # _predict_velocity: takes x_t (B, C), llm_proj (B, D), t_proj (B, D) -> (B, C)
         self._velocity_proj = nn.Linear(N_ACOUSTIC_CODEBOOK + HIDDEN_DIM + HIDDEN_DIM, N_ACOUSTIC_CODEBOOK, bias=False)
 
-    def _predict_velocity(self, x_t: torch.Tensor, llm_output: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        combined = torch.cat([x_t, llm_output, t_emb], dim=-1)
+    def _predict_velocity(self, x_t: torch.Tensor, llm_proj: torch.Tensor, t_proj: torch.Tensor) -> torch.Tensor:
+        combined = torch.cat([x_t, llm_proj, t_proj], dim=-1)
         return self._velocity_proj(combined)
 
 
@@ -129,14 +134,18 @@ class SyntheticModel(nn.Module):
         hidden_zero = torch.zeros_like(hidden_states)
         timesteps = torch.linspace(0, 1, 16, device=hidden_states.device, dtype=hidden_states.dtype)
 
+        # llm_projection is constant across steps so hoist it (mirrors decode_one_frame).
+        llm_batched = torch.cat([hidden_states, hidden_zero], dim=0)
+        llm_proj_batched = at.llm_projection(llm_batched)
+
         for i in range(len(timesteps) - 1):
             t = timesteps[i]
             dt = timesteps[i + 1] - timesteps[i]
             t_emb = at.time_embedding(t.view(-1, 1).repeat(B, 1)).to(hidden_states.dtype)
+            t_proj = at.time_projection(t_emb)
             x_batched = torch.cat([x, x], dim=0)
-            llm_batched = torch.cat([hidden_states, hidden_zero], dim=0)
-            t_emb_batched = t_emb.repeat(2, 1)
-            v_all = at._predict_velocity(x_t=x_batched, llm_output=llm_batched, t_emb=t_emb_batched)
+            t_proj_batched = t_proj.repeat(2, 1)
+            v_all = at._predict_velocity(x_t=x_batched, llm_proj=llm_proj_batched, t_proj=t_proj_batched)
             v_t, uncond_v_t = v_all[:B], v_all[B:]
             cfg_alpha = 1.2
             v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t

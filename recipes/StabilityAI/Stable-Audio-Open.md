@@ -78,7 +78,7 @@ python examples/offline_inference/text_to_audio/text_to_audio.py \
 Start the online serving endpoint:
 
 ```bash
-vllm-omni serve /path/to/stable-audio-open-1.0 \
+vllm serve /path/to/stable-audio-open-1.0 \
   --host 0.0.0.0 \
   --port 8091 \
   --gpu-memory-utilization 0.9 \

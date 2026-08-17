@@ -30,8 +30,9 @@ also provided.
   `hf_config.version="4.5"`):
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - 2-GPU and 3-GPU layouts:
+  - Recommended 2-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
+  - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
@@ -77,7 +78,9 @@ a fallback because it would duplicate state machines and correctness paths.
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
-`gpu_memory_utilization` budgets are 0.55, 0.22, and 0.22. All stages admit
+`gpu_memory_utilization` budgets are 0.55, 0.15, and 0.15. The remaining
+device memory is left available for runtime workspaces such as the HiFi-GAN
+vocoder's cuDNN kernels. All stages admit
 up to four sequences. Startup video profiling is bounded to 32 frames per
 video. Use the two-GPU profile for production throughput.
 
@@ -202,9 +205,10 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.22, and
-  0.22 of GPU 0. The larger Thinker share protects its multimodal KV cache;
-  all three model processes still share one CUDA device.
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.15, and
+  0.15 of GPU 0. The larger Thinker share protects its multimodal KV cache,
+  while the unreserved memory remains available to runtime kernels; all three
+  model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
 - Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains

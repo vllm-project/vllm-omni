@@ -44,7 +44,7 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
@@ -579,7 +579,7 @@ class OrchestratorAggregator:
         if final_output_type is not None:
             stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
             else None
         )
@@ -644,8 +644,19 @@ class OrchestratorAggregator:
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
         if diffusion_metrics:
+            _MS_TO_S = {
+                "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+                "preprocess_time_ms": "preprocess_time_s",
+                "postprocess_time_ms": "postprocess_time_s",
+                "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
+            }
             for key, value in diffusion_metrics.items():
-                self.diffusion_metrics[req_id][key] += value
+                if value is None:
+                    continue
+                if key in _MS_TO_S:
+                    self.diffusion_metrics[req_id][_MS_TO_S[key]] = float(value) / 1000.0
+                else:
+                    self.diffusion_metrics[req_id][key] = value
 
     def on_forward(
         self,

@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -27,6 +27,21 @@ class OmniNewRequestData(NewRequestData):
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict[str, object] | None = None
+
+    @classmethod
+    def from_base(
+        cls,
+        data: NewRequestData,
+        request: Request | None,
+    ) -> "OmniNewRequestData":
+        """Preserve upstream request data while attaching Omni payloads."""
+        base_data = {field.name: getattr(data, field.name) for field in fields(NewRequestData)}
+        return cls(
+            **base_data,
+            external_req_id=getattr(request, "external_req_id", None),
+            additional_information=getattr(request, "additional_information", None),
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+        )
 
     @classmethod
     def from_request(

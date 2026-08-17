@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -264,7 +265,11 @@ def apply_rotary_emb_qwen(
 
 
 class QwenImagePipeline(
-    nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
+    QwenImageLoraLoaderMixin,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]

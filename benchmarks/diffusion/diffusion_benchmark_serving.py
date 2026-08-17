@@ -858,7 +858,12 @@ class RandomDataset(BaseDataset):
             height = int(self.args.height or profile.get("height") or 720)
             num_frames = int(self.args.num_frames or profile.get("num_frames") or 16)
             fps = float(self.args.fps or profile.get("fps") or 8)
-            writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            # cv2 typically writes MPEG-4 Part 2 (``mp4v``), which pipelines such
+            # as MiniMax-H3 Ref2VA reject because they require H.264/H.265
+            # reference videos. Write the synthetic clip first, then re-encode
+            # it to H.264 when ffmpeg is available; otherwise keep ``mp4v``.
+            raw_path = video_path + ".raw.mp4"
+            writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not writer.isOpened():
                 raise RuntimeError("cv2.VideoWriter failed to open")
             for frame_idx in range(num_frames):
@@ -871,11 +876,49 @@ class RandomDataset(BaseDataset):
                 frame[max(y - 36, 0) : min(y + 36, height), x : min(x + 96, width), :] = (64, 128, 220)
                 writer.write(frame)
             writer.release()
+            if _reencode_video_to_h264(raw_path, video_path):
+                os.unlink(raw_path)
+            else:
+                os.replace(raw_path, video_path)
             return [video_path]
         except Exception as e:
             raise RuntimeError(
                 "Failed to generate synthetic v2v input video. Install opencv-python or provide a custom dataset."
             ) from e
+
+
+def _reencode_video_to_h264(source: str, destination: str) -> bool:
+    """Re-encode a video to H.264/MP4 using ffmpeg when available.
+
+    Returns False when ffmpeg is missing or the re-encode fails so callers can
+    fall back to the original container/codec.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                source,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                destination,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and os.path.exists(destination)
+    except Exception:
+        return False
 
 
 def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:

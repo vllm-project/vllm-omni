@@ -3,7 +3,7 @@
 Thank you for your interest in contributing to vLLM-Omni! This document provides guidelines and instructions for contributing.
 
 !!! note
-    We host weekly developer-facing online meetings to discuss milestones and updates **every Tuesday at 19:30 PDT**. Meeting link as well as the past meeting notes can be found [here](https://tinyurl.com/vllm-omni-meeting).
+    vLLM-Omni hosts developer-facing meetings for Chinese- and English-language audiences. See [Community Meetings](../community/meetings.md) for current schedules, access details, agendas, and past notes.
 
 ## Getting Started
 
@@ -76,12 +76,53 @@ Please refer to the [test instructions](./ci/test_execution_guide.md) for detail
 !!! warning
     Currently, not all unit tests pass when run on CPU platforms. If you don't have access to a GPU platform to run unit tests locally, rely on the continuous integration system to run the tests for now.
 
+### Using repository skills with coding agents
+
+vLLM-Omni maintains [repository-scale skills](https://github.com/vllm-project/vllm-omni/tree/main/.claude/skills) for common coding, testing, performance, and review workflows. These skills capture repository-specific structure, validation requirements, and evidence standards that a general coding agent may not know.
+
+If your coding agent discovers repository skills automatically, ask it to use the relevant skill by name. Otherwise, point it to the linked `SKILL.md` and ask it to read the file before changing code. Skills can be combined: use a domain skill for the implementation, `vllm-omni-test` for test and CI decisions, and `precheck-pr` before opening the pull request.
+
+| Task | Repository skill |
+| --- | --- |
+| Add or extend a diffusion model | [`add-diffusion-model`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-diffusion-model/SKILL.md) |
+| Add or extend a text-to-speech model | [`add-tts-model`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-tts-model/SKILL.md) |
+| Add, select, or debug quantization | [`quantization`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/quantization/SKILL.md) |
+| Diagnose or optimize diffusion performance | [`diffusion-perf-opt`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/diffusion-perf-opt/SKILL.md) |
+| Upgrade an NPU model runner | [`vllm-omni-npu-model-runner-upgrade`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/vllm-omni-npu-upgrade/SKILL.md) |
+| Add a regression test, choose L1-L4 coverage, or wire Buildkite | [`vllm-omni-test`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/vllm-omni-test/SKILL.md) |
+| Self-check a branch before opening a pull request | [`precheck-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) |
+| Perform a maintainer or reviewer review of an existing pull request or local branch | [`review-pr`](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/review-pr/SKILL.md) |
+
+Use the following workflow when collaborating with a coding agent:
+
+1. **Ground the task.** Provide the issue, RFC, or design document that defines the expected behavior. Ask the agent to state its assumptions and identify the affected module or feature contracts before editing code.
+2. **Select the narrowest applicable skills.** Start with the domain skill that owns the change. Add `vllm-omni-test` whenever production behavior or tests change. For a bug fix, ask for the smallest reproducer and a regression test tied to the original symptom.
+3. **Require executable evidence.** Ask the agent to run the narrowest relevant checks and report the exact commands and results. It must identify tests it could not run because of unavailable hardware, model weights, credentials, or dependencies; an unrun check is not a pass.
+4. **Inspect the resulting diff.** Confirm that the implementation stays within the issue or RFC, does not overwrite unrelated work, and includes the required tests, documentation, and benchmark or accuracy evidence.
+5. **Run the pre-submit workflow.** Use `precheck-pr`, then run the applicable local tests and pre-commit hooks before opening the pull request.
+
+For example:
+
+```text
+Use add-diffusion-model and vllm-omni-test to implement the linked issue.
+Read the relevant design documents first, keep the change within the issue,
+and report every test command, result, and hardware validation gap.
+```
+
+```text
+Use vllm-omni-test to turn this bug reproducer into the smallest deterministic
+regression test. Prefer L1 CPU coverage; if the failure requires real weights
+or serving, explain the required L2/L3 environment and provide the exact command.
+```
+
+Repository skills guide the agent, but they do not replace contributor judgment, the accepted issue or RFC, required test evidence, or maintainer review. Review all generated changes before submitting them.
+
 ## Issues
 
 If you encounter a bug or have a feature request, please search existing issues first to see if it has already been reported. If not, please file a new issue, providing as much relevant information as possible.
 
 !!! important
-    If you discover a security vulnerability, please report it by creating a GitHub issue with the `security` label.
+    Do not report suspected security vulnerabilities through a public issue, pull request, discussion, or Slack channel. Follow the [security disclosure instructions](../community/contact_us.md#security-disclosures) to arrange a private report.
 
 ## Pull Requests & Code Reviews
 

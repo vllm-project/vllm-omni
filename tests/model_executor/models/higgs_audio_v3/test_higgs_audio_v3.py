@@ -1326,7 +1326,9 @@ class TestRegistry:
 
         assert "higgs_multimodal_qwen3" in OMNI_PIPELINES
 
-    def test_deploy_yaml_exists(self):
+    def test_deploy_yaml_uses_native_flashinfer(self):
+        from vllm_omni.config.stage_config import load_deploy_config
+
         for name in (
             "higgs_multimodal_qwen3.yaml",
             "higgs_multimodal_qwen3_high_throughput.yaml",
@@ -1334,6 +1336,10 @@ class TestRegistry:
         ):
             yaml_path = get_deploy_config_path(name)
             assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
+            deploy_config = load_deploy_config(yaml_path)
+            stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
+            assert stage_0.engine_extras["attention_backend"] == "FLASHINFER"
+            assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
 
 
 # ---- AC-3: Prompt Builder ----

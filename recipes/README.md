@@ -19,6 +19,11 @@ add files for this repo. Use one Markdown file per model family by default.
 > Individual pages resolve at `https://recipes.vllm.ai/<provider>/<model-id>`,
 > e.g. [`bosonai/higgs-audio-v3-tts-4b`](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b).
 
+The `Recipe` column in the Supported Models documentation links to the
+published recipe when available and otherwise to the corresponding recipe in
+this directory. The recipe files remain the source of truth for commands and
+validation details.
+
 Example layout:
 
 ```text
@@ -45,11 +50,17 @@ recipes/
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
+| [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
+| [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
+| [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU |
+| [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
+| [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
@@ -57,6 +68,7 @@ recipes/
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
+| [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
 | [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4 | 1x A100 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |

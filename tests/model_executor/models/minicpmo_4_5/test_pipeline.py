@@ -157,18 +157,26 @@ class TestDeployTopology:
         assert connector["name"] == "SharedMemoryConnector"
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
+        assert connector["extra"]["enable_hift_graph"] is True
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+            memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
+            assert memory_utilizations == [
                 0.55,
-                0.22,
-                0.22,
+                0.15,
+                0.18,
             ]
-            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"video": {"count": 1, "num_frames": 32}}
+            assert sum(memory_utilizations) <= 0.9 + 1e-6
+            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "image": 64,
+                "audio": 64,
+                "video": 1,
+            }
         elif filename in {"minicpmo_4_5_2gpu.yaml"}:
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,

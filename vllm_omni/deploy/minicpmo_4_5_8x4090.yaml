@@ -28,6 +28,13 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
+      enable_cfm_graph: true
+      cfm_max_graphs: 32
 
 stages:
   - stage_id: 0
@@ -38,6 +45,11 @@ stages:
     max_model_len: 4096
     max_num_batched_tokens: 4096
     devices: "0,1,2,3"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       video: 1
     default_sampling_params:

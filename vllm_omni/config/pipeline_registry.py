@@ -47,9 +47,11 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
 )
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
+from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.dynin_omni.pipeline import DYNIN_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
+from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.models.glm_tts.pipeline import GLM_TTS_PIPELINE
 from vllm_omni.model_executor.models.gr00t.pipeline import GR00T_N1D7_PIPELINE
@@ -61,7 +63,10 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_PIPELINE,
 )
 from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_PIPELINE
-from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
+from vllm_omni.model_executor.models.indextts2.pipeline import (
+    INDEXTTS2_PIPELINE,
+    INDEXTTS25_PIPELINE,
+)
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
@@ -85,7 +90,11 @@ from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_REALTIME_PIPELINE,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
+from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
+    NEMOTRON_VOICECHAT_PIPELINE,
+)
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
+from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -113,6 +122,12 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
+    "personaplex": PERSONAPLEX_PIPELINE,
+    "nemotron_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
+    # Alias: lets bare `vllm-omni serve <NVIDIA-NemotronLabs-VoiceChat-11B dir>`
+    # auto-detect through the path-basename fallback (the checkpoint config.json
+    # has no model_type key).
+    "nemotron_labs_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
@@ -124,6 +139,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
+    "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_image3_ar": HUNYUAN_IMAGE3_AR_PIPELINE,
@@ -131,6 +147,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_video_15": HUNYUAN_VIDEO_15_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
+    "dots_tts": DOTS_TTS_PIPELINE,
     "cosyvoice3": COSYVOICE3_PIPELINE,
     "audex_tts": AUDEX_TTS_PIPELINE,
     "audex_tta": AUDEX_TTA_PIPELINE,
@@ -162,6 +179,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
+    "indextts2_5": INDEXTTS25_PIPELINE,
     "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
     "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }

@@ -22,7 +22,7 @@ steps:
         timeout_in_minutes: 50
         commands:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and omni" --run-level "full_model"
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Doc Test with L4"
         timeout_in_minutes: 90
@@ -47,6 +47,19 @@ steps:
             pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_2
+
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_EVAL_DEVICE=cuda:1
+          - |
+            set +e
+            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and cuda" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
         mirror_hardwares: h100_2
 
@@ -101,6 +114,32 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
         mirror_hardwares: h100_3
+
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_1
+
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Multi-Replica Startup Test with 4x H100"
         timeout_in_minutes: 45
@@ -306,7 +345,7 @@ steps:
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
@@ -322,7 +361,7 @@ steps:
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_vllm_omni.json
@@ -338,7 +377,7 @@ steps:
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2511_vllm_omni.json
@@ -354,7 +393,7 @@ steps:
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_layered_vllm_omni.json
@@ -370,7 +409,7 @@ steps:
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-          - export CACHE_DIT_VERSION=1.3.0
+          - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
@@ -404,7 +443,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · LingBot Video MoE Function Test"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_lingbot_video_moe.py -m "full_model and cuda" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_lingbot_video_moe.py -k "video_generation" -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Doc Test"
@@ -417,8 +456,14 @@ steps:
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
-          - pytest -s -v tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_ltx2_expansion.py -m "full_model and cuda" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan_2_1_vace_expansion.py tests/e2e/online_serving/test_ltx.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
+
+      - label: ":full_moon: Diffusion X2V · LTX-2.5 Online Test"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_ltx25.py -m "full_model and cuda" --run-level "full_model"
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         timeout_in_minutes: 180
@@ -427,14 +472,33 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py -m full_model --run-level full_model
+        mirror_hardwares: h100_4
+
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
-          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_one_stage_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_video_streaming_output_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
+
+      - label: ":full_moon: Diffusion X2V · LTX Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx2_3_i2v]' -m full_model --run-level full_model
+          - pytest -s -v 'tests/e2e/accuracy/ltx/test_ltx_official_similarity.py::test_ltx_matches_official[ltx23_two_stage_layer_fused_i2v]' -m full_model --run-level full_model
+        mirror_hardwares: h100_1
+
+      - label: ":full_moon: Diffusion X2V · LTX-2.5 Official Parity Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_distilled_two_stage_matches_official -m full_model --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/ltx/test_ltx25_official_similarity.py::test_ltx25_full_matches_official -m full_model --run-level full_model
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Perf Test"
         key: nightly-diffusion-x2v-performance
@@ -454,16 +518,37 @@ steps:
             exit $$EXIT2
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax-H3"
+        key: nightly-diffusion-x2v-performance-minimax-h3
+        timeout_in_minutes: 180
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+        mirror_hardwares: h100_4
+
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Diffusion · Distributed Test"
+      - label: ":full_moon: Diffusion · Distributed Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda' --run-level "full_model"
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_4
+
+      - label: ":full_moon: Diffusion · Distributed Test with H100"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100' --run-level "full_model"
+        mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion · Offloader Test"
         timeout_in_minutes: 60
@@ -471,11 +556,17 @@ steps:
           - pytest -sv tests/diffusion/offloader -m "full_model and cuda"
         mirror_hardwares: l4_1
 
-      - label: ":full_moon: Diffusion · Quantization Test with H100"
+      - label: ":full_moon: Diffusion · Quantization Test with H100 · Single-GPU"
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         mirror_hardwares: h100_1
+
+      - label: ":full_moon: Diffusion · MiniMax H3 FP8 Quality Test with H100 · 2-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/models/minimax_h3/test_minimax_h3_quantization_quality.py -m 'full_model and cuda and H100' --run-level "full_model"
+        mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion · Quantization Test with L4"
         timeout_in_minutes: 60
