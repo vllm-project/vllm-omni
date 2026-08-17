@@ -450,7 +450,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transformer_kwargs["action_dim"] = ah_config["action_dim"]
         transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
         transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
-        transformer_kwargs["quant_config"] = getattr(od_config, "quantization_config", None)
+        transformer_kwargs["quant_config"] = od_config.quantization_config
         self.transformer = CausalWanModel(**transformer_kwargs)
 
         self.scheduler = FlowUniPCMultistepScheduler(

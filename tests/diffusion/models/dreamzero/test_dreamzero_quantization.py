@@ -3,8 +3,8 @@
 
 """Quantization wiring for the DreamZero DiT.
 
-Every GEMM-carrying linear must receive the pipeline's `quant_config`, nothing
-else may, and each linear's `prefix` must equal its module path.
+Every vLLM parallel linear gets `quant_config` and a `prefix` equal to its
+module path; small plain-`nn.Linear` projections stay bf16.
 
 CPU-only: the parallel linears, the patch conv and the attention layer are
 replaced by stand-ins.
@@ -164,7 +164,7 @@ def test_default_is_unquantized_and_prefixes_still_set(dz):
     assert all(mod.prefix == path for path, mod in linears.items())
 
 
-def test_non_gemm_modules_stay_full_precision(dz):
+def test_plain_linear_projections_stay_full_precision(dz):
     model = _build(dz, 1, quant_config=None)
 
     plain = {path for path, mod in model.named_modules() if isinstance(mod, nn.Linear)}
@@ -176,4 +176,6 @@ def test_non_gemm_modules_stay_full_precision(dz):
         "time_projection.1",
         "head.head",
     } <= plain
+    # head.head runs once per forward (not TP-critical), so it stays a plain
+    # nn.Linear and takes no quant_config -- not an accuracy decision.
     assert not any(isinstance(mod, _FakeLinear) for mod in model.head.modules())
