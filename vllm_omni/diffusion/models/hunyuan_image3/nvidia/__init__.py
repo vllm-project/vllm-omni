@@ -13,9 +13,8 @@ package silently fell back to the default blocks on every CUDA machine.
 """
 
 from vllm_omni.diffusion.models.hunyuan_image3.nvidia.autoencoder_blocks import (
-    Conv3d,
     ResnetBlock,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.nvidia.transformer_blocks import ResBlock
 
-__all__ = ["Conv3d", "ResnetBlock", "ResBlock"]
+__all__ = ["ResnetBlock", "ResBlock"]

@@ -58,7 +58,6 @@ def zero_module(module):
 class ResBlock(nn.Module):
     r"""
     A residual block that can optionally change the number of channels.
-
     Args:
         in_channels (`int`):
             The number of input channels.
@@ -77,7 +76,6 @@ class ResBlock(nn.Module):
             If True, use this block for upsampling.
         down (`bool`, *optional*):
             If True, use this block for downsampling.
-
     """
 
     def __init__(
@@ -148,4 +146,4 @@ class ResBlock(nn.Module):
         return self.skip_connection(x) + h
 
 
-__all__ = ["ResBlock", "conv_nd", "normalization", "linear", "zero_module"]
+__all__ = ["ResBlock"]

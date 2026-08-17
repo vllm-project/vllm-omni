@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.model_executor.models.common.ops import fused_group_norm_silu
+from ._cudnn_settings import cudnn_settings
 
 
 class Conv3d(nn.Conv3d):
@@ -76,20 +77,21 @@ class ResnetBlock(nn.Module):
             self.nin_shortcut = Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        h = x
-        h = fused_group_norm_silu(
-            h, self.norm1.weight, self.norm1.bias, num_groups=self.norm1.num_groups, eps=self.norm1.eps
-        )
-        h = self.conv1(h)
+        with cudnn_settings(benchmark = True, deterministic = True):
+            h = x
+            h = fused_group_norm_silu(
+                h, self.norm1.weight, self.norm1.bias, num_groups=self.norm1.num_groups, eps=self.norm1.eps
+            )
+            h = self.conv1(h)
 
-        h = fused_group_norm_silu(
-            h, self.norm2.weight, self.norm2.bias, num_groups=self.norm2.num_groups, eps=self.norm2.eps
-        )
-        h = self.conv2(h)
+            h = fused_group_norm_silu(
+                h, self.norm2.weight, self.norm2.bias, num_groups=self.norm2.num_groups, eps=self.norm2.eps
+            )
+            h = self.conv2(h)
 
-        if self.in_channels != self.out_channels:
-            x = self.nin_shortcut(x)
-        return x + h
+            if self.in_channels != self.out_channels:
+                x = self.nin_shortcut(x)
+            return x + h
 
 
-__all__ = ["Conv3d", "ResnetBlock"]
+__all__ = ["ResnetBlock"]
