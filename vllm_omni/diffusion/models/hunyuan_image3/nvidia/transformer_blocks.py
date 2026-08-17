@@ -19,6 +19,7 @@ without a working Triton.
 """
 
 import torch
+from torch import nn
 
 from vllm_omni.diffusion.models.hunyuan_image3.transformer_blocks import (
     ResBlock as _DefaultResBlock,
@@ -27,7 +28,9 @@ from vllm_omni.model_executor.models.common.ops import (
     fused_adaptive_group_norm,
     fused_group_norm_silu,
 )
-from ._cudnn_settings import cudnn_settings
+
+from ._cudnn import cudnn_settings
+
 
 def conv_nd(dims, *args, **kwargs):  # noqa: N802
     """

@@ -19,7 +19,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.model_executor.models.common.ops import fused_group_norm_silu
-from ._cudnn_settings import cudnn_settings
+
+from ._cudnn import cudnn_settings
 
 
 class Conv3d(nn.Conv3d):

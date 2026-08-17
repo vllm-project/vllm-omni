@@ -7,9 +7,6 @@ Uses native PyTorch F.group_norm + F.silu. Hardware-specific optimized versions
 live in subdirectories (e.g., nvidia/) and are selected via __init__.py dispatch.
 """
 
-import math
-
-import torch
 import torch.nn.functional as F
 from torch import nn
 
