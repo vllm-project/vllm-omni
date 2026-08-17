@@ -119,7 +119,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "response_format_json_schema_incomplete",
             400,
-            ("response_format", "value_error", "json_schema"),
+            ("response_format", "BadRequestError", "json_schema"),
             id="invalid_response_format_json_schema",
         ),
         pytest.param("logprobs_wrong_type", 400, "logprobs", id="logprobs_wrong_type", marks=_SKIP_ISSUE_3649),
