@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import re
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -1559,6 +1560,30 @@ class TestDownstreamPayloadMemoization:
         assert runner._request_needs_downstream_stage_payload("r1") is True
 
 
+# Matches a real ASSIGNMENT of the capability (optionally `self.`-qualified
+# and/or annotated), not a bare mention: a comment, a docstring, or a read
+# such as `getattr(self.model, "prefer_model_sampler", False)` must not count
+# as declaring it. `=(?!=)` keeps `==` comparisons out.
+_PREFER_MODEL_SAMPLER_ASSIGNMENT = re.compile(
+    r"^[ \t]*(?:self\.)?prefer_model_sampler[ \t]*(?::[^=\n]*)?=(?!=)[ \t]*(?P<rhs>[^\n]*)",
+    re.MULTILINE,
+)
+
+
+def _declares_prefer_model_sampler(source: str) -> bool:
+    """Whether `source` opts INTO the model-sampler contract.
+
+    An explicit `prefer_model_sampler = False` is an opt-OUT and does not
+    count; any other right-hand side does, including runtime-conditional
+    forms (minicpmo_4_5 assigns `self.model_stage in {...}`), which can
+    evaluate True.
+    """
+    for match in _PREFER_MODEL_SAMPLER_ASSIGNMENT.finditer(source):
+        if match.group("rhs").split("#")[0].strip() != "False":
+            return True
+    return False
+
+
 class TestPreferModelSamplerNoneFallback:
     """RFC #5450 C7: a `prefer_model_sampler` model returning None from
     `sample()` DECLINES the step and the runner falls back to the default
@@ -1624,9 +1649,22 @@ class TestPreferModelSamplerNoneFallback:
 
         assert out is model_out
 
+    def test_declaration_matcher_ignores_mentions_and_opt_outs(self):
+        # Guards the guard: the inventory below is only meaningful if
+        # "declares" means an actual opt-in assignment.
+        assert _declares_prefer_model_sampler("    prefer_model_sampler = True")
+        assert _declares_prefer_model_sampler("    prefer_model_sampler: bool = True")
+        assert _declares_prefer_model_sampler('        self.prefer_model_sampler = stage in {"llm"}')
+        assert not _declares_prefer_model_sampler("    prefer_model_sampler = False")
+        assert not _declares_prefer_model_sampler("    prefer_model_sampler = False  # opted out")
+        assert not _declares_prefer_model_sampler("    # prefer_model_sampler = True (not anymore)")
+        assert not _declares_prefer_model_sampler('    """Does not use prefer_model_sampler."""')
+        assert not _declares_prefer_model_sampler('    x = getattr(model, "prefer_model_sampler", False)')
+        assert not _declares_prefer_model_sampler("    if prefer_model_sampler == True:")
+
     def test_in_tree_declarer_inventory_is_exact(self):
-        # The contract's audience: exact inventory, so ADDING a declarer fails
-        # this test and the new model owner consciously signs up for the
+        # The contract's audience: an exact inventory, so ADDING a declarer
+        # fails this test and the new model owner consciously signs up for the
         # documented None-fallback semantics (update the set when they do).
         import pathlib
 
@@ -1636,9 +1674,9 @@ class TestPreferModelSamplerNoneFallback:
         declarers = {
             p.parent.name
             for p in models_dir.rglob("*.py")
-            if "prefer_model_sampler" in p.read_text(encoding="utf-8", errors="ignore")
+            if _declares_prefer_model_sampler(p.read_text(encoding="utf-8", errors="ignore"))
         }
-        assert declarers == {
+        expected = {
             "cosyvoice3",
             "glm_tts",
             "higgs_audio_v2",
@@ -1646,3 +1684,16 @@ class TestPreferModelSamplerNoneFallback:
             "hunyuan_image3",
             "minicpmo_4_5",
         }
+        assert declarers == expected, (
+            "The set of models declaring `prefer_model_sampler` changed:\n"
+            f"  added:   {sorted(declarers - expected) or 'none'}\n"
+            f"  removed: {sorted(expected - declarers) or 'none'}\n\n"
+            "This is a deliberate consent gate, not a broken test. Declaring "
+            "`prefer_model_sampler` opts a model into the runner's documented "
+            "None-fallback contract: `model.sample()` may return None to decline "
+            "a step, and the runner then falls back to the DEFAULT sampler "
+            "(see `GPUARModelRunner._sample`; RFC #5450 C7.3).\n\n"
+            "If you ADDED a declarer: confirm your model relies on -- or at "
+            "least tolerates -- that fallback, then add its directory name to "
+            "`expected` above. If you REMOVED one, drop its name."
+        )
