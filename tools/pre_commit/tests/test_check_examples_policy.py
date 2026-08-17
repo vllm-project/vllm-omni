@@ -3,15 +3,12 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from check_examples_policy import _load_baseline, _get_added_paths, main, APPROVED_EXCEPTIONS
+from check_examples_policy import APPROVED_EXCEPTIONS, _load_baseline, main
 
 BASELINE_FILE = Path(__file__).resolve().parents[1] / "examples_policy_baseline.txt"
 
@@ -34,7 +31,7 @@ def test_baseline_only_python_paths():
 
 def test_baseline_no_duplicates():
     lines = BASELINE_FILE.read_text().splitlines()
-    paths = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+    paths = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
     assert len(paths) == len(set(paths)), "baseline contains duplicate entries"
 
 
