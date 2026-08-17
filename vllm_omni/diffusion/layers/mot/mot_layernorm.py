@@ -54,6 +54,14 @@ class MoTRMSNorm(CustomOp):
         output[vae_indices] = self._rms_norm_native(x[vae_indices], self.gen_weight)
         return output
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        text_indices: torch.Tensor | None = None,
+        vae_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.forward_native(x, text_indices, vae_indices)
+
     # ------------------------------------------------------------------
     # CUDA fast-path
     # ------------------------------------------------------------------

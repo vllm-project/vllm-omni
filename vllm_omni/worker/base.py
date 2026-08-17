@@ -184,9 +184,9 @@ class OmniGPUWorkerBase(GPUWorker):
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             logger.info(f"[LLM Worker {self.rank}] Sleep Mode ENABLED. Activating CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         else:
@@ -199,11 +199,11 @@ class OmniGPUWorkerBase(GPUWorker):
         Args:
             level: 1 (Offload weights to CPU), level: 2 (Total Discard).
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.sleep(offload_tags=offload_tags)
         current_omni_platform.empty_cache()
         current_omni_platform.synchronize()
@@ -219,9 +219,9 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
