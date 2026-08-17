@@ -42,6 +42,7 @@ def _make_runner(connector, *, payload_keys=("text_encoder_output",), recv_stage
     runner = object.__new__(DiffusionModelRunner)
     runner.od_config = SimpleNamespace(stage_input_payload_keys=payload_keys, stage_id=1)
     runner.device = torch.device("cpu")
+    runner._local_rank = 0
     runner.pipeline = None
     runner.kv_transfer_manager = _FakeKVTransferManager(connector, recv_stages=recv_stages)
     return runner
@@ -137,6 +138,74 @@ def test_sender_info_is_applied_before_the_connector_is_used():
     runner._maybe_recv_stage_payload(req)
 
     assert runner.kv_transfer_manager.sender_info_calls == [({0: {"host": "10.0.0.1", "zmq_port": 50171}}, "0")]
+
+
+def test_tp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
+    connector = _FakeConnector(_conditioning())
+    state = {}
+
+    class _FakeTPGroup:
+        world_size = 4
+
+        def __init__(self, rank):
+            self.rank_in_group = rank
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                state["delivered"] = value
+            return state["delivered"]
+
+        def broadcast_tensor_dict(self, value, src=0):
+            if self.rank_in_group == src:
+                state["payload"] = value
+            return state["payload"]
+
+    leader = _make_runner(connector)
+    leader._local_rank = 0
+    leader._get_local_tp_group = lambda: _FakeTPGroup(0)
+    follower = _make_runner(connector)
+    follower._local_rank = 1
+    follower._get_local_tp_group = lambda: _FakeTPGroup(1)
+
+    leader_req = _make_request({"prompt": "a cat"})
+    follower_req = _make_request({"prompt": "a cat"})
+    leader._maybe_recv_stage_payload(leader_req)
+    follower._maybe_recv_stage_payload(follower_req)
+
+    assert len(connector.calls) == 1
+    leader_output = leader_req.prompt["additional_information"]["text_encoder_output"]["hidden_states"]
+    follower_output = follower_req.prompt["additional_information"]["text_encoder_output"]["hidden_states"]
+    assert torch.equal(leader_output, follower_output)
+
+
+def test_tp_payload_miss_is_broadcast_without_follower_connector_access():
+    connector = _FakeConnector(None)
+    state = {}
+
+    class _FakeTPGroup:
+        world_size = 2
+
+        def __init__(self, rank):
+            self.rank_in_group = rank
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                state["delivered"] = value
+            return state["delivered"]
+
+        def broadcast_tensor_dict(self, value, src=0):
+            raise AssertionError("missing payload must not be broadcast")
+
+    leader = _make_runner(connector)
+    leader._get_local_tp_group = lambda: _FakeTPGroup(0)
+    follower = _make_runner(connector)
+    follower._local_rank = 1
+    follower._get_local_tp_group = lambda: _FakeTPGroup(1)
+
+    leader._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
+    follower._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
+
+    assert len(connector.calls) == 1
 
 
 def test_missing_incoming_edge_is_reported_not_fetched():
