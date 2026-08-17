@@ -59,6 +59,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         validation_alias=AliasChoices("voice", "speaker"),
         description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def _normalize_voice(cls, voice: str | dict[str, str]) -> str:
+        if isinstance(voice, dict):
+            if "id" not in voice:
+                raise ValueError("voice dict must contain 'id'")
+            return voice["id"]
+        return voice
+
     instructions: str | None = Field(
         default=None,
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
@@ -161,10 +171,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     word_timestamps: bool = Field(
         default=False,
         description=(
-            "When true, the server runs a shared forced aligner alongside the streamed "
-            "audio and emits per-chunk word timestamps. Requires the server to be "
-            "launched with --forced-aligner pointing at an aligner model. No effect "
-            "when streaming is off."
+            "When true, non-streaming responses carry per-word timestamps in the "
+            "X-Word-Timestamps header (JSON list of {word, start_ms, end_ms}, "
+            "ASCII-escaped; replaced by X-Word-Timestamps-Omitted past 4 KB). "
+            "Requires the server to be launched with --forced-aligner (400 otherwise). "
+            "Not supported with stream=true; for streaming use the WebSocket "
+            "/v1/audio/speech/stream path."
         ),
     )
 

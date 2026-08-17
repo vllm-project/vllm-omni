@@ -20,6 +20,7 @@ import torch.nn as nn
 from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
@@ -57,6 +58,12 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3TextConditioning,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import (
+    resolve_component_quant_config as _resolve_component_quant_config,
+)
+from vllm_omni.quantization.component_config import (
+    resolve_encoder_quant_config as _resolve_encoder_quant_config,
+)
 
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
@@ -153,6 +160,13 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
 }
 
 
+def _resolve_minimax_h3_text_encoder_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    resolved = _resolve_component_quant_config(quant_config, "text_encoder")
+    return _resolve_encoder_quant_config(resolved)
+
+
 def _minimax_h3_partition_for_task(
     task_type: str | None,
     model: str | None = None,
@@ -220,12 +234,6 @@ def resolve_minimax_h3_diffusion_model_path(
     )
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
     return str(model_root / subdir)
-
-
-def _resolve_component_quant_config(quant_config, component: str):
-    if hasattr(quant_config, "resolve"):
-        return quant_config.resolve(component)
-    return quant_config
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -579,13 +587,6 @@ class MiniMaxH3Pipeline(
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
         on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
     )
-    # H3's regular loader performs checkpoint-layout conversions (grouped QKV
-    # and fused MLP). Keep it on that path until mmap can run the same loader
-    # callbacks for every affected parameter.
-    _supports_mmap_loading: ClassVar[bool] = False
-    # TODO(offload): Re-enable after the generic rank-local mmap path can run
-    # this model's grouped-QKV reorder and fused-MLP packing before TP sharding.
-    # Do not bypass the regular loader until that equivalence is tested.
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
         "encode_prompt",
@@ -746,7 +747,18 @@ class MiniMaxH3Pipeline(
                 device=self.device,
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
+                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
+            if rank < text_encoder_tp_size:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(model_path),
+                        subfolder="text_encoder",
+                        revision=od_config.revision,
+                        prefix="text_encoder.",
+                        fall_back_to_pt=False,
+                    )
+                )
         else:
             self.text_encoder_tp_size = 0
             self.text_encoder_group = None
@@ -783,7 +795,7 @@ class MiniMaxH3Pipeline(
         def source_prefix(item: tuple[str, torch.Tensor]) -> str:
             name, _ = item
             prefix = name.partition(".")[0] + "."
-            if prefix in {"transformer.", "transformers_ref."}:
+            if prefix in {"transformer.", "transformers_ref.", "text_encoder."}:
                 return prefix
             raise ValueError(f"unexpected MiniMax-H3 weight {name!r}")
 
@@ -793,17 +805,16 @@ class MiniMaxH3Pipeline(
             if prefix in loaded_prefixes:
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
             loaded_prefixes.add(prefix)
-            transformer = getattr(self, prefix.removesuffix("."))
-            loaded = transformer.load_weights((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
-            transformer.post_load_weights()
+            component = getattr(self, prefix.removesuffix("."))
+            loaded = component.load_weights((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix != "text_encoder.":
+                component.post_load_weights()
             loaded_with_prefix.update(prefix + name for name in loaded)
-        # The text encoder and both VAEs load eagerly in ``__init__`` rather
-        # than through ``weights_sources``. Record them for the runner's strict
-        # missing-parameter check. For the text encoder that report is exact
-        # because its loader raises on any unloaded parameter or partially filled
-        # fused parameter; weaken that and gaps here become invisible. The two
-        # VAEs carry no equivalent guarantee.
-        for component_name in ("text_encoder", "video_vae", "audio_vae"):
+        # Both VAEs load eagerly in ``__init__`` rather than through
+        # ``weights_sources``. The text encoder uses the shared component
+        # loader so online quantization and offload processing follow the same
+        # path as the DiT.
+        for component_name in ("video_vae", "audio_vae"):
             component = getattr(self, component_name)
             if component is None:
                 continue
@@ -1803,7 +1814,7 @@ class MiniMaxH3Pipeline(
                     device=self.device,
                     dtype=torch.long,
                 )
-            elif self.text_encoder is not None:
+            elif getattr(self, "load_text_encoder", True):
                 text_embeddings, text_tags = self.encode_prompt(
                     task=task,
                     prompt=prompt,

@@ -53,7 +53,6 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model",
         "omni",
         "output_modalities",
-        "stage_configs_path",
         "stage_id",
         "tokenizer",
     }
@@ -91,6 +90,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     trust_remote_code: bool
     dtype: Any
     attention_backend: Any
+    attention_config: Any
     moe_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
@@ -128,6 +128,7 @@ class _CacheEngineOverrides(TypedDict, total=False):
     enable_prefix_caching: bool
     disable_hybrid_kv_cache_manager: bool
     mm_processor_cache_gb: float
+    mamba_ssm_cache_dtype: str
 
 
 class _SchedulerEngineOverrides(TypedDict, total=False):
@@ -321,6 +322,7 @@ class OmniStageModelConfig:
     trust_remote_code: bool = False
     dtype: Any = "auto"
     attention_backend: Any = None
+    attention_config: Any = None
     moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
@@ -377,6 +379,8 @@ class OmniStageCacheConfig:
     enable_prefix_caching: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
+    # Hybrid-mamba SSM state dtype ("auto"/"float32"); vLLM CacheConfig field.
+    mamba_ssm_cache_dtype: str | None = None
 
 
 @config
