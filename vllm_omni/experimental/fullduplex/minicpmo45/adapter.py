@@ -163,7 +163,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_CHUNK_SIZE,
         )
         frame_rate = cls._positive_int(
-            cls._config_value(hf_config, "streaming_sliding_window_audio_frame_rate"),
+            cls._config_value(tts_config, "streaming_sliding_window_audio_frame_rate"),
             MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_FRAME_RATE,
         )
         chunk_ms = max(1, (chunk_size * 1000 + frame_rate // 2) // frame_rate)
