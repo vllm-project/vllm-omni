@@ -109,6 +109,13 @@ repos:
       types: [python]
       additional_dependencies: [regex]
 
+    - id: check-buildkite
+      name: Validate Buildkite Pipelines
+      entry: python tools/pre_commit/check_buildkite.py
+      language: python
+      files: ^\.buildkite/.*\.ya?ml$
+      additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
