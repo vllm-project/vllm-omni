@@ -36,7 +36,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3MLP
 
-from vllm_omni.diffusion.utils.kv_utils import repeat_kv
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -145,12 +146,22 @@ class HiDreamO1Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
+        self.attn = Attention(
+            num_heads=self.qkv_proj.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.scaling,
+            num_kv_heads=self.qkv_proj.num_kv_heads,
+            prefix=_prefix(prefix, "attn"),
+            role="self",
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         qkv, _ = self.qkv_proj(hidden_states)
@@ -164,20 +175,20 @@ class HiDreamO1Attention(nn.Module):
         query = self.q_norm(query)
         key = self.k_norm(key)
         query, key = _apply_rotary_pos_emb(query, key, *position_embeddings)
-        num_kv_groups = self.qkv_proj.num_heads // self.qkv_proj.num_kv_heads
-        key = repeat_kv(key.transpose(1, 2), num_kv_groups).transpose(1, 2)
-        value = repeat_kv(value.transpose(1, 2), num_kv_groups).transpose(1, 2)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output = self.attn(
             query,
             key,
             value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.scaling,
+            AttentionMetadata(
+                attn_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+            ),
         )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, q_size)
+        attn_output = attn_output.reshape(batch_size, seq_len, q_size)
         attn_output, _ = self.o_proj(attn_output)
         return attn_output
 
@@ -210,11 +221,17 @@ class HiDreamO1DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            full_attn_spans,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -255,12 +272,18 @@ class HiDreamO1TextModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
     ) -> torch.Tensor:
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
         hidden_states = inputs_embeds
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings, attention_mask)
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+            )
         return self.norm(hidden_states)
 
 
@@ -424,7 +447,8 @@ class HiDreamO1ImageModel(nn.Module):
         position_ids: torch.Tensor,
         vinputs: torch.Tensor,
         timestep: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
     ) -> HiDreamO1ImageOutput:
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         timestep_embeds = self.t_embedder1(timestep.to(inputs_embeds.device))
@@ -439,17 +463,27 @@ class HiDreamO1ImageModel(nn.Module):
         inputs_embeds = torch.cat([inputs_embeds, image_embeds], dim=1)
         batch_size, total_seq_len, _ = inputs_embeds.shape
 
-        if attention_mask.shape[0] == 1 and batch_size > 1:
-            attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
-        expected_mask_shape = (batch_size, 1, total_seq_len, total_seq_len)
-        if attention_mask.shape != expected_mask_shape:
-            raise ValueError(f"attention_mask must have shape {expected_mask_shape}, got {tuple(attention_mask.shape)}")
-        attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        if attention_mask is not None:
+            if attention_mask.shape[0] == 1 and batch_size > 1:
+                attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
+            expected_mask_shape = (batch_size, 1, total_seq_len, total_seq_len)
+            if attention_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    f"attention_mask must have shape {expected_mask_shape}, got {tuple(attention_mask.shape)}"
+                )
+            attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+        if full_attn_spans is None or len(full_attn_spans) != batch_size:
+            raise ValueError(
+                f"full_attn_spans must contain one entry per batch item; got {full_attn_spans!r} "
+                f"for batch_size={batch_size}"
+            )
 
         hidden_states = self.language_model(
             inputs_embeds,
             position_ids,
             attention_mask,
+            full_attn_spans,
         )
         return HiDreamO1ImageOutput(x_pred=self.final_layer2(hidden_states))
 
@@ -471,13 +505,20 @@ class HiDreamO1ImageTransformer(nn.Module):
             prefix=_prefix(prefix, "model"),
         )
 
+    @property
+    def supports_piecewise_attention(self) -> bool:
+        return all(
+            layer.self_attn.attn.attn_backend.supports_piecewise_spans for layer in self.model.language_model.layers
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         vinputs: torch.Tensor,
         timestep: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
         **_: object,
     ) -> HiDreamO1ImageOutput:
         return self.model(
@@ -486,6 +527,7 @@ class HiDreamO1ImageTransformer(nn.Module):
             vinputs=vinputs,
             timestep=timestep,
             attention_mask=attention_mask,
+            full_attn_spans=full_attn_spans,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

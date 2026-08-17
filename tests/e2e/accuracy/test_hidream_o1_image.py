@@ -26,7 +26,11 @@ PSNR_THRESHOLD = 19.0
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_hidream_o1_image_tp2_matches_baseline(accuracy_artifact_root: Path) -> None:
+def test_hidream_o1_image_tp2_matches_baseline(
+    accuracy_artifact_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     model = os.environ.get("HIDREAM_O1_IMAGE_MODEL", MODEL_ID)
     with OmniRunner(
         model,

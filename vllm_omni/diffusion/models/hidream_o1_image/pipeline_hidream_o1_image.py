@@ -57,7 +57,8 @@ PREDEFINED_RESOLUTIONS: tuple[tuple[int, int], ...] = (
 class HiDreamO1TextSample(TypedDict):
     input_ids: torch.Tensor
     position_ids: torch.Tensor
-    attention_mask: torch.Tensor
+    attention_mask: torch.Tensor | None
+    full_attn_spans: list[list[tuple[int, int]]]
     vinput_mask: torch.Tensor
 
 
@@ -291,6 +292,33 @@ def build_hidream_o1_attention_mask(
     )
     attention_mask[token_types.bool()] = 0
     return attention_mask.unsqueeze(1)
+
+
+def build_hidream_o1_full_attn_spans(
+    token_types: torch.Tensor,
+) -> list[list[tuple[int, int]]]:
+    """Encode the mixed causal/full rows without allocating an ``S x S`` mask."""
+    if token_types.ndim == 1:
+        token_types = token_types.unsqueeze(0)
+    elif token_types.ndim == 2 and token_types.shape[1] == 1 and token_types.shape[0] != 1:
+        token_types = token_types.transpose(0, 1)
+    if token_types.ndim != 2:
+        raise ValueError(f"token_types must have one or two dimensions, got shape {tuple(token_types.shape)}")
+
+    spans: list[list[tuple[int, int]]] = []
+    for sample_types in token_types:
+        full_rows = sample_types.bool().nonzero(as_tuple=False).flatten()
+        if full_rows.numel() == 0:
+            spans.append([])
+            continue
+
+        start = int(full_rows[0].item())
+        end = int(full_rows[-1].item()) + 1
+        expected = torch.arange(start, end, device=full_rows.device)
+        if not torch.equal(full_rows, expected):
+            raise ValueError("HiDream-O1 full-attention rows must form one contiguous span")
+        spans.append([(start, end)])
+    return spans
 
 
 def build_hidream_o1_scheduler(
@@ -580,7 +608,7 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
                 vinputs=z_in,
                 timestep=t_pixeldit.reshape(-1).to(self.device),
                 attention_mask=sample["attention_mask"],
-                use_flash_attn=False,
+                full_attn_spans=sample["full_attn_spans"],
             )
 
         if outputs.x_pred is None:
@@ -611,14 +639,19 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             raise RuntimeError(
                 f"vinput_mask has {actual_image_len} slots, expected {expected_image_len} for {height}x{width}"
             )
+        full_attn_spans = build_hidream_o1_full_attn_spans(sample["token_types"])
         inputs = {key: value.to(self.device) for key, value in sample.items()}
+        attention_mask = None
+        if not self.model.supports_piecewise_attention:
+            attention_mask = build_hidream_o1_attention_mask(
+                inputs["token_types"],
+                dtype=self.dtype,
+            )
         return {
             "input_ids": inputs["input_ids"],
             "position_ids": inputs["position_ids"],
-            "attention_mask": build_hidream_o1_attention_mask(
-                inputs["token_types"],
-                dtype=self.dtype,
-            ),
+            "attention_mask": attention_mask,
+            "full_attn_spans": full_attn_spans,
             "vinput_mask": inputs["vinput_mask"],
         }
 
