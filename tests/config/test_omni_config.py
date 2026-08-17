@@ -493,6 +493,8 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_multithread_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
+        "cache_backend",
+        "cache_config",
         # Per-stage checkpoint resolution for repos whose stages live in
         # subfolders (e.g. Audex): mirrors StagePipelineConfig on the
         # legacy engine-args path.
@@ -721,6 +723,52 @@ def test_stage_realizations_use_stage_specific_parallel_config_types():
     assert diffusion_stage.parallel_config.cfg_parallel_size == 1
     assert diffusion_stage.parallel_config.sequence_parallel_size == 1
     assert diffusion_stage.parallel_config.ulysses_degree == 1
+
+
+def test_mammoth_structured_cache_bundle_routes_only_to_dit_model_config():
+    omni_config = _from_pipeline_key(
+        "mammoth_moda2",
+        cli_overrides={
+            "cache_backend": "tea_cache",
+            "cache_config": {"rel_l1_thresh": 0.1},
+        },
+    )
+
+    ar_stage = omni_config.stage_by_id(0)
+    dit_stage = omni_config.stage_by_id(1)
+    assert ar_stage.model_config.cache_backend is None
+    assert ar_stage.model_config.cache_config is None
+    assert dit_stage.model_config.cache_backend == "tea_cache"
+    assert dit_stage.model_config.cache_config == {"rel_l1_thresh": 0.1}
+
+
+def test_mammoth_structured_stage_yaml_cache_bundle_wins_over_global_default(tmp_path):
+    deploy_path = tmp_path / "mammoth_cache.yaml"
+    deploy_path.write_text(
+        """
+pipeline: mammoth_moda2
+async_chunk: false
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    cache_backend: tea_cache
+    cache_config:
+      rel_l1_thresh: 0.12
+""",
+        encoding="utf-8",
+    )
+
+    omni_config = _from_pipeline_key(
+        "mammoth_moda2",
+        deploy_config_path=str(deploy_path),
+        cli_overrides={
+            "cache_backend": "tea_cache",
+            "cache_config": {"rel_l1_thresh": 0.18},
+        },
+    )
+
+    assert omni_config.stage_by_id(0).model_config.cache_backend is None
+    assert omni_config.stage_by_id(1).model_config.cache_config == {"rel_l1_thresh": 0.12}
 
 
 def test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding(tmp_path):

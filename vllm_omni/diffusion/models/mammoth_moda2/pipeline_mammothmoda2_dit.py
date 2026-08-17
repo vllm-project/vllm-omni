@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -19,6 +19,9 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Confi
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.cache.base import CacheBackend
 
 logger = init_logger(__name__)
 
@@ -113,6 +116,15 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.make_empty_intermediate_tensors = lambda: None
 
         self._llm_hidden_size = llm_hidden_size
+        self.cache_backend: CacheBackend | None = None
+
+    def set_cache_backend(self, cache_backend: CacheBackend) -> None:
+        self.cache_backend = cache_backend
+
+    def _refresh_cache(self, num_inference_steps: int) -> None:
+        if self.cache_backend is None or not self.cache_backend.is_enabled():
+            return
+        self.cache_backend.refresh(self, num_inference_steps, verbose=False)
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
@@ -215,6 +227,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
         cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
         num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
+        self._refresh_cache(num_inference_steps)
 
         negative_cond = info.get("negative_prompt_embeds")
         negative_attention_mask = info.get("negative_prompt_attention_mask")
@@ -369,6 +382,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 ar_image_hidden_states=ar_image_embeds,
                 ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
+                teacache_branch="positive",
             )
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
@@ -379,6 +393,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                     text_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
+                    teacache_branch="negative",
                 )
                 model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]

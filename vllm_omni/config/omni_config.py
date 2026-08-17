@@ -110,6 +110,8 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enable_multithread_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
+    cache_backend: str
+    cache_config: dict[str, Any] | str
 
 
 class _LoadEngineOverrides(TypedDict, total=False):
@@ -345,6 +347,10 @@ class OmniStageModelConfig:
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
+    # Model-local diffusion cache consumers such as MammothModa2 DiT run on
+    # the generation worker and read these fields from OmniModelConfig.
+    cache_backend: str | None = None
+    cache_config: dict[str, Any] | str | None = None
     # Per-stage checkpoint/tokenizer subdirectories under the model root
     # (e.g. Audex stage 0 → checkpoint_folder_audiogen). Mirrors
     # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
@@ -956,25 +962,62 @@ def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
+    cli_overrides: Mapping[str, Any] | None = None,
+    route_diffusion_cache: bool = False,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
+    stage_overrides = dict(stage_cli_overrides or {})
+    if route_diffusion_cache:
+        cli_overrides = cli_overrides or {}
+        backend_key = f"stage_{topology.stage_id}_cache_backend"
+        config_key = f"stage_{topology.stage_id}_cache_config"
+        scoped_backend = cli_overrides.get(backend_key)
+        scoped_config = cli_overrides.get(config_key)
+        yaml_backend = engine.get("cache_backend")
+        yaml_config = engine.get("cache_config")
+        if scoped_backend is not None or scoped_config is not None:
+            engine.pop("cache_backend", None)
+            engine.pop("cache_config", None)
+            stage_overrides.pop("cache_backend", None)
+            stage_overrides.pop("cache_config", None)
+            if scoped_backend is not None:
+                stage_overrides["cache_backend"] = scoped_backend
+            if scoped_config is not None:
+                stage_overrides["cache_config"] = scoped_config
+        elif yaml_backend is not None or yaml_config is not None:
+            stage_overrides.pop("cache_backend", None)
+            stage_overrides.pop("cache_config", None)
+    elif topology.execution_type != StageExecutionType.DIFFUSION:
+        engine.pop("cache_backend", None)
+        engine.pop("cache_config", None)
+        stage_overrides.pop("cache_backend", None)
+        stage_overrides.pop("cache_config", None)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
-    if stage_cli_overrides:
-        engine.update(_copy_value(stage_cli_overrides))
+    if stage_overrides:
+        engine.update(_copy_value(stage_overrides))
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
         engine,
     )
+    model_engine_fields = _MODEL_ENGINE_FIELDS
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        model_engine_fields = model_engine_fields - {"cache_backend", "cache_config"}
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
             _select_engine_overrides(engine, _QUANTIZATION_ENGINE_FIELDS),
         ),
-        model=cast(_ModelEngineOverrides, _select_engine_overrides(engine, _MODEL_ENGINE_FIELDS)),
+        model=cast(
+            _ModelEngineOverrides,
+            _select_engine_overrides(
+                engine,
+                model_engine_fields,
+            ),
+        ),
         load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, _LOAD_ENGINE_FIELDS)),
         cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, _CACHE_ENGINE_FIELDS)),
         scheduler=cast(
@@ -1559,6 +1602,10 @@ class VllmOmniConfig:
                     deploy_by_id.get(topology.stage_id),
                     topology,
                     _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    cli_overrides,
+                    route_diffusion_cache=(
+                        pipeline_cfg.model_type == "mammoth_moda2" and topology.model_stage == "dit"
+                    ),
                 ),
                 model=model,
             )

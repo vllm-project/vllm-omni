@@ -25,6 +25,7 @@ from vllm_omni.config.stage_config import (
     DeployConfig,
     PipelineConfig,
     StageConfig,
+    StageExecutionType,
     StageType,
     build_stage_runtime_overrides,
     load_deploy_config,
@@ -460,6 +461,33 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            topology = pipeline_cfg.get_stage(stage.stage_id)
+            assert topology is not None
+            is_mammoth_dit = pipeline_cfg.model_type == "mammoth_moda2" and topology.model_stage == "dit"
+            if is_mammoth_dit:
+                backend_key = f"stage_{stage.stage_id}_cache_backend"
+                config_key = f"stage_{stage.stage_id}_cache_config"
+                scoped_backend = explicit_overrides.get(backend_key)
+                scoped_config = explicit_overrides.get(config_key)
+                yaml_backend = stage.yaml_engine_args.get("cache_backend")
+                yaml_config = stage.yaml_engine_args.get("cache_config")
+                if scoped_backend is not None or scoped_config is not None:
+                    stage.runtime_overrides.pop("cache_backend", None)
+                    stage.runtime_overrides.pop("cache_config", None)
+                    stage.yaml_engine_args.pop("cache_backend", None)
+                    stage.yaml_engine_args.pop("cache_config", None)
+                    if scoped_backend is not None:
+                        stage.runtime_overrides["cache_backend"] = scoped_backend
+                    if scoped_config is not None:
+                        stage.runtime_overrides["cache_config"] = scoped_config
+                elif yaml_backend is not None or yaml_config is not None:
+                    stage.runtime_overrides.pop("cache_backend", None)
+                    stage.runtime_overrides.pop("cache_config", None)
+            elif topology.execution_type != StageExecutionType.DIFFUSION:
+                stage.runtime_overrides.pop("cache_backend", None)
+                stage.runtime_overrides.pop("cache_config", None)
+                stage.yaml_engine_args.pop("cache_backend", None)
+                stage.yaml_engine_args.pop("cache_config", None)
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)

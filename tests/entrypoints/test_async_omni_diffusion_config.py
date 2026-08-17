@@ -46,6 +46,16 @@ def test_default_cache_config_used_when_missing():
     assert cache_config["Fn_compute_blocks"] == 1
 
 
+def test_teacache_default_config_preserves_single_stage_threshold():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "cache_backend": "tea_cache",
+        }
+    )[0]
+
+    assert stage_cfg["engine_args"]["cache_config"] == {"rel_l1_thresh": 0.2}
+
+
 def test_default_stage_devices_from_sequence_parallel():
     """Ensure runtime devices reflect computed diffusion world size."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

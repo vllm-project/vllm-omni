@@ -28,7 +28,7 @@ def test_no_ambiguous_overlap_with_real_engine():
     """
     # Fields on both classes by design: orchestrator captures them to prevent
     # uniform per-stage propagation; redistributed via DeployConfig.
-    orchestrator_captured = {"async_chunk", "tokenizer"}
+    orchestrator_captured = {"async_chunk", "tokenizer", "cache_backend", "cache_config"}
 
     orch = orchestrator_field_names()
     engine = {f.name for f in fields(OmniEngineArgs)}
@@ -49,3 +49,8 @@ def test_internal_blacklist_keys_derived_from_orchestrator():
     """
     blacklist = internal_blacklist_keys()
     assert blacklist == orchestrator_field_names() - SHARED_FIELDS
+
+
+def test_diffusion_cache_bundle_is_not_a_shared_field():
+    assert "cache_backend" not in SHARED_FIELDS
+    assert "cache_config" not in SHARED_FIELDS

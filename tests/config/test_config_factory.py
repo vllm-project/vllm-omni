@@ -506,6 +506,24 @@ class TestStageConfigFactory:
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
 
+    def test_generic_runtime_overrides_keep_deploy_cache_fields(self):
+        overrides = build_stage_runtime_overrides(
+            1,
+            {
+                "cache_backend": "tea_cache",
+                "cache_config": {"rel_l1_thresh": 0.1},
+                "stage_1_cache_backend": "cache_dit",
+                "stage_1_cache_config": {"Fn_compute_blocks": 2},
+                "stage_1_gpu_memory_utilization": 0.6,
+            },
+        )
+
+        assert overrides == {
+            "cache_backend": "cache_dit",
+            "cache_config": {"Fn_compute_blocks": 2},
+            "gpu_memory_utilization": 0.6,
+        }
+
     def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self):
         # Pass the same filter set the function uses by default
         # (orchestrator-only fields plus SHARED_FIELDS so ``model`` is
@@ -1297,6 +1315,170 @@ stages:
         assert stages[-1].final_output_type == final_output_type
         if deploy.trust_remote_code is not None:
             assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
+
+    def test_mammoth_cache_cli_overrides_reach_dit_stage(self):
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={"cache_backend": "tea_cache"},
+            deploy_config_path=get_deploy_config_path("mammoth_moda2.yaml"),
+        )
+
+        ar_stage = stages[0].to_omegaconf()
+        dit_stage = stages[1].to_omegaconf()
+        assert "cache_backend" not in ar_stage.engine_args
+        assert "cache_config" not in ar_stage.engine_args
+        assert dit_stage.engine_args.model_stage == "dit"
+        assert dit_stage.engine_args.cache_backend == "tea_cache"
+        assert "cache_config" not in dit_stage.engine_args
+
+    def test_mammoth_global_cache_bundle_preserves_explicit_config(self):
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={
+                "cache_backend": "tea_cache",
+                "cache_config": {"rel_l1_thresh": 0.13},
+            },
+            deploy_config_path=get_deploy_config_path("mammoth_moda2.yaml"),
+        )
+
+        assert stages[1].to_omegaconf().engine_args.cache_config == {"rel_l1_thresh": 0.13}
+
+    def test_mammoth_stage_yaml_cache_bundle_wins_over_global_default(self, tmp_path):
+        deploy_path = tmp_path / "mammoth_cache.yaml"
+        deploy_path.write_text(
+            """
+pipeline: mammoth_moda2
+async_chunk: false
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    cache_backend: tea_cache
+    cache_config:
+      rel_l1_thresh: 0.12
+""",
+            encoding="utf-8",
+        )
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={
+                "cache_backend": "tea_cache",
+                "cache_config": {"rel_l1_thresh": 0.18},
+            },
+            deploy_config_path=str(deploy_path),
+        )
+
+        assert "cache_backend" not in stages[0].to_omegaconf().engine_args
+        assert stages[1].to_omegaconf().engine_args.cache_config == {"rel_l1_thresh": 0.12}
+
+    def test_mammoth_stage_scoped_cache_backend_replaces_yaml_bundle(self, tmp_path):
+        deploy_path = tmp_path / "mammoth_cache.yaml"
+        deploy_path.write_text(
+            """
+pipeline: mammoth_moda2
+async_chunk: false
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    cache_backend: tea_cache
+    cache_config:
+      rel_l1_thresh: 0.12
+""",
+            encoding="utf-8",
+        )
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={"stage_1_cache_backend": "tea_cache"},
+            deploy_config_path=str(deploy_path),
+        )
+
+        engine_args = stages[1].to_omegaconf().engine_args
+        assert engine_args.cache_backend == "tea_cache"
+        assert "cache_config" not in engine_args
+
+    def test_mammoth_cache_config_does_not_borrow_backend_from_yaml(self, tmp_path):
+        deploy_path = tmp_path / "mammoth_cache.yaml"
+        deploy_path.write_text(
+            """
+pipeline: mammoth_moda2
+async_chunk: false
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    cache_backend: tea_cache
+""",
+            encoding="utf-8",
+        )
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={"stage_1_cache_config": {"rel_l1_thresh": 0.11}},
+            deploy_config_path=str(deploy_path),
+        )
+
+        engine_args = stages[1].to_omegaconf().engine_args
+        assert "cache_backend" not in engine_args
+        assert engine_args.cache_config == {"rel_l1_thresh": 0.11}
+
+    def test_mammoth_unsupported_cache_backend_routes_only_to_dit(self):
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={"cache_backend": "cache_dit"},
+            deploy_config_path=get_deploy_config_path("mammoth_moda2.yaml"),
+        )
+
+        assert "cache_backend" not in stages[0].to_omegaconf().engine_args
+        assert stages[1].to_omegaconf().engine_args.cache_backend == "cache_dit"
+
+    def test_standard_diffusion_stage_keeps_global_cache_compatibility(self):
+        pipeline = PipelineConfig(
+            model_type="test_diffusion",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                ),
+            ),
+        )
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={
+                "cache_backend": "cache_dit",
+                "cache_config": {"Fn_compute_blocks": 2},
+            },
+        )
+
+        engine_args = stages[0].to_omegaconf().engine_args
+        assert engine_args.cache_backend == "cache_dit"
+        assert engine_args.cache_config == {"Fn_compute_blocks": 2}
+
+    def test_non_diffusion_pipeline_ignores_global_diffusion_cache_bundle(self):
+        pipeline = PipelineConfig(
+            model_type="test_llm",
+            stages=(StagePipelineConfig(stage_id=0, model_stage="ar"),),
+        )
+
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            cli_overrides={
+                "cache_backend": "tea_cache",
+                "cache_config": {"rel_l1_thresh": 0.1},
+            },
+        )
+
+        engine_args = stages[0].to_omegaconf().engine_args
+        assert "cache_backend" not in engine_args
+        assert "cache_config" not in engine_args
 
     @pytest.mark.parametrize(
         ("config_json", "model_index", "expected_pipeline"),
@@ -2462,7 +2644,6 @@ stages:
                 "ring_degree": 4,
                 "cfg_parallel_size": 2,
                 "vae_patch_parallel_size": 2,
-                "cache_backend": "tea_cache",
                 "use_hsdp": True,
                 "hsdp_shard_size": 8,
                 "hsdp_replicate_size": 2,
@@ -2478,7 +2659,7 @@ stages:
 
         omega_config = stage.to_omegaconf()
 
-        assert omega_config.engine_args.cache_backend == "tea_cache"
+        assert omega_config.engine_args.cache_backend == "cache_dit"
         assert omega_config.engine_args.diffusion_attention_backend == "SAGE_ATTN"
         assert omega_config.engine_args.diffusion_kv_cache_dtype == "fp8"
         assert omega_config.engine_args.step_execution is True

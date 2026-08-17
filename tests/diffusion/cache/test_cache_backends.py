@@ -571,6 +571,57 @@ class TestTeaCacheBackend:
         backend.refresh(mock_pipeline, num_inference_steps=50)
         mock_registry.reset_hook.assert_called_once()
 
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_uses_gen_transformer(self, mock_apply_hook):
+        """MammothModa2 exposes its DiT as gen_transformer, not transformer."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        mock_apply_hook.assert_called_once()
+        transformer_arg, config_arg = mock_apply_hook.call_args.args
+        assert transformer_arg is mock_pipeline.gen_transformer
+        assert config_arg.transformer_type == "MammothModa2Transformer2DModel"
+        assert config_arg.rel_l1_thresh == 0.1
+        assert mock_pipeline.transformer is mock_pipeline.gen_transformer
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_preserves_explicit_threshold(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        pipeline.gen_transformer = Mock()
+        del pipeline.transformer
+
+        TeaCacheBackend(DiffusionCacheConfig(rel_l1_thresh=0.05)).enable(pipeline)
+
+        assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.05
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_refresh_mammoth_moda2_resets_gen_transformer_hook(self, mock_apply_hook):
+        """Refresh should find the hook through the transformer alias set by the enabler."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        mock_hook = Mock()
+        mock_registry = Mock()
+        mock_registry.get_hook = Mock(return_value=mock_hook)
+        mock_registry.reset_hook = Mock()
+        mock_pipeline.gen_transformer._hook_registry = mock_registry
+
+        backend.refresh(mock_pipeline, num_inference_steps=12)
+
+        mock_registry.reset_hook.assert_called_once_with("teacache")
+
 
 class TestCacheSelector:
     """Test cache backend selector function."""

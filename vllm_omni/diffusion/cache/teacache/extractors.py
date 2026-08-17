@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -819,6 +820,114 @@ def extract_longcat_context(
     )
 
 
+def extract_mammoth_moda2_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_hidden_states: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    ar_image_hidden_states: torch.Tensor | None = None,
+    ar_image_attention_mask: torch.Tensor | None = None,
+    return_dict: bool = False,
+    teacache_branch: str | None = None,
+) -> CacheContext:
+    """Extract cache context for MammothModa2's Lumina-style DiT."""
+    if not hasattr(module, "layers") or len(module.layers) == 0:
+        raise ValueError("Module must have layers")
+
+    batch_size, height, width = module._validate_inputs(
+        hidden_states,
+        text_hidden_states,
+        text_attention_mask,
+        ref_image_hidden_states,
+        return_dict,
+    )
+
+    (
+        temb,
+        text_hidden_states,
+        text_attention_mask,
+        img_tokens,
+        img_mask,
+        img_len,
+        context_rotary_emb,
+        noise_rotary_emb,
+        rotary_emb,
+        encoder_seq_lengths,
+        seq_lengths,
+    ) = module._prepare_embeddings(
+        hidden_states,
+        timestep,
+        text_hidden_states,
+        text_attention_mask,
+        freqs_cis,
+        batch_size,
+        height,
+        width,
+        ar_image_hidden_states,
+        ar_image_attention_mask,
+    )
+
+    text_hidden_states, img_tokens = module._apply_refiners(
+        text_hidden_states,
+        text_attention_mask,
+        context_rotary_emb,
+        img_tokens,
+        img_mask,
+        noise_rotary_emb,
+        temb,
+    )
+
+    max_seq_len = max(seq_lengths)
+    attention_mask = img_tokens.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
+    joint_hidden_states = img_tokens.new_zeros(batch_size, max_seq_len, module.config.hidden_size)
+    for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        attention_mask[i, :seq_len] = True
+        joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
+        joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
+
+    modulated_input = module.layers[0].norm1(joint_hidden_states, temb)[0]
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = module._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> torch.Tensor:
+        h = module.norm_out(h, temb)
+        p = module.config.patch_size
+        img_hidden_states = torch.stack(
+            [
+                h[i, encoder_seq_len : encoder_seq_len + img_len]
+                for i, encoder_seq_len in enumerate(encoder_seq_lengths)
+            ],
+            dim=0,
+        )
+        return rearrange(
+            img_hidden_states,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=height // p,
+            w=width // p,
+            p1=p,
+            p2=p,
+        )
+
+    extra_states = {}
+    if teacache_branch is not None:
+        extra_states["teacache_branch"] = teacache_branch
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=joint_hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states=extra_states,
+    )
+
+
 def extract_stable_audio_context(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -1411,6 +1520,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "StableAudioDiTModel": extract_stable_audio_context,
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
+    "MammothModa2Transformer2DModel": extract_mammoth_moda2_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
     "MiniMaxH3DiTModel": extract_minimax_h3_context,

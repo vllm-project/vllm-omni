@@ -8,8 +8,9 @@ This module provides the TeaCache backend that implements the CacheBackend
 interface using the hooks-based TeaCache system.
 """
 
-from typing import Any
+from typing import Any, Protocol
 
+import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
@@ -18,6 +19,11 @@ from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
+
+
+class _MammothModa2TeaCachePipeline(Protocol):
+    gen_transformer: nn.Module
+    transformer: nn.Module
 
 
 def enable_hunyuan_image3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
@@ -48,6 +54,23 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
         coefficients=config.coefficients,
     )
     transformer = pipeline.bagel
+    apply_teacache_hook(transformer, teacache_config)
+    pipeline.transformer = transformer
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
+def enable_mammoth_moda2_teacache(pipeline: _MammothModa2TeaCachePipeline, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for MammothModa2's DiT stage."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="MammothModa2Transformer2DModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.gen_transformer
     apply_teacache_hook(transformer, teacache_config)
     pipeline.transformer = transformer
 
@@ -124,6 +147,7 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "MammothModa2DiTPipeline": enable_mammoth_moda2_teacache,
     "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }

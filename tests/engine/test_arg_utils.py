@@ -42,6 +42,26 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
+def test_stage_cache_bundle_reaches_model_config(mocker):
+    cache_config = {"rel_l1_thresh": 0.1}
+    base_model_config = SimpleNamespace()
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=base_model_config)
+    from_vllm_model_config = mocker.patch.object(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        side_effect=lambda model_config, **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    cfg = OmniEngineArgs(
+        cache_backend="tea_cache",
+        cache_config=cache_config,
+    ).create_model_config()
+
+    assert from_vllm_model_config.call_args.kwargs["model_config"] is base_model_config
+    assert cfg.cache_backend == "tea_cache"
+    assert cfg.cache_config == cache_config
+
+
 def test_multimodal_kwarg_overrides(mocker):
     """Ensure that overrides in the multimodal config are preserved."""
     sig = inspect.signature(OmniEngineArgs)

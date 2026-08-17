@@ -196,6 +196,8 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    cache_backend: str = "none"
+    cache_config: dict[str, Any] | str | None = None
     worker_type: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
@@ -409,6 +411,8 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            cache_backend=getattr(self, "cache_backend", "none"),
+            cache_config=getattr(self, "cache_config", None),
         )
         return omni_config
 
@@ -532,7 +536,7 @@ class OrchestratorArgs:
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
-    cache_config: str | None = None
+    cache_config: dict[str, Any] | str | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False

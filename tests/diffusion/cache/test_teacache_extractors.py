@@ -27,16 +27,23 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_mammoth_moda2_context,
     extract_minimax_h3_context,
 )
+from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
+    Transformer2DModel as MammothModa2Transformer2DModel,
+)
+from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
 pytestmark = [pytest.mark.core_model]
 
@@ -75,6 +82,121 @@ class BaseExtractorTest(ABC):
     def get_sample_inputs(self):
         """Return sample inputs for model."""
         pass
+
+
+@pytest.mark.cpu
+class TestMammothModa2Extractor(BaseExtractorTest):
+    """Test extract_mammoth_moda2_context function."""
+
+    def get_extractor(self):
+        return extract_mammoth_moda2_context
+
+    @pytest.fixture
+    def mammoth_module(self):
+        return MammothModa2Transformer2DModel(
+            patch_size=2,
+            in_channels=4,
+            hidden_size=16,
+            num_layers=2,
+            num_refiner_layers=1,
+            num_attention_heads=2,
+            num_kv_heads=1,
+            axes_dim_rope=(2, 2, 4),
+            axes_lens=(16, 16, 16),
+            text_feat_dim=8,
+        )
+
+    def get_module(self, mammoth_module):
+        return mammoth_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        return {
+            "hidden_states": torch.randn(1, 4, 4, 4),
+            "timestep": torch.tensor([500.0]),
+            "text_hidden_states": torch.randn(1, 3, 8),
+            "text_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+            "freqs_cis": RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (16, 16, 16), theta=10000),
+        }
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    def test_context_shapes_and_postprocess(self, mammoth_module, sample_inputs):
+        context = extract_mammoth_moda2_context(mammoth_module, **sample_inputs)
+
+        assert context.modulated_input.shape == context.hidden_states.shape
+        assert context.encoder_hidden_states is None
+        assert context.temb.shape[0] == 1
+
+        outputs = context.run_transformer_blocks()
+        assert len(outputs) == 1
+        assert outputs[0].shape == context.hidden_states.shape
+
+        output = context.postprocess(context.hidden_states)
+        assert output.shape == sample_inputs["hidden_states"].shape
+
+    def test_branch_hint_is_preserved(self, mammoth_module, sample_inputs):
+        context = extract_mammoth_moda2_context(
+            mammoth_module,
+            **sample_inputs,
+            teacache_branch="positive",
+        )
+
+        assert context.extra_states is not None
+        assert context.extra_states["teacache_branch"] == "positive"
+
+    def test_hook_keeps_positive_and_negative_branch_state_separate(self, mammoth_module, sample_inputs, monkeypatch):
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=999.0,
+        )
+        apply_teacache_hook(mammoth_module, config)
+
+        original_apply_layers = mammoth_module._apply_transformer_layers
+        apply_layers_mock = Mock(wraps=original_apply_layers)
+        monkeypatch.setattr(mammoth_module, "_apply_transformer_layers", apply_layers_mock)
+
+        mammoth_module(**sample_inputs, teacache_branch="positive")
+        assert apply_layers_mock.call_count == 1
+
+        mammoth_module(**sample_inputs, teacache_branch="positive")
+        assert apply_layers_mock.call_count == 1
+
+        mammoth_module(**sample_inputs, teacache_branch="negative")
+        assert apply_layers_mock.call_count == 2
+
+    def test_hook_rejects_invalid_branch_hint(self, mammoth_module, sample_inputs):
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=999.0,
+        )
+        apply_teacache_hook(mammoth_module, config)
+
+        with pytest.raises(ValueError, match="teacache_branch"):
+            mammoth_module(**sample_inputs, teacache_branch="bad")
+
+    def test_forced_full_compute_matches_original_forward(self, mammoth_module, sample_inputs, monkeypatch):
+        with torch.no_grad():
+            expected = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=0.1,
+        )
+        apply_teacache_hook(mammoth_module, config)
+        hook = mammoth_module._hook_registry.get_hook("teacache")
+        should_compute_full = Mock(return_value=True)
+        monkeypatch.setattr(hook, "_should_compute_full_transformer", should_compute_full)
+
+        with torch.no_grad():
+            actual = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        should_compute_full.assert_called_once()
+        torch.testing.assert_close(actual, expected)
 
 
 class TestFlux2KleinExtractor(BaseExtractorTest):
