@@ -884,8 +884,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     try_set_result(fut, msg)
         elif msg.kind == AsyncOutputKind.OUTPUT_READY:
             batch_id = msg.async_output_id
+            if not batch_id:
+                # async_output_id is what routes the result back to its waiter.
+                # Without it there is nobody to resolve and nothing to cache, so
+                # the request hangs until its own timeout — say so rather than
+                # dropping the message silently.
+                logger.error("Dropping OUTPUT_READY with no async_output_id; its request cannot be resolved")
+                return
             with self._futures_lock:
-                per_req_map = self._batch_split_map.pop(batch_id, None) if batch_id else None
+                per_req_map = self._batch_split_map.pop(batch_id, None)
             if per_req_map is not None:
                 # Batch result: split into per-request DiffusionOutputs.
                 try:
@@ -907,32 +914,31 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         logger.exception("SHM unpack failed in result pump")
                         exc = e
 
-                if batch_id:
-                    with self._futures_lock:
-                        pending = self._output_futures.pop(batch_id, None)
-                        if pending is not None and not pending.done():
-                            if exc is not None:
-                                try_set_exception(pending, exc)
-                            else:
-                                try_set_result(pending, output_result)
-                        elif pending is not None:
-                            # The waiter resolved itself first — cancelled by an
-                            # inter-output timeout, or aborted. Nothing will ever
-                            # collect a cached copy for it, so drop the result
-                            # instead of pinning the unpacked output (a whole
-                            # decoded video, for a t2va request) until shutdown.
-                            logger.debug(
-                                "Dropping output for %s: waiter already %s",
-                                batch_id,
-                                "cancelled" if pending.cancelled() else "resolved",
-                            )
+                with self._futures_lock:
+                    pending = self._output_futures.pop(batch_id, None)
+                    if pending is not None and not pending.done():
+                        if exc is not None:
+                            try_set_exception(pending, exc)
                         else:
-                            fut = concurrent.futures.Future()
-                            if exc is not None:
-                                fut.set_exception(exc)
-                            else:
-                                fut.set_result(output_result)
-                            self._completed_outputs[batch_id] = fut
+                            try_set_result(pending, output_result)
+                    elif pending is not None:
+                        # The waiter resolved itself first — cancelled by an
+                        # inter-output timeout, or aborted. Nothing will ever
+                        # collect a cached copy for it, so drop the result
+                        # instead of pinning the unpacked output (a whole
+                        # decoded video, for a t2va request) until shutdown.
+                        logger.debug(
+                            "Dropping output for %s: waiter already %s",
+                            batch_id,
+                            "cancelled" if pending.cancelled() else "resolved",
+                        )
+                    else:
+                        fut = concurrent.futures.Future()
+                        if exc is not None:
+                            fut.set_exception(exc)
+                        else:
+                            fut.set_result(output_result)
+                        self._completed_outputs[batch_id] = fut
 
     def _deliver_batch_split(
         self,

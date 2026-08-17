@@ -3,6 +3,7 @@
 """Unit tests for MultiprocDiffusionExecutor async result pump and wait_output_ready."""
 
 import concurrent.futures
+import logging
 import queue
 import threading
 import time
@@ -612,6 +613,23 @@ class TestResultPumpDropsOutputForAbandonedWaiter:
         assert executor._completed_outputs == {}
         assert healthy.done()
         assert healthy.result(timeout=1.0) is outputs["r-healthy"]
+
+    def test_output_ready_without_an_id_is_logged_not_silently_dropped(self, caplog):
+        """async_output_id is what routes a result back to its waiter, so a
+        message without one strands its request; it must not pass unnoticed.
+        """
+        executor = _make_executor()
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=None,
+            output=DiffusionOutput(output="unroutable"),
+        )
+        with caplog.at_level(logging.ERROR):
+            pump = _feed_one_msg_to_pump(executor, msg)
+
+        assert not pump.is_alive()
+        assert executor._completed_outputs == {}
+        assert "no async_output_id" in caplog.text
 
     def test_output_with_no_waiter_is_still_cached(self):
         """The pre-existing early-arrival path must keep working."""
