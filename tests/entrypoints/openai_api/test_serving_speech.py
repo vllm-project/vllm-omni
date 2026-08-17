@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
     SPEAKER_EMBEDDING_DIM,
+    TEXT_EOS_TOKEN_ID,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -3618,7 +3619,21 @@ class TestCosyVoice3Serving:
         assert error is not None
         assert "max_new_tokens" in error
 
-    def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server, mocker: MockerFixture):
+    @pytest.mark.parametrize(
+        ("max_new_tokens", "expected_min_tokens", "expected_max_tokens"),
+        [
+            (None, 10, 2000),
+            (5, 5, 5),
+        ],
+    )
+    def test_prepare_speech_generation_cosyvoice3(
+        self,
+        cosyvoice3_server,
+        mocker: MockerFixture,
+        max_new_tokens: int | None,
+        expected_min_tokens: int,
+        expected_max_tokens: int,
+    ):
         cosyvoice3_server._build_cosyvoice3_prompt = mocker.AsyncMock(
             return_value={
                 "prompt": "Hello",
@@ -3626,15 +3641,23 @@ class TestCosyVoice3Serving:
                 "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
             }
         )
-        cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
+        cosyvoice3_server.model_config.hf_config = SimpleNamespace(
+            min_token_text_ratio=1, max_token_text_ratio=200, allowed_special=True
+        )
+        cosyvoice3_server._cosyvoice3_tokenizer = mocker.MagicMock()
+        mocker.patch("vllm_omni.model_executor.models.cosyvoice3.utils.extract_text_token", return_value=[None, 10])
 
         request = OpenAICreateSpeechRequest(
             input="Hello",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="Reference text",
+            max_new_tokens=max_new_tokens,
         )
         request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
+        sampling_params = cosyvoice3_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
 
+        assert sampling_params.min_tokens == expected_min_tokens
+        assert sampling_params.max_tokens == expected_max_tokens
         assert request_id.startswith("speech-")
         assert generator == "generator"
         assert tts_params == {}
@@ -3717,6 +3740,90 @@ class TestGLMTTSServing:
 
         assert text_token_len == 3
         load_tokenizer.assert_called_once()
+
+    def test_prepare_speech_generation_glm_tts(self, glm_tts_server, mocker: MockerFixture):
+        glm_tts_server._build_glm_tts_prompt = mocker.AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+        glm_tts_server.model_config.hf_config = SimpleNamespace(min_token_text_ratio=1, max_token_text_ratio=200)
+        glm_tts_server._estimate_glm_tts_text_token_len = mocker.MagicMock(return_value=10)
+        request_id, generator, tts_params = asyncio.run(glm_tts_server._prepare_speech_generation(request))
+        sampling_params = glm_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+
+        assert sampling_params.min_tokens == 10
+        assert sampling_params.max_tokens == 2000
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        assert tts_params == {}
+        glm_tts_server._build_glm_tts_prompt.assert_awaited_once()
+
+
+@pytest.fixture
+def ming_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="inclusionAI/Ming-omni-tts-0.5B",
+        hf_config=SimpleNamespace(min_token_text_ratio=2, max_token_text_ratio=20),
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(
+                model_stage="llm", model_arch="MingTTSForConditionalGeneration", worker_type="ar"
+            ),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestMingTTSServing:
+    def test_prepare_speech_generation_ming(self, ming_tts_server, mocker: MockerFixture):
+        ming_tts_server._adapter.build = mocker.AsyncMock(
+            return_value=PreparedRequest(
+                prompt={"prompt": "hello"},
+                tts_params={},
+                model_type="ming_tts",
+            )
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+            max_new_tokens=7,
+        )
+        asyncio.run(ming_tts_server._prepare_speech_generation(request))
+
+        assert ming_tts_server._tts_model_type == "ming_tts"
+        ming_tts_server._adapter.build.assert_awaited_once()
+        sampling_params = ming_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert sampling_params.stop_token_ids == [TEXT_EOS_TOKEN_ID]
+        assert sampling_params.max_tokens == 8
 
 
 @pytest.fixture
@@ -3900,6 +4007,9 @@ class TestTTSAsyncOffloading:
                     tts_params={},
                     model_type=adapter_model_type,
                 )
+
+            def apply_sampling_overrides(self, sampling_params_list, request, prompt, request_id=None):
+                return sampling_params_list
 
         voxtral_server._tts_model_type = legacy_tts_model_type
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())

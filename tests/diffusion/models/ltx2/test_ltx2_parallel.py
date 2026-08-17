@@ -28,6 +28,15 @@ def test_velocity_from_x0_uses_official_host_scalar_sigma(mocker):
 class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
 
+    def test_single_guidance_pass_preserves_official_token_layout(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_guidance import _repeat_batch
+
+        tokens = torch.randn(1, 16, 32).transpose(1, 2).contiguous().transpose(1, 2)
+        repeated = _repeat_batch(tokens, 1)
+
+        assert repeated is tokens
+        assert repeated.stride() == tokens.stride()
+
     def test_combine_cfg_noise_matches_x0_space_formula(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 

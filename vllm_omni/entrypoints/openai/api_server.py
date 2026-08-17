@@ -43,6 +43,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -1481,8 +1482,7 @@ async def list_voices(raw_request: Request):
             status_code=HTTPStatus.NOT_FOUND,
         )
 
-    # Get all speakers (both model built-in and uploaded)
-    speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
+    speakers = sorted(handler._get_available_voices())
 
     # Get uploaded speakers details
     uploaded_speakers = []
@@ -3826,26 +3826,16 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    from vllm.entrypoints.openai.cli_args import make_arg_parser
-
     parser = TrackingArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
-    registered_flags = set()
-    for action in parser._actions:
-        registered_flags.update(action.option_strings)
-
-    # FIXME - this is broken on `main`. `make_arg_parser` does not handle omni engine args properly.
-    if "--omni" not in registered_flags:
-        parser.add_argument("--omni", action="store_true", default=False, help="Enable vLLM-Omni mode.")
-    if "--enable-sleep-mode" not in registered_flags:
-        parser.add_argument(
-            "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
-        )
+    # Ensure that passing --omni won't crash the server.
+    # NOTE: the value here does not matter since we are always running the Omni server
+    # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
+    parser.add_argument("--omni", action="store_true", default=False)
     args = parser.parse_args()
-    if not hasattr(args, "model_tag"):
-        setattr(args, "model_tag", args.model)
-    if hasattr(args, "model_tag") and args.model_tag is None:
-        args.model_tag = args.model
+    # sync args.model to model_tag, because if we pass the model positionally,
+    # args.model will be the default from vLLM's ModelConfig (currently
+    # Qwen/Qwen3-0.6B) and crash cryptically.
+    if args.model_tag is not None:
+        args.model = args.model_tag
     asyncio.run(omni_run_server(args))

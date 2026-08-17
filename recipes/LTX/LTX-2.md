@@ -8,10 +8,12 @@
 |---|---|---|
 | `LTX2Pipeline` | LTX-2 one-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
-| `LTX2DistilledPipeline` | LTX-2 full-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
+| `LTX2DistilledOneStagePipeline` | LTX-2 merged-distilled one-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
+| `LTX2DistilledTwoStagePipeline` | LTX-2 merged-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
 | `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
 | `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
-| `LTX2DistilledPipeline` | LTX-2.3 full-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
+| `LTX2DistilledOneStagePipeline` | LTX-2.3 merged-distilled one-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers` |
+| `LTX2DistilledTwoStagePipeline` | LTX-2.3 merged-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
 
 Repositories in the table are download units. A full pipeline repository
 contains the Transformer, text encoder, connectors, VAEs, vocoder, scheduler,
@@ -26,9 +28,12 @@ image selects I2V. Both one-stage repositories declare this class, so
 the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 
 `LTX2TwoStagePipeline` samples the regular model at half resolution, upsamples,
-then refines with the distilled LoRA. `LTX2DistilledPipeline` uses a fully
-merged distilled Transformer in both stages. Both entries support T2V and I2V;
-select their class explicitly.
+then refines with the distilled LoRA. `LTX2DistilledOneStagePipeline` uses a
+merged distilled Transformer without upsampling, while
+`LTX2DistilledTwoStagePipeline` uses it in both stages. All entries support
+T2V and I2V; select their class explicitly. The deprecated
+`LTX2DistilledPipeline` name remains an alias for
+`LTX2DistilledTwoStagePipeline`.
 
 ## API Migration
 
@@ -52,8 +57,8 @@ The consolidation also removes these registry names without aliases:
 | `LTX23Pipeline` | `LTX2Pipeline`; checkpoint metadata selects LTX-2.3 |
 | `LTX2ImageToVideoPipeline` | `LTX2Pipeline` with `image=` |
 | `LTX23ImageToVideoPipeline` | `LTX2Pipeline` with `image=`; checkpoint metadata selects LTX-2.3 |
-| `LTX2TwoStagesPipeline` | `LTX2DistilledPipeline` |
-| `LTX2ImageToVideoTwoStagesPipeline` | `LTX2DistilledPipeline` with `image=` |
+| `LTX2TwoStagesPipeline` | `LTX2DistilledTwoStagePipeline` |
+| `LTX2ImageToVideoTwoStagesPipeline` | `LTX2DistilledTwoStagePipeline` with `image=` |
 
 Passing any second positional argument now raises `TypeError`. These changes
 affect direct Python callers and explicit `--model-class-name` overrides;
@@ -112,10 +117,10 @@ Start a two-stage checkpoint with its explicit class:
 
 ```bash
 vllm serve rootonchair/LTX-2-19b-distilled --omni \
-  --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
+  --model-class-name LTX2DistilledTwoStagePipeline --stage-init-timeout 600
 # LTX-2.3 full-distilled; the v1.1 x2 upsampler is resolved when absent
 vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
-  --model-class-name LTX2DistilledPipeline --stage-init-timeout 600
+  --model-class-name LTX2DistilledTwoStagePipeline --stage-init-timeout 600
 # Ordinary LTX-2.3 two-stage
 vllm serve diffusers/LTX-2.3-Diffusers --omni \
   --model-class-name LTX2TwoStagePipeline \

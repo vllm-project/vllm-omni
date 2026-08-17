@@ -43,6 +43,7 @@ nav:
     - Overview: features/README.md
     - Runtime and Stage Execution:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
+      - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Sleep Mode: features/sleep_mode.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
@@ -60,7 +61,11 @@ nav:
       - Overview and Compatibility:
         - Overview: user_guide/diffusion_features.md
         - Feature Compatibility: user_guide/feature_compatibility.md
-      - CPU Offloading: user_guide/diffusion/cpu_offload.md
+      - CPU Offloading:
+        - Overview: user_guide/diffusion/cpu_offload.md
+        - Model-Level: user_guide/diffusion/offloader/cpu_offload.md
+        - Layerwise: user_guide/diffusion/offloader/layerwise_offload.md
+        - Distributed Layerwise: user_guide/diffusion/offloader/distributed_layerwise_offload.md
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
@@ -72,7 +77,13 @@ nav:
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
         - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
-      - Attention Backends: user_guide/diffusion/attention_backends.md
+      - Attention Backends:
+        - Overview: user_guide/diffusion/attention_backends.md
+        - Dense Backends: user_guide/diffusion/attention_backends/dense_backends.md
+        - TRTLLM: user_guide/diffusion/attention_backends/trtllm.md
+        - SageAttention: user_guide/diffusion/attention_backends/sage.md
+        - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
+        - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
@@ -106,6 +117,7 @@ nav:
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
+        - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
       - Communication:
         - OmniConnector Implementations:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md
@@ -125,11 +137,16 @@ nav:
           - Tensor Parallel: design/feature/tensor_parallel.md
           - VAE Patch Parallelism: design/feature/vae_parallel.md
         - Attention Optimization:
+          - Backend Selection: design/feature/attention_backend_selection.md
           - Skip-Softmax: design/feature/skip_softmax.md
+        - CPU Offloading:
+          - Overview: design/feature/offloader/README.md
+          - Model-Level: design/feature/offloader/cpu_offload.md
+          - Layerwise: design/feature/offloader/layerwise_offload.md
+          - Distributed Layerwise: design/feature/offloader/distributed_layerwise_offload.md
         - Cache-DiT: design/feature/cache_dit.md
         - TeaCache: design/feature/teacache.md
         - Diffusion Continuous Batching: design/feature/diffusion_continuous_batching.md
-        - Distributed Layerwise Offload: design/feature/distributed_layerwise_offload.md
     - Infrastructure and Performance:
       - Prometheus Metrics: design/metrics.md
       - Speech Generation Performance Optimizations: design/qwen3_omni_tts_performance_optimization.md
