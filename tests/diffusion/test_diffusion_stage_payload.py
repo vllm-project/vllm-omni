@@ -268,8 +268,11 @@ def test_send_puts_declared_keys_and_attaches_a_handle():
     assert handle["key"] == "req-7_0_0"
     assert handle["metadata"] == {"schema_version": 1}
     assert handle["payload_keys"] == ["prompt_embeds"]
-    # The inline payload stays put as the fallback.
-    assert "prompt_embeds" in output.custom_output
+    assert handle["size_bytes"] == 128
+    # Transferred keys must not also travel inline through the orchestrator.
+    assert "prompt_embeds" not in output.custom_output
+    # Undeclared keys are untouched.
+    assert "latents" in output.custom_output
 
 
 def test_send_key_matches_the_receive_key_convention():
@@ -357,6 +360,7 @@ def test_send_puts_only_on_the_tp_leader(monkeypatch, rank_in_group):
         "key": "req-7_0_0",
         "from_stage": "0",
         "to_stage": "1",
+        "size_bytes": 128,
         "metadata": {"schema_version": 1},
         "payload_keys": ["prompt_embeds"],
     }
@@ -369,4 +373,6 @@ def test_send_puts_only_on_the_tp_leader(monkeypatch, rank_in_group):
     assert len(connector.put_calls) == (1 if rank_in_group == 0 else 0)
     # Every rank ends up reporting the same handle, leader or not.
     assert output.custom_output[HANDLE_KEY] == expected_handle
+    # ...and every rank drops the inline copy, not just the sender.
+    assert "prompt_embeds" not in output.custom_output
     assert len(tp_group.broadcast_calls) == 1
