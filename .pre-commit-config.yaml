@@ -48,6 +48,9 @@ repos:
         # Agent skill docs and CLAUDE.md are not user-facing docs/READMEs.
         exclude: (^|/)CLAUDE\.md$|^\.claude/|^\.cursor/
 
+  # Keep `local` last so `suggestion` stays the final hook. Autofix repos
+  # (ruff, typos, markdownlint, trailing-whitespace, etc.) must run first;
+  # otherwise their "files were modified" output displaces the SKIP tip.
   - repo: local
     hooks:
     - id: signoff-commit
@@ -116,7 +119,8 @@ repos:
       files: ^\.buildkite/.*\.ya?ml$
       additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
 
-    # Keep `suggestion` last
+    # Keep `suggestion` as the final hook. Run after autofix hooks so the
+    # bypass/SKIP tip is not displaced.
     - id: suggestion
       name: Suggestion
       entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
