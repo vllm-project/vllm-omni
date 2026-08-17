@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypeGuard, cast
+from typing import Any, TypeGuard, cast
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_audio_output
@@ -106,6 +106,7 @@ def format_empty_diffusion_outputs(
     request: OmniDiffusionRequest,
     *,
     finished: bool = True,
+    custom_output: dict[str, Any] | None = None,
 ) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
@@ -115,6 +116,7 @@ def format_empty_diffusion_outputs(
             metrics={},
             latents=None,
             finished=finished,
+            custom_output=custom_output or {},
         )
     ]
 

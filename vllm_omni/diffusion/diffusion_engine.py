@@ -535,6 +535,18 @@ class DiffusionEngine:
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
+        if output.media is None and output.output is None:
+            # Encode-only stages carry forward prompt embeddings in custom_output
+            # even though they do not emit media.
+            custom_output = output.custom_output or {}
+            if not custom_output:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+            return format_empty_diffusion_outputs(
+                request,
+                finished=output.finished,
+                custom_output=custom_output,
+            )
+
         if output.media is not None:
             if output.output is not None:
                 raise ValueError("DiffusionOutput cannot contain both media and legacy output")
