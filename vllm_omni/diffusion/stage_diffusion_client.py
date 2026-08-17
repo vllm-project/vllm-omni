@@ -44,6 +44,17 @@ logger = init_logger(__name__)
 _MISSING_RPC_RESULT = object()
 
 
+def _coerce_id_list(value: object) -> list[str]:
+    """Coerce a msgpack-decoded ``get_load`` id field into ``list[str]``."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, (tuple, set, frozenset)):
+        return [str(v) for v in value]
+    return []
+
+
 def create_diffusion_client(
     model: str,
     od_config: OmniDiffusionConfig,
@@ -132,6 +143,7 @@ class StageDiffusionClient(StageClientBase):
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
         self._engine_dead: bool = False
+        self._load_future: asyncio.Future[tuple[int, int, list[str], list[str]]] | None = None
 
         if self._proc_manager is not None:
             self._start_proc_monitor()
@@ -247,6 +259,18 @@ class StageDiffusionClient(StageClientBase):
                 )
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
+            elif msg_type == "load_result":
+                # DTPS: DiT-load query reply from the subprocess.
+                fut = self._load_future
+                if fut is not None and not fut.done():
+                    try:
+                        waiting = int(msg.get("waiting", 0))
+                        running = int(msg.get("running", 0))
+                        waiting_ids = _coerce_id_list(msg.get("waiting_ids"))
+                        running_ids = _coerce_id_list(msg.get("running_ids"))
+                        fut.set_result((waiting, running, waiting_ids, running_ids))
+                    except (TypeError, ValueError):
+                        fut.set_result((0, 0, [], []))
             elif msg_type == "error":
                 req_id = msg.get("request_id")
                 rpc_id = msg.get("rpc_id")
@@ -389,6 +413,64 @@ class StageDiffusionClient(StageClientBase):
                     return None
                 raise EngineDeadError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
+
+    async def get_dit_load_async(self, *, timeout_s: float = 0.05) -> tuple[int, int, list[str], list[str]] | None:
+        """Return ``(num_waiting, num_running, waiting_ids, running_ids)``.
+
+        DTPS: the Orchestrator polls each DiT replica's queue depth +
+        request-id sets and feeds them to the shared :class:`DitLoadState`.
+        The ids let the AR scheduler de-duplicate its blind in-flight set
+        (requests that finished AR but haven't surfaced in a DiT poll yet).
+        Subprocess path: we send a one-shot ``get_load`` ZMQ frame and await
+        the matching ``load_result`` reply (routed in ``_drain_responses``),
+        bounded by a short timeout so a slow/dead subprocess can never block
+        the orchestrator's poll loop.
+        """
+        if self._engine_dead:
+            return None
+        self._drain_responses()
+        if self._load_future is not None and not self._load_future.done():
+            self._load_future.cancel()
+        self._load_future = asyncio.get_running_loop().create_future()
+        try:
+            self._request_socket.send(self._encoder.encode({"type": "get_load"}))
+        except Exception:
+            logger.debug(
+                "[StageDiffusionClient] get_load send failed on stage-%s rep-%s",
+                self.stage_id,
+                self.replica_id,
+                exc_info=True,
+            )
+            return None
+
+        deadline = time.monotonic() + timeout_s
+        try:
+            while not self._load_future.done():
+                # Poll the response socket for at most the remaining time, then
+                # drain (which resolves the future if a load_result arrived).
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        self._response_poller.poll(timeout=min(remaining * 1000.0, 100.0)),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    break
+                self._drain_responses()
+                if self._engine_dead:
+                    break
+            if self._load_future.done() and not self._load_future.cancelled():
+                exc = self._load_future.exception()
+                if exc is not None:
+                    return None
+                return self._load_future.result()
+            return None
+        finally:
+            if not self._load_future.done():
+                self._load_future.cancel()
+            self._load_future = None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         self._request_socket.send(

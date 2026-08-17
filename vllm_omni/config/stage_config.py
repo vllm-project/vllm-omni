@@ -548,6 +548,7 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
+    dtps: dict[str, Any] | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool | None = None
@@ -754,6 +755,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "dtps": raw_dict.get("dtps", None),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -984,6 +986,69 @@ def _build_extras(
     return extras
 
 
+def _build_dtps_config_block(dtps_raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build the validated ``omni_dtps_config`` block from the raw YAML ``dtps`` dict.
+
+    Returns ``None`` (DTPS disabled) unless ``enabled: true``. Coerces the few
+    scalar fields the scheduler reads and drops malformed entries with a warning
+    rather than failing deploy resolution.
+    """
+    if not dtps_raw:
+        return None
+    if not bool(dtps_raw.get("enabled", False)):
+        return None
+
+    block: dict[str, Any] = {"enabled": True}
+
+    if "i2t_aging_s" in dtps_raw:
+        try:
+            block["i2t_aging_s"] = float(dtps_raw["i2t_aging_s"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "[OmniDTPS] Invalid i2t_aging_s=%r; ignoring (DTPSScheduler will fall back to its default).",
+                dtps_raw["i2t_aging_s"],
+            )
+
+    if "cot_tag_key" in dtps_raw:
+        block["cot_tag_key"] = str(dtps_raw["cot_tag_key"])
+
+    if "dit_load_threshold" in dtps_raw:
+        try:
+            block["dit_load_threshold"] = int(dtps_raw["dit_load_threshold"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "[OmniDTPS] Invalid dit_load_threshold=%r; ignoring (DTPSScheduler will fall back to its default).",
+                dtps_raw["dit_load_threshold"],
+            )
+
+    raw_table = dtps_raw.get("cot_weight_table")
+    if raw_table is None:
+        block["cot_weight_table"] = {}
+    elif hasattr(raw_table, "items"):
+        # Duck-typed mapping: works for plain dict (the normal path, since
+        # resolve_deploy_yaml runs OmegaConf.to_container) and for DictConfig
+        # if a future code path bypasses that conversion.
+        table: dict[str, int] = {}
+        for key, val in raw_table.items():
+            try:
+                table[str(key)] = int(val)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[OmniDTPS] Ignoring malformed cot_weight_table entry %r=%r.",
+                    key,
+                    val,
+                )
+        block["cot_weight_table"] = table
+    else:
+        logger.warning(
+            "[OmniDTPS] cot_weight_table must be a mapping; got %s. Ignoring.",
+            type(raw_table).__name__,
+        )
+        block["cot_weight_table"] = {}
+
+    return block
+
+
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -1039,6 +1104,9 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            dtps_block = _build_dtps_config_block(deploy.dtps)
+            if dtps_block is not None:
+                engine_args["omni_dtps_config"] = dtps_block
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

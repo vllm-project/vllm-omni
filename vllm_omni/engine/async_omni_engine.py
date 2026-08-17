@@ -38,6 +38,7 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
+from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -407,6 +408,12 @@ class AsyncOmniEngine:
                         sampling_defaults=tuple(client.default_sampling_params for client in stage_clients),
                     )
 
+            # Sets up the cross-process shared memory pipeline for DiT stage load awareness.
+            # Main-process orchestrator aggregates DiT replica loads and safely shares snapshots
+            # with the AR subprocess via shared memory name.
+            dit_load_state = DitLoadState()
+            dit_load_shared_state = getattr(self._runtime, "_dit_load_shared_state", None)
+
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
@@ -424,10 +431,19 @@ class AsyncOmniEngine:
                 duplex_runtime_extension=duplex_runtime_extension,
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
+                dit_load_state=dit_load_state,
+                dit_load_shared_state=dit_load_shared_state,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
-            await orchestrator.run()
+            try:
+                await orchestrator.run()
+            finally:
+                # Shared-memory cleanup: close + unlink in the main process;
+                # AR subprocess readers only close() (they must NOT unlink).
+                if dit_load_shared_state is not None:
+                    dit_load_shared_state.close()
+                    dit_load_shared_state.unlink()
 
         try:
             loop.run_until_complete(_run_orchestrator())

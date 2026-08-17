@@ -5,6 +5,28 @@ pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
 
+# DTPS (DiT-load-aware Type-Priority Scheduling) config
+dtps:
+  enabled: false
+  # Seconds an ar_only (e.g. i2t) request waits in the AR queue before being
+  # promoted to L0 (starvation guard). Raise to favor DiT-feed throughput,
+  # lower to favor i2t latency.
+  i2t_aging_s: 500.0
+  # Request field (in additional_information) carrying the CoT-length tag used
+  # to order ar_downstream requests. HunyuanImage-3.0 uses ``bot_task``; other
+  # AR+DiT models override this per-deploy.
+  cot_tag_key: bot_task
+  # Model-specific CoT length weights indexed by cot_tag.
+  # Computes composite cost (prompt tokens + weight) for L1 generation requests to prioritize shorter AR dwell times;
+  # falls back to pure prompt-token ordering if unconfigured.
+  cot_weight_table:
+    vanilla: 0             # plain generation, no special CoT
+    recaption: 800         # short recaption CoT
+    think: 1500            # full thinking CoT
+    think_recaption: 2000  # thinking + recaption (longest AR dwell)
+
+  dit_load_threshold: 2    # DiT phase boundary + per-batch admission cap
+
 connectors:
   rdma_connector:
     name: MooncakeTransferEngineConnector

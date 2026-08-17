@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_diffusion_proc import _DIT_LOAD_ID_CAP
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
@@ -191,6 +192,38 @@ class InlineStageDiffusionClient(StageClientBase):
         except asyncio.QueueEmpty:
             if self._engine_dead:
                 raise EngineDeadError(f"Stage-{self.stage_id} inline diffusion engine is dead")
+            return None
+
+    async def get_dit_load_async(self) -> tuple[int, int, list[str], list[str]] | None:
+        """Return ``(num_waiting, num_running, waiting_ids, running_ids)``.
+
+        the Orchestrator polls each DiT replica's queue depth +
+        request-id sets every loop tick and feeds them to the shared
+        :class:`DitLoadState`, which the AR scheduler's DTPS component reads to
+        decide whether the DiT stage is idle (feed t2i/it2i) or busy (let i2t
+        interleave). The ids let the AR scheduler de-duplicate its blind
+        in-flight set (requests that finished AR but haven't surfaced in a DiT
+        poll yet).
+        """
+        try:
+            engine = getattr(self, "_engine", None)
+            if engine is None:
+                return (0, 0, [], [])
+            scheduler = getattr(engine, "scheduler", None)
+            if scheduler is None:
+                return (0, 0, [], [])
+            waiting = len(getattr(scheduler, "_waiting", ()) or ())
+            running = len(getattr(scheduler, "_running", ()) or ())
+            waiting_ids = list(getattr(scheduler, "_waiting", ()) or [])[:_DIT_LOAD_ID_CAP]
+            running_ids = list(getattr(scheduler, "_running", ()) or [])[:_DIT_LOAD_ID_CAP]
+            return (int(waiting), int(running), waiting_ids, running_ids)
+        except Exception:
+            logger.debug(
+                "[InlineStageDiffusionClient] get_dit_load_async failed on stage-%s rep-%s",
+                self.stage_id,
+                self.replica_id,
+                exc_info=True,
+            )
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

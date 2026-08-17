@@ -18,6 +18,10 @@ import janus
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.core.sched.dit_load_shared import (
+    _DIT_LOAD_SHM_NAME_KEY,
+    DitLoadSharedState,
+)
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -148,6 +152,7 @@ class StageRuntime:
         # ``llm_stage_launch_lock`` for all replicas.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+        self._dit_load_shared_state: DitLoadSharedState | None = None
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -267,6 +272,22 @@ class StageRuntime:
         if self._stage_init_executor is not None:
             self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
             self._stage_init_executor = None
+
+        # [OmniDTPS] Release the cross-process DiT-load shared-memory
+        # segment. Only the writer (owns_segment=True) unlinks; AR subprocess
+        # readers only close their handles.
+        dit_shm = self._dit_load_shared_state
+        if dit_shm is not None:
+            self._dit_load_shared_state = None
+            try:
+                dit_shm.close()
+            except Exception:
+                logger.debug("[StageRuntime] shared memory close failed", exc_info=True)
+            if dit_shm.owns_segment:
+                try:
+                    dit_shm.unlink()
+                except Exception:
+                    logger.debug("[StageRuntime] shared memory unlink failed", exc_info=True)
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""
@@ -566,6 +587,21 @@ class StageRuntime:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing executor_class")
             if plan.engine_args_dict is None:
                 raise RuntimeError(f"LLM stage {plan.metadata.stage_id} is missing engine args")
+            # [OmniDTPS] Create the cross-process DiT-load segment ONCE
+            # (all AR replicas of a stage share the same stage_vllm_config /
+            # omni_dtps_config)
+            dtps_cfg = getattr(vllm_config.model_config, "omni_dtps_config", None)
+            if isinstance(dtps_cfg, dict) and (dtps_cfg.get("dit_load_threshold", 0) or 0) > 0:
+                if self._dit_load_shared_state is None:
+                    try:
+                        self._dit_load_shared_state = DitLoadSharedState.create()
+                    except Exception:
+                        logger.debug(
+                            "[OmniDTPS] Failed to create DiT-load shared memory; may not work across processes",
+                            exc_info=True,
+                        )
+                if self._dit_load_shared_state is not None:
+                    dtps_cfg[_DIT_LOAD_SHM_NAME_KEY] = self._dit_load_shared_state.name
             with self._scoped_spawn_device_env(physical_devices):
                 lock_fds = acquire_device_locks(
                     plan.metadata.stage_id,
