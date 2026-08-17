@@ -958,6 +958,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     @staticmethod
     def _build_speech_usage_headers(usage: SpeechTokenUsage | None) -> dict[str, str]:
+        """Map speech usage into non-streaming response headers.
+
+        Returns an empty dict when usage is unavailable, allowing callers to
+        merge these headers with other optional response headers.
+        """
         if usage is None:
             return {}
 
@@ -3189,7 +3194,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
         # 2-tuple so existing callers (and their test mocks) are unaffected;
-        # only the batch path, which surfaces per-item usage, opts in.
+        # batch and non-streaming response-header paths opt in when surfacing
+        # usage outside the raw audio body.
         request_id, generator, bytes_tts_params = await self._prepare_speech_generation(
             request, request_id=request_id, has_inline_ref_audio=has_inline_ref_audio
         )
