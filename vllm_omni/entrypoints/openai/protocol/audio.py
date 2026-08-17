@@ -15,6 +15,7 @@ _MAX_EMBEDDING_DIM = 8192
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
 DEFAULT_AUDIO_FORMAT: str = "wav"
+SpeechSampleRate = Literal[8000, 24000]
 
 
 def _normalize_ref_audio_value(value):
@@ -80,6 +81,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
     )
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = Field(
+        default=None,
+        description="Target sample rate of the returned audio. If omitted, use the model's native sample rate.",
+    )
     speed: float | None = Field(
         default=1.0,
         ge=0.25,
@@ -396,6 +401,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
 class CreateAudio(BaseModel):
     audio_tensor: np.ndarray
     sample_rate: int = 24000
+    output_sample_rate: int | None = None
     response_format: str = "wav"
     speed: float = 1.0
     base64_encode: bool = True

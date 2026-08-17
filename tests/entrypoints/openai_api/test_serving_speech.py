@@ -2953,8 +2953,10 @@ class TestStreamingResponse:
             usage_acc=None,
             tts_params=None,
             collect=None,
+            target_sample_rate=None,
         ):
             captured["tts_params"] = tts_params
+            captured["target_sample_rate"] = target_sample_rate
             yield b"\x00\x00"
 
         monkeypatch.setattr(speech_server, "_prepare_speech_generation", prepare)
@@ -2967,6 +2969,7 @@ class TestStreamingResponse:
 
         assert response.status_code == 200
         assert captured["tts_params"] is finalized_tts_params
+        assert captured["target_sample_rate"] is None
 
     def test_sse_streaming(self, streaming_app):
         """stream_format=sse without stream=True returns audio deltas as SSE."""
@@ -3297,6 +3300,27 @@ def test_streaming_speech_session_config_accepts_non_streaming_mode():
     config = StreamingSpeechSessionConfig(non_streaming_mode=True)
 
     assert config.non_streaming_mode is True
+
+
+@pytest.mark.parametrize("sample_rate", [8000, 24000])
+def test_speech_requests_accept_supported_sample_rates(sample_rate):
+    assert OpenAICreateSpeechRequest(input="hello", sample_rate=sample_rate).sample_rate == sample_rate
+
+
+def test_speech_request_rejects_unsupported_sample_rate():
+    with pytest.raises(ValidationError):
+        OpenAICreateSpeechRequest(input="hello", sample_rate=16000)
+
+
+def test_sample_rate_uses_adapter_capabilities():
+    server = object.__new__(OmniOpenAIServingSpeech)
+    request = OpenAICreateSpeechRequest(input="hello", sample_rate=8000)
+
+    server._tts_model_type = "qwen3_tts"
+    assert server._validate_speech_sample_rate(request) is None
+
+    server._tts_model_type = "fish_speech"
+    assert server._validate_speech_sample_rate(request) == "sample_rate is not supported by fish_tts"
 
 
 def test_streaming_speech_session_config_scopes_native_speed_to_http():
@@ -5026,6 +5050,50 @@ class TestTTSAsyncOffloading:
         payload = json.loads(next(line for line in error_event.splitlines() if line.startswith("data: "))[6:])
         assert "partial_audio" not in payload["error"]
         assert "action" not in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_generate_audio_chunks_resamples_pcm_to_8khz(self, qwen3_tts_server):
+        async def pcm_generator():
+            output = create_mock_audio_output_for_test()
+            output.multimodal_output = {
+                "audio": torch.linspace(-0.5, 0.5, 2400, dtype=torch.float32),
+                "sr": 24000,
+            }
+            yield output
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_audio_chunks(
+                pcm_generator(),
+                "req-8khz",
+                target_sample_rate=8000,
+            )
+        ]
+
+        assert len(chunks) >= 2
+        assert len(b"".join(chunks)) == 800 * 2
+
+    @pytest.mark.asyncio
+    async def test_generate_audio_chunks_wav_header_uses_target_sample_rate(self, qwen3_tts_server):
+        async def pcm_generator():
+            output = create_mock_audio_output_for_test()
+            output.multimodal_output = {
+                "audio": torch.zeros(2400, dtype=torch.float32),
+                "sr": 24000,
+            }
+            yield output
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_audio_chunks(
+                pcm_generator(),
+                "req-8khz-wav",
+                response_format="wav",
+                target_sample_rate=8000,
+            )
+        ]
+
+        assert struct.unpack("<I", chunks[0][24:28])[0] == 8000
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
