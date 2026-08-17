@@ -119,9 +119,6 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
             audio_output = None
             if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
                 audio_output = final_output.multimodal_output
-            if not audio_output and hasattr(final_output, "request_output"):
-                if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
-                    audio_output = final_output.request_output.multimodal_output
 
             # Check for audio data using either "audio" or "model_outputs" key
             audio_key = None

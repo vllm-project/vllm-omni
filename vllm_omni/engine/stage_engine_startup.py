@@ -1558,6 +1558,7 @@ def launch_diffusion_stage_replica(
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     od_config = build_diffusion_config(model, stage_config, metadata)
+    od_config.max_num_seqs = batch_size
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:

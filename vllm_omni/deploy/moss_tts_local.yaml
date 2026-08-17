@@ -31,12 +31,12 @@ stages:
     output_connectors:
       to_stage_1: shm
     default_sampling_params:
-      temperature: 1.0
-      top_p: 0.95
-      top_k: 50
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
       max_tokens: 4096
       seed: 42
-      repetition_penalty: 1.1
+      repetition_penalty: 1.0
 
   - stage_id: 1
     max_num_seqs: 64

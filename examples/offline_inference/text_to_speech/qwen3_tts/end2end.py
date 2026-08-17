@@ -391,7 +391,7 @@ def main(args):
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
-            output = stage_outputs.request_output
+            output = stage_outputs
             _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
 
 
@@ -412,7 +412,7 @@ async def main_streaming(args):
         t_prev = t_start
         chunk_idx = 0
         async for stage_output in omni.generate(prompt, request_id=request_id):
-            mm = stage_output.request_output.outputs[0].multimodal_output
+            mm = stage_output.outputs[0].multimodal_output
             if not stage_output.finished:
                 t_now = time.perf_counter()
                 audio = mm.get("audio")
@@ -490,10 +490,10 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a deploy config YAML.",
     )
     parser.add_argument(
         "--audio-path",

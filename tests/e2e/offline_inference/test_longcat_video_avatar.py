@@ -84,7 +84,6 @@ def longcat_omni_runner() -> Generator[OmniRunner, None, None]:
     with OmniRunner(
         model,
         seed=42,
-        stage_configs_path=None,
         model_class_name="LongCatVideoAvatarPipeline",
         additional_config={
             "model_type": "avatar-v1.5",

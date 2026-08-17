@@ -2,14 +2,120 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
+import base64
+from io import BytesIO
+
+import httpx
 import numpy as np
 import pytest
 import torch
+from PIL import Image
+from vllm import envs
 
 from vllm_omni.diffusion.postprocess import rife_interpolator
 from vllm_omni.entrypoints.openai import video_api_utils
+from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _png_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (2, 1), color=(12, 34, 56)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _install_http_transport(monkeypatch, handler, client_kwargs):
+    async_client = httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        client_kwargs.append(kwargs.copy())
+        return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
+    requested_paths = []
+    client_kwargs = []
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/redirect.png":
+            return httpx.Response(302, headers={"location": "/image.png"})
+        return httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
+
+    assert image.size == (2, 1)
+    assert image.mode == "RGB"
+    assert requested_paths == ["/redirect.png", "/image.png"]
+    assert client_kwargs == [{"timeout": 60, "follow_redirects": True}]
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
+    requested_paths = []
+    client_kwargs = []
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        return httpx.Response(302, headers={"location": "/image.png"})
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", False)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="redirect.*VLLM_MEDIA_URL_ALLOW_REDIRECTS"):
+        await video_api_utils.decode_image_url("https://example.com/redirect.png")
+
+    assert requested_paths == ["/redirect.png"]
+    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_reports_http_status(monkeypatch):
+    client_kwargs = []
+
+    def _handler(request):
+        return httpx.Response(404)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="server returned HTTP 404"):
+        await video_api_utils.decode_image_url("https://example.com/missing.png")
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_reports_connection_failure(monkeypatch):
+    client_kwargs = []
+
+    def _handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="failed to download image"):
+        await video_api_utils.decode_image_url("https://example.com/unreachable.png")
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
+    def _unexpected_http_client(*args, **kwargs):
+        pytest.fail("data URLs must not create an HTTP client")
+
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _unexpected_http_client)
+    encoded_image = base64.b64encode(_png_bytes()).decode()
+
+    image = await video_api_utils.decode_image_url(f"data:image/png;base64,{encoded_image}")
+
+    assert image.size == (2, 1)
+    assert image.mode == "RGB"
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
