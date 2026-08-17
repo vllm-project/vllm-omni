@@ -632,15 +632,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         from_stage, to_stage = self.kv_transfer_manager.recv_stages
-        # Apply the producer endpoint before the connector is built so the
-        # handshake socket exists from the start.
-        sender_info = getattr(req, "kv_sender_info", None)
-        if sender_info:
-            self.kv_transfer_manager.update_sender_info(sender_info, sender_stage_id=from_stage)
+        tp_group = self._get_local_tp_group()
+        tp_active = tp_group is not None and getattr(tp_group, "world_size", 1) > 1
+        is_transfer_rank = not tp_active or self.is_data_transfer_rank()
 
-        connector = self._stage_payload_connector()
-        if connector is None:
-            return
+        connector = None
+        if is_transfer_rank:
+            # Ordinary stage payloads are TP-identical and published once by
+            # the producer's transfer rank. Only the matching receiver rank
+            # may consume the NIXL key; the payload is broadcast below.
+            sender_info = getattr(req, "kv_sender_info", None)
+            if sender_info:
+                self.kv_transfer_manager.update_sender_info(sender_info, sender_stage_id=from_stage)
+            connector = self._stage_payload_connector()
 
         metadata = None
         if isinstance(handle, dict):
@@ -663,17 +667,24 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not get_key:
             return
 
-        try:
-            result = connector.get(str(from_stage), str(to_stage), str(get_key), metadata=metadata)
-        except Exception as exc:
-            logger.warning("Stage payload get failed for %s: %s", get_key, exc)
+        result = None
+        if connector is not None:
+            try:
+                result = connector.get(str(from_stage), str(to_stage), str(get_key), metadata=metadata)
+            except Exception as exc:
+                logger.warning("Stage payload get failed for %s: %s", get_key, exc)
+
+        payload = result[0] if result else None
+        if tp_active:
+            delivered = tp_group.broadcast_object(isinstance(payload, dict) if is_transfer_rank else None, src=0)
+            if delivered:
+                payload = tp_group.broadcast_tensor_dict(payload if is_transfer_rank else None, src=0)
+
+        if payload is None:
+            if is_transfer_rank:
+                logger.warning("Stage payload %s was not delivered; falling back to the inline prompt", get_key)
             return
 
-        if not result:
-            logger.warning("Stage payload %s was not delivered; falling back to the inline prompt", get_key)
-            return
-
-        payload = result[0]
         if not isinstance(payload, dict):
             logger.warning("Stage payload %s has unexpected type %s", get_key, type(payload).__name__)
             return
