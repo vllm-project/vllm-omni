@@ -528,7 +528,9 @@ def _run_isend_irecv(
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
-@pytest.mark.parametrize("pp_size, comm_id", [pytest.param(2, None, id="unlabeled"), pytest.param(2, "test-comm-id", id="comm_id")])
+@pytest.mark.parametrize(
+    "pp_size, comm_id", [pytest.param(2, None, id="unlabeled"), pytest.param(2, "test-comm-id", id="comm_id")]
+)
 def test_isend_irecv_tensor_dict(pp_size: int, comm_id: str | None):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
     _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_distributed_init_method(), comm_id=comm_id)
@@ -539,7 +541,10 @@ def test_isend_irecv_tensor_dict(pp_size: int, comm_id: str | None):
 @pytest.mark.parallel
 @pytest.mark.parametrize(
     "pp_size, comm_id",
-    [pytest.param(2, None, marks=_L4_TWO_GPU, id="unlabeled"), pytest.param(2, "test-comm-id", marks=_L4_TWO_GPU, id="comm_id")],
+    [
+        pytest.param(2, None, marks=_L4_TWO_GPU, id="unlabeled"),
+        pytest.param(2, "test-comm-id", marks=_L4_TWO_GPU, id="comm_id"),
+    ],
 )
 def test_isend_irecv_tensor_dict_parity(pp_size: int, comm_id: str | None):
     """Nightly: isend/irecv on real multi-GPU NCCL."""
