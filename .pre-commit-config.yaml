@@ -89,6 +89,12 @@ repos:
       language: system
       types: [shell]
 
+    - id: check-spdx-header
+      name: Check SPDX headers
+      entry: python tools/pre_commit/check_spdx_header.py
+      language: python
+      types_or: [python, rust, proto]
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
