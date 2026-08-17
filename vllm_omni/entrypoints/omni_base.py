@@ -4,11 +4,13 @@ import os
 import time
 import weakref
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import file_or_path_exists
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -29,6 +31,9 @@ from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
 
@@ -62,6 +67,14 @@ def omni_snapshot_download(model_id: str) -> str:
     if os.path.exists(model_id):
         return model_id
 
+    # Object-storage models must remain URIs until each stage constructs its
+    # ModelConfig. vLLM then materializes only config/tokenizer files locally
+    # and keeps the URI in model_weights for Run:AI streaming. Treating the URI
+    # as a Hugging Face repo here either fails validation or downloads through
+    # the wrong backend before the stage processes are created.
+    if is_runai_obj_uri(model_id):
+        return model_id
+
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     # Read through ``vllm.envs`` so the flag keeps vLLM's semantics (only
@@ -72,6 +85,16 @@ def omni_snapshot_download(model_id: str) -> str:
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
+
+    # Modular Diffusers repositories describe independently loadable
+    # components. Let the selected pipeline download only its component
+    # sources instead of eagerly materializing the entire repository.
+    try:
+        if file_or_path_exists(model_id, "modular_model_index.json", revision=None):
+            return model_id
+    except (huggingface_hub.errors.GatedRepoError, huggingface_hub.errors.RepositoryNotFoundError):
+        # Preserve the more helpful errors raised by the full-download path.
+        pass
 
     try:
         download_weights_from_hf_specific(
@@ -226,6 +249,42 @@ class OmniBase(PDDisaggregationMixin):
         """Expose engine stage configs for PD disaggregation detection and validation."""
         return self.engine.stage_configs
 
+    @staticmethod
+    def _replica_is_dead(client: StagePoolClient | None) -> bool:
+        """Whether a replica slot is evicted (``None``) or its engine is dead.
+
+        ``check_health()`` is the source of truth: it raises ``EngineDeadError``
+        when dead (inspecting the ``engine_dead`` flags internally), and the
+        diffusion client additionally runs a synchronous ``proc.is_alive()``
+        probe that catches a silent SIGKILL/segfault the monitor thread has not
+        flagged yet — so ``/health`` does not report 200 for a stage whose
+        subprocess is already dead. A client exposing no ``check_health`` cannot
+        confirm liveness, so it is treated as dead (fail closed).
+        """
+        if client is None:
+            return True
+        check_health = getattr(client, "check_health", None)
+        if not callable(check_health):
+            return True
+        try:
+            check_health()
+        except EngineDeadError:
+            return True
+        return False
+
+    def _live_replica_count(self, pool: StagePool) -> int:
+        """Number of replicas in ``pool`` that are neither evicted nor dead.
+
+        A dead replica is evicted from its pool (slot set to ``None`` in
+        ``StagePool.clients``); a replica that died but has not been evicted
+        yet still carries an ``engine_dead`` flag. Both are excluded.
+        """
+        return sum(1 for client in pool.clients if not self._replica_is_dead(client))
+
+    def _stage_has_no_live_replica(self, pool: StagePool) -> bool:
+        """True when a non-empty stage pool has lost all of its replicas."""
+        return len(pool.clients) > 0 and self._live_replica_count(pool) == 0
+
     def _consumed_metric_message_ids(self, request_id: str) -> set[int]:
         consumed_by_request = getattr(self, "_consumed_metric_messages", None)
         if consumed_by_request is None:
@@ -233,38 +292,33 @@ class OmniBase(PDDisaggregationMixin):
             self._consumed_metric_messages = consumed_by_request
         return consumed_by_request.setdefault(request_id, set())
 
-    def _has_dead_stage(self) -> bool:
-        for stage_client in self.engine.stage_clients:
-            if getattr(stage_client, "_engine_dead", False):
-                return True
-            resources = getattr(stage_client, "resources", None)
-            if resources is not None and getattr(resources, "engine_dead", False):
-                return True
-        return False
-
     @property
     def is_running(self) -> bool:
-        return self.engine.is_alive() and not self._has_dead_stage()
+        return self.engine.is_alive()
 
     @property
     def errored(self) -> bool:
-        """Whether the engine is in a non-recoverable error state.
+        """Whether the engine is in a process-fatal error state.
 
-        True when the orchestrator thread is dead **or** any stage client
-        has been marked dead (e.g. diffusion worker OOM / process death).
-
-        Checks both ``_engine_dead`` (StageDiffusionClient) and
-        ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
-        since the two client types store the flag differently.
+        True only when the orchestrator thread is dead. Per-stage liveness is
+        deliberately excluded: the OpenAI serving paths precheck ``errored``
+        before request routing, so including it would reject requests that do
+        not touch the dead stage (e.g. text-only chat when the talker stage is
+        down). A fully dead stage instead fails only the requests routed
+        through it (dispatch guards) and flips readiness to 503 via
+        :meth:`check_health` (per-replica fault isolation, #4285).
         """
-        return not self.engine.is_alive() or self._has_dead_stage()
+        return not self.engine.is_alive()
 
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
-        for stage_client in self.engine.stage_clients:
-            if hasattr(stage_client, "check_health"):
-                stage_client.check_health()
+        pools = getattr(self.engine, "stage_pools", None)
+        if pools is None:
+            return
+        for pool in pools:
+            if self._stage_has_no_live_replica(pool):
+                raise EngineDeadError(f"Stage-{pool.stage_id} has no live replica")
 
     def resolve_sampling_params_list(
         self,
@@ -523,6 +577,7 @@ class OmniBase(PDDisaggregationMixin):
             msg_id = id(result)
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
 
@@ -583,7 +638,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
@@ -608,19 +662,16 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
                 response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
-        return OmniRequestOutput(
+        # Generation content (outputs, prompt, images, trajectory_*, ...) is
+        # copied from engine_outputs onto the returned object by
+        # OmniRequestOutput.from_stage_output().
+        return OmniRequestOutput.from_stage_output(
+            engine_outputs,
             request_id=req_id or "",
             finished=finished,
             stage_id=stage_id,
             replica_id=result.replica_id,
             final_output_type=output_type,
-            request_output=engine_outputs,
-            images=images,
-            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
-            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
-            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
-            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
-            _custom_output=getattr(engine_outputs, "_custom_output", {}),
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,

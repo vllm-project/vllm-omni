@@ -41,6 +41,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
@@ -48,7 +49,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
@@ -62,6 +63,17 @@ from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
+
+_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
+# Maximum time (in seconds) to wait for pending background D2H / SHM packing
+# to drain before the worker executes memory-releasing lifecycle tasks
+# (e.g. during sleep/wake transitions). This barrier prevents device tensors
+# from being freed while the side CUDA stream is still actively reading them.
+_ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
+
+# Worker entry points that release device memory. Background D2H/SHM packing
+# still reads model output tensors, so it must finish before these run.
+_MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
 @dataclass
@@ -385,14 +397,31 @@ class DiffusionWorker:
         """Initialize the LoRA manager for this worker."""
         if self.model_runner.pipeline is None:
             return
-        self.lora_manager = DiffusionLoRAManager(
-            pipeline=self.model_runner.pipeline,
-            device=self.device,
-            dtype=self.od_config.dtype,
-            max_cached_adapters=self.od_config.max_cpu_loras,
-            lora_path=self.od_config.lora_path,
-            lora_scale=self.od_config.lora_scale,
-        )
+
+        lora_path = self.od_config.lora_path
+        if isinstance(lora_path, list) and len(lora_path) == 1:
+            lora_path = lora_path[0]
+
+        lora_backend = self.od_config.lora_backend
+        if lora_backend == LoRABackend.PEFT:
+            self.lora_manager = DiffusionLoRAManager(
+                pipeline=self.model_runner.pipeline,
+                device=self.device,
+                dtype=self.od_config.dtype,
+                max_cached_adapters=self.od_config.max_cpu_loras,
+                lora_path=lora_path,
+                lora_scale=self.od_config.lora_scale,
+            )
+        elif lora_backend == LoRABackend.DISTILL:
+            pipeline = self.model_runner.pipeline
+            if hasattr(pipeline, "load_lora_weights"):
+                if self.od_config.lora_scale > 1.0:
+                    logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+                pipeline.load_lora_weights(lora_path)
+            else:
+                logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
+        else:
+            raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
@@ -415,11 +444,31 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
+    def _run_ar_diffusion_session_lifecycle(self, method: str, session_id: str) -> bool:
+        """Delegate an optional AR session lifecycle call to the model runner."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string.")
+        assert self.model_runner is not None, "Model runner not initialized"
+        lifecycle_method = getattr(self.model_runner, method, None)
+        if not callable(lifecycle_method):
+            return False
+        lifecycle_method(session_id)
+        return True
+
+    def reset_ar_diffusion_session(self, session_id: str) -> bool:
+        """Reset runner-owned AR state through the collective RPC boundary."""
+        return self._run_ar_diffusion_session_lifecycle("reset_session", session_id)
+
+    def close_ar_diffusion_session(self, session_id: str) -> bool:
+        """Close runner-owned AR state through the collective RPC boundary."""
+        return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[OmniDiffusionRequest],
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner.
 
@@ -429,8 +478,8 @@ class DiffusionWorker:
         ranks stay synchronised at each AllGather call while computing
         different activations.
 
-        Each rank returns its OWN DiffusionOutput (no gather).  The executor
-        collects N responses via result_mq (all ranks share one queue).
+        Each rank returns its OWN DiffusionOutput (no gather). The executor
+        collects N responses via the per-worker result queues.
         """
         assert self.model_runner is not None, "Model runner not initialized"
 
@@ -455,7 +504,10 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
+            if diffusion_kv_metadata is not None:
+                kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
+            output = self.model_runner.execute_model(req, **kwargs)
         if profiler:
             profiler.step()
 
@@ -826,6 +878,13 @@ class WorkerProc:
 
         self._async_output_queue: queue.Queue | None = None
         self._async_output_thread: threading.Thread | None = None
+        self._async_output_done = threading.Condition()
+        self._async_output_pending = 0
+        # MessageQueue.acquire_write() is single-writer: it reads current_idx,
+        # writes that block, then advances the index. The async output thread
+        # enqueues OUTPUT_READY while the main loop enqueues COMPUTE_DONE, so
+        # unsynchronized writers can target the same block and drop a message.
+        self._result_mq_lock = threading.Lock()
         if not self.od_config.step_execution:
             self._async_output_queue = queue.Queue()
             self._async_output_thread = threading.Thread(
@@ -858,25 +917,32 @@ class WorkerProc:
         )
         return wrapper
 
+    def _enqueue_result(self, msg: Any) -> None:
+        """Serialize writes to the single-writer result queue."""
+        with self._result_mq_lock:
+            self.result_mq.enqueue(msg)
+
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
             return
         if isinstance(output, OmniACK):
-            self.result_mq.enqueue(output)
+            self._enqueue_result(output)
             return
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
+            with self._async_output_done:
+                self._async_output_pending += 1
             self._async_output_queue.put((output, async_output_id, gpu_event))
             msg = AsyncDiffusionOutput(
                 kind=AsyncOutputKind.COMPUTE_DONE,
                 rpc_id=rpc_id,
                 async_output_id=async_output_id,
             )
-            self.result_mq.enqueue(msg)
+            self._enqueue_result(msg)
             return
 
         # Sync path (original, or async fallback).
@@ -885,7 +951,7 @@ class WorkerProc:
         except Exception as e:
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
-        self.result_mq.enqueue(output)
+        self._enqueue_result(output)
 
     def _async_output_loop(self):
         """Background thread: D2H + SHM packing for async diffusion output.
@@ -895,8 +961,11 @@ class WorkerProc:
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
-        while self._running:
-            output, async_output_id, gpu_event = self._async_output_queue.get()
+        while True:
+            item = self._async_output_queue.get()
+            if item is None:
+                break
+            output, async_output_id, gpu_event = item
             try:
                 # Cross-stream ordering: wait for default stream to finish
                 # writing the output tensors before the side stream reads.
@@ -905,7 +974,7 @@ class WorkerProc:
                 pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
                 d2h_stream.synchronize()
 
-                self.result_mq.enqueue(
+                self._enqueue_result(
                     AsyncDiffusionOutput(
                         kind=AsyncOutputKind.OUTPUT_READY,
                         async_output_id=async_output_id,
@@ -917,13 +986,72 @@ class WorkerProc:
                     "Async output packing failed for id '%s'; sending error",
                     async_output_id,
                 )
-                self.result_mq.enqueue(
+                self._enqueue_result(
                     AsyncDiffusionOutput(
                         kind=AsyncOutputKind.OUTPUT_READY,
                         async_output_id=async_output_id,
                         error="Background D2H/SHM packing failed",
                     )
                 )
+            finally:
+                with self._async_output_done:
+                    # Clamped: only items enqueued by _return_result are counted.
+                    self._async_output_pending = max(0, self._async_output_pending - 1)
+                    self._async_output_done.notify_all()
+
+    def drain_async_outputs(self, timeout: float = _ASYNC_OUTPUT_DRAIN_TIMEOUT_S) -> bool:
+        """Block until background D2H/SHM packing has no work left.
+
+        Returns False if outputs are still in flight when ``timeout`` expires.
+        """
+        with self._async_output_done:
+            if self._async_output_pending == 0:
+                return True
+            drained = self._async_output_done.wait_for(lambda: self._async_output_pending == 0, timeout=timeout)
+            pending = self._async_output_pending
+        if not drained:
+            logger.warning(
+                "Worker %d: %d async output(s) still in flight after %.1fs; "
+                "releasing device memory now may drop OUTPUT_READY messages",
+                self.gpu_id,
+                pending,
+                timeout,
+            )
+        return drained
+
+    def shutdown(self) -> None:
+        """Stop background work and release worker-owned IPC resources."""
+        self._running = False
+
+        if self._async_output_queue is not None:
+            self._async_output_queue.put(None)
+        if self._async_output_thread is not None:
+            self._async_output_thread.join(timeout=_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S)
+            if self._async_output_thread.is_alive():
+                logger.warning(
+                    "Worker %d: Async output thread did not stop before shutdown",
+                    self.gpu_id,
+                )
+
+        try:
+            self.worker.shutdown()
+        finally:
+            if self.mq is not None:
+                self.mq.shutdown()
+                self.mq = None
+
+            # The worker creates this queue's shared-memory ring buffer.
+            # Dropping the final creator reference invokes
+            # ShmRingBuffer.__del__, which closes and unlinks it before
+            # multiprocessing.resource_tracker exits.
+            if self.result_mq is not None and (
+                self._async_output_thread is None or not self._async_output_thread.is_alive()
+            ):
+                result_mq = self.result_mq
+                self.result_mq = None
+                result_mq.shutdown()
+                del result_mq
+                gc.collect()
 
     def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
         if not torch.distributed.is_initialized():
@@ -988,6 +1116,8 @@ class WorkerProc:
         }
 
         try:
+            if method in _MEMORY_RELEASING_METHODS:
+                self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
@@ -1026,6 +1156,10 @@ class WorkerProc:
             result["wave_id"] = wave_id
         return result, should_reply
 
+    def recv_message(self) -> Any:
+        """Receive one complete broadcast message without dropping overflow data."""
+        return self.mq.dequeue(indefinite=True)
+
     def _worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
@@ -1033,7 +1167,7 @@ class WorkerProc:
         while self._running:
             msg = None
             try:
-                msg = self.mq.dequeue(timeout=1.0)
+                msg = self.recv_message()
             except Exception:
                 if self.wake_event and self.wake_event.is_set():
                     self.wake_event.clear()
@@ -1049,6 +1183,7 @@ class WorkerProc:
                 continue
 
             if isinstance(msg, dict) and msg.get("type") == "sleep":
+                self.drain_async_outputs()
                 task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
                 ack = self.worker.handle_sleep_task(task)
                 self._return_result(ack)
@@ -1075,7 +1210,7 @@ class WorkerProc:
                         if rpc_id is not None:
                             # Async RPC: must complete the executor's pending
                             # future so collective_rpc() doesn't hang.
-                            self.result_mq.enqueue(
+                            self._enqueue_result(
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
@@ -1196,7 +1331,7 @@ class WorkerProc:
         finally:
             if worker_proc is not None:
                 try:
-                    worker_proc.worker.shutdown()
+                    worker_proc.shutdown()
                 except Exception as exc:
                     logger.warning("Worker %d: Shutdown encountered an error: %s", rank, exc)
                 worker_proc.context.term()
@@ -1311,6 +1446,7 @@ class WorkerWrapperBase:
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1323,7 +1459,10 @@ class WorkerWrapperBase:
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(req, od_config, kv_prefetch_job=kv_prefetch_job)
+        kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
+        if diffusion_kv_metadata is not None:
+            kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
+        return self.worker.execute_model(req, od_config, **kwargs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

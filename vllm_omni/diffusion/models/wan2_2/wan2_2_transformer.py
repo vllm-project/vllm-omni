@@ -1081,6 +1081,8 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Transformer blocks
+        # Preserve the post-patch (T, H, W) grid so VSA can partition
+        # the flattened DiT sequence into spatiotemporal blocks.
         vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
         for block in self.blocks[self.start_layer : self.end_layer]:
             hidden_states = block(

@@ -11,6 +11,8 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+
 
 class OmniTextPrompt(TextPrompt):
     """Text prompt with optional embeddings and stage payloads.
@@ -208,6 +210,10 @@ class OmniDiffusionSamplingParams:
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
 
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int | None = None
@@ -336,6 +342,10 @@ class OmniDiffusionSamplingParams:
 
     # results
     output: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 
     @property
     def batch_size(self):

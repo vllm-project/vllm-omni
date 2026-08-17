@@ -64,6 +64,41 @@ omni = Omni(
 )
 ```
 
+### Combined with Online FP8 Quantization
+
+HSDP can be combined with online FP8 quantization for diffusion models that
+support both features. HSDP shards the quantized weights across GPUs to reduce
+the per-GPU weight memory footprint.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="<your-model>",
+    quantization="fp8",
+    parallel_config=DiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_shard_size=2,
+    ),
+)
+```
+
+For online serving:
+
+```bash
+vllm serve <your-model> \
+    --omni \
+    --quantization fp8 \
+    --use-hsdp \
+    --hsdp-shard-size 2
+```
+
+The model must support both HSDP and online FP8 quantization. HSDP remains
+incompatible with Tensor Parallelism. See the
+[FP8 Quantization Guide](../../quantization/fp8.md) for supported models and
+hardware.
+
 ---
 
 ## Example Script
@@ -147,3 +182,4 @@ For detailed instructions on adding HSDP support to new models, see the [HSDP Co
 1. ✅ **Enable HSDP** - Set `use_hsdp=True` and `hsdp_shard_size` to reduce per-GPU memory for large models
 2. ✅ **Combine with SP** - Use together with `ulysses_degree` for video models requiring both memory reduction and sequence parallelism
 3. ⚠️ **Incompatible with TP** - `tensor_parallel_size` must be 1 when HSDP is enabled
+4. ✅ **Combine with online FP8** - Use `quantization="fp8"` or `--quantization fp8` to reduce the sharded weight memory footprint

@@ -221,9 +221,15 @@ class DenoiseProgressMixin:
         step_idx: int | None,
         timestep=None,
         scheduler=None,
+        normalized_timestep: float | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
-        if timestep is None or _forward_context is None:
+        if _forward_context is None:
+            return
+        if normalized_timestep is not None:
+            _forward_context.denoise_timestep = float(normalized_timestep)
+            return
+        if timestep is None:
             return
         scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)

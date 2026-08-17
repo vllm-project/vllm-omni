@@ -180,6 +180,7 @@ class TrtllmAttentionImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -187,6 +188,7 @@ class TrtllmAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.causal = causal
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.role = role
 
         self.skip = SkipSoftmaxConfig.from_backend_kwargs(backend_kwargs)
         self._warned_missing_timestep = False
@@ -255,8 +257,16 @@ class TrtllmAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        extra = getattr(attn_metadata, "extra", {}) if attn_metadata is not None else {}
+        packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+        present_packed_keys = [key for key in packed_keys if key in extra]
+        if present_packed_keys and len(present_packed_keys) != len(packed_keys):
+            missing = sorted(set(packed_keys) - set(present_packed_keys))
+            raise ValueError(f"Incomplete packed TRTLLM attention metadata; missing {missing}")
+        has_packed_metadata = len(present_packed_keys) == len(packed_keys)
+
         attn_mask = getattr(attn_metadata, "attn_mask", None) if attn_metadata is not None else None
-        if attn_mask is not None:
+        if attn_mask is not None and not has_packed_metadata:
             raise ValueError(
                 "TRTLLM_ATTN does not support attn_mask (Wan sets one only under SP with "
                 "mask_sp_padding=True and a non-divisible seq len). Either set "
@@ -270,30 +280,96 @@ class TrtllmAttentionImpl(AttentionImpl):
                 "another backend via --diffusion-attention-backend."
             )
 
-        batch, q_len, num_q_heads, head_dim = query.shape
+        physical_batch, q_len, num_q_heads, head_dim = query.shape
         kv_len, num_kv_heads = key.shape[1], key.shape[2]
 
         device = query.device
 
-        q = query.reshape(batch * q_len, num_q_heads, head_dim).contiguous()
-        k = key.reshape(batch * kv_len, num_kv_heads, head_dim).contiguous()
-        v = value.reshape(batch * kv_len, num_kv_heads, head_dim).contiguous()
+        q = query.reshape(physical_batch * q_len, num_q_heads, head_dim).contiguous()
+        k = key.reshape(physical_batch * kv_len, num_kv_heads, head_dim).contiguous()
+        v = value.reshape(physical_batch * kv_len, num_kv_heads, head_dim).contiguous()
+        output_tokens = q.shape[0]
 
-        seq_lens = torch.full((batch,), kv_len, dtype=torch.int32, device=device)
-        cu_seq_lens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
-        cu_seq_lens_kv = torch.arange(0, (batch + 1) * kv_len, step=kv_len, dtype=torch.int32, device=device)
+        if has_packed_metadata:
+            cu_seq_lens_q = extra["cu_seqlens_q"]
+            cu_seq_lens_kv = extra["cu_seqlens_k"]
+            if cu_seq_lens_q.ndim != 1 or cu_seq_lens_kv.ndim != 1:
+                raise ValueError("Packed TRTLLM attention cu_seqlens tensors must be one-dimensional")
+            if cu_seq_lens_q.numel() != cu_seq_lens_kv.numel() or cu_seq_lens_q.numel() < 2:
+                raise ValueError("Packed TRTLLM attention requires matching non-empty Q and KV sequence batches")
+            if int(cu_seq_lens_q[-1].item()) != q.shape[0] or int(cu_seq_lens_kv[-1].item()) != k.shape[0]:
+                raise ValueError("Packed TRTLLM attention cu_seqlens must cover all Q/K/V tokens")
+
+            # Drop trailing empty sequences retained by packed producers when
+            # alignment adds no padding tokens.
+            while (
+                cu_seq_lens_q.numel() > 2
+                and int(cu_seq_lens_q[-1].item()) == int(cu_seq_lens_q[-2].item())
+                and int(cu_seq_lens_kv[-1].item()) == int(cu_seq_lens_kv[-2].item())
+            ):
+                cu_seq_lens_q = cu_seq_lens_q[:-1]
+                cu_seq_lens_kv = cu_seq_lens_kv[:-1]
+
+            # A packed prefix mask denotes structural suffix padding, not another
+            # document. Exclude it before quantization and attention; in particular,
+            # SAGE block quantization must not span the valid/padding boundary.
+            if attn_mask is not None:
+                if q.shape[0] != k.shape[0] or attn_mask.numel() != q.shape[0]:
+                    raise ValueError("Packed TRTLLM prefix masks require equal Q/K lengths")
+                flat_mask = attn_mask.reshape(-1).to(dtype=torch.bool)
+                valid_tokens = int(flat_mask.sum().item())
+                expected_mask = torch.arange(flat_mask.numel(), device=device) < valid_tokens
+                if not torch.equal(flat_mask, expected_mask):
+                    raise ValueError("TRTLLM_ATTN only supports prefix-valid packed attention masks")
+
+                q_boundary = (cu_seq_lens_q == valid_tokens).nonzero(as_tuple=False)
+                kv_boundary = (cu_seq_lens_kv == valid_tokens).nonzero(as_tuple=False)
+                if q_boundary.numel() != 1 or kv_boundary.numel() != 1:
+                    raise ValueError("Packed TRTLLM prefix length must be a Q/K sequence boundary")
+                q_end = int(q_boundary.item()) + 1
+                kv_end = int(kv_boundary.item()) + 1
+                if q_end != kv_end:
+                    raise ValueError("Packed TRTLLM prefix masks require matching Q/K sequence batches")
+
+                q = q[:valid_tokens]
+                k = k[:valid_tokens]
+                v = v[:valid_tokens]
+                cu_seq_lens_q = cu_seq_lens_q[:q_end].contiguous()
+                cu_seq_lens_kv = cu_seq_lens_kv[:kv_end].contiguous()
+
+            batch = cu_seq_lens_q.numel() - 1
+            seq_lens = (cu_seq_lens_kv[1:] - cu_seq_lens_kv[:-1]).to(dtype=torch.int32).contiguous()
+            max_q_len = int(extra["max_seqlen_q"])
+            max_kv_len = int(extra["max_seqlen_k"])
+        else:
+            batch = physical_batch
+            seq_lens = torch.full((batch,), kv_len, dtype=torch.int32, device=device)
+            cu_seq_lens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
+            cu_seq_lens_kv = torch.arange(0, (batch + 1) * kv_len, step=kv_len, dtype=torch.int32, device=device)
+            max_q_len = q_len
+            max_kv_len = kv_len
         workspace = self._get_workspace(device)
 
         bmm1_scale = self.softmax_scale
         bmm2_scale = 1.0
 
-        _skip_factor = self._resolve_skip_factor(kv_len)
+        _skip_factor = self._resolve_skip_factor(max_kv_len)
 
         # SAGE kwargs are only understood by newer FlashInfer builds; pass them exclusively when
         # SAGE quant is active (which already requires the kernel, checked at init) so the dense
         # path stays compatible with older builds that lack these parameters.
         sage_kwargs: dict = {}
-        if self.quant.enabled:
+        # The SAGE kernel requires every KV sequence to contain at least one full
+        # quantization block. Small auxiliary attention sites use the dense kernel.
+        use_sage = self.quant.enabled and bool(torch.all(seq_lens >= self.quant.k_block_size).item())
+        if self.quant.enabled and not use_sage:
+            message = (
+                f"TRTLLM_ATTN SAGE quantization is configured for attention role {self.role!r}, but at least one "
+                f"KV sequence is shorter than k_block_size={self.quant.k_block_size}. Falling back to dense "
+                "attention for this input."
+            )
+            logger.warning_once(message)
+        if use_sage:
             q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
             sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
             sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
@@ -304,8 +380,8 @@ class TrtllmAttentionImpl(AttentionImpl):
             value=v,
             workspace_buffer=workspace,
             seq_lens=seq_lens,
-            max_q_len=q_len,
-            max_kv_len=kv_len,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             o_sf_scale=-1.0,
@@ -319,4 +395,12 @@ class TrtllmAttentionImpl(AttentionImpl):
             skip_softmax_threshold_scale_factor=_skip_factor,
             **sage_kwargs,
         )
-        return out.reshape(batch, q_len, num_q_heads, head_dim)
+        if out.shape[0] != output_tokens:
+            padded_out = torch.zeros(
+                (output_tokens, num_q_heads, head_dim),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            padded_out[: out.shape[0]] = out
+            out = padded_out
+        return out.reshape(physical_batch, q_len, num_q_heads, head_dim)

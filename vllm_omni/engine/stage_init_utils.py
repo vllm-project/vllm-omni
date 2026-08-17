@@ -8,6 +8,7 @@ out of StageEngineCoreClient into reusable functions.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import importlib
 import multiprocessing as mp
@@ -15,17 +16,22 @@ import os
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
+from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -348,6 +354,30 @@ class StageMetadata:
     replica_id: int = 0
 
 
+def _apply_rocm_attention_backend(
+    engine_args: dict[str, Any],
+    stage_type: str | StageType,
+) -> None:
+    """Preserve Omni's ROCm attention-backend compatibility default."""
+    if (
+        not current_omni_platform.is_rocm()
+        or stage_type == StageType.DIFFUSION
+        or engine_args.get("attention_backend") is not None
+    ):
+        return
+
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if rocm_aiter_ops.is_enabled():
+        engine_args["attention_backend"] = "ROCM_AITER_FA"
+    # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
+    # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+    # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+    # Therefore, we still use TRITON_ATTN as the default attention backend,
+    # when the selected_backend is not specified.
+    engine_args["attention_backend"] = "TRITON_ATTN"
+
+
 def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     """Extract metadata through the active production legacy path.
 
@@ -358,18 +388,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
 
-    if current_omni_platform.is_rocm():
-        if stage_type != "diffusion" and engine_args.get("attention_backend") is None:
-            from vllm._aiter_ops import rocm_aiter_ops
-
-            if rocm_aiter_ops.is_enabled():
-                engine_args["attention_backend"] = "ROCM_AITER_FA"
-            # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
-            # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
-            # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
-            # Therefore, we still use TRITON_ATTN as the default attention backend,
-            # when the selected_backend is not specified.
-            engine_args["attention_backend"] = "TRITON_ATTN"
+    _apply_rocm_attention_backend(engine_args, stage_type)
 
     runtime_cfg = stage_config.runtime
     engine_input_source: list[int] = _get_attr_or_item(stage_config, "engine_input_source", [])
@@ -377,8 +396,19 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = stage_config.final_output_type
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage carries its task via default_pooling_params, set where the
+    # stage is declared.
+    default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
+    # is_pooling_model signal); pick params by that signal, not execution_type.
+    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+    default_params: OmniSamplingParams | PoolingParams
+    if stage_type == "diffusion":
+        default_params = OmniDiffusionSamplingParams(**default_sp)
+    elif is_pooling:
+        default_params = PoolingParams(**default_pp)
+    else:  # generative llm: ar / generation
+        default_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
@@ -410,7 +440,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_input_source=engine_input_source,
             final_output=final_output,
             final_output_type=final_output_type,
-            default_sampling_params=default_sampling_params,
+            default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
@@ -430,7 +460,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         engine_input_source=engine_input_source,
         final_output=final_output,
         final_output_type=final_output_type,
-        default_sampling_params=default_sampling_params,
+        default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
@@ -748,25 +778,110 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
                 os.environ[key] = old_value
 
 
-def build_engine_args_dict(
-    stage_config: Any,
-    model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
-    cli_tokenizer: str | None = None,
+def _project_omni_config_fields(
+    config: Any,
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """Build the normalized engine args dict for one stage."""
-    engine_args = stage_config.engine_args
-    # HACK (Alex) Tensor parallel size should not be passed as None;
-    # remove it if this is the case so that we fall back to default
-    # creation from vLLM's engine args.
-    # NOTE: This will be fixed more generically in ongoing work for engine arg filtering.
-    if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
-        del engine_args["tensor_parallel_size"]
+    """Copy defined typed config fields into backend adapter kwargs."""
+    projected: dict[str, Any] = {}
+    for config_field in fields(config):
+        name = config_field.name
+        if name in exclude:
+            continue
+        value = getattr(config, name)
+        if value is not None:
+            projected[name] = copy.deepcopy(value)
+    return projected
 
-    stage_type = _get_attr_or_item(stage_config, "stage_type", "llm")
-    stage_id = stage_config.stage_id
 
-    engine_args_dict = _to_dict(engine_args)
+def _project_omni_stage_engine_args(
+    stage_config: BaseVllmOmniStageConfig,
+) -> dict[str, Any]:
+    """Read backend inputs from one structured stage config."""
+    engine_args: dict[str, Any] = {}
+    is_diffusion = isinstance(stage_config, VllmOmniDiffusionStageConfig)
+
+    if is_diffusion:
+        engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
+
+    for config, excluded_fields in (
+        (
+            stage_config.model_config,
+            frozenset({"default_sampling_params", "has_sampling_extra_args"}),
+        ),
+        (stage_config.load_config, frozenset()),
+        (stage_config.cache_config, frozenset()),
+        (stage_config.scheduler_config, frozenset()),
+        (
+            stage_config.runtime_config,
+            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+        ),
+    ):
+        engine_args.update(
+            _project_omni_config_fields(
+                config,
+                exclude=excluded_fields,
+            )
+        )
+
+    # The legacy builder always emits this key, including for pipelines such
+    # as Audex that intentionally defer architecture discovery to HF config.
+    engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
+
+    topology = stage_config.stage_pipeline_config
+    topology_engine_args = {
+        "model_stage": stage_config.model_stage,
+        "worker_type": stage_config.worker_type,
+        "scheduler_cls": stage_config.scheduler_cls,
+        "hf_config_name": stage_config.hf_config_name,
+        "engine_output_type": stage_config.engine_output_type,
+        "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
+        "retains_state_across_chunks": topology.retains_state_across_chunks,
+    }
+    engine_args.update(
+        {name: copy.deepcopy(value) for name, value in topology_engine_args.items() if value is not None}
+    )
+
+    connector_config = stage_config.connector_config
+    engine_args["async_chunk"] = connector_config.async_chunk
+    if connector_config.omni_kv_config is not None:
+        engine_args["omni_kv_config"] = copy.deepcopy(connector_config.omni_kv_config)
+
+    if is_diffusion:
+        engine_args["parallel_config"] = _project_omni_config_fields(
+            stage_config.parallel_config,
+            exclude=frozenset({"world_size"}),
+        )
+    else:
+        engine_args.update(
+            _project_omni_config_fields(
+                stage_config.parallel_config,
+                exclude=frozenset({"world_size"}),
+            )
+        )
+
+    quantization_config = stage_config.quantization_config
+    if quantization_config is not None:
+        quantization_key = (
+            "quantization" if isinstance(quantization_config, str) and not is_diffusion else "quantization_config"
+        )
+        engine_args[quantization_key] = copy.deepcopy(quantization_config)
+
+    return engine_args
+
+
+def _finalize_engine_args_dict(
+    engine_args_dict: dict[str, Any],
+    *,
+    stage_type: str | StageType,
+    stage_id: int,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None,
+    cli_tokenizer: str | None,
+    has_sampling_extra_args: bool,
+) -> dict[str, Any]:
+    """Apply representation-independent engine adapter behavior."""
     pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
@@ -826,15 +941,15 @@ def build_engine_args_dict(
     if stage_connector_spec:
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
-    if stage_type == "diffusion":
+    is_diffusion = stage_type == StageType.DIFFUSION
+    if is_diffusion:
         from vllm_omni.diffusion.data import parse_attention_config
 
         if engine_args_dict.get("diffusion_attention_config") is not None:
             engine_args_dict["diffusion_attention_config"] = parse_attention_config(
-                engine_args_dict.get("diffusion_attention_config"),
+                engine_args_dict["diffusion_attention_config"],
             )
-
-    if stage_type != "diffusion":
+    else:
         resolve_worker_cls(engine_args_dict)
 
     if engine_args_dict.get("worker_type") == "generation":
@@ -844,15 +959,84 @@ def build_engine_args_dict(
         engine_args_dict.setdefault("disable_hybrid_kv_cache_manager", True)
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
-    # Check whether the stage's default_sampling_params defines extra_args.
-    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+    engine_args_dict["has_sampling_extra_args"] = has_sampling_extra_args
 
     # TODO: Remove this after the performance regression is fixed
     # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
     _maybe_set_qwen3_omni_moe_env(engine_args_dict)
-
     return engine_args_dict
+
+
+def build_legacy_engine_args_dict(
+    stage_config: Any,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None = None,
+    cli_tokenizer: str | None = None,
+) -> dict[str, Any]:
+    """Implement engine-argument building for the legacy stage representation."""
+    engine_args_dict = _to_dict(stage_config.engine_args)
+    # Legacy configs can materialize an omitted optional TP size as None.
+    # Remove it from the detached adapter dict so the backend default applies
+    # without mutating stage_config.engine_args.
+    if engine_args_dict.get("tensor_parallel_size") is None:
+        engine_args_dict.pop("tensor_parallel_size", None)
+
+    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
+    return _finalize_engine_args_dict(
+        engine_args_dict,
+        stage_type=_get_attr_or_item(stage_config, "stage_type", "llm"),
+        stage_id=stage_config.stage_id,
+        model=model,
+        stage_connector_spec=stage_connector_spec,
+        cli_tokenizer=cli_tokenizer,
+        has_sampling_extra_args=bool(default_sp.get("extra_args")),
+    )
+
+
+def build_engine_args_dict(
+    stage_config: Any,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None = None,
+    cli_tokenizer: str | None = None,
+) -> dict[str, Any]:
+    """Build engine arguments through the stable production entry point.
+
+    Production inputs still use the legacy stage representation. Keep that
+    compatibility choice behind this function so callers do not bind directly
+    to a representation-specific implementation.
+    """
+    return build_legacy_engine_args_dict(
+        stage_config,
+        model,
+        stage_connector_spec=stage_connector_spec,
+        cli_tokenizer=cli_tokenizer,
+    )
+
+
+def build_engine_args_dict_from_omni_stage_config(
+    stage_config: BaseVllmOmniStageConfig,
+    model: str,
+    stage_connector_spec: dict[str, Any] | None = None,
+    cli_tokenizer: str | None = None,
+) -> dict[str, Any]:
+    """Project one typed stage config into backend engine arguments.
+
+    This projection is prepared for the RFC #4021 stage-init cutover. Current
+    production startup reaches the legacy implementation through
+    ``build_engine_args_dict`` while strategy and startup-plan inputs still
+    use the legacy representation.
+    """
+    engine_args_dict = _project_omni_stage_engine_args(stage_config)
+    _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
+    return _finalize_engine_args_dict(
+        engine_args_dict,
+        stage_type=stage_config.stage_type,
+        stage_id=stage_config.stage_id,
+        model=model,
+        stage_connector_spec=stage_connector_spec,
+        cli_tokenizer=cli_tokenizer,
+        has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
+    )
 
 
 def build_vllm_config(
@@ -948,11 +1132,30 @@ def build_llm_stage_output_processor(
     )
 
 
+class _TokenOnlyRenderer(BaseRenderer):
+    """Renderer for stages that explicitly skip tokenizer initialization."""
+
+    def render_messages(self, messages, params):
+        raise ValueError(
+            "Chat messages are unavailable when skip_tokenizer_init=True; submit prompt_token_ids or prompt_embeds"
+        )
+
+
+def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
+    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+
+
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
+        input_processor = InputProcessor(
+            vllm_config=stage_vllm_config,
+            renderer=_build_token_only_renderer(stage_vllm_config),
+        )
+    else:
+        input_processor = InputProcessor(vllm_config=stage_vllm_config)
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
         renderer=input_processor.renderer,
@@ -1238,6 +1441,7 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    od_config.max_num_seqs = batch_size
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 

@@ -49,7 +49,7 @@ Parallelism methods distribute computation across GPUs without quality loss (mat
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[Multi-Thread Weight Loading](#multi-thread-weight-loading)** | Loads safetensors shards in parallel using a thread pool | All diffusion models; reduces startup from minutes to seconds |
+| **[Multi-Thread Weight Loading](diffusion/startup_and_loading.md)** | Loads safetensors shards in parallel using a thread pool | All diffusion models; reduces startup from minutes to seconds |
 
 **Note:** Some acceleration methods can be combined together for optimized performance. See [Feature Compatibility Table](#feature-compatibility) and [Feature Compatibility Tutorial](feature_compatibility.md) for detailed configuration examples.
 
@@ -59,7 +59,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
+| **[CPU Offload](diffusion/cpu_offload.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
 | **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
 | **[VAE Parallelism](diffusion/parallelism/vae_parallelism.md)** | Distributes VAE decode work across GPUs | High-resolution generation with reduced VAE memory peak |
 
@@ -80,12 +80,11 @@ denoise steps.
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[Request-Level Batching](diffusion/request_batching.md)** | Scheduler batches compatible independent diffusion requests into one pipeline forward pass | Bursty online serving and multi-request throughput |
-| **[Step Execution](diffusion/step_execution.md)** | Per-step denoise execution with mid-request abort support | Request cancellation between denoise steps, fine-grained execution control |
+| **[Diffusion Execution Modes](diffusion/execution_modes.md)** | Configures serial requests, request batching, step execution, continuous batching, and streaming output | Matching latency, throughput, cancellation, and output-delivery requirements |
 
-**Note:** Request-level batching is available for pipelines that declare the
-request-batch forward contract. Step execution is currently supported by
-QwenImagePipeline only. See [Supported Models](#supported-models) for details.
+**Note:** Request-level batching and step execution are capability-based.
+Consult the execution guide and the selected pipeline's documentation for
+current support.
 
 ### Quantization Methods
 
@@ -101,12 +100,17 @@ The following tables show which models support each feature:
 
 - **🔀SP (Ulysses & Ring)**: Includes both Ulysses-SP and Ring-Attention methods
 - ✅ = Fully supported
+- ✅* = Supported with the constraint listed below the table
 - ❌ = Not supported
+- ❓ = Not verified; not recommended
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload_diffusion.md).
-> 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
+> 1. CPU Offload has three strategies: model-level, layerwise, and distributed
+>    layerwise. The tables below show **layerwise support** only. Split models
+>    like Cosmos3 swap their reasoner/generator components for model-level
+>    offload; see the [CPU Offload Guide](diffusion/cpu_offload.md).
+> 2. The **💾Quantization** column is collapsed for readability. See [Quantization](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
 
@@ -120,7 +124,7 @@ The following tables show which models support each feature:
 | **FLUX.2-dev**           |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |          ✅           |       ❌        |        ❌         |
 | **GLM-Image**            |     ❌     |     ❌      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Hidream-I1-Full**        |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
-| **HunyuanImage3**        |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ✅        |        ❌         |
+| **HunyuanImage3**        |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ✅        |        ✅*        |
 | **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
@@ -146,6 +150,7 @@ The following tables show which models support each feature:
 > 2. `Tongyi-MAI/Z-Image-Turbo` and `SII-GAIR/daVinci-MagiHuman-Base-1080p` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
 > 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
 > 4. Krea 2 currently supports single-GPU inference plus LoRA, Cache-DiT, HSDP, CPU/layerwise offload, and VAE-patch-parallel (decode). TP/SP/CFG-Parallel are not yet wired. The few-step distilled (Turbo) checkpoint uses `is_distilled=true` (fixed timestep shift `mu=1.15`); generate at 2048x2048 by default with `num_inference_steps≈8` and `guidance_scale=0`. The Raw checkpoint uses 1024x1024, `num_inference_steps=28`, and `guidance_scale=4.5`.
+> 5. HunyuanImage3 supports step execution. Multi-request step execution requires `TORCH_SDPA`; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
 
 ### VideoGen
 
@@ -156,16 +161,21 @@ The following tables show which models support each feature:
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
-| **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
+| **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
+| **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
+| **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
 
+> **Step execution note:** Helios supports single-request step execution only;
+> use `max_num_seqs=1`.
 
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, Helios, HunyuanVideo-1.5, DreamID-Omni
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni
 
 ### AudioGen
 
@@ -190,7 +200,7 @@ The following tables show which models support each feature:
 | **🔀Ring-Attn** | ✅ | ✅ | ✅ | | | | | | | | | | | |
 | **🔀CFG-Parallel** | ✅ | ✅ | ✅ | ✅ | | | | | | | | | | |
 | **🔀Tensor Parallel** | ✅ | ✅ | ✅ | ✅ | ✅ | | | | | | | | | |
-| **🔀HSDP** | ❓ | ❓ | ❓ | ❓ | ❓ | ❌ | | | | | | | | |
+| **🔀HSDP** | ❓ | ❓ | ✅ | ❓ | ✅ | ❌ | | | | | | | | |
 | **🔀Expert Parallel** | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | | | | | | | |
 | **💾CPU Offloading (Layerwise)** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | | | | | | |
 | **💾CPU Offloading (Module-wise)** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❓ | ❓ | ❌ | | | | | |
@@ -201,97 +211,43 @@ The following tables show which models support each feature:
 
 !!! info
 
-    1. Tensor Parallel and HSDP are not compatible.
+    1. HSDP can be combined with Ulysses-SP or CFG-Parallel. Tensor Parallel
+       and HSDP are not compatible; other HSDP combinations in the table
+       remain unverified.
     2. TeaCache and Cache-DiT are not compatible.
     3. CPU Offloading (Layerwise) and CPU Offloading (Module-wise) are not compatible.
-    4. CPU Offloading (Layerwise) supports single-card for now.
-    5. Using FP8-Quant as an example of qunatization methods.
-    6. Step Execution is not compatible with cache backends (TeaCache, Cache-DiT). LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
+    4. The CPU Offloading (Layerwise) row describes local layerwise offload.
+       Multi-device Distributed Layerwise Offload has a separate topology and
+       compatibility matrix in the [Distributed Layerwise Offloading guide](diffusion/offloader/distributed_layerwise_offload.md).
+    5. The compatibility matrix uses FP8 as the representative quantization method.
+    6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
 
 
 ## Multi-Thread Weight Loading
 
-Large diffusion models can take several minutes to load weights at startup (e.g., ~3 min for Qwen-Image, ~5 min for Wan2.2 I2V 14B). Multi-thread weight loading speeds up this process by loading safetensors shards in parallel using a thread pool instead of sequentially.
-
-This optimization is **enabled by default** with 4 threads. No configuration is needed for the default behavior.
-
-### Configuration
-
-| Parameter | CLI Flag | Default | Description |
-|-----------|----------|---------|-------------|
-| `enable_multithread_weight_load` | `--disable-multithread-weight-load` | `True` (enabled) | Pass the flag to disable multi-thread loading |
-| `num_weight_load_threads` | `--num-weight-load-threads` | `4` | Number of threads for parallel weight loading |
-
-!!! tip
-    The default of 4 threads balances speed and disk I/O contention. On fast NVMe storage you may benefit from more threads (e.g., 8). On HDD or network storage, the default of 4 avoids saturating I/O bandwidth.
-
-### Online Serving
-
-```bash
-# Default (multi-thread enabled, 4 threads)
-vllm serve Qwen/Qwen-Image --omni --port 8091
-
-# Custom thread count
-vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni --num-weight-load-threads 8
-
-# Disable multi-thread loading
-vllm serve Qwen/Qwen-Image --omni --disable-multithread-weight-load
-```
-
-### Offline Inference
-
-```python
-from vllm_omni import Omni
-
-# Default (multi-thread enabled, 4 threads)
-omni = Omni(model="Qwen/Qwen-Image")
-
-# Custom thread count
-omni = Omni(
-    model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-    num_weight_load_threads=8,
-)
-```
-
-### Benchmarks
-
-Measured on NVIDIA H800:
-
-| Model | Before | After | Speedup |
-|-------|--------|-------|---------|
-| **Qwen/Qwen-Image** (53.7 GiB) | 168s | 27s | **6.2x** |
-| **Wan-AI/Wan2.2-I2V-A14B-Diffusers** (64.5 GiB) | 283s | 56s | **5.1x** |
+The loading guide now lives at [Diffusion Startup and
+Loading](diffusion/startup_and_loading.md). This heading remains so existing
+links to this section continue to work.
 
 ## Learn More
 
-**Cache Acceleration:**
+The Diffusion Acceleration navigation groups the remaining guides as follows:
 
-- **[TeaCache Configuration Guide](diffusion/cache_acceleration/teacache.md)** - Parameter tuning, performance tips, troubleshooting
-- **[Cache-DiT Advanced Guide](diffusion/cache_acceleration/cache_dit.md)** - DBCache, TaylorSeer, SCM techniques and optimization
+| Area | Guide |
+| --- | --- |
+| Compatibility | [Feature Compatibility](feature_compatibility.md) |
+| CPU offloading | [CPU Offloading](diffusion/cpu_offload.md) |
+| Cache acceleration | [TeaCache](diffusion/cache_acceleration/teacache.md), [Cache-DiT](diffusion/cache_acceleration/cache_dit.md) |
+| Parallelism | [Parallelism Overview](diffusion/parallelism/overview.md) |
+| Attention | [Attention Backends](diffusion/attention_backends.md) |
+| Compilation | [Regional Compilation](diffusion/regional_compilation.md) |
+| Video extension | [Frame Interpolation](diffusion/frame_interpolation.md) |
+| Startup | [Startup and Loading](diffusion/startup_and_loading.md) |
+| Adapters | [LoRA](diffusion/lora.md) |
 
-**Parallelism Methods:**
+Related cross-model and runtime features are documented separately:
 
-- **[Parallelism Overview](diffusion/parallelism/overview.md)** - Tensor Parallelism, Sequence Parallelism, CFG Parallelism, Pipeline Parallelism, HSDP, and Expert Parallelism
-
-**Memory Optimization:**
-
-- **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
-- **[VAE Parallelism Guide](diffusion/parallelism/vae_parallelism.md)** - Distribute VAE decode work across GPUs for high-resolution images and videos
-- **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
-
-**Extensions:**
-
-- **[LoRA Inference Guide](diffusion/lora.md)** - Low-Rank Adaptation for style customization and fine-tuning
-- **[Frame Interpolation Guide](diffusion/frame_interpolation.md)** - Worker-side post-generation video frame interpolation for smoother motion
-
-**Execution Modes:**
-
-- **[Step Execution Guide](diffusion/step_execution.md)** - Per-step denoise execution with mid-request abort support
-
-**Startup Optimization:**
-
-- **[Multi-Thread Weight Loading](#multi-thread-weight-loading)** - Speed up model startup by loading safetensors shards in parallel
-
-**Advanced Topics:**
-
-- **[Feature Compatibility](feature_compatibility.md)** - How to combine multiple features for maximum performance
+- [Quantization](quantization/overview.md) covers diffusion-only models,
+  multi-stage omni/TTS models, and multi-stage diffusion models.
+- [Execution Modes and Streaming](diffusion/execution_modes.md) covers the
+  diffusion runtime, including batching, step execution, and streaming output.

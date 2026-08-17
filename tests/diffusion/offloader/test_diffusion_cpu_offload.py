@@ -122,8 +122,8 @@ def test_cpu_offload_diffusion_model(model_name: str):
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     if model_name == "stabilityai/stable-audio-open-1.0":
-        audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
-        audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
+        audio_offload = output_offload[0].multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0].multimodal_output.get("audio")
         check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
 
     # Set platform-specific VRAM saving thresholds to account

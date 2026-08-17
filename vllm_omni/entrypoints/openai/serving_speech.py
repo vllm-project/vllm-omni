@@ -53,7 +53,10 @@ from vllm_omni.entrypoints.openai.speech_usage import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters import (
     SpeechServingContext,
+    all_tts_stage_keys,
+    detect_tts_model_type,
     resolve_adapter,
+    tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
@@ -78,52 +81,17 @@ from vllm_omni.utils.speaker_cache import (
 logger = init_logger(__name__)
 
 # TTS Configuration
-_MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
-_VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
-_QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
-_FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
-_COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+#
+# The stage-key -> model-type mapping is NOT declared here: it is derived from
+# the ``stage_keys`` / ``model_archs`` each adapter declares, via
+# ``tts_adapters.detect_tts_model_type``. Adding a TTS model must not require an
+# edit to this module.
+#
 # CosyVoice3 talker expects its reference transcript wrapped in the model
 # instruction template; without the delimiter the talker re-speaks the
 # reference (issue #4644). Matches the offline example/test and upstream demo.
 _COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
 _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
-_OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
-_COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
-_VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
-_MING_TTS_MODEL_STAGES = {"ming_tts"}
-_MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
-_MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
-_MOSS_TTS_LOCAL_MODEL_STAGES = {"moss_tts_local", "moss_tts_local_codec"}
-_HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
-_HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
-_GLM_TTS_MODEL_STAGES = {"glm_tts"}
-_STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
-_INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
-# audex_omni covers the audex_s2s S2S deployment, whose
-# TTS pass uses the same /v1/audio/speech surface.
-_AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
-_AUDEX_TTA_MODEL_STAGES = {"audex_tta_thinker"}
-_TTS_MODEL_STAGES: set[str] = (
-    _VOXTRAL_TTS_MODEL_STAGES
-    | _QWEN3_TTS_MODEL_STAGES
-    | _FISH_TTS_MODEL_STAGES
-    | _COSYVOICE3_TTS_MODEL_STAGES
-    | _OMNIVOICE_TTS_MODEL_STAGES
-    | _HIGGS_AUDIO_V2_TTS_MODEL_STAGES
-    | _HIGGS_V3_TTS_MODEL_STAGES
-    | _COVO_AUDIO_MODEL_STAGES
-    | _VOXCPM2_TTS_MODEL_STAGES
-    | _MING_TTS_MODEL_STAGES
-    | _MOSS_TTS_MODEL_STAGES
-    | _MOSS_TTS_FULL_MODEL_STAGES
-    | _MOSS_TTS_LOCAL_MODEL_STAGES
-    | _GLM_TTS_MODEL_STAGES
-    | _STEP_AUDIO2_TTS_MODEL_STAGES
-    | _INDEXTTS2_TTS_MODEL_STAGES
-    | _AUDEX_TTS_MODEL_STAGES
-    | _AUDEX_TTA_MODEL_STAGES
-)
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "fish_tts",
     "qwen3_tts",
@@ -133,6 +101,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2",
+    "indextts2_5",
     "audex",
     "audex_tta",
 }
@@ -165,6 +134,13 @@ _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 _MING_DEFAULT_PROMPT = MING_DEFAULT_PROMPT
+_DEFAULT_VOICE_NAME = "default"
+
+
+def _is_default_voice(voice, supported_speakers):
+    """Check if a lowercased voice name is the placeholder default and not
+    an actual registered/built-in speaker."""
+    return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -446,7 +422,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_stage_configs = stage_configs
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
-        instance._is_fish_speech = False
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
@@ -455,17 +430,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
-        self.forced_aligner_config: Any | None = kwargs.pop("forced_aligner_config", None)
+        # True when the server was launched with --forced-aligner (a pooling
+        # aligner stage is appended to the pipeline). Gates word_timestamps.
+        self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
-        self._is_fish_speech = (
-            self._tts_stage is not None
-            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
-        )
         self._fish_speech_tokenizer = None
         self._covo_audio_tokenizer = None
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
@@ -474,11 +447,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # TTFP critical path) in _apply_cosyvoice3_dynamic_tokens.
         self._cosyvoice3_tokenizer = None
 
-        self._is_cosyvoice3 = (
-            self._tts_stage is not None
-            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
-            in _COSYVOICE3_TTS_MODEL_STAGES
-        )
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
         self.precomputed_speakers = self._load_precomputed_speakers()
@@ -509,7 +477,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
-        logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
+        if self.supported_speakers:
+            logger.info(
+                "Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers)
+            )
+        else:
+            logger.info(
+                "No built-in speakers configured; only '%s' and uploaded voices are available", _DEFAULT_VOICE_NAME
+            )
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
@@ -541,11 +516,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _get_tts_adapter(self):
         """Return the per-model serving adapter for the current ``_tts_model_type``.
 
+        Pure-diffusion speech uses its dedicated request path and does not
+        resolve adapters for AR-stage TTS models.
+
         Resolved lazily (rebuilt if ``_tts_model_type`` changed since the cached
         instance was built) so callers that set ``_tts_model_type`` after
         construction still dispatch to the matching adapter. In production
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
+        if self._diffusion_mode:
+            return None
+
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
             self._adapter = None
@@ -554,6 +535,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
         return self._adapter
+
+    def _uses_native_speed_control(self) -> bool:
+        adapter = self._get_tts_adapter()
+        return bool(adapter is not None and adapter.native_speed_control)
+
+    def _audio_encode_speed(self, request: OpenAICreateSpeechRequest) -> float:
+        if self._uses_native_speed_control():
+            return 1.0
+        return float(request.speed or 1.0)
 
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
@@ -687,74 +677,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _find_tts_stage(self):
         """Find and return the TTS stage config, or None if not found."""
-        all_stages = {getattr(stage.engine_args, "model_stage", None) for stage in self.engine_client.stage_configs}
+        tts_stage_keys = all_tts_stage_keys()
+        entry_stage_archs = tts_entry_stage_archs()
+        all_stages = frozenset(
+            getattr(stage.engine_args, "model_stage", None) for stage in self.engine_client.stage_configs
+        )
         for stage in self.engine_client.stage_configs:
             engine_args = stage.engine_args
             model_stage = engine_args.model_stage
             model_arch = getattr(engine_args, "model_arch", None)
             worker_type = getattr(engine_args, "worker_type", None)
-            if model_stage in _TTS_MODEL_STAGES:
-                # The audio-capable Audex thinker is only speech-capable when
-                # deployed WITH the speech decoder (audex_s2s);
-                # the thinker-only deployment is text-final and must not
-                # accept /v1/audio/speech requests.
-                if model_stage == "audex_omni" and "audex_code2wav" not in all_stages:
+            if model_stage in tts_stage_keys:
+                # Owning the stage key is not always enough: a model may be
+                # speech-capable only in some deployment topologies. Ask the
+                # adapter. Stages that resolve to no adapter keep the legacy
+                # behaviour of being accepted here (and detected as ``None``).
+                adapter_cls = resolve_adapter(detect_tts_model_type(model_stage, model_arch))
+                if adapter_cls is not None and not adapter_cls.stage_serves_speech(model_stage, all_stages):
                     continue
                 return stage
-            # Ming dense identifies its AR entry stage by architecture because
-            # it does not use a dedicated TTS model_stage value.
-            if model_arch in _MING_TTS_MODEL_ARCHS and worker_type == "ar":
+            # Models with no dedicated TTS model_stage value identify their AR
+            # entry stage by architecture (Ming dense).
+            if model_arch in entry_stage_archs and worker_type == "ar":
                 return stage
         return None
 
     def _detect_tts_model_type(self) -> str | None:
-        """Detect TTS model type from the stage's model_stage attribute."""
+        """Detect TTS model type from the resolved stage's deployment metadata.
+
+        The mapping lives on the adapters (``stage_keys`` / ``model_archs``);
+        this only supplies the stage under inspection.
+        """
         if self._tts_stage is None:
             return None
-        model_stage = getattr(self._tts_stage.engine_args, "model_stage", None)
-        model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
-        if model_arch == "VoxCPM2TalkerForConditionalGeneration":
-            return "voxcpm2"
-        if model_stage in _QWEN3_TTS_MODEL_STAGES:
-            return "qwen3_tts"
-        if model_stage in _VOXTRAL_TTS_MODEL_STAGES:
-            return "voxtral_tts"
-        if model_stage in _FISH_TTS_MODEL_STAGES:
-            return "fish_tts"
-        if model_stage in _COSYVOICE3_TTS_MODEL_STAGES:
-            return "cosyvoice3"
-        if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
-            return "omnivoice"
-        if model_stage in _COVO_AUDIO_MODEL_STAGES:
-            if model_arch and "CovoAudio" in model_arch:
-                return "covo_audio"
-        if model_stage in _VOXCPM2_TTS_MODEL_STAGES:
-            return "voxcpm2"
-        if model_stage in _MING_TTS_MODEL_STAGES:
-            return "ming_flash_omni_tts"
-        if model_arch in _MING_TTS_MODEL_ARCHS:
-            return "ming_tts"
-        if model_stage in _MOSS_TTS_MODEL_STAGES:
-            return "moss_tts_nano"
-        if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
-            return "moss_tts"
-        if model_stage in _MOSS_TTS_LOCAL_MODEL_STAGES:
-            return "moss_tts"
-        if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
-            return "higgs_audio_v2"
-        if model_stage in _HIGGS_V3_TTS_MODEL_STAGES:
-            return "higgs_audio_v3"
-        if model_stage in _GLM_TTS_MODEL_STAGES:
-            return "glm_tts"
-        if model_stage in _STEP_AUDIO2_TTS_MODEL_STAGES:
-            return "step_audio2"
-        if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
-            return "indextts2"
-        if model_stage in _AUDEX_TTS_MODEL_STAGES:
-            return "audex"
-        if model_stage in _AUDEX_TTA_MODEL_STAGES:
-            return "audex_tta"
-        return None
+        return detect_tts_model_type(
+            getattr(self._tts_stage.engine_args, "model_stage", None),
+            getattr(self._tts_stage.engine_args, "model_arch", None),
+        )
 
     def _get_custom_voice_dir(self) -> str | None:
         try:
@@ -813,6 +772,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 3. Default fallback
         return _TTS_MAX_INSTRUCTIONS_LENGTH
+
+    def _get_available_voices(self) -> set[str]:
+        """Get all voice names accepted by the API, including the placeholder default."""
+        return self.supported_speakers | self.uploaded_speakers.keys() | {_DEFAULT_VOICE_NAME}
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -1520,9 +1483,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
-        if self._tts_model_type == "ming_flash_omni_tts":
-            return self._validate_ming_flash_omni_tts_request(request)
-
         adapter = self._get_tts_adapter()
         if adapter is not None:
             return adapter.validate(request)
@@ -1555,41 +1515,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._voxcpm2_split_map)
-
-    def _validate_ming_flash_omni_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate Ming-flash-omni standalone-talker request parameters."""
-        if not request.input or not request.input.strip():
-            return "Input text cannot be empty"
-        if request.instructions is not None:
-            if not isinstance(request.instructions, str):
-                return "instructions must be a string"
-            if len(request.instructions) > self._max_instructions_length:
-                return f"instructions exceeds max length {self._max_instructions_length}"
-
-        if request.task_type is not None:
-            return "'task_type' is not supported for Ming-flash-omni TTS"
-        if request.language is not None:
-            return "'language' is not supported for Ming-flash-omni TTS (language is inferred from input text)"
-        if request.x_vector_only_mode is not None:
-            return "'x_vector_only_mode' is not supported for Ming-flash-omni TTS"
-        if request.initial_codec_chunk_frames is not None:
-            return "'initial_codec_chunk_frames' is not supported for Ming-flash-omni TTS"
-
-        # Per-request voice cloning from raw audio is not yet wired up: Ming
-        # extracts spk_emb / prompt_wav_lat / prompt_wav_emb model-side via
-        # register_prompt_wav() at engine init. For ad-hoc cloning, callers
-        # should pre-compute speaker_embedding and pass it directly.
-        if request.ref_audio is not None:
-            return (
-                "'ref_audio' is not yet supported for Ming-flash-omni TTS; "
-                "use a preset 'voice' or 'speaker_embedding' instead"
-            )
-        if request.ref_text is not None:
-            return "'ref_text' is not yet supported for Ming-flash-omni TTS"
-
-        if request.max_new_tokens is not None and request.max_new_tokens <= 0:
-            return "'max_new_tokens' must be a positive integer"
-        return None
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -2287,6 +2212,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_start_s: float | None = None,
         include_sample_rate: bool = False,
         usage_acc: SpeechOutputTokenCounter | None = None,
+        collect: dict | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2319,6 +2245,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     usage_acc.observe(res)
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
+                    # Stash the aligner's timestamps output for streaming callers.
+                    if collect is not None and self._is_timestamps_output(res):
+                        collect["aligner_res"] = res
                     continue
 
                 sr_raw = audio_output.get("sr")
@@ -2508,6 +2437,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             yield f"event: speech.audio.error\ndata: {data}\n\n"
 
     @staticmethod
+    def _is_timestamps_output(res) -> bool:
+        """True when ``res`` is the forced-aligner stage's terminal timestamps output."""
+        from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
+
+        return getattr(res, "final_output_type", None) == TIMESTAMPS_MODALITY
+
+    @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
         """Return (audio_output dict, audio key) or (None, None).
 
@@ -2517,7 +2453,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         mm = getattr(res, "multimodal_output", None)
         ro = None
         if not mm:
-            ro = getattr(res, "request_output", None)
+            ro = res
             mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             # MultimodalOutputProcessor attaches mm_accumulated on per-completion outputs.
@@ -3246,18 +3182,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # inline vs. via an uploaded voice.
         model_type: str | None = None
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
-        if self._tts_model_type == "ming_flash_omni_tts":
-            # ming_flash_omni is intentionally NOT migrated onto the adapter
-            # framework in this PR (it has no registered adapter); keep it on the
-            # legacy inline dispatch so serving still works.
-            model_type = "ming_flash_omni_tts"
-            validation_error = self._validate_ming_flash_omni_tts_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
-            prompt = self._build_ming_flash_omni_prompt(request)
-            tts_params = {}
-            qwen3_ref_audio_warmup_artifact_key = None
-        elif (adapter := self._get_tts_adapter()) is not None:
+        if (adapter := self._get_tts_adapter()) is not None:
             validation_error = adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)
@@ -3444,11 +3369,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     stage0_params.extra_args = {}
                 stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
+        # When word_timestamps is requested, also ask for the aligner stage's
+        # output so the orchestrator drives the request through the forced-aligner
+        # stage (final_stage_id extends to it). Harmless if no aligner stage exists.
+        output_modalities = ["audio"]
+        if getattr(request, "word_timestamps", False):
+            from vllm_omni.model_executor.stage_input_processors.forced_aligner import TIMESTAMPS_MODALITY
+
+            output_modalities.append(TIMESTAMPS_MODALITY)
+
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
-            output_modalities=["audio"],
+            output_modalities=output_modalities,
         )
         self._track_ref_audio_artifact_warmup(
             request_id,
@@ -3457,17 +3391,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return request_id, generator, tts_params
 
-    async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):
+    async def _generate_pcm_chunks(
+        self, generator, request_id: str, *, include_sample_rate: bool = False, collect: dict | None = None
+    ):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
         Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
+        ``collect`` (when given) receives the forced-aligner stage's pooling
+        output under ``"aligner_res"`` for downstream word-timestamp extraction.
         """
         async for chunk in self._generate_audio_chunks(
             generator,
             request_id,
             response_format="pcm",
             include_sample_rate=include_sample_rate,
+            collect=collect,
         ):
             yield chunk
 
@@ -3487,6 +3426,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str | None = None,
         usage_out: list[SpeechTokenUsage] | None = None,
         has_inline_ref_audio: bool | None = None,
+        collect: dict | None = None,
     ) -> tuple[bytes | str, str]:
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
@@ -3510,9 +3450,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Non-streaming is FINAL_ONLY, so the stage-0 output carries the full
             # token sequence; the counter records its length for output_tokens.
             usage_acc = SpeechOutputTokenCounter()
+            audio_res: OmniRequestOutput | None = None
+            aligner_res: OmniRequestOutput | None = None
             async for res in generator:
                 final_output = res
                 usage_acc.observe(res)
+                # The generator yields both the audio output (Code2Wav) and, with
+                # a forced-aligner stage, a timestamps output. Keep the audio res
+                # for the WAV and the aligner res for word timestamps.
+                if self._is_timestamps_output(res):
+                    aligner_res = res
+                else:
+                    _, audio_key = self._extract_audio_output(res)
+                    if audio_key is not None:
+                        audio_res = res
                 if not is_moss:
                     continue
                 try:
@@ -3534,9 +3485,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if final_output is None:
                 raise ValueError("No output generated from the model.")
 
-            audio_output, audio_key = self._extract_audio_output(final_output)
+            # Extract audio from the audio-bearing res (not necessarily the last
+            # yielded one, which may be the aligner's timestamps output).
+            audio_source = audio_res if audio_res is not None else final_output
+            audio_output, audio_key = self._extract_audio_output(audio_source)
             if audio_key is None:
                 raise ValueError("TTS model did not produce audio output.")
+
+            # Surface forced-aligner word timestamps to the caller (set as a
+            # response header) when requested and an aligner stage produced them.
+            if collect is not None and getattr(request, "word_timestamps", False):
+                from vllm_omni.utils.forced_aligner import extract_word_timestamps
+
+                ts = (
+                    extract_word_timestamps(aligner_res, request.input, getattr(request, "language", None))
+                    if aligner_res is not None
+                    else None
+                )
+                if ts is not None:
+                    collect["word_timestamps"] = ts
 
             audio_tensor = audio_output[audio_key]
             sr_raw = audio_output.get("sr", 24000)
@@ -3595,7 +3562,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
+                speed=self._audio_encode_speed(request),
                 base64_encode=base64_encode,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3607,6 +3574,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+
+    def _get_normalized_voice(self, voice: str | None) -> str | None:
+        """Get the normalized voice to be used; currently this means that
+        the voice is a:
+            - lowercase str if it's a valid supported/uploaded speaker
+            - None if the voice is the placeholder default or not provided
+        """
+        if voice is not None:
+            voice = voice.lower()
+            if voice not in self.uploaded_speakers and voice not in self.supported_speakers:
+                raise ValueError(
+                    f"Invalid voice '{voice}'. Supported: {', '.join(sorted(self._get_available_voices()))}"
+                )
+        return voice
 
     async def _create_diffusion_speech(
         self,
@@ -3624,11 +3605,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if fmt_err:
                     return self._diffusion_error_response(fmt_err, status_code=400)
 
-            if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
-                    all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
-                    raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
+            request.voice = self._get_normalized_voice(request.voice)
 
             has_inline_ref_audio = request.ref_audio is not None
             err = self._apply_uploaded_speaker(request)
@@ -3643,10 +3620,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text
             if request.voice:
-                voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = voice_lower
-                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = request.voice
+                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
@@ -3709,7 +3685,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
-                speed=request.speed or 1.0,
+                speed=self._audio_encode_speed(request),
                 base64_encode=False,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3751,7 +3727,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return response_format, self.create_error_response(
                 f"{mode_label} is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
             )
-        if request.speed is not None and request.speed != 1.0:
+        if request.speed is not None and request.speed != 1.0 and not self._uses_native_speed_control():
             return response_format, self.create_error_response(
                 f"{mode_label} is not supported with speed adjustment. "
                 "Use a non-streaming request or remove the speed parameter."
@@ -3785,6 +3761,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
         decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
+        if request.voice is not None:
+            if _is_default_voice(request.voice.lower(), self.supported_speakers):
+                request.voice = None
+
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)
 
@@ -3806,6 +3786,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "word_timestamps=true is currently supported by the WebSocket "
                     "/v1/audio/speech/stream path. Use session.config with "
                     "stream_audio=true and response_format='pcm'."
+                )
+            if request.word_timestamps and not self.forced_aligner_enabled:
+                # Fail loud instead of silently returning 200 with no timestamps header.
+                return self.create_error_response(
+                    "word_timestamps=true requires the server to be launched with --forced-aligner."
                 )
 
             if request.is_raw_audio_stream():
@@ -3851,7 +3836,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     media_type="text/event-stream",
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            collect: dict = {}
+            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id, collect=collect)
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -3859,7 +3845,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
-            return Response(content=audio_bytes, media_type=media_type)
+            headers = {}
+            if collect.get("word_timestamps") is not None:
+                # Default ensure_ascii keeps the header latin-1 encodable (non-ASCII words \uXXXX-escaped).
+                ts_json = json.dumps(collect["word_timestamps"])
+                # Cap at 4 KB: oversized headers turn into opaque 502s at common reverse-proxy defaults.
+                if len(ts_json) <= 4096:
+                    headers["X-Word-Timestamps"] = ts_json
+                else:
+                    # Marker header so clients can tell an oversized alignment from no alignment.
+                    headers["X-Word-Timestamps-Omitted"] = f"oversize; bytes={len(ts_json)}; limit=4096"
+                    logger.warning(
+                        "X-Word-Timestamps header omitted: %d bytes exceeds the 4 KB budget "
+                        "(use the WebSocket streaming path for long transcripts)",
+                        len(ts_json),
+                    )
+            return Response(content=audio_bytes, media_type=media_type, headers=headers)
 
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0

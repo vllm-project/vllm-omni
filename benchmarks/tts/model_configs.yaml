@@ -7,6 +7,17 @@
 # is tracked here.
 
 models:
+  IndexTeam/IndexTTS-2.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone:
+        extra_params:
+          lang: en
+          text_normalization: true
+
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
   # at model runtime).  Use -Base for voice_clone.

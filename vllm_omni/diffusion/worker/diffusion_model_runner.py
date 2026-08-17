@@ -30,13 +30,25 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsPromptUpdate, supports_prompt_update, supports_step_execution
+from vllm_omni.diffusion.models.interface import (
+    SupportsPromptUpdate,
+    adopt_request_scoped_cache_dit,
+    is_request_scoped_cache_dit_enabled,
+    supports_prompt_update,
+    supports_step_execution,
+)
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionSchedulerOutput,
+    KVPrefetchJob,
+    validate_new_request_data_identity,
+)
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -147,6 +159,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     @property
     def _target_device(self) -> torch.device | None:
         return getattr(self.pipeline, "device", None)
+
+    def _validate_diffusion_kv_metadata(
+        self,
+        *,
+        request_id: str,
+        metadata: DiffusionKVMetadata | None,
+    ) -> None:
+        cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        # W0 does not wire the Scheduler allocator or Worker installer yet, so
+        # validate an allocation snapshot when present without requiring one.
+        if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is not None:
+            raise ValueError(f"{cache_mode.value} request {request_id!r} must not carry Diffusion KV metadata")
+
+        if metadata is not None and metadata.request_id != request_id:
+            raise ValueError(
+                f"Diffusion KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}"
+            )
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -263,7 +292,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         # Apply CPU offloading
-        self.offload_backend = get_offload_backend(self.od_config, device=self.device)
+        self.offload_backend = get_offload_backend(
+            self.od_config,
+            device=self.device,
+            host_weight_plan=model_loader.take_host_weight_plan(),
+        )
         if self.offload_backend is not None:
             logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
             self.offload_backend.enable(self.pipeline)
@@ -280,8 +313,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             exc,
                         )
                 else:
-                    self._compile_transformer("transformer")
-                    self._compile_transformer("transformer_2")
+                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+                    if not transformer_attrs:
+                        transformer_attrs = ("transformer", "transformer_2")
+                    for attr_name in transformer_attrs:
+                        self._compile_transformer(attr_name)
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -301,7 +337,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.cache_backend = None
                 self.od_config.cache_backend = None
             else:
+                # Install configured cache capability once at startup. A model
+                # may explicitly adopt the enabled Cache-DiT backend and then
+                # own all later request-boundary enable/disable transitions.
                 self.cache_backend.enable(self.pipeline)
+                if str(self.od_config.cache_backend).lower() == "cache_dit" and adopt_request_scoped_cache_dit(
+                    self.pipeline,
+                    self.cache_backend,
+                ):
+                    logger.info(
+                        "Pipeline %s owns request-scoped Cache-DiT transitions.",
+                        type(self.pipeline).__name__,
+                    )
+                    self.cache_backend = None
 
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
@@ -520,11 +568,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and prompt_embed_cache is not None:
                 logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
 
+            runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
             if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and od_config.cache_backend == "cache_dit"
+                od_config.cache_backend == "cache_dit"
                 and od_config.enable_cache_dit_summary
+                and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
 
@@ -545,6 +593,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -561,6 +610,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             not track. For non-HSDP inference, we use torch.inference_mode() for better
             performance.
         """
+        self._validate_diffusion_kv_metadata(
+            request_id=req.request_id,
+            metadata=diffusion_kv_metadata,
+        )
         runner_output = self._execute_request_list(
             [req],
             od_config=self.od_config,
@@ -584,6 +637,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
+        for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         return self._execute_request_list(
             reqs,
@@ -620,6 +679,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
                     kv_sender_info=sched_new_req.req.kv_sender_info,
+                    prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                 )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
@@ -691,6 +751,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.

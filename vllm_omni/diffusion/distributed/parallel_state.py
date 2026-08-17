@@ -28,6 +28,8 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 
+import inspect
+
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as vllm_parallel_state
@@ -524,13 +526,23 @@ def init_vllm_model_parallel_group(
     local_rank: int,
     backend: str,
     group_name: str,
+    use_all2all: bool = False,
 ) -> vllm_parallel_state.GroupCoordinator:
+    # vLLM 0.27's MoE oracle (make_unquantized_moe_kernel ->
+    # get_ep_all2all_manager) asserts that the EP group's device communicator
+    # carries an all2all_manager, and vLLM only builds one when the group is
+    # created with use_all2all=True. Older vLLM has neither the kwarg nor the
+    # requirement, so forward it only when supported.
+    kwargs = {}
+    if use_all2all and "use_all2all" in inspect.signature(vllm_parallel_state.init_model_parallel_group).parameters:
+        kwargs["use_all2all"] = True
     return vllm_parallel_state.init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         backend=backend,
         group_name=group_name,
         use_device_communicator=True,
+        **kwargs,
     )
 
 
@@ -954,6 +966,7 @@ def initialize_model_parallel(
             local_rank=get_world_group().local_rank,
             backend=backend,
             group_name="ep",
+            use_all2all=True,
         )
 
     init_dit_group(dit_parallel_size, backend)

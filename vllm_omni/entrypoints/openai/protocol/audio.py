@@ -59,6 +59,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         validation_alias=AliasChoices("voice", "speaker"),
         description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def _normalize_voice(cls, voice: str | dict[str, str]) -> str:
+        if isinstance(voice, dict):
+            if "id" not in voice:
+                raise ValueError("voice dict must contain 'id'")
+            return voice["id"]
+        return voice
+
     instructions: str | None = Field(
         default=None,
         description="Instructions for voice style/emotion (maps to 'instruct' for Qwen3-TTS)",
@@ -82,7 +92,8 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
             "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
-            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
+            "HTTP streaming requires response_format='pcm' or 'wav'. "
+            "Models with native speed control may accept speed adjustment over HTTP."
         ),
     )
 
@@ -160,10 +171,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     word_timestamps: bool = Field(
         default=False,
         description=(
-            "When true, the server runs a shared forced aligner alongside the streamed "
-            "audio and emits per-chunk word timestamps. Requires the server to be "
-            "launched with --forced-aligner pointing at an aligner model. No effect "
-            "when streaming is off."
+            "When true, non-streaming responses carry per-word timestamps in the "
+            "X-Word-Timestamps header (JSON list of {word, start_ms, end_ms}, "
+            "ASCII-escaped; replaced by X-Word-Timestamps-Omitted past 4 KB). "
+            "Requires the server to be launched with --forced-aligner (400 otherwise). "
+            "Not supported with stream=true; for streaming use the WebSocket "
+            "/v1/audio/speech/stream path."
         ),
     )
 
@@ -317,8 +330,6 @@ class OpenAICreateSpeechRequest(BaseModel):
                 )
             if self.speed is None:
                 self.speed = 1.0
-            elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
@@ -532,7 +543,8 @@ class StreamingSpeechSessionConfig(BaseModel):
         default=False,
         description=(
             "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm'. WebSocket streaming currently requires "
+            "speed=1.0, including for models with native speed control."
         ),
     )
     word_timestamps: bool = Field(
@@ -556,5 +568,8 @@ class StreamingSpeechSessionConfig(BaseModel):
             if self.speed is None:
                 self.speed = 1.0
             elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
+                raise ValueError(
+                    "WebSocket stream_audio=true currently requires speed=1.0; "
+                    "native speed control is only available through HTTP streaming."
+                )
         return self

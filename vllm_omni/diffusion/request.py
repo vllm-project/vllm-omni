@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import random
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 
@@ -30,6 +35,18 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    # Optional opaque, model-owned input prepared before Scheduler admission.
+    # Model code validates its concrete type when consuming it on the Worker.
+    prepared_layout: Any | None = None
+    # Scheduler-only native-compatible KV requests produced by model
+    # preprocessing.
+    # BaseScheduler takes ownership and clears this field before the request is
+    # sent to a Worker.
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] | None = None
+    # Optional model-specific condition structure used by request-batch admission.
+    # This is populated by a pipeline preprocessor before the request reaches
+    # the scheduler; ``None`` keeps the default behavior for other pipelines.
+    batch_compatibility_key: tuple[Any, ...] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

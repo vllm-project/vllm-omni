@@ -6,7 +6,7 @@ Online serving tests for the Qwen-Image-Edit family (image-to-image via chat com
 
 - ``test_single_image_to_image_001``: ``Qwen/Qwen-Image-Edit`` — one reference image, fixed 512×512.
 - ``test_multi_images_to_image_001``: ``Qwen/Qwen-Image-Edit-2511`` — two reference images, fixed 512×512.
-- ``test_different_sizes_001``: ``Qwen/Qwen-Image-Edit-2511`` only, ``advanced_model`` — mixed input
+- ``test_different_sizes_001``: ``Qwen/Qwen-Image-Edit-2511`` only, ``slow`` — mixed input
   resolutions; ``extra_body`` uses per-output ``width``/``height`` lists; the test client sends one
   scalar-size request per list index in parallel and merges images (see ``OpenAIClientHandler.send_diffusion_request``).
 
@@ -52,7 +52,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -82,8 +82,7 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -114,7 +113,7 @@ def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenA
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
