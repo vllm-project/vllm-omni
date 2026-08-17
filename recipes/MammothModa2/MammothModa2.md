@@ -115,14 +115,13 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --guidance-scale 4.0 \
   --num-inference-steps 50 \
   --cache-backend tea_cache \
-  --cache-config '{"rel_l1_thresh": 0.1}' \
   --extra-body '{"cfg_range": [0.0, 1.0]}' \
   --output mammoth_t2i_teacache.png
 ```
 
 The bundled TeaCache coefficients were fitted from MammothModa2 full-compute
-traces. For the evaluated 1024x1024, 50-step configuration,
-`rel_l1_thresh=0.1` provided the selected quality/speed tradeoff.
+traces. MammothModa2 uses the model-specific default `rel_l1_thresh=0.1`,
+selected for the evaluated 1024x1024, 50-step configuration.
 
 The model-specific keys are declared in
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),

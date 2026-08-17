@@ -1248,17 +1248,45 @@ def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
+    cli_overrides: Mapping[str, Any] | None = None,
+    route_diffusion_cache: bool = False,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
+    stage_overrides = dict(stage_cli_overrides or {})
+    if route_diffusion_cache:
+        cli_overrides = cli_overrides or {}
+        backend_key = f"stage_{topology.stage_id}_cache_backend"
+        config_key = f"stage_{topology.stage_id}_cache_config"
+        scoped_backend = cli_overrides.get(backend_key)
+        scoped_config = cli_overrides.get(config_key)
+        yaml_backend = engine.get("cache_backend")
+        yaml_config = engine.get("cache_config")
+        if scoped_backend is not None or scoped_config is not None:
+            engine.pop("cache_backend", None)
+            engine.pop("cache_config", None)
+            stage_overrides.pop("cache_backend", None)
+            stage_overrides.pop("cache_config", None)
+            if scoped_backend is not None:
+                stage_overrides["cache_backend"] = scoped_backend
+            if scoped_config is not None:
+                stage_overrides["cache_config"] = scoped_config
+        elif yaml_backend is not None or yaml_config is not None:
+            stage_overrides.pop("cache_backend", None)
+            stage_overrides.pop("cache_config", None)
+    elif topology.execution_type != StageExecutionType.DIFFUSION:
+        engine.pop("cache_backend", None)
+        engine.pop("cache_config", None)
+        stage_overrides.pop("cache_backend", None)
+        stage_overrides.pop("cache_config", None)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
-    if stage_cli_overrides:
+    if stage_overrides:
         if topology.execution_type == StageExecutionType.DIFFUSION:
             # Mirror StageConfig.to_omegaconf so both projections resolve alike.
-            reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
-        engine.update(_copy_value(stage_cli_overrides))
+            reconcile_diffusion_attention_overrides(engine, stage_overrides)
+        engine.update(_copy_value(stage_overrides))
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
@@ -1936,6 +1964,10 @@ class VllmOmniConfig:
                         topology.stage_id,
                         cli_overrides,
                         execution_type=topology.execution_type,
+                    ),
+                    cli_overrides,
+                    route_diffusion_cache=(
+                        pipeline_cfg.model_type == "mammoth_moda2" and topology.model_stage == "dit"
                     ),
                 ),
                 model=model,

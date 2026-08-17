@@ -56,7 +56,6 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
-parse_cache_config = functools.partial(parse_json_object, flag_name="--cache-config")
 
 
 def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -162,15 +161,6 @@ def parse_args() -> argparse.Namespace:
             "Cache backend to use for acceleration. "
             "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
             "Default: None (no cache acceleration)."
-        ),
-    )
-    parser.add_argument(
-        "--cache-config",
-        type=parse_cache_config,
-        default=None,
-        help=(
-            "JSON object of cache configuration values that override the example defaults. "
-            "Example: '{\"rel_l1_thresh\": 0.1}'."
         ),
     )
     parser.add_argument(
@@ -428,19 +418,6 @@ def main():
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
-    elif cache_backend == "tea_cache":
-        # TeaCache configuration
-        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
-        cache_config = {
-            # TeaCache parameters [tea_cache only]
-            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
-            # Note: coefficients will use model-specific defaults based on model_type
-            #       (e.g., QwenImagePipeline or FluxPipeline)
-        }
-
-    if args.cache_config is not None:
-        cache_config = {**(cache_config or {}), **args.cache_config}
-
     profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization

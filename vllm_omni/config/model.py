@@ -155,8 +155,6 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
-    cache_backend: str | None = "none"
-    cache_config: dict[str, Any] | str | None = None
 
     @property
     def registry(self):

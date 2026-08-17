@@ -179,6 +179,26 @@ class TestMammothModa2Extractor(BaseExtractorTest):
         with pytest.raises(ValueError, match="teacache_branch"):
             mammoth_module(**sample_inputs, teacache_branch="bad")
 
+    def test_forced_full_compute_matches_original_forward(self, mammoth_module, sample_inputs, monkeypatch):
+        with torch.no_grad():
+            expected = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=0.1,
+        )
+        apply_teacache_hook(mammoth_module, config)
+        hook = mammoth_module._hook_registry.get_hook("teacache")
+        should_compute_full = Mock(return_value=True)
+        monkeypatch.setattr(hook, "_should_compute_full_transformer", should_compute_full)
+
+        with torch.no_grad():
+            actual = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        should_compute_full.assert_called_once()
+        torch.testing.assert_close(actual, expected)
+
 
 class TestFlux2KleinExtractor(BaseExtractorTest):
     """Test extract_flux2_klein_context function."""

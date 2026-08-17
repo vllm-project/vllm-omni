@@ -83,11 +83,8 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
-    # MammothModa2 DiT transformer coefficients.
-    # Fitted from MammothModa2 full-compute traces by mapping consecutive
-    # modulated-input rel-L1 distances to consecutive transformer-output rel-L1
-    # distances. The calibration set used 12 prompts x 2 CFG branches x
-    # 49 transitions at 1024x1024, 50 denoising steps.
+    # MammothModa2 DiT coefficients fitted from full-compute traces
+    # at 1024x1024 with 50 denoising steps.
     "MammothModa2Transformer2DModel": [
         -972.2069838924724,
         493.79503932912513,
@@ -107,6 +104,7 @@ _MODEL_COEFFICIENTS = {
 
 _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
+    "MammothModa2Transformer2DModel": 0.1,
     "MiniMaxH3DiTModel": 0.17,
 }
 
