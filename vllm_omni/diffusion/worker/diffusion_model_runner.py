@@ -1011,7 +1011,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 paged_kv_context,
             ):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    # Stage dispatch is owned by the pipeline: pipelines that
+                    # support per-stage roles (e.g. Encode/Generation (EG)
+                    # disaggregation) expose ``run_stage`` and decide internally
+                    # whether to encode only or run the full forward pass.
+                    run_stage = getattr(self.pipeline, "run_stage", None)
+                    if callable(run_stage):
+                        raw_outputs = run_stage(batch)
+                    else:
+                        raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
