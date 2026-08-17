@@ -4,6 +4,7 @@
 import math
 import time
 from collections import OrderedDict
+from enum import Enum
 from typing import get_args
 
 import torch
@@ -31,6 +32,11 @@ from vllm_omni.diffusion.lora.utils import (
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+
+
+class LoRABackend(str, Enum):
+    PEFT = "peft"
+    DISTILL = "distill"
 
 
 class DiffusionLoRAManager:

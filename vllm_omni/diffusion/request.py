@@ -43,6 +43,10 @@ class OmniDiffusionRequest:
     # BaseScheduler takes ownership and clears this field before the request is
     # sent to a Worker.
     diffusion_kv_requests: tuple[DiffusionKVRequest, ...] | None = None
+    # Optional model-specific condition structure used by request-batch admission.
+    # This is populated by a pipeline preprocessor before the request reaches
+    # the scheduler; ``None`` keeps the default behavior for other pipelines.
+    batch_compatibility_key: tuple[Any, ...] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

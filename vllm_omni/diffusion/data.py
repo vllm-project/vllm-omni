@@ -27,6 +27,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
 )
+from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -537,7 +538,11 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
-def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
+def resolve_model_class_name(
+    model: str | None,
+    diffusion_load_format: str = "default",
+    revision: str | None = None,
+) -> str | None:
     """Resolve the diffusion pipeline class name from the model config.
 
     Read-only counterpart of ``OmniDiffusionConfig.enrich_config``, safe to call
@@ -549,11 +554,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     if not model:
         return None
-
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
     # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model)
+    model_index = get_diffusion_model_index(model, revision=revision)
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -561,7 +565,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     # Other models: map model_type / architecture from config.json.
     try:
-        cfg = get_hf_file_to_dict("config.json", model) or {}
+        cfg = get_hf_file_to_dict("config.json", model, revision=revision) or {}
     except Exception:
         cfg = {}
     model_type = cfg.get("model_type")
@@ -682,8 +686,9 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    lora_path: str | None = None
-    lora_scale: float = 1.0
+    lora_path: str | list[str] | None = None
+    lora_scale: float | list[float] = 1.0
+    lora_backend: LoRABackend = LoRABackend.PEFT  # available choices: ["peft", "distill"]
     max_cpu_loras: int | None = None
 
     output_type: str = "pil"
@@ -1208,9 +1213,20 @@ class OmniDiffusionConfig:
                             exc,
                         )
                 else:
-                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                    from vllm_omni.model_extras import get_transformer_config_subfolder
+
+                    transformer_subfolder = get_transformer_config_subfolder(
+                        self.model_class_name,
+                        model=self.model,
+                        revision=self.revision,
+                    )
+                    tf_config_dict = get_hf_file_to_dict(
+                        f"{transformer_subfolder}/config.json",
+                        self.model,
+                        revision=self.revision,
+                    )
                     if tf_config_dict is None:
-                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
                     if tf_config_dict is not None:
                         self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
                     else:
@@ -1230,7 +1246,7 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
-                cfg = get_hf_file_to_dict("config.json", self.model)
+                cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
@@ -1302,6 +1318,12 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif cfg.get("type") == "pi0":
+                    # π0 (Pi-Zero) VLA — the LeRobot config.json uses ``type: "pi0"``.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry

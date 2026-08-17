@@ -14,7 +14,6 @@ import itertools
 import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters import (
-    LEGACY_TTS_DETECTORS,
     TTS_ADAPTER_REGISTRY,
     all_tts_stage_keys,
     detect_tts_model_type,
@@ -149,6 +148,7 @@ _PIPELINE_STAGES = [
     "glm_tts_dit",
     "higgs_audio_v2",
     "higgs_audio_v3",
+    "indextts2_5_talker",
     "indextts2_s2mel_decoder",
     "indextts2_talker",
     "latent_generator",
@@ -213,18 +213,23 @@ _CLAIMED_ARCH_CASES = [
     ("fused_thinker_talker", "Qwen3TTSForConditionalGeneration"),
 ]
 
-_REACHABLE = list(itertools.product(_STAGES, _UNCLAIMED_ARCHS)) + _CLAIMED_ARCH_CASES
+# The frozen ladder can only be compared over stages it knew about. New
+# adapter-owned stages are covered by their adapter tests and by the registry
+# completeness checks below.
+_NEW_ADAPTER_STAGE_KEYS = all_tts_stage_keys() - _LEGACY_TTS_MODEL_STAGES
+_LEGACY_REACHABLE_STAGES = [stage for stage in _STAGES if stage not in _NEW_ADAPTER_STAGE_KEYS]
+_REACHABLE = list(itertools.product(_LEGACY_REACHABLE_STAGES, _UNCLAIMED_ARCHS)) + _CLAIMED_ARCH_CASES
 
 
 @pytest.mark.parametrize(("model_stage", "model_arch"), _REACHABLE)
 def test_detection_matches_legacy_ladder(model_stage, model_arch):
     """Registry detection is identical to the ladder it replaced.
 
-    Covers every ``model_stage`` any in-tree pipeline emits (``_PIPELINE_STAGES``,
-    plus negatives) against every architecture no adapter claims, and each
-    claimed architecture against the stage keys it really ships with. Pairing a
-    claimed architecture with an unrelated model's stage key is excluded because
-    no pipeline can produce it, and is covered separately by
+    Covers every stage the frozen ladder knew about, plus non-TTS pipeline
+    stages and negatives, against every architecture no adapter claims. New
+    adapter-owned stages are tested by their adapter suites. Pairing a claimed
+    architecture with an unrelated model's stage key is excluded because no
+    pipeline can produce it, and is covered separately by
     ``test_arch_matching_is_a_fallback_not_an_override``.
     """
     assert detect_tts_model_type(model_stage, model_arch) == _legacy_detect(model_stage, model_arch)
@@ -251,7 +256,7 @@ def test_arch_matching_is_a_fallback_not_an_override():
 
 def test_stage_keys_cover_legacy_stage_set():
     """No stage key was dropped when the module constants were deleted."""
-    assert all_tts_stage_keys() == frozenset(_LEGACY_TTS_MODEL_STAGES)
+    assert _LEGACY_TTS_MODEL_STAGES <= all_tts_stage_keys()
 
 
 def test_pipeline_stage_list_is_complete():
@@ -276,24 +281,14 @@ def test_entry_stage_archs_is_ming_only():
     assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
 
 
-def test_every_detected_type_is_adapter_backed_or_declared_legacy():
-    """Detection may only name a model that has an adapter or an explicit
-    :data:`LEGACY_TTS_DETECTORS` entry — never an undeclared string."""
-    legacy_names = {d.name for d in LEGACY_TTS_DETECTORS}
+def test_every_detected_type_is_adapter_backed():
+    """Detection may only name a model that has a registered adapter."""
     for stage, arch in itertools.product(_STAGES, _ARCHS):  # full cross product on purpose
         detected = detect_tts_model_type(stage, arch)
         if detected is None:
             continue
-        assert detected in TTS_ADAPTER_REGISTRY or detected in legacy_names, (
+        assert detected in TTS_ADAPTER_REGISTRY, (
             f"detection produced undeclared model type {detected!r} for stage={stage!r} arch={arch!r}"
-        )
-
-
-def test_legacy_detectors_have_no_adapter():
-    """A legacy entry that gained an adapter must be deleted from the list."""
-    for detector in LEGACY_TTS_DETECTORS:
-        assert resolve_adapter(detector.name) is None, (
-            f"{detector.name!r} now has an adapter; remove it from LEGACY_TTS_DETECTORS"
         )
 
 

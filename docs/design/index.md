@@ -11,6 +11,10 @@ in the active navigation.
 
 ## Feature Design Documents
 
+For user-facing configuration and current compatibility, see the
+[Features overview](../features/README.md). A design document defines an
+implementation contract; it is not, by itself, a general support claim.
+
 ### Runtime and stage execution
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
@@ -18,6 +22,7 @@ in the active navigation.
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication
 
@@ -29,6 +34,10 @@ in the active navigation.
 - [Shared Memory Connector](feature/omni_connectors/shared_memory_connector.md)
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)
+
+### Quantization
+
+- [Quantization](feature/quantization.md)
 
 ### Diffusion acceleration
 
@@ -42,18 +51,25 @@ in the active navigation.
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
 
-#### Attention Backends
+#### Attention optimization
 
+The [Diffusion Attention Backends](../user_guide/diffusion/attention_backends.md)
+guides list selectable backends, platform defaults, installation, and tuning.
+The design contracts separate selection mechanics from backend algorithms:
+
+- [Attention Backend Selection](feature/attention_backend_selection.md)
 - [Skip-Softmax](feature/skip_softmax.md)
 
-#### Quantization
+#### CPU offloading
 
-- [Quantization](feature/quantization.md)
+- [Overview and Shared Contracts](feature/offloader/README.md)
+- [Model-Level Offload](feature/offloader/cpu_offload.md)
+- [Layerwise Offload](feature/offloader/layerwise_offload.md)
+- [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
-- [Distributed Layerwise Offload](feature/distributed_layerwise_offload.md)
 
 ## Infrastructure and Performance
 

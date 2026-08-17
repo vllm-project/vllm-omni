@@ -29,7 +29,7 @@ from vllm.distributed import (
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,

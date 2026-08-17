@@ -341,7 +341,7 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
@@ -381,7 +381,7 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
@@ -561,7 +561,11 @@ def _make_scheduler_output(num_reqs: int):
     reqs = [_make_request() for _ in range(num_reqs)]
     for i, req in enumerate(reqs):
         req.request_id = f"req-{i}"
-    return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(request_id=req.request_id, req=req, diffusion_kv_metadata=None) for req in reqs
+        ],
+    )
 
 
 @pytest.mark.core_model
@@ -736,6 +740,9 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
             del kwargs
             return SimpleNamespace(transformer=torch.nn.Identity())
 
+        def take_host_weight_plan(self):
+            return None
+
     class _DummyMemoryProfiler:
         consumed_memory = 0
 
@@ -775,7 +782,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_offload_backend",
+        lambda od_config, device, host_weight_plan: None,
+    )
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )

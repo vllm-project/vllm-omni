@@ -43,6 +43,7 @@ from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import get_extra_body_params, get_model_class_name
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 AUDIOX_TASKS = ("t2a", "t2m", "v2a", "v2m", "tv2a", "tv2m")
@@ -388,9 +389,9 @@ def main():
         raise ValueError("No output generated from omni.generate()")
 
     output = outputs[0]
-    if not hasattr(output, "request_output") or not output.request_output:
+    if not isinstance(output, OmniRequestOutput) or not output:
         raise ValueError("No request_output found in OmniRequestOutput")
-    request_output = output.request_output
+    request_output = output
     if not hasattr(request_output, "multimodal_output"):
         raise ValueError("No multimodal_output found in request_output")
 

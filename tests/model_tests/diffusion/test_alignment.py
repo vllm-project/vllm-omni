@@ -21,14 +21,15 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # if you are adding a new model and see the tests below fail, please follow the pattern
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
-    "QwenImageEditPipeline",
-    "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
     "WanPipeline",
     "WanVACEPipeline",
+    "LTX2TwoStagePipeline",
+    "LTX2DistilledOneStagePipeline",
+    "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
@@ -40,6 +41,7 @@ EXCLUDED_MODELS = [
     "WanT2VDMD2Pipeline",
     "WanI2VDMD2Pipeline",
     "LongCatImagePipeline",
+    "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
     "LancePipeline",
@@ -47,7 +49,6 @@ EXCLUDED_MODELS = [
     "InternVLAA1Pipeline",
     "LongCatImageEditPipeline",
     "StableDiffusion3Pipeline",
-    "FluxKontextPipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
@@ -63,6 +64,9 @@ EXCLUDED_MODELS = [
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated contract tests and real-checkpoint E2E smoke instead.
+    "LingBotWorldCausalDMDPipeline",
     "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
@@ -73,6 +77,7 @@ EXCLUDED_MODELS = [
     "DreamZeroPipeline",
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
+    "Pi0Pipeline",
     "SoulXSingerPipeline",
     "SoulXSingerSVCPipeline",
 ]

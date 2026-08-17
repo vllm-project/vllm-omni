@@ -1094,6 +1094,12 @@ class _HashableRequest(SimpleNamespace):
     # request; real Requests initialise it to 0 (vllm/v1/request.py).
     num_in_flight_tokens = 0
 
+    # vLLM 0.27 (a0c092ee72): the stale-output counter that replaced
+    # async_tokens_to_discard. update_from_output reads it for every scheduled
+    # request, and real Requests initialise it to 0 (vllm/v1/request.py), so the
+    # double needs it too.
+    num_stale_output_tokens = 0
+
     def __hash__(self):
         return hash(self.request_id)
 
@@ -1722,3 +1728,112 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests={})
     assert running_queue == []
     assert waiting_queue == []
+
+
+# --------------------------------------------------------------------------- #
+#  Chunk-wait deadline (RFC #4855 R1.1, issue #3833)
+#
+#  Before this, the async-chunk path had no deadline of any kind, so a dropped
+#  terminal chunk or an upstream stage that died mid-stream parked the request
+#  in WAITING_FOR_CHUNK forever. None of these scenarios were covered.
+# --------------------------------------------------------------------------- #
+
+
+def _park_in_chunk_wait(adapter, request, *, waiting=True):
+    """Drive a request through one process_pending_chunks round into the wait."""
+    queue = DummyWaitingQueue([request]) if waiting else [request]
+    if waiting:
+        adapter.process_pending_chunks(queue, [])
+    else:
+        adapter.process_pending_chunks(DummyWaitingQueue(), queue)
+    return queue
+
+
+def test_chunk_wait_clock_starts_when_a_request_parks(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("r1", RequestStatus.WAITING)
+
+    _park_in_chunk_wait(adapter, request)
+
+    assert request.status == RequestStatus.WAITING_FOR_CHUNK
+    assert "r1" in adapter._waiting_since
+
+
+def test_chunk_wait_does_not_expire_before_the_deadline(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    _park_in_chunk_wait(adapter, _req("r1", RequestStatus.WAITING))
+
+    assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == set()
+    assert "r1" in adapter._waiting_since
+
+
+def test_dropped_terminal_chunk_expires_the_request(build_adapter):
+    """The #3833 scenario: upstream stops sending and never marks the stream done."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    _park_in_chunk_wait(adapter, _req("r1", RequestStatus.WAITING))
+
+    adapter._waiting_since["r1"] -= 601.0
+
+    assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"r1"}
+    # Cleared, so a second sweep does not re-report the same request.
+    assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == set()
+
+
+def test_arriving_chunk_resets_the_clock(build_adapter):
+    """A slow but healthy stream must never expire: the deadline measures stall
+    time between chunks, not the lifetime of the stream."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("r1", RequestStatus.WAITING)
+    queue = _park_in_chunk_wait(adapter, request)
+    adapter.restore_queues(queue, [], scheduler_requests={"r1": request})
+
+    # Age the wait to just under the deadline, then deliver a chunk.
+    adapter._waiting_since["r1"] -= 599.0
+    adapter._finished_load_reqs.add("r1")
+    adapter.process_pending_chunks(queue, [])
+
+    assert "r1" not in adapter._waiting_since
+    assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == set()
+
+
+def test_a_disabled_deadline_never_expires(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    _park_in_chunk_wait(adapter, _req("r1", RequestStatus.WAITING))
+    adapter._waiting_since["r1"] -= 10_000.0
+
+    assert adapter.collect_timed_out_request_ids(timeout_s=0.0) == set()
+    assert adapter.collect_timed_out_request_ids(timeout_s=-1.0) == set()
+
+
+def test_finished_request_leaves_no_stale_timestamp(build_adapter):
+    """Otherwise a completed request would be reported as timed out later."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("r1", RequestStatus.WAITING)
+    _park_in_chunk_wait(adapter, request)
+
+    adapter.finish_requests(["r1"], RequestStatus.FINISHED_STOPPED, {"r1": request})
+
+    assert "r1" not in adapter._waiting_since
+    assert adapter.collect_timed_out_request_ids(timeout_s=0.001) == set()
+
+
+def test_aborted_request_leaves_no_stale_timestamp(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar")
+    _park_in_chunk_wait(adapter, _req("r1", RequestStatus.WAITING))
+
+    adapter.cleanup_receiver("r1")
+
+    assert "r1" not in adapter._waiting_since
+
+
+def test_expiry_is_per_request(build_adapter):
+    """One stalled stream must not take down its healthy neighbours."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=4)
+    stalled = _req("stalled", RequestStatus.WAITING)
+    healthy = _req("healthy", RequestStatus.WAITING)
+    adapter.process_pending_chunks(DummyWaitingQueue([stalled, healthy]), [])
+
+    adapter._waiting_since["stalled"] -= 601.0
+
+    assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"stalled"}
+    assert "healthy" in adapter._waiting_since

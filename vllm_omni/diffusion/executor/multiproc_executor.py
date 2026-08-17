@@ -18,11 +18,13 @@ import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
@@ -294,6 +296,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
+        # Without this, every worker inherits one Torch thread per core, so an
+        # N-GPU run oversubscribes the host by N x core_count. Honours a
+        # user-provided OMP_NUM_THREADS.
+        set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
         processes = []
 
@@ -451,6 +457,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
 
+        # Validate every envelope before selecting a dispatch path. In
+        # particular, keep identity errors outside the RPC error wrapper so an
+        # invalid request cannot be forwarded or converted into a worker output.
+        from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
+
+        for new_req in new_reqs:
+            validate_new_request_data_identity(new_req)
+
+        has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
+
         # DP multi-concurrency: when DLO+AllGather is active and multiple
         # requests are scheduled, send ALL requests in one broadcast RPC.
         # Each rank picks req[rank % len(reqs)] and computes independently.
@@ -458,6 +474,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # responses and match by dp_rank.
         if (
             len(new_reqs) > 1
+            and not has_diffusion_kv_metadata
             and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
             and getattr(self.od_config, "dlo_use_allgather", True)
         ):
@@ -530,9 +547,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             req = new_req.req
             try:
+                args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
+                if new_req.diffusion_kv_metadata is not None:
+                    args += (new_req.diffusion_kv_metadata,)
                 result = self.collective_rpc(
                     "execute_model",
-                    args=(req, self.od_config, scheduler_output.kv_prefetch_job),
+                    args=args,
                     unique_reply_rank=0,
                     exec_all_ranks=True,
                 )
@@ -622,8 +642,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         async_output_id=per_req_id,
                     )
                 )
+            # The worker's background D2H/SHM thread can publish OUTPUT_READY
+            # before this call returns. In that case the pump found no split
+            # map and cached the whole batch output under batch_id, so adopt it
+            # here instead of registering a map nothing will ever consume.
             with self._futures_lock:
-                self._batch_split_map[batch_id] = per_req_map
+                early = self._completed_outputs.pop(batch_id, None)
+                if early is None:
+                    self._batch_split_map[batch_id] = per_req_map
+            if early is not None:
+                logger.debug("Batch %s output arrived before split map; splitting now", batch_id)
+                try:
+                    batch_output = early.result()
+                    error = None
+                except Exception as exc:
+                    batch_output = None
+                    error = str(exc)
+                self._deliver_batch_split(per_req_map, batch_output, error)
             return BatchRunnerOutput.from_list(runner_outputs)
         if not isinstance(result, BatchRunnerOutput):
             raise RuntimeError(f"Unexpected response type for execute_batch: {type(result)!r}")
@@ -836,9 +871,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
                 if fut is not None and not fut.done():
                     if msg.error:
-                        fut.set_exception(RuntimeError(msg.error))
+                        try_set_exception(fut, RuntimeError(msg.error))
                     else:
-                        fut.set_result(msg)
+                        try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
                 with self._futures_lock:
@@ -849,52 +884,76 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         unpack_diffusion_output_shm(msg.output)
                     except Exception:
                         logger.exception("SHM unpack failed for batch %s", batch_id)
-                    batch_output = msg.output
-                    for per_req_id, req_id in per_req_map.items():
-                        req_output = batch_output.get_request_output(req_id)
-                        per_req_result: DiffusionOutput
-                        if req_output is not None and req_output.result is not None:
-                            per_req_result = req_output.result
-                        elif msg.error:
-                            per_req_result = DiffusionOutput(error=msg.error)
-                        else:
-                            per_req_result = DiffusionOutput(error="No output result for batch request")
-                        fut: concurrent.futures.Future = concurrent.futures.Future()
-                        fut.set_result(per_req_result)
-                        with self._futures_lock:
-                            pending = self._output_futures.pop(per_req_id, None)
-                            if pending is not None and not pending.done():
-                                pending.set_result(per_req_result)
-                            else:
-                                self._completed_outputs[per_req_id] = fut
+                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
                 else:
-                    with self._futures_lock:
-                        fut = self._output_futures.pop(batch_id, None) if batch_id else None
-                    if fut is not None and not fut.done():
-                        if msg.error:
-                            fut.set_exception(RuntimeError(msg.error))
-                        else:
-                            try:
-                                unpack_diffusion_output_shm(msg.output)
-                            except Exception as e:
-                                logger.exception("SHM unpack failed in result pump")
-                                fut.set_exception(e)
-                                continue
-                            fut.set_result(msg.output)
-                    elif batch_id:
-                        fut = concurrent.futures.Future()
-                        if msg.error:
-                            fut.set_exception(RuntimeError(msg.error))
-                        else:
-                            try:
-                                unpack_diffusion_output_shm(msg.output)
-                            except Exception as e:
-                                logger.exception("SHM unpack failed in result pump (cached)")
-                                fut.set_exception(e)
-                            else:
-                                fut.set_result(msg.output)
+                    # Single-request result: unpack SHM first, then resolve or cache atomically.
+                    output_result: DiffusionOutput | None = None
+                    exc: Exception | None = None
+                    if msg.error:
+                        exc = RuntimeError(msg.error)
+                    else:
+                        try:
+                            unpack_diffusion_output_shm(msg.output)
+                            output_result = msg.output
+                        except Exception as e:
+                            logger.exception("SHM unpack failed in result pump")
+                            exc = e
+
+                    if batch_id:
                         with self._futures_lock:
-                            self._completed_outputs[batch_id] = fut
+                            pending = self._output_futures.pop(batch_id, None)
+                            if pending is not None and not pending.done():
+                                if exc is not None:
+                                    try_set_exception(pending, exc)
+                                else:
+                                    try_set_result(pending, output_result)
+                            else:
+                                fut = concurrent.futures.Future()
+                                if exc is not None:
+                                    fut.set_exception(exc)
+                                else:
+                                    fut.set_result(output_result)
+                                self._completed_outputs[batch_id] = fut
+
+    def _deliver_batch_split(
+        self,
+        per_req_map: dict[str, str],
+        batch_output: Any,
+        error: str | None = None,
+    ) -> None:
+        """Resolve per-request futures from one batch-level output."""
+        for per_req_id, req_id in per_req_map.items():
+            req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
+            per_req_result: DiffusionOutput
+            if req_output is not None and req_output.result is not None:
+                per_req_result = req_output.result
+            elif error:
+                per_req_result = DiffusionOutput(error=error)
+            else:
+                per_req_result = DiffusionOutput(error="No output result for batch request")
+            with self._futures_lock:
+                pending = self._output_futures.pop(per_req_id, None)
+                if pending is not None and not pending.done():
+                    try_set_result(pending, per_req_result)
+                else:
+                    fut: concurrent.futures.Future = concurrent.futures.Future()
+                    fut.set_result(per_req_result)
+                    self._completed_outputs[per_req_id] = fut
+
+    def describe_pending_state(self, async_output_id: str | None = None) -> str:
+        """Summarize async-output bookkeeping for diagnosing stuck waits."""
+        with self._futures_lock:
+            waiting = list(self._output_futures)
+            cached = list(self._completed_outputs)
+            batches = list(self._batch_split_map)
+            rpcs = list(self._rpc_futures)
+        return (
+            f"async_output_id={async_output_id} "
+            f"waiting={len(waiting)}{waiting[:5]} "
+            f"cached={len(cached)}{cached[:5]} "
+            f"unsplit_batches={len(batches)}{batches[:5]} "
+            f"pending_rpcs={len(rpcs)}{rpcs[:5]}"
+        )
 
     def _next_rpc_id(self) -> str:
         with self._rpc_id_lock:
@@ -941,10 +1000,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             with self._futures_lock:
                 for fut in self._rpc_futures.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("Executor shut down"))
+                        try_set_exception(fut, RuntimeError("Executor shut down"))
                 for fut in self._output_futures.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("Executor shut down"))
+                        try_set_exception(fut, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()

@@ -22,12 +22,19 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
+    "IndexTTS25S2MelDecoder": "indextts2_5",
+    "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
     # the HF config without manual overrides.
     "PersonaPlexTalkerForConditionalGeneration": "personaplex",
     "PersonaPlexCode2Wav": "personaplex",
+    # NemotronVoiceChat ships a NeMo-style config.json without model_type;
+    # create_model_config() patches model_type=nemotron_voicechat from the arch.
+    "NemotronVoiceChatThinkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -44,6 +51,7 @@ def _register_omni_hf_configs() -> None:
 
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
+            IndexTTS25Config,
         )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
@@ -52,6 +60,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
+        )
+        from vllm_omni.model_executor.models.nemotron_voicechat.configuration_nemotron_voicechat import (
+            NemotronVoiceChatConfig,
         )
         from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
             PersonaPlexConfig,
@@ -79,10 +90,12 @@ def _register_omni_hf_configs() -> None:
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
+        ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("personaplex", PersonaPlexConfig),
+        ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
@@ -104,10 +117,16 @@ def register_omni_models_to_vllm():
 
     _register_omni_hf_configs()
 
-    supported_archs = ModelRegistry.get_supported_archs()
+    # Unconditionally (re)register every omni arch into the upstream global
+    # ModelRegistry: vLLM 0.27 added some omni archs (e.g.
+    # Qwen3OmniMoeForConditionalGeneration) to its own registry, but resolves
+    # them to upstream classes that lack omni features (e.g.
+    # buffer_realtime_audio for the realtime endpoint). Registering here
+    # overwrites those entries with the vllm-omni classes, which is the
+    # behavior entrypoints resolving through the global registry rely on
+    # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-        if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+        ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
@@ -148,9 +167,6 @@ class OmniEngineArgs(EngineArgs):
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
-        stage_configs_path: Optional path to a JSON/YAML file containing
-            stage configurations for the multi-stage pipeline. If None,
-            stage configs are resolved from the model's default configuration.
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
@@ -181,6 +197,8 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    # Dotted path of a per-stage pooling-output decoder applied worker-side.
+    pooling_output_decoder: str | None = None
     task_type: str | None = None
     worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
@@ -210,7 +228,6 @@ class OmniEngineArgs(EngineArgs):
     omni_dp_size_local: int = 1
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = 30.0
-    stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
@@ -244,7 +261,15 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            return  # can't load config, let vLLM handle the error
+            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # Keep this exception model-scoped so other loader failures retain
+            # vLLM's normal error path.
+            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+                return
+            config_path = os.path.join(self.model, "config.json")
+            if os.path.lexists(config_path):
+                return
+            config_dict = {}
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
@@ -304,6 +329,19 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
+        # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
+        # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
+        # subfolder auto-detect below would wrongly pick up. The text tokenizer
+        # is the Nemotron backbone's, resolved from a local override or its
+        # HF id (cache-friendly).
+        if not self.tokenizer and self.model_arch in (
+            "NemotronVoiceChatThinkerForConditionalGeneration",
+            "NemotronVoiceChatTalkerForConditionalGeneration",
+            "NemotronVoiceChatCode2Wav",
+        ):
+            self.tokenizer = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+            logger.info("NemotronVoiceChat: using text tokenizer from %s", self.tokenizer)
+
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
         if not self.tokenizer and self.model:
@@ -362,6 +400,7 @@ class OmniEngineArgs(EngineArgs):
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
@@ -447,7 +486,6 @@ class OrchestratorArgs:
     ray_address: str | None = None
 
     # === Config Files ===
-    stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
@@ -456,6 +494,11 @@ class OrchestratorArgs:
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
+
+    # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
+    forced_aligner: str | None = None
+    forced_aligner_config: str | None = None
+    forced_aligner_device: str | None = None
 
     # === Observability ===
     log_stats: bool = False
@@ -471,6 +514,9 @@ class OrchestratorArgs:
     num_gpus: int | None = None
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
@@ -531,7 +577,6 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
-        "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
     }

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable
 from typing import Any
 
+import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
@@ -40,25 +43,56 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 
-# Upper bound on how long a request may sit in full-payload-input wait
-# (the state ``OmniSchedulingCoordinator`` records via ``_waiting_since``)
-# before the scheduler force-fails it.  Defends against stuck consumer-side
-# requests when the producer drops a full-payload, send fails, or recv
-# never arrives.  Override per-deployment via
-# VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set <=0 to disable the safety net.
+# Upper bound on how long a request may wait for stage input before the
+# scheduler force-fails it.  Defends against stuck consumer-side requests when
+# the producer drops a payload, send fails, or recv never arrives.  Override
+# per-deployment via VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set exactly 0 to disable
+# the safety net. Negative and non-finite values are rejected at startup.
 #
-# Scope: this constant only covers the full-payload coordinator path
-# (``input_coordinator``).  The async-chunk path uses
-# ``chunk_transfer_adapter`` and is not affected by this constant.
+# Scope: both transports.  The full-payload path measures time parked in
+# WAITING_FOR_INPUT (``OmniSchedulingCoordinator._waiting_since``); the
+# async-chunk path measures time stalled in WAITING_FOR_CHUNK
+# (``OmniChunkTransferAdapter._waiting_since``, reset on each chunk arrival).
+# One knob, because the question it answers -- "how long may a request wait for
+# stage input?" -- does not depend on which transport carries it.
+_INPUT_WAIT_TIMEOUT_DEFAULT = 600.0
 _INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
 except ValueError:
     logger.warning(
-        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 600 seconds.",
+        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to %s seconds.",
         _INPUT_WAIT_TIMEOUT_RAW,
+        _INPUT_WAIT_TIMEOUT_DEFAULT,
     )
-    DEFAULT_INPUT_WAIT_TIMEOUT_S = 600.0
+    DEFAULT_INPUT_WAIT_TIMEOUT_S = _INPUT_WAIT_TIMEOUT_DEFAULT
+
+if not math.isfinite(DEFAULT_INPUT_WAIT_TIMEOUT_S):
+    # nan compares false against everything, so every deadline check silently
+    # passes; inf makes the deadline unreachable. Both disable the net while
+    # looking like a number, which is the failure this item exists to stop.
+    raise ValueError(
+        f"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S={_INPUT_WAIT_TIMEOUT_RAW!r} is not finite. "
+        "Use a positive number of seconds, or exactly 0 to disable the deadline."
+    )
+if DEFAULT_INPUT_WAIT_TIMEOUT_S < 0:
+    # Fail at startup rather than substituting a default. `-1` is a common idiom
+    # for "no limit", so silently turning it into 600 would give an operator who
+    # meant "never time out" mysterious failures ten minutes in.
+    raise ValueError(
+        f"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S={_INPUT_WAIT_TIMEOUT_RAW!r} is negative. "
+        "Use a positive number of seconds, or exactly 0 to disable the deadline."
+    )
+elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
+    # Zero stays a supported opt-out, but it is no longer silent: it disables
+    # the deadline on BOTH transports, so a request whose stage input never
+    # arrives waits forever. Say which nets just went away.
+    logger.warning(
+        "VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=0: stage-input deadlines are DISABLED for "
+        "both the full-payload path (WAITING_FOR_INPUT) and the async-chunk path "
+        "(WAITING_FOR_CHUNK). A request whose input never arrives will wait "
+        "indefinitely instead of failing."
+    )
 
 
 class OmniSchedulerMixin:
@@ -80,6 +114,29 @@ class OmniSchedulerMixin:
             else None
         )
         self._latest_omni_connector_output = None
+        # Optional per-stage pooling-output decoder hook (dotted path in
+        # model_config); applied worker-side before IPC.
+        self._pooling_output_decoder = None
+        _decoder_path = getattr(model_config, "pooling_output_decoder", None)
+        if _decoder_path:
+            self._pooling_output_decoder = resolve_obj_by_qualname(str(_decoder_path))
+
+    def _maybe_decode_pooling_output(self, request: Request, pooler_output: Any) -> Any:
+        """Apply the stage's pooling-output decoder hook to the pooler tensor
+        before IPC, or pass it through unchanged when none is configured.
+        Decoder exceptions propagate; callers fail the request with
+        FinishReason.ERROR rather than emitting an empty success."""
+        if self._pooling_output_decoder is None:
+            return pooler_output
+        if pooler_output is None or getattr(request, "pooling_params", None) is None:
+            return pooler_output
+        if not isinstance(pooler_output, torch.Tensor):
+            return pooler_output
+        return self._pooling_output_decoder(
+            pooler_output,
+            request,
+            self.vllm_config.model_config.hf_config,
+        )
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -94,6 +151,17 @@ class OmniSchedulerMixin:
             adapter.segment_finished_requests.discard(session.request_id)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
+        # In-flight outputs from the previous segment were optimistically
+        # scheduled (async lookahead). Mark them stale so update_from_output
+        # drops them instead of underflowing num_output_placeholders
+        # (vLLM 0.27 a0c092ee72 removed async_tokens_to_discard). Seed in
+        # SCHEDULED-token units — num_in_flight_tokens matches what each
+        # pre-replacement frame will drain, so the counter reaches exactly
+        # zero; a placeholder-based seed swallowed valid new-segment frames
+        # whenever placeholder counts diverged from scheduled counts.
+        session.num_stale_output_tokens += int(getattr(session, "num_in_flight_tokens", 0) or 0)
+        session.num_output_placeholders = 0
+        session.spec_token_ids = []
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
@@ -148,6 +216,8 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
+            self._process_pending_chunk_timeouts()
+            self._log_failed_chunk_sends()
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""
@@ -175,9 +245,9 @@ class OmniSchedulerMixin:
         Disabled when ``DEFAULT_INPUT_WAIT_TIMEOUT_S`` is <= 0.
 
         Scope: only covers ``input_coordinator`` (full-payload path).
-        Async-chunk requests park in ``chunk_transfer_adapter`` instead
-        and are not handled here -- if a similar safety net is needed
-        for the chunk path, it belongs in the chunk adapter.
+        Async-chunk requests park in ``chunk_transfer_adapter`` instead and
+        are handled by ``_process_pending_chunk_timeouts`` below, which shares
+        this timeout.
         """
         if DEFAULT_INPUT_WAIT_TIMEOUT_S <= 0:
             return
@@ -192,6 +262,84 @@ class OmniSchedulerMixin:
             return
         logger.warning(
             "Marking %d request(s) as FINISHED_ERROR after waiting > %.0fs for connector input: %s",
+            len(present_ids),
+            DEFAULT_INPUT_WAIT_TIMEOUT_S,
+            sorted(present_ids),
+        )
+        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+
+    def _log_failed_chunk_sends(self) -> None:
+        """Surface chunks the sender gave up on (R1.2 of #4855).
+
+        ``save_loop`` pops a task with ``popleft()`` and never re-queues it, and
+        ``connector.put`` can report failure without raising, so a dropped chunk
+        is a give-up rather than a retry. Until this change the only trace was a
+        warning that printed ``None`` for the request id, because the task dict
+        has no ``request_id`` key.
+
+        This only reports. Failing the request from here does not work: the
+        producer is not the ``final_output`` stage, so an abort synthesized by
+        ``finish_requests`` is not turned into a client-visible termination by
+        ``Orchestrator._route_output`` (see the ``final_output`` guards there).
+        Making a producer-side drop client-visible needs an orchestrator-side
+        path like ``_fail_request_dead_stage``; the consumer's R1.1 deadline is
+        what actually ends the request today.
+        """
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        failures = adapter.collect_failed_send_request_ids()
+        for request_id, reason in failures.items():
+            if request_id in self.requests:
+                logger.error(
+                    "[OmniScheduler] req=%s: chunk send gave up (%s); the consumer will "
+                    "fail on the stage-input deadline",
+                    request_id,
+                    reason,
+                )
+            else:
+                # Drained but no longer scheduled here: the request finished or
+                # was aborted between the failed send and this sweep. Still say
+                # so -- collect_* empties the map, so staying quiet would make
+                # this the one drop path in a change whose point is visibility.
+                logger.warning(
+                    "[OmniScheduler] req=%s: chunk send gave up (%s) after the request "
+                    "left this scheduler (finished or aborted)",
+                    request_id,
+                    reason,
+                )
+
+    def _process_pending_chunk_timeouts(self) -> None:
+        """Force-fail requests stalled in ``WAITING_FOR_CHUNK`` too long.
+
+        The async-chunk counterpart of ``_process_pending_input_timeouts``,
+        called right after ``chunk_transfer_adapter.process_pending_chunks``.
+        Until now the chunk path had no safety net at all: the scheduler-side
+        comment on the full-payload net said a similar guard "belongs in the
+        chunk adapter", while the worker mixin assumed the full-payload net
+        already covered it.  Only the first was true, so a dropped terminal
+        chunk or a producer that exhausted its send retries parked the request
+        forever (vllm-project/vllm-omni#3833).  Since ``async_chunk: true`` is
+        the default for the flagship TTS pipelines, that was the default
+        streaming path.
+
+        Shares ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S`` with the full-payload net:
+        one knob for "how long may a request wait for stage input", regardless
+        of which transport carries it.  Disabled when the value is <= 0.
+        """
+        if DEFAULT_INPUT_WAIT_TIMEOUT_S <= 0:
+            return
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None or not getattr(adapter, "receives_chunks", False):
+            return
+        timed_out_ids = adapter.collect_timed_out_request_ids(timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S)
+        if not timed_out_ids:
+            return
+        present_ids = {req_id for req_id in timed_out_ids if req_id in self.requests}
+        if not present_ids:
+            return
+        logger.warning(
+            "Marking %d request(s) as FINISHED_ERROR after stalling > %.0fs waiting for a chunk: %s",
             len(present_ids),
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),

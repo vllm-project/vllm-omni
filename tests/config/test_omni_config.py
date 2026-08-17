@@ -471,9 +471,12 @@ def test_sub_config_fields_match_structured_scopes():
         "trust_remote_code",
         "dtype",
         "attention_backend",
+        "attention_config",
         "moe_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
+        "interleave_mm_strings",
+        "media_io_kwargs",
         "active_stream_window",
         "duplex_max_sessions",
         "enable_sleep_mode",
@@ -511,6 +514,7 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
+        "mamba_ssm_cache_dtype",
     }
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {
         "max_num_seqs",

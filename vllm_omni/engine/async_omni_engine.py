@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import dataclasses
 import json
 import queue
 import threading
@@ -24,7 +23,6 @@ import janus
 import torch
 from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
-from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
@@ -34,7 +32,6 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
-    strip_parent_engine_args,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
@@ -84,39 +81,6 @@ if TYPE_CHECKING:
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-# ============================================================================
-# Parent-EngineArgs field-routing contracts (consumed by
-# AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
-# ============================================================================
-
-# Fields that must survive the "equal to default → strip" filter because
-# diffusion stages need them even when equal to vllm's default value
-# (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
-_PARENT_ARGS_KEEP: frozenset[str] = frozenset(
-    {
-        "worker_extension_cls",
-        "allowed_local_media_path",
-        "allowed_media_domains",
-        # Legacy stage-config YAMLs may intentionally leave parallel or
-        # distributed knobs unspecified at the stage level and rely on
-        # top-level CLI values to fill them in during the per-stage merge.
-        # Keep these fields so stages that omit them can inherit CLI values,
-        # while stages with explicit YAML values still win because the legacy
-        # stage-config loader prefers stage-local engine args.
-        "tensor_parallel_size",
-    }
-)
-
-# Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
-# must never leak into per-stage EngineArgs (``stage_configs_path`` would
-# trigger the ``create_model_config`` guard).
-_PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
-
-
-# Fields always populated by callers (via ``from_cli_args`` / ``asdict``) so
-# their presence as an override is never a surprise — suppress the
-# "override ignored" warning for these.
-_PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
 
 
 class AsyncOmniEngine:
@@ -209,10 +173,8 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get pipeline-wide settings
-        # beforehand. The stage CLI exposes the same deploy YAML through
-        # stage_configs_path.
-        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # Stage resolution pops deploy_config, so get pipeline-wide settings beforehand.
+        deploy_config_path = kwargs.get("deploy_config")
         # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
         # specified" so stage-config resolution can defer to the deploy yaml's
         # per-stage value (see ``with_trust_remote_code_override``). The
@@ -538,6 +500,7 @@ class AsyncOmniEngine:
         if not isinstance(mm_data, dict) or not mm_data:
             return
 
+        from vllm.config.multimodal import _get_mm_hasher_algorithm
         from vllm.multimodal.hasher import MultiModalHasher
 
         existing_uuids = prompt.get("multi_modal_uuids")
@@ -564,6 +527,7 @@ class AsyncOmniEngine:
                     base_uuid = None
                 else:
                     base_uuid = MultiModalHasher.hash_kwargs(
+                        _get_mm_hasher_algorithm(),
                         model_id=model_id,
                         **{modality: item},
                     )
@@ -1018,6 +982,9 @@ class AsyncOmniEngine:
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
+            # Default-stage construction bypasses the structured projection.
+            # Runner selection remains owned by the selected engine/platform.
+            "engine_backend": kwargs.get("engine_backend", "default"),
             "model_class_name": kwargs.get("model_class_name", None),
             "task_type": kwargs.get("task_type", None),
             "model_config": kwargs.get("model_config", None),
@@ -1047,6 +1014,9 @@ class AsyncOmniEngine:
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "lora_path": kwargs.get("lora_path", None),
+            "lora_scale": kwargs.get("lora_scale", 1.0),
+            "lora_backend": kwargs.get("lora_backend", "peft"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
@@ -1110,40 +1080,6 @@ class AsyncOmniEngine:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
-    @staticmethod
-    def _strip_single_engine_args(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Remove parent ``EngineArgs`` fields from *kwargs*.
-
-        When ``stage_configs_path`` is set, per-stage engine args are defined
-        in the YAML.  Top-level single-engine fields (``compilation_config``,
-        ``tensor_parallel_size``, …) must not leak into per-stage configs via
-        the ``base_engine_args`` merge in ``load_stage_configs_from_yaml`` —
-        they can cause type errors (e.g. ``compilation_config`` as a JSON
-        string rejected by ``VllmConfig``) or silently override YAML values.
-
-        Logs a warning for any parent field whose value differs from the
-        dataclass default, so users know their explicit overrides are ignored.
-        See the module-level ``_PARENT_ARGS_*`` constants for the routing
-        contracts this method enforces.
-        """
-        parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        result, overridden = strip_parent_engine_args(
-            kwargs,
-            parent_fields=parent_fields,
-            keep_keys=_PARENT_ARGS_KEEP,
-            strip_keys=_PARENT_ARGS_STRIP,
-            no_warn_keys=_PARENT_ARGS_NO_WARN,
-        )
-
-        if overridden:
-            logger.warning(
-                "stage_configs_path is set — the following top-level engine "
-                "args are ignored (per-stage YAML takes precedence): %s",
-                ", ".join(sorted(overridden)),
-            )
-
-        return result
-
     def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
         """Apply a strategy-derived ``omni_lb_policy`` to the engine.
 
@@ -1182,29 +1118,20 @@ class AsyncOmniEngine:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        stage_configs_path = kwargs.get("stage_configs_path", None)
+        for legacy_arg in ("stage_configs_path", "stage_configs"):
+            if legacy_arg in kwargs:
+                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        explicit_stage_configs = kwargs.pop("stage_configs", None)
-        if explicit_stage_configs is not None:
-            logger.warning(
-                "`stage_configs` is not part of the public API. "
-                "Ignoring it and resolving stages from stage_configs_path/model factory."
-            )
-
-        if stage_configs_path is not None:
-            base_kwargs = self._strip_single_engine_args(kwargs)
-        else:
-            base_kwargs = kwargs
 
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
-            stage_configs_path,
-            base_kwargs,
+            kwargs,
             trust_remote_code=trust_remote_code,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
@@ -1245,6 +1172,9 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                if kwargs.get("lora_backend") is not None:
+                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
+                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None
