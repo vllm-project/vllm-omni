@@ -435,6 +435,7 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
 class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin):
     supports_request_batch = False
     dummy_run_num_frames: ClassVar[int] = 0
+    _dit_modules: ClassVar[list[str]] = ["model.model.language_model"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()

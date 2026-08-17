@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
 from transformers import Qwen3VLConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -38,6 +39,7 @@ from vllm.model_executor.models.qwen3 import Qwen3MLP
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -241,6 +243,11 @@ class HiDreamO1DecoderLayer(nn.Module):
 
 
 class HiDreamO1TextModel(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"layers": ForwardPattern.Pattern_3},
+        has_separate_cfg=True,
+    )
+
     def __init__(
         self,
         config,
