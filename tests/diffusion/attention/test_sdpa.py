@@ -55,3 +55,41 @@ def test_sdpa_keeps_compressed_kv_when_native_gqa_kernel_is_available(monkeypatc
     assert key_shape == value_shape == (1, 2, 3, 8)
     assert kwargs["enable_gqa"] is True
     assert output.shape == (1, 3, 4, 8)
+
+
+def test_sdpa_npu_uses_native_gqa_without_cuda_capability_check(monkeypatch):
+    calls = []
+
+    def fake_sdpa(query, key, value, **kwargs):
+        calls.append((query.shape, key.shape, value.shape, kwargs))
+        return query
+
+    def unexpected_capability_check(*args):
+        raise AssertionError("NPU native GQA must not use the CUDA capability check")
+
+    monkeypatch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", unexpected_capability_check)
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
+
+    impl = SDPAImpl(num_heads=4, num_kv_heads=2, head_size=8, softmax_scale=0.5)
+    output = impl.forward_npu(
+        torch.randn(1, 3, 4, 8),
+        torch.randn(1, 3, 2, 8),
+        torch.randn(1, 3, 2, 8),
+    )
+
+    query_shape, key_shape, value_shape, kwargs = calls[0]
+    assert query_shape == (1, 4, 3, 8)
+    assert key_shape == value_shape == (1, 2, 3, 8)
+    assert kwargs["enable_gqa"] is True
+    assert output.shape == (1, 3, 4, 8)
+
+
+def test_sdpa_npu_rejects_invalid_gqa_head_ratio():
+    impl = SDPAImpl(num_heads=3, num_kv_heads=2, head_size=8, softmax_scale=0.5)
+
+    with pytest.raises(ValueError, match="query heads to be a multiple"):
+        impl.forward_npu(
+            torch.randn(1, 3, 3, 8),
+            torch.randn(1, 3, 2, 8),
+            torch.randn(1, 3, 2, 8),
+        )

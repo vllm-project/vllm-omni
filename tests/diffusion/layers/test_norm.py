@@ -25,11 +25,6 @@ def test_rmsnorm_import():
     from vllm_omni.diffusion.layers.norm import RMSNorm  # noqa: F401
 
 
-def test_add_rmsnorm_import():
-    """Verify AddRMSNorm can be imported from the norm module."""
-    from vllm_omni.diffusion.layers.norm import AddRMSNorm  # noqa: F401
-
-
 # ── LayerNorm tests ──
 
 
@@ -345,15 +340,15 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
     assert captured["epsilon"].item() == pytest.approx(1e-5)
 
 
-# ── AddRMSNorm tests ──
+# ── RMSNorm residual tests ──
 
 
-def test_add_rmsnorm_inherits_rmsnorm_and_matches_native_contract():
+def test_rmsnorm_matches_native_residual_contract():
     """The non-NPU path preserves separate residual-add and RMSNorm math."""
-    from vllm_omni.diffusion.layers.norm import AddRMSNorm, RMSNorm
+    from vllm_omni.diffusion.layers.norm import RMSNorm
 
     eps = 1e-6
-    norm = AddRMSNorm(4, eps=eps, dtype=torch.bfloat16)
+    norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16)
     norm.weight.data.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0], dtype=torch.bfloat16))
     x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16)
     residual = torch.tensor([[0.5, 1.0, -1.5, 2.0]], dtype=torch.bfloat16)
@@ -365,14 +360,13 @@ def test_add_rmsnorm_inherits_rmsnorm_and_matches_native_contract():
     ).to(expected_residual.dtype)
     output, updated_residual = norm.forward_native(x, residual)
 
-    assert isinstance(norm, RMSNorm)
     torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
     torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
 
 
-def test_add_rmsnorm_npu_uses_fused_op(monkeypatch: pytest.MonkeyPatch):
+def test_rmsnorm_npu_uses_fused_op_with_residual(monkeypatch: pytest.MonkeyPatch):
     """The NPU path passes both inputs and configured gamma to the fused op."""
-    from vllm_omni.diffusion.layers.norm import AddRMSNorm
+    from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, object] = {}
     fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
@@ -392,7 +386,7 @@ def test_add_rmsnorm_npu_uses_fused_op(monkeypatch: pytest.MonkeyPatch):
         "torch_npu",
         types.SimpleNamespace(npu_add_rms_norm=npu_add_rms_norm),
     )
-    norm = AddRMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
+    norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, dtype=torch.bfloat16)
     residual = torch.randn(2, 4, dtype=torch.bfloat16)
 
@@ -406,9 +400,9 @@ def test_add_rmsnorm_npu_uses_fused_op(monkeypatch: pytest.MonkeyPatch):
     assert captured["epsilon"] == 1e-5
 
 
-def test_add_rmsnorm_musa_preserves_residual_contract(monkeypatch: pytest.MonkeyPatch):
+def test_rmsnorm_musa_preserves_residual_contract(monkeypatch: pytest.MonkeyPatch):
     """The MUSA path accepts residual input and retains the aten RMSNorm path."""
-    from vllm_omni.diffusion.layers.norm import AddRMSNorm
+    from vllm_omni.diffusion.layers.norm import RMSNorm
 
     captured: dict[str, object] = {}
     normalized = torch.randn(2, 4)
@@ -418,7 +412,7 @@ def test_add_rmsnorm_musa_preserves_residual_contract(monkeypatch: pytest.Monkey
         return normalized
 
     monkeypatch.setattr(torch.nn.functional, "rms_norm", rms_norm)
-    norm = AddRMSNorm(4, eps=1e-5)
+    norm = RMSNorm(4, eps=1e-5)
     x = torch.randn(2, 4)
     residual = torch.randn(2, 4)
 

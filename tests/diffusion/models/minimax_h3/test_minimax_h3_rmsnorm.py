@@ -7,9 +7,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.layers.norm import AddRMSNorm, RMSNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.minimax_h3.encoder import (
-    MiniMaxH3Qwen3VLAddRMSNorm,
     MiniMaxH3Qwen3VLRMSNorm,
     MiniMaxH3Qwen3VLTextDecoderLayer,
 )
@@ -34,15 +33,6 @@ def test_qwen3_vl_rmsnorm_uses_common_fused_rmsnorm_contract() -> None:
     assert norm.weight.dtype == torch.bfloat16
     assert set(norm.state_dict()) == {"weight"}
     torch.testing.assert_close(norm.forward_native(x), expected, atol=0, rtol=0)
-
-
-def test_qwen3_vl_add_rmsnorm_uses_common_fused_contract() -> None:
-    norm = MiniMaxH3Qwen3VLAddRMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16)
-
-    assert isinstance(norm, AddRMSNorm)
-    assert isinstance(norm, RMSNorm)
-    assert norm.weight.dtype == torch.bfloat16
-    assert set(norm.state_dict()) == {"weight"}
 
 
 def test_qwen3_vl_decoder_uses_fused_post_attention_residual_contract() -> None:
@@ -72,5 +62,5 @@ def test_qwen3_vl_decoder_uses_fused_post_attention_residual_contract() -> None:
 
     output = layer(hidden_states, (torch.empty(0), torch.empty(0)))
 
-    assert isinstance(layer.post_attention_layernorm, MiniMaxH3Qwen3VLAddRMSNorm)
+    assert isinstance(layer.post_attention_layernorm, MiniMaxH3Qwen3VLRMSNorm)
     torch.testing.assert_close(output, expected_residual + expected_normalized)

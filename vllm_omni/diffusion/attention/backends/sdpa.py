@@ -96,6 +96,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
         mask_mode: SDPAMaskMode = "broadcast_k",
+        use_native_gqa: bool = False,
     ) -> torch.Tensor:
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
@@ -108,7 +109,11 @@ class SDPAImpl(AttentionImpl):
         # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
         # cannot select a fused GQA kernel for the runtime shape/mask, expand
         # K/V locally so it can use the better-supported equal-head path.
-        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
+        if (
+            enable_gqa
+            and not use_native_gqa
+            and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal)
+        ):
             if query.shape[1] % key.shape[1] != 0:
                 raise ValueError(
                     "GQA requires query heads to be a multiple of KV heads, "
@@ -168,4 +173,16 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")
+        if query.shape[2] != key.shape[2] and query.shape[2] % key.shape[2] != 0:
+            raise ValueError(
+                "GQA requires query heads to be a multiple of KV heads, "
+                f"got q_heads={query.shape[2]} and kv_heads={key.shape[2]}."
+            )
+        return self._forward_impl(
+            query,
+            key,
+            value,
+            attn_metadata,
+            mask_mode="full_qk",
+            use_native_gqa=True,
+        )

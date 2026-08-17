@@ -39,9 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.layers.norm import AddRMSNorm as DiffusionAddRMSNorm
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
-from vllm_omni.diffusion.layers.sdpa import ScaledDotProductAttention as DiffusionScaledDotProductAttention
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -313,25 +312,6 @@ class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
         super().__init__(hidden_size, eps=eps, dtype=dtype)
 
 
-class MiniMaxH3Qwen3VLAddRMSNorm(DiffusionAddRMSNorm):
-    """Qwen3-VL residual-add RMSNorm with platform-specific dispatch."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        super().__init__(hidden_size, eps=eps, dtype=dtype)
-
-
-class MiniMaxH3Qwen3VLScaledDotProductAttention(DiffusionScaledDotProductAttention):
-    """Qwen3-VL SDPA using the common platform-dispatched implementation."""
-
-    def __init__(self, causal: bool = False) -> None:
-        super().__init__(causal=causal)
-
-
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -341,8 +321,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def _apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
@@ -714,7 +694,14 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        self.sdpa = MiniMaxH3Qwen3VLScaledDotProductAttention(causal=True)
+        self.attn = Attention(
+            num_heads=self.qkv_proj.local_num_heads,
+            head_size=self.head_dim,
+            causal=True,
+            softmax_scale=self.scaling,
+            num_kv_heads=self.qkv_proj.local_num_kv_heads,
+            skip_sequence_parallel=True,
+        )
 
     def forward(
         self,
@@ -730,15 +717,15 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
         # Three separate GEMMs keep the numerics identical to the reference
         # path (packed QKV changes cuBLAS tiling and shifts bf16 rounding).
-        query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape)).transpose(1, 2)
-        value_states = F.linear(hidden_states, v_weight).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape))
+        key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape))
+        value_states = F.linear(hidden_states, v_weight).view(hidden_shape)
 
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output = self.sdpa(query_states, key_states, value_states)
-        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        attn_output = self.attn(query_states, key_states, value_states)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -777,7 +764,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
         self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
         self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        self.post_attention_layernorm = MiniMaxH3Qwen3VLAddRMSNorm(
+        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
 

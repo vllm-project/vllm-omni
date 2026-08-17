@@ -852,23 +852,20 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
 
 
-@pytest.mark.parametrize(
-    ("is_npu", "expected_kv_heads", "expected_enable_gqa"),
-    [(True, 2, True), (False, 4, None)],
-)
-def test_text_attention_scopes_native_sdpa_gqa_to_npu(
-    monkeypatch,
-    is_npu,
-    expected_kv_heads,
-    expected_enable_gqa,
-):
-    import vllm_omni.diffusion.layers.custom_op as custom_op_module
-    from vllm_omni.diffusion.layers.sdpa import ScaledDotProductAttention
+def test_text_attention_uses_common_attention_with_local_gqa_heads(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as attention_layer
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
+    from vllm_omni.diffusion.attention.layer import Attention
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
-        MiniMaxH3Qwen3VLScaledDotProductAttention,
         MiniMaxH3Qwen3VLTextAttention,
     )
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _SingleRankEncoderGroup
+
+    class FakeEncoderGroup:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_reduce(self, tensor):
+            del tensor
 
     config = SimpleNamespace(
         hidden_size=8,
@@ -877,31 +874,33 @@ def test_text_attention_scopes_native_sdpa_gqa_to_npu(
         head_dim=2,
         rms_norm_eps=1e-6,
     )
-    monkeypatch.setattr(custom_op_module.current_omni_platform, "is_rocm", lambda: False)
-    monkeypatch.setattr(custom_op_module.current_omni_platform, "is_cuda", lambda: False)
-    monkeypatch.setattr(custom_op_module.current_omni_platform, "is_npu", lambda: is_npu)
-    monkeypatch.setattr(custom_op_module.current_omni_platform, "is_xpu", lambda: False)
-    monkeypatch.setattr(custom_op_module.current_omni_platform, "is_musa", lambda: False)
-    attention = MiniMaxH3Qwen3VLTextAttention(_SingleRankEncoderGroup(0), config, torch.float32)
-    assert isinstance(attention.sdpa, MiniMaxH3Qwen3VLScaledDotProductAttention)
-    assert isinstance(attention.sdpa, ScaledDotProductAttention)
-    sdpa_call = {}
+    monkeypatch.setattr(attention_layer, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        attention_layer,
+        "get_attn_backend_for_role",
+        lambda **kwargs: (SDPABackend, None),
+    )
+    attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    assert isinstance(attention.attn, Attention)
+    assert isinstance(attention.attn.attention, SDPAImpl)
+    assert attention.attn.skip_sequence_parallel is True
+    attn_call = {}
 
-    def fake_sdpa(query, key, value, **kwargs):
-        sdpa_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape, kwargs=kwargs)
+    def fake_attention(query, key, value, attn_metadata=None):
+        attn_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape)
+        assert attn_metadata is None
         return query
 
-    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
+    monkeypatch.setattr(attention.attn, "forward", fake_attention)
     hidden_states = torch.randn(1, 3, config.hidden_size)
     cos = torch.ones(1, 3, config.head_dim)
     sin = torch.zeros_like(cos)
 
     output = attention(hidden_states, (cos, sin))
 
-    assert sdpa_call["query_shape"] == (1, config.num_attention_heads, 3, config.head_dim)
-    assert sdpa_call["key_shape"] == (1, expected_kv_heads, 3, config.head_dim)
-    assert sdpa_call["value_shape"] == (1, expected_kv_heads, 3, config.head_dim)
-    assert sdpa_call["kwargs"].get("enable_gqa") is expected_enable_gqa
+    assert attn_call["query_shape"] == (1, 3, config.num_attention_heads // 2, config.head_dim)
+    assert attn_call["key_shape"] == (1, 3, config.num_key_value_heads // 2, config.head_dim)
+    assert attn_call["value_shape"] == (1, 3, config.num_key_value_heads // 2, config.head_dim)
     assert output.shape == hidden_states.shape
 
 
