@@ -107,6 +107,7 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # video/text/audio tokens (padding is clamped to 0 before the embedding
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+_LOCAL_SP_PREPARE_HOOK = "sp_input---local_sp_prepare"
 
 # Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
 # (consumed only via the "laser_input_scale" extra key; other backends and
@@ -210,6 +211,51 @@ def _modulate_gate(
 ) -> torch.Tensor:
     # Apply the per-index gated residual: x + gate[idx] * other.
     return (x + gate.index_select(0, indices) * other).to(dtype)
+
+
+def _sequence_parallel_local_span(
+    seq_len: int,
+    *,
+    hooks_applied: bool,
+) -> tuple[int, int]:
+    """Return the packed-row span owned by this sequence-parallel rank."""
+    from vllm_omni.diffusion.forward_context import (
+        get_ulysses_mode,
+        is_forward_context_available,
+    )
+
+    if not hooks_applied or not is_forward_context_available():
+        return 0, seq_len
+    if get_ulysses_mode(default="strict") != "strict":
+        return 0, seq_len
+
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_allgather_parallel_world_size,
+            get_ring_parallel_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_ulysses_parallel_world_size,
+        )
+
+        world_size = int(get_sequence_parallel_world_size())
+        rank = int(get_sequence_parallel_rank())
+        ulysses_world_size = int(get_ulysses_parallel_world_size())
+        ring_world_size = int(get_ring_parallel_world_size())
+        allgather_world_size = int(get_allgather_parallel_world_size())
+    except AssertionError:
+        return 0, seq_len
+
+    if world_size <= 1 or ulysses_world_size != world_size:
+        return 0, seq_len
+    if ring_world_size != 1 or allgather_world_size != 1:
+        return 0, seq_len
+    if seq_len < world_size or seq_len % world_size:
+        return 0, seq_len
+
+    chunk_size = seq_len // world_size
+    start = rank * chunk_size
+    return start, chunk_size
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -888,6 +934,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 split_output=True,
             ),
         },
+        "local_sp_prepare": {
+            2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=1,
+                split_output=True,
+            ),
+        },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
     # The checkpoint already stores qkv and the MLP gate/up as single tensors
@@ -995,6 +1048,7 @@ class MiniMaxH3DiTModel(nn.Module):
             ]
         )
         self.sp_prepare = MiniMaxH3SPPrepare()
+        self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
@@ -1087,16 +1141,39 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_max_seqlen: int,
         seq_len: int,
         device: torch.device,
+        local_span: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build packed multimodal embeddings for the TP=1/SP=1 inference path.
+        """Build this rank's packed multimodal embedding rows.
 
-        Returns (decoder_input [S, H] bf16, t_emb [M, t_dim] fp32).
+        Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
         """
+        local_start, local_len = local_span
+        local_end = local_start + local_len
+        local_only = local_len != seq_len
+        if local_only:
+            img_mask = (img_pos >= local_start) & (img_pos < local_end)
+            audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
+            text_mask = (text_pos >= local_start) & (text_pos < local_end)
+            img_global_pos = img_pos[img_mask]
+            audio_global_pos = audio_pos[audio_mask]
+            img_local_pos = img_global_pos - local_start
+            audio_local_pos = audio_global_pos - local_start
+            text_local_pos = text_pos[text_mask] - local_start
+            text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
+        else:
+            img_global_pos = img_pos
+            audio_global_pos = audio_pos
+            img_local_pos = img_pos
+            audio_local_pos = audio_pos
+            text_local_pos = text_pos
+            text_local_indices = None
+
         # Latent embedders stay fp32 in and out; their outputs are cast to the
         # bf16 sequence dtype only during indexed scattering.
-        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(_FP32_DTYPE)
+        x_rows = x.view(-1, x.shape[-1]).index_select(0, img_global_pos).to(_FP32_DTYPE)
         video_embed, _ = self.video_patch_proj(x_rows)
-        audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(_FP32_DTYPE)
+        audio_rows = audio_x.view(-1, audio_x.shape[-1])
+        audio_rows = audio_rows.index_select(0, audio_global_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
         text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
@@ -1106,11 +1183,29 @@ class MiniMaxH3DiTModel(nn.Module):
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
         )
+        if text_local_indices is not None:
+            text_embed = text_embed.index_select(0, text_local_indices)
 
-        embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
-        embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
-        embeddings.index_add_(0, img_pos, video_embed.to(_BF16_DTYPE)[: img_pos.shape[0]])
-        embeddings.index_add_(0, audio_pos, audio_embed.to(_BF16_DTYPE)[: audio_pos.shape[0]])
+        embeddings = torch.zeros(
+            (local_len, self.hidden_size),
+            device=device,
+            dtype=_BF16_DTYPE,
+        )
+        embeddings.index_add_(
+            0,
+            text_local_pos,
+            text_embed.to(_BF16_DTYPE)[: text_local_pos.shape[0]],
+        )
+        embeddings.index_add_(
+            0,
+            img_local_pos,
+            video_embed.to(_BF16_DTYPE)[: img_local_pos.shape[0]],
+        )
+        embeddings.index_add_(
+            0,
+            audio_local_pos,
+            audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
+        )
 
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
@@ -1140,7 +1235,6 @@ class MiniMaxH3DiTModel(nn.Module):
         update_mask = _required_kwarg(kwargs, "update_mask")
         token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
         skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
-
         text_selected = _required_kwarg(kwargs, "prompt_embeds")
 
         img_pos = self._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
@@ -1170,8 +1264,18 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        # Compute the packed RoPE table once for all transformer blocks.
-        rope_table = _build_rope_table(self.rope(img_position_ids).to(device))
+        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
+        hooks_applied = local_sp_registry is not None
+        if local_sp_registry is not None:
+            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
+            hooks_applied = local_sp_hook is not None
+        local_span = _sequence_parallel_local_span(
+            seq_len,
+            hooks_applied=hooks_applied,
+        )
+        local_start, local_len = local_span
+        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+        rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
 
         decoder_input, t_emb = self._embed(
             x=x,
@@ -1185,6 +1289,7 @@ class MiniMaxH3DiTModel(nn.Module):
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
+            local_span=local_span,
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1195,11 +1300,18 @@ class MiniMaxH3DiTModel(nn.Module):
         block_rope = rope_table
         block_combined = combined_indices
 
-        hidden, block_rope, block_combined = self.sp_prepare(
-            hidden,
-            block_rope,
-            block_combined,
-        )
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = self.sp_prepare(
+                hidden,
+                block_rope,
+                block_combined,
+            )
+        else:
+            hidden, block_rope, block_combined = self.local_sp_prepare(
+                hidden,
+                block_rope,
+                block_combined,
+            )
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1211,13 +1323,29 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=seq_len,
                 video_layout=video_layout,
             )
-        hidden = self.sp_gather(hidden)
-
-        video_logits, audio_logits = self.final_layer(
-            hidden,
-            t_emb=t_emb,
-            inverse_indices=inverse_indices,
-        )
+        if local_len == seq_len:
+            hidden = self.sp_gather(hidden)
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = self.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = self.sp_gather(compact_logits)
+            video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
 
         # Select target and condition rows at inference-output positions, then
         # zero the condition rows.

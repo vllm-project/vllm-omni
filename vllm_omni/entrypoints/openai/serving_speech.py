@@ -92,19 +92,7 @@ logger = init_logger(__name__)
 # reference (issue #4644). Matches the offline example/test and upstream demo.
 _COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
 _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
-    "fish_tts",
-    "qwen3_tts",
-    "voxtral_tts",
-    "cosyvoice3",
-    "voxcpm2",
-    "higgs_audio_v2",
-    "higgs_audio_v3",
-    "indextts2",
-    "indextts2_5",
-    "audex",
-    "audex_tta",
-}
+
 # Audex contract: zero-codec / invalid generations arrive as empty terminal
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
@@ -444,7 +432,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
         # path used for dynamic-token sizing. Without this, every request
         # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
-        # TTFP critical path) in _apply_cosyvoice3_dynamic_tokens.
+        # TTFP critical path) in the CosyVoice3 adapter's sampling override.
         self._cosyvoice3_tokenizer = None
 
         # Determine TTS model type or None
@@ -502,9 +490,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
-        # adapter owns request validation + prompt/param building. Sampling
-        # overrides and the model-type label remain in the orchestrator tail
-        # (keyed on ``_tts_model_type``) during this incremental migration.
+        # adapter owns request validation, prompt/param building, and sampling
+        # overrides; the model-type label remains available for compatibility.
         self._adapter = None
         if self._tts_stage is not None:
             adapter_cls = resolve_adapter(self._tts_model_type)
@@ -2825,154 +2812,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._audex_tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, folder))
         return self._audex_tokenizer
 
-    def _inject_audex_tta_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
-        """Complete the Audex TTA contract on a CLONE of the stage-0 params.
-
-        Always attaches the RVQ phase-mask contract (required for token
-        validity) and the CFG pair contract at the official default scale
-        3.0 unless the caller passed ``cfg_scale`` (1.0 disables guidance).
-
-        Returns the cloned params; the input is never mutated. On the
-        no-extra_params online path the input is an element of the engine's
-        SHARED ``default_sampling_params_list`` — writing per-request pair
-        state (``cfg_pair_id``/``cfg_null_prompt``) into it would race
-        concurrent requests and leak stale CFG metadata into later ones.
-        """
-        import copy
-
-        from vllm_omni.model_executor.models.audex.prompt import build_tta_null_prompt
-        from vllm_omni.model_executor.models.audex.tta import build_tta_phase_token_ids
-
-        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
-        if not isinstance(cond_prompt, str) or not cond_prompt:
-            raise ValueError("Audex TTA requires the adapter-built caption prompt")
-
-        stage0_params = copy.deepcopy(stage0_params)
-        tokenizer = self._get_audex_tokenizer()
-        if self._audex_tta_rvq is None:
-            phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
-            self._audex_tta_rvq = {
-                "phase_token_ids": phase_token_ids,
-                "start_tid": start_tid,
-                "end_tid": end_tid,
-                # Official generation cap (decode truncates at 500 frames).
-                "codec_cap": 4000,
-                # The TTA prompt ends with <audiogen_start>.
-                "start_in_prompt": True,
-            }
-
-        extra_args = getattr(stage0_params, "extra_args", None)
-        if extra_args is None:
-            extra_args = {}
-            stage0_params.extra_args = extra_args
-        extra_args["tta_rvq"] = self._audex_tta_rvq
-
-        cfg_scale = extra_args.get("cfg_scale")
-        cfg_scale = 3.0 if cfg_scale is None else float(cfg_scale)
-        if cfg_scale <= 1.0:
-            extra_args.pop("cfg_scale", None)
-            return stage0_params
-        extra_args.update(
-            {
-                "cfg_scale": cfg_scale,
-                "cfg_role": "cond",
-                "cfg_pair_id": request_id,
-                "cfg_null_prompt": build_tta_null_prompt(cond_prompt, tokenizer),
-            }
-        )
-        return stage0_params
-
-    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
-        """Complete the Audex CFG contract on a CLONE of the stage-0 params.
-
-        The adapter validated ``cfg_scale``; here (where the final request id
-        exists) the cond role, pair id, and the length-matched null prompt are
-        attached. ``cfg_scale`` absent/1.0 returns a clone value-identical to
-        the non-CFG flow (the key is dropped rather than forwarded).
-
-        Returns the cloned params; the input is never mutated (it may be an
-        element of the engine's shared ``default_sampling_params_list`` —
-        see ``_inject_audex_tta_args``).
-        """
-        import copy
-
-        stage0_params = copy.deepcopy(stage0_params)
-        extra_args = getattr(stage0_params, "extra_args", None)
-        if not extra_args or extra_args.get("cfg_scale") is None:
-            if extra_args:
-                extra_args.pop("cfg_scale", None)
-            return stage0_params
-        cfg_scale = float(extra_args["cfg_scale"])
-        if cfg_scale <= 1.0:
-            extra_args.pop("cfg_scale", None)
-            return stage0_params
-
-        from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
-
-        cond_prompt = prompt.get("prompt") if isinstance(prompt, dict) else prompt
-        if not isinstance(cond_prompt, str) or not cond_prompt:
-            raise ValueError("Audex CFG requires the adapter-built text prompt")
-        null_prompt = build_null_prompt(cond_prompt, self._get_audex_tokenizer())
-        extra_args.update(
-            {
-                "cfg_scale": cfg_scale,
-                "cfg_role": "cond",
-                "cfg_pair_id": request_id,
-                "cfg_null_prompt": null_prompt,
-            }
-        )
-        # Guided decoding sharpens the distribution; the unguided default
-        # temperature (0.1) adds excess sampling noise under CFG. Measured
-        # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
-        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
-        stage0_params.temperature = 0.05
-        return stage0_params
-
-    def _apply_cosyvoice3_dynamic_tokens(
-        self,
-        sampling_params_list: list,
-        request: OpenAICreateSpeechRequest,
-    ) -> list:
-        """Set min/max tokens from tokenized text length (ratios target tokens, not chars)."""
-        import copy
-
-        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
-        from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-
-        sampling_params_list = copy.deepcopy(sampling_params_list)
-        hf_cfg = self.model_config.hf_config
-        # Build the Qwen tokenizer once per process (resolving the model dir via
-        # snapshot_download at most once) and reuse it across requests.
-        tokenizer = self._cosyvoice3_tokenizer
-        if tokenizer is None:
-            model_path = self.engine_client.model_config.model
-            if not os.path.isdir(model_path):
-                from huggingface_hub import snapshot_download
-
-                model_path = snapshot_download(model_path)
-            tokenizer = get_qwen_tokenizer(
-                token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
-                skip_special_tokens=hf_cfg.skip_special_tokens,
-                version=hf_cfg.version,
-            )
-            self._cosyvoice3_tokenizer = tokenizer
-        _, text_token_len = extract_text_token(
-            request.input,
-            tokenizer,
-            hf_cfg.allowed_special,
-        )
-        min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
-        max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
-        sampling_params_list[0].min_tokens = max(1, int(text_token_len * min_ratio))
-        sampling_params_list[0].max_tokens = min(2048, int(text_token_len * max_ratio))
-        logger.info(
-            "CosyVoice3 dynamic tokens: text_tokens=%d, min_tokens=%d, max_tokens=%d",
-            text_token_len,
-            sampling_params_list[0].min_tokens,
-            sampling_params_list[0].max_tokens,
-        )
-        return sampling_params_list
-
     # ---- GLM-TTS helpers ----
 
     async def _build_glm_tts_prompt(
@@ -3172,9 +3011,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
         # dedicated TTS model resolves to an adapter that owns its validation,
-        # uploaded-speaker handling, and prompt/param building. Sampling
-        # overrides and the model-type label remain in the orchestrator tail
-        # below (keyed on ``_tts_model_type``) during this incremental migration.
+        # uploaded-speaker handling, prompt/param building, and sampling
+        # overrides. The model-type label remains available for compatibility.
         # Non-TTS deployments (no adapter) fall through to the rejection below.
         # Capture inline-ref-audio status BEFORE validate(): several adapters
         # apply uploaded speakers inside validate(), which sets request.ref_audio
@@ -3225,63 +3063,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type,
         )
 
-        # CosyVoice3: set dynamic min/max tokens based on text length.
-        # The official model requires min_token_text_ratio to prevent early
-        # EOS and max_token_text_ratio to cap generation length.
-        if self._tts_model_type == "cosyvoice3" and sampling_params_list:
-            sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
-
-        # GLM-TTS: set dynamic min/max tokens based on text length.
-        if self._tts_model_type == "glm_tts" and sampling_params_list:
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            glm_metadata = prompt.get("additional_information") if isinstance(prompt, dict) else None
-            text_len_value = None
-            if isinstance(glm_metadata, dict):
-                text_len_value = glm_metadata.get("glm_tts_text_token_len")
-                if isinstance(text_len_value, list) and text_len_value:
-                    text_len_value = text_len_value[0]
-            text_token_len = (
-                int(text_len_value)
-                if text_len_value is not None
-                else self._estimate_glm_tts_text_token_len(request.input)
-            )
-            hf_cfg = self.model_config.hf_config
-            min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
-            max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
-            stage_min_tokens = getattr(sampling_params_list[0], "min_tokens", None)
-            stage_max_tokens = getattr(sampling_params_list[0], "max_tokens", None)
-            cap_candidates = [int(cap) for cap in (stage_max_tokens, request.max_new_tokens) if cap is not None]
-            hard_cap = min(cap_candidates) if cap_candidates else None
-
-            min_tokens = max(1, int(text_token_len * min_ratio))
-            if stage_min_tokens is not None:
-                min_tokens = max(min_tokens, int(stage_min_tokens))
-            if hard_cap is not None:
-                min_tokens = min(min_tokens, hard_cap)
-
-            max_tokens = max(min_tokens, int(text_token_len * max_ratio))
-            if hard_cap is not None:
-                max_tokens = min(max_tokens, hard_cap)
-            sampling_params_list[0].min_tokens = min_tokens
-            sampling_params_list[0].max_tokens = max_tokens
-            seed = getattr(request, "seed", None)
-            if seed is not None:
-                sampling_params_list[0].seed = seed
-            logger.info(
-                "GLM-TTS dynamic tokens: text_tokens=%d, min_ratio=%s, max_ratio=%s, "
-                "stage_min=%s, stage_max=%s, request_max=%s, min_tokens=%d, max_tokens=%d",
-                text_token_len,
-                min_ratio,
-                max_ratio,
-                stage_min_tokens,
-                stage_max_tokens,
-                request.max_new_tokens,
-                min_tokens,
-                max_tokens,
-            )
-
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
             if not isinstance(request.extra_params, dict):
@@ -3300,52 +3081,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list[0].extra_args.update(request.extra_params)
             logger.info("Applied extra_params: %s", request.extra_params)
 
-        # Audex CFG: turn an adapter-validated cfg_scale into the engine-side
-        # pair contract. This must run here (not in the adapter) because the
-        # pair id is the final request_id, which the adapter never sees.
-        # The injectors return a CLONE: without extra_params above,
-        # sampling_params_list still holds the engine's shared default params,
-        # which must never carry per-request CFG state.
-        if self._tts_model_type == "audex" and sampling_params_list:
-            sampling_params_list[0] = self._inject_audex_cfg_pair_args(request_id, prompt, sampling_params_list[0])
-        elif self._tts_model_type == "audex_tta" and sampling_params_list:
-            sampling_params_list[0] = self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
-
-        # Some TTS model defaults come from deploy YAML. Their AR
-        # generation length is controlled by SamplingParams.max_tokens, so only
-        # override it when the caller explicitly requests max_new_tokens.
-        if (
-            self._tts_model_type in _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES
-            and request.max_new_tokens is not None
-            and sampling_params_list
-        ):
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
-            if self._tts_model_type == "cosyvoice3":
-                sampling_params_list[0].min_tokens = min(
-                    getattr(sampling_params_list[0], "min_tokens", 0),
-                    request.max_new_tokens,
-                )
-        elif self._tts_model_type == "ming_tts" and sampling_params_list:
-            import copy
-
-            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
-                MOE_TEXT_EOS_TOKEN_ID,
-                TEXT_EOS_TOKEN_ID,
-            )
-
-            hf_config = self.engine_client.model_config.hf_config
-            is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
-            stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].stop_token_ids = [int(stop_token_id)]
-            if request.max_new_tokens is not None:
-                # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
-                # Stage-0 needs one extra token beyond ming_max_decode_steps.
-                sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
+        # Apply adapter-owned sampling overrides, including request-level token
+        # limits and model-specific dynamic token or stop-token configuration.
+        if sampling_params_list and (adapter := self._get_tts_adapter()) is not None:
+            sampling_params_list = adapter.apply_sampling_overrides(sampling_params_list, request, prompt, request_id)
 
         if request.seed is not None and sampling_params_list:
             import copy

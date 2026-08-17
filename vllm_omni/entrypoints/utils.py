@@ -19,7 +19,7 @@ from vllm_omni.config.config_factory import (
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
-from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
@@ -369,11 +369,12 @@ def load_stage_configs_from_model(
 ) -> tuple[list, str | None]:
     """Load stage configurations from model's default config file.
 
-    For models registered in the pipeline registry (new path), uses
+    For models registered in the pipeline registry, uses
     ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
-    For other models (legacy path), loads stage configs from YAML.
+    Models that cannot be resolved through the registry return no stages so the
+    caller can apply its default stage configuration, when available.
 
     Args:
         model: Model name or path (used to determine model_type)
@@ -383,7 +384,7 @@ def load_stage_configs_from_model(
         stage_overrides: Per-stage overrides from --stage-overrides.
         strategy_config_path: Optional path to a composable-parallel
             ``strategy.yaml`` whose derived sizing is overlaid onto the
-            registry-merged stages (opt-in; ignored on the legacy YAML path).
+            registry-merged stages.
 
     Returns:
         ``(stage_configs, omni_lb_policy)``: the list of stage configuration
@@ -427,69 +428,17 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
-    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
-    # applied here (it overlays onto registry-merged stages), so warn rather than
-    # silently dropping the operator's --strategy-config.
+    strategy_note = ""
     if strategy_config_path is not None:
-        logger.warning(
-            "--strategy-config (%s) was provided but model %r resolves via the "
-            "legacy stage_configs YAML path, which does not support "
-            "composable-parallel strategies; the strategy is ignored. Use a "
-            "registry-based model to apply it.",
-            strategy_config_path,
-            model,
-        )
-    stage_config_path = resolve_model_config_path(model)
-    if stage_config_path is None:
-        return [], None
-    stage_configs = load_stage_configs_from_yaml(
-        config_path=stage_config_path,
-        base_engine_args=base_engine_args,
-        prefer_stage_engine_args=True,
+        strategy_note = f" Strategy config {strategy_config_path!r} was not applied."
+    logger.warning(
+        "No registered PipelineConfig resolved for model %r. Legacy `stage_args` "
+        "YAMLs are no longer supported; register the pipeline and provide deployment "
+        "overrides through `deploy_config`.%s",
+        model,
+        strategy_note,
     )
-    return stage_configs, None
-
-
-def load_stage_configs_from_yaml(
-    config_path: str,
-    base_engine_args: dict | None = None,
-    prefer_stage_engine_args: bool = True,
-) -> list:
-    """Load stage configurations from a YAML file (legacy OmegaConf path).
-
-    TODO(@lishunyang12): remove once all models use PipelineConfig + DeployConfig.
-
-    Args:
-        config_path: Path to the YAML configuration file
-        base_engine_args: Engine args supplied by the caller.
-        prefer_stage_engine_args: When True, YAML stage args override caller
-            engine args. When False, caller engine args override YAML defaults.
-
-    Returns:
-        List of stage configuration dictionaries from the file's stage_args
-    """
-    if base_engine_args is None:
-        base_engine_args = {}
-    config_data = load_yaml_config(config_path)
-    stage_args = config_data.stage_args
-    global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating DictConfig
-    base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = create_config(base_engine_args)
-    for stage_arg in stage_args:
-        base_engine_args_tmp = base_engine_args.copy()
-        # Update base_engine_args with stage-specific engine_args if they exist
-        if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            if prefer_stage_engine_args:
-                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
-            else:
-                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
-            base_engine_args_tmp = create_config(merged_engine_args)
-        stage_type = getattr(stage_arg, "stage_type", "llm")
-        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            base_engine_args_tmp.async_chunk = global_async_chunk
-        stage_arg.engine_args = base_engine_args_tmp
-    return stage_args
+    return [], None
 
 
 def filter_stages(

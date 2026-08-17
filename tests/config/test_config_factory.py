@@ -1102,6 +1102,13 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_rejects_legacy_stage_args_schema(self, tmp_path):
+        deploy_path = tmp_path / "legacy.yaml"
+        deploy_path.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
+            load_deploy_config(deploy_path)
+
     def test_load_minicpmo_duplex_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5_duplex.yaml"))
 
@@ -1377,7 +1384,8 @@ stages:
         assert async_stages[1].custom_process_input_func is None
 
     def test_no_bundled_legacy_stage_config_yamls(self):
-        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        repo_root = Path(__file__).resolve().parents[2]
+        stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"
         assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):

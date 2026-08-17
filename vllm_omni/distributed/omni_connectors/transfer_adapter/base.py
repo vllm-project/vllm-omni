@@ -35,6 +35,8 @@ class OmniTransferAdapterBase:
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
+        self._send_failures: dict[str, str] = {}
+        self._send_failure_lock = threading.Lock()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -82,6 +84,24 @@ class OmniTransferAdapterBase:
                 elif not any_success and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.001)
 
+    def record_send_failure(self, request_id: str | None, reason: str) -> None:
+        """Note that a chunk for *request_id* will never be delivered.
+
+        Called from the sender thread; drained by the scheduler thread, hence
+        the lock. ``_waiting_since`` needs none because only the scheduler
+        touches it.
+        """
+        if not request_id:
+            return
+        with self._send_failure_lock:
+            self._send_failures.setdefault(request_id, reason)
+
+    def collect_failed_send_request_ids(self) -> dict[str, str]:
+        """Drain and return the requests whose send gave up."""
+        with self._send_failure_lock:
+            failures, self._send_failures = self._send_failures, {}
+        return failures
+
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
@@ -90,7 +110,18 @@ class OmniTransferAdapterBase:
                 try:
                     self._send_single_request(task)
                 except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+                    # R1.2 of #4855. The task was popleft()-ed and is not re-queued,
+                    # so this is a give-up, not a retry: the consumer will wait for a
+                    # chunk that is never coming. Record it so the scheduler can fail
+                    # the request now instead of leaving it to the wait deadline.
+                    # The task dict carries the Request object, not a bare id --
+                    # `task.get("request_id")` is always None (it was that way in the
+                    # original warning too, which logged "None" for every failure).
+                    # Use the scheduler-side id: that is what `self.requests` is keyed
+                    # by, and what `finish_requests` expects.
+                    failed = getattr(task.get("request"), "request_id", None)
+                    logger.error("Send gave up for %s: %s", failed, e)
+                    self.record_send_failure(failed, f"{type(e).__name__}: {e}")
 
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
