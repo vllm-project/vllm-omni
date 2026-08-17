@@ -714,8 +714,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         Unlike AR stages, a diffusion producer has no orchestrator-advertised
         handshake endpoint, so the transfer metadata returned by ``put`` is
         stashed on ``custom_output`` and rides the existing IPC hop; the consumer
-        feeds it straight back into ``connector.get``. The inline payload is left
-        in place so a failed transfer degrades instead of dropping conditioning.
+        feeds it straight back into ``connector.get``. Transferred keys are then
+        dropped from ``custom_output`` -- leaving them would ship the payload a
+        second time through the orchestrator and defeat the whole point. A put
+        that fails or is rejected leaves the inline payload untouched, so the
+        stage degrades to the pre-connector behaviour instead of losing data.
 
         Only the local leader rank talks to the connector -- stage payloads are
         TP-identical -- and the resulting handles are broadcast so every rank
@@ -759,6 +762,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "key": put_key,
                         "from_stage": from_stage,
                         "to_stage": to_stage,
+                        "size_bytes": int(size),
                         "metadata": metadata,
                         "payload_keys": list(payload),
                     }
@@ -770,8 +774,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         for req, output in zip(reqs, outputs):
             handle = handles.get(req.request_id)
             custom = getattr(output, "custom_output", None)
-            if handle is not None and isinstance(custom, dict):
-                custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+            if handle is None or not isinstance(custom, dict):
+                continue
+            custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+            # Every rank drops the inline copy, not just the one that sent it.
+            for name in handle["payload_keys"]:
+                custom.pop(name, None)
 
     def _prepare_request_for_forward(
         self,
