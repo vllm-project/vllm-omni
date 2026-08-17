@@ -17,7 +17,7 @@ from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 
 MODEL_ID = "Qwen/Qwen-Image-Layered"

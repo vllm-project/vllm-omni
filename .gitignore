@@ -254,6 +254,7 @@ outputs/
 results/
 generated/
 output_*/
+/tests/e2e/accuracy/artifacts/
 
 # Configuration overrides
 configs/local.yaml

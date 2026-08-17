@@ -22,11 +22,12 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    _try_resolve_omni_model_type,
     coerce_param_message_types,
     filter_dataclass_kwargs,
     filter_stages,
     load_and_resolve_stage_configs,
-    load_stage_configs_from_yaml,
+    load_stage_configs_from_model,
     resolve_model_config_path,
 )
 
@@ -371,11 +372,54 @@ class TestResolveModelConfigPath:
         assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert sender["extra"]["connector_get_max_wait"] == 300
 
+    def test_object_storage_uri_resolves_via_materialized_configs(
+        self,
+        mocker: MockerFixture,
+        tmp_path,
+    ):
+        """An object-storage URI must not reach HF helpers; resolution reads the
+        locally materialized config files instead."""
+        hf_config = SimpleNamespace(
+            model_type="qwen3_omni_moe",
+            architectures=["Qwen3OmniMoeForConditionalGeneration"],
+        )
+        uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
+        materialize = mocker.patch(
+            "vllm_omni.entrypoints.utils._materialize_object_storage_configs",
+            return_value=str(tmp_path),
+        )
+        get_config = mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            return_value=hf_config,
+        )
+
+        result = resolve_model_config_path(uri)
+
+        materialize.assert_called_once_with(uri)
+        get_config.assert_called_once()
+        assert get_config.call_args[0][0] == str(tmp_path)
+        assert result is not None
+        assert Path(result).as_posix().endswith("qwen3_omni_moe.yaml")
+
+
+class TestTryResolveOmniModelType:
+    """Name matching must only scan the last path component."""
+
+    def test_uri_bucket_name_cannot_hijack_pipeline(self):
+        # "qwen3-tts-models" normalizes to "qwen3ttsmodels", which contains the
+        # registered key "qwen3tts" — only the basename may participate, so a
+        # misleadingly named bucket selects nothing.
+        assert _try_resolve_omni_model_type("s3://qwen3-tts-models/plain-checkpoint") is None
+
+    def test_basename_still_matches_pipeline(self):
+        assert _try_resolve_omni_model_type("gs://any-bucket/Fun-CosyVoice3-0.5B-2512") == "cosyvoice3"
+
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self, mocker: MockerFixture):
-        """Ensure that dtype survives default stage creation."""
-        kwargs = {"dtype": torch.float32}
+        """Ensure that kwargs survive default stage creation."""
+        engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+        kwargs = {"dtype": torch.float32, "engine_backend": engine_backend}
         mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
         mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
 
@@ -388,6 +432,7 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
+        assert stage_configs[0]["engine_args"]["engine_backend"] == engine_backend
 
     def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"
@@ -475,71 +520,20 @@ class TestLoadAndResolveStageConfigs:
         assert filtered[0].final_output_type is None
 
 
-class TestLoadStageConfigsFromYaml:
-    """Regression tests for stage-config loading and merging."""
-
-    def test_deep_merges_stage_engine_args(self, mocker: MockerFixture):
-        yaml_config = create_config(
-            {
-                "async_chunk": True,
-                "stage_args": [
-                    {
-                        "stage_id": 0,
-                        "runtime": {"device": 0},
-                        "engine_args": {
-                            "parallel_config": {"tensor_parallel_size": 4},
-                        },
-                    }
-                ],
-            }
-        )
+class TestLoadStageConfigsFromModel:
+    def test_unresolved_model_does_not_fall_back_to_yaml(self, mocker: MockerFixture, caplog):
         mocker.patch(
-            "vllm_omni.entrypoints.utils.load_yaml_config",
-            return_value=yaml_config,
+            "vllm_omni.entrypoints.utils.StageConfigFactory.create_legacy_stage_configs_from_model",
+            return_value=(None, None),
         )
+        resolve_path = mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path")
 
-        stages = load_stage_configs_from_yaml(
-            "fake.yaml",
-            base_engine_args={
-                "parallel_config": {
-                    "tensor_parallel_size": 1,
-                    "pipeline_parallel_size": 2,
-                },
-                "model": "base-model",
-            },
-        )
+        result = load_stage_configs_from_model("unregistered-model", trust_remote_code=False)
 
-        merged_engine_args = stages[0]["engine_args"]
-        assert merged_engine_args["parallel_config"]["tensor_parallel_size"] == 4
-        assert merged_engine_args["parallel_config"]["pipeline_parallel_size"] == 2
-        assert merged_engine_args["model"] == "base-model"
-        assert merged_engine_args["async_chunk"] is True
-
-    def test_merges_nested_stage_engine_args(self, mocker: MockerFixture):
-        yaml_config = create_config(
-            {
-                "stage_args": [
-                    {
-                        "stage_id": 0,
-                        "engine_args": {
-                            "nested": {"override": 2},
-                        },
-                    }
-                ],
-            }
-        )
-        mocker.patch(
-            "vllm_omni.entrypoints.utils.load_yaml_config",
-            return_value=yaml_config,
-        )
-
-        stages = load_stage_configs_from_yaml(
-            "fake.yaml",
-            base_engine_args={"nested": {"base": 1}},
-        )
-
-        assert stages[0]["engine_args"]["nested"]["base"] == 1
-        assert stages[0]["engine_args"]["nested"]["override"] == 2
+        assert result == ([], None)
+        resolve_path.assert_not_called()
+        assert "No registered PipelineConfig resolved" in caplog.text
+        assert "deploy_config" in caplog.text
 
 
 class TestCumulativeStreamingCoercion:

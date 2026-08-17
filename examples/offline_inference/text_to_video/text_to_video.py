@@ -570,6 +570,8 @@ def main():
         num_frames=args.num_frames,
         extra_args=extra_args,
     )
+    if args.frame_rate is not None:
+        sampling_kwargs["frame_rate"] = args.frame_rate
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
 

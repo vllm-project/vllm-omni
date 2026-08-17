@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), t2i Task",
@@ -61,7 +61,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-stage BAGEL (TP=1, CFG=1), i2i Task",
@@ -113,7 +113,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i Task",
@@ -164,7 +164,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, i2i Task",

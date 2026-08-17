@@ -292,7 +292,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         # Apply CPU offloading
-        self.offload_backend = get_offload_backend(self.od_config, device=self.device)
+        self.offload_backend = get_offload_backend(
+            self.od_config,
+            device=self.device,
+            host_weight_plan=model_loader.take_host_weight_plan(),
+        )
         if self.offload_backend is not None:
             logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
             self.offload_backend.enable(self.pipeline)

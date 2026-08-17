@@ -217,13 +217,21 @@ class TestGetRequestBatchSamplingParamsKey:
         num_inference_steps: int = 2,
         seed: int | None = 123,
         generator: torch.Generator | None = None,
+        extra_args: dict | None = None,
+        condition_key: tuple | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             seed=seed,
             generator=generator,
+            extra_args=extra_args or {},
         )
-        return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-{num_inference_steps}",
+            batch_compatibility_key=condition_key,
+        )
 
     def test_distinguishes_num_inference_steps(self) -> None:
         scheduler = RequestScheduler()
@@ -239,6 +247,57 @@ class TestGetRequestBatchSamplingParamsKey:
         assert scheduler._build_sampling_params_key(
             self._make(seed=1, generator=gen_a)
         ) == scheduler._build_sampling_params_key(self._make(seed=2, generator=gen_b))
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_distinguishes_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) != scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": " Euler "}, {"sample_solver": "euler"}),
+            ({"flow_shift": "5.0"}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_normalizes_equivalent_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) == scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
+    def test_uses_none_for_unspecified_wan_scheduler_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        key = scheduler._build_sampling_params_key(self._make())
+
+        assert key.sample_solver is None
+        assert key.flow_shift is None
+
+    def test_distinguishes_pipeline_condition_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(condition_key=("wan22_s2v_condition", True))
+        ) != scheduler._build_sampling_params_key(self._make(condition_key=("wan22_s2v_condition", False)))
 
 
 class TestRequestScheduler:
@@ -602,6 +661,38 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
+    def test_batches_incompatible_pipeline_conditions_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        request_a = OmniDiffusionRequest(
+            prompt="a",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123),
+            request_id="a",
+            batch_compatibility_key=("wan22_s2v_condition", True),
+        )
+        request_b = OmniDiffusionRequest(
+            prompt="b",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=456),
+            request_id="b",
+            batch_compatibility_key=("wan22_s2v_condition", False),
+        )
+        scheduler.add_request(request_a)
+        scheduler.add_request(request_b)
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == ["a"]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(first, _make_request_output("a"))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == ["b"]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
+
     def test_batches_different_request_local_seed_together(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
@@ -624,6 +715,47 @@ class TestRequestScheduler:
         assert _new_ids(first) == [req_id_a, req_id_b]
         assert first.num_running_reqs == 2
         assert first.num_waiting_reqs == 0
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+            ({"sample_solver": "unipc"}, {}),
+            ({"flow_shift": 3.0}, {}),
+        ],
+    )
+    def test_batches_incompatible_wan_scheduler_structure_separately(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        first_id = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=first_extra_args,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=second_extra_args,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [first_id]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()

@@ -329,11 +329,13 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 
 ### Per-model coverage
 
-Pilot (v1): two Merge-tier (L3) jobs in `.buildkite/cuda/test-merge.yml` upload
-per-model, per-entry-mode coverage as Buildkite artifacts — "Diffusion · Bagel
-Test" and "TTS · Qwen3-TTS Base Test". Both run on a single GPU so the pilot is
-cheap to reproduce. This is a pilot, not a rollout: no dashboard/visualization
-lives in this repo, and nothing is gated on coverage.
+Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-merge.yml` uploads
+per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS Base
+Test". It runs on a single GPU so the pilot is cheap to reproduce. (A second
+diffusion pilot, "Diffusion · Bagel Test", was retired from merge; reintroduce
+another diffusion coverage job if a second pilot is needed again.) This is a
+pilot, not a rollout: no dashboard/visualization lives in this repo, and nothing
+is gated on coverage.
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under
@@ -410,7 +412,8 @@ runs a coverage job needs the same.
 List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 `source_file_dependencies` — both change what the job measures, so without them a
 change there is filtered out of normal PR builds and only surfaces in a later
-nightly. `tests/buildkite/test_upload_pipeline.py` asserts this for the pilots.
+nightly. `tests/buildkite/test_upload_pipeline.py` covers the filter behavior with
+a synthetic job (it does not pin real merge labels).
 Editing only the surrounding CI YAML still does not schedule them, so a PR that
 touches just the wiring needs a full E2E run (or the commands run on a GPU host)
 to produce artifacts. When checking a new model's
