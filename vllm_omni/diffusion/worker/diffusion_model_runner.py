@@ -536,6 +536,83 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 continue
             additional[name] = _to_device(value, target_device)
 
+    def _stage_output_payload_keys(self) -> tuple[str, ...]:
+        """Payload keys this stage hands to the next stage over the connector.
+
+        Empty (the default) keeps the connector send path completely disabled.
+        """
+        keys = getattr(self.od_config, "stage_output_payload_keys", None)
+        return tuple(keys) if keys else ()
+
+    def _maybe_send_stage_payload(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        outputs: list[DiffusionOutput],
+    ) -> None:
+        """Push this stage's declared payload to the next stage over the connector.
+
+        Unlike AR stages, a diffusion producer has no orchestrator-advertised
+        handshake endpoint, so the transfer metadata returned by ``put`` is
+        stashed on ``custom_output`` and rides the existing IPC hop; the consumer
+        feeds it straight back into ``connector.get``. The inline payload is left
+        in place so a failed transfer degrades instead of dropping conditioning.
+
+        Only the local leader rank talks to the connector -- stage payloads are
+        TP-identical -- and the resulting handles are broadcast so every rank
+        reports the same ``custom_output``.
+        """
+        payload_keys = self._stage_output_payload_keys()
+        if not payload_keys:
+            return
+        from_stage, to_stage = self.kv_transfer_manager.send_stages
+        if not from_stage or not to_stage:
+            logger.warning(
+                "Stage %s declares output payload keys but has no outgoing connector edge",
+                getattr(self.od_config, "stage_id", "?"),
+            )
+            return
+
+        # Every rank must reach the broadcast below, so the leader-only work is
+        # confined to this block rather than short-circuiting the whole method.
+        handles: dict[str, dict[str, Any]] = {}
+        if self.is_data_transfer_rank():
+            connector = self._stage_payload_connector()
+            if connector is not None:
+                for req, output in zip(reqs, outputs):
+                    custom = getattr(output, "custom_output", None)
+                    if not isinstance(custom, dict):
+                        continue
+                    payload = {key: custom[key] for key in payload_keys if custom.get(key) is not None}
+                    if not payload:
+                        continue
+                    # Mirror the key convention _maybe_recv_stage_payload rebuilds.
+                    put_key = f"{req.request_id}_{from_stage}_0"
+                    try:
+                        success, size, metadata = connector.put(from_stage, to_stage, put_key, payload)
+                    except Exception as exc:
+                        logger.warning("Stage payload put failed for %s: %s", put_key, exc)
+                        continue
+                    if not success:
+                        logger.warning("Stage payload %s was rejected; keeping the inline payload", put_key)
+                        continue
+                    handles[req.request_id] = {
+                        "key": put_key,
+                        "from_stage": from_stage,
+                        "to_stage": to_stage,
+                        "metadata": metadata,
+                        "payload_keys": list(payload),
+                    }
+                    logger.debug("Stage payload put %s size=%s keys=%s", put_key, size, list(payload))
+
+        handles = self._broadcast_tp_payload_packet(handles) or {}
+        if not handles:
+            return
+        for req, output in zip(reqs, outputs):
+            handle = handles.get(req.request_id)
+            custom = getattr(output, "custom_output", None)
+            if handle is not None and isinstance(custom, dict):
+                custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -701,6 +778,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
+
+        self._maybe_send_stage_payload(reqs, outputs)
 
         return self._runner_output_from_outputs(reqs, outputs)
 

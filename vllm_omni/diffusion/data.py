@@ -823,6 +823,10 @@ class OmniDiffusionConfig:
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
 
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
+
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
