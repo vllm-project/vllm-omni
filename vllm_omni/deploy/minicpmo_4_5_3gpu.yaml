@@ -89,6 +89,14 @@ stages:
 platforms:
   npu:
     stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
       - stage_id: 2
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
         # estimator kernels through the NPU platform patch.

@@ -78,7 +78,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         return (
             make((2, 2, 6), 0.0),
             make((2, 2, 6), 0.5),
-            make((2, 16), 1.0),
+            make((2, 1, 16), 1.0),
             make((2, 1), 1.5),
             make((2, 1, 6), 2.0),
         )
