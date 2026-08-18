@@ -81,6 +81,7 @@ def test_minimax_h3_disaggregation_is_explicit_opt_in():
     assert isinstance(pipeline, PipelineConfig)
     assert pipeline.model_type == "minimax_h3_disaggregated"
 
+
 def test_wan_eg_preserves_fused_denoise_decode_role():
     pipeline = OMNI_PIPELINES["wan2_2_eg"]
 

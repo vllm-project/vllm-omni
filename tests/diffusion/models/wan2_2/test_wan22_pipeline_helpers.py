@@ -316,7 +316,9 @@ def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionSt
 
     prompt_embeds, negative_prompt_embeds = pipeline.run_stage(DiffusionRequestBatch(requests=[request]))
 
-    assert prompt_embeds.shape == (1, 4, 8)
+    # Per-request payloads are unbatched; the batch dim is added by the
+    # stack-based prompt collation in ``forward``.
+    assert prompt_embeds.shape == (4, 8)
     torch.testing.assert_close(negative_prompt_embeds, torch.zeros_like(prompt_embeds))
 
 

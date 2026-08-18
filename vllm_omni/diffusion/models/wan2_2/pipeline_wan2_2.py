@@ -635,8 +635,8 @@ class Wan22Pipeline(
             text_dim = self.transformer_config.text_dim
             for req in batch.requests:
                 prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+                # Per-request payloads are stacked into the batch dim downstream.
                 prompt["prompt_embeds"] = torch.zeros(
-                    1,
                     sequence_length,
                     text_dim,
                     device=self.device,
@@ -651,6 +651,7 @@ class Wan22Pipeline(
             latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
             for req in batch.requests:
                 prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+                # ``decode_batch`` concatenates per-request BCTHW latents.
                 prompt["latents"] = torch.zeros(
                     1,
                     self.vae.config.z_dim,
@@ -685,8 +686,9 @@ class Wan22Pipeline(
         latents_per_request: list[torch.Tensor] = []
         output_types: list[str] = []
         for req in batch.requests:
-            prompt = req.prompt
-            latents = prompt.get("latents") if isinstance(prompt, dict) else None
+            # Connector-delivered payloads land under ``additional_information``,
+            # which ``get_prompt_field`` resolves alongside top-level keys.
+            latents = DiffusionRequestBatch.get_prompt_field(req.prompt, "latents")
             if not isinstance(latents, torch.Tensor):
                 raise ValueError("Wan decode stage requires a tensor 'latents' payload.")
             if latents.ndim != 5:
@@ -760,21 +762,26 @@ class Wan22Pipeline(
         guidance_scale_2 = first_sampling.guidance_scale_2
         do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
 
+        # ``num_videos_per_prompt`` stays 1 here: the downstream diffusion stage
+        # re-expands the embeddings via ``repeat_interleave`` once it collates
+        # the batch, so expanding here would duplicate the fan-out.
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompts,
             negative_prompt=negative_prompts,
             do_classifier_free_guidance=do_classifier_free_guidance,
-            num_videos_per_prompt=first_sampling.num_outputs_per_prompt or 1,
+            num_videos_per_prompt=1,
             max_sequence_length=first_sampling.max_sequence_length or 512,
             device=device,
             dtype=dtype,
         )
 
+        # Emit unbatched ``(sequence_length, text_dim)`` tensors: the consuming
+        # stage stacks the per-request payloads back into the batch dimension.
         outputs: list[DiffusionOutput] = []
         for idx in range(batch.num_reqs):
-            custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[idx : idx + 1]}
+            custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[idx]}
             if negative_prompt_embeds is not None:
-                custom_output["negative_prompt_embeds"] = negative_prompt_embeds[idx : idx + 1]
+                custom_output["negative_prompt_embeds"] = negative_prompt_embeds[idx]
             outputs.append(DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True))
         return outputs
 
@@ -802,19 +809,21 @@ class Wan22Pipeline(
         guidance_scale_2 = req.sampling_params.guidance_scale_2
         do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
 
+        # See ``encode_batch``: the fan-out to ``num_outputs_per_prompt`` belongs
+        # to the downstream diffusion stage.
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
             do_classifier_free_guidance=do_classifier_free_guidance,
-            num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+            num_videos_per_prompt=1,
             max_sequence_length=req.sampling_params.max_sequence_length or 512,
             device=device,
             dtype=dtype,
         )
 
-        custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds}
+        custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[0]}
         if negative_prompt_embeds is not None:
-            custom_output["negative_prompt_embeds"] = negative_prompt_embeds
+            custom_output["negative_prompt_embeds"] = negative_prompt_embeds[0]
 
         # ``to_cpu`` moves the embedding tensors off-device at construction so
         # they can cross a process / connector boundary to the decode stage
