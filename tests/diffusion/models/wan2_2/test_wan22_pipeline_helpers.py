@@ -257,7 +257,8 @@ def test_wan_decode_batch_consumes_latents_with_vae_only() -> None:
     outputs = pipeline.decode_batch(DiffusionRequestBatch(requests=[request]))
 
     assert len(pipeline.vae.inputs) == 1
-    torch.testing.assert_close(outputs[0].output, latents + 1)
+    assert outputs[0].output is None
+    torch.testing.assert_close(outputs[0].media.video.tensor, latents + 1)
 
 
 def test_wan_decode_batch_fuses_requests_and_splits_outputs() -> None:
@@ -288,8 +289,10 @@ def test_wan_decode_batch_fuses_requests_and_splits_outputs() -> None:
 
     assert len(pipeline.vae.inputs) == 1
     assert pipeline.vae.inputs[0].shape == (3, 2, 1, 1, 1)
-    torch.testing.assert_close(outputs[0].output, first + 1)
-    torch.testing.assert_close(outputs[1].output, second + 1)
+    assert outputs[0].output is None
+    assert outputs[1].output is None
+    torch.testing.assert_close(outputs[0].media.video.tensor, first + 1)
+    torch.testing.assert_close(outputs[1].media.video.tensor, second + 1)
 
 
 def test_wan_decode_batch_requires_latent_payload() -> None:
@@ -325,7 +328,9 @@ def test_wan_denoise_dummy_run_synthesizes_prompt_embeds(stage_role: DiffusionSt
 
     prompt_embeds, negative_prompt_embeds = pipeline.run_stage(DiffusionRequestBatch(requests=[request]))
 
-    assert prompt_embeds.shape == (1, 4, 8)
+    # Per-request payloads are unbatched; the batch dim is added by the
+    # stack-based prompt collation in ``forward``.
+    assert prompt_embeds.shape == (4, 8)
     torch.testing.assert_close(negative_prompt_embeds, torch.zeros_like(prompt_embeds))
 
 
