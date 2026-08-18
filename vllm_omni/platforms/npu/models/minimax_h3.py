@@ -28,10 +28,10 @@ def _apply_rotary_pos_emb_npu(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Qwen3-VL text RoPE with fused BNSD rotary multiplication."""
+    """Apply Qwen3-VL text RoPE with fused BSND rotary multiplication."""
     return (
-        npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim=1),
-        npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim=1),
+        npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim=2),
+        npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim=2),
     )
 
 
