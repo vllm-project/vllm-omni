@@ -239,6 +239,19 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
                 async def close(self):
                     return None
 
+            class MockTokenizer:
+                vocab_size = 256
+                all_special_ids = []
+
+                def num_special_tokens_to_add(self, *args, **kwargs):
+                    return 0
+
+                def decode(self, token_ids, *args, **kwargs):
+                    return " ".join(str(token_id) for token_id in token_ids)
+
+                def encode(self, text, *args, **kwargs):
+                    return [int(token_id) for token_id in text.split()]
+
             # Patch globally so modules loaded after this also see the mock
             import aiohttp
             aiohttp.ClientSession = MockClientSession
@@ -248,6 +261,11 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
             import vllm_omni.benchmarks.patch.patch as patch_mod
             patch_mod.aiohttp.ClientSession = MockClientSession
             patch_mod.aiohttp.TCPConnector = lambda *args, **kwargs: object()
+
+            # This test exercises CLI and HTTP routing, not model tokenization.
+            # Keep its subprocess independent of hub access and model caches.
+            import vllm.benchmarks.serve as benchmark_serve
+            benchmark_serve.get_tokenizer = lambda *args, **kwargs: MockTokenizer()
 
             calls_file = os.environ.get("VLLM_OMNI_TEST_POST_CALLS_FILE")
 
@@ -265,6 +283,9 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
     env["VLLM_OMNI_TEST_POST_CALLS_FILE"] = str(calls_path)
+    env["HF_HOME"] = str(tmp_path / "hf-cache")
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
 
     cmd = [
         "vllm",
