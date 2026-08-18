@@ -851,6 +851,14 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
+    # These mirror the structured stage cache/scheduler config until all
+    # diffusion runtime construction consumes VllmOmniConfig directly.
+    kv_cache_memory_bytes: int | None = None
+    gpu_memory_utilization: float = 0.9
+    max_num_batched_tokens: int | None = None
+    max_model_len: int | None = None
+
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
@@ -936,6 +944,14 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
+            raise ValueError("kv_cache_memory_bytes must be non-negative")
+        if not 0.0 < self.gpu_memory_utilization <= 1.0:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
+            raise ValueError("max_model_len must be positive or -1")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}
@@ -1318,6 +1334,12 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif cfg.get("type") == "pi0":
+                    # π0 (Pi-Zero) VLA — the LeRobot config.json uses ``type: "pi0"``.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
