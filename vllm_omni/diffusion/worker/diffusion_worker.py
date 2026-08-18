@@ -30,6 +30,7 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
+from vllm.utils.system_utils import decorate_logs
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import (
@@ -1307,6 +1308,7 @@ class WorkerProc:
             pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
+        decorate_logs("DiffusionWorker")
         worker_proc = None
         try:
             worker_proc = WorkerProc(
@@ -1327,6 +1329,8 @@ class WorkerProc:
             worker_proc._worker_busy_loop()
         except SystemExit:
             logger.info("Worker %d: Shutdown signal received, starting cleanup.", rank)
+            raise
+        except Exception:
             raise
         finally:
             if worker_proc is not None:

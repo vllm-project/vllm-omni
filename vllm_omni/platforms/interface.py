@@ -326,6 +326,34 @@ class OmniPlatform(Platform):
         )
 
 
+_UNSPECIFIED_ERROR_SUFFIX = (
+    " This means no acceleration hardware (CUDA/ROCm/NPU/XPU/MUSA) was detected "
+    "and vLLM-Omni fell back to UnspecifiedOmniPlatform. Check the debug log "
+    "messages above for details about why each platform was skipped. Common "
+    "causes: broken device driver (like nvidia-smi failures), missing or corrupted "
+    "pynvml/amdsmi libraries, or running on CPU-only hardware."
+)
+
+
+def _make_unsupported_stub(method_name: str):
+    """Return a classmethod that raises NotImplementedError with diagnostics."""
+
+    @classmethod
+    def stub(cls, *args, **kwargs):
+        try:
+            from vllm_omni.platforms import _platform_diagnostics  # noqa: PLC0415
+
+            extra = "\n" + _platform_diagnostics
+        except Exception:
+            extra = _UNSPECIFIED_ERROR_SUFFIX
+        msg = f"{method_name} is not implemented.{extra}"
+        raise NotImplementedError(msg)
+
+    stub.__name__ = method_name
+    stub.__qualname__ = f"UnspecifiedOmniPlatform.{method_name}"
+    return stub
+
+
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     _enum = PlatformEnum.UNSPECIFIED
@@ -338,3 +366,19 @@ class UnspecifiedOmniPlatform(OmniPlatform):
     @classmethod
     def get_device_count(cls) -> int:
         return 0
+
+
+# Attach stub methods that raise NotImplementedError with diagnostic context.
+for _name in (
+    "set_device",
+    "synchronize",
+    "get_free_memory",
+    "get_device_memory",
+    "get_device_version",
+    "get_omni_ar_worker_cls",
+    "get_omni_generation_worker_cls",
+    "get_default_stage_config_path",
+    "get_diffusion_attn_backend_cls",
+    "supports_torch_inductor",
+):
+    setattr(UnspecifiedOmniPlatform, _name, _make_unsupported_stub(_name))
