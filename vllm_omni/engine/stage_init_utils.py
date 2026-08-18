@@ -871,6 +871,20 @@ def _project_omni_stage_engine_args(
     return engine_args
 
 
+def _sampling_extra_args_keys(default_sampling_params: Any) -> tuple[str, ...]:
+    """Key names of a stage's default sampling ``extra_args``, sorted.
+
+    Only the keys travel into the engine config: engine-core code needs to know
+    which request-shaping conventions a stage uses (e.g. CFG request pairing)
+    before any request exists, while the values stay a serving-layer concern.
+    """
+    extra_args = _to_dict(default_sampling_params or {}).get("extra_args") or {}
+    try:
+        return tuple(sorted(str(key) for key in extra_args))
+    except TypeError:
+        return ()
+
+
 def _finalize_engine_args_dict(
     engine_args_dict: dict[str, Any],
     *,
@@ -880,6 +894,7 @@ def _finalize_engine_args_dict(
     stage_connector_spec: dict[str, Any] | None,
     cli_tokenizer: str | None,
     has_sampling_extra_args: bool,
+    sampling_extra_args_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
     pipeline_model_root = model
@@ -960,6 +975,7 @@ def _finalize_engine_args_dict(
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
     engine_args_dict["has_sampling_extra_args"] = has_sampling_extra_args
+    engine_args_dict["sampling_extra_args_keys"] = sampling_extra_args_keys
 
     # TODO: Remove this after the performance regression is fixed
     # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
@@ -990,6 +1006,7 @@ def build_legacy_engine_args_dict(
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=bool(default_sp.get("extra_args")),
+        sampling_extra_args_keys=_sampling_extra_args_keys(default_sp),
     )
 
 
@@ -1036,6 +1053,7 @@ def build_engine_args_dict_from_omni_stage_config(
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
+        sampling_extra_args_keys=_sampling_extra_args_keys(stage_config.model_config.default_sampling_params),
     )
 
 
@@ -1445,24 +1463,45 @@ def initialize_diffusion_stage(
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
-def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
-    """Install the Audex CFG scheduler patches for CFG-configured engines.
+def _stage_declares_cfg_pairs(model_config: Any) -> bool:
+    """Whether this stage submits classifier-free-guidance request pairs.
+
+    Two independent declarations, because a model may own either side of the
+    mechanism without the other:
+
+    * a CFG logits processor is configured (blending implies pairing), or
+    * the stage's default sampling ``extra_args`` carry ``cfg_role``, which is
+      how a model declares paired requests without owning a logits processor.
+      Only the *key set* survives into the engine config (see
+      ``sampling_extra_args_keys``); the values stay in the serving layer.
+    """
+    processors = getattr(model_config, "logits_processors", None) or []
+    if any("CFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+        return True
+    return "cfg_role" in (getattr(model_config, "sampling_extra_args_keys", None) or ())
+
+
+def maybe_apply_cfg_scheduler_patches(vllm_config: Any) -> None:
+    """Install the CFG pairing scheduler patches for CFG-configured engines.
 
     Must run in the engine-core process BEFORE ``Scheduler`` is constructed:
     the patch wraps ``Scheduler.__init__`` to add the pair registry, so a
-    scheduler built earlier would never become pair-aware. Gated on the
-    engine's ``logits_processors`` so non-CFG stages stay untouched.
+    scheduler built earlier would never become pair-aware. Gated so non-CFG
+    stages stay untouched.
     """
     model_config = getattr(vllm_config, "model_config", None)
-    processors = getattr(model_config, "logits_processors", None) or []
-    if not any("AudexCFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+    if model_config is None or not _stage_declares_cfg_pairs(model_config):
         return
 
-    from vllm_omni.model_executor.models.audex.cfg import apply_cfg_patches
+    from vllm_omni.model_executor.models.common.cfg_pairing import apply_cfg_patches
 
     apply_cfg_patches()
 
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if not getattr(Scheduler.schedule, "_audex_cfg_patched", False):
-        raise RuntimeError("Audex CFG scheduler patches failed to install before Scheduler construction")
+    if not getattr(Scheduler.schedule, "_cfg_pairing_patched", False):
+        raise RuntimeError("CFG pairing scheduler patches failed to install before Scheduler construction")
+
+
+# Name kept for callers written against the Audex-only gate.
+maybe_apply_audex_cfg_patches = maybe_apply_cfg_scheduler_patches

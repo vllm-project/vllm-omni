@@ -130,6 +130,21 @@ class TestCreateDefaultDiffusion:
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
+    def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            kv_cache_memory_bytes=4096,
+            gpu_memory_utilization=0.75,
+            max_num_batched_tokens=2048,
+            max_model_len=4096,
+        )
+
+        assert od.kv_cache_memory_bytes == 4096
+        assert od.gpu_memory_utilization == 0.75
+        assert od.max_num_batched_tokens == 2048
+        assert od.max_model_len == 4096
+
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(model="Qwen/Qwen-Image-Edit-2511", model_class_name="QwenImageEditPlusPipeline")
