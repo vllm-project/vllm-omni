@@ -27,7 +27,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.omnivoice import omnivoice_generator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
     OmniVoiceAttention,
     OmniVoiceGenerator,
@@ -59,17 +58,13 @@ def _tiny_config() -> OmniVoiceConfig:
     )
 
 
-def _inputs(dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _inputs(dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hidden = torch.randn(2, 6, 32, device=device, dtype=dtype)
     bool_mask = torch.ones(2, 1, 6, 6, dtype=torch.bool, device=device)
     bool_mask[:, :, :, 4:] = False
-    return hidden, bool_mask
-
-
-@pytest.fixture
-def torch_norm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route RMSNorm through its PyTorch branch; Triton cannot take CPU tensors."""
-    monkeypatch.setattr(omnivoice_generator, "_TRITON_AVAILABLE", False)
+    rope_table = torch.zeros(6, 8, device=device, dtype=dtype)
+    rope_table[:, :4] = 1.0  # cos = 1, sin = 0: no rotation, so the test is about the mask
+    return hidden, bool_mask, rope_table
 
 
 # --------------------------------------------------------------------------
@@ -113,12 +108,12 @@ def test_generator_model_dtype_tracks_its_weights(dtype: torch.dtype) -> None:
 @cpu_test
 @pytest.mark.cpu
 @pytest.mark.parametrize("dtype", HALF_DTYPES)
-def test_attention_accepts_a_model_dtype_mask(dtype: torch.dtype, torch_norm: None) -> None:
+def test_attention_accepts_a_model_dtype_mask(dtype: torch.dtype) -> None:
     attn = OmniVoiceAttention(_tiny_config()).to(dtype).eval()
-    hidden, bool_mask = _inputs(dtype, torch.device("cpu"))
+    hidden, bool_mask, rope_table = _inputs(dtype, torch.device("cpu"))
 
     with torch.inference_mode():
-        out = attn(hidden, attention_mask=_additive_float_mask(bool_mask, dtype))
+        out = attn(hidden, rope_table, attention_mask=_additive_float_mask(bool_mask, dtype))
 
     assert out.shape == hidden.shape
     assert out.dtype == dtype
@@ -135,10 +130,10 @@ def test_attention_accepts_a_model_dtype_mask(dtype: torch.dtype, torch_norm: No
 def test_float32_mask_is_what_broke_half_precision(dtype: torch.dtype) -> None:
     """Pin the original failure so a float32 default cannot come back unnoticed."""
     attn = OmniVoiceAttention(_tiny_config()).to(device="cuda:0", dtype=dtype).eval()
-    hidden, bool_mask = _inputs(dtype, torch.device("cuda:0"))
+    hidden, bool_mask, rope_table = _inputs(dtype, torch.device("cuda:0"))
 
     with pytest.raises(RuntimeError, match=r"(invalid dtype for bias|attn_mask)"), torch.inference_mode():
-        attn(hidden, attention_mask=_additive_float_mask(bool_mask, torch.float32))
+        attn(hidden, rope_table, attention_mask=_additive_float_mask(bool_mask, torch.float32))
 
 
 @cuda_test
@@ -146,10 +141,10 @@ def test_float32_mask_is_what_broke_half_precision(dtype: torch.dtype) -> None:
 def test_real_path_forward_runs_in_half_precision(dtype: torch.dtype) -> None:
     """The regression, on the production path with the Triton norm kernels live."""
     attn = OmniVoiceAttention(_tiny_config()).to(device="cuda:0", dtype=dtype).eval()
-    hidden, bool_mask = _inputs(dtype, torch.device("cuda:0"))
+    hidden, bool_mask, rope_table = _inputs(dtype, torch.device("cuda:0"))
 
     with torch.inference_mode():
-        out = attn(hidden, attention_mask=_additive_float_mask(bool_mask, dtype))
+        out = attn(hidden, rope_table, attention_mask=_additive_float_mask(bool_mask, dtype))
 
     assert out.dtype == dtype
     assert torch.isfinite(out).all()
