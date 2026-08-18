@@ -573,6 +573,11 @@ def resolve_model_class_name(
 
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
+    if model_type == "sensenova" or "OmniSenseNovaForConditionalGeneration" in architectures:
+        # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json carries no
+        # model_type/architectures (metadata-only keys), so this mapping is
+        # what resolves the diffusion stage to SenseNovaPipeline.
+        return "SenseNovaPipeline"
     if (
         model_type == "lance"
         or "LancePipeline" in architectures
@@ -1267,6 +1272,14 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "sensenova" or "OmniSenseNovaForConditionalGeneration" in architectures:
+                    # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json
+                    # carries no model_type/architectures (metadata-only keys),
+                    # so this branch is what resolves the diffusion stage to
+                    # SenseNovaPipeline.
+                    self.model_class_name = "SenseNovaPipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif (
                     model_type == "lance"
                     or "LancePipeline" in architectures
@@ -1327,6 +1340,14 @@ class OmniDiffusionConfig:
                         or DiffusionModelRegistry._try_load_model_cls(architecture) is not None
                     ):
                         self.model_class_name = architecture
+                elif self.model_class_name is not None:
+                    # Configs that carry no model_type/architectures (e.g.
+                    # SenseNova-Vision-7B-MoT, whose config.json is metadata-only)
+                    # cannot self-describe their pipeline. Honor an explicit
+                    # model_class_name already resolved by the deploy config or
+                    # pipeline registry instead of raising.
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 else:
                     raise
 

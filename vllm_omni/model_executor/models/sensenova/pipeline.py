@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""SenseNova-Vision-7B-MoT pipeline topologies.
+
+Two-stage (default):
+  Stage 0: Thinker — multimodal understanding + text generation (AR)
+  Stage 1: DiT     — diffusion image generation
+
+This mirrors the BAGEL two-stage pipeline but is registered under
+``model_type="sensenova"`` and uses the SenseNova model architecture string.
+The stage-transition functions are reused verbatim from the BAGEL processor
+module (``expand_cfg_prompts`` / ``collect_cfg_kv_caches``).
+"""
+
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
+
+_PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
+
+SENSENOVA_PIPELINE = PipelineConfig(
+    model_type="sensenova",
+    default_deploy_config_name="sensenova.yaml",
+    model_arch="OmniSenseNovaForConditionalGeneration",
+    hf_architectures=(),
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            model_arch="OmniSenseNovaForConditionalGeneration",
+            engine_output_type="text",
+            prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
+            omni_kv_config={
+                "need_send_cache": True,
+                "kv_transfer_criteria": {"type": "prefill_finished"},
+            },
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="image",
+            cfg_kv_collect_func=f"{_PROC}.collect_cfg_kv_caches",
+            omni_kv_config={"need_recv_cache": True},
+        ),
+    ),
+)
