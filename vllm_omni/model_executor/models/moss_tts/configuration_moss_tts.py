@@ -244,6 +244,9 @@ class MossTTSLocalConfig(PretrainedConfig):
     a nested GPT2-style config (``gpt2_config``) describing the single-layer
     local depth transformer that decodes the ``n_vq`` audio codebooks per frame
     (see ``modeling_moss_tts_local_depth.py``).
+
+    ``use_static_local_kv_cache`` follows the checkpoint's static-cache opt-in
+    name. Configs that omit it keep vLLM's existing growing-prefix path.
     """
 
     model_type = "moss_tts_local"
@@ -265,6 +268,7 @@ class MossTTSLocalConfig(PretrainedConfig):
         sampling_rate: int = 48000,
         audio_tokenizer_name_or_path: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2",
         local_text_head_mode: str = "binary",
+        use_static_local_kv_cache: bool = False,
         **kwargs: object,
     ) -> None:
         if qwen3_config is None:
@@ -298,6 +302,7 @@ class MossTTSLocalConfig(PretrainedConfig):
         self.sampling_rate = sampling_rate
         self.audio_tokenizer_name_or_path = audio_tokenizer_name_or_path
         self.local_text_head_mode = local_text_head_mode
+        self.use_static_local_kv_cache = bool(use_static_local_kv_cache)
 
     def get_text_config(self, **_: object) -> Qwen3Config:
         return self.qwen3_config
