@@ -22,6 +22,24 @@ def test_independent_group_capability_is_limited_to_h3_adapters():
     assert not supports_independent_vae_process_group("WanPipeline")
 
 
+def test_capability_is_declared_by_the_pipeline_class():
+    """The answer comes from the pipeline, not from a list kept in this module.
+
+    A model opts in by declaring the attribute, so a pipeline that never heard
+    of the feature stays off, and the two H3 registry names resolve to the one
+    class that declares it.
+    """
+    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+    h3_cls = DiffusionModelRegistry._try_load_model_cls("MiniMaxH3Pipeline")
+    assert h3_cls.supports_independent_vae_process_group is True
+    assert DiffusionModelRegistry._try_load_model_cls("MiniMaxH3ModularPipeline") is h3_cls
+
+
+def test_unregistered_model_names_do_not_claim_the_capability():
+    assert not supports_independent_vae_process_group("NotARegisteredPipeline")
+
+
 def test_h3_requires_dedicated_group_only_when_smaller_than_dit_group():
     assert not requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 1)
     assert requires_independent_vae_process_group("MiniMaxH3Pipeline", 4, 2)

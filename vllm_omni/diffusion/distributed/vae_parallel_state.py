@@ -12,13 +12,23 @@ logger = init_logger(__name__)
 
 _VAE_GROUP: dist.ProcessGroup | None = None
 _VAE_GROUP_RANKS: list[int] | None = None
-_INDEPENDENT_VAE_GROUP_MODELS = frozenset({"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
 
 
 def supports_independent_vae_process_group(model_class_name: str) -> bool:
-    """Return whether a pipeline can bind its VAE after construction."""
+    """Return whether a pipeline can bind its VAE after construction.
 
-    return model_class_name in _INDEPENDENT_VAE_GROUP_MODELS
+    Read off the pipeline class rather than a name allowlist, matching how
+    ``io_support`` resolves ``support_audio_output`` and friends. The registry
+    check in ``registry.py`` uses ``isinstance(model.vae, DistributedVaeMixin)``,
+    which is unavailable here: process groups must exist before the model is
+    loaded, so only the class is in hand at this point.
+    """
+
+    # Imported lazily: registry imports this module.
+    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    return model_cls is not None and bool(getattr(model_cls, "supports_independent_vae_process_group", False))
 
 
 def requires_independent_vae_process_group(model_class_name: str, dit_group_size: int, group_size: int) -> bool:

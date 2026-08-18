@@ -539,6 +539,12 @@ class MiniMaxH3Pipeline(
     # TODO(offload): Re-enable after the generic rank-local mmap path can run
     # this model's grouped-QKV reorder and fused-MLP packing before TP sharding.
     # Do not bypass the regular loader until that equivalence is tested.
+
+    # The checkpoint ships its own ``parallel`` module whose global state the
+    # VAE adapter rebinds in ``set_parallel_size``, so this pipeline can decode
+    # on a process group that is not the DiT group. Process groups are created
+    # before the model is loaded, so this has to be readable off the class.
+    supports_independent_vae_process_group: ClassVar[bool] = True
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
         "encode_prompt",
