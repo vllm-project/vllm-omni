@@ -3080,12 +3080,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 model_type = tts_params.get("task_type", ["unknown"])[0]
             else:
                 model_type = "generic"
-        logger.info(
-            "TTS speech request %s: text=%r, model=%s",
-            request_id,
-            request.input[:50] + "..." if len(request.input) > 50 else request.input,
-            model_type,
-        )
+        logger.info("TTS speech request %s: model=%s", request_id, model_type)
+        _rl = getattr(self, "request_logger", None)
+        if _rl:
+            base_len = len(f"TTS speech request {request_id}: text=")
+            raw_max = getattr(_rl, "max_log_len", None)
+            cap = raw_max if isinstance(raw_max, int) else 200
+            text = request.input[: max(cap - base_len, 0)]
+            logger.debug("TTS speech request %s: text=%r", request_id, text)
 
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
@@ -3393,11 +3395,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["instruct"] = request.instructions
 
             logger.info(
-                "Diffusion TTS speech request %s: text=%r, voice_clone=%s",
+                "Diffusion TTS speech request %s: voice_clone=%s",
                 request_id,
-                request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 "ref_audio" in prompt,
             )
+            _rl = getattr(self, "request_logger", None)
+            if _rl:
+                base_len = len(f"Diffusion TTS speech request {request_id}: text=")
+                raw_max = getattr(_rl, "max_log_len", None)
+                cap = raw_max if isinstance(raw_max, int) else 200
+                text = request.input[: max(cap - base_len, 0)]
+                logger.debug("Diffusion TTS speech request %s: text=%r", request_id, text)
             if request.extra_params is not None and not isinstance(request.extra_params, dict):
                 raise ValueError("extra_params must be a JSON object/dict.")
             extra = dict(request.extra_params or {})
