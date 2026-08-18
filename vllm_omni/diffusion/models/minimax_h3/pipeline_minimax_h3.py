@@ -27,7 +27,8 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_dit_group,
     init_world_group,
@@ -85,7 +86,11 @@ from .presentation import (
     minimax_h3_ref2va_video_presentation,
     minimax_h3_text_only_ids,
 )
-from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .quality_policy import (
+    MINIMAX_H3_GENERIC_CACHE_KEY,
+    MiniMaxH3QualityPolicy,
+    minimax_h3_teacache_hook_configs,
+)
 from .reference_video import (
     load_audio_file,
     load_video_audio,
@@ -550,9 +555,14 @@ class MiniMaxH3Pipeline(
         "decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    num_inference_steps: ClassVar[int] = 50
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+
+    def _teacache_hook_configs(self, config: DiffusionCacheConfig) -> dict[str, TeaCacheConfig]:
+        """Return model-owned TeaCache policy keyed by DiT component path."""
+        return minimax_h3_teacache_hook_configs(self.partition, config)
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -1810,7 +1820,7 @@ class MiniMaxH3Pipeline(
         sigma_schedule = self._base_schedule_for_task(task)
         if sigma_schedule is None:
             base_schedule = None
-            num_steps = int(sampling.num_inference_steps or 50)
+            num_steps = int(sampling.num_inference_steps or self.num_inference_steps)
         else:
             # The schedule lists sigma boundaries; the denoise loop runs one
             # step per interval, and that count is what requests and Cache-DiT

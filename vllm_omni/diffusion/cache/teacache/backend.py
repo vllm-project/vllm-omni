@@ -8,6 +8,7 @@ This module provides the TeaCache backend that implements the CacheBackend
 interface using the hooks-based TeaCache system.
 """
 
+from operator import attrgetter
 from typing import Any
 
 from vllm.logger import init_logger
@@ -73,34 +74,6 @@ def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) ->
     )
 
 
-def enable_minimax_h3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
-    """Enable TeaCache for the calibrated MiniMax-H3 FL2VA partition."""
-    partition = getattr(pipeline, "partition", None)
-    if partition == "ref2va":
-        raise ValueError(
-            "TeaCache only supports the MiniMax-H3 FL2VA partition; Ref2VA TeaCache has not been calibrated"
-        )
-    if partition not in {"fl2va", "combined"}:
-        raise ValueError(f"Unsupported MiniMax-H3 partition for TeaCache: {partition!r}")
-
-    teacache_config = TeaCacheConfig(
-        transformer_type="MiniMaxH3DiTModel",
-        rel_l1_thresh=config.rel_l1_thresh,
-        coefficients=config.coefficients,
-    )
-    apply_teacache_hook(pipeline.transformer, teacache_config)
-
-    if partition == "combined":
-        logger.warning(
-            "TeaCache is enabled only for MiniMax-H3 FL2VA; "
-            "Ref2VA requests on this combined pipeline will run without TeaCache"
-        )
-    logger.info(
-        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
-        "transformer_class=MiniMaxH3DiTModel, partition=FL2VA"
-    )
-
-
 def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Flux2 Klein model.
@@ -124,7 +97,6 @@ CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
-    "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }
 
@@ -161,11 +133,28 @@ class TeaCacheBackend(CacheBackend):
                      - transformer: pipeline.transformer
                      - transformer_type: pipeline.transformer.__class__.__name__
         """
-        # Helper to get pipeline class name
         pipeline_type = pipeline.__class__.__name__
+        config_factory = getattr(type(pipeline), "_teacache_hook_configs", None)
 
-        # Check for pipeline-level custom enablers
-        if pipeline_type in CUSTOM_TEACACHE_ENABLERS:
+        if callable(config_factory):
+            hook_configs = config_factory(pipeline, self.config)
+            if not hook_configs:
+                raise ValueError(f"{pipeline_type} declared no TeaCache hook targets")
+            for target_path, teacache_config in hook_configs.items():
+                if not isinstance(teacache_config, TeaCacheConfig):
+                    raise TypeError(
+                        f"{pipeline_type} TeaCache config for {target_path!r} "
+                        f"must be TeaCacheConfig, got {type(teacache_config).__name__}"
+                    )
+                transformer = attrgetter(target_path)(pipeline)
+                apply_teacache_hook(transformer, teacache_config)
+                logger.info(
+                    "TeaCache applied with rel_l1_thresh=%s, transformer_class=%s, component=%s",
+                    teacache_config.rel_l1_thresh,
+                    teacache_config.transformer_type,
+                    target_path,
+                )
+        elif pipeline_type in CUSTOM_TEACACHE_ENABLERS:
             logger.info(f"Using custom TeaCache enabler for model: {pipeline_type}")
             CUSTOM_TEACACHE_ENABLERS[pipeline_type](pipeline, self.config)
         else:
@@ -223,20 +212,41 @@ class TeaCacheBackend(CacheBackend):
                 logger.debug(f"TeaCache state refreshed for HunyuanImage3 (num_inference_steps={num_inference_steps})")
             return
 
-        # Extract transformer from pipeline
-        transformer = pipeline.transformer
-        if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
-            transformer = pipeline.denoising_transformer
+        target_names = vars(pipeline).get("_dit_modules")
+        if target_names is None:
+            target_names = getattr(type(pipeline), "_dit_modules", None)
+        if target_names:
+            targets = [(name, attrgetter(name)(pipeline)) for name in target_names]
+        else:
+            transformer = pipeline.transformer
+            target_name = "transformer"
+            if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
+                transformer = pipeline.denoising_transformer
+                target_name = "denoising_transformer"
+            targets = [(target_name, transformer)]
 
-        if hasattr(transformer, "_hook_registry"):
+        for target_name, transformer in targets:
+            if not hasattr(transformer, "_hook_registry"):
+                if verbose:
+                    logger.warning(f"Transformer {target_name} has no hook registry, TeaCache may not be applied")
+                continue
+
             hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
-            if hook is not None:
+            if hook is None:
+                if verbose:
+                    logger.warning(f"TeaCache hook not found on {target_name}, nothing to refresh")
+            else:
+                calibration_matches = hook.prepare_for_request(num_inference_steps)
+                if not calibration_matches and verbose:
+                    logger.warning(
+                        "TeaCache on %s is calibrated for %d inference steps; "
+                        "got %d, so this request will run uncached",
+                        target_name,
+                        hook.config.calibrated_num_inference_steps,
+                        num_inference_steps,
+                    )
                 transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
                 if verbose:
-                    logger.debug(f"TeaCache state refreshed (num_inference_steps={num_inference_steps})")
-            else:
-                if verbose:
-                    logger.warning("TeaCache hook not found, nothing to refresh")
-        else:
-            if verbose:
-                logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+                    logger.debug(
+                        f"TeaCache state refreshed for {target_name} (num_inference_steps={num_inference_steps})"
+                    )

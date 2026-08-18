@@ -454,6 +454,28 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert cache_backend.refresh_calls == [(runner.pipeline, 4, True)]
 
 
+def test_refresh_cache_uses_pipeline_default_when_steps_are_omitted():
+    class _EnabledCacheBackend:
+        def __init__(self):
+            self.refresh_calls = []
+
+        def is_enabled(self):
+            return True
+
+        def refresh(self, pipeline, num_inference_steps, verbose=True):
+            self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="tea_cache")
+    runner.pipeline.num_inference_steps = 50
+    req = _make_request()
+    req.sampling_params.num_inference_steps = None
+
+    runner._refresh_cache_for_requests([req], od_config=runner.od_config)
+
+    assert cache_backend.refresh_calls == [(runner.pipeline, 50, True)]
+
+
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("cache_dit_enabled", [False, True])

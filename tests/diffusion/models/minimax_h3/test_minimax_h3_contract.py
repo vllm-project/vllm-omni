@@ -99,6 +99,7 @@ def test_pipeline_import_registry_and_component_discovery():
     assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
     assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
+    assert MiniMaxH3Pipeline.num_inference_steps == 50
 
 
 def _write_partition_index(path, *, partition, tasks):

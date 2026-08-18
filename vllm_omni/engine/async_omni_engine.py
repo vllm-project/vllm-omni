@@ -855,9 +855,7 @@ class AsyncOmniEngine:
                 "scm_steps_policy": "dynamic",
             }
         if cache_backend == "tea_cache":
-            return {
-                "rel_l1_thresh": 0.2,
-            }
+            return {}
         if cache_backend == "mag_cache":
             return {
                 "mag_threshold": 0.24,

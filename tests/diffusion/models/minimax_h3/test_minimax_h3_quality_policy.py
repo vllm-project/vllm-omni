@@ -192,6 +192,69 @@ def test_model_policy_owns_request_cache_target(cache_backend, quality, expected
             assert plan.cache_dit.cache_config is config.cache_config
 
 
+@pytest.mark.parametrize(
+    ("partition", "expected"),
+    [
+        ("fl2va", [("transformer", 0.17, None, 0, None)]),
+        ("ref2va", [("transformer", 0.295, 5, 35, 50)]),
+        (
+            "combined",
+            [
+                ("transformer", 0.17, None, 0, None),
+                ("transformers_ref", 0.295, 5, 35, 50),
+            ],
+        ),
+    ],
+)
+def test_h3_owns_teacache_partition_calibration(partition, expected):
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
+        minimax_h3_teacache_hook_configs,
+    )
+
+    configs = minimax_h3_teacache_hook_configs(partition, DiffusionCacheConfig())
+
+    actual = [
+        (
+            path,
+            config.rel_l1_thresh,
+            config.max_cached_steps,
+            config.min_compute_steps,
+            config.calibrated_num_inference_steps,
+        )
+        for path, config in configs.items()
+    ]
+    assert actual == expected
+    assert all(config.transformer_type == "MiniMaxH3DiTModel" for config in configs.values())
+    assert len({id(config) for config in configs.values()}) == len(configs)
+
+
+def test_h3_teacache_user_overrides_apply_to_every_partition():
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
+        minimax_h3_teacache_hook_configs,
+    )
+
+    coefficients = [1.0, 0.5, 0.25, 0.125, 0.0]
+    configs = minimax_h3_teacache_hook_configs(
+        "combined",
+        DiffusionCacheConfig(
+            rel_l1_thresh=0.4,
+            coefficients=coefficients,
+        ),
+    )
+
+    assert all(config.rel_l1_thresh == 0.4 for config in configs.values())
+    assert all(config.coefficients is coefficients for config in configs.values())
+
+
+def test_h3_teacache_rejects_unknown_partition():
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
+        minimax_h3_teacache_hook_configs,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported MiniMax-H3 partition"):
+        minimax_h3_teacache_hook_configs("unknown", DiffusionCacheConfig())
+
+
 def test_h3_adopts_runner_installed_cache_dit_backend():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 

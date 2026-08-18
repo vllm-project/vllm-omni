@@ -14,6 +14,10 @@ from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_teacache_default_config_defers_to_model_profile():
+    assert AsyncOmniEngine._get_default_cache_config("tea_cache") == {}
+
+
 def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
     return EngineCoreRequest(
         request_id=request_id,

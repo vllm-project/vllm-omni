@@ -790,18 +790,40 @@ media in this repository.
 ## TeaCache acceleration
 
 TeaCache reuses DiT block residuals across denoising steps when consecutive
-timestep embeddings are similar. MiniMax-H3 TeaCache is currently calibrated
-only for the FL2VA partition. In combined serving, FL2VA requests use TeaCache
-while Ref2VA requests run uncached; Ref2VA-only serving rejects TeaCache.
+timestep embeddings are similar. MiniMax-H3 has independently calibrated
+profiles for FL2VA and Ref2VA. A combined server installs a separate hook and
+request-scoped cache state on each DiT, so task switching cannot reuse residuals
+from the other checkpoint partition.
+
+Omit `cache_config` to use the calibrated defaults. FL2VA uses
+`rel_l1_thresh=0.17`. Ref2VA uses its own coefficients and
+`rel_l1_thresh=0.295`, computes the first 35 denoising calls in full, and allows
+at most five cache hits in the remaining calls. The late-step policy prevents a
+small number of early high-noise skips from changing the rest of a long-reference
+trajectory. This profile is calibrated for 50 inference steps; other step counts
+fail closed and run uncached. A 50-step request that never meets the late-step
+criterion also runs uncached.
 
 TeaCache and Cache-DiT are mutually exclusive; pick one cache backend per server.
+Changing `rel_l1_thresh` can trade quality for speed, but it does not remove the
+Ref2VA warmup or five-hit safety budget. Validate custom thresholds on both video
+and audio outputs.
 
-The model-specific default and examples use `rel_l1_thresh=0.17`, which
-provided the best conservative speed/quality balance in the validated 107-frame
-T2VA workload. Lower values
-may produce few or no cache hits, while higher values can improve performance
-at the cost of output quality. Validate the threshold on representative
-prompts and generation settings before changing it.
+### Ref2VA validation
+
+The Ref2VA profile was fitted from 15 full-compute requests: six image-only, six
+image+audio, and three video+audio cases. A same-seed single-B300 A/B used BF16,
+`CUDNN_ATTN`, a four-second request, 448x256, 107 output frames, and 50 requested
+inference steps:
+
+| Case | Cache hits | Baseline | TeaCache | Speedup | Video quality vs baseline | Audio quality |
+|---|---:|---:|---:|---:|---:|---:|
+| Image-only | 0 / 49 | 53.34 s | 53.26 s | 1.00x | SSIM 1.000 | sample-identical |
+| Video+audio | 5 / 49 | 244.19 s | 221.24 s | 1.10x | SSIM 0.9795 / PSNR 41.60 dB | 168.8 dB PSNR |
+
+Both video+audio runs peaked at 140,972 MiB; TeaCache is a compute optimization,
+not a weight-memory optimization. The image case demonstrates the conservative
+fallback: no qualifying late steps means no approximation and no speedup.
 
 ### Offline (Python API)
 
@@ -817,7 +839,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 omni = Omni(
     model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
     cache_backend="tea_cache",
-    cache_config={"rel_l1_thresh": 0.17},
     trust_remote_code=True,
     enable_cpu_offload=True,
 )
@@ -841,19 +862,20 @@ outputs = omni.generate(
 )
 ```
 
+For Ref2VA, point `model` at `${MODEL_ROOT}/Ref2VA`; combined serving selects
+the matching calibrated profile per request.
+
 ### Online serving
 
 ```bash
-vllm serve "${MODEL_ROOT}/FL2VA" \
+vllm serve "${MODEL_ROOT}/Ref2VA" \
   --omni \
   --trust-remote-code \
-  --cache-backend tea_cache \
-  --cache-config '{"rel_l1_thresh":0.17}'
+  --cache-backend tea_cache
 ```
 
 ## Known limitations
 
-- TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - H3 currently executes one generation request per diffusion batch.

@@ -11,6 +11,7 @@ from numbers import Integral
 from typing import Any
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.errors import OmniClientError
 
@@ -19,6 +20,64 @@ MINIMAX_H3_HIGH_CACHE_KEY = "minimax_h3.high"
 MINIMAX_H3_FORCE_REFRESH_STEP_HINT_ARG = "force_refresh_step_hint"
 MINIMAX_H3_FORCE_REFRESH_STEP_POLICY_ARG = "force_refresh_step_policy"
 MINIMAX_H3_FORCE_REFRESH_POLICIES = ("once", "repeat")
+
+_MINIMAX_H3_FL2VA_TEACACHE_COEFFICIENTS = [
+    2.283704065852778e03,
+    -7.775977277886368e02,
+    9.408414741359490e01,
+    -4.232669906169421e00,
+    2.173782527946167e-01,
+]
+_MINIMAX_H3_REF2VA_TEACACHE_COEFFICIENTS = [
+    2.1282372412524368e04,
+    -2.2712379331933703e03,
+    -5.8373015511205919e00,
+    6.2854270826260406e00,
+    2.5209538122600766e-01,
+]
+_MINIMAX_H3_FL2VA_TEACACHE_THRESHOLD = 0.17
+_MINIMAX_H3_REF2VA_TEACACHE_THRESHOLD = 0.295
+_MINIMAX_H3_REF2VA_TEACACHE_STEPS = 50
+_MINIMAX_H3_REF2VA_TEACACHE_MIN_COMPUTE_STEPS = 35
+_MINIMAX_H3_REF2VA_TEACACHE_MAX_CACHED_STEPS = 5
+
+
+def _minimax_h3_teacache_config(
+    config: DiffusionCacheConfig,
+    *,
+    ref2va: bool,
+) -> TeaCacheConfig:
+    coefficients = config.coefficients
+    if coefficients is None:
+        coefficients = _MINIMAX_H3_REF2VA_TEACACHE_COEFFICIENTS if ref2va else _MINIMAX_H3_FL2VA_TEACACHE_COEFFICIENTS
+    threshold = config.rel_l1_thresh
+    if threshold is None:
+        threshold = _MINIMAX_H3_REF2VA_TEACACHE_THRESHOLD if ref2va else _MINIMAX_H3_FL2VA_TEACACHE_THRESHOLD
+    return TeaCacheConfig(
+        transformer_type="MiniMaxH3DiTModel",
+        rel_l1_thresh=threshold,
+        coefficients=coefficients,
+        max_cached_steps=_MINIMAX_H3_REF2VA_TEACACHE_MAX_CACHED_STEPS if ref2va else None,
+        min_compute_steps=_MINIMAX_H3_REF2VA_TEACACHE_MIN_COMPUTE_STEPS if ref2va else 0,
+        calibrated_num_inference_steps=_MINIMAX_H3_REF2VA_TEACACHE_STEPS if ref2va else None,
+    )
+
+
+def minimax_h3_teacache_hook_configs(
+    partition: str,
+    config: DiffusionCacheConfig,
+) -> dict[str, TeaCacheConfig]:
+    """Declare TeaCache targets and calibrated policy for an H3 partition."""
+    if partition == "fl2va":
+        return {"transformer": _minimax_h3_teacache_config(config, ref2va=False)}
+    if partition == "ref2va":
+        return {"transformer": _minimax_h3_teacache_config(config, ref2va=True)}
+    if partition == "combined":
+        return {
+            "transformer": _minimax_h3_teacache_config(config, ref2va=False),
+            "transformers_ref": _minimax_h3_teacache_config(config, ref2va=True),
+        }
+    raise ValueError(f"Unsupported MiniMax-H3 partition for TeaCache: {partition!r}")
 
 
 def _high_quality_cache_config() -> DiffusionCacheConfig:
@@ -175,4 +234,5 @@ __all__ = [
     "MINIMAX_H3_HIGH_CACHE_KEY",
     "MiniMaxH3QualityPlan",
     "MiniMaxH3QualityPolicy",
+    "minimax_h3_teacache_hook_configs",
 ]
