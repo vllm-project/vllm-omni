@@ -371,3 +371,106 @@ def test_build_add_request_message_releases_preselected_replica_on_preprocess_er
         )
 
     assert stage_pool.get_bound_replica_id("req-error") is None
+
+
+def test_cfg_companion_build_failure_admits_nothing(mocker: MockerFixture):
+    """A guided request is all-or-nothing.
+
+    Admitting the parent before its companion is built leaves an orphan: a
+    model whose guidance is mandatory never completes the pair, so the request
+    holds scheduler and KV capacity for the scheduler's whole hold budget and
+    then produces no audio. The build has to raise before anything is enqueued.
+    """
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = mocker.Mock(side_effect=ValueError("cannot build the null twin"))
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.request_queue = mocker.Mock()
+
+    with pytest.raises(ValueError, match="null twin"):
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_companion_processing_failure_admits_nothing(mocker: MockerFixture):
+    """The same holds when expansion succeeds but input processing does not."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = RuntimeError("tokenizer rejected the prompt")
+    engine.request_queue = mocker.Mock()
+
+    with pytest.raises(RuntimeError, match="tokenizer rejected"):
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerFixture):
+    """Construction and admission are separate steps."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    companions = engine._build_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    assert len(companions) == 1
+    assert companions[0].companion_id == "req__cfg_text"
+    assert companions[0].parent_id == "req"
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):
+    """An unguided request expands to no companions and admits normally."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: []
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.request_queue = mocker.Mock()
+
+    assert (
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+        == []
+    )
+    engine.request_queue.sync_q.put.assert_not_called()

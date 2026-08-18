@@ -141,7 +141,20 @@ The response shape depends on the streaming parameters:
 
 **Non-streaming (default).** With `stream=false` and no `stream_format`, returns the
 complete clip as binary audio data with an appropriate `Content-Type` header (e.g.
-`audio/wav`). The raw-bytes body has no JSON carrier, so no `usage` is reported.
+`audio/wav`). Because the raw-bytes body has no JSON carrier, successful
+non-streaming responses from non-diffusion speech servers report usage through
+response headers:
+
+| Header | Description |
+| --- | --- |
+| `x-vllm-omni-input-tokens` | Total input tokens (`text_tokens` + `audio_tokens`). |
+| `x-vllm-omni-output-tokens` | Generated codec/audio tokens. |
+| `x-vllm-omni-total-tokens` | `input_tokens` + `output_tokens`. |
+| `x-vllm-omni-input-text-tokens` | Tokens from the synthesized text (`input` plus `instructions`). |
+| `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
+
+Diffusion-mode speech servers route through a separate response path and do not
+emit these headers.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
