@@ -1720,7 +1720,7 @@ class HunyuanImage3Pipeline(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
-            allow_cond_image=False,
+            allow_cond_image=True,
         )
         cot_text = (
             [request_layout_utils.normalize_hunyuan_cot_text(text) for text in cot_text_list]
