@@ -12,6 +12,7 @@ import aiohttp
 from tqdm import tqdm
 
 DEFAULT_EDITS_BOT_TASK = "think"
+DEFAULT_VIDEO_CLIENT_TIMEOUT_S = 600.0
 
 
 def _is_minimax_h3_mixed_reference(model: str) -> bool:
@@ -38,6 +39,7 @@ class RequestFuncInput:
     fps: int | None = None
     timestamp: float | None = None
     slo_ms: float | None = None
+    client_timeout: float = DEFAULT_VIDEO_CLIENT_TIMEOUT_S
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     video_paths: list[str] | None = None
@@ -406,8 +408,7 @@ async def async_request_v1_videos(
 
         # invoke a poll request (GET /v1/videos/{video_id})
         poll_interval = 2.0  # Unit(s)
-        timeout_seconds = 600.0
-        deadline = time.perf_counter() + timeout_seconds
+        deadline = time.perf_counter() + input.client_timeout
         job_url = f"{input.api_url}/{job_id}"
 
         while job_status not in {"completed", "failed"}:
@@ -423,7 +424,7 @@ async def async_request_v1_videos(
                 job_status = poll_json.get("status")
 
                 if time.perf_counter() >= deadline:
-                    output.error = f"Timed out waiting for video job {job_id} to complete."
+                    output.error = f"Timed out waiting {input.client_timeout:g}s for video job {job_id} to complete."
                     output.success = False
                     return output
 

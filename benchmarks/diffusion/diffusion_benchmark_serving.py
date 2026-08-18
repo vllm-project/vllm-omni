@@ -87,6 +87,7 @@ import base64
 import glob
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -101,6 +102,7 @@ import aiohttp
 import numpy as np
 import requests
 from backends import (
+    DEFAULT_VIDEO_CLIENT_TIMEOUT_S,
     RequestFuncInput,
     RequestFuncOutput,
     backends_function_mapping,
@@ -113,6 +115,13 @@ logger = logging.getLogger(__name__)
 
 _STAGE_METRICS_ENDPOINTS = {"/v1/chat/completions"}
 _RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
+
+
+def positive_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return seconds
 
 
 class BaseDataset(ABC):
@@ -1311,6 +1320,8 @@ async def benchmark(args):
 
     print("Loading requests...")
     requests_list = dataset.get_requests()
+    for request in requests_list:
+        request.client_timeout = args.client_timeout
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
@@ -1493,6 +1504,12 @@ if __name__ == "__main__":
         "to execute at a time. This means that when used in combination, the "
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
+    )
+    parser.add_argument(
+        "--client-timeout",
+        type=positive_seconds,
+        default=DEFAULT_VIDEO_CLIENT_TIMEOUT_S,
+        help="Seconds to wait for an asynchronous /v1/videos job (default: 600).",
     )
     parser.add_argument(
         "--request-rate",
