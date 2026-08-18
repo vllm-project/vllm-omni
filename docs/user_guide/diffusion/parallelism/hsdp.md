@@ -147,12 +147,11 @@ In `DiffusionParallelConfig`:
 |-----------|------|---------|-------------|
 | `use_hsdp` | bool | False | Enable HSDP |
 | `hsdp_shard_size` | int | -1 | Number of GPUs to shard weights across. `-1` = auto (requires other parallelism > 1) |
-| `hsdp_replicate_size` | int | 1 | Number of replica groups. Each group holds a full sharded copy |
 
 **Constraints:**
 
-- `hsdp_replicate_size × hsdp_shard_size == world_size`
 - HSDP cannot be used with Tensor Parallelism (`tensor_parallel_size` must be 1)
+- Only `hsdp_replicate_size = 1` is supported
 
 ---
 

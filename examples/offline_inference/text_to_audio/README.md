@@ -92,6 +92,6 @@ Key arguments:
 - `--num-inference-steps`: diffusion sampling steps.(more steps = higher quality, slower).
 - `--use-hsdp`: enable HSDP weight sharding for the Stable Audio DiT.
 - `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
-- `--hsdp-replicate-size`: number of HSDP replica groups.
+- `--hsdp-replicate-size`: number of HSDP replica groups. Only 1 is supported.
 - `--cache-backend`: cache acceleration backend. Stable Audio currently supports `tea_cache`.
 - `--output`: path to save the generated WAV file.

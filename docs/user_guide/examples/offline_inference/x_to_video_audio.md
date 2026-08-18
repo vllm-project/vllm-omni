@@ -97,7 +97,7 @@ Key arguments:
 - `--cfg-parallel-size`: number of parallel cfg parallel (defaults 1).
 - `--use-hsdp`: enable HSDP weight sharding for DreamID-Omni fused blocks.
 - `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
-- `--hsdp-replicate-size`: number of HSDP replica groups.
+- `--hsdp-replicate-size`: number of HSDP replica groups. Only 1 is supported.
 - `--num-inference-steps`: number of denoising steps (defaults 45).
 - `--video-negative-prompt`: negative prompt for video generation.
 - `--audio-negative-prompt`: negative prompt for audio generation.

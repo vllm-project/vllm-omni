@@ -92,7 +92,7 @@ Key arguments:
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
-- `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
+- `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication). Only 1 is supported.
 
 
 

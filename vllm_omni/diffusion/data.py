@@ -237,7 +237,7 @@ class DiffusionParallelConfig:
     """Number of GPUs to shard weights across within each replica group. -1 means auto-calculate."""
 
     hsdp_replicate_size: int = 1
-    """Number of replica groups for HSDP. Each replica holds a full sharded copy."""
+    """Number of replica groups for HSDP. Each replica holds a full sharded copy. Only 1 is supported."""
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
@@ -297,6 +297,9 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
+            if self.hsdp_replicate_size > 1:
+                # Extra replicas receive identical requests and waste compute with no throughput benefit.
+                raise ValueError("hsdp_replicate_size > 1 is not supported. Set hsdp_replicate_size = 1.")
             if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
                 raise ValueError(
                     "HSDP (use_hsdp=True) cannot be used with TP or DP "

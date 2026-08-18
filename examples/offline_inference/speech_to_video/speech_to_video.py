@@ -189,9 +189,10 @@ def parse_args() -> argparse.Namespace:
         "--hsdp-replicate-size",
         type=int,
         default=1,
+        choices=[1],
         help=(
             "Number of replica groups for HSDP. Each replica holds a full sharded copy. "
-            "Default 1 means pure sharding (no replication)."
+            "Default 1 means pure sharding (no replication). Only 1 is supported."
         ),
     )
     parser.add_argument(

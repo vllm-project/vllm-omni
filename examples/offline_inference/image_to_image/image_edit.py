@@ -407,7 +407,8 @@ def parse_args() -> argparse.Namespace:
         "--hsdp-replicate-size",
         type=int,
         default=1,
-        help="Number of HSDP replica groups.",
+        choices=[1],
+        help="Number of HSDP replica groups. Only 1 is supported.",
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",

@@ -489,6 +489,9 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             * self.cfg_parallel_size
         )
         if self.use_hsdp:
+            if self.hsdp_replicate_size > 1:
+                # Extra replicas receive identical requests and waste compute with no throughput benefit.
+                raise ValueError("hsdp_replicate_size > 1 is not supported. Set hsdp_replicate_size = 1.")
             if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
                 raise ValueError(
                     "HSDP (use_hsdp=True) cannot be used with TP or DP "

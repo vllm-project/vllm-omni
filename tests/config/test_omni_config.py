@@ -614,10 +614,10 @@ def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
         ulysses_degree=2,
         use_hsdp=True,
         hsdp_shard_size=-1,
-        hsdp_replicate_size=2,
+        hsdp_replicate_size=1,
     )
 
-    assert cfg.hsdp_shard_size == 2
+    assert cfg.hsdp_shard_size == 4
     assert cfg.world_size == 4
 
 
@@ -627,6 +627,15 @@ def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():
 
     with pytest.raises(ValueError, match="cannot be used with TP or DP"):
         OmniStageDiffusionParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
+
+
+def test_diffusion_parallel_config_rejects_hsdp_replicate_size():
+    with pytest.raises(ValueError, match="hsdp_replicate_size > 1 is not supported. Set hsdp_replicate_size = 1."):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_shard_size=-1,
+            hsdp_replicate_size=2,
+        )
 
 
 def test_from_pipeline_config_preserves_legacy_pp_dp_for_world_size():

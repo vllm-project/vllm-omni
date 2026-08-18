@@ -159,29 +159,14 @@ class TestDiffusionParallelConfigHSDP:
         assert config.hsdp_shard_size == 4
         assert config.hsdp_replicate_size == 1
 
-    def test_hsdp_standalone_with_replicate(self):
-        """Test standalone HSDP with replication."""
-        config = DiffusionParallelConfig(
-            use_hsdp=True,
-            hsdp_shard_size=4,
-            hsdp_replicate_size=2,
-        )
-        # world_size = shard_size * replicate_size
-        assert config.world_size == 8
-        assert config.hsdp_shard_size == 4
-        assert config.hsdp_replicate_size == 2
-
-    def test_hsdp_with_replicate(self):
-        """Test HSDP with replication (hybrid mode) combined with other parallelism."""
-        # world_size=8, replicate=2 -> shard_size should be 4
-        config = DiffusionParallelConfig(
-            ulysses_degree=8,
-            use_hsdp=True,
-            hsdp_replicate_size=2,
-        )
-        assert config.world_size == 8
-        assert config.hsdp_shard_size == 4
-        assert config.hsdp_replicate_size == 2
+    def test_hsdp_replicate_rejected(self):
+        """Test HSDP with replication is rejected."""
+        with pytest.raises(ValueError, match="hsdp_replicate_size > 1 is not supported. Set hsdp_replicate_size = 1."):
+            DiffusionParallelConfig(
+                use_hsdp=True,
+                hsdp_shard_size=4,
+                hsdp_replicate_size=2,
+            )
 
     def test_hsdp_explicit_shard_size_valid(self):
         """Test explicit hsdp_shard_size that matches world_size."""
@@ -201,15 +186,6 @@ class TestDiffusionParallelConfigHSDP:
                 use_hsdp=True,
                 hsdp_shard_size=3,  # 1 * 3 != 4
                 hsdp_replicate_size=1,
-            )
-
-    def test_hsdp_replicate_size_exceeds_world_size(self):
-        """Test that replicate_size > world_size raises an error."""
-        with pytest.raises(ValueError, match="replicate_size.*must evenly divide world_size"):
-            DiffusionParallelConfig(
-                ulysses_degree=4,  # world_size=4
-                use_hsdp=True,
-                hsdp_replicate_size=8,  # 8 > 4, invalid
             )
 
     def test_hsdp_combined_world_size(self):
@@ -256,12 +232,11 @@ class TestDiffusionParallelConfigHSDP:
             {
                 "ulysses_degree": 4,
                 "use_hsdp": True,
-                "hsdp_replicate_size": 2,
             }
         )
         assert config.use_hsdp is True
-        assert config.hsdp_replicate_size == 2
-        assert config.hsdp_shard_size == 2  # auto: 4 // 2
+        assert config.hsdp_replicate_size == 1
+        assert config.hsdp_shard_size == 4  # auto: 4 // 1
 
 
 class TestStandaloneHSDPDetection:

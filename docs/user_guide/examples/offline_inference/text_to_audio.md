@@ -55,7 +55,7 @@ Key arguments:
 - `--num-inference-steps`: diffusion sampling steps.(more steps = higher quality, slower).
 - `--use-hsdp`: enable HSDP weight sharding for the Stable Audio DiT.
 - `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
-- `--hsdp-replicate-size`: number of HSDP replica groups.
+- `--hsdp-replicate-size`: number of HSDP replica groups. Only 1 is supported.
 - `--output`: path to save the generated WAV file.
 - `--enable-cpu-offload`: enabling model-wise offloading to save gpu memory
 - `--enable-layerwise-offload`: enabling layerwise offloading to save gpu memory
