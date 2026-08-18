@@ -402,7 +402,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _diffusion_text_content_part(multimodal_output: Any) -> dict[str, Any] | None:
         """Return an OpenAI ``{type: text}`` content part for a mixed payload.
 
-        Diffusion pipelines that produce both text and image (e.g. SenseNova
+        Diffusion pipelines that produce both text and image (e.g. SenseNovaVision
         ``caption_generate``/``think_generate``) carry the caption under the
         ``text`` key of their multimodal output.  When present, it is serialized
         as a leading text content part so the OpenAI response is a single

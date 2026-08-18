@@ -471,11 +471,11 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
-    "sensenova": {
-        # SenseNova stage 1 runs at max_latent_size=64 (~1024x1024) and needs
+    "sensenova_vision": {
+        # SenseNovaVision stage 1 runs at max_latent_size=64 (~1024x1024) and needs
         # more memory than BAGEL (~512x512); the higher gpu_memory_utilization
-        # is already in sensenova.yaml, so the overlay only trims seq counts.
-        "base_config": "sensenova.yaml",
+        # is already in sensenova_vision.yaml, so the overlay only trims seq counts.
+        "base_config": "sensenova_vision.yaml",
         "stages": [
             {
                 "stage_id": 0,

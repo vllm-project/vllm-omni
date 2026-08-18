@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SenseNova-Vision-7B-MoT offline inference (full modality matrix).
 
-SenseNova-Vision is a Bagel-fork MoT model; the diffuser reads the SenseNova
-per-mode defaults from the prompt dict (``mode`` / ``sensenova_mode``) and
+SenseNova-Vision is a Bagel-fork MoT model; the diffuser reads the SenseNovaVision
+per-mode defaults from the prompt dict (``mode`` / ``sensenova_vision_mode``) and
 the pipeline routes outputs through the standard BAGEL modality contract:
 
     text2text        — text-only understanding (no image)
@@ -25,37 +25,37 @@ the pipeline routes outputs through the standard BAGEL modality contract:
 Examples:
 
     # Text to image
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality text2img \
         --prompts "A cute corgi astronaut on the moon" \
         --output ./out
 
     # Image understanding (caption)
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality img2text \
         --image-path /path/to/photo.jpg \
         --prompts "What are the main objects in this scene and their relationships?"
 
     # Dense depth estimation
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality img2dense --dense-task depth \
         --image-path /path/to/photo.jpg \
         --output ./out
 
     # Multi-view camera pose estimation
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality multi-img2text \
         --image-path /path/to/view1.png /path/to/view2.png /path/to/view3.png \
         --output ./out
 
     # Multi-view 3D reconstruction
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality recon3d \
         --image-path /path/to/view1.png /path/to/view2.png /path/to/view3.png \
         --output ./out
 
     # Mixed text + image (caption_generate)
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality mixed \
         --image-path /path/to/photo.jpg \
         --output ./out
@@ -121,7 +121,7 @@ CAPTION_GENERATE_PROMPT = (
 )
 EDIT_PROMPT = "Turn this image into a vibrant cartoon-style illustration."
 
-# ``--modality`` choices and the SenseNova pipeline mode they map to.
+# ``--modality`` choices and the SenseNovaVision pipeline mode they map to.
 MODALITY_MODE = {
     "text2text": "understanding",
     "img2text": "understanding",
@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--prompts",
         nargs="+",
         default=None,
-        help="Input text prompts. Omitted prompts use the official SenseNova defaults per mode.",
+        help="Input text prompts. Omitted prompts use the official SenseNovaVision defaults per mode.",
     )
     p.add_argument(
         "--modality",
@@ -184,13 +184,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=None, help="Image height (image-output modes).")
     p.add_argument("--width", type=int, default=None, help="Image width (image-output modes).")
     p.add_argument("--output", type=str, default=".", help="Output directory.")
-    p.add_argument("--steps", type=int, default=50, help="Denoising steps (SenseNova default 50).")
+    p.add_argument("--steps", type=int, default=50, help="Denoising steps (SenseNovaVision default 50).")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument(
         "--deploy-config",
         type=str,
-        default="vllm_omni/deploy/sensenova.yaml",
-        help="Path to the SenseNova deploy YAML (two-stage thinker + DiT).",
+        default="vllm_omni/deploy/sensenova_vision.yaml",
+        help="Path to the SenseNovaVision deploy YAML (two-stage thinker + DiT).",
     )
     p.add_argument(
         "--cfg-text-scale",
@@ -378,9 +378,10 @@ def _write_image(output_dir, prefix, index, image) -> str:
 
 
 def _decode_and_write_dense(output_dir, prefix, index, image, dense_task):
-    """Decode a dense prediction image with the SenseNova decoders and save it."""
+    """Decode a dense prediction image with the SenseNovaVision decoders and save it."""
     import numpy as np
-    from vllm_omni.model_executor.models.sensenova.decoders import (
+
+    from vllm_omni.model_executor.models.sensenova_vision.decoders import (
         decode_depth,
         decode_normal,
         decode_segmentation,
@@ -406,7 +407,8 @@ def _decode_and_write_dense(output_dir, prefix, index, image, dense_task):
 def _decode_and_write_recon3d(output_dir, prefix, index, images):
     """Decode each per-view point map and optionally save the intermediate text."""
     import numpy as np
-    from vllm_omni.model_executor.models.sensenova.decoders import decode_point_map
+
+    from vllm_omni.model_executor.models.sensenova_vision.decoders import decode_point_map
 
     paths = []
     for j, image in enumerate(images):
@@ -535,17 +537,17 @@ def main():
             path = _write_text(args.output, prefix, i, text)
             print(f"[Output {i}] Saved text to {path}")
             if args.modality == "dense_detection":
-                from vllm_omni.model_executor.models.sensenova.decoders import parse_bbox
+                from vllm_omni.model_executor.models.sensenova_vision.decoders import parse_bbox
 
                 parsed = parse_bbox(text or "")
                 print(f"  → parsed detections: {json.dumps(parsed, indent=2)}")
             elif args.modality == "dense_OCR":
-                from vllm_omni.model_executor.models.sensenova.decoders import parse_points
+                from vllm_omni.model_executor.models.sensenova_vision.decoders import parse_points
 
                 parsed = parse_points(text or "")
                 print(f"  → parsed OCR boxes: {json.dumps(parsed, indent=2)}")
             elif args.modality == "multi-img2text":
-                from vllm_omni.model_executor.models.sensenova.decoders import parse_camera_pose
+                from vllm_omni.model_executor.models.sensenova_vision.decoders import parse_camera_pose
 
                 parsed = parse_camera_pose(text or "")
                 print(f"  → parsed camera pose: {json.dumps(parsed, indent=2) if parsed else 'unparsable'}")

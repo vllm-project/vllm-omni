@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Regression tests for the SenseNova mixed text+image output contract.
+"""Regression tests for the SenseNovaVision mixed text+image output contract.
 
-SenseNova ``caption_generate`` / ``think_generate`` produce an image together
+SenseNovaVision ``caption_generate`` / ``think_generate`` produce an image together
 with its caption/reasoning text.  Phase 3 wires that mixed payload through the
 existing ``TEXT | IMAGE`` output-modality contract: the pipeline exposes the
 text under ``payload["text"]`` alongside ``payload["image"]``, the diffusion
 formatter preserves it in ``multimodal_output``, and the serving layer
 serializes it as a leading ``{type: text}`` OpenAI content part.  No
-SenseNova-specific output modality keys are introduced.
+SenseNovaVision-specific output modality keys are introduced.
 
 These tests are CPU-only and construct the payload dict exactly as the
-pipeline produces it (via :func:`build_sensenova_diffusion_output`); no model
+pipeline produces it (via :func:`build_sensenova_vision_diffusion_output`); no model
 weights are loaded and no GPU is required.
 """
 
@@ -21,13 +21,13 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
-from vllm_omni.diffusion.models.sensenova.pipeline_sensenova import (
-    SenseNovaPipeline,
-    build_sensenova_diffusion_output,
-)
 
 from vllm_omni.diffusion import output_formatter
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.models.sensenova_vision.pipeline_sensenova_vision import (
+    SenseNovaVisionPipeline,
+    build_sensenova_vision_diffusion_output,
+)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     normalize_diffusion_postprocess_output,
@@ -60,13 +60,13 @@ def _request() -> OmniDiffusionRequest:
 
 
 def _config() -> SimpleNamespace:
-    return SimpleNamespace(model_class_name="SenseNovaPipeline")
+    return SimpleNamespace(model_class_name="SenseNovaVisionPipeline")
 
 
-def test_build_sensenova_diffusion_output_carries_text_and_image() -> None:
+def test_build_sensenova_vision_diffusion_output_carries_text_and_image() -> None:
     """The canonical envelope exposes both text and image payload keys."""
     image = _image()
-    output = build_sensenova_diffusion_output(
+    output = build_sensenova_vision_diffusion_output(
         text=_CAPTION,
         image=image,
         think_text="thinking before caption",
@@ -93,7 +93,7 @@ def test_mixed_payload_formats_to_image_with_text_multimodal_output(
     """
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
     image = _image()
-    diffusion_output = build_sensenova_diffusion_output(
+    diffusion_output = build_sensenova_vision_diffusion_output(
         text=_CAPTION,
         image=image,
         think_text="thinking before caption",
@@ -118,7 +118,7 @@ def test_mixed_payload_formats_to_image_with_text_multimodal_output(
         "text_output": _CAPTION,
         "think_text": "thinking before caption",
     }
-    # The multimodal output must not gain any SenseNova-specific modality keys.
+    # The multimodal output must not gain any SenseNovaVision-specific modality keys.
     assert not ({"depth", "normal", "segmentation", "camera_pose", "point_map"} & set(result.multimodal_output))
 
 
@@ -131,7 +131,7 @@ def test_multimodal_payload_from_dict_splits_text_and_image() -> None:
     assert payload.tensors == {}
 
 
-def test_sensenova_forward_merges_think_text_into_image_payload(
+def test_sensenova_vision_forward_merges_think_text_into_image_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``forward`` lifts the caption/reasoning text into the image payload."""
@@ -147,7 +147,7 @@ def test_sensenova_forward_merges_think_text_into_image_payload(
     def fake_super_forward(_req):
         return super_output
 
-    pipeline = object.__new__(SenseNovaPipeline)
+    pipeline = object.__new__(SenseNovaVisionPipeline)
     monkeypatch.setattr(pipeline, "_apply_mode_defaults", lambda _req: None)
     monkeypatch.setattr(pipeline, "forward", fake_super_forward)
     req = DiffusionRequestBatch(
@@ -229,9 +229,9 @@ def test_create_image_choice_emits_text_then_image_parts() -> None:
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def _make_pipeline() -> SenseNovaPipeline:
-    """Build a SenseNovaPipeline instance without loading weights."""
-    pipeline = object.__new__(SenseNovaPipeline)
+def _make_pipeline() -> SenseNovaVisionPipeline:
+    """Build a SenseNovaVisionPipeline instance without loading weights."""
+    pipeline = object.__new__(SenseNovaVisionPipeline)
     pipeline.bagel = None
     pipeline._stage_durations = {"execute": 0.5}
     pipeline._profiler_lock = None

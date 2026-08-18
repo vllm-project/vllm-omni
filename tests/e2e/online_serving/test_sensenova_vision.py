@@ -11,15 +11,15 @@ exposed by ``vllm-omni serve``.
 
 Equivalent to running:
     vllm serve sensenova/SenseNova-Vision-7B-MoT --omni \\
-        --port 8092 --deploy-config <ci/sensenova.yaml>
+        --port 8092 --deploy-config <ci/sensenova_vision.yaml>
 
-    python examples/online_serving/sensenova/openai_chat_client.py \\
+    python examples/online_serving/sensenova_vision/openai_chat_client.py \\
         --modality text2img --prompt "A cute cat"
 
-    python examples/online_serving/sensenova/openai_chat_client.py \\
+    python examples/online_serving/sensenova_vision/openai_chat_client.py \\
         --modality img2text --image-url <image>
 
-    python examples/online_serving/sensenova/openai_chat_client.py \\
+    python examples/online_serving/sensenova_vision/openai_chat_client.py \\
         --modality mixed --image-url <image>
 """
 
@@ -37,7 +37,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "sensenova/SenseNova-Vision-7B-MoT"
-STAGE_CONFIG_PATH = get_deploy_config_path("ci/sensenova.yaml")
+STAGE_CONFIG_PATH = get_deploy_config_path("ci/sensenova_vision.yaml")
 
 TEXT2TEXT_PROMPT = "What is the capital of France?"
 TEXT2IMG_PROMPT = "A cute corgi astronaut on the moon, cinematic"
@@ -115,8 +115,8 @@ def _build_img2text_messages(prompt: str, image_b64: str) -> list[dict]:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_text2img_online(omni_server, openai_client) -> None:
-    """Test SenseNova text2img via OpenAI-compatible chat completions API."""
+def test_sensenova_vision_text2img_online(omni_server, openai_client) -> None:
+    """Test SenseNovaVision text2img via OpenAI-compatible chat completions API."""
     request_config = {
         "model": omni_server.model,
         "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
@@ -137,8 +137,8 @@ def test_sensenova_text2img_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_img2img_online(omni_server, openai_client) -> None:
-    """Test SenseNova img2img via OpenAI-compatible chat completions API."""
+def test_sensenova_vision_img2img_online(omni_server, openai_client) -> None:
+    """Test SenseNovaVision img2img via OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -162,8 +162,8 @@ def test_sensenova_img2img_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_img2text_online(omni_server, openai_client) -> None:
-    """Test SenseNova img2text via OpenAI-compatible chat completions API."""
+def test_sensenova_vision_img2text_online(omni_server, openai_client) -> None:
+    """Test SenseNovaVision img2text via OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -186,8 +186,8 @@ def test_sensenova_img2text_online(omni_server, openai_client) -> None:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_sensenova_mixed_online(omni_server, openai_client) -> None:
-    """Test SenseNova mixed text+image (caption_generate) via chat API."""
+def test_sensenova_vision_mixed_online(omni_server, openai_client) -> None:
+    """Test SenseNovaVision mixed text+image (caption_generate) via chat API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")

@@ -13,7 +13,7 @@ Usage:
     # Text-to-image
     python openai_chat_client.py --modality text2img \
         --prompt "A cute corgi astronaut on the moon, cinematic" \
-        --output sensenova_text2img.png
+        --output sensenova_vision_text2img.png
 
     # Image understanding (img2text)
     python openai_chat_client.py --modality img2text \
@@ -23,13 +23,13 @@ Usage:
     # Mixed text + image (caption_generate)
     python openai_chat_client.py --modality mixed \
         --image-url /path/to/photo.jpg \
-        --output sensenova_mixed.png
+        --output sensenova_vision_mixed.png
 
     # Image editing (img2img)
     python openai_chat_client.py --modality img2img \
         --image-url /path/to/photo.jpg \
         --prompt "Turn this image into a vibrant cartoon-style illustration." \
-        --output sensenova_img2img.png
+        --output sensenova_vision_img2img.png
 
     # Text-to-text (chat)
     python openai_chat_client.py --modality text2text \
@@ -133,7 +133,7 @@ def generate(
 def main():
     parser = argparse.ArgumentParser(description="SenseNova-Vision multimodal chat client")
     parser.add_argument("--prompt", "-p", default=None, help="Text prompt (official per-mode default if omitted)")
-    parser.add_argument("--output", "-o", default="sensenova_output.png", help="Output file (for image results)")
+    parser.add_argument("--output", "-o", default="sensenova_vision_output.png", help="Output file (for image results)")
     parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
     parser.add_argument("--image-url", "-i", type=str, help="Input image URL or local path")
     parser.add_argument(

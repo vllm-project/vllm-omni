@@ -1,6 +1,6 @@
 # SenseNova-Vision-7B-MoT deploy: CUDA defaults, verified on NVIDIA A100 (80GB).
 #
-# This mirrors the BAGEL two-stage topology (Thinker + DiT) but the SenseNova
+# This mirrors the BAGEL two-stage topology (Thinker + DiT) but the SenseNovaVision
 # pipeline runs at max_latent_size=64 (BAGEL ships 32, ~512x512), producing
 # outputs up to 1024x1024. Stage 1 therefore needs more memory and a larger
 # batched-token budget to fit the larger latent, so gpu_memory_utilization and
@@ -34,9 +34,9 @@ stages:
   - stage_id: 1
     # Must be explicit: unlike BAGEL (whose config.json model_type="bagel"
     # resolves to BagelPipeline in OmniDiffusionConfig.enrich_config), the
-    # SenseNova config.json carries no model_type/architectures, so the
+    # SenseNovaVision config.json carries no model_type/architectures, so the
     # diffusion stage cannot infer its pipeline class from the checkpoint.
-    model_class_name: SenseNovaPipeline
+    model_class_name: SenseNovaVisionPipeline
     max_num_batched_tokens: 65536
     max_num_seqs: 1
     enforce_eager: true

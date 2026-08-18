@@ -7,7 +7,7 @@ Two-stage (default):
   Stage 1: DiT     — diffusion image generation
 
 This mirrors the BAGEL two-stage pipeline but is registered under
-``model_type="sensenova"`` and uses the SenseNova model architecture string.
+``model_type="sensenova_vision"`` and uses the SenseNovaVision model architecture string.
 The stage-transition functions are reused verbatim from the BAGEL processor
 module (``expand_cfg_prompts`` / ``collect_cfg_kv_caches``).
 """
@@ -20,10 +20,10 @@ from vllm_omni.config.stage_config import (
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.bagel"
 
-SENSENOVA_PIPELINE = PipelineConfig(
-    model_type="sensenova",
-    default_deploy_config_name="sensenova.yaml",
-    model_arch="OmniSenseNovaForConditionalGeneration",
+SENSENOVA_VISION_PIPELINE = PipelineConfig(
+    model_type="sensenova_vision",
+    default_deploy_config_name="sensenova_vision.yaml",
+    model_arch="OmniSenseNovaVisionForConditionalGeneration",
     hf_architectures=(),
     stages=(
         StagePipelineConfig(
@@ -35,7 +35,7 @@ SENSENOVA_PIPELINE = PipelineConfig(
             final_output_type="text",
             owns_tokenizer=True,
             requires_multimodal_data=True,
-            model_arch="OmniSenseNovaForConditionalGeneration",
+            model_arch="OmniSenseNovaVisionForConditionalGeneration",
             engine_output_type="text",
             prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
             omni_kv_config={

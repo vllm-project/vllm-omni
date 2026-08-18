@@ -4,7 +4,7 @@
 
 SenseNova-Vision is a Bagel fork; the denoising model, VAE, and ViT are
 weight-compatible with the BAGEL integration.  This pipeline subclasses
-:class:`BagelPipeline` and overrides only the SenseNova checkpoint defaults:
+:class:`BagelPipeline` and overrides only the SenseNovaVision checkpoint defaults:
 
 - ``max_latent_size=64`` (BAGEL ships 32)
 - ``vit_max_num_patch_per_side=70``
@@ -25,8 +25,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
 @dataclass
-class SenseNovaGenParams:
-    """SenseNova per-mode generation parameters (BASE_PARAMS equivalents)."""
+class SenseNovaVisionGenParams:
+    """SenseNovaVision per-mode generation parameters (BASE_PARAMS equivalents)."""
 
     num_timesteps: int = 50
     timestep_shift: float = 3.0
@@ -35,7 +35,7 @@ class SenseNovaGenParams:
     cfg_interval: tuple = (0.4, 1.0)
     cfg_renorm_min: float = 1.0
     cfg_renorm_type: str = "global"
-    # SenseNova-specific additive flags (not consumed by the BAGEL core).
+    # SenseNovaVision-specific additive flags (not consumed by the BAGEL core).
     think: bool = False
     caption: bool = False
     understanding_output: bool = False
@@ -45,8 +45,8 @@ class SenseNovaGenParams:
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_base_params(cls, mode: str) -> SenseNovaGenParams:
-        """Build defaults for a SenseNova inference mode.
+    def from_base_params(cls, mode: str) -> SenseNovaVisionGenParams:
+        """Build defaults for a SenseNovaVision inference mode.
 
         Mirrors ``BASE_PARAMS`` in
         ``SenseNova-Vision/inference/sensenova_vision.py``.
@@ -173,8 +173,8 @@ _BASE_PARAMS: dict[str, dict[str, Any]] = {
 }
 
 
-def get_sensenova_post_process_func(od_config: OmniDiffusionConfig):
-    """SenseNova post-processing: pipelines return PIL images directly."""
+def get_sensenova_vision_post_process_func(od_config: OmniDiffusionConfig):
+    """SenseNovaVision post-processing: pipelines return PIL images directly."""
     del od_config  # unused
 
     def post_process_func(x):
@@ -183,14 +183,14 @@ def get_sensenova_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def build_sensenova_diffusion_output(
+def build_sensenova_vision_diffusion_output(
     *,
     text: str | None = None,
     image: Any = None,
     think_text: str | None = None,
     stage_durations: dict[str, float] | None = None,
 ) -> DiffusionOutput:
-    """Build a canonical SenseNova ``DiffusionOutput`` envelope.
+    """Build a canonical SenseNovaVision ``DiffusionOutput`` envelope.
 
     Mirrors the envelope contract used by :class:`BagelPipeline`:
 
@@ -203,7 +203,7 @@ def build_sensenova_diffusion_output(
     produced alongside the image (e.g. ``think_generate``) and is recorded under
     the shared ``text`` metadata group. This is deliberately generic: it carries
     only the existing ``TEXT``/``IMAGE`` output-modality contract and never
-    introduces a SenseNova-specific modality key.
+    introduces a SenseNovaVision-specific modality key.
     """
     payload: dict[str, Any] = {}
     metadata: dict[str, Any] = {}
@@ -228,39 +228,39 @@ def build_sensenova_diffusion_output(
     )
 
 
-class SenseNovaPipeline(BagelPipeline):
+class SenseNovaVisionPipeline(BagelPipeline):
     """SenseNova-Vision-7B-MoT diffusion pipeline.
 
     Subclasses :class:`BagelPipeline` and reuses the entire BAGEL weight
-    loading / denoising machinery.  Only the SenseNova checkpoint defaults
+    loading / denoising machinery.  Only the SenseNovaVision checkpoint defaults
     differ; these are applied in :meth:`__init__` and per-request mode
     defaults are applied in :meth:`forward` via ``extra_args``.
     """
 
-    # SenseNova checkpoint overrides applied on top of BAGEL.
-    _sensenova_max_latent_size = 64
-    _sensenova_vit_max_num_patch_per_side = 70
-    # Official SenseNova image transforms (vae, vit).
-    _sensenova_vae_transform = (1024, 512, 16)
-    _sensenova_vit_transform = (980, 224, 14)
+    # SenseNovaVision checkpoint overrides applied on top of BAGEL.
+    _sensenova_vision_max_latent_size = 64
+    _sensenova_vision_vit_max_num_patch_per_side = 70
+    # Official SenseNovaVision image transforms (vae, vit).
+    _sensenova_vision_vae_transform = (1024, 512, 16)
+    _sensenova_vision_vit_transform = (980, 224, 14)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
-        self._apply_sensenova_defaults()
+        self._apply_sensenova_vision_defaults()
 
-    def _apply_sensenova_defaults(self) -> None:
-        """Force SenseNova defaults on the loaded Bagel core after init."""
+    def _apply_sensenova_vision_defaults(self) -> None:
+        """Force SenseNovaVision defaults on the loaded Bagel core after init."""
         bagel = self.bagel
-        bagel.max_latent_size = self._sensenova_max_latent_size
+        bagel.max_latent_size = self._sensenova_vision_max_latent_size
         if hasattr(bagel.config, "max_latent_size"):
-            bagel.config.max_latent_size = self._sensenova_max_latent_size
+            bagel.config.max_latent_size = self._sensenova_vision_max_latent_size
         if hasattr(bagel.config, "vit_max_num_patch_per_side"):
-            bagel.config.vit_max_num_patch_per_side = self._sensenova_vit_max_num_patch_per_side
+            bagel.config.vit_max_num_patch_per_side = self._sensenova_vision_vit_max_num_patch_per_side
         if hasattr(bagel.latent_pos_embed, "max_num_patch_per_side"):
-            bagel.latent_pos_embed.max_num_patch_per_side = self._sensenova_max_latent_size
+            bagel.latent_pos_embed.max_num_patch_per_side = self._sensenova_vision_max_latent_size
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        """Run SenseNova image/text generation with per-mode defaults."""
+        """Run SenseNovaVision image/text generation with per-mode defaults."""
         self._apply_mode_defaults(req)
         output = super().forward(req)
         return self._merge_mixed_task_text(req, output)
@@ -270,7 +270,7 @@ class SenseNovaPipeline(BagelPipeline):
 
         The BAGEL core returns image generations as ``payload["image"]`` and, for
         thinking modes, records the generated text only under
-        ``metadata["text"]["think_text"]``. SenseNova mixed tasks (e.g.
+        ``metadata["text"]["think_text"]``. SenseNovaVision mixed tasks (e.g.
         ``caption_generate``/``think_generate``) must represent both under the
         existing ``TEXT | IMAGE`` output-modality contract, so when an image
         payload carries an available text it is also exposed as
@@ -305,9 +305,9 @@ class SenseNovaPipeline(BagelPipeline):
         return output
 
     def _apply_mode_defaults(self, req: DiffusionRequestBatch) -> None:
-        """Inject SenseNova ``BASE_PARAMS`` defaults into sampling params.
+        """Inject SenseNovaVision ``BASE_PARAMS`` defaults into sampling params.
 
-        The BAGEL core reads CFG/timestep knobs from ``extra_args``; SenseNova
+        The BAGEL core reads CFG/timestep knobs from ``extra_args``; SenseNovaVision
         defines those defaults per mode.  User-supplied values always win.
         """
         if not req.requests:
@@ -319,7 +319,7 @@ class SenseNovaPipeline(BagelPipeline):
         mode = None
         prompt = req.prompts[0] if req.prompts else None
         if isinstance(prompt, dict):
-            mode = prompt.get("mode") or prompt.get("sensenova_mode")
+            mode = prompt.get("mode") or prompt.get("sensenova_vision_mode")
 
         if not mode:
             # No explicit mode: text-only output uses understanding-style
@@ -330,7 +330,7 @@ class SenseNovaPipeline(BagelPipeline):
             else:
                 mode = "generate"
 
-        defaults = SenseNovaGenParams.from_base_params(mode)
+        defaults = SenseNovaVisionGenParams.from_base_params(mode)
         extra_args = dict(getattr(params, "extra_args", None) or {})
 
         # Only fill unset knobs; explicit user args win.
@@ -345,7 +345,7 @@ class SenseNovaPipeline(BagelPipeline):
         extra_args.setdefault("max_think_tokens", defaults.max_think_token_n)
         extra_args.setdefault("do_sample", defaults.do_sample)
         extra_args.setdefault("text_temperature", defaults.text_temperature)
-        extra_args.setdefault("sensenova_mode", mode)
+        extra_args.setdefault("sensenova_vision_mode", mode)
         if defaults.extra:
             for k, v in defaults.extra.items():
                 extra_args.setdefault(k, v)

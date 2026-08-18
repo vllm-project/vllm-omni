@@ -15,7 +15,7 @@ for image generation.
 
 ## Supported modalities
 
-| `--modality` | Input | Output | SenseNova mode |
+| `--modality` | Input | Output | SenseNovaVision mode |
 | :----------- | :---- | :----- | :------------- |
 | `text2text` | text | text | `understanding` |
 | `img2text` | image | text | `understanding` |
@@ -31,7 +31,7 @@ for image generation.
 Run from the repository root:
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality <modality> \
     [--image-path path1 [path2 ...]] \
     [--prompts "text prompt"] \
@@ -47,7 +47,7 @@ omitted, and writes deterministic outputs (`<modality>_<index>.png`,
 ### Text to text (text2text)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality text2text \
     --prompts "What is the capital of France?"
 ```
@@ -55,7 +55,7 @@ python examples/offline_inference/sensenova/end2end.py \
 ### Image to text (img2text)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality img2text \
     --image-path /path/to/photo.jpg \
     --prompts "What are the main objects in this scene and their relationships?"
@@ -64,7 +64,7 @@ python examples/offline_inference/sensenova/end2end.py \
 ### Dense detection (dense_detection)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality dense_detection \
     --image-path /path/to/photo.jpg
 ```
@@ -76,7 +76,7 @@ console.
 ### Dense OCR (dense_OCR)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality dense_OCR \
     --image-path /path/to/text.jpg
 ```
@@ -84,7 +84,7 @@ python examples/offline_inference/sensenova/end2end.py \
 ### Text to image (text2img)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality text2img \
     --prompts "A cute corgi astronaut on the moon, cinematic" \
     --height 1024 --width 1024 \
@@ -94,7 +94,7 @@ python examples/offline_inference/sensenova/end2end.py \
 ### Image to image (img2img)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality img2img \
     --image-path /path/to/photo.jpg \
     --prompts "Turn this image into a vibrant cartoon-style illustration."
@@ -104,17 +104,17 @@ python examples/offline_inference/sensenova/end2end.py \
 
 ```bash
 # depth
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality img2dense --dense-task depth \
     --image-path /path/to/photo.jpg
 
 # normals
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality img2dense --dense-task normal \
     --image-path /path/to/photo.jpg
 
 # segmentation
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality img2dense --dense-task segmentation \
     --image-path /path/to/photo.jpg
 ```
@@ -126,7 +126,7 @@ int32/uint8 class-index segmentation).
 ### Multi-view camera pose (multi-img2text)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality multi-img2text \
     --image-path /path/to/view1.png /path/to/view2.png /path/to/view3.png
 ```
@@ -138,7 +138,7 @@ lists on the console.
 ### Multi-view 3D reconstruction (recon3d)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality recon3d \
     --image-path /path/to/view1.png /path/to/view2.png /path/to/view3.png
 ```
@@ -150,7 +150,7 @@ it is saved as `recon3d_<i>.txt`.
 ### Mixed text + image (mixed / caption_generate)
 
 ```bash
-python examples/offline_inference/sensenova/end2end.py \
+python examples/offline_inference/sensenova_vision/end2end.py \
     --modality mixed \
     --image-path /path/to/photo.jpg
 ```
@@ -161,12 +161,12 @@ the intermediate caption text; both are saved.
 ## Configuration
 
 The example builds the two-stage engine with the default deploy config
-`vllm_omni/deploy/sensenova.yaml` (Thinker + DiT sharing GPU 0). To use a
+`vllm_omni/deploy/sensenova_vision.yaml` (Thinker + DiT sharing GPU 0). To use a
 custom topology or device layout, pass `--deploy-config /path/to/config.yaml`.
 
-Generation knobs mirror the SenseNova per-mode `BASE_PARAMS`: `--steps`,
+Generation knobs mirror the SenseNovaVision per-mode `BASE_PARAMS`: `--steps`,
 `--seed`, `--height`, `--width`, `--cfg-text-scale`, `--cfg-img-scale`,
 `--timestep-shift`, `--max-think-tokens`, and `--extra-args` (JSON object for
 keys such as `cfg_interval`, `cfg_renorm_type`, `cfg_renorm_min`, `think`,
-`do_sample`, `text_temperature`). When omitted, the SenseNova pipeline fills
+`do_sample`, `text_temperature`). When omitted, the SenseNovaVision pipeline fills
 the per-mode defaults.

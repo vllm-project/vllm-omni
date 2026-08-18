@@ -10,16 +10,16 @@ generates text output for understanding tasks and image output for generation
 tasks, matching the BAGEL-fork lineage of the model.
 
 Equivalent to running:
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality text2text \
         --prompts "What is the capital of France?"
 
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality img2text \
         --image-path <image> \
         --prompts "What are the main objects in this scene and their relationships?"
 
-    python examples/offline_inference/sensenova/end2end.py \
+    python examples/offline_inference/sensenova_vision/end2end.py \
         --modality text2img \
         --prompts "A cute corgi astronaut on the moon, cinematic"
 """
@@ -36,7 +36,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL_NAME = "sensenova/SenseNova-Vision-7B-MoT"
-STAGE_CONFIG = get_deploy_config_path("ci/sensenova.yaml")
+STAGE_CONFIG = get_deploy_config_path("ci/sensenova_vision.yaml")
 
 REFERENCE_TEXT_TEXT2TEXT = "Paris"
 REFERENCE_TEXT_IMG2TEXT = "This is a photo of a wooden boardwalk or pathway that leads through tall green grass."
@@ -71,8 +71,8 @@ def _extract_image(omni_outputs: list):
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_sensenova_text2text(run_level, omni_runner: OmniRunner) -> None:
-    """Test SenseNova text2text produces correct text output."""
+def test_sensenova_vision_text2text(run_level, omni_runner: OmniRunner) -> None:
+    """Test SenseNovaVision text2text produces correct text output."""
     omni = omni_runner.omni
     prompt = "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
     params_list = omni.default_sampling_params_list
@@ -92,8 +92,8 @@ def test_sensenova_text2text(run_level, omni_runner: OmniRunner) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_sensenova_img2text(run_level, omni_runner: OmniRunner) -> None:
-    """Test SenseNova img2text produces correct text output."""
+def test_sensenova_vision_img2text(run_level, omni_runner: OmniRunner) -> None:
+    """Test SenseNovaVision img2text produces correct text output."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     omni = omni_runner.omni
     prompt = (
@@ -125,8 +125,8 @@ def test_sensenova_img2text(run_level, omni_runner: OmniRunner) -> None:
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_sensenova_text2img(omni_runner: OmniRunner) -> None:
-    """Test SenseNova text2img produces an image output."""
+def test_sensenova_vision_text2img(omni_runner: OmniRunner) -> None:
+    """Test SenseNovaVision text2img produces an image output."""
     omni = omni_runner.omni
     prompt = "<|im_start|>A cute corgi astronaut on the moon, cinematic<|im_end|>"
     params_list = omni.default_sampling_params_list

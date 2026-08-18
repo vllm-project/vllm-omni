@@ -573,11 +573,11 @@ def resolve_model_class_name(
 
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
-    if model_type == "sensenova" or "OmniSenseNovaForConditionalGeneration" in architectures:
+    if model_type == "sensenova_vision" or "OmniSenseNovaVisionForConditionalGeneration" in architectures:
         # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json carries no
         # model_type/architectures (metadata-only keys), so this mapping is
-        # what resolves the diffusion stage to SenseNovaPipeline.
-        return "SenseNovaPipeline"
+        # what resolves the diffusion stage to SenseNovaVisionPipeline.
+        return "SenseNovaVisionPipeline"
     if (
         model_type == "lance"
         or "LancePipeline" in architectures
@@ -1272,12 +1272,12 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
-                elif model_type == "sensenova" or "OmniSenseNovaForConditionalGeneration" in architectures:
+                elif model_type == "sensenova_vision" or "OmniSenseNovaVisionForConditionalGeneration" in architectures:
                     # SenseNova-Vision-7B-MoT: a Bagel fork. Its config.json
                     # carries no model_type/architectures (metadata-only keys),
                     # so this branch is what resolves the diffusion stage to
-                    # SenseNovaPipeline.
-                    self.model_class_name = "SenseNovaPipeline"
+                    # SenseNovaVisionPipeline.
+                    self.model_class_name = "SenseNovaVisionPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif (

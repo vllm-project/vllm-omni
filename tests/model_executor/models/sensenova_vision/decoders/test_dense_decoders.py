@@ -7,7 +7,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PIL import Image
-from vllm_omni.model_executor.models.sensenova.decoders.dense_decoders import (
+
+from vllm_omni.model_executor.models.sensenova_vision.decoders.dense_decoders import (
     decode_depth,
     decode_normal,
     decode_point_map,

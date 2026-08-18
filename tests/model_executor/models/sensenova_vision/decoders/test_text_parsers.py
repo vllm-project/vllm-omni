@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import pytest
-from vllm_omni.model_executor.models.sensenova.decoders.camera_pose import parse_camera_pose
-from vllm_omni.model_executor.models.sensenova.decoders.text_parsers import (
+
+from vllm_omni.model_executor.models.sensenova_vision.decoders.camera_pose import parse_camera_pose
+from vllm_omni.model_executor.models.sensenova_vision.decoders.text_parsers import (
     parse_bbox,
     parse_keypoints,
     parse_points,

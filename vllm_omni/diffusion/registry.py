@@ -156,10 +156,10 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
-    "SenseNovaPipeline": (
-        "sensenova",
-        "pipeline_sensenova",
-        "SenseNovaPipeline",
+    "SenseNovaVisionPipeline": (
+        "sensenova_vision",
+        "pipeline_sensenova_vision",
+        "SenseNovaVisionPipeline",
     ),
     "BooguImagePipeline": (
         "boogu_image",
@@ -562,7 +562,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
-    "SenseNovaPipeline": "get_sensenova_post_process_func",
+    "SenseNovaVisionPipeline": "get_sensenova_vision_post_process_func",
     "LancePipeline": "get_lance_post_process_func",
     "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
