@@ -457,6 +457,11 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    "MiniMaxH3TextEncoder": (
+        "minimax_h3",
+        "text_encoder",
+        "MiniMaxH3TextEncoder",
+    ),
 }
 
 

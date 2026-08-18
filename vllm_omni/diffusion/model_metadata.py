@@ -12,6 +12,7 @@ class DiffusionModelMetadata:
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
     attention_mask_free: bool = False
+    final_output_type: str | None = None
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
@@ -41,6 +42,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
         attention_mask_free=True,
@@ -51,11 +53,39 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        final_output_type="video",
     ),
-    "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
-    "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
-    "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
-    "WanS2VPipeline": DiffusionModelMetadata(attention_mask_free=True),
+    "WanPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanImageToVideoPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanVACEPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanS2VPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2DistilledPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2T2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2I2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HeliosPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "Cosmos3OmniPipeline": DiffusionModelMetadata(final_output_type="video"),
 }
 
 

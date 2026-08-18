@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -29,7 +30,7 @@ from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
@@ -44,6 +45,15 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
+
+
+def load_wan_vae_scale_factors(model: str, local_files_only: bool) -> tuple[int, int]:
+    vae_config = DistributedAutoencoderKLWan.load_config(
+        model,
+        subfolder="vae",
+        local_files_only=local_files_only,
+    )
+    return vae_config.get("scale_factor_temporal", 4), vae_config.get("scale_factor_spatial", 8)
 
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
@@ -341,6 +351,23 @@ class Wan22Pipeline(
 
         self.boundary_ratio = od_config.boundary_ratio
 
+        # Diffusion stage role (Encode/Generation (EG) disaggregation and
+        # beyond). ``resolve_diffusion_stage_role`` maps the structured
+        # ``stage_role`` (falling back to the legacy ``model_stage`` string) to
+        # a ``DiffusionStageRole``. ``role_loads_component`` then decides, model
+        # -agnostically, which component groups this stage instantiates so an
+        # ENCODE stage drops the DiT + VAE, etc.  ``forward`` is never called on
+        # an encode-only stage.
+        self.stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        role = self.stage_role.value
+        self.encode_only = not role_loads_component(role, "dit")
+        load_encoder = role_loads_component(role, "encoder")
+        load_dit = role_loads_component(role, "dit")
+        load_vae = role_loads_component(role, "vae")
+
         # Determine which transformers to load based on boundary_ratio
         # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
         # boundary_ratio=0.0: only load transformer (high-noise stage only)
@@ -349,6 +376,9 @@ class Wan22Pipeline(
         load_transformer_2 = self.has_transformer_2 and (
             self.boundary_ratio != 0.0 if self.boundary_ratio is not None else True
         )
+        if not load_dit:
+            load_transformer = False
+            load_transformer_2 = False
 
         # Set up weights sources for transformer(s)
         self.weights_sources = []
@@ -374,7 +404,11 @@ class Wan22Pipeline(
             )
 
         # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
-        component_subfolders = ["tokenizer", "text_encoder", "vae"]
+        component_subfolders = []
+        if load_encoder:
+            component_subfolders.extend(["tokenizer", "text_encoder"])
+        if load_vae:
+            component_subfolders.append("vae")
         prefetch_subfolders(
             model,
             component_subfolders,
@@ -385,29 +419,36 @@ class Wan22Pipeline(
         # cache is still half-written (the missing-shard ``OSError`` and the
         # default-``UMT5Config`` size-mismatch ``RuntimeError`` seen on multi
         # -worker HSDP / ring launches), instead of crashing the worker.
-        self.tokenizer = from_pretrained_with_prefetch(
-            AutoTokenizer.from_pretrained,
-            model,
-            subfolder="tokenizer",
-            prefetch_list=component_subfolders,
-            local_files_only=local_files_only,
-        )
-        self.text_encoder = from_pretrained_with_prefetch(
-            UMT5EncoderModel.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=component_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLWan.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=component_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+        if load_encoder:
+            self.tokenizer = from_pretrained_with_prefetch(
+                AutoTokenizer.from_pretrained,
+                model,
+                subfolder="tokenizer",
+                prefetch_list=component_subfolders,
+                local_files_only=local_files_only,
+            )
+            self.text_encoder = from_pretrained_with_prefetch(
+                UMT5EncoderModel.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=component_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            ).to(self.device)
+        else:
+            self.tokenizer = None
+            self.text_encoder = None
+        if not load_vae:
+            self.vae = None
+        else:
+            self.vae = from_pretrained_with_prefetch(
+                DistributedAutoencoderKLWan.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=component_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
@@ -427,6 +468,9 @@ class Wan22Pipeline(
             self.transformer_config = self.transformer.config
         elif load_transformer_2:
             self.transformer_config = self.transformer_2.config
+        elif not load_dit:
+            # Encode-only and decode-only stages never run the denoise path.
+            self.transformer_config = None
         else:
             raise RuntimeError("No transformer loaded")
 
@@ -434,8 +478,9 @@ class Wan22Pipeline(
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
+        self.vae_scale_factor_temporal, self.vae_scale_factor_spatial = load_wan_vae_scale_factors(
+            model, local_files_only
+        )
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -565,6 +610,225 @@ class Wan22Pipeline(
                 pbar.update()
 
         return latents
+
+    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
+        """Dispatch to the computation for this pipeline's stage role.
+
+        Centralizes diffusion disaggregation dispatch so the model runner stays
+        stage-agnostic: an ENCODE stage runs just the text encoder, while every
+        other role runs the full diffusion forward pass (which internally skips
+        text encoding when upstream embeddings are supplied). Additional roles
+        (e.g. a standalone DECODE stage) plug in here without runner changes.
+        """
+        if self.stage_role == DiffusionStageRole.ENCODE:
+            return self.encode_batch(batch)
+        if batch.is_dummy_run():
+            self._prepare_dummy_stage_payload(batch)
+        if self.stage_role == DiffusionStageRole.DECODE:
+            return self.decode_batch(batch)
+        return self.forward(batch)
+
+    def _prepare_dummy_stage_payload(self, batch: DiffusionRequestBatch) -> None:
+        """Supply the upstream payload omitted by the engine's local warmup."""
+        if self.stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
+            sequence_length = batch.sampling_params.max_sequence_length or 512
+            text_dim = self.transformer_config.text_dim
+            for req in batch.requests:
+                prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+                # Per-request payloads are stacked into the batch dim downstream.
+                prompt["prompt_embeds"] = torch.zeros(
+                    sequence_length,
+                    text_dim,
+                    device=self.device,
+                    dtype=self.transformer.dtype,
+                )
+                prompt["negative_prompt_embeds"] = torch.zeros_like(prompt["prompt_embeds"])
+                req.prompt = prompt
+        elif self.stage_role == DiffusionStageRole.DECODE:
+            height = batch.sampling_params.height or 512
+            width = batch.sampling_params.width or 512
+            num_frames = batch.sampling_params.num_frames or 1
+            latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+            for req in batch.requests:
+                prompt = req.prompt if isinstance(req.prompt, dict) else {"prompt": req.prompt}
+                # ``decode_batch`` concatenates per-request BCTHW latents.
+                prompt["latents"] = torch.zeros(
+                    1,
+                    self.vae.config.z_dim,
+                    latent_frames,
+                    height // self.vae_scale_factor_spatial,
+                    width // self.vae_scale_factor_spatial,
+                    device=self.device,
+                    dtype=self.vae.dtype,
+                )
+                req.prompt = prompt
+
+    def _decode_latents(self, latents: torch.Tensor, output_type: str | None = "np") -> torch.Tensor:
+        if latents.ndim != 5:
+            raise ValueError(f"Wan decode expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
+        if output_type == "latent":
+            return latents
+        if self.vae is None:
+            raise RuntimeError("Wan decode requires a loaded VAE.")
+
+        latents = latents.to(device=self.device, dtype=self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        return self.vae.decode(latents / latents_std + latents_mean, return_dict=False)[0]
+
+    def decode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        latents_per_request: list[torch.Tensor] = []
+        output_types: list[str] = []
+        for req in batch.requests:
+            # Connector-delivered payloads land under ``additional_information``,
+            # which ``get_prompt_field`` resolves alongside top-level keys.
+            latents = DiffusionRequestBatch.get_prompt_field(req.prompt, "latents")
+            if not isinstance(latents, torch.Tensor):
+                raise ValueError("Wan decode stage requires a tensor 'latents' payload.")
+            if latents.ndim != 5:
+                raise ValueError(f"Wan decode expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
+            latents_per_request.append(latents)
+            output_types.append(getattr(req.sampling_params, "output_type", None) or "np")
+
+        if not latents_per_request:
+            return []
+        if len(set(output_types)) != 1:
+            raise ValueError("Wan decode request batch requires the same output_type for all requests.")
+        latent_shape = latents_per_request[0].shape[1:]
+        if any(latents.shape[1:] != latent_shape for latents in latents_per_request[1:]):
+            raise ValueError("Wan decode request batch requires matching latent CTHW shapes.")
+
+        batch_sizes = [latents.shape[0] for latents in latents_per_request]
+        decoded = self._decode_latents(torch.cat(latents_per_request, dim=0), output_types[0])
+        if decoded.shape[0] != sum(batch_sizes):
+            raise RuntimeError(f"Wan VAE decode produced batch size {decoded.shape[0]}; expected {sum(batch_sizes)}.")
+        return [
+            DiffusionOutput(
+                output=output,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+            for output in torch.split(decoded, batch_sizes, dim=0)
+        ]
+
+    @staticmethod
+    def _denoise_outputs(
+        batch: DiffusionRequestBatch,
+        latents: torch.Tensor,
+        num_outputs_per_prompt: int,
+    ) -> list[DiffusionOutput]:
+        if latents.ndim != 5:
+            raise ValueError(f"Wan denoise expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
+        expected_batch = batch.num_reqs * num_outputs_per_prompt
+        if latents.shape[0] != expected_batch:
+            raise ValueError(
+                f"Wan denoise produced {latents.shape[0]} latent rows for {batch.num_reqs} requests "
+                f"with {num_outputs_per_prompt} outputs each; expected {expected_batch}."
+            )
+        return [
+            DiffusionOutput(
+                output=None,
+                custom_output={"latents": latents[idx * num_outputs_per_prompt : (idx + 1) * num_outputs_per_prompt]},
+                to_cpu=True,
+            )
+            for idx in range(batch.num_reqs)
+        ]
+
+    def encode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if batch.num_reqs == 1:
+            return [self.encode(batch.requests[0])]
+
+        prompts: list[str] = []
+        negative_prompts: list[str | None] = []
+        for req in batch.requests:
+            if req.prompt is None:
+                raise ValueError("Prompt is required for the Wan text-encode stage.")
+            prompt = req.prompt if isinstance(req.prompt, str) else req.prompt.get("prompt")
+            negative_prompt = None if isinstance(req.prompt, str) else req.prompt.get("negative_prompt")
+            if prompt is None:
+                raise ValueError("Prompt is required for the Wan text-encode stage.")
+            prompts.append(prompt)
+            negative_prompts.append(negative_prompt)
+
+        first_sampling = batch.sampling_params_list[0]
+        device = self.device
+        dtype = self.text_encoder.dtype
+        guidance_scale = first_sampling.guidance_scale or 1.0
+        guidance_scale_2 = first_sampling.guidance_scale_2
+        do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
+
+        # ``num_videos_per_prompt`` stays 1 here: the downstream diffusion stage
+        # re-expands the embeddings via ``repeat_interleave`` once it collates
+        # the batch, so expanding here would duplicate the fan-out.
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompts,
+            negative_prompt=negative_prompts,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            num_videos_per_prompt=1,
+            max_sequence_length=first_sampling.max_sequence_length or 512,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Emit unbatched ``(sequence_length, text_dim)`` tensors: the consuming
+        # stage stacks the per-request payloads back into the batch dimension.
+        outputs: list[DiffusionOutput] = []
+        for idx in range(batch.num_reqs):
+            custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[idx]}
+            if negative_prompt_embeds is not None:
+                custom_output["negative_prompt_embeds"] = negative_prompt_embeds[idx]
+            outputs.append(DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True))
+        return outputs
+
+    def encode(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Run only the text encoder and emit prompt embeddings.
+
+        This is the "encode" stage of Encode/Generation (EG) disaggregation.
+        It runs UMT5 on the prompt (and the negative prompt when CFG is
+        requested) and returns the embeddings in ``DiffusionOutput.custom_output``
+        so a downstream diffusion stage can consume them via ``prompt_embeds`` /
+        ``negative_prompt_embeds`` and skip text encoding entirely.
+        """
+        if req.prompt is None:
+            raise ValueError("Prompt is required for the Wan text-encode stage.")
+
+        prompt = req.prompt if isinstance(req.prompt, str) else req.prompt.get("prompt")
+        negative_prompt = None if isinstance(req.prompt, str) else req.prompt.get("negative_prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required for the Wan text-encode stage.")
+
+        device = self.device
+        dtype = self.text_encoder.dtype
+
+        guidance_scale = req.sampling_params.guidance_scale or 1.0
+        guidance_scale_2 = req.sampling_params.guidance_scale_2
+        do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
+
+        # See ``encode_batch``: the fan-out to ``num_outputs_per_prompt`` belongs
+        # to the downstream diffusion stage.
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            num_videos_per_prompt=1,
+            max_sequence_length=req.sampling_params.max_sequence_length or 512,
+            device=device,
+            dtype=dtype,
+        )
+
+        custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[0]}
+        if negative_prompt_embeds is not None:
+            custom_output["negative_prompt_embeds"] = negative_prompt_embeds[0]
+
+        # ``to_cpu`` moves the embedding tensors off-device at construction so
+        # they can cross a process / connector boundary to the decode stage
+        # without pinning a CUDA/XPU context on the receiver.
+        return DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
@@ -803,6 +1067,15 @@ class Wan22Pipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
 
+        if req.num_reqs > 1:
+            logger.info(
+                "[WanRequestBatch] denoise requests=%d latent_batch=%d steps=%d shape=%s",
+                req.num_reqs,
+                latents.shape[0],
+                len(timesteps),
+                tuple(latents.shape[1:]),
+            )
+
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
         latents = self.diffuse(
@@ -832,22 +1105,12 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
+        if self.stage_role == DiffusionStageRole.DENOISE:
+            return self._denoise_outputs(req, latents, num_outputs_per_prompt)
+
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
-        if output_type == "latent":
-            output = latents
-        else:
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+        output = self._decode_latents(latents, output_type)
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -944,6 +1207,7 @@ class Wan22Pipeline(
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt = [p or "" for p in negative_prompt]
             neg_text_inputs = self.tokenizer(
                 [self._prompt_clean(p) for p in negative_prompt],
                 padding="max_length",
@@ -1004,6 +1268,13 @@ class Wan22Pipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
+        if self.encode_only:
+            # Encode-only stage: the UMT5 text encoder is fully loaded via
+            # ``from_pretrained`` in ``__init__`` and there are no DiT/VAE
+            # weight sources for this stage. Return ``None`` so the loader skips
+            # its strict coverage check (which would otherwise flag the
+            # pre-loaded ``text_encoder.*`` params as "not initialized").
+            return None
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

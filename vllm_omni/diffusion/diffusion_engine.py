@@ -406,8 +406,16 @@ class DiffusionEngine:
         logger.debug("Generation completed successfully.")
 
         if output.output is None:
-            logger.warning("Output is None, returning empty OmniRequestOutput")
-            return format_empty_diffusion_outputs(request, finished=output.finished)
+            # Encode-only stages carry forward prompt embeddings in custom_output
+            # even though they do not emit images.
+            custom_output = output.custom_output or {}
+            if not custom_output:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+            return format_empty_diffusion_outputs(
+                request,
+                finished=output.finished,
+                custom_output=custom_output,
+            )
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still

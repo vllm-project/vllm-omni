@@ -606,6 +606,7 @@ class _DiffusionConfigProjection:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1117,6 +1118,10 @@ class BaseVllmOmniStageConfig:
     @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
+
+    @property
+    def prompt_transform_func(self) -> str | None:
+        return self.stage_pipeline_config.prompt_transform_func
 
     @property
     def cfg_kv_collect_func(self) -> str | None:

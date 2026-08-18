@@ -1,0 +1,43 @@
+# MiniMax H3: vLLM Qwen3-VL text encoder + diffusion video/audio generation.
+pipeline: minimax_h3_disaggregated
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+# The text encoder emits multi-megabyte BF16 hidden states per request. Moving
+# them worker-to-worker keeps them off the engine-core IPC socket entirely.
+connectors:
+  nixl_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50071
+      backends: ["UCX"]
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    output_connectors:
+      to_stage_1: nixl_connector
+    default_sampling_params:
+      max_tokens: 1
+      temperature: 0.0
+      detokenize: false
+
+  - stage_id: 1
+    devices: "2,3,4,5"
+    max_num_seqs: 1
+    model_loaded:
+      transformer: true
+      vae: true
+      text_encoder: false
+    parallel_config:
+      tensor_parallel_size: 4
+    input_connectors:
+      from_stage_0: nixl_connector
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50

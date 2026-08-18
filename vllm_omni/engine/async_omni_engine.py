@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import json
 import queue
 import threading
@@ -33,8 +34,12 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
-from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
-from vllm_omni.diffusion.diffusion_engine import supports_audio_output
+from vllm_omni.diffusion.data import (
+    DiffusionParallelConfig,
+    parse_attention_config,
+    resolve_model_class_name,
+)
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
     SHUTDOWN_JOIN_TIMEOUT_S,
@@ -215,6 +220,7 @@ class AsyncOmniEngine:
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
+        self.prompt_transform_func: Any | None = None
         self.prompt_expand_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
@@ -322,6 +328,9 @@ class AsyncOmniEngine:
             build_stage0_input_processor(self.stage_vllm_configs[0])
             if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
             else None
+        )
+        self.prompt_transform_func = (
+            getattr(self.stage_clients[0], "prompt_transform_func", None) if self.stage_clients else None
         )
         self.prompt_expand_func = next(
             (
@@ -672,6 +681,13 @@ class AsyncOmniEngine:
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+            prompt_transform_func = getattr(self, "prompt_transform_func", None)
+            if prompt_transform_func is not None:
+                prompt = prompt_transform_func(
+                    copy.copy(prompt),
+                    effective_sampling_params_list,
+                )
+
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 inject_global_id(prompt, request_id)
@@ -967,7 +983,7 @@ class AsyncOmniEngine:
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
         model_class_name = kwargs.get("model_class_name", None)
-        final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
+        final_output_type = get_diffusion_output_type(model_class_name)
 
         attention_config = None
         if (
@@ -1129,11 +1145,22 @@ class AsyncOmniEngine:
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
+        def create_default_stage_config() -> list:
+            default_stage_kwargs = dict(kwargs)
+            if not default_stage_kwargs.get("model_class_name"):
+                model_class_name = resolve_model_class_name(
+                    model,
+                    default_stage_kwargs.get("diffusion_load_format", "default"),
+                )
+                if model_class_name is not None:
+                    default_stage_kwargs["model_class_name"] = model_class_name
+            return self._create_default_diffusion_stage_cfg(default_stage_kwargs)
+
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            default_stage_cfg_factory=create_default_stage_config,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,

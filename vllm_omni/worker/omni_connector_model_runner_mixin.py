@@ -26,9 +26,11 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
     ConnectorSpec,
     get_stage_connector_role,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, kv_zmq_port
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -2125,11 +2127,36 @@ class OmniConnectorModelRunnerMixin:
         elif not isinstance(extra, dict):
             raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
 
+        extra = OmniConnectorModelRunnerMixin._rank_aware_extra(name, extra)
         spec = ConnectorSpec(name=name, extra=extra)
         try:
             return OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
+
+    @staticmethod
+    def _rank_aware_extra(name: str, extra: dict[str, Any]) -> dict[str, Any]:
+        """Offset a handshake port so every TP rank binds its own.
+
+        The deploy YAML spells out a single base port per edge, and the
+        orchestrator publishes ``kv_zmq_port(base, from_stage, 0)`` as the
+        producer endpoint. Senders created here must bind by the same formula,
+        otherwise rank 1 collides with rank 0 on the port from the YAML.
+        """
+        if name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            return extra
+        base_port = extra.get("zmq_port")
+        if base_port is None or extra.get("role") == "receiver":
+            return extra
+        try:
+            base_port = int(os.path.expandvars(str(base_port)))
+            stage_id = int(extra.get("stage_id", 0))
+        except (TypeError, ValueError):
+            logger.warning("Connector %s has a non-numeric zmq_port/stage_id; leaving the port as configured", name)
+            return extra
+        resolved = dict(extra)
+        resolved["zmq_port"] = kv_zmq_port(base_port, stage_id, get_local_tp_rank())
+        return resolved
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
@@ -2315,7 +2342,8 @@ class OmniConnectorModelRunnerMixin:
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             return getattr(tp_group, "rank_in_group", 0) == 0
-        return self._local_rank == 0
+        # Runners that skip init_omni_connectors (diffusion) have no _local_rank.
+        return getattr(self, "_local_rank", 0) == 0
 
     def get_kv_connector_key(
         self,

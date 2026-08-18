@@ -29,6 +29,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
     pipeline.od_config = SimpleNamespace()
+    pipeline.text_encoder = object()
     cache_spec = object()
     quality_plan = SimpleNamespace(cache_dit=cache_spec)
     pipeline._quality_policy = Mock()

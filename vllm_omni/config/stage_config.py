@@ -140,6 +140,74 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStageRole(str, Enum):
+    """Role of a diffusion stage within a (possibly disaggregated) pipeline.
+
+    ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
+    orthogonal axis that answers *which slice of a diffusion model* the stage
+    runs. Splitting a single diffusion model across stages by role lets many
+    DiT-style models become disaggregatable through configuration alone, with no
+    per-model source changes:
+
+    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
+                   stage. This is the default / single-stage behavior.
+    - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
+                   embeddings for a downstream stage.
+    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
+                   and emit latents for a downstream decode stage.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                          generation stage of E/G disaggregation).
+    - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
+                   stage of a 3-way E/G/D split).
+    """
+
+    FULL = "full"
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
+    DECODE = "decode"
+
+
+# Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
+# a free-form string ("text_encode"/"dit") before roles existed; keep the map so
+# older stage configs and deploy YAML keep working.
+_MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
+    "text_encode": DiffusionStageRole.ENCODE,
+    "encode": DiffusionStageRole.ENCODE,
+    "dit": DiffusionStageRole.DENOISE_DECODE,
+    "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
+    "decode": DiffusionStageRole.DECODE,
+    "vae_decode": DiffusionStageRole.DECODE,
+    "diffusion": DiffusionStageRole.FULL,
+    "full": DiffusionStageRole.FULL,
+}
+
+
+def resolve_diffusion_stage_role(
+    stage_role: DiffusionStageRole | str | None,
+    model_stage: str | None = None,
+) -> DiffusionStageRole:
+    """Resolve the effective diffusion stage role.
+
+    Prefers an explicit ``stage_role`` and otherwise falls back to the legacy
+    free-form ``model_stage`` string. Unknown values resolve to ``FULL`` so a
+    plain single-stage diffusion model keeps running the whole pipeline.
+    """
+    if isinstance(stage_role, DiffusionStageRole):
+        return stage_role
+    if isinstance(stage_role, str) and stage_role:
+        try:
+            return DiffusionStageRole(stage_role)
+        except ValueError:
+            resolved = _MODEL_STAGE_TO_ROLE.get(stage_role)
+            if resolved is not None:
+                return resolved
+    if model_stage:
+        return _MODEL_STAGE_TO_ROLE.get(model_stage, DiffusionStageRole.FULL)
+    return DiffusionStageRole.FULL
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -174,6 +242,11 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
+    # Diffusion-only: which slice of a diffusion model this stage runs
+    # (encode / denoise / decode / full). Orthogonal to ``execution_type`` and
+    # only meaningful when ``execution_type == DIFFUSION``. ``None`` falls back
+    # to ``model_stage`` (legacy) and ultimately to ``FULL``.
+    stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
@@ -191,8 +264,21 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
+    # The callable receives ``(prompt, sampling_params_list)``; downstream
+    # stages continue to receive the original prompt.
+    prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    # Payload keys this stage expects to receive from its upstream stage over
+    # the omni connector instead of through the orchestrator IPC hop. Declaring
+    # them is what enables the worker-side connector receive path, so an empty
+    # tuple leaves existing deployments untouched.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    # Mirror of the above on the producing side: keys this stage hands to the
+    # next stage over the connector. Only diffusion producers need this; AR
+    # stages already send through ``send_full_payload_outputs``.
+    stage_output_payload_keys: tuple[str, ...] = ()
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -819,6 +905,10 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.stage_input_payload_keys:
+        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_output_payload_keys:
+        engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -864,6 +954,8 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_transform_func:
+        extras["prompt_transform_func"] = ps.prompt_transform_func
     if ps.prompt_expand_func:
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
@@ -942,6 +1034,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -969,6 +1062,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    stage_role: str | None = None
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -992,6 +1086,11 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
+        # surfaced when set so non-diffusion stages are unaffected; the payload
+        # key schema rides along in ``yaml_engine_args``.
+        if self.stage_role is not None:
+            engine_args["stage_role"] = self.stage_role
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:

@@ -339,6 +339,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "NemotronHForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
+            "MiniMaxH3TextEncoder",
             # nemotron_voicechat: the talker (stage 1) is the full-payload
             # producer for code2wav (stage 2); the thinker (stage 0) only
             # produces over the connector in async-chunk (streaming) mode.

@@ -429,6 +429,20 @@ class TestStageConfigFactory:
         assert cfg["final_output"] is True
         assert cfg["final_output_type"] == "image"
 
+    @pytest.mark.parametrize(
+        "model_class_name",
+        [
+            "MiniMaxH3Pipeline",
+            "WanPipeline",
+            "LTX2Pipeline",
+            "Cosmos3OmniDiffusersPipeline",
+        ],
+    )
+    def test_default_video_diffusion_output_type(self, model_class_name):
+        configs = StageConfigFactory.create_default_diffusion({"model_class_name": model_class_name})
+
+        assert configs[0]["final_output_type"] == "video"
+
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
 
@@ -1275,6 +1289,13 @@ stages:
             ("step_audio2_ci.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
             ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
             ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
+            (
+                "minimax_h3_disaggregated.yaml",
+                "minimax_h3_disaggregated",
+                2,
+                "video",
+                "minimax_h3_disaggregated",
+            ),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(
@@ -1331,6 +1352,29 @@ stages:
 
         assert pipeline is not None
         assert pipeline.model_type == expected_pipeline
+
+    def test_minimax_h3_disaggregation_is_not_auto_discovered(self):
+        def get_model_file(filename, _model, revision=None):
+            del revision
+            if filename == "config.json":
+                return None
+            if filename == "model_index.json":
+                return {"_class_name": "MiniMaxH3Pipeline"}
+            return None
+
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch(
+                "vllm_omni.config.config_factory.get_hf_file_to_dict",
+                side_effect=get_model_file,
+            ),
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                model="/models/unrelated-checkpoint-name",
+                trust_remote_code=False,
+            )
+
+        assert pipeline is None
 
     @pytest.mark.parametrize("deploy_name", ["step_audio_2.yaml", "step_audio_2_async_chunk.yaml"])
     def test_step_audio2_deploy_configs_fit_two_gpus(self, deploy_name):

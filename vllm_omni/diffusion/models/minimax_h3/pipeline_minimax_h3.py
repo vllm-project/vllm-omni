@@ -54,6 +54,9 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+    MiniMaxH3TextConditioning,
+)
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
@@ -133,6 +136,28 @@ MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
     "fl2va": ["FL2VA/**"],
     "ref2va": ["Ref2VA/**"],
 }
+MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
+    "fl2va": [
+        "FL2VA/model_index.json",
+        "FL2VA/transformer/**",
+        "FL2VA/video_vae/**",
+        "FL2VA/audio_vae/**",
+    ],
+    "ref2va": [
+        "Ref2VA/model_index.json",
+        "Ref2VA/transformer/**",
+        "Ref2VA/video_vae/**",
+        "Ref2VA/audio_vae/**",
+    ],
+    "combined": [
+        "FL2VA/model_index.json",
+        "FL2VA/transformer/**",
+        "FL2VA/video_vae/**",
+        "FL2VA/audio_vae/**",
+        "Ref2VA/model_index.json",
+        "Ref2VA/transformer/**",
+    ],
+}
 
 
 def _resolve_minimax_h3_text_encoder_quant_config(
@@ -164,15 +189,20 @@ def _resolve_minimax_h3_model_root(
     model: str,
     revision: str | None,
     partition: str,
+    *,
+    load_text_encoder: bool,
 ) -> Path:
     path = Path(model)
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
             return path.parent
         return path
-    allow_patterns = (
-        MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
-    )
+    if load_text_encoder:
+        allow_patterns = (
+            MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
+        )
+    else:
+        allow_patterns = MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS[partition]
     return Path(
         download_weights_from_hf_specific(
             model_name_or_path=model,
@@ -187,6 +217,23 @@ def _resolve_minimax_h3_model_root(
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
     return DMD2SigmaSchedule.from_metadata(release)
+
+
+def resolve_minimax_h3_diffusion_model_path(
+    model: str,
+    revision: str | None,
+    task_type: str | None,
+) -> str:
+    """Resolve a repository root or Hub ID to its startup partition."""
+    partition = _minimax_h3_partition_for_task(task_type, model)
+    model_root = _resolve_minimax_h3_model_root(
+        model,
+        revision,
+        partition,
+        load_text_encoder=False,
+    )
+    subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
+    return str(model_root / subdir)
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -271,7 +318,7 @@ def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
         return audios[0]
     if isinstance(value, (str, os.PathLike)):
         return load_audio_file(str(value))
-    if isinstance(value, tuple) and len(value) == 2:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
         waveform, sample_rate = value
         waveform = torch.as_tensor(waveform).float()
         return waveform, int(sample_rate)
@@ -580,6 +627,7 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self.load_text_encoder = od_config.model_loaded["text_encoder"]
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
             str(od_config.model),
@@ -588,6 +636,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
             od_config.revision,
             self.partition,
+            load_text_encoder=self.load_text_encoder,
         )
         model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
@@ -659,54 +708,62 @@ class MiniMaxH3Pipeline(
                 quant_config=transformer_quant_config,
             )
 
-        self.tokenizer = Qwen2TokenizerFast.from_pretrained(
-            str(model_path),
-            subfolder="tokenizer",
-            local_files_only=os.path.isdir(model_path),
-        )
-        self.processor = Qwen3VLProcessor.from_pretrained(
-            str(model_path),
-            subfolder="processor",
-            local_files_only=os.path.isdir(model_path),
-        )
+        if self.load_text_encoder:
+            self.tokenizer = Qwen2TokenizerFast.from_pretrained(
+                str(model_path),
+                subfolder="tokenizer",
+                local_files_only=os.path.isdir(model_path),
+            )
+            self.processor = Qwen3VLProcessor.from_pretrained(
+                str(model_path),
+                subfolder="processor",
+                local_files_only=os.path.isdir(model_path),
+            )
+        else:
+            self.tokenizer = None
+            self.processor = None
 
         _, rank, dit_world = _dit_rank_world()
         self._dit_rank = rank
-        text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
-        if text_encoder_tp_size < 1:
-            raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
-        if text_encoder_tp_size > dit_world:
-            raise ValueError(
-                f"text_encoder_tp_size must not exceed the DiT group size ({dit_world}), got {text_encoder_tp_size}"
-            )
-        # The Qwen3-VL text model uses 64 attention heads / 8 KV heads; the
-        # encoder shards them across the encoder TP ranks.
-        if 64 % text_encoder_tp_size or 8 % text_encoder_tp_size:
-            raise ValueError(
-                "text_encoder_tp_size must divide both Qwen3-VL "
-                f"num_attention_heads (64) and num_key_value_heads (8), "
-                f"got {text_encoder_tp_size}"
-            )
-        self.text_encoder_tp_size = text_encoder_tp_size
-        self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
-        load_text_encoder = rank < text_encoder_tp_size
-        self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-            os.path.join(model_path, "text_encoder"),
-            device=self.device,
-            load_model=load_text_encoder,
-            encoder_group=self.text_encoder_group,
-            quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
-        )
-        if load_text_encoder:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(model_path),
-                    subfolder="text_encoder",
-                    revision=od_config.revision,
-                    prefix="text_encoder.",
-                    fall_back_to_pt=False,
+        if self.load_text_encoder:
+            text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1))
+            if text_encoder_tp_size < 1:
+                raise ValueError(f"text_encoder_tp_size must be >= 1, got {text_encoder_tp_size}")
+            if text_encoder_tp_size > dit_world:
+                raise ValueError(
+                    f"text_encoder_tp_size must not exceed the DiT group size ({dit_world}), got {text_encoder_tp_size}"
                 )
+            # The Qwen3-VL text model uses 64 attention heads / 8 KV heads.
+            if 64 % text_encoder_tp_size or 8 % text_encoder_tp_size:
+                raise ValueError(
+                    "text_encoder_tp_size must divide both Qwen3-VL "
+                    f"num_attention_heads (64) and num_key_value_heads (8), "
+                    f"got {text_encoder_tp_size}"
+                )
+            self.text_encoder_tp_size = text_encoder_tp_size
+            self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+            self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                os.path.join(model_path, "text_encoder"),
+                device=self.device,
+                load_model=rank < text_encoder_tp_size,
+                encoder_group=self.text_encoder_group,
+                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
+            if rank < text_encoder_tp_size:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(model_path),
+                        subfolder="text_encoder",
+                        revision=od_config.revision,
+                        prefix="text_encoder.",
+                        fall_back_to_pt=False,
+                    )
+                )
+        else:
+            self.text_encoder_tp_size = 0
+            self.text_encoder_group = None
+            self.text_encoder = None
+            self._encoder_modules = []
         stage_components = bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
@@ -759,6 +816,8 @@ class MiniMaxH3Pipeline(
         # path as the DiT.
         for component_name in ("video_vae", "audio_vae"):
             component = getattr(self, component_name)
+            if component is None:
+                continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
         return loaded_with_prefix
 
@@ -1614,12 +1673,22 @@ class MiniMaxH3Pipeline(
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
         raw_prompt = request.prompts[0]
+        text_conditioning = None
         if isinstance(raw_prompt, str):
             prompt = raw_prompt
             multi_modal_data: dict[str, Any] = {}
         else:
             prompt = str(raw_prompt.get("prompt") or "")
             multi_modal_data = raw_prompt.get("multi_modal_data") or {}
+            additional_information = raw_prompt.get("additional_information") or {}
+            text_encoder_output = additional_information.get("text_encoder_output")
+            if text_encoder_output is not None:
+                if not isinstance(text_encoder_output, Mapping):
+                    raise OmniClientError("text_encoder_output must be a mapping")
+                try:
+                    text_conditioning = MiniMaxH3TextConditioning.from_payload(text_encoder_output)
+                except ValueError as exc:
+                    raise OmniClientError(str(exc)) from exc
         if not prompt:
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
 
@@ -1736,13 +1805,27 @@ class MiniMaxH3Pipeline(
                 audio_index += 1
                 condition_labels.append(("audio", audio_index))
 
-            text_embeddings, text_tags = self.encode_prompt(
-                task=task,
-                prompt=prompt,
-                images=prepared_images,
-                prepared_videos=prepared_videos,
-                condition_labels=condition_labels if task == "ref2va" else None,
-            )
+            if text_conditioning is not None:
+                text_embeddings = text_conditioning.hidden_states.to(
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                )
+                text_tags = text_conditioning.token_tags.to(
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            elif getattr(self, "load_text_encoder", True):
+                text_embeddings, text_tags = self.encode_prompt(
+                    task=task,
+                    prompt=prompt,
+                    images=prepared_images,
+                    prepared_videos=prepared_videos,
+                    condition_labels=condition_labels if task == "ref2va" else None,
+                )
+            else:
+                raise OmniClientError(
+                    "MiniMax H3 diffusion stage requires text_encoder_output when text_encoder is not loaded"
+                )
 
             # ``prepared_videos`` is intentionally ``None`` on non-zero DiT
             # ranks; the distributed video encoder broadcasts the prepared
