@@ -5,6 +5,26 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
+  - group: ":card_index_dividers: Simple Test"
+    key: nightly-simple-test-group
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    steps:
+
+      - label: ":full_moon: Simple · CPU Coverage Test"
+        key: nightly-simple-cpu-coverage
+        timeout_in_minutes: 40
+        commands:
+          - |
+            set +e
+            REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
+            pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
+            EXIT=$$?
+            gzip -9 -f "$${REPORT}"
+            buildkite-agent artifact upload "$${REPORT}.gz"
+            exit $$EXIT
+        mirror_hardwares: l4_1
+
   # Group: collapses under one heading in the Buildkite UI; child steps still run in parallel.
   - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
