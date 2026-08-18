@@ -81,6 +81,7 @@ def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods():
     model_config = _make_diffusion_vllm_model_config(od_config)
 
     assert model_config.dtype is torch.bfloat16
+    assert model_config.head_dtype is model_config.dtype
     assert model_config.quantization == "modelopt"
     assert model_config.quantization_config is od_config.quantization_config
     assert model_config.is_quantized()

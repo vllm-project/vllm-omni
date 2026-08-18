@@ -90,6 +90,10 @@ class _DiffusionVllmModelConfig:
     enable_return_routed_experts: bool = False
     is_moe: bool = False
 
+    @property
+    def head_dtype(self) -> torch.dtype:
+        return self.dtype
+
     def is_quantized(self) -> bool:
         return self.quantization is not None
 
