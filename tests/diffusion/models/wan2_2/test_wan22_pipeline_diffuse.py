@@ -93,6 +93,29 @@ def _make_pipeline() -> Wan22Pipeline:
     return pipeline
 
 
+def _make_sampling(**overrides):
+    values = {
+        "height": None,
+        "width": None,
+        "num_frames": 1,
+        "num_inference_steps": 2,
+        "guidance_scale_provided": True,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": None,
+        "guidance_scale_2_provided": False,
+        "boundary_ratio": None,
+        "generator": None,
+        "seed": None,
+        "num_outputs_per_prompt": 1,
+        "max_sequence_length": 32,
+        "latents": None,
+        "output_type": "latent",
+        "extra_args": {},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 @pytest.mark.parametrize(
     ("sampling_params_kwargs", "expected_low", "expected_high"),
     [
@@ -129,9 +152,10 @@ def test_forward_delegates_denoising_to_diffuse(
     )
     batch = DiffusionRequestBatch(requests=[mock_req])
 
-    output = pipeline.forward(batch)
+    outputs = pipeline.forward(batch)
 
-    assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
+    assert len(outputs) == 1
+    assert torch.equal(outputs[0].output, torch.ones((1, 4, 1, 8, 8)))
     assert torch.equal(captured["prompt_embeds"], torch.zeros(1, 32, 8))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
     assert captured["guidance_low"] == expected_low
@@ -140,6 +164,134 @@ def test_forward_delegates_denoising_to_diffuse(
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None
     assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"))]
+
+
+def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
+    pipeline = _make_pipeline()
+    encode_call = {}
+    prepare_call = {}
+
+    def _fake_encode_prompt(**kwargs):
+        encode_call.update(kwargs)
+        batch_size = len(kwargs["prompt"])
+        n = batch_size * kwargs["num_videos_per_prompt"]
+        return torch.arange(n, dtype=torch.float32).view(n, 1, 1), torch.zeros(n, 1, 1)
+
+    def _fake_prepare_latents(**kwargs):
+        prepare_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.encode_prompt = _fake_encode_prompt  # type: ignore[method-assign]
+    pipeline.prepare_latents = _fake_prepare_latents  # type: ignore[method-assign]
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+
+    gen_a = torch.Generator(device="cpu").manual_seed(1)
+    gen_b = torch.Generator(device="cpu").manual_seed(2)
+    latents_a = torch.zeros(2, 4, 1, 2, 2)
+    latents_b = torch.ones(2, 4, 1, 2, 2)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={"prompt": "first", "negative_prompt": "bad first"},
+                sampling_params=_make_sampling(
+                    generator=gen_a,
+                    latents=latents_a,
+                    num_outputs_per_prompt=2,
+                ),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt": "second", "negative_prompt": "bad second"},
+                sampling_params=_make_sampling(
+                    generator=gen_b,
+                    latents=latents_b,
+                    num_outputs_per_prompt=2,
+                ),
+            ),
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert encode_call["prompt"] == ["first", "second"]
+    assert encode_call["negative_prompt"] == ["bad first", "bad second"]
+    assert prepare_call["batch_size"] == 4
+    assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]
+    torch.testing.assert_close(prepare_call["latents"], torch.cat([latents_a, latents_b]))
+    assert len(outputs) == 2
+    torch.testing.assert_close(outputs[0].output, latents_a)
+    torch.testing.assert_close(outputs[1].output, latents_b)
+
+
+def test_forward_batches_precomputed_prompt_embeddings() -> None:
+    pipeline = _make_pipeline()
+    diffuse_call = {}
+    pipeline.encode_prompt = lambda **kwargs: pytest.fail("text encoder must not run")  # type: ignore[method-assign]
+    pipeline.prepare_latents = lambda **kwargs: torch.zeros(kwargs["batch_size"], 4, 1, 2, 2)  # type: ignore[method-assign]
+
+    def _fake_diffuse(**kwargs):
+        diffuse_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    embeds_a = torch.zeros(3, 4)
+    embeds_b = torch.ones(3, 4)
+    negative_a = torch.full((3, 4), 2.0)
+    negative_b = torch.full((3, 4), 3.0)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={"prompt_embeds": embeds_a, "negative_prompt_embeds": negative_a},
+                sampling_params=_make_sampling(guidance_scale=4.0),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt_embeds": embeds_b, "negative_prompt_embeds": negative_b},
+                sampling_params=_make_sampling(guidance_scale=4.0),
+            ),
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    torch.testing.assert_close(diffuse_call["prompt_embeds"], torch.stack([embeds_a, embeds_b]))
+    torch.testing.assert_close(diffuse_call["negative_prompt_embeds"], torch.stack([negative_a, negative_b]))
+    assert len(outputs) == 2
+
+
+def test_prepare_latents_with_request_generators_matches_single_generation() -> None:
+    pipeline = _make_pipeline()
+    kwargs = {
+        "num_channels_latents": 4,
+        "height": 16,
+        "width": 16,
+        "num_frames": 5,
+        "dtype": torch.float32,
+        "device": torch.device("cpu"),
+    }
+
+    batched = Wan22Pipeline.prepare_latents(
+        pipeline,
+        batch_size=2,
+        generator=[torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)],
+        **kwargs,
+    )
+    singles = torch.cat(
+        [
+            Wan22Pipeline.prepare_latents(
+                pipeline,
+                batch_size=1,
+                generator=torch.Generator().manual_seed(seed),
+                **kwargs,
+            )
+            for seed in (1, 2)
+        ]
+    )
+
+    torch.testing.assert_close(batched, singles)
+    assert not torch.equal(batched[0], batched[1])
 
 
 def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:

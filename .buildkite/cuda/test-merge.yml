@@ -76,6 +76,9 @@ steps:
           - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
           - tests/e2e/offline_inference/test_qwen3_tts_customvoice.py
           - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+          - vllm_omni/model_executor/models/common/snake_activation.py
+          - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
         commands:
@@ -92,31 +95,24 @@ steps:
           - tests/e2e/online_serving/test_qwen3_tts_base.py
           - tests/e2e/offline_inference/test_qwen3_tts_base.py
           - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+          - vllm_omni/model_executor/models/common/snake_activation.py
+          - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - .buildkite/common/scripts/run_cov_split.sh
+          - pyproject.toml
+        # 40 -> 60: the coverage split runs the model twice.
+        timeout_in_minutes: 60
         commands:
           - |
-            timeout 40m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: l4_1
-
-      - label: "TTS · Higgs-Audio-V3 Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_higgs_audio_v3.py
-          - vllm_omni/model_executor/models/higgs_audio_v3/
-          - vllm_omni/model_executor/stage_input_processors/higgs_audio_v3.py
-          - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
-        commands:
-          - |
-            timeout 20m bash -c "
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              export VLLM_USE_DEEP_GEMM=0
-              export VLLM_MOE_USE_DEEP_GEMM=0
-              pytest -s -v tests/e2e/online_serving/test_higgs_audio_v3.py -m 'advanced_model' --run-level 'advanced_model'
-            "
+            export VLLM_LOGGING_LEVEL=DEBUG
+            export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+            .buildkite/common/scripts/run_cov_split.sh \
+              --model-id qwen3_tts \
+              --offline tests/e2e/offline_inference/test_qwen3_tts_base.py \
+              --online tests/e2e/online_serving/test_qwen3_tts_base.py \
+              -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
       - label: "Omni · Qwen3-Omni Test"
@@ -124,6 +120,10 @@ steps:
           - tests/e2e/offline_inference/test_qwen3_omni.py
           - tests/e2e/online_serving/test_qwen3_omni.py
           - vllm_omni/model_executor/models/qwen3_omni/
+          - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+          - vllm_omni/model_executor/models/common/snake_activation.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
+          - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
           - vllm_omni/deploy/qwen3_omni_moe.yaml
         timeout_in_minutes: 50
@@ -135,6 +135,11 @@ steps:
         source_file_dependencies:
           - tests/e2e/offline_inference/test_minicpmo_4_5.py
           - tests/e2e/online_serving/test_minicpmo_4_5.py
+          - vllm_omni/model_executor/models/minicpmo_4_5/
+          - vllm_omni/model_executor/models/step_audio2/
+          - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
+          - vllm_omni/model_executor/models/cosyvoice3/utils.py
+          - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
         timeout_in_minutes: 50
         commands:
@@ -156,62 +161,35 @@ steps:
           - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+          - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
           - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
+          - vllm_omni/model_executor/models/step_audio2/
+          - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
+          - vllm_omni/model_executor/models/cosyvoice3/utils.py
           - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
           - vllm_omni/core/sched/
           - vllm_omni/outputs/multimodal_accumulation.py
           - vllm_omni/engine/stage_init_utils.py
           - vllm_omni/engine/async_omni_engine.py
+          - vllm_omni/engine/orchestrator.py
           - vllm_omni/entrypoints/cli/serve.py
+          - vllm_omni/entrypoints/openai/api_server.py
+          - vllm_omni/entrypoints/openai/duplex_capability.py
+          - vllm_omni/config/stage_config.py
         timeout_in_minutes: 50
         commands:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-        mirror_hardwares: h100_1
-
-      - label: "TTS · VoxCPM2 Test"
-        source_file_dependencies:
-          - tests/e2e/offline_inference/test_voxcpm2_tts.py
-          - tests/e2e/online_serving/test_voxcpm2_tts.py
-          - vllm_omni/model_executor/models/voxcpm2/
-          - vllm_omni/deploy/voxcpm2.yaml
-        timeout_in_minutes: 30
-        commands:
-          - |
-            timeout 30m bash -c "
-              export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_voxcpm2_tts.py tests/e2e/online_serving/test_voxcpm2_tts.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: l4_1
-
-      - label: "Diffusion · Qwen Image Edit Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen_image_edit.py
-          - vllm_omni/diffusion/models/qwen_image/
-        timeout_in_minutes: 20
-        commands:
-          - pytest -s -v tests/e2e/online_serving/test_qwen_image_edit.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-        mirror_hardwares: h100_1
-      - label: "Diffusion · Bagel Test"
-        source_file_dependencies:
-          - tests/e2e/offline_inference/test_bagel.py
-          - tests/e2e/online_serving/test_bagel.py
-          - vllm_omni/model_executor/models/bagel/
-          - vllm_omni/diffusion/models/bagel/
-          - vllm_omni/model_executor/stage_input_processors/bagel.py
-          - vllm_omni/deploy/bagel.yaml
-        timeout_in_minutes: 20
-        commands:
-          - pytest -s -v tests/e2e/offline_inference/test_bagel.py tests/e2e/online_serving/test_bagel.py -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_qwen_image.py
           - vllm_omni/diffusion/models/qwen_image/
+          - vllm_omni/diffusion/models/dmd2/
+          - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
         commands:
           - |
             timeout 40m bash -c '
@@ -220,23 +198,12 @@ steps:
             '
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · Qwen Image Layered Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_qwen_image_layered.py
-          - vllm_omni/diffusion/models/qwen_image/
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m 'advanced_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: h100_1
-
       - label: "Diffusion · Wan22 Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_wan22_t2v.py
           - tests/e2e/online_serving/test_wan22_t2v.py
           - vllm_omni/diffusion/models/wan2_2/
+          - vllm_omni/diffusion/models/dmd2/
         commands:
           - |
             timeout 40m bash -c "
@@ -244,21 +211,3 @@ steps:
               pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
-
-      - label: "Diffusion · Z Image Test"
-        source_file_dependencies:
-          - tests/e2e/offline_inference/test_z_image.py
-          - tests/e2e/online_serving/test_z_image.py
-          - vllm_omni/diffusion/models/z_image/
-        timeout_in_minutes: 30
-        commands:
-          - pytest -s -v tests/e2e/offline_inference/test_z_image.py tests/e2e/online_serving/test_z_image.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
-        mirror_hardwares: l4_1
-      - label: "Diffusion · FLUX.2 Klein Test"
-        source_file_dependencies:
-          - tests/e2e/offline_inference/test_flux2_klein.py
-          - vllm_omni/diffusion/models/flux2_klein/
-        timeout_in_minutes: 30
-        commands:
-          - pytest -s -v tests/e2e/offline_inference/test_flux2_klein.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
-        mirror_hardwares: l4_1

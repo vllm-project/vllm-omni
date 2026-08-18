@@ -109,7 +109,7 @@ def _diffusion_sampling_params(
 
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
 ]
 

@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-device baseline with enforce-eager (no torch.compile)",
@@ -64,7 +64,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-device with torch.compile (default, no enforce-eager)",
@@ -117,7 +117,7 @@
           "num_cards": 2
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "CFG-parallel=2 with enforce-eager",
@@ -172,7 +172,7 @@
           "num_cards": 2
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "CFG-parallel=2 with torch.compile",
@@ -226,7 +226,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "CacheDiT with enforce-eager",

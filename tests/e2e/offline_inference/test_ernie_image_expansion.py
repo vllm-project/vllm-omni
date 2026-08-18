@@ -17,7 +17,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 MODEL = "baidu/ERNIE-Image"
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAM = (
     MODEL,
     None,

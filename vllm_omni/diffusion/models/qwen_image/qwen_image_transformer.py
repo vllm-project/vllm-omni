@@ -642,10 +642,10 @@ class QwenImageCrossAttention(nn.Module):
         txt_query = self.norm_added_q(txt_query)
         txt_key = self.norm_added_k(txt_key)
 
-        img_cos = vid_freqs.real.to(img_query.dtype)
-        img_sin = vid_freqs.imag.to(img_query.dtype)
-        txt_cos = txt_freqs.real.to(txt_query.dtype)
-        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+        img_cos = torch.real(vid_freqs).to(img_query.dtype)
+        img_sin = torch.imag(vid_freqs).to(img_query.dtype)
+        txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
+        txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
 
         img_query = self.rope(img_query, img_cos, img_sin)
         img_key = self.rope(img_key, img_cos, img_sin)

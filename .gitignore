@@ -46,6 +46,8 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+coverage-*.xml
+coverage-*.xml.gz
 *.cover
 *.py,cover
 .hypothesis/
@@ -253,6 +255,7 @@ outputs/
 results/
 generated/
 output_*/
+/tests/e2e/accuracy/artifacts/
 
 # Configuration overrides
 configs/local.yaml
