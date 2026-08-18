@@ -153,6 +153,7 @@ _PIPELINE_STAGES = [
     "indextts2_talker",
     "latent_generator",
     "llm",
+    "minimax_music3_ar",
     "ming_tts",
     "moss_tts",
     "moss_tts_codec",

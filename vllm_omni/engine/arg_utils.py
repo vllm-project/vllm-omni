@@ -232,6 +232,7 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -409,6 +410,7 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
         )
         return omni_config
 
