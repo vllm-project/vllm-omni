@@ -406,11 +406,13 @@ class OmniConnectorModelRunnerMixin:
         # thread by one execute_model() cycle, especially when the request was
         # added after the current scheduler_output snapshot.
         #
-        # Orphaned pending recv entries (e.g. from upstream stage crash)
-        # are handled by OmniSchedulingCoordinator.collect_timed_out_request_ids()
-        # which detects wait-time violations.  The scheduler then removes the
-        # request from its queues, sets FINISHED_ERROR, and calls _free_request()
-        # which ultimately triggers cleanup_finished_request() here.
+        # Orphaned pending recv entries (e.g. from upstream stage crash) are
+        # handled by collect_timed_out_request_ids() -- on
+        # OmniSchedulingCoordinator for full-payload requests, and on
+        # OmniChunkTransferAdapter for async-chunk ones -- which detect
+        # wait-time violations.  The scheduler then removes the request from
+        # its queues, sets FINISHED_ERROR, and calls _free_request() which
+        # ultimately triggers cleanup_finished_request() here.
         for attr_name in (
             "_request_ids_mapping",
             "_get_req_chunk",
