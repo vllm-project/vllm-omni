@@ -1,6 +1,8 @@
-"""Nightly-only e2e coverage for BAGEL diffusion multi-replica serving.
+"""Weekly e2e coverage for BAGEL diffusion multi-replica serving.
 
 This test needs 4 H100 GPUs; keep it out of generic test_bagel_* jobs.
+It is covered by the weekly Diffusion · H100 · Multi-GPU lane
+(``.buildkite/cuda/test-weekly.yml``, ``mirror_hardwares: h100_4``).
 """
 
 import os
@@ -17,7 +19,7 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 MULTI_REPLICA_DEPLOY = get_deploy_config_path("ci/bagel_multi_replicas_4gpu.yaml")
 ROUTE_STRESS_REQUESTS = 6
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 test_params = [
     OmniServerParams(

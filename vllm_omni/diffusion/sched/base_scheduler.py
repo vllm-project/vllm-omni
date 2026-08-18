@@ -7,10 +7,14 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import fields
 
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -49,9 +53,17 @@ class BaseScheduler(ABC):
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
-        self._diffusion_kv_enabled = False
+        self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
 
-    def initialize(self, od_config: OmniDiffusionConfig) -> None:
+    def initialize(
+        self,
+        od_config: OmniDiffusionConfig,
+        *,
+        kv_cache_config: KVCacheConfig | None = None,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
+    ) -> None:
         self.od_config = od_config
         self._request_states.clear()
         self._step_id = 0
@@ -66,10 +78,36 @@ class BaseScheduler(ABC):
             self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
-        self._diffusion_kv_enabled = (
+        diffusion_kv_enabled = (
             getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
+        if diffusion_kv_enabled:
+            if kv_cache_config is None:
+                raise ValueError("paged_scheduler Diffusion KV requires a native Scheduler KVCacheConfig")
+            if scheduler_block_size is None or hash_block_size is None:
+                raise ValueError("paged_scheduler Diffusion KV requires native scheduler/hash block sizes")
+            if kv_vllm_config is None:
+                raise ValueError("paged_scheduler Diffusion KV requires the native VllmConfig used for cache sizing")
+            self._diffusion_kv_manager = DiffusionKVCacheManager(
+                kv_cache_config,
+                max_model_len=kv_vllm_config.model_config.max_model_len,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
+            )
+        else:
+            if any(
+                value is not None
+                for value in (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                )
+            ):
+                raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
+            self._diffusion_kv_manager = None
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -104,6 +142,35 @@ class BaseScheduler(ABC):
             if not self._can_schedule_waiting(state):
                 break
 
+            diffusion_kv_metadata: DiffusionKVMetadata | None = None
+            if self._diffusion_kv_manager is not None:
+                if self._diffusion_kv_manager.has_request(request_id):
+                    diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
+                else:
+                    try:
+                        allocation = self._diffusion_kv_manager.reserve_request(
+                            request_id,
+                            state.diffusion_kv_requests,
+                        )
+                    except Exception as exc:
+                        # schedule() runs outside the Engine execution-error
+                        # wrapper. Convert both expected admission failures and
+                        # unexpected native allocator failures into a terminal
+                        # request error so the busy loop can wake its stream.
+                        if not isinstance(exc, DiffusionKVAdmissionError):
+                            logger.exception(
+                                "Unexpected Diffusion KV allocation failure for request %s",
+                                request_id,
+                            )
+                        self._finish_requests(
+                            {request_id: DiffusionRequestStatus.FINISHED_ERROR},
+                            {request_id: str(exc)},
+                        )
+                        continue
+                    if allocation is None:
+                        break
+                    diffusion_kv_metadata = allocation
+
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
             if not self._running:
@@ -111,7 +178,12 @@ class BaseScheduler(ABC):
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
             if was_new_request:
-                scheduled_new_reqs.append(NewRequestData.from_state(state))
+                scheduled_new_reqs.append(
+                    NewRequestData.from_state(
+                        state,
+                        diffusion_kv_metadata=diffusion_kv_metadata,
+                    )
+                )
             else:
                 scheduled_cached_request_ids.append(request_id)
 
@@ -184,6 +256,8 @@ class BaseScheduler(ABC):
         return self._request_states.get(request_id)
 
     def pop_request_state(self, request_id: str) -> SchedulerRequestState | None:
+        if self._diffusion_kv_manager is not None:
+            self._diffusion_kv_manager.free_request(request_id)
         self._pop_extra_request_state(request_id)
         return self._request_states.pop(request_id, None)
 
@@ -206,6 +280,9 @@ class BaseScheduler(ABC):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        if self._diffusion_kv_manager is not None:
+            self._diffusion_kv_manager.close()
+            self._diffusion_kv_manager = None
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
@@ -245,6 +322,8 @@ class BaseScheduler(ABC):
             self._waiting = deque(request_id for request_id in self._waiting if request_id not in waiting_to_remove)
 
         for request_id in finished_req_ids:
+            if self._diffusion_kv_manager is not None:
+                self._diffusion_kv_manager.free_request(request_id)
             state = self._request_states[request_id]
             status = statuses[request_id]
             state.status = status
@@ -266,7 +345,13 @@ class BaseScheduler(ABC):
         # update_from_output() processes the runner output. It is already
         # marked finished at that point, but we still need to surface its id
         # in this update so the engine can observe the terminal state.
+        # Also surface admission failures recorded while schedule() built this
+        # output. Older finished ids retained only for Worker cleanup have
+        # already been popped by the Engine and are deliberately ignored.
         finished_req_ids = {
+            request_id for request_id in sched_output.finished_req_ids if request_id in self._request_states
+        }
+        finished_req_ids |= {
             request_id for request_id in sched_output.scheduled_request_ids if request_id in self._finished_req_ids
         }
         finished_req_ids |= self._finish_requests(statuses, errors)
@@ -280,7 +365,7 @@ class BaseScheduler(ABC):
 
     def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> SchedulerRequestState:
         kv_requests = request.diffusion_kv_requests or ()
-        if self._diffusion_kv_enabled:
+        if self._diffusion_kv_manager is not None:
             self._reject_legacy_dense_kv(request)
             if not kv_requests:
                 raise ValueError("paged_scheduler request preprocessing did not produce DiffusionKVRequest state")

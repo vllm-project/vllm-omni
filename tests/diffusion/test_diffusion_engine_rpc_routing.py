@@ -123,6 +123,7 @@ class _ConcurrencyTrackingExecutor:
 def _make_request(tag: str):
     sampling_params = dict(_SAMPLING_KEY_DEFAULTS)
     sampling_params["num_inference_steps"] = 1
+    sampling_params["extra_args"] = {}
     return SimpleNamespace(
         request_id=tag,
         prompt=f"prompt_{tag}",
@@ -467,6 +468,38 @@ async def test_cancelled_future_does_not_kill_busy_loop():
             timeout=3.0,
         )
         assert result.error == "rpc_result_for_after"
+        assert engine.worker_thread.is_alive()
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+
+    def fail_reservation(*args, **kwargs):
+        raise RuntimeError("native allocation bug")
+
+    engine.scheduler._diffusion_kv_manager = SimpleNamespace(
+        has_request=lambda request_id: False,
+        reserve_request=fail_reservation,
+        free_request=lambda request_id: None,
+    )
+    request = _make_request("kv-error")
+    request.diffusion_kv_requests = (object(),)
+    try:
+        response_stream = engine.async_add_req_and_stream_response(request)
+        output_queue = engine._out_streams[request.request_id]
+        for _ in range(300):
+            if not output_queue.empty():
+                break
+            await asyncio.sleep(0.01)
+        assert not output_queue.empty(), "terminal KV allocation error was not delivered to the request stream"
+
+        output = await anext(response_stream)
+        assert output.error == "native allocation bug"
+        assert output.finished
         assert engine.worker_thread.is_alive()
     finally:
         _stop_engine(engine)

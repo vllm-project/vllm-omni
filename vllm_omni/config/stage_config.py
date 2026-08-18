@@ -632,6 +632,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
+    if "stage_args" in raw_dict:
+        raise ValueError(
+            f"Deploy config {path} uses the removed `stage_args` schema; "
+            "define topology in PipelineConfig and deployment overrides under `stages`."
+        )
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 

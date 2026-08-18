@@ -30,7 +30,7 @@ from tests.helpers.runtime import (
 )
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = os.environ.get("GLM_IMAGE_MODEL_PATH", "zai-org/GLM-Image")
 

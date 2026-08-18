@@ -146,6 +146,11 @@ class OmniModelConfig(ModelConfig):
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    # Key names (not values) of the stage's default sampling ``extra_args``.
+    # Engine-core code runs before any request arrives, so this is the only
+    # place it can learn which request-shaping conventions a stage uses (e.g.
+    # ``cfg_role`` for classifier-free-guidance request pairs).
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     @property
     def registry(self):

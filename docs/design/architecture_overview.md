@@ -406,7 +406,7 @@ the source for configuration, compatibility, and implementation details.
   stage contract.
 * **Quantization and memory efficiency:** [Quantization](feature/quantization.md)
   resolves per-pipeline or per-component quantization configurations, while
-  [Distributed Layerwise Offload](feature/distributed_layerwise_offload.md)
+  [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
   streams diffusion blocks from host memory within the existing parallel
   topology.
 

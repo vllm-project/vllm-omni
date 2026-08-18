@@ -544,7 +544,7 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

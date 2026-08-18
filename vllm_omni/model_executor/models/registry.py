@@ -295,6 +295,12 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    ## Gepard-1.0 (nineninesix) — single-stage native-AR FSQ/NanoCodec TTS
+    "GepardTalkerForConditionalGeneration": (
+        "gepard",
+        "gepard_talker",
+        "GepardTalkerForConditionalGeneration",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
@@ -450,6 +456,17 @@ _OMNI_MODELS = {
         "aura_omni",
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
+    ),
+    ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
+    "MiniMaxMusic3TalkerForConditionalGeneration": (
+        "minimax_music3",
+        "talker",
+        "MiniMaxMusic3TalkerForConditionalGeneration",
+    ),
+    "MiniMaxMusic3AcousticForConditionalGeneration": (
+        "minimax_music3",
+        "acoustic",
+        "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
 }
 

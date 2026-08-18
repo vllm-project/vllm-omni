@@ -23,6 +23,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "DotsTTSConfig": "vllm_omni.transformers_utils.configs.dots_tts",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -46,6 +47,7 @@ __all__ = [
     "DotsTTSConfig",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "MiniMaxMusic3Config",
     "OmniVoiceConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
@@ -78,6 +80,7 @@ from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F4
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
