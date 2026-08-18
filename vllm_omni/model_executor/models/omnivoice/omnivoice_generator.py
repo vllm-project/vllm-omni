@@ -449,13 +449,17 @@ def _maybe_enable_tf32() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _additive_float_mask(mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def _additive_float_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Convert a boolean attention mask to its additive float form.
 
     ``True`` (attend) maps to ``0.0`` and ``False`` (masked) to ``-inf``. A bool
     mask must never be copied straight into a float buffer: the implicit cast
     maps True/False to 1.0/0.0, which leaves masked positions at 0.0 and so
     silently *unmasks* them.
+
+    ``dtype`` is required rather than defaulting to float32: SDPA rejects an
+    additive mask whose dtype differs from the query, so the mask has to follow
+    the model dtype and a default would just hide that coupling.
     """
     if mask.dtype != torch.bool:
         return mask
@@ -537,7 +541,7 @@ class _OmniVoiceCUDAGraphForward:
         device = input_ids.device
 
         self._gen._ensure_rope(bucket, device)
-        model_dtype = self._gen.text_embedding.weight.dtype
+        model_dtype = self._gen.model_dtype
         static_cos = self._gen._rope_cos[:bucket].to(device=device, dtype=model_dtype).contiguous()
         static_sin = self._gen._rope_sin[:bucket].to(device=device, dtype=model_dtype).contiguous()
 
@@ -600,8 +604,9 @@ class _OmniVoiceCUDAGraphForward:
             key = (two_b, bucket)
             dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
             dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
-            # Capture with a float mask to match what forward() feeds at replay time.
-            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=torch.float32, device=device)
+            # Capture with a float mask to match what forward() feeds at replay time,
+            # in the model dtype so replay can copy_ into it without a cast.
+            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=self._gen.model_dtype, device=device)
             self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
@@ -614,7 +619,7 @@ class _OmniVoiceCUDAGraphForward:
         if torch.cuda.is_current_stream_capturing():
             seq_len = input_ids.shape[-1]
             self._gen._ensure_rope(seq_len, input_ids.device)
-            dtype = self._gen.text_embedding.weight.dtype
+            dtype = self._gen.model_dtype
             cos = self._gen._rope_cos[:seq_len].to(device=input_ids.device, dtype=dtype)
             sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
             return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
@@ -626,7 +631,7 @@ class _OmniVoiceCUDAGraphForward:
         # Graphs are captured with (and their static buffers hold) the additive
         # float mask, so normalize here, before padding or any copy_ into them.
         if attention_mask is not None:
-            attention_mask = _additive_float_mask(attention_mask)
+            attention_mask = _additive_float_mask(attention_mask, self._gen.model_dtype)
 
         if bucket is None:
             # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
@@ -733,6 +738,11 @@ class OmniVoiceGenerator(nn.Module):
         self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
             _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes) if config.enable_cuda_graph else None
         )
+
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """The dtype every activation and mask in the generator has to match."""
+        return self.text_embedding.weight.dtype
 
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
         """Lazily compute RoPE cos/sin if needed."""
@@ -926,9 +936,7 @@ class OmniVoiceGenerator(nn.Module):
         c_lens = attention_mask[:B, 0, 0].sum(dim=-1).tolist()
 
         # Materialize the SDPA float mask once so the captured graph (and eager path) skip per-layer conversion.
-        sdpa_attn_mask = torch.zeros_like(attention_mask, dtype=torch.float32).masked_fill_(
-            ~attention_mask, float("-inf")
-        )
+        sdpa_attn_mask = _additive_float_mask(attention_mask, self.model_dtype)
 
         use_cuda_graph = self._cuda_graph_fwd is not None and input_ids.is_cuda
         if not use_cuda_graph:

@@ -56,6 +56,11 @@ class _SyntheticGenerator:
         self._rope_cos: torch.Tensor | None = None
         self._rope_sin: torch.Tensor | None = None
 
+    @property
+    def model_dtype(self) -> torch.dtype:
+        """Part of the interface _OmniVoiceCUDAGraphForward expects of a generator."""
+        return self.text_embedding.weight.dtype
+
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
         if self._rope_cos is None or self._rope_cos.shape[0] < seq_len:
             max_len = max(seq_len, 512)
