@@ -179,6 +179,24 @@ python text_to_image.py --model <your-model> --quantization fp8 --ignored-layers
 vllm serve <your-model> --omni --quantization fp8
 ```
 
+### Distributed layerwise offload
+
+Per-tensor online FP8 linears can be combined with DLO's default AllGather path:
+
+```bash
+vllm serve <your-model> \
+  --omni \
+  --quantization fp8 \
+  --enable-distributed-layerwise-offload
+```
+
+Direct checkpoint mmap is not used for this combination. Each rank runs the
+ordinary loader to create the final FP8 weights and scales before DLO shards
+them, so startup temporarily materializes the complete FP8 model in host memory
+on every rank. Runtime DLO host residency is sharded normally. Use
+`--dlo-no-use-allgather` when the synchronized AllGather request-wave contract
+does not fit the workload.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
