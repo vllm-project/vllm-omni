@@ -14,7 +14,7 @@ from packaging.requirements import Requirement
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[4]
 TEXT_PROCESSING_PATH = ROOT / "vllm_omni" / "model_executor" / "models" / "indextts2" / "text_processing_v2_5.py"
 INDEXTTS2_FRONTEND_PACKAGES = {
     "fugashi",

@@ -16,6 +16,10 @@
 # At least one of --offline/--online is required, so a job with only one mode runs
 # just that half. Total runtime is bounded by the step's timeout_in_minutes.
 #
+# Coverage + artifact upload run only on scheduled nightly E2E sweeps
+# (NIGHTLY=1 and BUILDKITE_BRANCH=main — same gate as bootstrap --e2e).
+# All other invocations (PR merge-test, regular main merge, local) run plain pytest.
+#
 # Exits non-zero if any half or the upload failed.
 set -uo pipefail
 
@@ -42,6 +46,17 @@ fi
 if ((${#OFFLINE[@]} == 0 && ${#ONLINE[@]} == 0)); then
     echo "run_cov_split.sh: need at least one of --offline / --online" >&2
     exit 2
+fi
+
+_should_run_coverage() {
+    [[ "${NIGHTLY:-}" == "1" && "${BUILDKITE_BRANCH:-}" == "main" ]]
+}
+
+if ! _should_run_coverage; then
+    PATHS=("${OFFLINE[@]}" "${ONLINE[@]}")
+    echo "--- pytest (no coverage): ${MODEL_ID}"
+    pytest -s -v "${PATHS[@]}" "${PYTEST_ARGS[@]}"
+    exit $?
 fi
 
 # Two steps can test the same model, and artifacts are scoped to the build (a
