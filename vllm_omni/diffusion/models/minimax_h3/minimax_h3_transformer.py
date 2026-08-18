@@ -36,6 +36,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.swiglu import SwiGLU
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -586,8 +587,8 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
         )
-        # Chunk the fused fc1 output as [gate, up], then compute
-        # silu(gate) * up.
+        # The fused fc1 output is packed as [gate, up] for SwiGLU.
+        self.act_fn = SwiGLU()
         self.fc2 = RowParallelLinear(
             arch.ffn_hidden_size,
             arch.hidden_size,
@@ -600,8 +601,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        gate, up = hidden.chunk(2, dim=-1)
-        hidden = nn.functional.silu(gate) * up
+        hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
 
