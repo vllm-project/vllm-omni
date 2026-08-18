@@ -81,6 +81,19 @@ class AttentionBackend(ABC):
         supported_head_sizes = cls.get_supported_head_sizes()
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        """Whether this backend reads K/V pages by the runtime block stride.
+
+        Returning ``True`` means the physical cache layout has ``num_blocks``
+        as its outer stride, so native vLLM may safely use page-size padding
+        when it unifies cache layouts across layers. Dense diffusion backends
+        conservatively keep the default ``False``; a paged backend should
+        override this only when its kernel actually follows that layout.
+        """
+
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class QueryRange:
