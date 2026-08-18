@@ -33,7 +33,6 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
-from vllm_omni.diffusion.models.pi0.pipeline_pi0 import PI0_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -118,6 +117,22 @@ logger = init_logger(__name__)
 
 PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineConfig | None]
 
+
+def _get_pi0_pipeline(hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
+    """Lazily import the π0 pipeline config.
+
+    Eager import closes a circular-import loop on Ascend: ``import vllm_omni``
+    activates the NPU platform plugin, whose MiniMax-H3 patch chain imports
+    ``diffusion.cache.base`` → ``diffusion.data`` → ``diffusion.lora.manager``
+    → ``vllm_omni.config`` → ``config_factory`` → ``pipeline_registry`` →
+    ``pi0.pipeline_pi0`` → ``from vllm_omni.diffusion.data import
+    DiffusionOutput`` while ``diffusion.data`` is still partially initialized.
+    """
+    from vllm_omni.diffusion.models.pi0.pipeline_pi0 import PI0_PIPELINE
+
+    return PI0_PIPELINE
+
+
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
@@ -140,7 +155,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lance": LANCE_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
-    "pi0": PI0_PIPELINE,
+    "pi0": _get_pi0_pipeline,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
