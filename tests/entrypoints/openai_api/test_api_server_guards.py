@@ -143,19 +143,39 @@ _MULTISTAGE_APP_STATE_KEYS = {
 }
 
 
-def _route_manifest(routes) -> set[tuple[str, str]]:
-    manifest: set[tuple[str, str]] = set()
+def _route_entries(routes) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
     for route in routes:
         if isinstance(route, APIRoute):
             for method in sorted((route.methods or set()) & _HTTP_METHODS):
-                manifest.add((method, route.path))
+                entries.append((method, route.path))
         elif isinstance(route, APIWebSocketRoute):
-            manifest.add(("WEBSOCKET", route.path))
-    return manifest
+            entries.append(("WEBSOCKET", route.path))
+    return entries
 
 
-def _route_count(routes, method: str, path: str) -> int:
-    return sum(1 for item in _route_manifest(routes) if item == (method, path))
+def _route_manifest(routes) -> set[tuple[str, str]]:
+    return set(_route_entries(routes))
+
+
+def _assert_unique_route_entries(routes) -> None:
+    entries = _route_entries(routes)
+    duplicates = sorted({item for item in entries if entries.count(item) > 1})
+    assert not duplicates, f"duplicate route registrations: {duplicates}"
+
+
+def _matching_http_routes(routes, method: str, path: str) -> list[APIRoute]:
+    return [
+        route
+        for route in routes
+        if isinstance(route, APIRoute) and route.path == path and method in (route.methods or set())
+    ]
+
+
+def _single_http_route(routes, method: str, path: str) -> APIRoute:
+    matches = _matching_http_routes(routes, method, path)
+    assert len(matches) == 1, f"expected exactly one {method} {path}, got {len(matches)}"
+    return matches[0]
 
 
 def _minimal_args(**overrides) -> SimpleNamespace:
@@ -258,8 +278,12 @@ def test_router_route_manifest_is_explicit_and_complete() -> None:
     """Lock the Omni + profiler router census.
 
     Fails if a route is added/removed/renamed, a method changes, or a
-    WebSocket path disappears during helper/router moves.
+    WebSocket path disappears during helper/router moves. Also fails if the
+    same public route is registered more than once, which a set manifest alone
+    would collapse.
     """
+    _assert_unique_route_entries(api_server.router.routes)
+    _assert_unique_route_entries(api_server.profiler_router.routes)
     assert _route_manifest(api_server.router.routes) == _EXPECTED_ROUTER_ROUTES
     assert _route_manifest(api_server.profiler_router.routes) == _EXPECTED_PROFILER_ROUTES
 
@@ -357,6 +381,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert hasattr(served_wrapper, "_inner")
     served_app = served_wrapper._inner
     routes = served_app.routes
+    _assert_unique_route_entries(routes)
     manifest = _route_manifest(routes)
 
     assert captured["supported_tasks"] == ("generate",)
@@ -366,10 +391,15 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert served_app.state.initialized_by_omni is True
 
     # Upstream override: unrelated route kept; Omni owns overridden pairs once.
+    # Endpoint identity ensures the surviving route is the Omni handler, not
+    # the fake upstream handler with the same method/path.
     assert ("GET", "/v1/upstream-only") in manifest
-    assert _route_count(routes, "POST", "/v1/chat/completions") == 1
-    assert _route_count(routes, "POST", "/v1/chat/completions/batch") == 1
-    assert _route_count(routes, "GET", "/v1/models") == 1
+    assert _single_http_route(routes, "POST", "/v1/chat/completions").endpoint is api_server.create_chat_completion
+    assert (
+        _single_http_route(routes, "POST", "/v1/chat/completions/batch").endpoint
+        is api_server.create_batch_chat_completion
+    )
+    assert _single_http_route(routes, "GET", "/v1/models").endpoint is api_server.show_available_models
 
     # Assembled app includes Omni router HTTP/WS surface + profiler.
     for item in _EXPECTED_ROUTER_ROUTES:
