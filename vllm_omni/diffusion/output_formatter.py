@@ -253,7 +253,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        if key in {"audio", "actions", "trajectory", "text"}:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

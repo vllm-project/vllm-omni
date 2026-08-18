@@ -398,6 +398,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return str(mm_output["text"])
         return ""
 
+    @staticmethod
+    def _diffusion_text_content_part(multimodal_output: Any) -> dict[str, Any] | None:
+        """Return an OpenAI ``{type: text}`` content part for a mixed payload.
+
+        Diffusion pipelines that produce both text and image (e.g. SenseNova
+        ``caption_generate``/``think_generate``) carry the caption under the
+        ``text`` key of their multimodal output.  When present, it is serialized
+        as a leading text content part so the OpenAI response is a single
+        ``message.content`` array of ``text`` + ``image_url`` parts.
+        """
+        if not isinstance(multimodal_output, dict):
+            return None
+        value = multimodal_output.get("text")
+        if isinstance(value, list) and len(value) == 1:
+            value = value[0]
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return {"type": "text", "text": value}
+
     def _get_supported_speakers(self) -> set[str]:
         """Load supported speakers from model config (cached)."""
         if self._supported_speakers is not None:
@@ -2898,10 +2917,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 }
             )
 
-        # Create message content
-        if len(image_contents) == 1:
-            content = image_contents
-        elif len(image_contents) > 1:
+        # Create message content: for mixed text+image responses the caption is
+        # emitted as a leading ``{type: text}`` part followed by the image parts.
+        # (Referenced via the class so callers that pass ``None`` as ``self``,
+        # as some unit tests do, still work.)
+        text_part = OmniOpenAIServingChat._diffusion_text_content_part(
+            omni_outputs.multimodal_output if hasattr(omni_outputs, "multimodal_output") else None
+        )
+        if text_part is not None:
+            content = [text_part] + image_contents
+        elif len(image_contents) >= 1:
             content = image_contents
         else:
             content = [{"type": "text", "text": "Image generation completed but no images were produced."}]
@@ -3774,11 +3799,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         }
                     )
 
-                # Build response
-                if not image_contents:
-                    content = "Image generation completed but no images were produced."
-                else:
+                # Build response: mixed text+image payloads keep their caption as
+                # a leading ``{type: text}`` content part before the image parts.
+                text_part = self._diffusion_text_content_part(multimodal_output)
+                if text_part is not None:
+                    content = [text_part] + image_contents
+                elif image_contents:
                     content = image_contents
+                else:
+                    content = "Image generation completed but no images were produced."
 
                 # Use model_construct to bypass validation for multimodal content
                 # (ChatMessage.content only accepts str, but we need list for images)
