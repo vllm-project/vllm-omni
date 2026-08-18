@@ -83,8 +83,7 @@ def find_target() -> Path:
     target = root / RELATIVE_TARGET
     if not target.is_file():
         raise SystemExit(
-            f"expected file not found: {target}\n"
-            "vLLM's layout changed; re-check the fix against your version."
+            f"expected file not found: {target}\nvLLM's layout changed; re-check the fix against your version."
         )
     return target
 

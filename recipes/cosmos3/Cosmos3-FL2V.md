@@ -249,7 +249,7 @@ often never see:
 |---|---|---|
 | `--url` | `http://localhost:8000` | vLLM-Omni base URL |
 | `--model` | `nvidia/Cosmos3-Super` | Served model (`Super` recommended; `nvidia/Cosmos3-Nano` also works) |
-| `--start` / `--end` | package seed PNGs | Boundary image **or** video (auto-detected by extension) |
+| `--start` / `--end` | package seed PNG files | Boundary image **or** video (auto-detected by extension) |
 | `--prompt` / `--negative` | package JSON | Event / negative prompts |
 | `--package` | `testdata/fl2v_from_cosmos_v2v` | Demo defaults root |
 | `--head-frames` / `--tail-frames` | `5` / `9` | Frame mode: still repeats. Clip mode: frames taken from start/end of each video |

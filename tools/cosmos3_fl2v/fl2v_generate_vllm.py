@@ -182,10 +182,7 @@ def prepare_boundary(
     chunk = video[:take] if side == "start" else video[-take:]
     aligned = align_frame_count(len(chunk))
     if aligned != len(chunk):
-        print(
-            f"{side} clip: snapped {len(chunk)} frames -> {aligned} "
-            f"(VAE grid k*{VAE_TEMPORAL}+1)"
-        )
+        print(f"{side} clip: snapped {len(chunk)} frames -> {aligned} (VAE grid k*{VAE_TEMPORAL}+1)")
         chunk = chunk[:aligned] if side == "start" else chunk[-aligned:]
     n_lock = latent_count_for_frames(len(chunk))
     ref = chunk[0] if side == "start" else chunk[-1]
@@ -285,10 +282,7 @@ def warn_if_vllm_unpatched(url: str, payload_bytes: int) -> None:
     if spec is None or not spec.submodule_search_locations:
         return
     shm = (
-        Path(next(iter(spec.submodule_search_locations)))
-        / "distributed"
-        / "device_communicators"
-        / "shm_broadcast.py"
+        Path(next(iter(spec.submodule_search_locations))) / "distributed" / "device_communicators" / "shm_broadcast.py"
     )
     try:
         if "FL2V patch" in shm.read_text():
@@ -301,7 +295,7 @@ def warn_if_vllm_unpatched(url: str, payload_bytes: int) -> None:
         "         and this environment's vLLM is missing the FL2V fix for that path.\n"
         "         The server will most likely hang with no error and no GPU activity.\n"
         "         Fix it with:  python patch_vllm_shm.py   (then restart the server)\n"
-        "         See README.md, \"Required vLLM patch\".",
+        '         See README.md, "Required vLLM patch".',
         file=sys.stderr,
     )
 
@@ -323,8 +317,7 @@ def main() -> None:
     p.add_argument(
         "--model",
         default="nvidia/Cosmos3-Super",
-        help="Served model name (Super recommended for quality; "
-        "nvidia/Cosmos3-Nano also works)",
+        help="Served model name (Super recommended for quality; nvidia/Cosmos3-Nano also works)",
     )
 
     p.add_argument(
