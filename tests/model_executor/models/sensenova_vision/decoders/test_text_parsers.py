@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import pytest
-
 from vllm_omni.model_executor.models.sensenova.decoders.camera_pose import parse_camera_pose
 from vllm_omni.model_executor.models.sensenova.decoders.text_parsers import (
     parse_bbox,

@@ -21,13 +21,13 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
-
-from vllm_omni.diffusion import output_formatter
-from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.sensenova.pipeline_sensenova import (
     SenseNovaPipeline,
     build_sensenova_diffusion_output,
 )
+
+from vllm_omni.diffusion import output_formatter
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     normalize_diffusion_postprocess_output,
