@@ -5,10 +5,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
@@ -114,6 +116,39 @@ class DiffusionExecutor(ABC):
         no-op implementation.
         """
         return None
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        """Collect rank-local native specs after every Worker loads its model."""
+
+        result = self.collective_rpc(
+            "get_kv_cache_specs",
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list):
+            raise TypeError(f"get_kv_cache_specs returned {type(result).__name__}, expected list")
+        return result
+
+    def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
+        """Profile and collect the KV memory budget on every Worker rank."""
+
+        result = self.collective_rpc(
+            "determine_available_kv_memory",
+            args=(profile_requests,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list) or not all(isinstance(value, int) for value in result):
+            raise TypeError("determine_available_kv_memory must return list[int]")
+        return result
+
+    def set_kv_cache_configs(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+        """Send each native rank-local config back to all Workers."""
+
+        # The default control-plane RPC mode executes on every rank and has
+        # rank 0 return the gathered rank statuses, so failures on nonzero
+        # ranks are not silently dropped.
+        self.collective_rpc("set_kv_cache_configs", args=(kv_cache_configs,))
 
     @abstractmethod
     def shutdown(self) -> None:

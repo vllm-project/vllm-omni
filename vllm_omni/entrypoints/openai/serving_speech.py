@@ -80,6 +80,12 @@ from vllm_omni.utils.speaker_cache import (
 
 logger = init_logger(__name__)
 
+_SPEECH_USAGE_INPUT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TOKENS"
+_SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
+_SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
+_SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
+_SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
+
 # TTS Configuration
 #
 # The stage-key -> model-type mapping is NOT declared here: it is derived from
@@ -949,6 +955,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Assemble the full usage object (input breakdown + generated tokens)."""
         details = self._compute_speech_input_details(request, tts_params)
         return build_speech_usage(details, output_tokens)
+
+    @staticmethod
+    def _build_speech_usage_headers(usage: SpeechTokenUsage | None) -> dict[str, str]:
+        """Map speech usage into non-streaming response headers.
+
+        Returns an empty dict when usage is unavailable, allowing callers to
+        merge these headers with other optional response headers.
+        """
+        if usage is None:
+            return {}
+
+        return {
+            _SPEECH_USAGE_INPUT_TOKENS_HEADER: str(usage.input_tokens),
+            _SPEECH_USAGE_OUTPUT_TOKENS_HEADER: str(usage.output_tokens),
+            _SPEECH_USAGE_TOTAL_TOKENS_HEADER: str(usage.total_tokens),
+            _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER: str(usage.input_token_details.text_tokens),
+            _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER: str(usage.input_token_details.audio_tokens),
+        }
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate Fish Speech semantic token length from raw reference audio."""
@@ -3170,7 +3194,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # ``usage_out`` is an opt-in output channel: when a list is passed, the
         # computed SpeechTokenUsage is appended to it. The return stays a
         # 2-tuple so existing callers (and their test mocks) are unaffected;
-        # only the batch path, which surfaces per-item usage, opts in.
+        # batch and non-streaming response-header paths opt in when surfacing
+        # usage outside the raw audio body.
         request_id, generator, bytes_tts_params = await self._prepare_speech_generation(
             request, request_id=request_id, has_inline_ref_audio=has_inline_ref_audio
         )
@@ -3576,7 +3601,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
 
             collect: dict = {}
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id, collect=collect)
+            usage_box: list[SpeechTokenUsage] = []
+            audio_bytes, media_type = await self._generate_audio_bytes(
+                request, request_id=request_id, usage_out=usage_box, collect=collect
+            )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -3584,7 +3612,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
-            headers = {}
+            headers = self._build_speech_usage_headers(usage_box[0] if usage_box else None)
             if collect.get("word_timestamps") is not None:
                 # Default ensure_ascii keeps the header latin-1 encodable (non-ASCII words \uXXXX-escaped).
                 ts_json = json.dumps(collect["word_timestamps"])

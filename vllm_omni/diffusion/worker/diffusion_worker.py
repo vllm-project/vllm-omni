@@ -16,20 +16,21 @@ import signal
 import threading
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import zmq
-from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
-from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.mem_utils import GiB_bytes
+from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import (
@@ -41,6 +42,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -52,7 +54,13 @@ from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusio
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionSchedulerOutput,
+    KVPrefetchJob,
+    NewRequestData,
+    validate_new_request_data_identity,
+)
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -76,49 +84,28 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
-@dataclass
-class _DiffusionVllmModelConfig:
-    model: str
-    dtype: torch.dtype
-    quantization: str | None = None
-    quantization_config: Any | None = None
-    hf_config: Any | None = None
-    hf_text_config: Any | None = None
-    multimodal_config: Any | None = None
-    enforce_eager: bool = False
-    disable_cascade_attn: bool = False
-    enable_return_routed_experts: bool = False
-    is_moe: bool = False
-
-    def is_quantized(self) -> bool:
-        return self.quantization is not None
-
-    def is_model_moe(self) -> bool:
-        return self.is_moe
-
-    def is_nvfp4_quantized(self) -> bool:
-        return self.quantization == "modelopt_fp4"
-
-    @property
-    def is_diffusion(self) -> bool:
-        return False
+def _all_gather_rank_values(value: Any) -> list[Any]:
+    if not dist.is_available() or not dist.is_initialized():
+        return [value]
+    values: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(values, value)
+    return values
 
 
-def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
-    quant_config = getattr(od_config, "quantization_config", None)
-    quantization = quant_config.get_name() if quant_config is not None and hasattr(quant_config, "get_name") else None
-    hf_config = getattr(od_config, "tf_model_config", None)
-    hf_text_config = get_hf_text_config(hf_config) if hasattr(hf_config, "get_text_config") else hf_config
-    return _DiffusionVllmModelConfig(
-        model=od_config.model,
-        dtype=od_config.dtype,
-        quantization=quantization,
-        quantization_config=quant_config,
-        hf_config=hf_config,
-        hf_text_config=hf_text_config,
-        enforce_eager=getattr(od_config, "enforce_eager", False),
-        is_moe=bool(getattr(od_config, "is_moe", False)),
-    )
+def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list[Any]:
+    """Run one rank-local probe without stranding peers on local failure."""
+
+    try:
+        local_result = (True, func())
+    except Exception as exc:
+        logger.exception("%s failed on this Worker rank", operation)
+        local_result = (False, f"{type(exc).__name__}: {exc}")
+
+    rank_results = _all_gather_rank_values(local_result)
+    failures = [f"rank {rank}: {result}" for rank, (ok, result) in enumerate(rank_results) if not ok]
+    if failures:
+        raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
+    return [result for _, result in rank_results]
 
 
 @contextmanager
@@ -150,37 +137,6 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
             return
 
     yield
-
-
-def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
-    """Return True only for constructor rejections of the additional_config kwarg."""
-    message = str(exc)
-    return "unexpected keyword argument" in message and "additional_config" in message
-
-
-def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDiffusionConfig) -> VllmConfig:
-    """Create a worker-local VllmConfig while preserving additional_config when supported."""
-    config_kwargs: dict[str, Any] = {
-        "compilation_config": CompilationConfig(),
-        "device_config": DeviceConfig(device=device),
-    }
-    if od_config.additional_config:
-        config_kwargs["additional_config"] = od_config.additional_config
-
-    try:
-        return VllmConfig(**config_kwargs)
-    except TypeError as exc:
-        if not _is_unexpected_additional_config_type_error(exc):
-            raise
-
-        logger.debug("Worker-local VllmConfig does not accept additional_config in constructor: %s", exc)
-        config_kwargs.pop("additional_config", None)
-        vllm_config = VllmConfig(**config_kwargs)
-        try:
-            setattr(vllm_config, "additional_config", dict(od_config.additional_config))
-        except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
-            logger.warning("Failed to attach additional_config to worker VllmConfig: %s", set_exc)
-        return vllm_config
 
 
 def _get_cumem_allocator_class() -> type:
@@ -223,6 +179,8 @@ class DiffusionWorker:
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
+        self.init_snapshot: MemorySnapshot | None = None
+        self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
@@ -287,22 +245,7 @@ class DiffusionWorker:
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
-        vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
-        parallel_config = self.od_config.parallel_config
-        vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
-        if parallel_config.enable_expert_parallel and self.od_config.is_moe:
-            # Diffusion uses its own DP/CFG/SP groups normally. vLLM groups are
-            # only remapped for expert-parallel runtimes that consume vLLM's
-            # FusedMoE/EP semantics.
-            vllm_config.parallel_config.data_parallel_size = (
-                parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
-            )
-            vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
-        vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
-        vllm_config.profiler_config = self.od_config.profiler_config
-        vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
-        vllm_config.quant_config = self.od_config.quantization_config
+        vllm_config = create_diffusion_vllm_config(self.device, self.od_config)
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
         vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
@@ -340,6 +283,23 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
+            if (
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+            ):
+                gc.collect()
+                current_omni_platform.empty_cache()
+                self.init_snapshot = MemorySnapshot(device=self.device)
+                self.requested_memory = request_memory(
+                    self.init_snapshot,
+                    vllm_config.cache_config,
+                )
+                logger.debug(
+                    "Worker %d: Diffusion KV initial memory snapshot: %r; requested=%s GiB",
+                    self.rank,
+                    self.init_snapshot,
+                    format_gib(self.requested_memory),
+                )
             init_workspace_manager(self.device)
 
     def _create_profiler(self) -> WorkerProfiler | None:
@@ -392,6 +352,96 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        """Return native rank-local specs for every diffusion Worker."""
+
+        assert self.model_runner is not None
+        return _run_and_gather_rank_values(
+            "Diffusion KV cache spec discovery",
+            self.model_runner.get_kv_cache_spec,
+        )
+
+    def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
+        """Profile and return each rank's safe Diffusion KV memory budget."""
+
+        def determine_local_memory() -> int:
+            assert self.vllm_config is not None
+            assert self.model_runner is not None
+            if self.init_snapshot is None or self.requested_memory is None:
+                raise RuntimeError("Diffusion KV memory snapshot was not captured before model loading")
+            override = self.vllm_config.cache_config.kv_cache_memory_bytes
+            if override:
+                # Match native vLLM: an explicit cache budget skips automatic
+                # capacity derivation, but still runs the maximum-shape model
+                # request so lazy kernels and communication buffers initialize.
+                self.model_runner.profile_run(profile_requests)
+                logger.info(
+                    "Worker %d: Initial free memory %s GiB, reserved %s GiB memory for "
+                    "Diffusion KV Cache as specified by kv_cache_memory_bytes config and "
+                    "skipped automatic memory profiling. This does not respect the "
+                    "gpu_memory_utilization config. A profile warmup was still executed.",
+                    self.rank,
+                    format_gib(self.init_snapshot.free_memory),
+                    format_gib(int(override)),
+                )
+                return int(override)
+
+            with memory_profiling(
+                self.init_snapshot,
+                weights_memory=self.model_runner.model_memory_usage,
+            ) as profile_result:
+                self.model_runner.profile_run(profile_requests)
+
+            available_memory = self.requested_memory - profile_result.non_kv_cache_memory
+            if available_memory <= 0:
+                raise RuntimeError(
+                    "No memory remains for Diffusion KV cache after profiling: "
+                    f"requested_memory={self.requested_memory} bytes, "
+                    f"non_kv_cache_memory={profile_result.non_kv_cache_memory} bytes. "
+                    "Increase gpu_memory_utilization or reduce the maximum profile request shape."
+                )
+            free_gpu_memory = profile_result.after_profile.free_memory
+            unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+            logger.debug(
+                "Worker %d: Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
+                self.rank,
+                format_gib(self.init_snapshot.free_memory),
+                self.vllm_config.cache_config.gpu_memory_utilization,
+                format_gib(self.requested_memory),
+            )
+            logger.debug(
+                "Worker %d: Free memory after profiling: %s GiB (total), %s GiB (within requested)",
+                self.rank,
+                format_gib(free_gpu_memory),
+                format_gib(free_gpu_memory - unrequested_memory),
+            )
+            logger.debug("Worker %d: %r", self.rank, profile_result)
+            logger.info(
+                "Worker %d: Available Diffusion KV cache memory: %s GiB",
+                self.rank,
+                format_gib(available_memory),
+            )
+            return int(available_memory)
+
+        return [
+            int(value)
+            for value in _run_and_gather_rank_values(
+                "Diffusion KV memory discovery",
+                determine_local_memory,
+            )
+        ]
+
+    def set_kv_cache_configs(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+        """Install this rank's native config without allocating tensors yet."""
+
+        assert self.model_runner is not None
+        if len(kv_cache_configs) != self.od_config.num_gpus:
+            raise ValueError(
+                "Diffusion KVCacheConfig rank count mismatch: "
+                f"expected={self.od_config.num_gpus}, got={len(kv_cache_configs)}"
+            )
+        self.model_runner.set_kv_cache_config(kv_cache_configs[self.rank])
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -465,18 +515,19 @@ class DiffusionWorker:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest | list[OmniDiffusionRequest],
+        req: OmniDiffusionRequest | list[NewRequestData],
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner.
 
-        If *req* is a list (DP multi-concurrency), each rank picks one
-        request based on its distributed rank.  AllGather in the layerwise
-        offload only gathers weight shards (request-independent), so all
-        ranks stay synchronised at each AllGather call while computing
-        different activations.
+        If *req* is a list (DP multi-concurrency), each rank picks one complete
+        NewRequestData envelope based on its distributed rank. AllGather in
+        the layerwise offload only gathers weight shards (request-independent),
+        so all ranks stay synchronised at each AllGather call while computing
+        different activations. Selecting the envelope keeps Scheduler-issued
+        KV metadata bound to the request that owns its block tables.
 
         Each rank returns its OWN DiffusionOutput (no gather). The executor
         collects N responses via the per-worker result queues.
@@ -492,7 +543,10 @@ class DiffusionWorker:
 
             dp_rank = get_data_parallel_rank()
             idx = dp_rank % len(req)
-            req = req[idx]
+            new_req = req[idx]
+            validate_new_request_data_identity(new_req)
+            req = new_req.req
+            diffusion_kv_metadata = new_req.diffusion_kv_metadata
 
         if self.lora_manager is not None:
             try:
@@ -1443,7 +1497,7 @@ class WorkerWrapperBase:
 
     def execute_model(
         self,
-        req: OmniDiffusionRequest,
+        req: OmniDiffusionRequest | list[NewRequestData],
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
