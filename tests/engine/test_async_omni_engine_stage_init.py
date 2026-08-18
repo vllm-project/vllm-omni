@@ -232,6 +232,36 @@ def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
     assert replica_devices_map == {0: ["0,1", "2,3"]}
 
 
+def test_compute_replica_layout_rejects_multi_replica_stage_without_devices():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime={"num_replicas": 2},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Stage 0: num_replicas=2 requires runtime.devices",
+    ):
+        compute_replica_layout([stage_cfg])
+
+
+def test_compute_replica_layout_rejects_multi_replica_stage_with_empty_devices():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime={"devices": "", "num_replicas": 2},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Stage 0: devices='' has 0 id\(s\)",
+    ):
+        compute_replica_layout([stage_cfg])
+
+
 def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     shared = types.SimpleNamespace(name="shared")
     extra = types.SimpleNamespace(name="extra")

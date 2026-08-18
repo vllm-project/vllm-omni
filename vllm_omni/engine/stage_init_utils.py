@@ -589,8 +589,13 @@ def split_devices_for_replicas(
     Any other length raises ``ValueError`` (the two modes are
     length-disjoint for ``num_replicas > 1``).
     """
-    if num_replicas <= 1 or devices_str is None:
-        return [devices_str] if devices_str is not None else [devices_str]
+    if num_replicas <= 1:
+        return [devices_str]
+
+    if devices_str is None:
+        raise ValueError(
+            f"Stage {stage_id}: num_replicas={num_replicas} requires runtime.devices when launching multiple replicas"
+        )
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
