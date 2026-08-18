@@ -491,7 +491,7 @@ def test_create_hsdp_mesh(cpu_process_group, mocker):
     )
 
     # 3. replicate_size <= 0: rejected with ValueError
-    with pytest.raises(ValueError, match="replicate_size must be greater than 0"):
+    with pytest.raises(ValueError, match="HSDP replica size must be a positive integer"):
         _create_hsdp_mesh("cpu", replicate_size=0, shard_pg=dist.group.WORLD)
-    with pytest.raises(ValueError, match="replicate_size must be greater than 0"):
+    with pytest.raises(ValueError, match="HSDP replica size must be a positive integer"):
         _create_hsdp_mesh("cpu", replicate_size=-1, shard_pg=dist.group.WORLD)
