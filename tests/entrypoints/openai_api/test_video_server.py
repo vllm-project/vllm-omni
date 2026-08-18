@@ -128,6 +128,64 @@ def test_video_response_encoding_mode_is_resolved_from_server_policy(
 
 
 @pytest.mark.parametrize(
+    ("engine_stage_types", "injected_stage_types", "expected_optimized"),
+    [
+        (["diffusion"], ["diffusion", "diffusion"], False),
+        (["diffusion", "diffusion"], ["diffusion"], True),
+    ],
+)
+def test_video_response_encoding_prefers_injected_stage_configs(
+    engine_stage_types,
+    injected_stage_types,
+    expected_optimized,
+):
+    engine = SimpleNamespace(
+        stage_configs=[VideoStageConfigFake(stage_type=stage_type) for stage_type in engine_stage_types],
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
+    )
+
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+        stage_configs=[VideoStageConfigFake(stage_type=stage_type) for stage_type in injected_stage_types],
+        video_response_encoding_mode="auto",
+    )
+
+    assert handler._video_response_encoding_config.optimized is expected_optimized
+
+
+def test_video_response_encoding_auto_uses_attribute_od_config_fallback():
+    engine = SimpleNamespace(
+        stage_configs=[VideoStageConfigFake(stage_type="diffusion")],
+        od_config=SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
+    )
+
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+        video_response_encoding_mode="auto",
+    )
+
+    assert handler._video_response_encoding_config.optimized
+
+
+def test_video_response_encoding_prefers_od_config_getter():
+    engine = SimpleNamespace(
+        stage_configs=[VideoStageConfigFake(stage_type="diffusion")],
+        od_config=SimpleNamespace(model_class_name="WanPipeline"),
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
+    )
+
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+        video_response_encoding_mode="auto",
+    )
+
+    assert handler._video_response_encoding_config.optimized
+
+
+@pytest.mark.parametrize(
     "stage_types",
     [
         ["diffusion", "diffusion"],

@@ -124,6 +124,12 @@ class OmniOpenAIServingVideo:
             self._video_response_encoding_config.optimized,
         )
 
+    def _resolve_diffusion_od_config(self) -> Any:
+        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
+        if callable(get_od_config):
+            return get_od_config()
+        return getattr(self._engine_client, "od_config", None)
+
     def _get_diffusion_model_metadata(self) -> DiffusionModelMetadata:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
         if stage_configs is None:
@@ -134,8 +140,7 @@ class OmniOpenAIServingVideo:
             # ambiguous multi-stage pipelines; explicit optimized still works.
             return DiffusionModelMetadata()
 
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._resolve_diffusion_od_config()
         model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
         return get_diffusion_model_metadata(model_class_name)
 
@@ -154,8 +159,7 @@ class OmniOpenAIServingVideo:
     @cached_property
     def preserves_reference_image_size(self) -> bool:
         """Return whether the active pipeline owns reference-image resizing."""
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
         model = getattr(od_config, "model", None) if od_config is not None else None
         model = model or self.model_name
@@ -169,8 +173,7 @@ class OmniOpenAIServingVideo:
     @property
     def supports_mixed_reference_inputs(self) -> bool:
         """Return whether the configured diffusion model accepts mixed refs."""
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._resolve_diffusion_od_config()
         if od_config is None:
             return False
 
