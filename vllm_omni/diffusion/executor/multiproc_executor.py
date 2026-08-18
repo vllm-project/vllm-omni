@@ -465,16 +465,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
 
-        has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
-
         # DP multi-concurrency: when DLO+AllGather is active and multiple
-        # requests are scheduled, send ALL requests in one broadcast RPC.
-        # Each rank picks req[rank % len(reqs)] and computes independently.
+        # requests are scheduled, send every complete NewRequestData envelope
+        # in one broadcast RPC. Each rank picks one envelope, keeping its
+        # request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
         if (
             len(new_reqs) > 1
-            and not has_diffusion_kv_metadata
             and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
             and getattr(self.od_config, "dlo_use_allgather", True)
         ):
@@ -507,12 +505,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     f"empty prompt request IDs: {empty_prompt_ids}."
                 )
 
-            reqs_list = [nr.req for nr in new_reqs]
             try:
                 results = self.collective_rpc(
                     "execute_model",
                     timeout=_DLO_DP_WAVE_TIMEOUT_S,
-                    args=(reqs_list, self.od_config, scheduler_output.kv_prefetch_job),
+                    args=(new_reqs, self.od_config, scheduler_output.kv_prefetch_job),
                     unique_reply_rank=None,
                     exec_all_ranks=True,
                 )
