@@ -15,11 +15,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, Protocol, TypeVar
 
+from vllm.logger import init_logger
+
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
 )
+
+logger = init_logger(__name__)
 
 
 class ARDiffusionSessionError(RuntimeError):
@@ -191,6 +195,11 @@ class ARDiffusionWorkerLifecycle:
     session's replica affinity (see ``StagePool.release_session``). It runs
     last, and only on success: a session whose worker state could not be
     released must stay pinned to the replica still holding it.
+
+    It is optional only for backwards compatibility. ``StagePool.release_session``
+    is the only path that drops a binding, so a lifecycle built without the hook
+    leaves one entry per session behind for the life of the process; construction
+    warns in that case.
     """
 
     def __init__(
@@ -210,6 +219,17 @@ class ARDiffusionWorkerLifecycle:
         self._stage_ids = normalized_stage_ids
         self._timeout = timeout
         self._route_release = route_release
+        if route_release is None:
+            # Releasing the worker state does not release the replica route:
+            # StagePool.release_session is the only path that drops a binding.
+            # Without this hook a closed session keeps its affinity entry
+            # forever, so the table grows with every session the server sees.
+            logger.warning(
+                "ARDiffusionWorkerLifecycle was built without route_release, so "
+                "reset/close will not free the session's replica affinity. Pass "
+                "ARDiffusionOmniTickConsumer.release_session_route to keep the "
+                "StagePool session table bounded on a replicated stage."
+            )
 
     async def _invoke(self, method: str, session_id: str) -> None:
         results = await self._rpc_client.collective_rpc(

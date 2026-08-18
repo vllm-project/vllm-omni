@@ -495,6 +495,50 @@ async def test_worker_lifecycle_routes_to_selected_stage_rpc() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_lifecycle_releases_the_route_after_a_successful_rpc() -> None:
+    released: list[str] = []
+    lifecycle = ARDiffusionWorkerLifecycle(
+        FakeRPCClient([[True]]),
+        stage_ids=[0],
+        route_release=released.append,
+    )
+
+    await lifecycle.reset_session("world-1")
+    await lifecycle.close_session("world-1")
+
+    assert released == ["world-1", "world-1"]
+
+
+@pytest.mark.asyncio
+async def test_worker_lifecycle_keeps_the_route_when_the_rpc_fails() -> None:
+    """A session whose worker state survived must stay pinned to its owner.
+
+    Releasing the route first would let the next tick be load-balanced onto a
+    replica holding none of the session's state, while the original replica
+    still holds all of it.
+    """
+    released: list[str] = []
+    lifecycle = ARDiffusionWorkerLifecycle(
+        FakeRPCClient([{"supported": False, "error": "worker refused"}]),
+        stage_ids=[0],
+        route_release=released.append,
+    )
+
+    with pytest.raises(ARDiffusionSessionError, match="worker refused"):
+        await lifecycle.close_session("world-1")
+
+    assert released == []
+
+
+def test_worker_lifecycle_warns_when_no_route_release_is_wired(caplog) -> None:
+    """Without the hook, StagePool keeps one entry per session forever."""
+    with caplog.at_level("WARNING"):
+        ARDiffusionWorkerLifecycle(FakeRPCClient([[True]]), stage_ids=[0])
+
+    assert any("route_release" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_worker_lifecycle_rejects_unsupported_stage_result() -> None:
     lifecycle = ARDiffusionWorkerLifecycle(
         FakeRPCClient([{"supported": False, "error": "not an AR stage"}]),

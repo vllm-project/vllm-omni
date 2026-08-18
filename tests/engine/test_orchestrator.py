@@ -481,6 +481,7 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    session_id: str | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -494,6 +495,7 @@ async def _enqueue_add_request(
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
+            session_id=session_id,
         )
     )
 
@@ -1652,6 +1654,68 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
         assert output_msg.stage_id == 1
         assert output_msg.finished is True
         assert "req-0" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_session_affinity_is_threaded_through_the_orchestrator(
+    orchestrator_factory,
+) -> None:
+    """A ``session_id`` on the submission message must reach StagePool placement.
+
+    The stage-level behavior is covered by
+    ``tests/engine/test_stage_pool_session_affinity.py``; this pins the plumbing
+    in between, where ``AsyncOmni.generate`` puts ``session_id`` on
+    ``StageSubmissionMessage`` and the orchestrator forwards it to
+    ``submit_initial``. Realtime AR-Diffusion issues a new ``request_id`` per
+    tick, so without that hop every tick would be round-robined away from the
+    replica holding the session's state.
+    """
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
+    )
+
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    async def submit(request_id: str, *, session_id: str | None) -> None:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": request_id},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            session_id=session_id,
+        )
+
+    try:
+        # Tick 0 places the session with the ordinary policy: replica 0.
+        await submit("world-1-tick-0", session_id="world-1")
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+        assert len(stage0_r1.add_request_calls) == 0
+        assert stage_pools[0].get_session_replica_id("world-1") == 0
+
+        # Tick 1 is a different request_id, so round-robin alone would send it
+        # to replica 1. Affinity must keep it on the owner.
+        await submit("world-1-tick-1", session_id="world-1")
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 2)
+        assert len(stage0_r1.add_request_calls) == 0
+
+        # A request without a session_id still load-balances normally.
+        await submit("stateless-0", session_id=None)
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+        assert len(stage0_r0.add_request_calls) == 2
+
+        # Releasing the route frees the id for placement again.
+        stage_pools[0].release_session("world-1")
+        assert stage_pools[0].get_session_replica_id("world-1") is None
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
