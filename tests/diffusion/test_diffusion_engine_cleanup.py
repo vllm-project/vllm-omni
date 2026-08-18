@@ -189,7 +189,7 @@ def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
 
 def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
     events = []
-    expected_profile_request = object()
+    expected_profile_requests = [object()]
     fake_executor = SimpleNamespace(shutdown=Mock())
     kv_cache_config = object()
     kv_vllm_config = object()
@@ -208,15 +208,15 @@ def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest
     )
     monkeypatch.setattr(
         DiffusionEngine,
-        "_prepare_diffusion_kv_profile_request",
-        lambda self: events.append("prepare-profile") or expected_profile_request,
+        "_prepare_diffusion_kv_profile_requests",
+        lambda self: events.append("prepare-profile") or expected_profile_requests,
     )
 
-    def initialize(executor, config, *, profile_request):
+    def initialize(executor, config, *, profile_requests):
         events.append("profile-workers")
         assert executor is fake_executor
         assert config is od_config
-        assert profile_request is expected_profile_request
+        assert profile_requests is expected_profile_requests
         return kv_cache_config, 16, 16, kv_vllm_config
 
     monkeypatch.setattr(

@@ -129,12 +129,12 @@ class DiffusionExecutor(ABC):
             raise TypeError(f"get_kv_cache_specs returned {type(result).__name__}, expected list")
         return result
 
-    def determine_available_kv_memory(self, profile_request: OmniDiffusionRequest) -> list[int]:
+    def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
         """Profile and collect the KV memory budget on every Worker rank."""
 
         result = self.collective_rpc(
             "determine_available_kv_memory",
-            args=(profile_request,),
+            args=(profile_requests,),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )

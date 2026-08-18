@@ -47,8 +47,10 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionSchedulerOutput,
     KVPrefetchJob,
+    NewRequestData,
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
@@ -674,30 +676,58 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         assert output is not None
         return output
 
-    def profile_run(self, request: OmniDiffusionRequest) -> None:
-        """Run one prepared request directly for startup memory profiling.
+    def profile_run(self, requests: list[OmniDiffusionRequest]) -> None:
+        """Run the maximum per-rank request batch for memory profiling.
 
         This deliberately bypasses Scheduler admission and Diffusion KV
         metadata validation because cache capacity has not been sized yet.
-        It otherwise uses the normal request forward path so model inputs,
+        It otherwise uses the normal execution-mode path so model inputs,
         collective communication, backend workspaces, denoising, and decode
-        allocations contribute to the observed peak.
+        allocations contribute to the observed peak. Step execution profiles
+        one fused ``InputBatch`` instead of sequential single-request forwards.
         """
 
-        runner_output = self._execute_request_list(
-            [request],
-            od_config=self.od_config,
-            allow_single_output=True,
-            require_request_batch_support=False,
-            record_name="pipeline_memory_profile",
-            # The enclosing native memory_profiling context owns the peak
-            # counters. Resetting them here would discard allocations from
-            # request preparation and understate the startup memory budget.
-            record_output_peak_memory=False,
-        )
-        current_omni_platform.synchronize()
-        del runner_output
-        gc.collect()
+        if not requests:
+            raise ValueError("Diffusion memory profiling requires at least one request.")
+
+        runner_output: BatchRunnerOutput | None = None
+        request_ids = [request.request_id for request in requests]
+        try:
+            if getattr(self.od_config, "step_execution", False):
+                scheduler_output = DiffusionSchedulerOutput(
+                    step_id=0,
+                    scheduled_new_reqs=[
+                        NewRequestData(request_id=request.request_id, req=request) for request in requests
+                    ],
+                    scheduled_cached_reqs=CachedRequestData.make_empty(),
+                    finished_req_ids=set(),
+                    num_running_reqs=len(requests),
+                    num_waiting_reqs=0,
+                )
+                runner_output = self._execute_stepwise(
+                    scheduler_output,
+                    validate_kv_metadata=False,
+                    record_output_peak_memory=False,
+                )
+            else:
+                runner_output = self._execute_request_list(
+                    requests,
+                    od_config=self.od_config,
+                    allow_single_output=len(requests) == 1,
+                    require_request_batch_support=len(requests) > 1,
+                    record_name="pipeline_memory_profile",
+                    # The enclosing native memory_profiling context owns the
+                    # peak counters. Resetting them here would discard request
+                    # preparation allocations and understate the budget.
+                    record_output_peak_memory=False,
+                )
+            current_omni_platform.synchronize()
+        finally:
+            for request_id in request_ids:
+                self.state_cache.pop(request_id, None)
+            self.input_batch = None
+            del runner_output
+            gc.collect()
 
     def execute_model_batch(
         self,
@@ -823,13 +853,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
+        return self._execute_stepwise(
+            scheduler_output,
+            validate_kv_metadata=True,
+            record_output_peak_memory=True,
+        )
+
+    def _execute_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        validate_kv_metadata: bool,
+        record_output_peak_memory: bool,
+    ) -> BatchRunnerOutput:
+        """Execute one step with explicit validation and profiling policy."""
+
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
-            self._validate_diffusion_kv_metadata(
-                request_id=new_req.req.request_id,
-                metadata=new_req.diffusion_kv_metadata,
-            )
+            if validate_kv_metadata:
+                self._validate_diffusion_kv_metadata(
+                    request_id=new_req.req.request_id,
+                    metadata=new_req.diffusion_kv_metadata,
+                )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
@@ -844,7 +890,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
+            if (
+                record_output_peak_memory
+                and new_request_ids
+                and not had_active_states
+                and is_primary
+                and current_omni_platform.is_available()
+            ):
                 current_omni_platform.reset_peak_memory_stats()
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = {}
@@ -937,7 +989,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
                         )
 
-                if is_primary:
+                if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
                     states_by_id = {state.request_id: state for state in states}
                     for state in states:

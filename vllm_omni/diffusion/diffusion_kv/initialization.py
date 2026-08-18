@@ -42,7 +42,7 @@ def initialize_diffusion_kv_control_plane(
     executor: DiffusionExecutor,
     od_config: OmniDiffusionConfig,
     *,
-    profile_request: OmniDiffusionRequest | None = None,
+    profile_requests: list[OmniDiffusionRequest] | None = None,
     device: torch.device | None = None,
 ) -> tuple[KVCacheConfig, int, int, VllmConfig] | None:
     """Run the native Worker-spec to Scheduler-config initialization chain."""
@@ -52,13 +52,13 @@ def initialize_diffusion_kv_control_plane(
         is not DiffusionKVCacheMode.PAGED_SCHEDULER
     ):
         return None
-    if profile_request is None:
-        raise ValueError("paged_scheduler Diffusion KV initialization requires a prepared memory profile request")
+    if not profile_requests:
+        raise ValueError("paged_scheduler Diffusion KV initialization requires prepared memory profile requests")
     if device is None:
         device = current_omni_platform.get_torch_device(0)
     vllm_config = create_diffusion_vllm_config(device, od_config)
     worker_specs = executor.get_kv_cache_specs()
-    available_memory = executor.determine_available_kv_memory(profile_request)
+    available_memory = executor.determine_available_kv_memory(profile_requests)
     if len(worker_specs) != od_config.num_gpus or len(available_memory) != od_config.num_gpus:
         raise ValueError(
             "Diffusion KV initialization rank count mismatch: "

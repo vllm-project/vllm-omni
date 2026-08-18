@@ -22,13 +22,13 @@ class _Executor:
         self.specs = [{"layer0": object()}, {"layer0": object()}]
         self.memory = [1024, 1024]
         self.configs = None
-        self.profile_request = None
+        self.profile_requests = None
 
     def get_kv_cache_specs(self):
         return self.specs
 
-    def determine_available_kv_memory(self, profile_request):
-        self.profile_request = profile_request
+    def determine_available_kv_memory(self, profile_requests):
+        self.profile_requests = profile_requests
         return self.memory
 
     def set_kv_cache_configs(self, configs) -> None:
@@ -71,7 +71,7 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     )
     worker_configs = [object(), object()]
     scheduler_kv_cache_config = object()
-    profile_request = object()
+    profile_requests = [object()]
     monkeypatch.setattr(initialization, "create_diffusion_vllm_config", lambda *args, **kwargs: vllm_config)
     build = Mock(return_value=(worker_configs, scheduler_kv_cache_config))
     monkeypatch.setattr(
@@ -84,14 +84,14 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     result = initialization.initialize_diffusion_kv_control_plane(
         executor,
         od_config,
-        profile_request=profile_request,
+        profile_requests=profile_requests,
         device=torch.device("cpu"),
     )
 
     build.assert_called_once_with(vllm_config, executor.specs, executor.memory)
     assert result == (scheduler_kv_cache_config, 16, 16, vllm_config)
     assert executor.configs == worker_configs
-    assert executor.profile_request is profile_request
+    assert executor.profile_requests is profile_requests
 
 
 def test_dense_mode_skips_worker_kv_initialization(monkeypatch) -> None:
@@ -117,13 +117,13 @@ def test_control_plane_rejects_rank_count_mismatch(monkeypatch) -> None:
         initialization.initialize_diffusion_kv_control_plane(
             executor,
             od_config,
-            profile_request=object(),
+            profile_requests=[object()],
             device=torch.device("cpu"),
         )
 
 
 def test_paged_control_plane_requires_prepared_profile_request() -> None:
-    with pytest.raises(ValueError, match="prepared memory profile request"):
+    with pytest.raises(ValueError, match="prepared memory profile requests"):
         initialization.initialize_diffusion_kv_control_plane(
             _Executor(),
             _od_config(),

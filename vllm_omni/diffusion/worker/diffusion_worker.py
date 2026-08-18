@@ -362,7 +362,7 @@ class DiffusionWorker:
             self.model_runner.get_kv_cache_spec,
         )
 
-    def determine_available_kv_memory(self, profile_request: OmniDiffusionRequest) -> list[int]:
+    def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
         """Profile and return each rank's safe Diffusion KV memory budget."""
 
         def determine_local_memory() -> int:
@@ -375,7 +375,7 @@ class DiffusionWorker:
                 # Match native vLLM: an explicit cache budget skips automatic
                 # capacity derivation, but still runs the maximum-shape model
                 # request so lazy kernels and communication buffers initialize.
-                self.model_runner.profile_run(profile_request)
+                self.model_runner.profile_run(profile_requests)
                 logger.info(
                     "Worker %d: Initial free memory %s GiB, reserved %s GiB memory for "
                     "Diffusion KV Cache as specified by kv_cache_memory_bytes config and "
@@ -391,7 +391,7 @@ class DiffusionWorker:
                 self.init_snapshot,
                 weights_memory=self.model_runner.model_memory_usage,
             ) as profile_result:
-                self.model_runner.profile_run(profile_request)
+                self.model_runner.profile_run(profile_requests)
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -75,15 +75,33 @@ def test_dense_mode_does_not_build_kv_profile_request() -> None:
     engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
     engine._make_dummy_request = Mock(side_effect=AssertionError("dense mode must not profile"))
 
-    assert engine._prepare_diffusion_kv_profile_request() is None
+    assert engine._prepare_diffusion_kv_profile_requests() is None
     engine._make_dummy_request.assert_not_called()
 
 
-def test_paged_kv_profile_request_is_preprocessed_without_scheduler_state() -> None:
+@pytest.mark.parametrize(
+    ("execution_mode", "uses_dlo_dp", "max_num_seqs", "expected_profile_requests"),
+    [
+        (DiffusionExecutionMode.STEP_BATCH, False, 2, 2),
+        (DiffusionExecutionMode.REQUEST_BATCH, True, 4, 1),
+        (DiffusionExecutionMode.STEP_BATCH, True, 3, 3),
+    ],
+)
+def test_paged_kv_profile_requests_match_per_rank_batch(
+    execution_mode: DiffusionExecutionMode,
+    uses_dlo_dp: bool,
+    max_num_seqs: int,
+    expected_profile_requests: int,
+) -> None:
     engine = object.__new__(DiffusionEngine)
+    engine.execution_mode = execution_mode
     engine.od_config = SimpleNamespace(
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         model_class_name="HunyuanImage3ForCausalMM",
+        max_num_seqs=max_num_seqs,
+        parallel_config=SimpleNamespace(data_parallel_size=max_num_seqs if uses_dlo_dp else 1),
+        enable_distributed_layerwise_offload=uses_dlo_dp,
+        dlo_use_allgather=True,
     )
     request = OmniDiffusionRequest(
         prompt="profile",
@@ -116,12 +134,17 @@ def test_paged_kv_profile_request_is_preprocessed_without_scheduler_state() -> N
 
     engine._prepare_request_for_admission = Mock(side_effect=preprocess)
 
-    result = engine._prepare_diffusion_kv_profile_request()
+    result = engine._prepare_diffusion_kv_profile_requests()
 
-    assert result is request
-    assert result.prepared_layout is prepared_layout
-    assert result.diffusion_kv_requests is None
+    assert result is not None
+    assert len(result) == expected_profile_requests
+    assert len({profile_request.request_id for profile_request in result}) == expected_profile_requests
+    assert all(profile_request.is_dummy_run() for profile_request in result)
+    assert all(profile_request.prepared_layout is prepared_layout for profile_request in result)
+    assert all(profile_request.diffusion_kv_requests is None for profile_request in result)
+    assert len({id(profile_request.sampling_params) for profile_request in result}) == expected_profile_requests
     assert engine._diffusion_kv_profile_limits == (2, 13, 8)
+    assert len(result) * engine._diffusion_kv_profile_limits[0] == expected_profile_requests * 2
     engine._make_dummy_request.assert_called_once_with(
         height=1024,
         width=1024,

@@ -539,10 +539,53 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
     synchronize = Mock()
     monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
 
-    runner.profile_run(request)
+    runner.profile_run([request])
 
     assert runner.pipeline.forward_calls == 1
     assert record_names == ["pipeline_memory_profile"]
+    runner._validate_diffusion_kv_metadata.assert_not_called()
+    reset_peak_memory_stats.assert_not_called()
+    synchronize.assert_called_once_with()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id = "profile-0"
+    requests[1].request_id = "profile-1"
+    for request in requests:
+        request.sampling_params.num_inference_steps = 1
+
+    observed_batch_rows = []
+    original_denoise_step = runner.pipeline.denoise_step
+
+    def denoise_step(input_batch, states):
+        observed_batch_rows.append((len(states), int(input_batch.latents.shape[0])))
+        return original_denoise_step(input_batch, states)
+
+    runner.pipeline.denoise_step = denoise_step
+    runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    reset_peak_memory_stats = Mock()
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "reset_peak_memory_stats",
+        reset_peak_memory_stats,
+    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    synchronize = Mock()
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
+
+    runner.profile_run(requests)
+
+    assert observed_batch_rows == [(2, 2)]
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()

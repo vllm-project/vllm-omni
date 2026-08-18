@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import inspect
 import queue
 import threading
@@ -199,11 +200,11 @@ class DiffusionEngine:
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
-            profile_request = self._prepare_diffusion_kv_profile_request()
+            profile_requests = self._prepare_diffusion_kv_profile_requests()
             kv_control_plane = initialize_diffusion_kv_control_plane(
                 self.executor,
                 od_config,
-                profile_request=profile_request,
+                profile_requests=profile_requests,
             )
             if kv_control_plane is None:
                 self._init_scheduler(od_config, scheduler)
@@ -980,15 +981,19 @@ class DiffusionEngine:
             ),
         )
 
-    def _prepare_diffusion_kv_profile_request(self) -> OmniDiffusionRequest | None:
-        """Prepare the model request used to profile paged-KV headroom.
+    def _prepare_diffusion_kv_profile_requests(self) -> list[OmniDiffusionRequest] | None:
+        """Prepare the per-rank request batch used to profile paged-KV headroom.
 
         The profile executes directly on each Worker before the Scheduler and
-        its KV manager exist. Hunyuan is currently the only model integrated
-        with ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum
-        advertised reference-image count exercise its first-step activation
-        peak. Admission compares each preprocessed request's CFG count and
-        tokenized sequence/target shape with the resulting profile envelope.
+        its KV manager exist. It uses the maximum number of requests that one
+        rank can execute together. DLO+DP is the exception because each rank
+        executes one request from the collective wave.
+
+        Hunyuan is currently the only model integrated with
+        ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum advertised
+        reference-image count exercise its first-step activation peak.
+        Admission compares each preprocessed request's CFG count and tokenized
+        sequence/target shape with the resulting per-request profile envelope.
         Future paged model integrations must extend this recipe for their
         serving limits (for example, video frame count) rather than reusing it
         silently.
@@ -1016,12 +1021,22 @@ class DiffusionEngine:
             max(kv_request.seq_len for kv_request in kv_requests),
             max(kv_request.target_len for kv_request in kv_requests),
         )
-        # Preprocessing owns request geometry and prepared model inputs, but
-        # its native KV requests remain Scheduler-only mutable state. The
-        # profile bypasses Scheduler admission and must not send them to the
-        # Worker.
-        request.diffusion_kv_requests = None
-        return request
+        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
+            self.od_config
+        )
+        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_requests: list[OmniDiffusionRequest] = []
+        for index in range(profile_batch_size):
+            profile_request = copy.copy(request)
+            profile_request.request_id = f"{DUMMY_DIFFUSION_REQUEST_ID}/kv-profile-{index}"
+            profile_request.sampling_params = copy.deepcopy(request.sampling_params)
+            # Preprocessing owns request geometry and prepared model inputs,
+            # but native KV requests remain Scheduler-only mutable state. The
+            # profile bypasses Scheduler admission and must not send them to
+            # the Worker.
+            profile_request.diffusion_kv_requests = None
+            profile_requests.append(profile_request)
+        return profile_requests
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
