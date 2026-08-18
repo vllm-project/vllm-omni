@@ -74,7 +74,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output.images
+    images = outputs[0].images
     images[0].save("coffee.png")
 ```
 
@@ -265,7 +265,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 !!! info
@@ -301,7 +301,7 @@ if __name__ == "__main__":
         }
     ])
     for i, output in enumerate(outputs):
-        output.request_output.images[0].save(f"{i}.jpg")
+        output.images[0].save(f"{i}.jpg")
 ```
 
 You can also pass a negative prompt via the CLI argument `--negative-prompt`:

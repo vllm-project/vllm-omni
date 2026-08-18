@@ -78,7 +78,7 @@ python examples/offline_inference/text_to_audio/text_to_audio.py \
 Start the online serving endpoint:
 
 ```bash
-vllm-omni serve /path/to/stable-audio-open-1.0 \
+vllm serve /path/to/stable-audio-open-1.0 \
   --host 0.0.0.0 \
   --port 8091 \
   --gpu-memory-utilization 0.9 \
@@ -164,7 +164,50 @@ PY
   `torchaudio==2.11.0+cu130`.
 - The `NIXL is not available`, `GLOO_SOCKET_IFNAME`, and `torchsde` boundary
   warnings observed during validation did not prevent successful generation.
-- This recipe was validated on one RTX 4090 24GB GPU only. Other GPU counts,
-  ROCm, XPU, and NPU setups are not covered here.
+- The RTX 4090 entry was validated on one 24 GB GPU. The MI300X entry below covers one 192 GB GPU.
 - Long generations, higher inference-step counts, and non-WAV response formats
   were not benchmarked in this recipe.
+
+#### 1x AMD MI300X 192GB
+
+##### Environment
+
+- OS: Linux 6.8.0-134-generic, x86_64
+- Container: official ROCm image built from `docker/Dockerfile.rocm`
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- Driver / runtime: AMD 6.19.14.31400000 / ROCm 7.2.53211
+- GPU: one AMD Instinct MI300X, `gfx942:sramecc+:xnack-`, 191.69 GiB visible HBM
+- vLLM version: 0.27.0+rocm723
+- vLLM Omni version or commit: `73e1368c7bb940efe1a025859c9d6c8eeeb2e3f0`
+- Installed vLLM Omni package metadata: `0.27.0rc2.dev44+g55abdade9.rocm`
+
+##### Commands
+
+```bash
+python3 examples/offline_inference/text_to_audio/text_to_audio.py \
+    --model stabilityai/stable-audio-open-1.0 \
+    --prompt "A gentle piano melody with soft room ambience" \
+    --negative-prompt "Low quality, distorted, noisy" \
+    --seed 42 \
+    --guidance-scale 7.0 \
+    --audio-length 10.0 \
+    --num-inference-steps 50 \
+    --cache-backend tea_cache \
+    --enable-diffusion-pipeline-profiler \
+    --output stable_audio_10s.wav
+```
+
+##### Verification
+
+The command completed and wrote a valid 44.1 kHz stereo WAV with 10.00 seconds of audio.
+
+##### Notes
+
+- TeaCache ran with `rel_l1_thresh=0.2`.
+- Model loading used 2.7891 GiB and took 3.706 seconds.
+- Generation took 4.750 seconds, which gives a real time factor of 0.475 for the 10.00 second output.
+- The internal profiler recorded 15.65 GB reserved and 9.68 GB allocated for the request.
+- The highest one second whole device memory sample was 19.61 GiB.
+- The output RMS was 0.0887, and its peak absolute amplitude was 0.5761.
+- The full process took 384 seconds, including startup and compilation.

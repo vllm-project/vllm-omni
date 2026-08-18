@@ -17,7 +17,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion]
 
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
@@ -253,6 +253,7 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
     )
 
 
+@pytest.mark.slow
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
@@ -278,6 +279,7 @@ def test_qwen_image_edit_single_matches_diffusers(
     )
 
 
+@pytest.mark.slow
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_2511_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:

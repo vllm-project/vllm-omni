@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -52,19 +53,18 @@ def _preprocess_i2v_pil_images(
     *,
     height: int,
     width: int,
+    crf: int = 0,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Match official LTX aspect-preserving resize and center crop."""
+    """Match the version-specific official LTX PIL preprocessing."""
     image_list = images if isinstance(images, list) else [images]
     processed = []
     for image in image_list:
-        pixels = (
-            torch.from_numpy(np.array(image.convert("RGB"), copy=True))
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(device=device, dtype=torch.float32)
-        )
+        image_array = np.array(image.convert("RGB"), copy=True)
+        if crf:
+            image_array = _apply_image_conditioning_crf(image_array, crf)
+        pixels = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
         source_height, source_width = pixels.shape[-2:]
         scale = max(height / source_height, width / source_width)
         resized_height = math.ceil(source_height * scale)
@@ -80,6 +80,47 @@ def _preprocess_i2v_pil_images(
         pixels = pixels[:, :, crop_top : crop_top + height, crop_left : crop_left + width]
         processed.append((pixels / 127.5 - 1.0).to(dtype=dtype))
     return torch.cat(processed, dim=0)
+
+
+def _apply_image_conditioning_crf(image: np.ndarray, crf: int) -> np.ndarray:
+    """Round-trip one RGB frame through H.264 to match LTX-2.5 training."""
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError("LTX image-conditioning CRF expects a uint8 RGB image.")
+    if min(image.shape[:2]) < 2:
+        return image
+    try:
+        import av
+    except ImportError as exc:
+        raise ImportError("PyAV with a libx264 encoder is required for LTX-2.5 image conditioning (CRF 18).") from exc
+
+    with BytesIO() as output_file:
+        container = av.open(output_file, "w", format="mp4")
+        try:
+            stream = container.add_stream("libx264", rate=1, options={"crf": str(crf), "preset": "veryfast"})
+            height = image.shape[0] // 2 * 2
+            width = image.shape[1] // 2 * 2
+            stream.height = height
+            stream.width = width
+            frame = av.VideoFrame.from_ndarray(image[:height, :width], format="rgb24").reformat(format="yuv420p")
+            container.mux(stream.encode(frame))
+            container.mux(stream.encode())
+        except Exception as exc:
+            raise RuntimeError(
+                "The installed PyAV/FFmpeg build cannot encode libx264 video required "
+                "for LTX-2.5 image conditioning (CRF 18)."
+            ) from exc
+        finally:
+            container.close()
+        video_bytes = output_file.getvalue()
+
+    with BytesIO(video_bytes) as video_file:
+        container = av.open(video_file)
+        try:
+            stream = next(stream for stream in container.streams if stream.type == "video")
+            frame = next(container.decode(stream))
+        finally:
+            container.close()
+    return frame.to_ndarray(format="rgb24")
 
 
 class LTXTextConditioningMixin:
@@ -106,13 +147,30 @@ class LTXTextConditioningMixin:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        text_inputs = self.tokenizer(
-            [text.strip() for text in prompt],
+        bos_token_id = self.tokenizer.bos_token_id
+        if bos_token_id is None:
+            raise ValueError("Tokenizer is missing bos_token_id; LTX prompt encoding requires a leading BOS.")
+
+        input_ids = []
+        for text in prompt:
+            encoded = self.tokenizer(
+                text.strip(),
+                padding=False,
+                truncation=True,
+                max_length=max_sequence_length,
+                return_tensors=None,
+            )
+            ids = encoded.input_ids
+            if not ids or ids[0] != bos_token_id:
+                ids = [bos_token_id, *ids][:max_sequence_length]
+            input_ids.append(ids)
+
+        text_inputs = self.tokenizer.pad(
+            {"input_ids": input_ids},
             padding="max_length",
             max_length=max_sequence_length,
-            truncation=True,
-            add_special_tokens=True,
             return_tensors="pt",
+            return_attention_mask=True,
         )
         text_input_ids = text_inputs.input_ids.to(device)
         prompt_attention_mask = text_inputs.attention_mask.to(device)
@@ -121,7 +179,6 @@ class LTXTextConditioningMixin:
             attention_mask=prompt_attention_mask,
             output_hidden_states=True,
         ).hidden_states
-
         prompt_embeds = torch.stack(hidden_states, dim=-1).flatten(2, 3).to(dtype=dtype)
         prompt_embeds = _repeat_prompt_tensor_for_outputs(prompt_embeds, num_videos_per_prompt)
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
@@ -501,6 +558,7 @@ class LTXI2VConditioningMixin:
             vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
         )
         mask_shape = (batch_size, 1, num_frames, height, width)
+        is_ltx25 = getattr(self, "model_version", None) == "2.5"
 
         if latents is not None:
             unpacked_latents = latents.ndim == 5
@@ -518,6 +576,7 @@ class LTXI2VConditioningMixin:
                     self.vae.latents_std,
                     self.vae.config.scaling_factor,
                 )
+                clean_latents = latents
                 if image is not None:
                     image_latents = self._encode_i2v_image_latents(
                         image,
@@ -525,11 +584,16 @@ class LTXI2VConditioningMixin:
                         generator=generator,
                         dtype=dtype,
                     )
-                    # Official distilled Stage 2 starts from the upsampled Stage 1
-                    # state, then reapplies the source image at final resolution.
-                    latents = self._replace_first_latent_frame(latents, image_latents)
+                    # Official Stage 2 starts from the upsampled Stage 1 state,
+                    # then reapplies the source image at final resolution.
+                    clean_latents = self._replace_first_latent_frame(clean_latents, image_latents)
                 latents = latent_ops.pack_latents(
                     latents,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+                clean_latents = latent_ops.pack_latents(
+                    clean_latents,
                     self.transformer_spatial_patch_size,
                     self.transformer_temporal_patch_size,
                 )
@@ -548,14 +612,14 @@ class LTXI2VConditioningMixin:
                     f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
                 )
             if unpacked_latents:
-                # Official LTX patchifies the latent state before drawing noise.
-                # Sampling the packed shape preserves its seed-to-output contract.
-                latents = latent_ops.create_noised_state(
+                latents = latent_ops.create_conditioned_noised_state(
                     latents,
-                    noise_scale * (1 - conditioning_mask).unsqueeze(-1),
+                    clean_latents,
+                    (1 - conditioning_mask.float()).unsqueeze(-1),
+                    noise_scale,
                     generator,
                 )
-            elif image is not None:
+            elif not unpacked_latents and image is not None:
                 image_latents = self._encode_i2v_image_latents(
                     image,
                     batch_size=batch_size,
@@ -595,13 +659,27 @@ class LTXI2VConditioningMixin:
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
-        conditioning_mask = latent_ops.pack_latents(
+        packed_conditioning_mask = latent_ops.pack_latents(
             conditioning_mask,
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         ).squeeze(-1)
-        noise = randn_tensor(init_latents.shape, generator=generator, device=device, dtype=dtype)
-        latents = init_latents * conditioning_mask.unsqueeze(-1) + noise * (1 - conditioning_mask).unsqueeze(-1)
+        if is_ltx25:
+            clean_latents = init_latents
+            init_latents = torch.zeros_like(init_latents)
+            latents = latent_ops.create_conditioned_noised_state(
+                init_latents,
+                clean_latents,
+                (1 - packed_conditioning_mask.float()).unsqueeze(-1),
+                noise_scale,
+                generator=generator,
+            )
+        else:
+            noise = randn_tensor(init_latents.shape, generator=generator, device=device, dtype=dtype)
+            latents = init_latents * packed_conditioning_mask.unsqueeze(-1) + noise * (
+                1 - packed_conditioning_mask
+            ).unsqueeze(-1)
+        conditioning_mask = packed_conditioning_mask
         return latents, conditioning_mask
 
     def _step_video_latents_i2v(
@@ -665,6 +743,17 @@ class LTXI2VConditioningMixin:
             )
 
         if image is not None:
+            default_crf = 18 if getattr(self, "model_version", "2") == "2.5" else 0
+            image_crf = getattr(request_inputs, "image_crf", None)
+            image_crf = default_crf if image_crf is None else int(image_crf)
+            is_pil_input = isinstance(image, PIL.Image.Image) or (
+                isinstance(image, list) and image and all(isinstance(item, PIL.Image.Image) for item in image)
+            )
+            if image_crf != 0 and not is_pil_input:
+                raise ValueError(
+                    "`image_crf` re-compression requires PIL images. Pass PIL images, or set `image_crf=0` "
+                    "to skip re-compression."
+                )
             if isinstance(image, torch.Tensor):
                 if image.ndim == 3:
                     image = image.unsqueeze(0)
@@ -677,6 +766,7 @@ class LTXI2VConditioningMixin:
                     image,
                     height=request_inputs.height,
                     width=request_inputs.width,
+                    crf=image_crf,
                     device=device,
                     dtype=prompt_context.positive_connector_prompt_embeds.dtype,
                 )

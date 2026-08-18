@@ -95,7 +95,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan stage config for multi-stage runs | None | |
 | HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
-| MiniMax H3 | `MiniMaxAI/MiniMax-H3` | Yes | Not validated | DiT linears except patch, timestep, and final projections; not compatible with layerwise offload | None | |
+| MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -137,6 +137,39 @@ outputs = omni.generate(
     OmniDiffusionSamplingParams(num_inference_steps=50),
 )
 ```
+
+### Global and per-component scope
+
+A plain, global quantization configuration is passed unchanged to every
+quantization-aware component constructed by a pipeline. This includes an
+eligible encoder when that encoder is implemented with vLLM quantizable
+layers; it does not rewrite arbitrary `torch.nn` modules. A structured
+component map is the only way to narrow that scope. Pipeline integrations that
+do not yet expose an encoder through the quantization factory remain DiT-only.
+
+For a pipeline that exposes both a transformer and a quantization-aware text
+encoder, the scope is:
+
+| Configuration | Transformer | Text encoder | Components without supported quantizable layers |
+|---------------|-------------|--------------|-------------------------------------------------|
+| `quantization="fp8"` | FP8 | FP8 | checkpoint precision |
+| `{"transformer": {"method": "fp8"}}` | FP8 | checkpoint precision | checkpoint precision |
+| `{"text_encoder": {"method": "fp8"}}` | checkpoint precision | FP8 | checkpoint precision |
+
+Use `quantization_config` for component-selective Python configuration. For
+example, quantize only the text decoder:
+
+```python
+omni = Omni(
+    model="<your-model>",
+    quantization_config={"text_encoder": {"method": "fp8"}},
+)
+```
+
+Component keys are runtime prefixes exposed by the pipeline integration; common
+keys include `transformer` and `text_encoder`. Entries may be combined, and
+`ignored_layers` can keep named eligible layers in checkpoint precision. Check
+the model recipe for supported components and their runtime prefixes.
 
 CLI:
 

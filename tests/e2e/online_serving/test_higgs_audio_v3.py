@@ -59,8 +59,7 @@ _REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know w
 class TestHiggsAudioV3OnlineHappyPath:
     """Plain-text -> audio happy paths against the live HTTP server."""
 
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_wav(self, omni_server, openai_client) -> None:
@@ -79,7 +78,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_with_max_new_tokens(self, omni_server, openai_client) -> None:
@@ -97,8 +96,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_concurrent_plain_text(self, omni_server, openai_client) -> None:
@@ -115,7 +113,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_plain_text_pcm_streaming(self, omni_server, openai_client) -> None:
@@ -147,7 +145,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         )
 
     @pytest.mark.skip(reason="issue#4411")
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_concurrent_pcm_streaming(self, omni_server, openai_client) -> None:
@@ -189,7 +187,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     They do not assert audio quality (out of scope for CI).
     """
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_emotion_and_expressive(self, omni_server, openai_client) -> None:
@@ -205,7 +203,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_style_whispering(self, omni_server, openai_client) -> None:
@@ -221,7 +219,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_prosody_speed_and_pitch(self, omni_server, openai_client) -> None:
@@ -239,7 +237,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_pause_mid_text(self, omni_server, openai_client) -> None:
@@ -255,7 +253,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_inline_sfx_with_onomatopoeia(self, omni_server, openai_client) -> None:
@@ -279,8 +277,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
 class TestHiggsAudioV3OnlineVoiceClone:
     """Voice clone via the two payload shapes the model serves."""
 
-    @pytest.mark.core_model
-    @pytest.mark.advanced_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_ref_text(self, omni_server, openai_client) -> None:
@@ -297,7 +294,7 @@ class TestHiggsAudioV3OnlineVoiceClone:
             }
         )
 
-    @pytest.mark.core_model
+    @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_references_alias(self, omni_server, openai_client) -> None:

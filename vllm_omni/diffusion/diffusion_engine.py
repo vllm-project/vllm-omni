@@ -339,7 +339,16 @@ class DiffusionEngine:
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
-                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                try:
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                except (TimeoutError, asyncio.TimeoutError):
+                    describe = getattr(self.executor, "describe_pending_state", None)
+                    logger.error(
+                        "Timed out after %.0fs waiting for async output; executor state: %s",
+                        _ASYNC_OUTPUT_TIMEOUT,
+                        describe(output.async_output_id) if describe else "unavailable",
+                    )
+                    raise
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time

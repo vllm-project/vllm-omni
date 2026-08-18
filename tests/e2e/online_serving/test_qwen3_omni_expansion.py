@@ -452,11 +452,31 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_one_word_prompt_001(omni_server, openai_client) -> None:
-    """
+    """Catastrophic-regression gate on one-word pronunciation.
+
+    Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
+    talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1),
+    so asserting it per request gates on a random variable, which is what the old 10-retry
+    loop was compensating for.
+
+    Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
+    word. 85.6% is a predeclared minimum acceptable success probability, taken from a
+    measured HF reference run (77/90); vLLM-Omni itself measured 92.2%. Assuming 40
+    independent Bernoulli trials, >=29/40 has a nominal rejection probability of 0.9%
+    at p=.856, with 92.9% power at p=.60 and 55.9% at p=.70.
+
+    Those are conditional on p, not a measured false-failure rate for this CI: 77/90 is
+    one point estimate (Wilson 76.8%-91.4%), and at the low end of that interval the gate
+    would reject about 20% of runs. Pinning down a real rate would take repeated
+    report-only runs on the target hardware.
+
+    A drop to 70% is caught only about half the time, so this is a smoke gate for gross
+    pipeline breakage, not a quality tracker -- resolving moderate drift needs ~80+
+    samples and belongs in an accuracy benchmark. See #5395.
+
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
     Input Setting: stream=True
-    Datasets: single request
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -474,17 +494,13 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "transcript_language": "en",
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
-    _similarity_assert_msg = "The audio content is not same as the text"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    # The judge runs per request so mismatches can be counted, which also transcribes
+    # concurrently where the previous request_num=5 path judged serially -- worth watching
+    # on tighter cards, since each judge loads whisper on the same device as the talker and
+    # code2wav stages.
+    openai_client.send_omni_request(
+        request_config, request_num=40, min_successes=29, max_concurrency=get_max_batch_size()
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)

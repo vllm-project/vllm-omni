@@ -7,9 +7,7 @@ model's request normalization, validation, prompt/param building, sampling
 overrides, and output policy, so adding a model means writing one adapter file
 instead of editing the shared serving module in ~10 scattered places.
 
-See the RFC for the full design (issue #4327). This is the foundation landed in
-the first migration PR; Qwen3-TTS is the first model routed through it while the
-remaining models stay on the legacy path until individually migrated.
+See the RFC for the full design (issue #4327).
 """
 
 from abc import ABC, abstractmethod
@@ -37,6 +35,21 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
 
         _conditioning_cache_salt_fn = _conditioning_cache_salt
     return _conditioning_cache_salt_fn(request, tts_params)
+
+
+def apply_max_new_tokens(
+    sampling_params_list: list,
+    request: "OpenAICreateSpeechRequest",
+) -> list:
+    """Apply a request-level ``max_new_tokens`` limit."""
+    if request.max_new_tokens is None:
+        return sampling_params_list
+
+    import copy
+
+    sampling_params_list = copy.deepcopy(sampling_params_list)
+    sampling_params_list[0].max_tokens = request.max_new_tokens
+    return sampling_params_list
 
 
 @dataclass
@@ -184,6 +197,8 @@ class TTSModelAdapter(ABC):
         self,
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         """Apply model-specific sampling mutations.
 
@@ -228,37 +243,10 @@ class DiffusionTTSAdapter(TTSModelAdapter):
         return frozenset(params) if params is not None else frozenset()
 
 
-@dataclass(frozen=True)
-class LegacyDetector:
-    """A model type the serving layer detects but has no adapter for yet.
-
-    Detection has to keep naming these models so ``serving_speech.py`` can route
-    them down its legacy path, but they own none of the adapter contract. Each
-    entry is a migration debt: delete it when the model gets an adapter. The
-    pre-commit gate (``tools/pre_commit/check_tts_adapter.py``) fails if the list
-    grows.
-
-    Exposes the subset of the :class:`TTSModelAdapter` class surface that
-    detection reads, so both kinds live in one sorted sequence.
-    """
-
-    name: str
-    stage_keys: frozenset[str] = frozenset()
-    model_archs: frozenset[str] = frozenset()
-    arch_identifies_entry_stage: bool = False
-    detect_priority: int = 100
-
-    def matches(self, model_stage: str | None, model_arch: str | None) -> bool:
-        if model_arch is not None and model_arch in self.model_archs:
-            return True
-        return model_stage is not None and model_stage in self.stage_keys
-
-
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
-    "LegacyDetector",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
