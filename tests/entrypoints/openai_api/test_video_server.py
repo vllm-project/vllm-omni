@@ -16,15 +16,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import av
+import httpx
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
+from vllm import envs
 
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
@@ -595,6 +597,45 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     engine = test_client.app.state.openai_serving_video._engine_client
     prompt = engine.captured_prompt
     input_image = prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (40, 24)
+
+
+def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker: MockerFixture, monkeypatch):
+    requested_paths = []
+    async_client = httpx.AsyncClient
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/redirect.png":
+            return httpx.Response(302, headers={"location": "/image.png"})
+        return httpx.Response(200, content=_make_test_image_bytes((40, 24)))
+
+    def _client_factory(*args, **kwargs):
+        return async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A fox running through snow.",
+            "image_reference": json.dumps({"image_url": "https://example.com/redirect.png"}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert requested_paths == ["/redirect.png", "/image.png"]
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
 

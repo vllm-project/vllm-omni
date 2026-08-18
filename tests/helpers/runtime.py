@@ -38,11 +38,13 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 
 from tests.helpers.assertions import (
+    SuccessRateGate,
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
     assert_images_generations_response,
     assert_omni_response,
+    collect_at_success_rate,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
@@ -1891,8 +1893,20 @@ class OpenAIClientHandler:
             )
         ]
 
-    def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
-        """Chat completions via the OpenAI Python SDK (not raw HTTP)."""
+    def send_omni_request(
+        self,
+        request_config: dict[str, Any],
+        request_num: int = 1,
+        *,
+        min_successes: int | None = None,
+        max_concurrency: int | None = None,
+    ) -> list[OmniResponse]:
+        """Chat completions via the OpenAI Python SDK (not raw HTTP).
+
+        ``min_successes`` gates the batch on how many of the ``request_num`` requests pass
+        rather than requiring each one to, and returns only the successes; ``max_concurrency``
+        caps how many are in flight at once. See ``SuccessRateGate``.
+        """
         responses: list[OmniResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
@@ -1923,22 +1937,6 @@ class OpenAIClientHandler:
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
-        if request_num == 1:
-            wall_start = time.perf_counter()
-            chat_completion = self.client.chat.completions.create(**create_kwargs)
-            resp = (
-                self._process_stream_omni_response(chat_completion, wall_start=wall_start)
-                if stream
-                else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
-            )
-            assert_omni_response(resp, request_config, run_level=self.run_level)
-            if resp.e2e_latency is not None:
-                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
-            else:
-                self._print_client_stat("[omni] request#1 completed")
-            responses.append(resp)
-            return responses
-
         def _one():
             wall_start = time.perf_counter()
             chat_completion = self.client.chat.completions.create(**create_kwargs)
@@ -1947,6 +1945,33 @@ class OpenAIClientHandler:
                 if stream
                 else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
             )
+
+        if min_successes is not None:
+            gate = SuccessRateGate(min_successes=min_successes, concurrency=max_concurrency)
+
+            def _sample() -> OmniResponse:
+                resp = _one()
+                assert_omni_response(resp, request_config, run_level=self.run_level)
+                return resp
+
+            # Not _print_client_stat: the count is the gate's verdict, so it has to survive
+            # log_stats=False.
+            return collect_at_success_rate(
+                _sample,
+                gate,
+                request_num=request_num,
+                report=lambda line: print(f"[omni] {line}", flush=True),
+            )
+
+        if request_num == 1:
+            resp = _one()
+            assert_omni_response(resp, request_config, run_level=self.run_level)
+            if resp.e2e_latency is not None:
+                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[omni] request#1 completed")
+            responses.append(resp)
+            return responses
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
             futures = {executor.submit(_one): i + 1 for i in range(request_num)}
@@ -3240,6 +3265,146 @@ def iter_omni_runner(
         print("OmniRunner stopped")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# π0 (Pi-Zero) OpenPI websocket policy client
+#
+# Minimal client for the OpenPI realtime robot protocol
+# (``/v1/realtime/robot/openpi``): connect → read handshake metadata → send
+# observation → receive an action chunk. Used by the π0 online-serving e2e
+# (tests/e2e/online_serving/test_pi0_expansion.py). π0's observation is 3 RGB
+# cameras + proprioceptive state + a language prompt, built as synthetic numpy
+# frames here (no video assets).
+# ─────────────────────────────────────────────────────────────────────
+PI0_OPENPI_PATH = "/v1/realtime/robot/openpi"
+PI0_OPENPI_DEFAULT_PROMPT = "pick up the red block and place it in the bin"
+# π0 / pi0_base camera identities (must match the server's image_feature_keys,
+# i.e. vllm_omni/deploy/pi0.yaml, whose image_key_map is empty).
+PI0_CAMERA_KEYS = (
+    "observation.images.base_0_rgb",
+    "observation.images.left_wrist_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+)
+PI0_ACTION_HORIZON = 50
+PI0_ACTION_DIM = 32
+PI0_STATE_DIM = 32
+PI0_IMAGE_SIZE = 224
+
+
+def pi0_openpi_require_dependencies() -> None:
+    """Raise ModuleNotFoundError if the OpenPI websocket client deps are missing."""
+    missing = []
+    try:
+        import websockets.sync.client  # noqa: F401
+    except ImportError:
+        missing.append("websockets")
+    try:
+        from openpi_client import msgpack_numpy  # noqa: F401
+    except ImportError:
+        missing.append("openpi-client")
+    if missing:
+        raise ModuleNotFoundError(f"π0 OpenPI test dependencies are missing: {', '.join(missing)}")
+
+
+def _pi0_decode_action_response(response: bytes | str) -> np.ndarray:
+    from openpi_client import msgpack_numpy
+
+    if isinstance(response, str):
+        raise RuntimeError(f"Inference failed: {response}")
+    decoded = msgpack_numpy.unpackb(response)
+    if isinstance(decoded, dict) and decoded.get("type") == "error":
+        raise RuntimeError(f"Inference failed: {decoded.get('message', decoded)}")
+    return np.asarray(decoded, dtype=np.float32)
+
+
+def pi0_make_dummy_obs(*, prompt: str, session_id: str, image_size: int = PI0_IMAGE_SIZE) -> dict[str, Any]:
+    """A single π0 observation: 3 blank cameras (HWC uint8) + zero state + prompt."""
+    obs: dict[str, Any] = {cam: np.zeros((image_size, image_size, 3), dtype=np.uint8) for cam in PI0_CAMERA_KEYS}
+    obs["state"] = np.zeros(PI0_STATE_DIM, dtype=np.float32)
+    obs["prompt"] = prompt
+    obs["session_id"] = session_id
+    return obs
+
+
+def pi0_openpi_run_policy_session(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    path: str = PI0_OPENPI_PATH,
+    prompt: str = PI0_OPENPI_DEFAULT_PROMPT,
+    session_id: str | None = None,
+    num_steps: int = 2,
+) -> dict[str, Any]:
+    """Connect, read handshake metadata, send ``num_steps`` observations."""
+    import uuid
+
+    import websockets.sync.client as websockets_client
+    from openpi_client import msgpack_numpy
+
+    session_id = session_id or str(uuid.uuid4())
+    uri = f"ws://{host}:{port}{path}"
+    packer = msgpack_numpy.Packer()
+    conn = websockets_client.connect(uri, compression=None, max_size=None, ping_interval=300, ping_timeout=3600)
+    try:
+        metadata = msgpack_numpy.unpackb(conn.recv())
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Expected dict metadata from server, got {type(metadata)!r}")
+        actions = []
+        for _ in range(num_steps):
+            payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+            payload["endpoint"] = "infer"
+            conn.send(packer.pack(payload))
+            actions.append(_pi0_decode_action_response(conn.recv()))
+        return {"metadata": dict(metadata), "actions": actions, "session_id": session_id}
+    finally:
+        conn.close()
+
+
+def pi0_openpi_validate_session_result(
+    result: dict[str, Any],
+    *,
+    expected_action_horizon: int = PI0_ACTION_HORIZON,
+    expected_action_dim: int = PI0_ACTION_DIM,
+) -> None:
+    """Assert the handshake metadata + every returned action chunk for π0."""
+    metadata = result["metadata"]
+    required_keys = (
+        "image_resolution",
+        "needs_wrist_camera",
+        "needs_session_id",
+        "action_space",
+        "action_horizon",
+        "action_dim",
+    )
+    missing = [key for key in required_keys if key not in metadata]
+    if missing:
+        raise AssertionError(f"Missing π0 metadata keys: {missing}")
+
+    if tuple(metadata["image_resolution"]) != (PI0_IMAGE_SIZE, PI0_IMAGE_SIZE):
+        raise AssertionError(f"Unexpected image_resolution: {metadata['image_resolution']!r}")
+    if not metadata["needs_wrist_camera"]:
+        raise AssertionError("π0 test expects needs_wrist_camera=True")
+    if metadata["needs_session_id"]:
+        raise AssertionError("π0 is stateless; needs_session_id must be False")
+    if metadata["action_space"] != "joint_position":
+        raise AssertionError(f"Unexpected action_space: {metadata['action_space']!r}")
+    if int(metadata["action_horizon"]) != expected_action_horizon:
+        raise AssertionError(f"Unexpected action_horizon: {metadata['action_horizon']!r}")
+    if int(metadata["action_dim"]) != expected_action_dim:
+        raise AssertionError(f"Unexpected action_dim: {metadata['action_dim']!r}")
+
+    actions = result["actions"]
+    if not actions:
+        raise AssertionError("No actions returned from the server")
+    for index, action in enumerate(actions):
+        if action.shape != (expected_action_horizon, expected_action_dim):
+            raise AssertionError(
+                f"Action {index} shape mismatch: expected "
+                f"{(expected_action_horizon, expected_action_dim)}, got {action.shape}"
+            )
+        if not np.isfinite(action).all():
+            raise AssertionError(f"Action {index} contains non-finite values")
+
+
 __all__ = [
     "DiffusionResponse",
     "HttpResponse",
@@ -3261,4 +3426,8 @@ __all__ = [
     "OpenAIClientHandler",
     "get_open_port",
     "dummy_messages_from_mix_data",
+    "pi0_openpi_require_dependencies",
+    "pi0_openpi_run_policy_session",
+    "pi0_openpi_validate_session_result",
+    "pi0_make_dummy_obs",
 ]

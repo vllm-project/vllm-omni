@@ -1,0 +1,52 @@
+# π0 (Pi-Zero) VLA deploy: single diffusion stage.
+#
+# Topology (PI0_PIPELINE) is declared in vllm_omni/diffusion/models/pi0/pipeline_pi0.py.
+# π0 takes multi-camera images + a language instruction + robot state and emits
+# a continuous action chunk [chunk_size, max_action_dim] via flow matching.
+# Actions are exposed through the OpenPI realtime serving API
+# (/v1/realtime/robot/openpi); they ride in multimodal_output["actions"].
+#
+# Default: one GPU, TP=1, eager (flow matching needs no CUDA graph), bsz 1
+# (OpenPI policy serving is one observation -> one action reply). float32 to
+# match the LeRobot pi0_base reference numerics.
+
+pipeline: pi0
+async_chunk: false
+distributed_executor_backend: mp
+dtype: float32
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Pi0Pipeline
+    model_config:
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      chunk_size: 50
+      max_action_dim: 32
+      max_state_dim: 32
+      num_inference_steps: 10
+      image_resolution: [224, 224]
+      tokenizer_max_length: 48
+      max_cameras: 3
+      # Camera identities (the order the model attends to). Serving maps raw obs
+      # keys onto these via image_key_map; leave image_key_map empty to match
+      # incoming keys verbatim.
+      image_feature_keys:
+        - observation.images.base_0_rgb
+        - observation.images.left_wrist_0_rgb
+        - observation.images.right_wrist_0_rgb
+      image_key_map: {}
+      # OpenPI handshake metadata advertised to the robot client.
+      policy_server_config:
+        image_resolution: [224, 224]
+        n_external_cameras: 1
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: false
+        action_space: joint_position
+        action_horizon: 50
+        action_dim: 32
+        max_cameras: 3
