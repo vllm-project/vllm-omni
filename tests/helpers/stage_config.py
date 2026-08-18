@@ -471,6 +471,24 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "sensenova": {
+        # SenseNova stage 1 runs at max_latent_size=64 (~1024x1024) and needs
+        # more memory than BAGEL (~512x512); the higher gpu_memory_utilization
+        # is already in sensenova.yaml, so the overlay only trims seq counts.
+        "base_config": "sensenova.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 3,
+                "gpu_memory_utilization": 0.45,
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.45,
+            },
+        ],
+    },
     "bagel_think": {
         "base_config": "bagel_think.yaml",
         "stages": [
