@@ -30,3 +30,23 @@ def test_check_health_raises_when_resources_engine_dead():
     client = _make_client(engine_dead=True)
     with pytest.raises(EngineDeadError, match="engine core is dead"):
         client.check_health()
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_routes_cache_control_to_engine_core(mocker):
+    client = _make_client()
+    client.reset_prefix_cache_async = mocker.AsyncMock(return_value=True)
+    client.reset_mm_cache_async = mocker.AsyncMock()
+    client.reset_encoder_cache_async = mocker.AsyncMock()
+
+    result = await client.collective_rpc_async(
+        "reset_prefix_cache",
+        kwargs={"reset_running_requests": True, "reset_connector": True},
+    )
+    assert result is True
+    client.reset_prefix_cache_async.assert_awaited_once_with(True, True)
+
+    assert await client.collective_rpc_async("reset_mm_cache") is True
+    client.reset_mm_cache_async.assert_awaited_once()
+    assert await client.collective_rpc_async("reset_encoder_cache") is True
+    client.reset_encoder_cache_async.assert_awaited_once()

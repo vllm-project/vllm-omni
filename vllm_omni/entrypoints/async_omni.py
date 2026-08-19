@@ -145,8 +145,15 @@ class AsyncOmni(EngineClient, OmniBase):
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
+        self._pause_lock = asyncio.Lock()
         self._paused: bool = False
+        self._pause_barrier_complete = False
+        self._weight_update_lock = asyncio.Lock()
+        self._weight_update_active = False
+        self._weight_update_stage_ids: list[int] | None = None
+        self._weight_update_component: str | None = None
         self._sleeping_tags: set[str] = set()
+        self._sleeping_stage_ids: set[int] = set()
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
         self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
@@ -1009,6 +1016,61 @@ class AsyncOmni(EngineClient, OmniBase):
 
         return results
 
+    async def collective_rpc_with_acks(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute a control RPC and fail unless every replica acknowledges it."""
+        result_method = getattr(self.engine, "collective_rpc_result_async", None)
+        if result_method is None:
+            results = await self.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=stage_ids,
+            )
+            result_stage_ids = stage_ids or list(range(len(results)))
+        else:
+            result_msg = await result_method(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=stage_ids,
+            )
+            results = list(result_msg.results)
+            result_stage_ids = list(result_msg.stage_ids)
+
+        acks: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for index, result in enumerate(results):
+            stage_id = result_stage_ids[index] if index < len(result_stage_ids) else None
+            supported = not (isinstance(result, dict) and (result.get("supported") is False or result.get("todo")))
+            successful = supported and result is not False
+            error = result.get("error") if isinstance(result, dict) else None
+            ack = {
+                "stage_id": stage_id,
+                "success": successful,
+                "result": result,
+            }
+            acks.append(ack)
+            if not successful or error:
+                failures.append(f"stage {stage_id}: {error or result!r}")
+
+        expected = set(stage_ids or range(len(self.engine.stage_clients)))
+        acknowledged = {ack["stage_id"] for ack in acks}
+        missing = sorted(expected - acknowledged)
+        if missing:
+            failures.append(f"missing acknowledgements from stages {missing}")
+        if failures:
+            raise RuntimeError(f"{method} did not complete on every target: " + "; ".join(failures))
+        return acks
+
     @staticmethod
     def _coerce_stage_bool(result: Any) -> bool:
         """Reduce a stage RPC result to a boolean.
@@ -1028,6 +1090,12 @@ class AsyncOmni(EngineClient, OmniBase):
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
+
+    async def abort_all(self) -> int:
+        """Abort every request currently tracked by the frontend."""
+        internal_ids = list(self.request_states)
+        await self._abort(internal_ids)
+        return len(internal_ids)
 
     async def submit_interaction_async(
         self,
@@ -1096,33 +1164,53 @@ class AsyncOmni(EngineClient, OmniBase):
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
-        """Pause generation."""
-        async with self._pause_cond:
-            if self._paused:
-                return
-            self._paused = True
+        """Pause admission and apply vLLM-compatible in-flight semantics."""
+        if wait_for_inflight_requests:
+            mode = "wait"
+        if mode not in ("abort", "wait", "keep"):
+            raise ValueError(f"Unsupported pause mode: {mode}")
+        async with self._pause_lock:
+            async with self._pause_cond:
+                if self._paused and self._pause_barrier_complete:
+                    return
+                self._paused = True
+                self._pause_barrier_complete = False
 
-        # TODO: Implement request draining if wait_for_inflight_requests
+            if mode == "abort":
+                await self.abort_all()
+            elif mode == "wait":
+                while self.request_states:
+                    await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
 
-        if clear_cache:
-            # Clear caches for all stages.
-            await self.reset_prefix_cache(
-                reset_running_requests=not wait_for_inflight_requests,
-                reset_connector=True,
-            )
-            await self.reset_mm_cache()
-            await self.reset_encoder_cache()
+            if clear_cache and mode != "keep":
+                await self.reset_prefix_cache(
+                    reset_running_requests=False,
+                    reset_connector=True,
+                )
+                await self.reset_mm_cache()
+                await self.reset_encoder_cache()
+            self._pause_barrier_complete = True
 
     async def resume_generation(self) -> None:
         """Resume generation."""
-        async with self._pause_cond:
-            self._paused = False
-            self._pause_cond.notify_all()
+        async with self._pause_lock:
+            async with self._pause_cond:
+                self._paused = False
+                self._pause_barrier_complete = False
+                self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
         """Check if paused."""
         async with self._pause_cond:
             return self._paused
+
+    async def get_pause_status(self) -> dict[str, bool]:
+        """Return admission and completed-barrier state."""
+        async with self._pause_cond:
+            return {
+                "is_paused": self._paused,
+                "barrier_complete": self._pause_barrier_complete,
+            }
 
     async def start_profile(
         self,
@@ -1149,30 +1237,29 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
-    async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
+    async def reset_mm_cache(self, stage_ids: list[int] | None = None) -> None:
+        """Reset multi-modal caches on every selected stage replica."""
+        await self.collective_rpc_with_acks("reset_mm_cache", stage_ids=stage_ids)
 
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
-
-    async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+    async def reset_encoder_cache(self, stage_ids: list[int] | None = None) -> None:
+        """Reset encoder caches on every selected stage replica."""
+        await self.collective_rpc_with_acks("reset_encoder_cache", stage_ids=stage_ids)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
+        stage_ids: list[int] | None = None,
     ) -> bool:
-        """Reset the prefix cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
+        """Reset prefix caches on every selected stage replica."""
+        await self.collective_rpc_with_acks(
+            "reset_prefix_cache",
+            kwargs={
+                "reset_running_requests": reset_running_requests,
+                "reset_connector": reset_connector,
+            },
+            stage_ids=stage_ids,
+        )
         return True
 
     async def sleep(
@@ -1208,6 +1295,7 @@ class AsyncOmni(EngineClient, OmniBase):
         if not hasattr(self, "_sleeping_tags"):
             self._sleeping_tags = set()
         self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
+        self._sleeping_stage_ids.update(stage_ids)
         if level == 2:
             self._level2_sleeping = True
         return final_acks
@@ -1256,8 +1344,9 @@ class AsyncOmni(EngineClient, OmniBase):
         current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
 
-        for t in requested_tags:
-            if hasattr(self, "_sleeping_tags"):
+        self._sleeping_stage_ids.difference_update(stage_ids)
+        if not self._sleeping_stage_ids:
+            for t in requested_tags:
                 self._sleeping_tags.discard(t)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
@@ -1274,6 +1363,30 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         return bool(getattr(self, "_sleeping_tags", None))
 
+    async def get_sleep_status(self) -> dict[str, Any]:
+        """Return the acknowledged stage-level sleep state."""
+        sleeping = set(self._sleeping_stage_ids)
+        return {
+            "is_sleeping": bool(sleeping),
+            "stages": [
+                {"stage_id": stage_id, "is_sleeping": stage_id in sleeping}
+                for stage_id in range(len(self.engine.stage_clients))
+            ],
+            "tags": sorted(self._sleeping_tags),
+        }
+
+    async def add_lora_with_acks(
+        self,
+        lora_request: LoRARequest,
+        stage_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load an adapter and retain per-stage acknowledgements."""
+        return await self.collective_rpc_with_acks(
+            method="add_lora",
+            args=(lora_request,),
+            stage_ids=stage_ids,
+        )
+
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.
 
@@ -1282,6 +1395,18 @@ class AsyncOmni(EngineClient, OmniBase):
         results = await self.collective_rpc(method="add_lora", args=(lora_request,))
         concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
         return all(self._coerce_stage_bool(r) for r in concrete_results) if concrete_results else False
+
+    async def remove_lora_with_acks(
+        self,
+        adapter_id: int,
+        stage_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Unload an adapter and retain per-stage acknowledgements."""
+        return await self.collective_rpc_with_acks(
+            method="remove_lora",
+            args=(adapter_id,),
+            stage_ids=stage_ids,
+        )
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from all stages.
@@ -1387,19 +1512,163 @@ class AsyncOmni(EngineClient, OmniBase):
             request_id,
         )
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """Start a new weight update.
+    @staticmethod
+    def _request_info(request: Any, attribute: str) -> dict[str, Any]:
+        value = getattr(request, attribute, None)
+        if value is None and isinstance(request, dict):
+            value = request.get(attribute)
+        if not isinstance(value, dict):
+            raise ValueError(f"{attribute} must be a dictionary")
+        return dict(value)
 
-        Omni does not currently support weight transfer, so this is a no-op.
-        """
-        logger.debug("Weight update start requested (no-op in omni)")
+    async def init_weight_transfer_engine(self, request: Any) -> list[dict[str, Any]]:
+        """Initialize a stage-targeted weight-transfer data plane."""
+        init_info = self._request_info(request, "init_info")
+        stage_ids = init_info.pop("stage_ids", None)
+        component = init_info.pop("component", None)
+        if stage_ids is not None:
+            stage_ids = [int(stage_id) for stage_id in stage_ids]
+        acks = await self.collective_rpc_with_acks(
+            "init_weight_transfer_engine",
+            kwargs={"init_info": init_info},
+            stage_ids=stage_ids,
+        )
+        self._weight_update_stage_ids = stage_ids
+        self._weight_update_component = component
+        return acks
 
-    async def finish_weight_update(self) -> None:
-        """Finish the current weight update.
+    async def start_weight_update(self, is_checkpoint_format: bool = True) -> list[dict[str, Any]]:
+        """Open an update transaction on every selected stage replica."""
+        if not self._paused or not self._pause_barrier_complete:
+            raise RuntimeError("pause must complete before starting a weight update")
+        if self._weight_update_active:
+            raise RuntimeError("A weight update is already active")
+        await self._weight_update_lock.acquire()
+        try:
+            acks = await self.collective_rpc_with_acks(
+                "start_weight_update",
+                stage_ids=self._weight_update_stage_ids,
+            )
+            self._weight_update_active = True
+            return acks
+        except Exception:
+            self._weight_update_lock.release()
+            raise
 
-        Omni does not currently support weight transfer, so this is a no-op.
-        """
-        logger.debug("Weight update finish requested (no-op in omni)")
+    async def start_draft_weight_update(self) -> list[dict[str, Any]]:
+        """Open a draft-model update transaction."""
+        if not self._paused or not self._pause_barrier_complete:
+            raise RuntimeError("pause must complete before starting a weight update")
+        if self._weight_update_active:
+            raise RuntimeError("A weight update is already active")
+        await self._weight_update_lock.acquire()
+        try:
+            acks = await self.collective_rpc_with_acks(
+                "start_draft_weight_update",
+                stage_ids=self._weight_update_stage_ids,
+            )
+            self._weight_update_active = True
+            return acks
+        except Exception:
+            self._weight_update_lock.release()
+            raise
+
+    async def update_weights(self, request: Any) -> list[dict[str, Any]]:
+        """Trigger one data-plane weight chunk while an update is active."""
+        if not self._weight_update_active:
+            raise RuntimeError("start_weight_update must be called first")
+        update_info = self._request_info(request, "update_info")
+        requested_stage_ids = update_info.pop("stage_ids", None)
+        if requested_stage_ids is not None:
+            requested_stage_ids = [int(stage_id) for stage_id in requested_stage_ids]
+            if requested_stage_ids != self._weight_update_stage_ids:
+                raise ValueError("update_weights stage_ids must match the initialized target")
+        stage_ids = self._weight_update_stage_ids
+        requested_component = update_info.get("component")
+        if (
+            requested_component is not None
+            and self._weight_update_component is not None
+            and requested_component != self._weight_update_component
+        ):
+            raise ValueError("update_weights component must match the initialized target")
+        component = update_info.setdefault("component", self._weight_update_component)
+        if component is None:
+            update_info.pop("component")
+        return await self.collective_rpc_with_acks(
+            "update_weights",
+            kwargs={"update_info": update_info},
+            stage_ids=stage_ids,
+        )
+
+    async def finish_weight_update(self, weight_version: str | None = None) -> list[dict[str, Any]]:
+        """Commit an active update only after every target acknowledges it."""
+        if not self._weight_update_active:
+            raise RuntimeError("No weight update is active")
+        try:
+            acks = await self.collective_rpc_with_acks(
+                "finish_weight_update",
+                stage_ids=self._weight_update_stage_ids,
+            )
+            await self.reset_prefix_cache(
+                reset_running_requests=False,
+                reset_connector=True,
+                stage_ids=self._weight_update_stage_ids,
+            )
+            await self.reset_mm_cache(stage_ids=self._weight_update_stage_ids)
+            await self.reset_encoder_cache(stage_ids=self._weight_update_stage_ids)
+            return acks
+        finally:
+            self._weight_update_active = False
+            self._weight_update_lock.release()
+
+    async def get_weights_checksum(
+        self,
+        stage_ids: list[int] | None = None,
+        component: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return per-replica hashes without transferring weight tensors."""
+        return await self.collective_rpc_with_acks(
+            "get_weights_checksum",
+            kwargs={"component": component},
+            stage_ids=stage_ids,
+        )
+
+    def get_stage_topology(self, include_dp: bool = True) -> dict[str, Any]:
+        """Describe logical stages and their data-plane receiver world sizes."""
+        stages: list[dict[str, Any]] = []
+        for stage_id, client in enumerate(self.engine.stage_clients):
+            stage_type = getattr(client, "stage_type", "unknown")
+            config = self.engine.stage_vllm_configs[stage_id]
+            if config is not None:
+                parallel = config.parallel_config
+                world_size = parallel.world_size_across_dp if include_dp else parallel.world_size
+                tp = parallel.tensor_parallel_size
+                pp = parallel.pipeline_parallel_size
+                dp = parallel.data_parallel_size if include_dp else 1
+            else:
+                od_config = getattr(client, "od_config", None) or self.get_diffusion_od_config()
+                parallel = getattr(od_config, "parallel_config", None)
+                tp = int(getattr(parallel, "tensor_parallel_size", 1))
+                pp = int(getattr(parallel, "pipeline_parallel_size", 1))
+                dp = int(getattr(parallel, "data_parallel_size", 1)) if include_dp else 1
+                sp = int(getattr(parallel, "sequence_parallel_size", 1))
+                cfg = int(getattr(parallel, "cfg_parallel_size", 1))
+                world_size = tp * pp * dp * sp * cfg
+            stages.append(
+                {
+                    "stage_id": stage_id,
+                    "stage_type": stage_type,
+                    "model_stage": getattr(client, "model_stage", None),
+                    "world_size": world_size,
+                    "tensor_parallel_size": tp,
+                    "pipeline_parallel_size": pp,
+                    "data_parallel_size": dp,
+                }
+            )
+        return {
+            "world_size": sum(stage["world_size"] for stage in stages),
+            "stages": stages,
+        }
 
     async def do_log_stats(self) -> None:
         """Log statistics.

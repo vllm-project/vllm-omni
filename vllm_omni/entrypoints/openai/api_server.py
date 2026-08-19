@@ -128,6 +128,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.rl_api import (
+    remove_overridden_routes as remove_rl_routes,
+)
+from vllm_omni.entrypoints.openai.rl_api import router as rl_router
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -520,6 +524,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
+        if envs.VLLM_SERVER_DEV_MODE:
+            remove_rl_routes(app)
+            app.include_router(rl_router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.

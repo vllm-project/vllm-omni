@@ -1757,15 +1757,15 @@ class AsyncOmniEngine:
         """Async interaction API."""
         self.submit_interaction(request_id, interaction)
 
-    def collective_rpc(
+    def collective_rpc_result(
         self,
         method: str,
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
-    ) -> list[Any]:
-        """Send a control RPC to the Orchestrator and wait for aggregated results.
+    ) -> CollectiveRPCResultMessage:
+        """Send a control RPC and retain stage/replica correlation metadata.
 
         This uses a dedicated RPC output queue so control-plane messages do not
         race with the normal request output polling loop.
@@ -1792,6 +1792,24 @@ class AsyncOmniEngine:
         )
         if not isinstance(result_msg, CollectiveRPCResultMessage):
             raise RuntimeError(f"unexpected collective RPC result type: {type(result_msg).__name__}")
+        return result_msg
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> list[Any]:
+        """Send a control RPC and return its results for compatibility."""
+        result_msg = self.collective_rpc_result(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=stage_ids,
+        )
         return list(result_msg.results)
 
     async def collective_rpc_async(
@@ -1807,6 +1825,27 @@ class AsyncOmniEngine:
         return await loop.run_in_executor(
             None,
             lambda: self.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=stage_ids,
+            ),
+        )
+
+    async def collective_rpc_result_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+    ) -> CollectiveRPCResultMessage:
+        """Async wrapper that preserves stage IDs in the RPC response."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.collective_rpc_result(
                 method=method,
                 timeout=timeout,
                 args=args,

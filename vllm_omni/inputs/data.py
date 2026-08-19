@@ -306,6 +306,7 @@ class OmniDiffusionSamplingParams:
 
     return_trajectory_latents: bool = False
     return_trajectory_decoded: bool = False
+    return_trajectory_handles: bool = False
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
 

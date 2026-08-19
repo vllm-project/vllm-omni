@@ -9,6 +9,7 @@ to DiffusionModelRunner.
 """
 
 import gc
+import hashlib
 import multiprocessing as mp
 import os
 import queue
@@ -187,6 +188,9 @@ class DiffusionWorker:
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_rollout_handle_requests: set[str] = set()
+        self._weight_transfer_info: dict[str, Any] | None = None
+        self._weight_update_active = False
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -561,6 +565,7 @@ class DiffusionWorker:
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
             output = self.model_runner.execute_model(req, **kwargs)
+        output.preserve_trajectory_handles = req.sampling_params.return_trajectory_handles
         if profiler:
             profiler.step()
 
@@ -591,6 +596,14 @@ class DiffusionWorker:
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
         with ctx:
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
+        handle_requests = {
+            new_req.request_id
+            for new_req in scheduler_output.scheduled_new_reqs
+            if new_req.req.sampling_params.return_trajectory_handles
+        }
+        for runner_output in output.runner_outputs:
+            if runner_output.result is not None and runner_output.request_id in handle_requests:
+                runner_output.result.preserve_trajectory_handles = True
         if profiler:
             profiler.step()
         return output
@@ -598,11 +611,20 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        self._step_rollout_handle_requests.difference_update(scheduler_output.finished_req_ids)
+        self._step_rollout_handle_requests.update(
+            new_req.request_id
+            for new_req in scheduler_output.scheduled_new_reqs
+            if new_req.req.sampling_params.return_trajectory_handles
+        )
         self._activate_step_lora(scheduler_output)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
             output = self.model_runner.execute_stepwise(scheduler_output)
+        for runner_output in output.runner_outputs:
+            if runner_output.result is not None and runner_output.request_id in self._step_rollout_handle_requests:
+                runner_output.result.preserve_trajectory_handles = True
         if profiler:
             profiler.step()
         return output
@@ -666,6 +688,118 @@ class DiffusionWorker:
 
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
+
+    def _pipeline_component(self, component: str | None = None) -> Any:
+        assert self.model_runner is not None, "Model runner not initialized"
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            raise RuntimeError("Diffusion pipeline is not loaded")
+        if component in (None, "", "pipeline", "model"):
+            return pipeline
+        target = getattr(pipeline, component, None)
+        if target is None:
+            raise ValueError(f"Unknown diffusion component: {component}")
+        return target
+
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Acknowledge the AR-only cache operation for a diffusion stage."""
+        return True
+
+    def _reset_optional_cache(self, method: str) -> bool:
+        pipeline = self._pipeline_component()
+        reset = getattr(pipeline, method, None)
+        if callable(reset):
+            reset()
+        return True
+
+    def reset_mm_cache(self) -> bool:
+        return self._reset_optional_cache("reset_mm_cache")
+
+    def reset_encoder_cache(self) -> bool:
+        return self._reset_optional_cache("reset_encoder_cache")
+
+    def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> dict[str, Any]:
+        """Configure the diffusion artifact transfer backend.
+
+        Direct NCCL and CUDA-IPC transfer engines remain owned by vLLM workers.
+        Diffusion workers currently accept safetensors artifacts, which may be
+        placed by a trainer in local or shared storage.
+        """
+        backend = str(init_info.get("backend", init_info.get("type", "safetensors")))
+        if backend not in {"safetensors", "filesystem", "shared_storage"}:
+            raise ValueError(f"Unsupported diffusion weight-transfer backend: {backend}")
+        self._weight_transfer_info = {**init_info, "backend": backend}
+        return {"supported": True, "backend": backend, "rank": self.rank}
+
+    def start_weight_update(self) -> dict[str, Any]:
+        if self._weight_transfer_info is None:
+            raise RuntimeError("init_weight_transfer_engine must be called first")
+        if self._weight_update_active:
+            raise RuntimeError("A weight update is already active")
+        self._weight_update_active = True
+        return {"supported": True, "rank": self.rank}
+
+    def start_draft_weight_update(self) -> None:
+        raise NotImplementedError("Diffusion stages do not have draft-model weights")
+
+    def update_weights(self, update_info: dict[str, Any]) -> dict[str, Any]:
+        if not self._weight_update_active:
+            raise RuntimeError("start_weight_update must be called first")
+        artifact_path = update_info.get("path") or update_info.get("weights_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            raise ValueError("Diffusion artifact updates require 'path' or 'weights_path'")
+
+        from safetensors.torch import load_file
+
+        component = update_info.get("component")
+        target = self._pipeline_component(component)
+        loader = getattr(target, "load_weights", None)
+        if not callable(loader):
+            raise RuntimeError(f"Component {component or 'pipeline'} does not support load_weights")
+        state_dict = load_file(artifact_path, device="cpu")
+        loaded = loader(state_dict.items())
+        current_omni_platform.synchronize()
+        return {
+            "supported": True,
+            "rank": self.rank,
+            "component": component or "pipeline",
+            "loaded": len(loaded) if loaded is not None else len(state_dict),
+        }
+
+    def finish_weight_update(self, weight_version: str | None = None) -> dict[str, Any]:
+        if not self._weight_update_active:
+            raise RuntimeError("No weight update is active")
+        self._weight_update_active = False
+        current_omni_platform.synchronize()
+        return {"supported": True, "rank": self.rank}
+
+    def get_weights_checksum(self, component: str | None = None) -> dict[str, Any]:
+        """Hash local parameters without returning model tensors."""
+        target = self._pipeline_component(component)
+        named_parameters = getattr(target, "named_parameters", None)
+        if not callable(named_parameters):
+            raise RuntimeError(f"Component {component or 'pipeline'} has no parameters")
+        digest = hashlib.sha256()
+        parameter_count = 0
+        for name, parameter in sorted(named_parameters(), key=lambda item: item[0]):
+            digest.update(name.encode())
+            digest.update(str(parameter.dtype).encode())
+            digest.update(str(tuple(parameter.shape)).encode())
+            raw = parameter.detach().contiguous().view(torch.uint8).cpu().numpy()
+            digest.update(raw.tobytes())
+            parameter_count += 1
+        return {
+            "supported": True,
+            "rank": self.rank,
+            "component": component or "pipeline",
+            "algorithm": "sha256",
+            "checksum": digest.hexdigest(),
+            "parameter_count": parameter_count,
+        }
 
     def sleep(self, level: int = 1) -> int:
         """

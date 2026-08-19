@@ -43,6 +43,22 @@ def split_diffusion_output_by_request(
                 idx * num_outputs_per_prompt,
                 (idx + 1) * num_outputs_per_prompt,
             ),
+            trajectory_timesteps=_slice_request_output(
+                result.trajectory_timesteps,
+                idx * num_outputs_per_prompt,
+                (idx + 1) * num_outputs_per_prompt,
+            ),
+            trajectory_latents=_slice_request_output(
+                result.trajectory_latents,
+                idx * num_outputs_per_prompt,
+                (idx + 1) * num_outputs_per_prompt,
+            ),
+            trajectory_log_probs=_slice_request_output(
+                result.trajectory_log_probs,
+                idx * num_outputs_per_prompt,
+                (idx + 1) * num_outputs_per_prompt,
+            ),
+            preserve_trajectory_handles=result.preserve_trajectory_handles,
             error=result.error,
             finished=result.finished,
             stage_durations=result.stage_durations,

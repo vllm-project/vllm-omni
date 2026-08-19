@@ -214,6 +214,68 @@ def test_diffusion_output_list_tensors_round_trip_through_shm() -> None:
     torch.testing.assert_close(output.output[1], frames[1])
 
 
+def test_rollout_trajectory_handles_are_not_rematerialized() -> None:
+    latents = torch.arange(8, dtype=torch.float32)
+    output = DiffusionOutput(
+        trajectory_latents=latents,
+        trajectory_timesteps=torch.arange(2, dtype=torch.float32),
+        trajectory_log_probs=torch.arange(2, dtype=torch.float32),
+        preserve_trajectory_handles=True,
+    )
+
+    pack_diffusion_output_shm(output)
+    handles = [
+        output.trajectory_latents,
+        output.trajectory_timesteps,
+        output.trajectory_log_probs,
+    ]
+    try:
+        assert all(handle["preserve_for_client"] is True for handle in handles)
+        assert all(handle["ownership"] == "client" for handle in handles)
+
+        unpack_diffusion_output_shm(output)
+
+        assert output.trajectory_latents is handles[0]
+        assert output.trajectory_timesteps is handles[1]
+        assert output.trajectory_log_probs is handles[2]
+    finally:
+        for handle in handles:
+            if isinstance(handle, dict):
+                handle.pop("preserve_for_client", None)
+                _cleanup_shm_handle(handle)
+
+
+def test_nested_rollout_trajectory_handles_are_not_rematerialized() -> None:
+    output = DiffusionOutput(
+        output={
+            "payload": {
+                "image": "decoded-image",
+                "trajectory": {
+                    "latents": torch.arange(8, dtype=torch.float32),
+                    "timesteps": torch.arange(2, dtype=torch.float32),
+                    "log_probs": torch.arange(2, dtype=torch.float32),
+                },
+            }
+        },
+        preserve_trajectory_handles=True,
+    )
+
+    pack_diffusion_output_shm(output)
+    trajectory = output.output["payload"]["trajectory"]
+    handles = list(trajectory.values())
+    try:
+        assert output.output["payload"]["image"] == "decoded-image"
+        assert all(handle["preserve_for_client"] is True for handle in handles)
+
+        unpack_diffusion_output_shm(output)
+
+        assert output.output["payload"]["trajectory"] == trajectory
+    finally:
+        for handle in handles:
+            handle.pop("preserve_for_client", None)
+            _cleanup_shm_handle(handle)
+
+
 def test_diffusion_output_numpy_array_round_trips_through_shm() -> None:
     frames = np.arange(300_000, dtype=np.float32)
     output = DiffusionOutput(output=frames)

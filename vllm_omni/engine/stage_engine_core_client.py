@@ -425,6 +425,17 @@ class StageEngineCoreClientBase(StageClientBase):
         control operations should be executed here and then fanned in-core
         across the workers managed by this EngineCore client.
         """
+        if method == "reset_prefix_cache":
+            return await self.reset_prefix_cache_async(
+                kwargs.get("reset_running_requests", False) if kwargs else False,
+                kwargs.get("reset_connector", False) if kwargs else False,
+            )
+        if method == "reset_mm_cache":
+            await self.reset_mm_cache_async()
+            return True
+        if method == "reset_encoder_cache":
+            await self.reset_encoder_cache_async()
+            return True
         return await super().collective_rpc_async(
             method=method,
             timeout=timeout,

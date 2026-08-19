@@ -160,10 +160,10 @@ class OmniRequestOutput(RequestOutput):
 
     # --- Diffusion model fields ---
     images: list[Image.Image] = field(default_factory=list)
-    latents: torch.Tensor | None = None
-    trajectory_latents: torch.Tensor | None = None
-    trajectory_timesteps: torch.Tensor | None = None
-    trajectory_log_probs: torch.Tensor | None = None
+    latents: torch.Tensor | dict[str, Any] | None = None
+    trajectory_latents: torch.Tensor | dict[str, Any] | None = None
+    trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
+    trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list | None = None
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
@@ -270,10 +270,10 @@ class OmniRequestOutput(RequestOutput):
         images: list[Image.Image],
         prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
-        latents: torch.Tensor | None = None,
-        trajectory_latents: torch.Tensor | None = None,
-        trajectory_timesteps: torch.Tensor | None = None,
-        trajectory_log_probs: torch.Tensor | None = None,
+        latents: torch.Tensor | dict[str, Any] | None = None,
+        trajectory_latents: torch.Tensor | dict[str, Any] | None = None,
+        trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None,
+        trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None,
         trajectory_decoded: list | None = None,
         multimodal_output: dict[str, Any] | None = None,
         custom_output: dict[str, Any] | None = None,

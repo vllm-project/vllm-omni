@@ -31,7 +31,7 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
 
     array = np.ascontiguousarray(array)
     nbytes = array.nbytes
-    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes))
     shm_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf[:nbytes])
     np.copyto(shm_array, array)
     handle = {
@@ -64,6 +64,8 @@ def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
 def _tensor_to_shm(
     tensor: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
+    *,
+    client_owned: bool = False,
 ) -> dict[str, Any]:
     """Copy a tensor into POSIX shared memory and return a metadata handle.
 
@@ -101,6 +103,15 @@ def _tensor_to_shm(
             "torch_dtype": str(original_dtype),
         }
     )
+    if client_owned:
+        handle.update(
+            {
+                "kind": "shm",
+                "ownership": "client",
+                "release": "unlink",
+                "preserve_for_client": True,
+            }
+        )
     return handle
 
 
@@ -175,11 +186,83 @@ def _pack_value_if_large(
     return val
 
 
+def _pack_client_owned_value(
+    val: object,
+    d2h_stream: torch.Stream | None = None,
+) -> object:
+    """Move a public rollout value to SHM without rematerializing it."""
+    if isinstance(val, torch.Tensor):
+        return _tensor_to_shm(val, d2h_stream=d2h_stream, client_owned=True)
+    if isinstance(val, np.ndarray) and not val.dtype.hasobject:
+        handle = _ndarray_to_shm(val)
+        handle.update(
+            {
+                "kind": "shm",
+                "ownership": "client",
+                "release": "unlink",
+                "preserve_for_client": True,
+            }
+        )
+        return handle
+    if isinstance(val, dict):
+        return {key: _pack_client_owned_value(value, d2h_stream=d2h_stream) for key, value in val.items()}
+    if isinstance(val, list):
+        return [_pack_client_owned_value(item, d2h_stream=d2h_stream) for item in val]
+    if isinstance(val, tuple):
+        return tuple(_pack_client_owned_value(item, d2h_stream=d2h_stream) for item in val)
+    return val
+
+
+def _pack_output_value(
+    val: object,
+    *,
+    preserve_trajectory_handles: bool,
+    d2h_stream: torch.Stream | None = None,
+) -> object:
+    """Pack regular output values while preserving nested RL trajectories."""
+    if isinstance(val, dict):
+        return {
+            key: (
+                _pack_client_owned_value(value, d2h_stream=d2h_stream)
+                if preserve_trajectory_handles and key == "trajectory"
+                else _pack_output_value(
+                    value,
+                    preserve_trajectory_handles=preserve_trajectory_handles,
+                    d2h_stream=d2h_stream,
+                )
+            )
+            for key, value in val.items()
+        }
+    if isinstance(val, list):
+        return [
+            _pack_output_value(
+                item,
+                preserve_trajectory_handles=preserve_trajectory_handles,
+                d2h_stream=d2h_stream,
+            )
+            for item in val
+        ]
+    if isinstance(val, tuple):
+        return tuple(
+            _pack_output_value(
+                item,
+                preserve_trajectory_handles=preserve_trajectory_handles,
+                d2h_stream=d2h_stream,
+            )
+            for item in val
+        )
+    return _pack_value_if_large(val, d2h_stream=d2h_stream)
+
+
 def _unpack_if_shm_handle(val: object) -> object:
     """Reconstruct tensors from SHM handles, mirroring ``_pack_value_if_large``."""
     if isinstance(val, dict) and val.get("__tensor_shm__"):
+        if val.get("preserve_for_client"):
+            return val
         return _tensor_from_shm(val)
     if isinstance(val, dict) and val.get("__ndarray_shm__"):
+        if val.get("preserve_for_client"):
+            return val
         return _ndarray_from_shm(val)
     if isinstance(val, dict):
         return {key: _unpack_if_shm_handle(value) for key, value in val.items()}
@@ -194,14 +277,31 @@ def _pack_diffusion_fields(
     output: DiffusionOutput,
     d2h_stream: torch.Stream | None = None,
 ) -> DiffusionOutput:
+    client_owned = output.preserve_trajectory_handles
     if output.output is not None:
-        output.output = _pack_value_if_large(output.output, d2h_stream=d2h_stream)
+        output.output = _pack_output_value(
+            output.output,
+            preserve_trajectory_handles=client_owned,
+            d2h_stream=d2h_stream,
+        )
     if output.trajectory_latents is not None and isinstance(output.trajectory_latents, torch.Tensor):
-        output.trajectory_latents = _pack_tensor_if_large(output.trajectory_latents, d2h_stream=d2h_stream)
+        output.trajectory_latents = (
+            _tensor_to_shm(output.trajectory_latents, d2h_stream=d2h_stream, client_owned=True)
+            if client_owned
+            else _pack_tensor_if_large(output.trajectory_latents, d2h_stream=d2h_stream)
+        )
     if output.trajectory_timesteps is not None and isinstance(output.trajectory_timesteps, torch.Tensor):
-        output.trajectory_timesteps = _pack_tensor_if_large(output.trajectory_timesteps, d2h_stream=d2h_stream)
+        output.trajectory_timesteps = (
+            _tensor_to_shm(output.trajectory_timesteps, d2h_stream=d2h_stream, client_owned=True)
+            if client_owned
+            else _pack_tensor_if_large(output.trajectory_timesteps, d2h_stream=d2h_stream)
+        )
     if output.trajectory_log_probs is not None and isinstance(output.trajectory_log_probs, torch.Tensor):
-        output.trajectory_log_probs = _pack_tensor_if_large(output.trajectory_log_probs, d2h_stream=d2h_stream)
+        output.trajectory_log_probs = (
+            _tensor_to_shm(output.trajectory_log_probs, d2h_stream=d2h_stream, client_owned=True)
+            if client_owned
+            else _pack_tensor_if_large(output.trajectory_log_probs, d2h_stream=d2h_stream)
+        )
     return output
 
 

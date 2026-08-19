@@ -1417,6 +1417,7 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    preserve_trajectory_handles: bool = False
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
