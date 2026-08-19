@@ -28,6 +28,13 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.dreamid_omni import (
+    DREAMID_OMNI_EXTRA_BODY_PARAMS,
+    DREAMID_OMNI_INPUT_AUDIO_SAMPLE_RATE,
+)
+from vllm_omni.model_extras.dreamid_omni import (
+    build_x_to_video_audio_prompt as build_dreamid_x_to_video_audio_prompt,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -98,6 +105,7 @@ ImageToVideoPromptBuilder = Callable[
     dict[str, Any],
 ]
 XToTextPromptBuilder = Callable[[str, str, bool], tuple[dict[str, Any], list[int] | None]]
+XToVideoAudioPromptBuilder = Callable[[dict[str, Any], Mapping[str, Any]], dict[str, Any]]
 OutputTensorRange = Literal["negative_one_to_one", "zero_to_one"]
 
 
@@ -203,6 +211,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
+    "DreamIDOmniPipeline": {
+        "extra_body_params": DREAMID_OMNI_EXTRA_BODY_PARAMS,
+        "input_audio_sample_rate": DREAMID_OMNI_INPUT_AUDIO_SAMPLE_RATE,
+        "x_to_video_audio_prompt_builder": build_dreamid_x_to_video_audio_prompt,
+    },
     "MagiHumanPipeline": {
         "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
         "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -293,6 +306,12 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+
+
+def get_input_audio_sample_rate(model_class_name: str | None) -> int | None:
+    """Return a pipeline's required input rate, or preserve the source rate."""
+    spec = _get_spec(model_class_name)
+    return spec.get("input_audio_sample_rate") if spec is not None else None
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
@@ -401,3 +420,14 @@ def build_image_to_video_prompt(
         width=width,
         num_frames=num_frames,
     )
+
+
+def build_x_to_video_audio_prompt(
+    model_class_name: str | None,
+    prompt: dict[str, Any],
+    request_options: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply a model adapter to an example-owned video+audio envelope."""
+    spec = _get_spec(model_class_name)
+    builder: XToVideoAudioPromptBuilder | None = spec.get("x_to_video_audio_prompt_builder") if spec else None
+    return builder(prompt, request_options) if builder is not None else prompt

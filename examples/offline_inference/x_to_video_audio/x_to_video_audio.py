@@ -3,21 +3,86 @@
 
 import argparse
 import json
+import math
 import re
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from PIL import Image
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.video_api_utils import encode_video_bytes
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras import (
+    build_x_to_video_audio_prompt as build_model_x_to_video_audio_prompt,
+)
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    get_input_audio_sample_rate,
+    get_model_class_name,
+    get_output_tensor_range,
+)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"}
+
+
+@dataclass(frozen=True)
+class XToVideoAudioOutput:
+    """Canonical generated video+audio payload and its required metadata."""
+
+    video: Any
+    audio: Any | None
+    fps: float
+    audio_sample_rate: int | None
+    output_tensor_range: str = "negative_one_to_one"
+
+
+def parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return parsed
+
+
+def build_x_to_video_audio_prompt(
+    prompt: str,
+    media_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical request envelope for image/audio-to-video models."""
+    result: dict[str, Any] = {"prompt": prompt, "modalities": ["video"]}
+    if media_inputs:
+        result["multi_modal_data"] = media_inputs
+    return result
+
+
+def _clean_official_prompt(prompt: str) -> str:
+    """Remove metadata tags used by the official DreamID prompt fixtures."""
+    prompt = re.sub(
+        r"\[SPEAKER_TIMESTAMPS_START\].*?\[SPEAKER_TIMESTAMPS_END\]",
+        "",
+        prompt,
+        flags=re.DOTALL,
+    ).strip()
+    prompt = re.sub(
+        r"\[AUDIO_DESCRIPTION_START].*?\[AUDIO_DESCRIPTION_END]",
+        "",
+        prompt,
+        flags=re.DOTALL,
+    ).strip()
+    prompt = re.sub(r"\[[A-Z_]+\]", "", prompt)
+    return re.sub(r"\n\s*\n", "\n", prompt).strip()
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,10 +90,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Model ckpt root directory.")
     parser.add_argument(
         "--model-type",
-        default="dreamid-omni",
-        choices=["dreamid-omni", "magi-human"],
-        help="Model type.",
+        default=None,
+        help="Optional legacy model type override (for example, magi-human).",
     )
+    parser.add_argument("--model-class-name", default=None, help="Optional diffusion pipeline class override.")
     parser.add_argument("--prompt", default=None, help="Text prompt.")
 
     parser.add_argument("--image-path", type=str, nargs="+", help="list of image-path")
@@ -36,9 +101,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", type=str, default=None, help="Text prompt in json format.")
     parser.add_argument(
         "--extra-body",
-        type=str,
+        type=parse_json_object,
         default=None,
-        help="[magi-human] JSON dict of model-specific extra params (declared in vllm_omni/model_extras/), "
+        help="JSON dict of model-specific extra params (declared in vllm_omni/model_extras/), "
         'merged into sampling extra_args. Example: \'{"image_path": "/path/to/img.jpg", "seconds": 5}\'.',
     )
 
@@ -71,13 +136,20 @@ def parse_args() -> argparse.Namespace:
         default="robotic, muffled, echo, distorted",
         help="Negative prompt for audio.",
     )
+    parser.add_argument("--fps", type=float, default=None, help="Override output FPS metadata.")
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=None,
+        help="Override output audio sample-rate metadata.",
+    )
     parser.add_argument("--output", default="dreamid_output.mp4", help="Output video path.")
     parser.add_argument(
         "--quantization",
         type=str,
         default=None,
         choices=["fp8", "int8"],
-        help=("Online (dynamic) quantization method for the DreamID-Omni transformer. "),
+        help="Online (dynamic) quantization method for the model transformer.",
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -94,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-hsdp",
         action="store_true",
-        help="Enable HSDP for DreamID-Omni fused transformer blocks.",
+        help="Enable HSDP for supported transformer blocks.",
     )
     parser.add_argument(
         "--hsdp-shard-size",
@@ -111,20 +183,105 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_image_and_audio(image_paths, audio_paths):
-    image = []
-    audio = []
+def load_image_and_audio(
+    image_paths: list[str] | None,
+    audio_paths: list[str] | None,
+    *,
+    audio_sample_rate: int | None = None,
+) -> tuple[list[Image.Image], list[tuple[Any, int]]]:
+    """Load complete media inputs into the canonical multimodal representation."""
+    images = []
+    audios = []
 
-    for path in image_paths:
+    for path in image_paths or []:
         with Image.open(path) as img:
-            img = img.convert("RGB")
-            image.append(img)
+            images.append(img.convert("RGB"))
 
-    for path in audio_paths:
-        audio_array, sr = load_audio(path, sr=16000)
-        audio_array = audio_array[int(sr * 1) : int(sr * 3)]
-        audio.append(audio_array)
-    return image, audio
+    for path in audio_paths or []:
+        waveform, sample_rate = load_audio(path, sr=audio_sample_rate)
+        audios.append((waveform, sample_rate))
+    return images, audios
+
+
+def extract_x_to_video_audio_output(
+    outputs: Any,
+    *,
+    fps: float | None = None,
+    audio_sample_rate: int | None = None,
+    output_tensor_range: str = "negative_one_to_one",
+) -> XToVideoAudioOutput:
+    """Normalize engine output without depending on a model's tensor layout."""
+    if isinstance(outputs, list):
+        if not outputs:
+            raise RuntimeError("No output returned from the model.")
+        result = outputs[0]
+    else:
+        result = outputs
+    if result is None:
+        raise RuntimeError("No output returned from the model.")
+
+    multimodal_output = getattr(result, "multimodal_output", None) or {}
+    if not isinstance(multimodal_output, Mapping):
+        raise RuntimeError("Model multimodal output must be a mapping.")
+    images = getattr(result, "images", None)
+    video = images[0] if images else multimodal_output.get("video")
+    if video is None:
+        raise RuntimeError("No video payload found in model output.")
+
+    resolved_fps = fps if fps is not None else multimodal_output.get("fps")
+    try:
+        resolved_fps = float(resolved_fps)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Model output must declare a valid 'fps', or pass --fps.") from exc
+    if not math.isfinite(resolved_fps) or resolved_fps <= 0:
+        raise RuntimeError("Output FPS must be finite and positive.")
+
+    audio = multimodal_output.get("audio")
+    resolved_sample_rate = audio_sample_rate
+    if resolved_sample_rate is None:
+        resolved_sample_rate = multimodal_output.get("audio_sample_rate")
+    if audio is not None:
+        try:
+            resolved_sample_rate = int(resolved_sample_rate)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Model output with audio must declare a valid 'audio_sample_rate', or pass --audio-sample-rate."
+            ) from exc
+        if resolved_sample_rate <= 0:
+            raise RuntimeError("Output audio sample rate must be positive.")
+    elif resolved_sample_rate is not None:
+        resolved_sample_rate = int(resolved_sample_rate)
+
+    return XToVideoAudioOutput(video, audio, resolved_fps, resolved_sample_rate, output_tensor_range)
+
+
+def _normalize_output_tensor_range(video: Any, source_range: str) -> Any:
+    """Normalize floating-point output according to the pipeline contract."""
+    if isinstance(video, torch.Tensor):
+        if not video.is_floating_point():
+            return video
+        video = video.detach().cpu().float().numpy()
+    if isinstance(video, np.ndarray):
+        if not np.issubdtype(video.dtype, np.floating):
+            return video
+        if source_range == "negative_one_to_one":
+            return np.clip(video, -1.0, 1.0) * 0.5 + 0.5
+        if source_range == "zero_to_one":
+            return np.clip(video, 0.0, 1.0)
+        raise ValueError(f"Unsupported floating-point tensor range: {source_range!r}")
+    if isinstance(video, list):
+        return [_normalize_output_tensor_range(frame, source_range) for frame in video]
+    return video
+
+
+def encode_x_to_video_audio_output(output: XToVideoAudioOutput) -> bytes:
+    """Encode any video layout supported by the shared video API utility."""
+    return encode_video_bytes(
+        _normalize_output_tensor_range(output.video, output.output_tensor_range),
+        output.fps,
+        output.audio,
+        output.audio_sample_rate,
+    )
 
 
 def _extract_peak_memory_mb(result: Any) -> float:
@@ -157,45 +314,10 @@ def main() -> None:
     if args.prompt_file:
         with open(args.prompt_file) as f:
             text_prompt = json.load(f)
-            text_prompt = re.sub(
-                r"\[SPEAKER_TIMESTAMPS_START\].*?\[SPEAKER_TIMESTAMPS_END\]", "", text_prompt, flags=re.DOTALL
-            ).strip()
-            text_prompt = re.sub(
-                r"\[AUDIO_DESCRIPTION_START].*?\[AUDIO_DESCRIPTION_END]", "", text_prompt, flags=re.DOTALL
-            ).strip()
-            text_prompt = re.sub(r"\[[A-Z_]+\]", "", text_prompt)
-            text_prompt = re.sub(r"\n\s*\n", "\n", text_prompt).strip()
-
-    if args.model_type == "magi-human":
-        prompt = text_prompt
-        extra_args = json.loads(args.extra_body) if args.extra_body else {}
-        sampling_params = OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            seed=args.seed,
-            extra_args=extra_args,
-        )
-    else:
-        image, audio = load_image_and_audio(args.image_path, args.audio_path)
-
-        prompt = {
-            "prompt": text_prompt,
-            "video_negative_prompt": args.video_negative_prompt,
-            "audio_negative_prompt": args.audio_negative_prompt,
-            "multi_modal_data": {"image": image, "audio": audio},
-        }
-
-        sampling_params = OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            seed=args.seed,
-            extra_args={
-                "solver_name": args.solver_name,
-                "shift": args.shift,
-            },
-        )
+            if isinstance(text_prompt, str):
+                text_prompt = _clean_official_prompt(text_prompt)
+    if not isinstance(text_prompt, str):
+        raise ValueError("Prompt content must be a JSON string or --prompt text.")
 
     parallel_config = DiffusionParallelConfig(
         cfg_parallel_size=args.cfg_parallel_size,
@@ -220,64 +342,83 @@ def main() -> None:
             "scm_steps_policy": "dynamic",
         }
 
-    omni_kwargs = dict(
+    omni_kwargs: dict[str, Any] = dict(
         model=args.model,
         parallel_config=parallel_config,
-        model_type=args.model_type,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
     )
+    if args.model_type is not None:
+        omni_kwargs["model_type"] = args.model_type
+    if args.model_class_name is not None:
+        omni_kwargs["model_class_name"] = args.model_class_name
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
     omni = Omni(**omni_kwargs)
-    start = time.perf_counter()
-    outputs = omni.generate(prompt, sampling_params)
-    elapsed = time.perf_counter() - start
+    try:
+        model_class_name = args.model_class_name or get_model_class_name(omni)
+        input_sample_rate = get_input_audio_sample_rate(model_class_name)
+        images, audios = load_image_and_audio(
+            args.image_path,
+            args.audio_path,
+            audio_sample_rate=input_sample_rate,
+        )
+        media_inputs: dict[str, Any] = {}
+        if images:
+            media_inputs["image"] = images
+        if audios:
+            media_inputs["audio"] = audios
 
-    if not outputs:
-        raise RuntimeError("No output returned from the model.")
-    result = outputs[0]
-    if not result.images:
-        raise RuntimeError("No video frames found in model output.")
-    generated_video = result.images[0]
-    mm = result.multimodal_output or {}
-    generated_audio = mm.get("audio")
+        canonical_prompt = build_x_to_video_audio_prompt(text_prompt, media_inputs)
+        prompt = build_model_x_to_video_audio_prompt(
+            model_class_name,
+            canonical_prompt,
+            {
+                "video_negative_prompt": args.video_negative_prompt,
+                "audio_negative_prompt": args.audio_negative_prompt,
+            },
+        )
 
-    if args.model_type == "magi-human":
-        # MagiHuman returns frames already as (F, H, W, C) uint8, ready to mux.
-        fps = float(mm.get("fps", 25))
-        sample_rate = int(mm.get("audio_sample_rate", 24000))
-        frames = generated_video
-    else:
-        fps = float(mm.get("fps", 24))
-        sample_rate = int(mm.get("audio_sample_rate", 16000))
-        # DreamID-Omni returns video as (C, F, H, W) float32 in [-1, 1].
-        # mux_video_audio_bytes expects (F, H, W, C) uint8.
-        if not isinstance(generated_video, np.ndarray) or generated_video.ndim != 4:
-            raise RuntimeError(f"Unexpected video shape: {getattr(generated_video, 'shape', None)}")
-        frames = generated_video.transpose(1, 2, 3, 0)
-        frames = (np.clip((frames + 1.0) / 2.0, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        sampling_params = OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            num_inference_steps=args.num_inference_steps,
+            seed=args.seed,
+            extra_args={},
+        )
+        declared_extra_body_params = get_extra_body_params(model_class_name)
+        extra_body = dict(args.extra_body or {})
+        legacy_extra_body = {"solver_name": args.solver_name, "shift": args.shift}
+        for key, value in legacy_extra_body.items():
+            if key in declared_extra_body_params:
+                extra_body.setdefault(key, value)
+        if declared_extra_body_params:
+            apply_declared_extra_args(sampling_params, declared_extra_body_params, extra_body)
+        elif extra_body:
+            sampling_params.extra_args.update({key: value for key, value in extra_body.items() if value is not None})
 
-    audio_np = None
-    if generated_audio is not None:
-        audio_np = np.squeeze(np.asarray(generated_audio)).astype(np.float32)
+        start = time.perf_counter()
+        outputs = omni.generate(prompt, sampling_params)
+        elapsed = time.perf_counter() - start
+        output = extract_x_to_video_audio_output(
+            outputs,
+            fps=args.fps,
+            audio_sample_rate=args.audio_sample_rate,
+            output_tensor_range=get_output_tensor_range(model_class_name),
+        )
 
-    output_path = args.output
-    video_bytes = mux_video_audio_bytes(
-        frames,
-        audio_np,
-        fps=float(fps),
-        audio_sample_rate=sample_rate,
-    )
-    with open(output_path, "wb") as f:
-        f.write(video_bytes)
-    print(f"Saved generated video to {output_path}")
-    print(f"Total time: {elapsed:.2f}s")
-    peak_mb = _extract_peak_memory_mb(outputs)
-    if peak_mb:
-        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(encode_x_to_video_audio_output(output))
+        print(f"Saved generated video to {output_path}")
+        print(f"Total time: {elapsed:.2f}s")
+        peak_mb = _extract_peak_memory_mb(outputs)
+        if peak_mb:
+            print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
+    finally:
+        omni.close()
 
 
 if __name__ == "__main__":

@@ -15,8 +15,10 @@ from vllm_omni.model_extras import (
     build_image_to_video_prompt,
     build_text_to_image_prompt,
     build_x_to_text_prompt,
+    build_x_to_video_audio_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_input_audio_sample_rate,
     get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
@@ -139,6 +141,50 @@ def test_lingbot_extra_registry_declares_request_params() -> None:
     assert get_output_tensor_range("LingBotVideoPipeline") == "zero_to_one"
     assert get_output_tensor_range("WanPipeline") == "negative_one_to_one"
     assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dreamid_x_to_video_audio_adapter() -> None:
+    image = Image.new("RGB", (16, 16))
+    waveform = object()
+    canonical_prompt = {
+        "prompt": "A person waves.",
+        "modalities": ["video"],
+        "multi_modal_data": {"image": [image], "audio": [(waveform, 16000)]},
+    }
+
+    result = build_x_to_video_audio_prompt(
+        "DreamIDOmniPipeline",
+        canonical_prompt,
+        {
+            "video_negative_prompt": "blur",
+            "audio_negative_prompt": "echo",
+        },
+    )
+
+    assert result == {
+        "prompt": "A person waves.",
+        "modalities": ["video"],
+        "video_negative_prompt": "blur",
+        "audio_negative_prompt": "echo",
+        "multi_modal_data": {"image": [image], "audio": [waveform]},
+    }
+    assert get_extra_body_params("DreamIDOmniPipeline") == frozenset({"solver_name", "shift"})
+    assert get_input_audio_sample_rate("DreamIDOmniPipeline") == 16000
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_generic_x_to_video_audio_adapter_is_model_neutral() -> None:
+    canonical_prompt = {
+        "prompt": "A person waves.",
+        "modalities": ["video"],
+        "multi_modal_data": {"audio": [(object(), 48000)]},
+    }
+
+    assert build_x_to_video_audio_prompt("FuturePipeline", canonical_prompt, {}) is canonical_prompt
+    assert get_input_audio_sample_rate("FuturePipeline") is None
 
 
 @pytest.mark.core_model

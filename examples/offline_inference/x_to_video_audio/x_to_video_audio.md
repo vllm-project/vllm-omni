@@ -1,6 +1,25 @@
 # X-To-Video-Audio
 
-The `DreamID-Omni` pipeline generates short videos from text, image and video.
+The shared runner generates video with optional audio from text, image, and audio
+inputs. It currently documents DreamID-Omni and MagiHuman, and can be extended
+through `vllm_omni.model_extras` without adding another model-specific runner.
+
+## Shared request and output contract
+
+The example builds one canonical request envelope: `prompt` is text,
+`modalities` is `["video"]`, and optional `multi_modal_data` contains RGB PIL
+images plus audio `(waveform, sample_rate)` tuples. Audio files are loaded in
+full by design; the runner does not apply a time window. Prepare a trimmed input
+file explicitly when only part of a recording should condition the model.
+DreamID-Omni's audio conditioning sequence grows with the complete input
+duration, so long recordings increase denoising memory and step time.
+
+Model-specific request translation (for example, DreamID-Omni's two negative
+prompts and its 16 kHz input requirement) is declared in `model_extras`. Model
+outputs must provide `fps` and, when audio is present, `audio_sample_rate`.
+`--fps` and `--audio-sample-rate` are available as explicit metadata overrides.
+The shared encoder normalizes supported video tensor layouts, so this runner
+does not branch on a model name or assume a model-specific frame layout.
 
 ## Local CLI Usage
 ### Download the Model locally
@@ -147,7 +166,8 @@ in `vllm_omni/model_extras/magi_human.py`, routed via `extra_args`):
 Key arguments:
 - `--prompt`: text description (string).
 - `--model`: path to the model local directory.
-- `--height/--width`: output resolution (defaults 704 * 1024).
+- `--model-class-name`: optional diffusion pipeline class override.
+- `--height/--width`: output resolution (defaults 704 * 1280).
 - `--image-path`: path to the input image list.
 - `--audio-path`: path to the input audio list, indicate the timbre of the output video.
 - `--cfg-parallel-size`: number of parallel cfg parallel (defaults 1).
@@ -157,6 +177,9 @@ Key arguments:
 - `--num-inference-steps`: number of denoising steps (defaults 45).
 - `--video-negative-prompt`: negative prompt for video generation.
 - `--audio-negative-prompt`: negative prompt for audio generation.
+- `--extra-body`: JSON object containing parameters declared by the selected model.
+- `--fps`: explicit output FPS override when a model does not return that metadata.
+- `--audio-sample-rate`: explicit output audio sample-rate override.
 - `--enable-cpu-offload`: enable CPU offload (defaults False).
 - `--cache-backend`: enable `cache_dit` for acceleration.
 - `--quantization`: online (dynamic) quantization method — `fp8` or `int8`.

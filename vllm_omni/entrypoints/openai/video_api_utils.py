@@ -520,9 +520,9 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     return frames_u8
 
 
-def _encode_video_bytes(
+def encode_video_bytes(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -539,6 +539,10 @@ def _encode_video_bytes(
         audio_sample_rate=audio_sample_rate or 24000,
         video_codec_options=video_codec_options,
     )
+
+
+# Backward-compatible private alias for existing internal callers.
+_encode_video_bytes = encode_video_bytes
 
 
 class FragmentedMP4VideoEncoder:
