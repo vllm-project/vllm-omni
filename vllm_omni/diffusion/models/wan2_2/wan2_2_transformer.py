@@ -42,6 +42,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.gated_residual import gated_residual
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
@@ -731,7 +732,7 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
         self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
-        hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
+        hidden_states = gated_residual(hidden_states, attn_output, gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
@@ -741,7 +742,7 @@ class WanTransformerBlock(nn.Module):
         # 3. Feed-forward
         norm_hidden_states = self.norm3(hidden_states, c_scale_msa, c_shift_msa).type_as(hidden_states)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states + ff_output * c_gate_msa).type_as(hidden_states)
+        hidden_states = gated_residual(hidden_states, ff_output, c_gate_msa).type_as(hidden_states)
 
         return hidden_states
 
