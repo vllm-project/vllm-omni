@@ -549,29 +549,33 @@ L5 level testing focuses on the performance of model services under ***long-runn
 #### 4.2 Testing Content and Scope
 
 - ***Long-term Stability (Stability) Testing***: Uses JSON under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` and `test_wan22.json`) to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
-- ***Reliability Testing***: Uses pytest suites under `tests/dfx/reliability/` to inject controlled faults against a **live** `vllm_omni serve` instance (same **`omni_server` / `omni_server_function`** fixture style as E2E). Current suites emphasize **GPU memory pressure** (CUDA sidecar “memory hog”), **worker / runtime process kill** (`SIGKILL` on `VLLM::Worker` for Qwen3-Omni, `multiprocessing.spawn` for Wan2.2 video workers, or `vLLM-Omni::` for HunyuanImage DiT workers), **large multimodal chat**, **`/v1/videos`**, **`/v1/images/generations`**, or **`/v1/audio/speech`** jobs under OOM, **`/health` → 503** and **fast-fail / non-hanging concurrent** requests after kill, and **OpenAI-style 5xx error contracts** (e.g. text vs text+audio under OOM). **Post-fault recovery** checks exist where enabled (some cases may be `skip` while issues are tracked). See the Reliability `<details>` block in Section 4.4 for file-level responsibilities and CI markers (`slow`, `hardware_test`, POSIX-only kill).
+- ***Reliability Testing***: Uses pytest suites under `tests/dfx/reliability/` to inject controlled faults against a **live** `vllm_omni serve` instance (same **`omni_server` / `omni_server_function`** fixture style as E2E). Current suites emphasize **GPU memory pressure** (CUDA sidecar “memory hog”), **worker / runtime process kill** (`SIGKILL` on `VLLM::Worker` for Qwen3-Omni, `multiprocessing.spawn` for Wan2.2 video workers, or `vLLM-Omni::` for HunyuanImage DiT workers), **large multimodal chat**, **`/v1/videos`**, **`/v1/images/generations`**, or **`/v1/audio/speech`** jobs under OOM, **`/health` → 503** and **fast-fail / non-hanging concurrent** requests after kill, and **OpenAI-style 5xx error contracts** (e.g. text vs text+audio under OOM). **Post-fault recovery** checks exist where enabled (some cases may be `skip` while issues are tracked). See Section 4.3 for file-level responsibilities and Section 4.4 Test Examples (Reliability) for CI markers (`slow`, `hardware_test`, POSIX-only kill).
 
 #### 4.3 Test Directory and Execution Files
 
--   ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
--   ***Reliability Test Suite*** (`tests/dfx/reliability/`):
-    -   `test_reliability_qwen3_omni.py` — Qwen3-Omni chat / multimodal reliability (GPU OOM, process kill, recovery, error contract under `--async-chunk` vs default).
-    -   `test_reliability_wan22.py` — Wan2.2 I2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
-    -   `test_reliability_hunyuan_image.py` — HunyuanImage-3.0-Instruct DiT-only reliability (`/v1/images/generations` under OOM and process kill; deploy `hunyuan_image3_dit.yaml`, H100 × 4).
-    -   `helpers.py` — Shared primitives used by current suites: raw HTTP probes for `/v1/chat/completions` and `/health`, OpenAI-style error parsing, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
-    -   `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
-    -   `README.md` — Short local run commands for this directory.
+- ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
+- ***Reliability Test Suite*** (`tests/dfx/reliability/`):
+    - `test_reliability_qwen3_omni.py` — Qwen3-Omni chat / multimodal reliability (GPU OOM, process kill, recovery, error contract under `--async-chunk` vs default).
+    - `test_reliability_wan22.py` — Wan2.2 I2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
+    - `test_reliability_hunyuan_image.py` — HunyuanImage-3.0-Instruct DiT-only reliability (`/v1/images/generations` under OOM and process kill; deploy `hunyuan_image3_dit.yaml`, H100 × 4).
+    - `helpers.py` — Shared primitives used by current suites: raw HTTP probes for `/v1/chat/completions` and `/health`, OpenAI-style error parsing, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
+    - `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
+    - `README.md` — Short local run commands for this directory.
 
 #### 4.4 Execution Method and Example
 
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
-- ***Execution Environment***: ***GPU*** servers, requiring a stable and exclusive testing environment.
+- ***Run Command***:
+    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
+    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`). Weekly CI (`.buildkite/cuda/test-weekly.yml`) runs one step per suite (`WEEKLY=1` or PR label `weekly-test`)
 - ***Script Example***:
 
 <details>
 <summary> Test Examples</summary>
 
-When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). The following illustrates the Qwen3-Omni shape:
+##### Stability
+
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/test_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
 
 ```json
 {
@@ -597,7 +601,7 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 }
 ```
 
-##### Parameter Explanation
+###### Parameter Explanation
 
 ***Overview***
 
@@ -607,28 +611,25 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 | server_params    | Yes      | Server-side configuration parameters (model, stage configuration, etc.)     |
 | benchmark_params | Yes      | Stability benchmark running parameters (supports multiple configurations)   |
 
-##### server_params Configuration
+###### server_params Configuration
 
-###### Basic Parameters
+Basic parameters:
 
 | Parameter         | Required | Example                            | Description                         |
 | ----------------- | -------- | ---------------------------------- | ----------------------------------- |
 | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path                  |
 | stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name       |
 
-###### Dynamic Configuration (update/delete)
-
-Supports incremental modifications based on the basic configuration:
+Dynamic configuration (`update` / `delete`) supports incremental modifications based on the basic configuration:
 
 | Operation | Description                          |
 | --------- | ------------------------------------ |
 | update    | Update or add configuration items    |
 | delete    | Delete specified configuration items |
 
-***Example***:
-You can refer to Test Examples in L4 §3.4
+***Example***: You can refer to Test Examples in L4 §3.4.
 
-##### benchmark_params Configuration
+###### benchmark_params Configuration
 
 For stability testing, the key parameters are:
 
@@ -640,58 +641,17 @@ For stability testing, the key parameters are:
 
 All other optional parameters follow the same rules as in L4 §3.4.
 
-</details>
+##### Reliability
 
-<details>
-<summary> Reliability test suite (<code>tests/dfx/reliability</code>)</summary>
+Add pytest modules under `tests/dfx/reliability/` (for example `test_reliability_qwen3_omni.py`, `test_reliability_wan22.py`, `test_reliability_hunyuan_image.py`). Reuse `helpers.py` and `conftest.py` rather than duplicating OOM / process-kill / raw HTTP plumbing.
 
-##### Purpose and relationship to stability
-
-Reliability tests are **short fault-injection** integration runs (L5 **(b)** in `tests/dfx/reliability/README.md`). They complement **stability** JSON-driven long runs: instead of hours of steady traffic, they **perturb** the server (GPU OOM sidecar, fatal signals on selected processes) and check **failure mode** and **latency bounds** (e.g. chat or `/v1/videos` must not hang under concurrent fault-time load).
-
-##### Directory layout
-
-| Path | Responsibility |
-| ---- | -------------- |
-| `helpers.py` | Shared helpers used by current reliability suites: raw `POST`/`GET` probes (`/v1/chat/completions`, `/health`), OpenAI error parsing (`extract_openai_error_contract_from_bytes`), GPU OOM sidecar lifecycle (`inject_gpu_oom`, `stop_gpu_oom_hogs`), and process-kill injector builder (`make_process_kill_fault_injector`). |
-| `conftest.py` | Pytest fixtures: indirect `fault_injector`, `omni_server_after_fault` / `omni_server_after_fault_function` (run injector after server is ready, then yield server). |
-| `test_reliability_qwen3_omni.py` | Qwen3-Omni: OOM vs **text vs text+audio** error contract, large multimodal chat under OOM, concurrent pressure, **SIGKILL** on `VLLM::Worker`, `/health` → 503 + fast-fail + concurrent chat; optional OOM recovery scenario (may be skipped while tracked in issues). |
-| `test_reliability_wan22.py` | Wan2.2 I2V: large `/v1/videos` under OOM, **SIGKILL** on `multiprocessing.spawn` chain, health / fast-fail / concurrent video requests; optional recovery test (may be skipped). |
-| `test_reliability_hunyuan_image.py` | HunyuanImage DiT-only: large `/v1/images/generations` under OOM, **SIGKILL** on `vLLM-Omni::` workers and serve/tree targets, health / fast-fail / concurrent image requests; some OOM/recovery cases may be skipped while tracked in issues. |
-| `README.md` | Minimal run / collect examples. |
-
-##### Parametrization and markers
+###### Parametrization and markers
 
 - Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths (including XPU substitutions where applicable) and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
 - Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100).
 - **Process-kill** tests use **`@pytest.mark.skipif(os.name == "nt", ...)`** because injection uses POSIX **`pgrep` / `kill`**.
 
-##### CI trigger
-
-Weekly Buildkite (`.buildkite/cuda/test-weekly.yml`) runs one step per model suite (trigger: `WEEKLY=1` or PR label `weekly-test`), for example:
-
-| Buildkite step | Test file | CI hardware |
-| -------------- | --------- | ----------- |
-| Reliability Test - qwen3-omni | `test_reliability_qwen3_omni.py` | H100 × 2 (`mithril-h100-pool`) |
-| Reliability Test - wan22 | `test_reliability_wan22.py` | H100 × 2 (`mithril-h100-pool`) |
-| Reliability Test - hunyuan-image | `test_reliability_hunyuan_image.py` | H100 × 4 (`mithril-h100-pool`) |
-
-```bash
-pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
-pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
-pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
-```
-
-##### Local commands
-
-```bash
-pytest --collect-only tests/dfx/reliability
-pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow
-pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
-pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
-```
-
-##### Adding a new model suite
+###### Adding a new model suite
 
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
 2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e stage-config directory (same pattern as existing files).
@@ -699,6 +659,3 @@ pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
 4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
 
 </details>
-
--   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
--   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)
