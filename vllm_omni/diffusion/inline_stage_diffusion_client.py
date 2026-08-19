@@ -314,11 +314,13 @@ class InlineStageDiffusionClient(StageClientBase):
             for task in self._tasks.values():
                 task.cancel()
 
+            engine_shutdown_complete = False
             try:
                 # Stop the engine first so any control RPC running in the thread
                 # pool can observe shutdown instead of keeping stage teardown
                 # blocked while the executor waits for that RPC.
                 self._engine.close()
+                engine_shutdown_complete = bool(getattr(self._engine, "_shutdown_complete", True))
             except Exception:
                 pass
 
@@ -326,4 +328,15 @@ class InlineStageDiffusionClient(StageClientBase):
                 self._executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
-            self._shutdown_complete = True
+
+            # DiffusionEngine.close() defers scheduler/executor teardown while
+            # a generation is still leaving its worker thread. After client
+            # tasks have joined, retry once; if it is still deferred, leave
+            # this client retryable for a later shutdown call.
+            if not engine_shutdown_complete:
+                try:
+                    self._engine.close()
+                    engine_shutdown_complete = bool(getattr(self._engine, "_shutdown_complete", True))
+                except Exception:
+                    pass
+            self._shutdown_complete = engine_shutdown_complete

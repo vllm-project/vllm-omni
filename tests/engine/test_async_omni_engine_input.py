@@ -426,6 +426,54 @@ def test_cfg_companion_processing_failure_admits_nothing(mocker: MockerFixture):
     engine.request_queue.sync_q.put.assert_not_called()
 
 
+def test_add_request_releases_preselected_replica_when_companion_build_fails(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.request_queue = mocker.Mock()
+
+    addr0 = "tcp://host-a:1000/input"
+    addr1 = "tcp://host-b:1000/input"
+    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool.attach_hub(_FakeHub([_replica(addr0), _replica(addr1)]))
+    stage_pool.attach_load_balancer(_RoundRobinLB())
+    engine.stage_pools = [stage_pool]
+    engine._ensure_stage_replica_mm_uuids = mocker.Mock()
+
+    def process_inputs(**kwargs):
+        request_id = kwargs["request_id"]
+        if request_id.endswith("__cfg_text"):
+            raise RuntimeError("companion preprocessing failed")
+        return _make_engine_core_request(request_id)
+
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = process_inputs
+
+    with pytest.raises(RuntimeError, match="companion preprocessing failed"):
+        engine.add_request(
+            request_id="req",
+            prompt={
+                "prompt": "positive",
+                "multi_modal_data": {"image": "same-image"},
+            },
+            sampling_params_list=[params],
+            final_stage_id=1,
+        )
+
+    assert stage_pool.get_bound_replica_id("req") is None
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
 def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerFixture):
     """Construction and admission are separate steps."""
     engine = object.__new__(AsyncOmniEngine)

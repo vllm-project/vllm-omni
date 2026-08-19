@@ -177,6 +177,37 @@ def test_inline_shutdown_runs_after_orchestrator_premark(client, mock_engine):
     mock_engine.close.assert_called_once()
 
 
+def test_inline_shutdown_retries_deferred_engine_cleanup(client, mock_engine):
+    mock_engine._shutdown_complete = False
+
+    def close_engine():
+        mock_engine._shutdown_complete = mock_engine.close.call_count >= 2
+
+    mock_engine.close.side_effect = close_engine
+
+    client.shutdown()
+
+    assert mock_engine.close.call_count == 2
+    assert client._shutdown_complete is True
+
+
+def test_inline_shutdown_remains_retryable_while_engine_cleanup_is_deferred(client, mock_engine):
+    mock_engine._shutdown_complete = False
+
+    def close_engine():
+        mock_engine._shutdown_complete = mock_engine.close.call_count >= 3
+
+    mock_engine.close.side_effect = close_engine
+
+    client.shutdown()
+    assert mock_engine.close.call_count == 2
+    assert client._shutdown_complete is False
+
+    client.shutdown()
+    assert mock_engine.close.call_count == 3
+    assert client._shutdown_complete is True
+
+
 def test_inline_registers_executor_failure_callback(client, mock_engine):
     mock_engine.executor.register_failure_callback.assert_called_once()
 

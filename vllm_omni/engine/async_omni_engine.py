@@ -1337,7 +1337,17 @@ class AsyncOmniEngine:
             effective_spl = msg.sampling_params_list
             stage0_params = effective_spl[0] if effective_spl else None
             if stage0_params is not None:
-                companions = self._build_cfg_companions(request_id, msg.original_prompt, stage0_params, effective_spl)
+                try:
+                    companions = self._build_cfg_companions(
+                        request_id,
+                        msg.original_prompt,
+                        stage0_params,
+                        effective_spl,
+                    )
+                except Exception:
+                    if self.stage_pools:
+                        self.stage_pools[0].release_binding(request_id)
+                    raise
 
         self.request_queue.sync_q.put(msg)
         for companion in companions:
