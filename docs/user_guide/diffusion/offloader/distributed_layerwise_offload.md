@@ -138,8 +138,11 @@ must enter each collective.
   but it provides no shared-mmap host-memory benefit or guarantee.
 - HSDP plus AllGather is rejected to avoid double sharding. HSDP without
   AllGather has limited end-to-end validation.
-- Online quantization uses the ordinary loader with no-AllGather. It remains
-  incompatible with DLO AllGather.
+- Per-tensor online FP8 linears use the ordinary loader and can run with either
+  DLO transfer path. With AllGather, every rank temporarily materializes the
+  complete FP8 model in host memory before DLO retains only its shard. Other
+  online quantization methods require no-AllGather until their runtime layouts
+  are validated.
 - Resident leading layers require `--dlo-no-use-allgather` and a model
   `OffloadPlan` that declares eligible `resident_dit_paths`.
 - DP concurrency requires an explicit, identical inference-step count.
