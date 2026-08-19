@@ -49,6 +49,7 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.activations import ColumnParallelGELU
 
 logger = init_logger(__name__)
 
@@ -205,34 +206,6 @@ class LTX2AdaLayerNormSingle(nn.Module):
         return self.linear(self.silu(embedded_timestep)), embedded_timestep
 
 
-class ColumnParallelApproxGELU(nn.Module):
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str,
-        bias: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj" if prefix else "proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
-
-
 class LTX2FeedForward(nn.Module):
     def __init__(
         self,
@@ -257,13 +230,13 @@ class LTX2FeedForward(nn.Module):
         dropout_layer: nn.Module = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(
+            ColumnParallelGELU(
                 dim,
                 inner_dim,
                 approximate="tanh",
                 bias=bias,
                 quant_config=quant_config,
-                prefix=f"{prefix}.net.0" if prefix else "net.0",
+                prefix=f"{prefix}.net.0.proj" if prefix else "net.0.proj",
             ),
             dropout_layer,
             RowParallelLinear(

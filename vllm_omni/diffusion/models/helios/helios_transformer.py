@@ -31,6 +31,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.activations import ColumnParallelGELU
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -105,34 +106,6 @@ class DistributedRMSNorm(nn.Module):
 
         output = (x_float / rms) * self.weight.float()
         return output.to(input_dtype)
-
-
-class ColumnParallelGELU(nn.Module):
-    """Column parallel linear with GELU activation."""
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str = "tanh",
-        bias: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
 
 
 class HeliosFeedForward(nn.Module):

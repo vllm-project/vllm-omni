@@ -38,6 +38,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
 
+from vllm_omni.diffusion.layers.rope import rotate_half
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
 from .configuration_qwen3_tts_tokenizer_v2 import (
@@ -85,13 +86,6 @@ class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
     """
 
     audio_values: list[torch.FloatTensor] = None
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):

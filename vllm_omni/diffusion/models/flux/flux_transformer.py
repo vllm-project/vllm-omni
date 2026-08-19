@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from cache_dit import ForwardPattern
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -18,7 +17,6 @@ from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -35,6 +33,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.activations import ColumnParallelGELU
 from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormContinuous,
     AdaLayerNormZero,
@@ -43,34 +42,6 @@ from vllm_omni.diffusion.layers.adalayernorm import (
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
-
-
-class ColumnParallelApproxGELU(nn.Module):
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str,
-        bias: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
 
 
 class FeedForward(nn.Module):
@@ -93,8 +64,8 @@ class FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(
-                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0"
+            ColumnParallelGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0.proj"
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(

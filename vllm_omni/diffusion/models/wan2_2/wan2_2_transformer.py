@@ -7,7 +7,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -41,6 +40,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
+from vllm_omni.diffusion.layers.activations import ColumnParallelGELU
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -81,36 +81,6 @@ class DistributedRMSNorm(nn.Module):
         return output.to(input_dtype)
 
 
-class ColumnParallelGELU(nn.Module):
-    """Column parallel linear with GELU activation."""
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str = "tanh",
-        bias: bool = True,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj" if prefix else "proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
-
-
 class WanFeedForward(nn.Module):
     """
     TP-enabled FeedForward network for WAN2.2.
@@ -136,7 +106,7 @@ class WanFeedForward(nn.Module):
             approximate="tanh",
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.net_0" if prefix else "net_0",
+            prefix=f"{prefix}.net_0.proj" if prefix else "net_0.proj",
         )
         # Placeholder for weight loading compatibility
         self.net_1 = nn.Identity()

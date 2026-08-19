@@ -15,6 +15,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+from vllm_omni.diffusion.layers.rope import rotate_half
+
 
 def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
     """Vanilla sinusoidal RoPE (no scaling).
@@ -48,12 +50,6 @@ def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
 # ---------------------------------------------------------------------------
 # Utilities (inlined from remote utils/model_utils.py)
 # ---------------------------------------------------------------------------
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(

@@ -21,7 +21,7 @@ _HEADS = 2
 _HEAD_DIM = _DIM // _HEADS
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=True, scope="module")
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     vLLM parallel linear layers (tensor-parallel group must exist)."""
@@ -127,7 +127,7 @@ def test_flux_feedforward_passes_prefix():
 
     params = _param_names(ff)
 
-    # net.0 is ColumnParallelApproxGELU which wraps a ColumnParallelLinear
+    # net.0 is ColumnParallelGELU which wraps a ColumnParallelLinear
     assert any("net.0" in name for name in params), f"net.0 not found in params: {sorted(params)}"
 
     # net.2 is RowParallelLinear

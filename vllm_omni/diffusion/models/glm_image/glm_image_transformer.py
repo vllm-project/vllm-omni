@@ -36,6 +36,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.activations import ColumnParallelGELU
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -697,34 +698,6 @@ class GlmImageAttention(nn.Module):
         return hidden_states_out, encoder_hidden_states_out
 
 
-class ColumnParallelGELU(nn.Module):
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str = "none",
-        bias: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
-
-
 class ColumnParallelSiLU(nn.Module):
     def __init__(
         self,
@@ -790,7 +763,7 @@ class GlmImageFeedForward(nn.Module):
                     approximate=approximate,
                     bias=bias,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.net.0",
+                    prefix=f"{prefix}.net.0.proj",
                 ),
                 nn.Identity(),
                 RowParallelLinear(

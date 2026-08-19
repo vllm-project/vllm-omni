@@ -21,6 +21,8 @@ from typing import Optional
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import is_torch_available, logging
 
+from vllm_omni.diffusion.layers.rope import rotate_half
+
 logger = logging.get_logger(__name__)
 
 
@@ -669,13 +671,6 @@ def rope_config_validation(config: PretrainedConfig, ignore_keys: set | None = N
         logger.warning(
             f"Missing validation function mapping in `ROPE_VALIDATION_FUNCTIONS` for 'rope_type'='{rope_type}'"
         )
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(x, cos, sin, position_ids=None, unsqueeze_dim=1):

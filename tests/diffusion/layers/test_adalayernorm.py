@@ -10,7 +10,7 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(autouse=True, scope="module")
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     ReplicatedLinear (tensor-parallel group must exist)."""
