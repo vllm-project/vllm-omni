@@ -1,5 +1,7 @@
 """Tests for data_entry_keys."""
 
+from collections.abc import Mapping
+
 import msgspec
 import pytest
 import torch
@@ -185,6 +187,15 @@ class TestWireEquivalenceStructVsDict:
             ),
         )
         self._assert_decoded_equal(self._round_trip(struct), self._round_trip(to_dict(struct)))
+
+    def test_codes_struct_supports_mapping_consumers(self):
+        codes = CodesStruct(ref=torch.tensor([1, 2, 3], dtype=torch.long))
+
+        assert isinstance(codes, Mapping)
+        assert torch.equal(codes.get("ref"), torch.tensor([1, 2, 3], dtype=torch.long))
+        assert codes.get("audio") is None
+        assert codes.get("missing", "fallback") == "fallback"
+        assert dict(codes) == {"ref": codes.ref}
 
 
 class TestFlattenPayload:

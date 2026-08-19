@@ -220,6 +220,26 @@ def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter)
     assert "req-tensor" in adapter._finished_load_reqs
 
 
+def test_load_poll_generation_preserves_reference_audio_with_list_codes(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("req-ref", RequestStatus.WAITING, external_req_id="external-ref")
+
+    reference = torch.tensor([0.0, 0.25, -0.25], dtype=torch.float32)
+    payload: OmniPayload = {
+        "codes": {"audio": [1, 2, 3], "ref": reference},
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+            "ref_audio_sr": 24000,
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(request) is True
+    assert request.prompt_token_ids == [1, 2, 3]
+    assert torch.equal(request.additional_information["codes"]["ref"], reference)
+    assert request.additional_information["meta"]["ref_audio_sr"] == 24000
+
+
 def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-empty-tensor", RequestStatus.WAITING, external_req_id="external-empty")
