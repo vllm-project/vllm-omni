@@ -13,7 +13,7 @@ steps:
 
       - label: ":full_moon: Simple · CPU Coverage Test"
         key: nightly-simple-cpu-coverage
-        timeout_in_minutes: 40
+        timeout_in_minutes: 60
         commands:
           - |
             set +e

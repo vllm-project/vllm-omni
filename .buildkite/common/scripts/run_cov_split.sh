@@ -18,7 +18,8 @@
 #
 # Coverage + artifact upload run only on scheduled nightly E2E sweeps
 # (NIGHTLY=1 and BUILDKITE_BRANCH=main — same gate as bootstrap --e2e).
-# All other invocations (PR merge-test, regular main merge, local) run plain pytest.
+# All other invocations (PR merge-test, regular main merge, local) run the
+# same combined pytest as the job used before coverage was added.
 #
 # Exits non-zero if any half or the upload failed.
 set -uo pipefail
