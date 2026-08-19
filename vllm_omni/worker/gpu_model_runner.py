@@ -12,7 +12,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.sampling_params import SamplingType
+from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
@@ -311,7 +311,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
-    def _create_request_generator(self, sampling_params: Any | None) -> torch.Generator | None:
+    def _create_request_generator(self, sampling_params: SamplingParams | None) -> torch.Generator | None:
         """Create the request-owned RNG used by sampling and opted-in TTS models."""
         if sampling_params is None:
             return None
