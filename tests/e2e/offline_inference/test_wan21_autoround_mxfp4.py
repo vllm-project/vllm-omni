@@ -16,7 +16,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 QUANTIZED_MODEL = os.environ.get(
     "WAN21_AUTOROUND_MXFP4_MODEL",
-    "Intel/Wan2.1-T2V-1.3B-MXFP4-AutoRound",
+    "INCModel/Wan2.1-T2V-1.3B-MXFP4-AutoRound",
 )
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
