@@ -420,6 +420,7 @@ class VoxtralTTSForConditionalGeneration(
         self,
         model_outputs: torch.Tensor | OmniOutput | tuple,
         logits_index: torch.Tensor | int | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
         **kwargs,
     ) -> OmniOutput:
         if isinstance(model_outputs, torch.Tensor):
@@ -430,7 +431,7 @@ class VoxtralTTSForConditionalGeneration(
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
                 noise = self._make_acoustic_noise(
                     input_hidden_states,
-                    kwargs.get("sampling_metadata"),
+                    sampling_metadata,
                 )
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
