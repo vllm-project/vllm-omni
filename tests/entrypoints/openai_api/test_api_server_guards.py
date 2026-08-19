@@ -28,8 +28,8 @@ Common wrong changes these tests are meant to catch
 * Missing-handler WS/HTTP responses change status, JSON shape, or wording
   (clients treat these as capability probes).
 * Engine error payloads lose ``request_id`` / ``error_stage_id``.
-* Pure-diffusion vs multi-stage init drops an ``app.state`` key that route
-  owners still read (endpoint registered but handler never wired).
+* Pure-diffusion vs multi-stage init drops an ``app.state`` key, or leaves a
+  handler as ``None`` while the route is still registered.
 
 Not covered here (add elsewhere if needed)
 ------------------------------------------
@@ -58,6 +58,9 @@ from vllm_omni.entrypoints.openai import api_server
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
+# would invent ("HEAD", path) entries for every GET and fail the current census.
+# TODO: extend this set and the expected census if @router.head / @router.options appear.
 _HTTP_METHODS = {"GET", "POST", "DELETE", "PUT", "PATCH"}
 
 # Exact Omni router census on main. Update intentionally when routes change.
@@ -95,7 +98,7 @@ _EXPECTED_PROFILER_ROUTES = {
 }
 
 # App-state keys that must remain available across refactor phases.
-# Values are not inspected — only presence/absence after init.
+# Presence is not enough: "not wired" is written as ``state.X = None``.
 _DIFFUSION_APP_STATE_KEYS = {
     "engine_client",
     "log_stats",
@@ -119,6 +122,14 @@ _DIFFUSION_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+_DIFFUSION_MUST_BE_NONE = {
+    "vllm_config",
+    "serving_tokenization",
+    "openai_serving_duplex",
+    "openai_streaming_speech",
+    "openai_streaming_video",
+}
+_DIFFUSION_MUST_BE_WIRED = _DIFFUSION_APP_STATE_KEYS - _DIFFUSION_MUST_BE_NONE
 _MULTISTAGE_APP_STATE_KEYS = {
     "engine_client",
     "log_stats",
@@ -127,6 +138,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "stage_configs",
     "vllm_config",
     "openai_serving_models",
+    "serving_tokenization",
     "online_renderer",
     "openai_serving_chat",
     "openai_serving_chat_batch",
@@ -141,6 +153,11 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+_MULTISTAGE_MUST_BE_NONE = {
+    "openai_serving_duplex",
+    "openai_serving_realtime_robot",
+}
+_MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE
 
 
 def _route_entries(routes) -> list[tuple[str, str]]:
@@ -176,6 +193,23 @@ def _single_http_route(routes, method: str, path: str) -> APIRoute:
     matches = _matching_http_routes(routes, method, path)
     assert len(matches) == 1, f"expected exactly one {method} {path}, got {len(matches)}"
     return matches[0]
+
+
+def _assert_app_state_snapshot(
+    state,
+    *,
+    expected_keys: set[str],
+    must_be_wired: set[str],
+    must_be_none: set[str],
+) -> None:
+    assert must_be_wired.isdisjoint(must_be_none)
+    assert must_be_wired | must_be_none <= expected_keys
+    present = {key for key in expected_keys if hasattr(state, key)}
+    assert present == expected_keys
+    not_wired = sorted(key for key in must_be_wired if getattr(state, key) is None)
+    assert not not_wired, f"app.state keys registered but not wired: {not_wired}"
+    unexpectedly_set = sorted(key for key in must_be_none if getattr(state, key) is not None)
+    assert not unexpectedly_set, f"app.state keys expected to stay None: {unexpectedly_set}"
 
 
 def _minimal_args(**overrides) -> SimpleNamespace:
@@ -252,19 +286,23 @@ class _FakeSocket:
 
 
 class _FakeEngineClient:
-    def __init__(self, *, stage_configs=None, endpoint_restrictions=None) -> None:
+    def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
         self.input_processor = object()
         self.renderer = object()
         self.errored = False
+        self.vllm_config = vllm_config
+
+    async def get_vllm_config(self):
+        return self.vllm_config
 
     async def get_supported_tasks(self) -> tuple[str, ...]:
         return ("generate",)
 
     async def get_tokenizer(self):
-        return None
+        return SimpleNamespace(chat_template="dummy")
 
     async def check_health(self) -> None:
         return None
@@ -282,6 +320,8 @@ def test_router_route_manifest_is_explicit_and_complete() -> None:
     same public route is registered more than once, which a set manifest alone
     would collapse.
     """
+    # TODO(P0.3): retarget this object-level census when routes move onto family
+    # routers. The assembled-app census is the client-facing lock that must survive.
     _assert_unique_route_entries(api_server.router.routes)
     _assert_unique_route_entries(api_server.profiler_router.routes)
     assert _route_manifest(api_server.router.routes) == _EXPECTED_ROUTER_ROUTES
@@ -343,6 +383,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_build_async_omni(*_args, **_kwargs):
         yield _FakeEngineClient(
             stage_configs=[{"engine_args": {"profiler_config": {"profiler": "torch"}}}],
+            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(_api_process_rank=0)),
         )
 
     async def fake_omni_init_app_state(engine_client, state, args):
@@ -351,9 +392,6 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
     async def fake_storage_start():
         captured["storage_started"] = True
-
-    async def fake_get_vllm_config(_engine_client):
-        return SimpleNamespace(parallel_config=SimpleNamespace(_api_process_rank=0))
 
     async def fake_serve_http(app, **_kwargs):
         captured["served_app"] = app
@@ -370,7 +408,6 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         lambda app, restrictions: captured.setdefault("restrictions", restrictions),
     )
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
-    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     sock = _FakeSocket()
@@ -447,8 +484,6 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_a, **_k: None)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=lambda: asyncio.sleep(0)))
-    monkeypatch.setattr(api_server, "_should_enable_profiler_endpoints", lambda _cfg: False)
-    monkeypatch.setattr(api_server, "_get_vllm_config", lambda _e: asyncio.sleep(0, result=None))
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
@@ -463,13 +498,17 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def _send(_message):
         return None
 
+    called = {"http": False, "websocket": False}
+
     async def inner(scope, receive, send):
-        return None
+        called[scope["type"]] = True
 
     middleware._inner = inner
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
+    assert called["http"] is True
+    assert called["websocket"] is True
     assert "request_timestamp" in http_scope["state"]
     assert isinstance(http_scope["state"]["request_timestamp"], float)
     assert "request_timestamp" not in ws_scope.get("state", {})
@@ -598,8 +637,15 @@ def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatc
 
     Fails if ``request_id`` / ``error_stage_id`` are dropped when error helpers
     move (P0.2) or exception-handler wiring changes.
+
+    Exercises the envelope through the registered handler, not the private
+    ``_create_engine_error_json_response`` helper, so relocating that helper
+    in P0.2 is not a false red.
     """
     app = FastAPI()
+    # TODO(P0.2): retarget this call if ``_register_omni_exception_handlers``
+    # leaves api_server (red here is a rename, not a surface regression).
+    api_server._register_omni_exception_handlers(app)
     app.state.engine_client = SimpleNamespace(errored=True, engine=SimpleNamespace(is_alive=lambda: False))
     app.state.server = object()
     app.state.args = SimpleNamespace(log_error_stack=False)
@@ -611,13 +657,13 @@ def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatc
 
     exc = EngineGenerateError("boom")
     exc.error_stage_id = 2  # type: ignore[attr-defined]
-    response = api_server._create_engine_error_json_response(req, exc)
+    handler = app.exception_handlers[EngineGenerateError]
+    response = asyncio.run(handler(req, exc))
     payload = json.loads(response.body)
 
     assert "error" in payload
     assert payload["error"]["request_id"] == "req-123"
     assert payload["error"]["error_stage_id"] == 2
-    assert isinstance(response.status_code, int)
     assert response.status_code >= 400
 
 
@@ -628,6 +674,8 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
     JSON with ``request_id``.
     """
     app = FastAPI()
+    # TODO(P0.2): retarget this call if ``_register_omni_exception_handlers``
+    # leaves api_server (red here is a rename, not a surface regression).
     api_server._register_omni_exception_handlers(app)
     app.state.engine_client = SimpleNamespace(errored=True, engine=SimpleNamespace(is_alive=lambda: False))
     app.state.server = object()
@@ -646,16 +694,14 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
-    """Lock pure-diffusion ``app.state`` key presence after init.
+    """Lock pure-diffusion ``app.state`` keys after init, including live vs None.
 
     Fails if bootstrap drops keys route owners still read (e.g. video/speech/
-    models), or pure-diffusion specifics like ``vllm_config is None`` change.
+    models), wires a handler that must stay None, or leaves a required
+    handler as None.
     """
     stage = SimpleNamespace(engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
-
-    async def _none_config(_engine):
-        return None
 
     def _for_diffusion_factory(label: str):
         @classmethod
@@ -664,7 +710,6 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
 
         return _factory
 
-    monkeypatch.setattr(api_server, "_get_vllm_config", _none_config)
     monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -685,22 +730,31 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())
 
-    present = {key for key in _DIFFUSION_APP_STATE_KEYS if hasattr(state, key)}
-    assert present == _DIFFUSION_APP_STATE_KEYS
-    assert state.vllm_config is None
+    _assert_app_state_snapshot(
+        state,
+        expected_keys=_DIFFUSION_APP_STATE_KEYS,
+        must_be_wired=_DIFFUSION_MUST_BE_WIRED,
+        must_be_none=_DIFFUSION_MUST_BE_NONE,
+    )
     assert state.diffusion_engine is engine
-    assert state.serving_tokenization is None
-    assert state.openai_serving_duplex is None
 
 
 @pytest.mark.asyncio
 async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
-    """Lock multi-stage ``app.state`` key presence after init.
+    """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
-    Fails if chat/speech/video/realtime keys disappear after init refactors —
-    classic “route still registered, handler never wired” failure mode.
+    Fails if chat/speech/video/realtime/tokenization keys disappear or are
+    left as None after init refactors — classic “route still registered,
+    handler never wired” failure mode.
     """
-    engine = _FakeEngineClient(stage_configs=[object(), object()])
+    engine = _FakeEngineClient(
+        stage_configs=[object(), object()],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -720,16 +774,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         async def warmup(self):
             return None
 
-    async def fake_get_vllm_config(_engine):
-        return SimpleNamespace(
-            lora_config=None,
-            model_config=SimpleNamespace(),
-            parallel_config=SimpleNamespace(_api_process_rank=0),
-        )
-
-    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
-    monkeypatch.setattr(api_server, "_load_model_chat_template_json", lambda *_a, **_k: None)
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
@@ -757,7 +802,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())
 
-    present = {key for key in _MULTISTAGE_APP_STATE_KEYS if hasattr(state, key)}
-    assert present == _MULTISTAGE_APP_STATE_KEYS
-    assert state.vllm_config is not None
-    assert state.openai_serving_realtime_robot is None
+    _assert_app_state_snapshot(
+        state,
+        expected_keys=_MULTISTAGE_APP_STATE_KEYS,
+        must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
+        must_be_none=_MULTISTAGE_MUST_BE_NONE,
+    )
