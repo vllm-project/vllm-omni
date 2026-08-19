@@ -16,12 +16,20 @@ weight-compatible with the BAGEL integration.  This pipeline subclasses
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -228,6 +236,24 @@ def build_sensenova_vision_diffusion_output(
     )
 
 
+# BAGEL-compatible image-processor defaults used to patch SenseNova-Vision
+# checkpoints that do not ship a preprocessor_config.json.  Transcribed from
+# ByteDance-Seed/BAGEL-7B-MoT's preprocessor_config.json so the patched file
+# drives SiglipImageProcessor exactly like the upstream BAGEL checkpoint.
+_SENSENOVA_VISION_PREPROCESSOR_CONFIG: dict[str, Any] = {
+    "image_processor_type": "SiglipImageProcessor",
+    "size": {"height": 980, "width": 980},
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "do_resize": True,
+    "do_rescale": True,
+    "do_normalize": True,
+    "do_convert_rgb": True,
+    "resample": 3,
+    "rescale_factor": 0.00392156862745098,
+}
+
+
 class SenseNovaVisionPipeline(BagelPipeline):
     """SenseNova-Vision-7B-MoT diffusion pipeline.
 
@@ -235,6 +261,13 @@ class SenseNovaVisionPipeline(BagelPipeline):
     loading / denoising machinery.  Only the SenseNovaVision checkpoint defaults
     differ; these are applied in :meth:`__init__` and per-request mode
     defaults are applied in :meth:`forward` via ``extra_args``.
+
+    The checkpoint does not ship a ``preprocessor_config.json`` (BAGEL does),
+    which the BAGEL core needs for ``SiglipImageProcessor``.  When it is
+    missing, :meth:`__init__` patches a temp directory with a generated
+    BAGEL-compatible ``preprocessor_config.json`` plus symlinks to every
+    checkpoint file and points a copy of ``od_config`` at it.  Checkpoints that
+    already ship the file (e.g. BAGEL itself) take the unpatched path.
     """
 
     # SenseNovaVision checkpoint overrides applied on top of BAGEL.
@@ -245,6 +278,37 @@ class SenseNovaVisionPipeline(BagelPipeline):
     _sensenova_vision_vit_transform = (980, 224, 14)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        # Resolve the checkpoint root exactly like the BAGEL core (local dir,
+        # otherwise HF snapshot).
+        model = od_config.model
+        if os.path.exists(model):
+            model_path = model
+        else:
+            model_path = download_weights_from_hf_specific(model, od_config.revision, ["*"])
+
+        # Fallback strictly for checkpoints that do not ship a
+        # preprocessor_config.json (SenseNova-Vision-7B-MoT). BAGEL checkpoints
+        # ship the file and never reach this path.
+        if not os.path.isfile(os.path.join(model_path, "preprocessor_config.json")):
+            patched_dir = tempfile.mkdtemp(prefix="sensenova_vision_preprocessor_")
+            for entry in os.listdir(model_path):
+                src = os.path.join(model_path, entry)
+                dst = os.path.join(patched_dir, entry)
+                if not os.path.lexists(dst):
+                    os.symlink(src, dst)
+            with open(os.path.join(patched_dir, "preprocessor_config.json"), "w", encoding="utf-8") as f:
+                json.dump(_SENSENOVA_VISION_PREPROCESSOR_CONFIG, f)
+            # Keep the patched dir alive for the lifetime of the pipeline
+            # (it is referenced by self.od_config.model / weights sources).
+            self._sensenova_vision_patched_dir = patched_dir
+            logger.info(
+                "SenseNova-Vision: checkpoint %s lacks preprocessor_config.json; "
+                "patched %s and pointed the diffusion stage at it",
+                model_path,
+                patched_dir,
+            )
+            od_config = replace(od_config, model=patched_dir)
+
         super().__init__(od_config=od_config, prefix=prefix)
         self._apply_sensenova_vision_defaults()
 

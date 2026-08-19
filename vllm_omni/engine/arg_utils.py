@@ -25,6 +25,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
+    # SenseNova-Vision-7B-MoT ships a metadata-only config.json (no model_type,
+    # no architectures). It is a BAGEL-fork, so model_type=bagel resolves the
+    # vLLM BagelConfig class; the real QCenet/SigLIP params live in sibling
+    # llm_config.json / vit_config.json which _patch_empty_hf_config merges in.
+    "OmniSenseNovaVisionForConditionalGeneration": "bagel",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
     # the HF config without manual overrides.
@@ -281,6 +286,17 @@ class OmniEngineArgs(EngineArgs):
         self._temp_config_dir = temp_dir
         logger.info("Patched empty HF config with model_type=%s at %s", model_type, temp_dir)
 
+    def _merge_sensenova_split_configs(self) -> None:
+        """Merge SenseNova-Vision-7B-MoT's llm_config.json / vit_config.json
+        into the current patched config directory as nested llm_config/
+        vit_config keys so BagelConfig can build the real sub-configs."""
+        # TODO: maybe create a new HF checkpoint with merged config will be better than merge it on the fly every time.
+        from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
+            merge_sensenova_split_configs,
+        )
+
+        merge_sensenova_split_configs(self.model, self.hf_config_path)
+
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
@@ -328,6 +344,14 @@ class OmniEngineArgs(EngineArgs):
                 model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
+
+            # SenseNova-Vision-7B-MoT stores its real Qwen2/SigLIP params in
+            # sibling llm_config.json / vit_config.json (BAGEL-fork layout) while
+            # config.json is metadata-only. Merge those into the patched config
+            # so BagelConfig builds proper Qwen2Config/SiglipVisionConfig from
+            # the nested llm_config/vit_config keys instead of empty defaults.
+            if self.model_arch == "OmniSenseNovaVisionForConditionalGeneration":
+                self._merge_sensenova_split_configs()
 
         # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
         # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
