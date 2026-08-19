@@ -49,7 +49,11 @@ def _group_norm_silu_kernel(
 ):
     """
     Fused GroupNorm + SiLU kernel.
-    Computes SiLU(GroupNorm(x)) in a single pass, avoiding intermediate tensors.
+    Computes SiLU(GroupNorm(x)) in one kernel, avoiding intermediate tensors.
+    Mean and variance use a parallel Welford reduction (block-level register
+    reduction merged with the Chan formula), which avoids the catastrophic
+    cancellation of E[x^2] - E[x]^2 on large-offset inputs. x is read once for
+    the statistics and once for normalization (2 reads total).
     One program handles each (batch, group) pair. Channels are processed serially,
     while spatial positions are vectorized for diffusion workloads.
     Moments are accumulated in fp32 to match PyTorch numerics.
@@ -60,9 +64,16 @@ def _group_norm_silu_kernel(
     n_idx = pid // num_groups
     g_idx = pid % num_groups
 
-    # === Pass 1: Compute mean and variance (fp32 accumulation) ===
-    mean_acc = tl.zeros([1], dtype=tl.float32)
-    var_acc = tl.zeros([1], dtype=tl.float32)
+    # === Pass 1: Welford reduction over the whole group (fp32) ===
+    # Each block is reduced in registers (block mean, then centered M2), so the
+    # loaded values are reused instead of re-reading memory; blocks are merged
+    # with the Chan et al. parallel-Welford formula. This keeps both the mean and
+    # the variance accurate for inputs like ``10000 +- 0.1``, where the naive
+    # ``E[x^2] - E[x]^2`` cancels catastrophically, and reads x only once for the
+    # statistics (2 reads total including normalize).
+    n_total = tl.zeros([1], dtype=tl.float32)
+    mean_total = tl.zeros([1], dtype=tl.float32)
+    m2_total = tl.zeros([1], dtype=tl.float32)
 
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
@@ -75,15 +86,24 @@ def _group_norm_silu_kernel(
             x_val = tl.load(x_ptr + base + offsets, mask=mask, other=0.0)
             x_val = x_val.to(tl.float32)
 
-            mean_acc += tl.sum(x_val, axis=0)
-            var_acc += tl.sum(x_val * x_val, axis=0)
+            # block-level reduction in registers (no extra memory traffic)
+            n = tl.sum(tl.where(mask, 1.0, 0.0), axis=0)
+            bsum = tl.sum(x_val, axis=0)
+            bmean = bsum / n
+            bm2 = tl.sum(tl.where(mask, (x_val - bmean) * (x_val - bmean), 0.0), axis=0)
 
-    group_total = group_size * spatial_size
-    mean = mean_acc / group_total
-    var = var_acc / group_total - mean * mean
+            # Chan et al. merge into the running (n, mean, m2)
+            delta = bmean - mean_total
+            new_n = n_total + n
+            mean_total = mean_total + delta * (n / new_n)
+            m2_total = m2_total + bm2 + delta * delta * (n_total * n / new_n)
+            n_total = new_n
+
+    mean = mean_total
+    var = m2_total / n_total
     rstd = 1.0 / tl.sqrt(var + eps)
 
-    # === Pass 2: Normalize, apply affine transform, and SiLU ===
+    # === Pass 2: normalize, apply affine, and SiLU ===
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
         base = n_idx * C * spatial_size + c_idx * spatial_size

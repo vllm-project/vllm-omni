@@ -294,5 +294,45 @@ def test_hunyuan_vae_config(batch_size, channels):
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_large_offset_small_variance(dtype):
+    """A large constant offset with a small variance must stay stable.
+
+    ``x ~ 10000 ± 0.1`` has mean ~1e4 and variance ~1e-2, so the naive
+    ``E[x^2] - E[x]^2`` subtracts two ~1e8 quantities and rounds the variance to
+    ~8.0 (the ULP of 1e8) — catastrophic cancellation, producing garbage
+    normalization. The Welford reduction keeps the variance accurate.
+
+    Why fp32 tolerance is 0.1, not the usual 1e-6: at this offset, ``x`` is stored
+    in fp32 with ULP ~0.001, so ``x - mean`` carries ~0.001 of representation
+    noise, and ``rstd ~ 10`` amplifies it to ~0.01-0.02. Even PyTorch's own
+    GroupNorm reference hits this floor (the old naive implementation would be
+    off by ~1.0 here). fp16/bf16 quantize the 0.1 perturbation away entirely, so
+    for those dtypes the meaningful assertion is just "no NaN".
+    """
+    torch.manual_seed(0)
+    B, C, H, W = 2, 64, 16, 16
+    num_groups = 32
+    eps = 1e-6
+    device = torch.device("cuda")
+
+    x = torch.full((B, C, H, W), 10000.0, device=device, dtype=dtype)
+    x = x + torch.randn(B, C, H, W, device=device, dtype=dtype) * 0.1
+    weight = torch.randn(C, device=device, dtype=dtype)
+    bias = torch.randn(C, device=device, dtype=dtype)
+
+    fused_out = fused_group_norm_silu(x, weight, bias, num_groups, eps)
+    # fp32 reference = PyTorch's Welford path, the ground truth.
+    ref_out = F.silu(F.group_norm(x.float(), num_groups, weight.float(), bias.float(), eps)).to(dtype)
+
+    assert not torch.isnan(fused_out).any(), "fused output must not contain NaN"
+
+    if dtype == torch.float32:
+        # ~0.02 is the representation-noise floor at offset 1e4; old impl ~1.0.
+        torch.testing.assert_close(fused_out, ref_out, rtol=0.05, atol=0.1)
+    # fp16/bf16: perturbation is swallowed by the dtype — no meaningful close,
+    # the no-NaN assertion above is the regression guard.
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

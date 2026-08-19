@@ -250,5 +250,43 @@ def test_dit_sized_activation(spatial):
     torch.testing.assert_close(fused_out, ref_out, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_large_offset_small_variance(dtype):
+    """A large constant offset with a small variance must stay stable.
+
+    Mirrors the fused_group_norm_silu case: ``x ~ 10000 ± 0.1`` has mean ~1e4
+    and variance ~1e-2, so ``E[x^2] - E[x]^2`` cancels catastrophically in fp32
+    (rounding the variance to ~8.0). The Welford reduction keeps it accurate.
+    fp32 tolerance is 0.1 (not 1e-6) because ``x``'s fp32 representation noise
+    (~0.001 ULP at 1e4) is amplified by ``rstd ~ 10`` to ~0.01-0.02 — the same
+    floor PyTorch's own reference hits; the old naive implementation would be
+    off by ~1.0 here. fp16/bf16 quantize the perturbation away, so for those
+    dtypes the meaningful assertion is just "no NaN".
+    """
+    torch.manual_seed(0)
+    B, C, H, W = 2, 64, 16, 16
+    num_groups = 32
+    eps = 1e-6
+    device = torch.device("cuda")
+
+    x = torch.full((B, C, H, W), 10000.0, device=device, dtype=dtype)
+    x = x + torch.randn(B, C, H, W, device=device, dtype=dtype) * 0.1
+    weight = torch.randn(C, device=device, dtype=dtype)
+    bias = torch.randn(C, device=device, dtype=dtype)
+    scale = torch.randn(B, C, device=device, dtype=dtype)
+    shift = torch.randn(B, C, device=device, dtype=dtype)
+
+    fused_out = fused_adaptive_group_norm_silu(x, weight, bias, scale, shift, num_groups, eps)
+    ref_out = _reference(x, weight, bias, scale, shift, num_groups, eps).to(dtype)
+
+    assert not torch.isnan(fused_out).any(), "fused output must not contain NaN"
+
+    if dtype == torch.float32:
+        # ~0.02 is the representation-noise floor at offset 1e4; old impl ~1.0.
+        torch.testing.assert_close(fused_out, ref_out, rtol=0.05, atol=0.1)
+    # fp16/bf16: perturbation is swallowed by the dtype — no meaningful close,
+    # the no-NaN assertion above is the regression guard.
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
