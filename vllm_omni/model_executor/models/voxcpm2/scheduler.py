@@ -21,6 +21,10 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
     scheduler rule.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._decode_steps_since_prefill = 0
+
     def _unified_decode_graph_enabled(self) -> bool:
         runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)
         return runtime_config.unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())
@@ -40,3 +44,24 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
 
     def _should_defer_waiting_admission(self) -> bool:
         return self._should_defer_waiting_for_unified_decode_graph()
+
+    def _should_run_prefill_only_admission(self) -> bool:
+        if not self._should_defer_waiting_for_unified_decode_graph():
+            self._decode_steps_since_prefill = 0
+            return False
+
+        runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)
+        interval = runtime_config.unified_decode_graph_prefill_interval
+        if interval <= 0:
+            return False
+        self._decode_steps_since_prefill += 1
+        if self._decode_steps_since_prefill < interval:
+            return False
+
+        occupied_slots = len(self.running) + getattr(self, "num_waiting_for_streaming_input", 0)
+        if occupied_slots >= self.max_num_running_reqs:
+            self._decode_steps_since_prefill = interval - 1
+            return False
+
+        self._decode_steps_since_prefill = 0
+        return True

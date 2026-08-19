@@ -42,6 +42,8 @@ class _VoxCPM2RuntimeConfig:
     enable_batched_prefill_tail: bool = False
     enable_unified_decode_graph: bool = True
     unified_decode_graph_max_batch_size: int = 64
+    # Zero keeps decode-first scheduling; positive values prioritize TTFA.
+    unified_decode_graph_prefill_interval: int = 0
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> _VoxCPM2RuntimeConfig:
@@ -111,7 +113,13 @@ class _VoxCPM2RuntimeConfig:
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
-            if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
+            if key == "unified_decode_graph_prefill_interval":
+                return max(0, value)
+            if key in {
+                "audio_emit_every",
+                "vae_decode_every",
+                "batched_fsq_fusion_max_batch",
+            }:
                 return max(1, value)
             return value
         if isinstance(default, float):
