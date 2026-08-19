@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any

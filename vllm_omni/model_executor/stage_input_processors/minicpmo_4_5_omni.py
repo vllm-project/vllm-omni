@@ -198,6 +198,44 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
         code_accumulators.pop(request_id, None)
 
 
+def _resolve_request_ref_audio(
+    transfer_manager: Any,
+    request: Any,
+    request_id: str,
+) -> tuple[Any, Any]:
+    """Read reference audio from request state or the runner buffer."""
+    request_info = getattr(request, "additional_information", None)
+    request_buffer = getattr(request, "model_intermediate_buffer", None)
+    candidates = [request_info, request_buffer]
+    buffers = getattr(transfer_manager, "model_intermediate_buffer", None)
+    if isinstance(buffers, Mapping):
+        candidates.append(buffers.get(request_id))
+    internal_id = getattr(request, "request_id", None)
+    if internal_id is not None and str(internal_id) != request_id:
+        candidates.append(buffers.get(str(internal_id)) if isinstance(buffers, Mapping) else None)
+    expanded_candidates = []
+    for info in candidates:
+        expanded_candidates.append(info)
+        if isinstance(info, Mapping):
+            for candidate_id in (request_id, internal_id):
+                if candidate_id is not None:
+                    nested = info.get(candidate_id)
+                    if nested is None:
+                        nested = info.get(str(candidate_id))
+                    if nested is not None:
+                        expanded_candidates.append(nested)
+    candidates = expanded_candidates
+    for info in candidates:
+        if not isinstance(info, Mapping):
+            continue
+        codes = info.get("codes")
+        meta = info.get("meta")
+        if isinstance(codes, Mapping) and codes.get("ref") is not None:
+            sample_rate = meta.get("ref_audio_sr") if isinstance(meta, Mapping) else None
+            return codes["ref"], sample_rate
+    return None, None
+
+
 def _is_aborted(request: Any) -> bool:
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
@@ -340,15 +378,10 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        raw_ref_audio, raw_ref_audio_sr = _resolve_request_ref_audio(transfer_manager, request, request_id)
+        ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+        if raw_ref_audio is not None:
+            ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -402,9 +435,6 @@ def tts2code2wav_full_payload(
     request_info = getattr(request, "additional_information", None)
     if not isinstance(request_info, Mapping):
         request_info = {}
-    codes_info = request_info.get("codes")
-    if not isinstance(codes_info, Mapping):
-        codes_info = {}
     meta_info = request_info.get("meta")
     if not isinstance(meta_info, Mapping):
         meta_info = {}
@@ -412,7 +442,7 @@ def tts2code2wav_full_payload(
     if not isinstance(duplex_info, Mapping):
         duplex_info = {}
 
-    ref_audio = codes_info.get("ref")
+    ref_audio, ref_audio_sr = _resolve_request_ref_audio(transfer_manager, request, request_id)
     finished = torch.tensor(True, dtype=torch.bool)
     return OmniPayloadStruct(
         codes=CodesStruct(
@@ -431,7 +461,7 @@ def tts2code2wav_full_payload(
             stream_finished=finished,
             finished=finished,
             req_id=[request_id],
-            ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
+            ref_audio_sr=ref_audio_sr if ref_audio_sr is not None else _coerce_int(meta_info.get("ref_audio_sr")),
             native_duplex_segment_text=(
                 str(meta_info["native_duplex_segment_text"])
                 if isinstance(meta_info.get("native_duplex_segment_text"), str)
@@ -690,7 +720,17 @@ def llm2tts(
     multi_modal_data = {}
     for llm_output, p in zip(llm_outputs, prompt):
         if isinstance(p, dict):
-            multi_modal_data[llm_output.request_id] = p.get("multi_modal_data", None)
+            request_mm_data = p.get("multi_modal_data")
+            if not request_mm_data:
+                additional_information = p.get("additional_information")
+                deferred_mm_data = (
+                    additional_information.get("deferred_multi_modal_data")
+                    if isinstance(additional_information, Mapping)
+                    else None
+                )
+                if isinstance(deferred_mm_data, Mapping):
+                    request_mm_data = dict(deferred_mm_data)
+            multi_modal_data[llm_output.request_id] = request_mm_data
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
 
