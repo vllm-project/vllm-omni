@@ -1,7 +1,7 @@
 # Argument to configure vllm base image if pre-built
 ARG VLLM_BASE=vllm-base
 
-FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04 AS vllm-base
+FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04 AS vllm-base
 
 WORKDIR /workspace/
 
@@ -29,23 +29,31 @@ RUN apt clean && apt-get update -y && \
     python3.12-dev \
     python3-pip
 
-# Add oneAPI repo, pin oneAPI to 2025.3, then install pinned packages in one layer.
+# Add oneAPI repo, pin oneAPI to 2026.0, then install pinned packages in one layer.
+# The generation must match the intel-sycl-rt wheel that torch pulls in, otherwise
+# Triton and torch load conflicting SYCL runtimes.
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
     printf '%s\n' \
     'Package: intel-oneapi-* intel-deep-learning-essentials* intel-pti*' \
-    'Pin: version 2025.3*' \
+    'Pin: version 2026.0*' \
     'Pin-Priority: 1001' \
-    > /etc/apt/preferences.d/oneapi-2025.3.pref && \
+    > /etc/apt/preferences.d/oneapi-2026.0.pref && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends \
-    intel-oneapi-compiler-dpcpp-cpp-2025.3 \
-    intel-oneapi-mkl-devel-2025.3 \
-    intel-oneapi-dnnl-devel-2025.3 && \
+    intel-oneapi-compiler-dpcpp-cpp-2026.0 \
+    intel-oneapi-mkl-devel-2026.0 \
+    intel-oneapi-dnnl-devel-2026.0 && \
     rm -rf /var/lib/apt/lists/*
 
-# Install UMD with fixed version
-RUN mkdir neo && \
+# oneDNN is not part of the base image, so add it to the search paths.
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/dnnl/latest/lib:$LD_LIBRARY_PATH"
+ENV LIBRARY_PATH="/opt/intel/oneapi/dnnl/latest/lib:$LIBRARY_PATH"
+
+# Install UMD with fixed version. The base image ships Level Zero as libze1/libze-dev,
+# which claim the same files as the packages below.
+RUN apt-get remove -y libze1 libze-dev libze-intel-gpu1 || true && \
+    mkdir neo && \
     cd neo && \
     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.34.4/intel-igc-core-2_2.34.4+21428_amd64.deb && \
     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.34.4/intel-igc-opencl-2_2.34.4+21428_amd64.deb && \
@@ -54,6 +62,7 @@ RUN mkdir neo && \
     wget https://github.com/intel/compute-runtime/releases/download/26.18.38308.1/libigdgmm12_22.10.0_amd64.deb && \
     wget https://github.com/intel/compute-runtime/releases/download/26.18.38308.1/libze-intel-gpu1_26.18.38308.1-0_amd64.deb && \
     wget https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero_1.28.2+u24.04_amd64.deb && \
+    wget https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-devel_1.28.2+u24.04_amd64.deb && \
     dpkg -i *.deb && \
     cd .. && \
     rm -rf neo
@@ -65,7 +74,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# This oneccl contains the BMG support which is not the case for default version of oneapi 2025.3.
+# This oneccl contains the BMG support which is not the case for default version of oneapi 2026.0.
 ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
 RUN wget "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
     bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
