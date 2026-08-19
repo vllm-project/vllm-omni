@@ -164,6 +164,27 @@ class TestReturnResultAsyncPath:
         proc._return_result(DiffusionOutput())
         # No crash, no enqueue attempted
 
+    def test_non_output_rank_acknowledges_successful_async_rpc(self):
+        proc = _make_worker_proc(step_execution=False)
+        proc.recv_message = MagicMock(
+            side_effect=[
+                {
+                    "type": "rpc",
+                    "method": "execute_model",
+                    "rpc_id": "rpc-1",
+                },
+                {"type": "shutdown"},
+            ]
+        )
+        proc._execute_rpc = MagicMock(return_value=(None, False))
+
+        proc._worker_busy_loop()
+
+        ack = proc.result_mq.enqueue.call_args.args[0]
+        assert ack.kind == AsyncOutputKind.RPC_RESULT
+        assert ack.rpc_id == "rpc-1"
+        assert ack.error is None
+
 
 class TestReturnResultSyncPath:
     """Test _return_result in step-execution mode (sync)."""

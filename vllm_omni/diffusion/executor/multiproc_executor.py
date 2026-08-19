@@ -133,6 +133,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_id_counter = 0
         self._rpc_id_lock = threading.Lock()
         self._rpc_futures: dict[str, concurrent.futures.Future[AsyncDiffusionOutput]] = {}
+        self._rpc_expected_replies: dict[str, int] = {}
+        self._rpc_replies: dict[str, list[AsyncDiffusionOutput]] = {}
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._completed_outputs: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._batch_split_map: dict[str, dict[str, str]] = {}  # batch_id -> {per_req_id: request_id}
@@ -722,12 +724,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             fut: concurrent.futures.Future = concurrent.futures.Future()
             with self._futures_lock:
                 self._rpc_futures[rpc_id] = fut
+                self._rpc_expected_replies[rpc_id] = int(self.od_config.num_gpus) if execute_all_ranks else 1
+                self._rpc_replies[rpc_id] = []
             self._broadcast_mq.enqueue(rpc_request)  # pyright: ignore[reportOptionalMemberAccess] MQ is not None before shutdown
             try:
                 return fut.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 with self._futures_lock:
                     self._rpc_futures.pop(rpc_id, None)
+                    self._rpc_expected_replies.pop(rpc_id, None)
+                    self._rpc_replies.pop(rpc_id, None)
                 raise TimeoutError(f"RPC call to {method} timed out.")
 
         # ── Path 2: step-execution or other non-execute_model RPCs ──
@@ -864,13 +870,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 continue
 
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
-                with self._futures_lock:
-                    fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
-                if fut is not None and not fut.done():
-                    if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
-                    else:
-                        try_set_result(fut, msg)
+                self._dispatch_async_rpc_result(msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
                 with self._futures_lock:
@@ -911,6 +911,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                 else:
                                     fut.set_result(output_result)
                                 self._completed_outputs[batch_id] = fut
+
+    def _dispatch_async_rpc_result(self, msg: AsyncDiffusionOutput) -> None:
+        rpc_id = msg.rpc_id
+        if rpc_id is None:
+            return
+        with self._futures_lock:
+            fut = self._rpc_futures.get(rpc_id)
+            if fut is None or fut.done():
+                return
+            replies = self._rpc_replies.setdefault(rpc_id, [])
+            replies.append(msg)
+            expected = self._rpc_expected_replies.get(rpc_id, 1)
+            if msg.error:
+                self._rpc_futures.pop(rpc_id, None)
+                self._rpc_expected_replies.pop(rpc_id, None)
+                self._rpc_replies.pop(rpc_id, None)
+                try_set_exception(fut, RuntimeError(msg.error))
+            elif len(replies) >= expected:
+                compute_done = next(
+                    (reply for reply in replies if reply.kind == AsyncOutputKind.COMPUTE_DONE),
+                    replies[-1],
+                )
+                self._rpc_futures.pop(rpc_id, None)
+                self._rpc_expected_replies.pop(rpc_id, None)
+                self._rpc_replies.pop(rpc_id, None)
+                try_set_result(fut, compute_done)
 
     def _deliver_batch_split(
         self,
@@ -1002,6 +1028,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     if not fut.done():
                         try_set_exception(fut, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
+                self._rpc_expected_replies.clear()
+                self._rpc_replies.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
             self._shutdown_cleaner = None

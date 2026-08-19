@@ -1251,6 +1251,17 @@ class WorkerProc:
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
                         self._return_result(result, rpc_id=rpc_id)
+                    elif rpc_id is not None and self.result_mq is not None:
+                        # Async RPC futures resolve only after every executing
+                        # rank has either acknowledged success or reported an
+                        # error. This prevents rank-zero COMPUTE_DONE from
+                        # racing ahead of a non-output-rank failure.
+                        self._enqueue_result(
+                            AsyncDiffusionOutput(
+                                kind=AsyncOutputKind.RPC_RESULT,
+                                rpc_id=rpc_id,
+                            )
+                        )
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     # Apply the same reply gate as the success path so

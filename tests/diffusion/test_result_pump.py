@@ -22,12 +22,15 @@ def _make_executor(step_execution=False):
 
     od_config = MagicMock()
     od_config.step_execution = step_execution
+    od_config.num_gpus = 1
 
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_config
     executor._rpc_id_counter = 0
     executor._rpc_id_lock = threading.Lock()
     executor._rpc_futures = {}
+    executor._rpc_expected_replies = {}
+    executor._rpc_replies = {}
     executor._output_futures = {}
     executor._completed_outputs = {}
     executor._batch_split_map = {}
@@ -200,6 +203,8 @@ class TestResultPumpDispatch:
         fut = concurrent.futures.Future()
         with executor._futures_lock:
             executor._rpc_futures[rpc_id] = fut
+            executor._rpc_expected_replies[rpc_id] = 1
+            executor._rpc_replies[rpc_id] = []
 
         msg = AsyncDiffusionOutput(
             kind=AsyncOutputKind.COMPUTE_DONE,
@@ -211,6 +216,33 @@ class TestResultPumpDispatch:
         assert fut.done()
         result = fut.result(timeout=1.0)
         assert result.kind == AsyncOutputKind.COMPUTE_DONE
+
+    @pytest.mark.parametrize("error_first", [False, True])
+    def test_async_rpc_prioritizes_nonzero_rank_error(self, error_first):
+        executor = _make_executor()
+        rpc_id = "two-rank"
+        fut = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._rpc_futures[rpc_id] = fut
+            executor._rpc_expected_replies[rpc_id] = 2
+            executor._rpc_replies[rpc_id] = []
+
+        compute_done = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE,
+            rpc_id=rpc_id,
+            async_output_id="output-id",
+        )
+        rank_error = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.RPC_RESULT,
+            rpc_id=rpc_id,
+            error="rank 1 failed",
+        )
+        messages = [rank_error, compute_done] if error_first else [compute_done, rank_error]
+        for message in messages:
+            executor._dispatch_async_rpc_result(message)
+
+        with pytest.raises(RuntimeError, match="rank 1 failed"):
+            fut.result(timeout=1.0)
 
     def test_output_ready_routes_to_output_future(self):
         executor = _make_executor()
