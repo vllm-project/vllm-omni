@@ -971,7 +971,7 @@ class AsyncOmniEngine:
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
-            data_parallel_size = normalized_kwargs.get("data_parallel_size") or 1
+            data_parallel_size = normalized_kwargs.get("data_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
@@ -1003,6 +1003,11 @@ class AsyncOmniEngine:
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
             )
+
+        num_gpus = normalized_kwargs.get("num_gpus")
+        if num_gpus is not None:
+            num_gpus = int(num_gpus)
+            parallel_config.resolve_data_parallel_size(num_gpus)
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
@@ -1092,6 +1097,8 @@ class AsyncOmniEngine:
                 else {}
             ),
         }
+        if num_gpus is not None:
+            stage_engine_args["num_gpus"] = num_gpus
         # Only set dtype if it was already explicitly passed and normalized
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from x_transformers.x_transformers import RotaryEmbedding
 
-from vllm_omni.model_executor.models.common.ming.dit import DiTBlock, FinalLayer
+from vllm_omni.model_executor.models.common.ming.dit_blocks import DiTBlock, FinalLayer
 
 
 class Aggregator(nn.Module):

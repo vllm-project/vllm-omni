@@ -5,9 +5,8 @@
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.common.ming.fm import Solver, build_timesteps
-
-from .fm.dit import DiT
+from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
+from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, build_timesteps
 
 
 class FlowLoss(nn.Module):

@@ -733,8 +733,7 @@ def test_diffusion_parallel_config_matches_diffusion_parallel_world_size_for_vae
 
 def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
     cfg = OmniStageDiffusionParallelConfig(
-        pipeline_parallel_size=2,
-        ulysses_degree=2,
+        ulysses_degree=4,
         use_hsdp=True,
         hsdp_shard_size=-1,
         hsdp_replicate_size=2,
@@ -745,10 +744,10 @@ def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
 
 
 def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():
-    with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+    with pytest.raises(ValueError, match="not compatible with TP"):
         OmniStageDiffusionParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
-    with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+    with pytest.raises(ValueError, match="not compatible with DP"):
         OmniStageDiffusionParallelConfig(data_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)
 
 
