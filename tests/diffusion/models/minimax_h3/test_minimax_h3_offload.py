@@ -12,6 +12,17 @@ from PIL import Image
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_h3_profiler_targets_cover_aggregate_reference_encoders():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    targets = MiniMaxH3Pipeline._PROFILER_TARGETS
+    assert "_encode_visual_conditions" in targets
+    assert "_encode_reference_audio_conditions" in targets
+    assert "_encode_video_conditions" not in targets
+    assert "_encode_video_audio_conditions" not in targets
+    assert "_encode_audio_conditions" not in targets
+
+
 @pytest.mark.parametrize("distributed", [False, True])
 def test_manual_component_offload_wins_over_requested_model_offload(distributed):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -188,7 +199,7 @@ def test_h3_model_cpu_offload_batches_visual_reference_scope(monkeypatch, encode
     ]
 
 
-def test_h3_model_cpu_offload_keeps_image_and_video_batches_separate(monkeypatch):
+def test_h3_model_cpu_offload_shares_image_and_video_scope(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -237,8 +248,61 @@ def test_h3_model_cpu_offload_keeps_image_and_video_batches_separate(monkeypatch
         ("activate", pipeline.video_vae),
         ("image", (16, 16)),
         ("image", (32, 16)),
-        ("offload", pipeline.video_vae),
-        ("activate", pipeline.video_vae),
         ("video", "frames:reference.mp4"),
         ("offload", pipeline.video_vae),
     ]
+
+
+@pytest.mark.parametrize("encode_fails", [False, True])
+def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeypatch, encode_fails):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = Mock()
+    pipeline._model_cpu_offload_modules = [pipeline.audio_vae]
+    events = []
+
+    @contextmanager
+    def record_component(value):
+        events.append(("activate", value))
+        try:
+            yield
+        finally:
+            events.append(("offload", value))
+
+    def encode_embedded(*args, **kwargs):
+        events.append(("embedded",))
+        if encode_fails:
+            raise RuntimeError("audio encode failed")
+        return torch.ones(1, 2), [1]
+
+    def encode_standalone(*args, **kwargs):
+        events.append(("standalone",))
+        return torch.ones(1, 2), [1]
+
+    pipeline._encode_video_audio_conditions_resident = encode_embedded
+    pipeline._encode_audio_conditions_resident = encode_standalone
+    monkeypatch.setattr(module, "sequential_offload_component", record_component)
+
+    def call():
+        return pipeline._encode_reference_audio_conditions(
+            [{"input_has_audio": True}],
+            has_audio=[True],
+            standalone_audios=[(torch.ones(1), 16_000)],
+            max_duration_seconds=1.0,
+        )
+
+    if encode_fails:
+        with pytest.raises(RuntimeError, match="audio encode failed"):
+            call()
+    else:
+        result = call()
+        assert result[0].shape == (1, 2)
+        assert result[2].shape == (1, 2)
+
+    assert events[0] == ("activate", pipeline.audio_vae)
+    assert events[-1] == ("offload", pipeline.audio_vae)
+    assert events.count(("activate", pipeline.audio_vae)) == 1
+    assert events.count(("offload", pipeline.audio_vae)) == 1
