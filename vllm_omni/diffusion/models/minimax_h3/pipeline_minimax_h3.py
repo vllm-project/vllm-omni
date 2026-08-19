@@ -8,6 +8,8 @@ import math
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
+from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -18,14 +20,20 @@ import torch.nn as nn
 from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTBackend,
+    RequestScopedCacheDiTRuntime,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_dit_group,
+    get_world_group,
     init_world_group,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
@@ -36,12 +44,23 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import (
+    resolve_component_quant_config as _resolve_component_quant_config,
+)
+from vllm_omni.quantization.component_config import (
+    resolve_encoder_quant_config as _resolve_encoder_quant_config,
+)
 
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
@@ -66,6 +85,7 @@ from .presentation import (
     minimax_h3_ref2va_video_presentation,
     minimax_h3_text_only_ids,
 )
+from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .reference_video import (
     load_audio_file,
     load_video_audio,
@@ -104,12 +124,69 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_DOWNLOAD_PATTERNS = [
+    "FL2VA/**",
+    "Ref2VA/model_index.json",
+    "Ref2VA/transformer/**",
+]
+MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
+    "fl2va": ["FL2VA/**"],
+    "ref2va": ["Ref2VA/**"],
+}
 
 
-def _resolve_component_quant_config(quant_config, component: str):
-    if hasattr(quant_config, "resolve"):
-        return quant_config.resolve(component)
-    return quant_config
+def _resolve_minimax_h3_text_encoder_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    resolved = _resolve_component_quant_config(quant_config, "text_encoder")
+    return _resolve_encoder_quant_config(resolved)
+
+
+def _minimax_h3_partition_for_task(
+    task_type: str | None,
+    model: str | None = None,
+) -> str:
+    task = str(task_type or "auto").lower()
+    if task == "auto" and model is not None:
+        path = Path(model)
+        if path.is_dir() and path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
+            return path.name.lower()
+    if task in {"auto", "combined"}:
+        return "combined"
+    if task in {"t2va", "fl2va"}:
+        return "fl2va"
+    if task == "ref2va":
+        return "ref2va"
+    raise ValueError(f"MiniMax-H3 task_type must be one of auto, t2va, fl2va, or ref2va; got {task_type!r}")
+
+
+def _resolve_minimax_h3_model_root(
+    model: str,
+    revision: str | None,
+    partition: str,
+) -> Path:
+    path = Path(model)
+    if path.is_dir():
+        if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
+            return path.parent
+        return path
+    allow_patterns = (
+        MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
+    )
+    return Path(
+        download_weights_from_hf_specific(
+            model_name_or_path=model,
+            cache_dir=None,
+            allow_patterns=allow_patterns,
+            revision=revision,
+            require_all=True,
+        )
+    )
+
+
+def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
+    """Read a partition's distilled schedule. An absent key means legacy uniform."""
+    return DMD2SigmaSchedule.from_metadata(release)
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -346,7 +423,7 @@ def _validate_reference_image(image: Image.Image) -> None:
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
-    group = get_dit_group()
+    group = get_world_group().device_group
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
@@ -444,6 +521,7 @@ class _SingleRankEncoderGroup:
 
 class MiniMaxH3Pipeline(
     nn.Module,
+    DenoiseProgressMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     SupportImageInput,
@@ -453,18 +531,41 @@ class MiniMaxH3Pipeline(
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
-    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        offload_submodules={"token_refiner": "blocks"},
+        resident_dit_paths=frozenset({"transformer"}),
+        encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
+        on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
+    )
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
         "encode_prompt",
         "_encode_video_conditions",
         "_encode_video_audio_conditions",
+        "_encode_audio_conditions",
         "diffuse",
         "decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    # Only distilled releases pin a schedule, so the default keeps the legacy
+    # uniform path available to partially constructed pipelines.
+    _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+
+    def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
+        """Adopt runner-installed generic Cache-DiT for request transitions."""
+
+        self._cache_dit_runtime.adopt(
+            backend,
+            installation_key=MINIMAX_H3_GENERIC_CACHE_KEY,
+        )
+
+    def is_cache_dit_enabled(self) -> bool:
+        """Return the request-scoped Cache-DiT installation state."""
+
+        return self._cache_dit_runtime.is_enabled
 
     def __init__(
         self,
@@ -479,24 +580,71 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
-        model_path = str(od_config.model)
-        model_index = json.loads((Path(model_path) / "model_index.json").read_text(encoding="utf-8"))
+        self.partition = _minimax_h3_partition_for_task(
+            getattr(od_config, "task_type", None),
+            str(od_config.model),
+        )
+        model_root = _resolve_minimax_h3_model_root(
+            str(od_config.model),
+            od_config.revision,
+            self.partition,
+        )
+        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
+        model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
         release = model_index.get("_minimax_h3") or {}
-        self.partition = str(release.get("partition", ""))
-        self.supported_tasks = frozenset(release.get("tasks") or ())
+        partition = str(release.get("partition", "")).lower()
+        expected_partition = "ref2va" if self.partition == "ref2va" else "fl2va"
+        if partition != expected_partition:
+            raise ValueError(f"invalid MiniMax-H3 {expected_partition} partition at {model_path}")
+
+        supported_tasks = {str(task).lower() for task in release.get("tasks", [])}
+        if not supported_tasks:
+            supported_tasks = {"ref2va"} if partition == "ref2va" else {"t2va", "fl2va"}
+        ref2va_model_path = None
+        if self.partition == "combined":
+            ref2va_model_path = model_root / "Ref2VA"
+            ref2va_index_path = ref2va_model_path / "model_index.json"
+            if not ref2va_index_path.is_file():
+                raise ValueError(f"Ref2VA partition not found at {ref2va_model_path}")
+            ref2va_index = json.loads(ref2va_index_path.read_text(encoding="utf-8"))
+            ref2va_release = ref2va_index.get("_minimax_h3") or {}
+            if str(ref2va_release.get("partition", "")).lower() != "ref2va":
+                raise ValueError(f"invalid MiniMax-H3 ref2va partition at {ref2va_model_path}")
+            supported_tasks.update(str(task).lower() for task in ref2va_release.get("tasks", ["ref2va"]))
+
+        self.supported_tasks = frozenset(supported_tasks)
         shifts = release.get("sigma_shift_scales") or {}
         self.default_video_shift = float(shifts.get("video", 12.0))
         self.default_audio_shift = float(shifts.get("audio", 3.0))
+        # Distilled releases pin their own few-step rectified-flow positions; the
+        # uniform schedule derived from num_inference_steps does not match what
+        # such a checkpoint was trained on. Each partition carries its own
+        # contract, so a distilled FL2VA must not drag Ref2VA onto its schedule.
+        self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
+        if ref2va_model_path is not None:
+            self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model_path,
+                model_or_path=str(model_path),
                 subfolder="transformer",
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=False,
             )
         ]
+        self._dit_modules = ["transformer"]
+        if ref2va_model_path is not None:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(ref2va_model_path),
+                    subfolder="transformer",
+                    revision=od_config.revision,
+                    prefix="transformers_ref.",
+                    fall_back_to_pt=False,
+                )
+            )
+            self._dit_modules.append("transformers_ref")
         transformer_quant_config = _resolve_component_quant_config(
             od_config.quantization_config,
             "transformer",
@@ -505,14 +653,19 @@ class MiniMaxH3Pipeline(
             od_config,
             quant_config=transformer_quant_config,
         )
+        if ref2va_model_path is not None:
+            self.transformers_ref = MiniMaxH3DiTModel(
+                od_config,
+                quant_config=transformer_quant_config,
+            )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
-            model_path,
+            str(model_path),
             subfolder="tokenizer",
             local_files_only=os.path.isdir(model_path),
         )
         self.processor = Qwen3VLProcessor.from_pretrained(
-            model_path,
+            str(model_path),
             subfolder="processor",
             local_files_only=os.path.isdir(model_path),
         )
@@ -536,22 +689,43 @@ class MiniMaxH3Pipeline(
             )
         self.text_encoder_tp_size = text_encoder_tp_size
         self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+        load_text_encoder = rank < text_encoder_tp_size
         self.text_encoder = MiniMaxH3Qwen3VLEncoder(
             os.path.join(model_path, "text_encoder"),
             device=self.device,
-            load_model=rank < text_encoder_tp_size,
+            load_model=load_text_encoder,
             encoder_group=self.text_encoder_group,
+            quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
         )
+        if load_text_encoder:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(model_path),
+                    subfolder="text_encoder",
+                    revision=od_config.revision,
+                    prefix="text_encoder.",
+                    fall_back_to_pt=False,
+                )
+            )
+        stage_components = bool(
+            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        )
+        component_load_device = torch.device("cpu") if stage_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
             device=self.device,
+            load_device=component_load_device,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             os.path.join(model_path, "audio_vae"),
             device=self.device,
+            load_device=component_load_device,
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        self._quality_policy = MiniMaxH3QualityPolicy(od_config)
+        self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
@@ -561,23 +735,42 @@ class MiniMaxH3Pipeline(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        prefix = "transformer."
+        def source_prefix(item: tuple[str, torch.Tensor]) -> str:
+            name, _ = item
+            prefix = name.partition(".")[0] + "."
+            if prefix in {"transformer.", "transformers_ref.", "text_encoder."}:
+                return prefix
+            raise ValueError(f"unexpected MiniMax-H3 weight {name!r}")
 
-        def transformer_weights():
-            for name, tensor in weights:
-                if name.startswith(prefix):
-                    yield name[len(prefix) :], tensor
-
-        loaded = self.transformer.load_weights(transformer_weights())
-        self.transformer.post_load_weights()
-        loaded_with_prefix = {prefix + name for name in loaded}
-        # The text encoder and both VAEs load eagerly in ``__init__`` rather
-        # than through ``weights_sources``. Record them for the runner's strict
-        # missing-parameter check.
-        for component_name in ("text_encoder", "video_vae", "audio_vae"):
+        loaded_with_prefix: set[str] = set()
+        loaded_prefixes: set[str] = set()
+        for prefix, grouped_weights in groupby(weights, key=source_prefix):
+            if prefix in loaded_prefixes:
+                raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
+            loaded_prefixes.add(prefix)
+            component = getattr(self, prefix.removesuffix("."))
+            loaded = component.load_weights((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix != "text_encoder.":
+                component.post_load_weights()
+            loaded_with_prefix.update(prefix + name for name in loaded)
+        # Both VAEs load eagerly in ``__init__`` rather than through
+        # ``weights_sources``. The text encoder uses the shared component
+        # loader so online quantization and offload processing follow the same
+        # path as the DiT.
+        for component_name in ("video_vae", "audio_vae"):
             component = getattr(self, component_name)
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
         return loaded_with_prefix
+
+    def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
+        if task == "ref2va" and hasattr(self, "transformers_ref"):
+            return self.transformers_ref
+        return self.transformer
+
+    def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
+        """Return the distilled schedule of the partition that serves ``task``."""
+        partition = "ref2va" if task == "ref2va" else "fl2va"
+        return self._base_schedule_by_partition.get(partition)
 
     def _resolve_task(
         self,
@@ -585,7 +778,11 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
     ) -> str:
         if requested is None:
+            # A Ref2VA-only startup has no FL2VA transformer; preserve its
+            # historical implicit default even for image-only references.
             if self.partition == "ref2va":
+                requested = "ref2va"
+            elif multi_modal_data.get("video") is not None or multi_modal_data.get("audio") is not None:
                 requested = "ref2va"
             elif multi_modal_data.get("image") is not None:
                 requested = "fl2va"
@@ -714,10 +911,7 @@ class MiniMaxH3Pipeline(
                     videos = []
                     sampled_videos = []
                     for index, item in enumerate(prepared_videos):
-                        sampled = sample_reference_video_frames(
-                            item["prepared_path"],
-                            workdir=str(Path(item["prepared_path"]).parent / f"qwen_frames_{index}"),
-                        )
+                        sampled = sample_reference_video_frames(item["prepared_path"])
                         videos.append(np.stack(sampled["frames"]))
                         sampled_videos.append(sampled)
                     vision = self.processor.video_processor(
@@ -935,12 +1129,16 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.od_config.enable_cpu_offload:
+        if self.od_config.enable_cpu_offload and not getattr(
+            self.od_config, "enable_distributed_layerwise_offload", False
+        ):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
 
-        if self.od_config.enable_layerwise_offload:
+        if self.od_config.enable_layerwise_offload or getattr(
+            self.od_config, "enable_distributed_layerwise_offload", False
+        ):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
             self.text_encoder.load_to_device()
@@ -955,12 +1153,33 @@ class MiniMaxH3Pipeline(
         self.text_encoder.load_to_device()
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
+    def _uses_manual_component_offload(self) -> bool:
+        od_config = getattr(self, "od_config", None)
+        return bool(
+            getattr(od_config, "enable_layerwise_offload", False)
+            or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        )
+
+    @contextmanager
+    def _component_on_device(self, component: nn.Module):
+        staged = self._uses_manual_component_offload()
+        if staged:
+            component.load_to_device()
+        try:
+            yield
+        finally:
+            if staged:
+                component.offload_to_cpu()
+
     def _encode_visual_condition(
         self,
         image: Image.Image,
     ) -> torch.Tensor:
         _, rank, _ = _dit_rank_world()
-        rows = self.video_vae.encode_image(image) if rank == 0 else None
+        rows = None
+        if rank == 0:
+            with self._component_on_device(self.video_vae):
+                rows = self.video_vae.encode_image(image)
         return _broadcast_tensor(
             rows,
             dtype=torch.float32,
@@ -996,7 +1215,8 @@ class MiniMaxH3Pipeline(
         rows = None
         audio_t = 0
         if rank == 0:
-            rows, audio_t = self.audio_vae.encode_waveform(*audio)
+            with self._component_on_device(self.audio_vae):
+                rows, audio_t = self.audio_vae.encode_waveform(*audio)
         audio_t_tensor = torch.tensor(
             [audio_t],
             dtype=torch.long,
@@ -1015,14 +1235,26 @@ class MiniMaxH3Pipeline(
     def _encode_audio_conditions(
         self,
         audios: list[tuple[torch.Tensor, int]],
+        *,
+        max_duration_seconds: float | None = None,
     ) -> tuple[torch.Tensor | None, list[int]]:
         if not audios:
             return None, []
+        if max_duration_seconds is not None:
+            max_duration_seconds = float(max_duration_seconds)
+            if max_duration_seconds <= 0:
+                raise ValueError("max_duration_seconds must be positive")
         _, rank, _ = _dit_rank_world()
         rows = None
         lengths = torch.zeros(len(audios), dtype=torch.long, device=self.device)
         if rank == 0:
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in audios]
+            bounded_audios = []
+            for waveform, sample_rate in audios:
+                if max_duration_seconds is not None:
+                    max_samples = int(round(max_duration_seconds * int(sample_rate)))
+                    waveform = waveform[..., :max_samples]
+                bounded_audios.append((waveform, sample_rate))
+            encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
             rows = torch.cat([item[0] for item in encoded])
             lengths = torch.tensor(
                 [int(item[1]) for item in encoded],
@@ -1038,6 +1270,15 @@ class MiniMaxH3Pipeline(
         )
 
     def _encode_video_conditions(
+        self,
+        prepared_videos: list[dict[str, Any]] | None,
+        *,
+        count: int,
+    ) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
+        with self._component_on_device(self.video_vae):
+            return self._encode_video_conditions_resident(prepared_videos, count=count)
+
+    def _encode_video_conditions_resident(
         self,
         prepared_videos: list[dict[str, Any]] | None,
         *,
@@ -1090,6 +1331,15 @@ class MiniMaxH3Pipeline(
         *,
         has_audio: list[bool],
     ) -> tuple[torch.Tensor | None, list[int]]:
+        with self._component_on_device(self.audio_vae):
+            return self._encode_video_audio_conditions_resident(prepared_videos, has_audio=has_audio)
+
+    def _encode_video_audio_conditions_resident(
+        self,
+        prepared_videos: list[dict[str, Any]] | None,
+        *,
+        has_audio: list[bool],
+    ) -> tuple[torch.Tensor | None, list[int]]:
         _, rank, _ = _dit_rank_world()
         count = sum(has_audio)
         if count == 0:
@@ -1104,7 +1354,10 @@ class MiniMaxH3Pipeline(
                     *load_video_audio(
                         item["original_path"],
                         start_time_seconds=float(item.get("start_time_seconds", 0.0)),
-                        duration_seconds=item.get("duration_seconds"),
+                        duration_seconds=item.get(
+                            "audio_duration_seconds",
+                            item.get("duration_seconds"),
+                        ),
                     )
                 )
                 for item in prepared_videos
@@ -1156,6 +1409,17 @@ class MiniMaxH3Pipeline(
         )
         return video_rows, audio_rows
 
+    @contextmanager
+    def _resident_dit_layers_on_device(self, *, enabled: bool = True):
+        controller = getattr(self, "_dlo_residency_controller", None)
+        if controller is not None and enabled:
+            controller.load_resident_layers()
+        try:
+            yield
+        finally:
+            if controller is not None and enabled:
+                controller.offload_resident_layers()
+
     def diffuse(
         self,
         *,
@@ -1171,6 +1435,7 @@ class MiniMaxH3Pipeline(
         num_steps: int,
         video_shift: float,
         audio_shift: float,
+        base_schedule: Sequence[float] | None,
         visual_condition: torch.Tensor | None,
         visual_condition_shape: tuple[int, int, int] | None,
         audio_condition: torch.Tensor | None,
@@ -1272,26 +1537,38 @@ class MiniMaxH3Pipeline(
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=video_shift,
+            base_schedule=base_schedule,
         )
         audio_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=audio_shift,
+            base_schedule=base_schedule,
         )
-        with self.progress_bar(total=len(video_sigmas) - 1) as progress:
-            video_rows, audio_rows = minimax_h3_denoise_loop(
-                model=self.transformer,
-                positive=branch,
-                initial_video_rows=initial_video,
-                initial_audio_rows=initial_audio,
-                keyframe_cond_rows=visual_anchor,
-                audio_ref_rows=audio_anchor,
-                sigmas_video=video_sigmas,
-                sigmas_audio=audio_sigmas,
-                device=self.device,
-                imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
-                audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
-                on_step=lambda step, video, audio: progress.update(),
-            )
+        transformer = self._transformer_for_task(task)
+        # The static DLO plan keeps leading blocks resident only for the
+        # primary ``transformer``. In combined mode ``transformers_ref`` is
+        # fully streamed, so a Ref2VA request must not stage the inactive
+        # FL2VA transformer resident blocks.
+        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+            with self.progress_bar(total=len(video_sigmas) - 1) as progress:
+                video_rows, audio_rows = minimax_h3_denoise_loop(
+                    model=transformer,
+                    positive=branch,
+                    initial_video_rows=initial_video,
+                    initial_audio_rows=initial_audio,
+                    keyframe_cond_rows=visual_anchor,
+                    audio_ref_rows=audio_anchor,
+                    sigmas_video=video_sigmas,
+                    sigmas_audio=audio_sigmas,
+                    device=self.device,
+                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    on_step_start=lambda step, video_sigma, audio_sigma: self.record_denoise_step(
+                        step,
+                        normalized_timestep=video_sigma,
+                    ),
+                    on_step_end=lambda step, video, audio: progress.update(),
+                )
 
         target_video = video_rows[branch.update_mask_dev]
         video_latent = minimax_h3_unpatchify_video_tokens(
@@ -1320,14 +1597,16 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with current_omni_platform.create_autocast_context(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=True,
-        ):
-            video = self.video_vae.decode_latent(video_latent)
+        with self._component_on_device(self.video_vae):
+            with current_omni_platform.create_autocast_context(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=True,
+            ):
+                video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
-        audio = self.audio_vae.decode_latent(audio_latent)
+        with self._component_on_device(self.audio_vae):
+            audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
 
     @torch.no_grad()
@@ -1345,6 +1624,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
 
         sampling = request.sampling_params
+        quality = sampling.quality
+        logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)
 
@@ -1434,7 +1715,7 @@ class MiniMaxH3Pipeline(
                     dist.broadcast(
                         has_audio_tensor,
                         src=0,
-                        group=get_dit_group(),
+                        group=get_world_group().device_group,
                     )
                 has_audio = [bool(value) for value in has_audio_tensor.tolist()]
 
@@ -1478,7 +1759,10 @@ class MiniMaxH3Pipeline(
                     prepared_videos,
                     has_audio=has_audio,
                 )
-                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(standalone_audios)
+                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(
+                    standalone_audios,
+                    max_duration_seconds=float(num_frames) / float(sampling.fps or MINIMAX_H3_FPS),
+                )
                 audio_parts = [
                     item for item in (embedded_audio_condition, external_audio_condition) if item is not None
                 ]
@@ -1523,9 +1807,30 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        num_steps = int(sampling.num_inference_steps or 50)
+        sigma_schedule = self._base_schedule_for_task(task)
+        if sigma_schedule is None:
+            base_schedule = None
+            num_steps = int(sampling.num_inference_steps or 50)
+        else:
+            # The schedule lists sigma boundaries; the denoise loop runs one
+            # step per interval, and that count is what requests and Cache-DiT
+            # speak in.
+            base_schedule = sigma_schedule.base_schedule
+            num_steps = sigma_schedule.num_inference_steps
+            requested_steps = sampling.num_inference_steps
+            if requested_steps is not None and int(requested_steps) != num_steps:
+                raise OmniClientError(
+                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; num_inference_steps "
+                    f"must be {num_steps} or omitted, got {int(requested_steps)}"
+                )
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        quality_plan = self._quality_policy.resolve(
+            quality=quality,
+            num_inference_steps=num_steps,
+            extra_args=extra,
+        )
+        self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         videos = []
         audios = []
@@ -1543,6 +1848,7 @@ class MiniMaxH3Pipeline(
                 num_steps=num_steps,
                 video_shift=video_shift,
                 audio_shift=audio_shift,
+                base_schedule=base_schedule,
                 visual_condition=visual_condition,
                 visual_condition_shape=visual_shape,
                 audio_condition=audio_condition,

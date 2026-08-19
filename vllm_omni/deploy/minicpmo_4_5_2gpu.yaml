@@ -17,6 +17,13 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
+      enable_cfm_graph: true
+      cfm_max_graphs: 32
 
 stages:
   - stage_id: 0
@@ -86,3 +93,9 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      - stage_id: 2
+        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
+        # estimator kernels through the NPU platform patch.
+        additional_config:
+          code2wav_enable_npu_graph: true
+          code2wav_max_npu_graphs: 32

@@ -2,16 +2,21 @@
 
 import io
 import json
+import math
 import tempfile
 import threading
 import wave
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
 
+import av
 import numpy as np
 import soundfile as sf
 from PIL import Image
@@ -19,11 +24,113 @@ from PIL import Image
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
+    decode_b64_image,
     preprocess_text,
 )
 
+_ResponseT = TypeVar("_ResponseT")
+
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
+
+# Assertions that sample a random variable rather than testing whether serving works:
+# whether TTS audio is intelligible enough to transcribe back, and whether a preset voice's
+# timbre estimates as the expected gender. Both are decided by the model and the estimator,
+# so a caller measuring a success rate has to tell them apart from a serving failure. The
+# messages are constants because a caller matching the wording by hand would silently stop
+# matching if it were reworded, reclassifying every quality failure as a hard failure.
+AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
+GENDER_MISMATCH_MESSAGE = "estimated gender is"
+_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
+
+
+@dataclass(frozen=True)
+class SuccessRateGate:
+    """Gate a sampled quality check on how many requests pass, not on each one passing.
+
+    Built by the send helpers from their own arguments, so a test states a policy and never
+    touches this class. See ``collect_at_success_rate``.
+
+    Attributes:
+        min_successes: Fail below this many successes out of ``request_num``. Predeclare it
+            from a measured baseline; tuning it until CI passes defeats the gate.
+        concurrency: In-flight requests, in batches until the sample count is reached.
+            Defaults to sending all of them at once.
+    """
+
+    min_successes: int
+    concurrency: int | None = None
+
+
+def is_quality_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is one of the sampled quality assertions above.
+
+    A caller absorbing a few of these into a success-rate budget must not absorb an HTTP
+    failure, missing audio or a text-keyword miss as well, or a broken server passes.
+    """
+    if not isinstance(exc, AssertionError):
+        return False
+    return any(message in str(exc) for message in _QUALITY_FAILURE_MESSAGES)
+
+
+def collect_at_success_rate(
+    sample: Callable[[], _ResponseT],
+    gate: SuccessRateGate,
+    *,
+    request_num: int,
+    report: Callable[[str], None] = print,
+) -> list[_ResponseT]:
+    """Send ``request_num`` samples and gate on how many passed, returning the successes.
+
+    ``sample`` sends one request and asserts it. Only the sampled quality assertions are
+    counted; anything else propagates immediately. Does not retry and does not exit early,
+    since both would bias the rate being measured.
+    """
+    if gate.min_successes > request_num:
+        raise ValueError(f"min_successes={gate.min_successes} exceeds request_num={request_num}, gate can never pass")
+    concurrency = min(gate.concurrency or request_num, request_num)
+    responses: list[_ResponseT] = []
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def _one_sample(_: int) -> None:
+        try:
+            response = sample()
+        except AssertionError as exc:
+            if not is_quality_failure(exc):
+                raise
+            with lock:
+                failures.append(str(exc))
+            return
+        with lock:
+            responses.append(response)
+
+    for start in range(0, request_num, concurrency):
+        size = min(concurrency, request_num - start)
+        with ThreadPoolExecutor(max_workers=size) as executor:
+            for _ in executor.map(_one_sample, range(size)):
+                pass
+
+    successes = request_num - len(failures)
+    report(f"success rate: {successes}/{request_num} succeeded")
+    assert successes >= gate.min_successes, (
+        f"success rate {successes}/{request_num} is below the "
+        f"{gate.min_successes}/{request_num} gate "
+        f"(95% CI {wilson_interval(successes, request_num)}). Failures:\n"
+        + "\n".join(f"  - {failure}" for failure in failures)
+    )
+    return responses
+
+
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> str:
+    """Format a 95% Wilson score interval, so a rate failure shows how marginal it is."""
+    p = successes / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    half = z / denom * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total))
+    return f"{max(0.0, centre - half):.1%}-{min(1.0, centre + half):.1%}"
+
+
 # Transcript gates default to whisper ``small`` for speed. ``small`` mishears a
 # short TTS clip ~0.5% of the time (e.g. "Hello"->"fellow", or hallucinating a
 # leading SFX token), which flakes the deterministic similarity gate. Short
@@ -112,6 +219,34 @@ def assert_image_diffusion_response(
                     )
 
 
+def assert_images_generations_response(
+    response: dict[str, Any],
+    request_config: dict[str, Any],
+    run_level: str | None = None,
+) -> None:
+    """Validate a successful ``/v1/images/generations`` JSON response."""
+    del run_level
+    request_body = request_config.get("json") or {}
+    data = response.get("data")
+    assert isinstance(data, list), "Image generation response is missing data[]"
+
+    expected_count = int(request_body.get("n", 1))
+    assert len(data) == expected_count, f"Expected {expected_count} images, got {len(data)}"
+
+    width = height = None
+    size = request_body.get("size")
+    if isinstance(size, str) and "x" in size:
+        width_value, height_value = size.lower().split("x", 1)
+        width, height = int(width_value), int(height_value)
+
+    for item in data:
+        assert isinstance(item, dict), "Image generation data entries must be objects"
+        b64_json = item.get("b64_json")
+        assert isinstance(b64_json, str) and b64_json, "Image generation response is missing b64_json"
+        image = decode_b64_image(b64_json)
+        assert_image_valid(image, width=width, height=height)
+
+
 def assert_video_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
@@ -156,6 +291,29 @@ def assert_video_diffusion_response(
             height=expected_height,
             fps=expected_fps,
         )
+
+
+def assert_video_first_frame_matches(
+    video: Path | bytes | BytesIO,
+    expected: np.ndarray,
+    *,
+    max_mean_absolute_error: float,
+) -> None:
+    """Assert that an encoded video's first frame matches a reference image."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    else:
+        video_bytes = video if isinstance(video, bytes) else video.getvalue()
+        source = BytesIO(video_bytes)
+
+    with av.open(source) as container:
+        first_frame = next(container.decode(video=0)).to_ndarray(format="rgb24")
+
+    assert first_frame.shape == expected.shape
+    mean_absolute_error = float(np.abs(first_frame.astype(np.float32) - expected).mean() / 255.0)
+    assert mean_absolute_error < max_mean_absolute_error, (
+        f"Expected first-frame MAE < {max_mean_absolute_error}, got {mean_absolute_error:.6f}."
+    )
 
 
 def assert_audio_diffusion_response(
@@ -421,7 +579,7 @@ def _assert_preset_voice_gender_from_audio(
     print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
     if estimated_gender != "unknown":
         assert estimated_gender == expected_gender, (
-            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+            f"{voice_name!r} is expected {expected_gender}, but {GENDER_MISMATCH_MESSAGE} {estimated_gender!r}"
         )
 
 
@@ -602,7 +760,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     shorter_clean = _re.sub(r"[^\w\s]", "", shorter).strip()
                     longer_clean = _re.sub(r"[^\w\s]", "", longer).strip()
                     assert shorter_clean and (shorter_clean in longer_clean), (
-                        f"The audio content is not same as the text "
+                        f"{AUDIO_MISMATCH_MESSAGE} "
                         f"(short-text containment check failed: "
                         f"text={text_output!r}, transcript={transcript!r})"
                     )
@@ -613,7 +771,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                         text_output.lower(),
                     )
                     print(f"similarity is: {similarity}")
-                    assert similarity > similarity_threshold, "The audio content is not same as the text"
+                    assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
                 audio_similarity = cosine_similarity_text(

@@ -167,6 +167,14 @@ transfer options such as `control_path`, `control_guidance`,
 `num_conditional_frames`, `show_control_condition`, and `show_input`; see the
 Cosmos3 recipe for complete examples.
 
+HTTP redirects for `image_reference.image_url` follow vLLM's
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
+`1` (the default) to allow redirects or `0` to reject them. A redirect target
+can differ from the original host, and vLLM-Omni does not yet fully implement
+upstream vLLM's media URL allowlist protection. Deployments should therefore
+treat remote media URLs as untrusted and choose this setting as part of their
+URL access policy.
+
 ### Speech-to-Video
 
 For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both

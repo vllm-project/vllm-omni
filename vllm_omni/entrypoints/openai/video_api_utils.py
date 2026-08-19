@@ -17,6 +17,7 @@ import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm import envs
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -172,11 +173,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
         return _decode_base64_image(image_url, source="image_reference.image_url")
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
+        allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
+        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
             try:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response.has_redirect_location and not allow_redirects:
+                    raise InvalidInputReferenceError(
+                        "Invalid image_reference.image_url: redirect response was rejected because "
+                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
+                    ) from exc
+                raise InvalidInputReferenceError(
+                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                ) from exc
+            except httpx.RequestError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc
@@ -481,18 +492,32 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     if not frames:
         raise ValueError("No frames found to encode.")
 
-    frames_np = np.stack(frames, axis=0)
-    if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
-        frames_np = frames_np[..., :3]
+    frame_shape = frames[0].shape
+    has_alpha = len(frame_shape) == 3 and frame_shape[-1] == 4
+    output_shape = (*frame_shape[:-1], 3) if has_alpha else frame_shape
+    frames_u8 = np.empty((len(frames), *output_shape), dtype=np.uint8)
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
 
-    if frames_np.dtype == np.uint8:
-        frames_u8 = frames_np
-    else:
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_np *= 255.0
-        frames_u8 = np.round(frames_np).astype(np.uint8)
+    # Convert one frame at a time instead of stacking the normalized float
+    # payload first. Long videos can otherwise require another full-size
+    # float array plus conversion temporaries before encoding.
+    for index, frame in enumerate(frames):
+        if frame.shape != frame_shape:
+            raise ValueError("All video frames must have the same shape.")
+        frame = frame[..., :3] if has_alpha else frame
+        if frame.dtype == np.uint8:
+            frames_u8[index] = frame
+            continue
 
-    return np.ascontiguousarray(frames_u8)
+        # np.stack(), used by the previous implementation, promoted mixed
+        # frame dtypes before scaling. Preserve those rounding semantics
+        # without allocating a full-video float buffer.
+        scaled = np.clip(frame.astype(common_dtype, copy=False), 0.0, 1.0)
+        scaled *= 255.0
+        np.rint(scaled, out=scaled)
+        frames_u8[index] = scaled
+
+    return frames_u8
 
 
 def _encode_video_bytes(

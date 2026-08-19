@@ -36,7 +36,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_TRANSFORMERS = [
     DreamIdOmniModel,
-    LTX2VideoTransformer3DModel,
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,
@@ -81,6 +80,8 @@ def test_cachedit_public_api_is_explicit():
         "CacheDiTAdapterConfig",
         "CacheDiTBackend",
         "CacheDiTConfig",
+        "CacheDiTRequestSpec",
+        "RequestScopedCacheDiTRuntime",
         "SensenovaCachedAdapter",
         "cache_summary",
         "enable_cache_for_dit",
@@ -120,6 +121,13 @@ def test_cache_dit_configs_have_separate_cfg(transformer_model):
     assert hasattr(transformer_model, "_cache_dit_adapter_config")
     assert isinstance(transformer_model._cache_dit_adapter_config, CacheDiTAdapterConfig)
     assert transformer_model._cache_dit_adapter_config.has_separate_cfg is True
+
+
+def test_ltx2_cache_dit_uses_one_forward_per_denoise_step():
+    """LTX batches all guidance passes into one Transformer invocation."""
+    adapter_config = LTX2VideoTransformer3DModel._cache_dit_adapter_config
+
+    assert adapter_config.has_separate_cfg is False
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")

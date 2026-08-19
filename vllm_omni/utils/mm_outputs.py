@@ -106,6 +106,60 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     return mm_cpu
 
 
+def snapshot_mm_payload(multimodal_outputs: dict) -> dict[str, object]:
+    """Snapshot a multimodal payload without moving it off its device.
+
+    Request-end full-payload producers retain these tensors across decode
+    steps. CUDA graph outputs and runner input buffers may be reused on the
+    next step, so retaining views is not sufficient: CUDA tensors must be
+    copied first. Compatible per-request tensor lists are packed with one
+    ``torch.cat`` and restored as views, avoiding one tiny copy kernel per
+    active request.
+    """
+    if not multimodal_outputs:
+        return {}
+    return {key: _snapshot_payload_value(value) for key, value in multimodal_outputs.items()}
+
+
+def _snapshot_payload_value(value):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        return tensor.clone() if tensor.device.type != "cpu" else tensor
+    if isinstance(value, dict):
+        return {key: _snapshot_payload_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        if not value:
+            return value
+        first = value[0]
+        if (
+            len(value) > 1
+            and isinstance(first, torch.Tensor)
+            and first.ndim > 0
+            and first.layout == torch.strided
+            and all(
+                isinstance(item, torch.Tensor)
+                and item.ndim == first.ndim
+                and item.layout == first.layout
+                and item.device == first.device
+                and item.dtype == first.dtype
+                and tuple(item.shape[1:]) == tuple(first.shape[1:])
+                for item in value
+            )
+        ):
+            packed = torch.cat([item.detach() for item in value], dim=0)
+            output = []
+            offset = 0
+            for item in value:
+                length = item.shape[0]
+                output.append(packed.narrow(0, offset, length))
+                offset += length
+            return output
+        return [_snapshot_payload_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_payload_value(item) for item in value)
+    return value
+
+
 def _to_cpu(value):
     """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
     if isinstance(value, torch.Tensor):

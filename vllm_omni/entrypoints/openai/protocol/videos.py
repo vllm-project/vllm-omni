@@ -15,9 +15,10 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
+from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
 
 
 class VideoGenerationStatus(str, Enum):
@@ -164,6 +165,24 @@ class VideoGenerationRequest(BaseModel):
     )
 
     # vllm-omni extensions for diffusion control
+    quality: str | None = Field(
+        default=None,
+        description=(
+            "Request-level generation quality intent. Supported values are "
+            "'lossless' and 'high'; exact behavior is model-specific. "
+            "When omitted, the model chooses its default policy."
+        ),
+    )
+
+    @field_validator("quality")
+    @classmethod
+    def validate_quality(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {value!r}")
+        return value
+
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
     num_inference_steps: int | None = Field(
         default=None,

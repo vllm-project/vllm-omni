@@ -51,10 +51,10 @@ def make_text_omni_output(
         finished=finish_reason is not None,
         num_cached_tokens=num_cached_tokens,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        res,
         request_id=request_id,
         final_output_type="text",
-        request_output=res,
         finished=finish_reason is not None,
     )
 
@@ -92,7 +92,7 @@ def build_serving_chat():
     )
     instance._create_audio_choice = MagicMock(
         side_effect=lambda omni_res, role, request, stream=False: mock_audio_choices(
-            index=omni_res.request_output.outputs[0].index,
+            index=omni_res.outputs[0].index,
             role=role,
         )
     )

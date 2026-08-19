@@ -7,7 +7,8 @@ Dataset source: https://huggingface.co/datasets/liarliar/Daily-Omni
 
 Supports loading QA metadata from:
 - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
-- HuggingFace datasets (``dataset_path``): legacy online mode
+- HuggingFace Hub id (``dataset_path``): resolved with ``snapshot_download`` to the repo's
+  ``qa.json``, which reads the hub cache and therefore also works under ``HF_HUB_OFFLINE``
 
 Video/audio files normally come from extracted ``Videos.tar``. When ``--daily-omni-video-dir``
 is not set, the first request that needs on-disk media downloads that archive from the Hugging Face
@@ -24,9 +25,9 @@ Why ``BenchmarkDataset`` instead of ``HuggingFaceDataset``?
     This class therefore inherits only ``BenchmarkDataset`` (minimal: ``dataset_path``,
     ``random_seed``, ``self.data``) and implements **two explicit loaders**:
     ``_load_from_local_json`` (default path for air-gapped runs) and ``_load_from_huggingface``
-    (optional legacy path for users who prefer ``datasets`` + Hub cache). The latter is **not**
+    (Hub ids, resolved to the repo's ``qa.json`` through the hub cache). The latter is **not**
     inheritance; it is the same Hub rows as before, factored into a helper so one class can
-    serve both deployment modes without mandatory ``datasets`` when using ``qa_json_path``.
+    serve both deployment modes without mandatory ``datasets``.
 
 Usage:
     from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset
@@ -38,7 +39,7 @@ Usage:
         random_seed=42,
     )
 
-    # HuggingFace mode (legacy, requires network)
+    # Hub id mode (works offline once the repo is in the HF hub cache)
     dataset = DailyOmniDataset(
         dataset_path="liarliar/Daily-Omni",
         dataset_split="train",
@@ -110,46 +111,16 @@ def _daily_omni_find_videos_root_in_extract(tmp: Path) -> Path:
     )
 
 
-def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
-    """Download ``Videos.tar`` from the Hugging Face dataset repo and return the ``Videos`` root.
+def _extract_daily_omni_videos_tar(tar_path: Path, cache_key: str) -> Path:
+    """Extract ``Videos.tar`` once into the shared media cache and return the ``Videos`` root.
 
-    The returned path matches ``--daily-omni-video-dir`` (directory containing ``{{video_id}}/``).
-
-    Cached under ``HF_HOME`` / ``vllm_omni/daily_omni_media/<repo>``. Reuses extraction when the
-    tarball fingerprint matches.
-
-    Raises:
-        ImportError: if ``huggingface_hub`` is not installed.
-        FileNotFoundError / RuntimeError: if the archive is missing or malformed.
+    Cached under ``HF_HOME`` / ``vllm_omni/daily_omni_media/<cache_key>``. Reuses a previous
+    extraction when the tarball fingerprint matches.
     """
-    rid = (repo_id or "").strip()
-    if not rid:
-        raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
-
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as e:
-        raise ImportError(
-            "Daily-Omni Hub media download requires huggingface_hub. "
-            "Install it (e.g. with vLLM) or provide --daily-omni-video-dir with a local extract."
-        ) from e
-
-    safe = rid.replace("/", "__").replace("\\", "_")
+    safe = cache_key.replace("/", "__").replace("\\", "_")
     staging_root = _daily_omni_hf_cache_root() / "vllm_omni" / "daily_omni_media" / safe
     videos_dir = staging_root / "Videos"
     marker = staging_root / ".videos_extracted"
-
-    tar_path: Path | None = None
-    for fname in ("Videos.tar", "videos.tar"):
-        try:
-            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
-            break
-        except Exception:
-            continue
-    if tar_path is None or not tar_path.is_file():
-        raise FileNotFoundError(
-            f"Could not download Videos.tar from Hugging Face dataset {rid!r} (tried Videos.tar / videos.tar)."
-        )
 
     fp = _daily_omni_tar_fingerprint(tar_path)
     if marker.is_file() and videos_dir.is_dir():
@@ -167,7 +138,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     try:
-        logger.info("Extracting Daily-Omni Videos.tar from %s (repo=%s)", tar_path, rid)
+        logger.info("Extracting Daily-Omni Videos.tar from %s (cache_key=%s)", tar_path, cache_key)
         with tarfile.open(tar_path, "r:*") as tf:
             tf.extractall(path=work, filter="data")
         found = _daily_omni_find_videos_root_in_extract(work)
@@ -178,8 +149,166 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
         shutil.rmtree(work, ignore_errors=True)
 
     marker.write_text(fp, encoding="utf-8")
-    logger.info("Daily-Omni Hub media ready at %s", videos_dir)
+    logger.info("Daily-Omni media ready at %s", videos_dir)
     return videos_dir
+
+
+def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
+    """Download ``Videos.tar`` from the Hugging Face dataset repo and return the ``Videos`` root.
+
+    The returned path matches ``--daily-omni-video-dir`` (directory containing ``{{video_id}}/``).
+
+    Raises:
+        ImportError: if ``huggingface_hub`` is not installed.
+        FileNotFoundError / RuntimeError: if the archive is missing or malformed.
+    """
+    rid = (repo_id or "").strip()
+    if not rid:
+        raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise ImportError(
+            "Daily-Omni Hub media download requires huggingface_hub. "
+            "Install it (e.g. with vLLM) or provide --daily-omni-video-dir with a local extract."
+        ) from e
+
+    tar_path: Path | None = None
+    for fname in ("Videos.tar", "videos.tar"):
+        try:
+            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
+            break
+        except Exception:
+            continue
+    if tar_path is None or not tar_path.is_file():
+        raise FileNotFoundError(
+            f"Could not download Videos.tar from Hugging Face dataset {rid!r} (tried Videos.tar / videos.tar)."
+        )
+
+    return _extract_daily_omni_videos_tar(tar_path, rid)
+
+
+def _resolve_hf_cache_snapshot(path: Path) -> Path:
+    """Map a HF hub cache dir (``datasets--org--name``) to its checked-out snapshot dir.
+
+    Any other directory is returned unchanged.
+    """
+    snapshots = path / "snapshots"
+    if not snapshots.is_dir():
+        return path
+    ref = path / "refs" / "main"
+    if ref.is_file():
+        try:
+            target = snapshots / ref.read_text(encoding="utf-8").strip()
+        except OSError:
+            target = snapshots
+        if target.is_dir():
+            return target
+    revisions = [p for p in snapshots.iterdir() if p.is_dir()]
+    if revisions:
+        return max(revisions, key=lambda p: p.stat().st_mtime)
+    return path
+
+
+#: QA metadata pulled by :func:`ensure_daily_omni_hub_root`. ``Videos.tar`` is deliberately left
+#: out: it is ~60GB and only :func:`ensure_daily_omni_hub_videos_dir` needs it, lazily, once a
+#: request actually asks for media.
+_DAILY_OMNI_QA_ALLOW_PATTERNS = ["qa.json", "QA.json"]
+
+
+def ensure_daily_omni_hub_root(repo_id: str) -> Path:
+    """Resolve a Daily-Omni Hub id to its snapshot directory, downloading QA metadata if needed.
+
+    Mirrors :func:`...seed_tts_dataset.resolve_seed_tts_root`: ``snapshot_download`` resolves the
+    repo through the **hub cache**, so an air-gapped run (``HF_HUB_OFFLINE=1``) keeps working as
+    long as the dataset was pre-staged there. ``datasets.load_dataset`` cannot do this — it only
+    consults the separate *datasets* cache, which a ``hf download`` never populates.
+
+    Raises:
+        ImportError: if ``huggingface_hub`` is not installed.
+        ValueError: if ``repo_id`` is empty.
+    """
+    rid = (repo_id or "").strip()
+    if not rid:
+        raise ValueError("repo_id is required to download Daily-Omni from Hugging Face")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "Install huggingface_hub to load Daily-Omni from the Hub, or pass a local "
+            "--daily-omni-qa-json / --daily-omni-video-dir mirror."
+        ) from e
+
+    cache = snapshot_download(
+        repo_id=rid,
+        repo_type="dataset",
+        allow_patterns=_DAILY_OMNI_QA_ALLOW_PATTERNS,
+    )
+    root = _resolve_hf_cache_snapshot(Path(cache).resolve())
+    logger.info("Daily-Omni Hub snapshot ready at %s (repo=%s)", root, rid)
+    return root
+
+
+def _daily_omni_qa_load_error(
+    repo_id: str | None,
+    snapshot_error: Exception | None,
+    datasets_error: Exception,
+) -> RuntimeError:
+    """Compose an actionable error after both QA-metadata sources failed.
+
+    Offline CI hits this when the dataset is missing from the hub cache *or* staged under a
+    different repo id, so the message names both attempts and the flags that bypass them.
+    """
+    parts = [f"Could not load Daily-Omni QA metadata for {repo_id!r}."]
+    if snapshot_error is not None:
+        parts.append(f"huggingface_hub snapshot_download failed: {type(snapshot_error).__name__}: {snapshot_error}")
+    parts.append(f"datasets.load_dataset failed: {type(datasets_error).__name__}: {datasets_error}")
+    parts.append(
+        "For offline runs, pre-stage the dataset in the HF hub cache "
+        "(`hf download --repo-type dataset <repo>`) and make sure the repo id matches, "
+        "or pass --daily-omni-qa-json / --daily-omni-video-dir pointing at a local mirror."
+    )
+    return RuntimeError(" ".join(parts))
+
+
+def resolve_daily_omni_local_root(dataset_path: str | None) -> Path | None:
+    """Return the local Daily-Omni mirror root for ``dataset_path``, or ``None`` if not local.
+
+    Accepts a plain directory (``qa.json`` + ``Videos/`` or ``Videos.tar``, i.e. the layout of the
+    Hub repo) as well as a HuggingFace hub cache directory (``datasets--liarliar--Daily-Omni``),
+    which is resolved to its snapshot. Hub ids such as ``liarliar/Daily-Omni`` return ``None``.
+    """
+    raw = (dataset_path or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_dir():
+        return None
+    return _resolve_hf_cache_snapshot(path.resolve())
+
+
+def daily_omni_local_qa_json(root: Path) -> Path | None:
+    """Locate ``qa.json`` inside a local Daily-Omni mirror (``None`` when absent)."""
+    for name in ("qa.json", "QA.json"):
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def daily_omni_local_videos_dir(root: Path) -> Path | None:
+    """Return the ``Videos`` root of a local mirror, extracting ``Videos.tar`` when needed."""
+    for name in ("Videos", "videos"):
+        candidate = root / name
+        if candidate.is_dir():
+            return candidate
+    for name in ("Videos.tar", "videos.tar"):
+        tar_path = root / name
+        if tar_path.is_file():
+            return _extract_daily_omni_videos_tar(tar_path, f"local__{root.name}")
+    return None
 
 
 class _ListDatasetIterator:
@@ -222,24 +351,92 @@ DAILY_OMNI_SYSTEM_TEXT = (
     "capable of perceiving auditory and visual inputs, as well as generating text and speech."
 )
 
-# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string
-# (still sent as role=system; see ``_build_daily_omni_openai_messages``).
+# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string.
 MINICPM_OMNI_SYSTEM_TEXT = ""
 
 
 def _uniform_sample_indices(n: int, k: int) -> list[int]:
-    """Evenly pick ``k`` indices from ``0..n-1`` (OpenBMB ``uniform_sample`` midpoint bins).
-
-    Matches OmniEvalKit / MiniCPM ``uniform_sample``: midpoint of each equal-width bin,
-    not ``np.linspace`` endpoints. See
-    https://github.com/OpenBMB/OmniEvalKit/blob/1adac0577258d539efc03f16d8a0f4b3f7df6c19/o_e_Kit/utils/utils.py#L50-L54
-    """
+    """Evenly pick ``k`` indices from ``0..n-1`` (MiniCPM ``uniform_sample`` on index lists)."""
     if k <= 0:
         return []
     if n <= k:
         return list(range(n))
-    gap = n / k
-    return [int(i * gap + gap / 2) for i in range(k)]
+    # Match numpy linspace(..., dtype=int) used upstream.
+    try:
+        import numpy as np
+
+        return [int(i) for i in np.linspace(0, n - 1, k, dtype=int)]
+    except ImportError:
+        if k == 1:
+            return [0]
+        return [int(round(i * (n - 1) / (k - 1))) for i in range(k)]
+
+
+def _probe_video_frames_and_fps(video_path: Path) -> tuple[int, float]:
+    """Frame count and average FPS, replacing ``len(vr)`` / ``vr.get_avg_fps()``.
+
+    PyAV is used instead of ``decord`` because ``decord`` ships x86_64-only Linux wheels
+    and is unmaintained, while ``av`` is already a first-class requirement and has
+    aarch64 wheels (Ascend hosts).
+    """
+    import av
+
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        avg_fps = float(stream.average_rate) if stream.average_rate else 0.0
+        num_frames = stream.frames or 0
+        if num_frames <= 0:
+            # Containers such as raw webm leave ``frames`` at 0; derive it from duration.
+            duration: float | None = None
+            if stream.duration is not None and stream.time_base is not None:
+                duration = float(stream.duration * stream.time_base)
+            elif container.duration is not None:
+                duration = container.duration / av.time_base
+            if duration and avg_fps:
+                num_frames = int(math.floor(duration * avg_fps))
+        if num_frames <= 0:
+            # Last resort for streams with no usable metadata at all.
+            stream.thread_type = "AUTO"
+            num_frames = sum(1 for _ in container.decode(stream))
+    if num_frames <= 0:
+        raise ValueError(f"No decodable video frames in {video_path}")
+    return num_frames, avg_fps or 1.0
+
+
+def _decode_video_frames_rgb(video_path: Path, frame_idx: list[int]) -> list[Any]:
+    """Decode presentation-order ``frame_idx`` into RGB ``PIL.Image``s.
+
+    Mirrors ``decord.VideoReader.get_batch(frame_idx)``: one image per requested index,
+    in the requested order, duplicates repeated. Decoding is a single forward pass
+    (no seeking) so the mapping from index to picture matches decord's indexing.
+    """
+    import av
+
+    wanted = sorted({int(i) for i in frame_idx})
+    if not wanted:
+        return []
+
+    decoded: dict[int, Any] = {}
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        cursor = 0
+        for position, frame in enumerate(container.decode(stream)):
+            if wanted[cursor] > position:
+                continue
+            image = frame.to_image()
+            # ``<=`` also absorbs indices that overshoot the real frame count.
+            while cursor < len(wanted) and wanted[cursor] <= position:
+                decoded[wanted[cursor]] = image
+                cursor += 1
+            if cursor >= len(wanted):
+                break
+
+    if not decoded:
+        raise ValueError(f"Decoded no frames from {video_path} for indices {wanted[:8]}")
+    # Metadata may promise more frames than the stream actually decodes; clamp to the last one.
+    last_image = decoded[max(decoded)]
+    return [decoded.get(int(i), last_image) for i in frame_idx]
 
 
 def _numpy_to_wav_bytes(audio_np: Any, sample_rate: int = _MINICPM_AUDIO_SR) -> bytes:
@@ -299,7 +496,8 @@ class DailyOmniDataset(BenchmarkDataset):
 
     QA metadata can be loaded from:
     - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
-    - HuggingFace datasets (``dataset_path``): legacy online mode
+    - HuggingFace Hub id (``dataset_path``): the repo's ``qa.json`` via ``snapshot_download``
+      (hub-cache backed, offline-safe); ``datasets.load_dataset`` only as a parquet fallback
 
     Video/audio files normally come from extracted ``Videos.tar``. When ``video_dir`` is not set,
     the first sample that needs on-disk media downloads that archive from the Hugging Face dataset
@@ -310,7 +508,8 @@ class DailyOmniDataset(BenchmarkDataset):
         qa_json_path: Path to local qa.json file (offline mode, preferred). When provided,
             ``dataset_path`` and ``dataset_split`` are ignored.
         dataset_path: HuggingFace dataset path (e.g., "liarliar/Daily-Omni"). Used only if
-            ``qa_json_path`` is not provided (legacy online mode).
+            ``qa_json_path`` is not provided; resolved through the hub cache, so a pre-staged
+            repo also loads with ``HF_HUB_OFFLINE=1``.
         dataset_split: Dataset split to use (default: "train"). Used only in online mode.
         random_seed: Random seed for shuffling
         video_dir: Directory containing extracted video files (default: None; may be filled lazily
@@ -468,21 +667,42 @@ class DailyOmniDataset(BenchmarkDataset):
         self.data = _ListDatasetIterator(data)
 
     def _load_from_huggingface(self) -> None:
-        """Load QA rows via ``datasets.load_dataset`` (legacy / convenience path).
+        """Load QA rows for a Hub id, preferring the repo's ``qa.json`` over ``datasets``.
 
-        Kept for backward compatibility: callers can still pass ``dataset_path=liarliar/Daily-Omni``
-        and get the same parquet-backed rows as the Hub dataset card, with streaming (or
-        non-streaming if ``no_stream=True``) and shuffle.
+        The Hub repo ships ``qa.json`` (1,197 rows) next to ``Videos.tar``, so the primary path is
+        :func:`ensure_daily_omni_hub_root` → :meth:`_load_from_local_json`: ``snapshot_download``
+        reads the hub cache and therefore works under ``HF_HUB_OFFLINE``, the same contract as
+        Seed-TTS. ``datasets.load_dataset`` remains only as a fallback for mirrors
+        that publish parquet rows instead of ``qa.json``; it consults the *datasets* cache rather
+        than the hub cache and streams shards over HTTP, so it cannot serve air-gapped runs.
 
         This is intentionally **not** implemented by subclassing ``HuggingFaceDataset``: that base
         always runs Hub ``load_dataset`` from its constructor and expects a Hub id as the primary
         API; Daily-Omni instead chooses the source in ``load_data()`` (JSON vs Hub) while sharing
         one ``sample()`` / request-building implementation for both.
         """
+        snapshot_error: Exception | None = None
+        try:
+            root = ensure_daily_omni_hub_root(self.dataset_path)
+        except Exception as e:  # noqa: BLE001 - any failure just falls through to `datasets`
+            snapshot_error = e
+        else:
+            qa_json = daily_omni_local_qa_json(root)
+            if qa_json is not None:
+                self.qa_json_path = qa_json
+                logger.info("Loading Daily-Omni QA metadata from Hub snapshot: %s", qa_json)
+                self._load_from_local_json()
+                return
+            logger.info(
+                "Hub snapshot %s ships no qa.json; falling back to `datasets.load_dataset`",
+                root,
+            )
+
         if load_dataset is None:
-            raise ImportError(
-                "datasets library is required for HuggingFace mode. "
-                "Install with: pip install datasets, or use local JSON mode instead."
+            raise _daily_omni_qa_load_error(
+                self.dataset_path,
+                snapshot_error,
+                ImportError("datasets library is not installed (pip install datasets)"),
             )
 
         load_kw: dict[str, Any] = {
@@ -492,7 +712,10 @@ class DailyOmniDataset(BenchmarkDataset):
         }
         if self.dataset_subset is not None:
             load_kw["name"] = self.dataset_subset
-        ds = load_dataset(self.dataset_path, **load_kw)
+        try:
+            ds = load_dataset(self.dataset_path, **load_kw)
+        except Exception as e:
+            raise _daily_omni_qa_load_error(self.dataset_path, snapshot_error, e) from e
         if not getattr(self, "disable_shuffle", False):
             ds = ds.shuffle(seed=self.random_seed)
         self.data = ds
@@ -1028,28 +1251,24 @@ class DailyOmniDataset(BenchmarkDataset):
     ) -> tuple[list[Any], list[Any]]:
         """Port of MiniCPM ``get_video_frame_audio_segments`` (stack_frames=1, 1fps)."""
         import numpy as np
-        from decord import VideoReader, cpu
-        from PIL import Image
         from vllm.multimodal.media.audio import load_audio
 
-        vr = VideoReader(str(video_path), ctx=cpu(0))
-        avg_fps = float(vr.get_avg_fps()) or 1.0
-        duration = len(vr) / avg_fps
+        num_video_frames, avg_fps = _probe_video_frames_and_fps(video_path)
+        duration = num_video_frames / avg_fps
         num_seconds = max(1, int(math.ceil(duration)))
         second_timestamps = list(range(num_seconds))
 
         if duration > max_num_frames:
             timestamps = [round(i * 0.1, 1) for i in range(int(duration / 0.1))]
-            frame_idx = [min(int(ts * avg_fps), len(vr) - 1) for ts in timestamps]
+            frame_idx = [min(int(ts * avg_fps), num_video_frames - 1) for ts in timestamps]
             pick = _uniform_sample_indices(len(frame_idx), max_num_frames)
             frame_idx = [frame_idx[i] for i in pick]
             timestamps = [timestamps[i] for i in pick]
         else:
-            frame_idx = [min(int(i * avg_fps), len(vr) - 1) for i in range(num_seconds)]
+            frame_idx = [min(int(i * avg_fps), num_video_frames - 1) for i in range(num_seconds)]
             timestamps = second_timestamps
 
-        video = vr.get_batch(frame_idx).asnumpy()
-        frames = [Image.fromarray(v.astype("uint8")).convert("RGB") for v in video]
+        frames = _decode_video_frames_rgb(video_path, frame_idx)
 
         audio_segments: list[Any] = []
         if include_audio:
@@ -1127,10 +1346,7 @@ class DailyOmniDataset(BenchmarkDataset):
         user_content: list[dict[str, Any]] = [*mm_list, {"type": "text", "text": user_text}]
         system_text = self._system_text_for_pack_mode()
         messages: list[dict[str, Any]] = []
-        # MiniCPM-o ``get_sys_prompt(mode="omni")`` still emits role=system with empty
-        # content (no ref-audio). Truthiness would drop that role and change chat-template
-        # control tokens; keep the empty system message for minicpm-interleave.
-        if self.pack_mode == "minicpm-interleave" or system_text:
+        if system_text:
             messages.append({"role": "system", "content": [{"type": "text", "text": system_text}]})
         messages.append({"role": "user", "content": user_content})
         return messages

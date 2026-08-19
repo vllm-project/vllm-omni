@@ -15,6 +15,36 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    # The backend can represent a contiguous valid K/V prefix by slicing the
+    # tensors instead of materializing a padding mask. Models may use this to
+    # avoid a slower masked-attention plan when tail padding is not semantic.
+    supports_prefix_kv_slicing: bool = False
+
+    @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        """Whether packed attention never reads attn_mask on this platform.
+
+        When True, models that pack a [real, pad] two-document layout and
+        carry cu_seqlens/max_seqlen in ``AttentionMetadata.extra`` may skip
+        constructing the padding mask entirely. Backends whose mask-free
+        behavior is platform-dependent must check current_omni_platform.
+        """
+        return False
+
+    # ``OmniPlatformEnum`` values this backend runs on; None means unrestricted.
+    # Platform resolution rejects an explicit selection outside this set, so a
+    # hardware-specific backend fails before the model is built.
+    supported_platforms: tuple[str, ...] | None = None
+
+    @classmethod
+    def validate_available(cls) -> None:
+        """Raise if this backend's optional dependencies are missing.
+
+        Called during platform resolution, i.e. before model construction, so a
+        backend that probes its kernel package lazily still reports the problem
+        while the user can still act on it.
+        """
+        return None
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -51,12 +81,42 @@ class AttentionBackend(ABC):
         supported_head_sizes = cls.get_supported_head_sizes()
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        """Whether this backend reads K/V pages by the runtime block stride.
+
+        Returning ``True`` means the physical cache layout has ``num_blocks``
+        as its outer stride, so native vLLM may safely use page-size padding
+        when it unifies cache layouts across layers. Dense diffusion backends
+        conservatively keep the default ``False``; a paged backend should
+        override this only when its kernel actually follows that layout.
+        """
+
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class QueryRange:
     local_start: int
     local_end: int
     global_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class VideoTokenLayout:
+    """Where the video segment sits inside a packed multimodal sequence.
+
+    A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
+    publishes this so backends can recover spatiotemporal locality; the prefix
+    holds everything that is not video (text, visual conditions, audio).
+    Publishing it also asserts that any ``attn_mask`` masks only the trailing
+    padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
+
+    Plain ints, so reading it never forces a device-to-host sync.
+    """
+
+    prefix_len: int
+    latent_grid: tuple[int, int, int]
 
 
 @dataclass
@@ -83,11 +143,28 @@ class AttentionMetadata:
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
     #     the packed cu_seqlens tensors.
+    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
+    #     backend that advertises supports_prefix_kv_slicing.
+    #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
+    #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
+    #     Requires the [real, pad] two-document packing contract; see
+    #     FlashAttentionImpl._forward_varlen_packed_npu.
+    #   "laser_input_scale": float — model opt-in input pre-scale for the NPU
+    #     ascend_laser_attention path. The kernel stores unscaled QK^T in an
+    #     fp16 workspace, so outlier activations overflow 65504 into NaN rows;
+    #     with this set (>1), q/k/v are divided by the factor before the op,
+    #     the kernel scale_value is multiplied by its square, and the output
+    #     is scaled back (exact for power-of-two factors). Absent means no
+    #     pre-scaling. See FlashAttentionImpl._forward_prefix_kv_slice_npu.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
     query_ranges: tuple[QueryRange, ...] | None = None
+
+    # Geometry of the video segment for backends that exploit spatiotemporal
+    # locality (block-sparse selection, tiled masks). Dense backends ignore it.
+    video_layout: VideoTokenLayout | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

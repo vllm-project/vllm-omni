@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 import os
 import warnings
@@ -770,8 +771,11 @@ AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=Tru
 
 
 # ============== SigLIP Vision Transformer Classes ==============
+FlashAttentionUnpaddingMetadata: TypeAlias = tuple[torch.Tensor, torch.Tensor, int]
+
+
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
-def _get_unpad_data(attention_mask):
+def _get_unpad_data(attention_mask: torch.Tensor) -> FlashAttentionUnpaddingMetadata:
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
@@ -1116,6 +1120,7 @@ class SiglipFlashAttention2(SiglipAttention):
         past_key_value: tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         output_attentions = False
@@ -1178,7 +1183,13 @@ class SiglipFlashAttention2(SiglipAttention):
             value_states = value_states.to(target_dtype)
 
         attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            unpadding_metadata=unpadding_metadata,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.embed_dim).contiguous()
@@ -1190,7 +1201,15 @@ class SiglipFlashAttention2(SiglipAttention):
         return attn_output, attn_weights
 
     def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout=0.0,
+        softmax_scale=None,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -1218,7 +1237,12 @@ class SiglipFlashAttention2(SiglipAttention):
         if attention_mask is not None:
             batch_size = query_states.shape[0]
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
+                unpadding_metadata=unpadding_metadata,
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
@@ -1245,8 +1269,18 @@ class SiglipFlashAttention2(SiglipAttention):
 
         return attn_output
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    def _upad_input(
+        self,
+        query_layer,
+        key_layer,
+        value_layer,
+        attention_mask,
+        query_length,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
+    ):
+        if unpadding_metadata is None:
+            unpadding_metadata = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = unpadding_metadata
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
@@ -1316,6 +1350,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool | None = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -1330,11 +1365,19 @@ class SiglipEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-        )
+        if self._use_flash_attention_2:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                unpadding_metadata=unpadding_metadata,
+            )
+        else:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1435,6 +1478,7 @@ class SiglipEncoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
     # Ignore copy
     def forward(
@@ -1475,6 +1519,9 @@ class SiglipEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
+        unpadding_metadata = (
+            _get_unpad_data(attention_mask) if self._use_flash_attention_2 and attention_mask is not None else None
+        )
         for encoder_layer in self.layers:
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -1484,12 +1531,14 @@ class SiglipEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     output_attentions,
+                    unpadding_metadata,
                 )
             else:
                 layer_outputs = encoder_layer(
                     hidden_states,
                     attention_mask,
                     output_attentions=output_attentions,
+                    unpadding_metadata=unpadding_metadata,
                 )
 
             hidden_states = layer_outputs[0]
@@ -2457,6 +2506,17 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+def _get_audio_cache_length(past_key_values: Any) -> int:
+    cache = getattr(past_key_values, "self_attention_cache", past_key_values)
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if callable(get_seq_length):
+        try:
+            return int(get_seq_length())
+        except TypeError:
+            return int(get_seq_length(0))
+    return int(cache[0][0].shape[2])
+
+
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
@@ -2468,6 +2528,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
+        )
+        attention_parameters = inspect.signature(self.self_attn.forward).parameters
+        self._past_key_values_kwarg = (
+            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2506,16 +2570,18 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_values,
-        )
+        attention_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "layer_head_mask": layer_head_mask,
+            "output_attentions": output_attentions,
+            self._past_key_values_kwarg: past_key_values,
+        }
+        attn_out = self.self_attn(**attention_kwargs)
         hidden_states = attn_out[0]
         attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
+        if len(attn_out) > 2:
+            past_key_values = attn_out[2]
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -2721,7 +2787,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
             else:
                 pass
-            past_key_values_length = past_key_values.self_attention_cache.get_usable_length(inputs_embeds.shape[1])
+            past_key_values_length = _get_audio_cache_length(past_key_values)
             if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
                 logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
                 embed_pos_front = embed_pos[past_key_values_length:, :]
@@ -4255,15 +4321,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             torch.Tensor: mask
 
         """
-        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
-        for i in range(size):
-            if num_left_chunks < 0:
-                start = 0
-            else:
-                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
-            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
-            ret[i, start:ending] = True
-        return ret
+        indices = torch.arange(size, device=device)
+        chunk_index = indices // chunk_size
+        chunk_end = torch.clamp(
+            (chunk_index + 1) * chunk_size + num_lookhead,
+            max=size,
+        )
+
+        mask = indices.unsqueeze(0) < chunk_end.unsqueeze(1)
+        if num_left_chunks >= 0:
+            chunk_start = torch.clamp(
+                (chunk_index - num_left_chunks) * chunk_size,
+                min=0,
+            )
+            mask.logical_and_(indices.unsqueeze(0) >= chunk_start.unsqueeze(1))
+        return mask
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         input_lengths_after_cnn = (input_lengths - 1) // 2 + 1
@@ -4414,7 +4486,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             return []
 
         if self.audio_past_key_values is not None:
-            cache_length = self.audio_past_key_values[0][0].shape[2]
+            cache_length = _get_audio_cache_length(self.audio_past_key_values)
             apm_max_len = self.apm.embed_positions.weight.shape[0]
             if cache_length + current_seq_len >= apm_max_len:
                 logger.warning(
@@ -4426,7 +4498,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         past_len = 0
         if self.audio_past_key_values is not None:
-            past_len = self.audio_past_key_values[0][0].shape[2]
+            past_len = _get_audio_cache_length(self.audio_past_key_values)
         total_seq_len = past_len + current_seq_len
         audio_attention_mask = torch.zeros(
             (batch_size, 1, current_seq_len, total_seq_len),

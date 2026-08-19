@@ -157,8 +157,19 @@ def benchmark_params(request):
     }
 
 
-def assert_result(result, num_prompt) -> None:
+def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    expected_audio_turns = params.get("expected_duplex_audio_turns_per_session")
+    if expected_audio_turns is not None:
+        session_metrics = result.get("duplex_session_metrics")
+        assert isinstance(session_metrics, list), "Duplex session metrics are missing"
+        assert len(session_metrics) == num_prompt, (
+            f"Expected {num_prompt} duplex session metric rows, got {len(session_metrics)}"
+        )
+        assert all(
+            isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
+            for metric in session_metrics
+        ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
 
 
 @pytest.mark.benchmark
@@ -212,6 +223,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "enabled",
         "eval_phase",
         "trust_remote_code",
+        "expected_duplex_audio_turns_per_session",
     }
 
     for key, value in params.items():
@@ -237,7 +249,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         break
 
     # QPS / request-rate sweep
-    for qps, num_prompt in zip(qps_list, num_prompt_list):
+    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
             args=args,
@@ -246,14 +258,15 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(result, num_prompt)
+        assert_result(result, params, num_prompt)
 
     # concurrency test
-    for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
+    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
             args=args,
@@ -262,8 +275,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
         )
-        assert_result(result, num_prompt)
+        assert_result(result, params, num_prompt)

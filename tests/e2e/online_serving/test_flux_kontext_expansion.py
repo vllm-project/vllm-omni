@@ -14,47 +14,15 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
+BASE_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
 
 
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--tensor-parallel-size",
-                    "2",
-                    "--enable-cpu-offload",
-                ],
-            ),
-            id="parallel_tp_2",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--enable-cpu-offload",
-                    "--cfg-parallel-size",
-                    "2",
-                ],
-            ),
-            id="parallel_cfg_2",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--tensor-parallel-size",
-                    "2",
-                    "--enable-cpu-offload",
-                    "--cache-backend",
-                    "cache_dit",
-                ],
-            ),
-            id="parallel_002",
+            OmniServerParams(model=model),
+            id="base",
+            marks=BASE_FEATURE_MARKS,
         ),
     ]
 

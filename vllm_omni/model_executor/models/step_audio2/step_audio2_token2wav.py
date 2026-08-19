@@ -13,9 +13,12 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from flashcosyvoice.modules.hifigan import HiFTGenerator
-from flashcosyvoice.utils.audio import mel_spectrogram
 from hyperpyyaml import load_hyperpyyaml
+
+try:
+    from torch.nn.utils.parametrizations import weight_norm
+except ImportError:
+    from torch.nn.utils import weight_norm
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
@@ -25,6 +28,8 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_STREAM_CONFIG,
@@ -64,6 +69,30 @@ class _StreamState:
     stream_cache: dict | None = None
     hift_cache_dict: dict = field(default_factory=dict)
     finished: bool = False
+
+
+class _ConvRNNF0Predictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        layers: list[nn.Module] = []
+        for in_channels in [80, 512, 512, 512, 512]:
+            layers.extend([weight_norm(nn.Conv1d(in_channels, 512, 3, padding=1)), nn.ELU()])
+        self.condnet = nn.Sequential(*layers)
+        self.classifier = nn.Linear(512, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
+
+
+def _build_hift() -> HiFTGenerator:
+    return HiFTGenerator(
+        sampling_rate=24000,
+        upsample_rates=[8, 5, 3],
+        upsample_kernel_sizes=[16, 11, 7],
+        source_resblock_kernel_sizes=[7, 7, 11],
+        source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+        f0_predictor=_ConvRNNF0Predictor(),
+    )
 
 
 class StepAudio2Token2WavCore(nn.Module):
@@ -142,8 +171,8 @@ class StepAudio2Token2WavCore(nn.Module):
             torch.load(f"{self.model_path}/flow.pt", map_location="cpu", weights_only=True), strict=True
         )
         self._flow.to(self.device).eval()
+        self._hift = _build_hift()
 
-        self._hift = HiFTGenerator()
         hift_state_dict = {
             k.replace("generator.", ""): v
             for k, v in torch.load(f"{self.model_path}/hift.pt", map_location="cpu", weights_only=True).items()
@@ -232,7 +261,21 @@ class StepAudio2Token2WavCore(nn.Module):
         if sample_rate != 24000:
             audio_24k = librosa.resample(y=audio_24k, orig_sr=sample_rate, target_sr=24000)
         audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
-        prompt_mel = mel_spectrogram(audio_24k_t).transpose(1, 2).squeeze(0)  # [T, num_mels]
+        prompt_mel = (
+            mel_spectrogram(
+                audio_24k_t,
+                n_fft=1920,
+                num_mels=80,
+                sampling_rate=24000,
+                hop_size=480,
+                win_size=1920,
+                fmin=0,
+                fmax=8000,
+                center=False,
+            )
+            .transpose(1, 2)
+            .squeeze(0)
+        )  # [T, num_mels]
         prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
         prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
         prompt_mels = torch.nn.functional.pad(
@@ -278,7 +321,7 @@ class StepAudio2Token2WavCore(nn.Module):
                 self.n_timesteps,
             )
 
-        wav, _ = self.hift(speech_feat=mel)
+        wav, _ = self.hift.inference(speech_feat=mel)
 
         if return_bytes:
             output = io.BytesIO()
@@ -321,7 +364,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def stream_chunk_for(
         self,
-        audio_tokens: list[int],
+        audio_tokens: list[int] | torch.Tensor,
         prompt_wav: str,
         last_chunk: bool,
         state: _StreamState,
@@ -334,7 +377,14 @@ class StepAudio2Token2WavCore(nn.Module):
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
 
-        token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
+        if isinstance(audio_tokens, torch.Tensor):
+            # Already on device; avoids the D2H->H2D round-trip of rebuilding from a list.
+            # clone() so token_tensor never aliases the caller's input_ids: when the ids
+            # already arrive int32-on-device the .to() is a no-op and would share storage,
+            # so an in-place write inside inference_chunk could corrupt input_ids.
+            token_tensor = audio_tokens.reshape(1, -1).to(device=self.device, dtype=torch.int32).clone()
+        else:
+            token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
 
         with torch.amp.autocast(
             str(self.device.type),
@@ -366,7 +416,7 @@ class StepAudio2Token2WavCore(nn.Module):
         hift_cache_speech = state.hift_cache_dict["speech"]
 
         mel = torch.cat([hift_cache_mel, chunk_mel], dim=2)
-        speech, source = self.hift(mel, hift_cache_source)
+        speech, source = self.hift.inference(mel, hift_cache_source)
 
         if hift_cache_speech.shape[-1] > 0:
             speech = fade_in_out(speech, hift_cache_speech, self.speech_window)
@@ -608,10 +658,11 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         state = self._stream_states[0]
 
         # --- Extract audio tokens ---
-        audio_tokens = input_ids.flatten().cpu().tolist()
+        # Kept on device; stream_chunk_for takes the tensor directly.
+        audio_tokens = input_ids.flatten()
 
         # Empty chunk (e.g. EOF with no audio tokens)
-        if not audio_tokens:
+        if audio_tokens.numel() == 0:
             if state.setup_done:
                 self.token2wav.reset_stream_for(state)
             else:

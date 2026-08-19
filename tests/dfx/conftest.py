@@ -1,4 +1,3 @@
-import copy
 import json
 import os
 import re
@@ -10,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
@@ -447,36 +446,16 @@ def _unique_benchmark_param_id_suffixes(params_list: list[dict[str, Any]]) -> li
     return unique
 
 
-def extract_mark_resource_label(mark_field: Any) -> str:
-    """Return a filename-safe hardware label from ``mark.hardware_marks.res`` values.
-
-    Example: ``{"cuda": "H100"}`` -> ``"H100"``; multiple platforms join with ``-``.
-
-    Prefer :func:`get_runtime_resource_label` for perf result filenames so labels
-    reflect the machine that actually ran the benchmark.
-    """
-    if isinstance(mark_field, list):
-        for item in mark_field:
-            if isinstance(item, dict) and "hardware_marks" in item:
-                return extract_mark_resource_label(item)
-        return "na"
-    if not isinstance(mark_field, dict):
-        return "na"
-    hw = mark_field.get("hardware_marks")
-    if not isinstance(hw, dict):
-        return "na"
-    res = hw.get("res")
-    if not isinstance(res, dict) or not res:
-        return "na"
-    labels = [_safe_filename_token(value) for value in res.values()]
-    return "-".join(labels) if labels else "na"
-
-
-_KNOWN_RUNTIME_RESOURCE_TOKENS: tuple[str, ...] = (
+# Device marketing-name tokens for ``get_runtime_resource_label`` only.
+# Longer / more specific tokens must appear before shorter substrings
+# (e.g. ``H200`` before ``H20``, ``910B4`` before ``910``).
+_RUNTIME_DEVICE_ALIASES: tuple[str, ...] = (
     "H100",
     "H800",
     "H200",
     "H20",
+    "B200",
+    "GB200",
     "L40S",
     "L40",
     "L4",
@@ -505,7 +484,7 @@ def _normalize_runtime_device_label(raw: str) -> str:
     if not raw or not str(raw).strip():
         return "na"
     upper = str(raw).upper()
-    for token in _KNOWN_RUNTIME_RESOURCE_TOKENS:
+    for token in _RUNTIME_DEVICE_ALIASES:
         if token.upper() in upper:
             return _safe_filename_token(token)
     compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
@@ -558,10 +537,108 @@ def resource_label_for_filename(resource_label: str | None) -> str:
     return token
 
 
-def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
-    """Return runtime hardware label for perf result filenames."""
-    del configs
-    return get_runtime_resource_label()
+def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
+    """True for ``{"H100": {"metric": ...}, "A3": {...}}`` baselines.
+
+    Detection is structural + hardware-label allowlist (not metric-name hints):
+
+    - every top-level value is a non-empty dict (per-hardware metric map);
+    - every top-level key is in :func:`tests.helpers.mark.get_hardware_mark_list`
+      (``[hardware-resource]`` markers from ``pyproject.toml``).
+
+    Metric names under each hardware bucket are unconstrained.
+    Runtime device aliases (:data:`_RUNTIME_DEVICE_ALIASES`) are unrelated.
+    """
+    if not baseline:
+        return False
+    if not all(isinstance(value, dict) and bool(value) for value in baseline.values()):
+        return False
+    allowed = {label.upper() for label in get_hardware_mark_list()}
+    return all((token := str(key).strip()) and token.upper() in allowed for key in baseline.keys())
+
+
+def resolve_baseline_value(
+    baseline_raw: Any,
+    *,
+    sweep_index: int | None,
+) -> Any:
+    """Pick the baseline threshold for one metric at this sweep step.
+
+    Accepts a sweep-aligned list/tuple (indexed by ``sweep_index``) or a scalar.
+    """
+    if baseline_raw is None:
+        return None
+    if isinstance(baseline_raw, dict):
+        raise TypeError(
+            "per-metric baseline dict keyed by concurrency/request-rate is not supported; "
+            "use a sweep-aligned list or a scalar under each hardware bucket"
+        )
+    if isinstance(baseline_raw, (list, tuple)):
+        if sweep_index is None:
+            raise ValueError("list baseline requires sweep_index")
+        if not (0 <= sweep_index < len(baseline_raw)):
+            raise IndexError(f"baseline list len={len(baseline_raw)} has no index {sweep_index}")
+        return baseline_raw[sweep_index]
+    return baseline_raw
+
+
+def resolve_baseline_for_sweep(
+    baseline_config: dict[str, Any] | None,
+    *,
+    sweep_index: int | None = None,
+) -> dict[str, Any]:
+    """Resolve sweep-dependent baselines while keeping every hardware bucket.
+
+    Expects hardware-nested input only::
+
+        {"H100": {"throughput_qps": [a, b, c]}, "A3": {"throughput_qps": [x, y, z]}}
+
+    with ``sweep_index=2`` (e.g. concurrency 32) becomes::
+
+        {"H100": {"throughput_qps": c}, "A3": {"throughput_qps": z}}
+
+    Per-metric values may be a sweep-aligned list or a scalar.
+    """
+    if not baseline_config:
+        return {}
+    if not is_hardware_nested_baseline(baseline_config):
+        allowed = sorted(get_hardware_mark_list())
+        unknown = [
+            str(key).strip()
+            for key in baseline_config.keys()
+            if str(key).strip().upper() not in {label.upper() for label in allowed}
+        ]
+        nested_shape = all(isinstance(value, dict) and bool(value) for value in baseline_config.values())
+        if nested_shape and unknown:
+            raise ValueError(
+                "baseline top-level keys must be [hardware-resource] pytest markers from "
+                "pyproject.toml (tool.pytest.ini_options.markers). "
+                f"Unknown hardware label(s): {unknown!r}. "
+                f"Known markers: {allowed!r}. "
+                "Add a marker such as '\"A100: [hardware-resource] Tests that require A100 GPU\"' "
+                "to pyproject.toml, then retry."
+            )
+        raise ValueError(
+            "baseline must be hardware-nested with [hardware-resource] marker names as "
+            "top-level keys, e.g. "
+            '{"H100": {"throughput_qps": [...]}, "A3": {"custom_metric": 1.0}}. '
+            f"got top-level keys={list(baseline_config.keys())!r}; "
+            f"known markers={allowed!r}. "
+            "If you need a new hardware bucket, add it to pyproject.toml markers with "
+            "the [hardware-resource] tag."
+        )
+
+    return {
+        hardware: {
+            metric_name: resolve_baseline_value(
+                baseline_raw,
+                sweep_index=sweep_index,
+            )
+            for metric_name, baseline_raw in metrics.items()
+        }
+        for hardware, metrics in baseline_config.items()
+        if isinstance(metrics, dict)
+    }
 
 
 def run_benchmark(
@@ -572,17 +649,18 @@ def run_benchmark(
     num_prompt: int,
     *,
     baseline_config: dict[str, Any] | None = None,
+    sweep_index: int | None = None,
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
     resource_label: str | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
-    After ``vllm bench`` writes the JSON, ``result["baseline"]`` stores the raw
-    ``baseline`` object from the test config (when ``baseline_config`` is provided),
-    including any hardware-nested map (e.g. ``{"H100": {...}}``). Downstream report
-    tooling can select a hardware bucket when needed. If the benchmark exits without
-    writing a result file, ``result_omni_template.json`` is used as a fallback.
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` stores the
+    sweep-resolved baseline (when ``baseline_config`` is provided). Hardware-nested
+    maps keep every hardware bucket, but each metric is reduced to the value for
+    this concurrency / request-rate step. If the benchmark exits without writing a
+    result file, ``result_omni_template.json`` is used as a fallback.
     """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
@@ -649,8 +727,11 @@ def run_benchmark(
             result = json.load(f)
 
     if baseline_config:
-        # Persist the JSON baseline as-is (no hardware / sweep resolution).
-        result["baseline"] = copy.deepcopy(baseline_config)
+        # Keep every hardware bucket; resolve list metrics to this sweep step.
+        result["baseline"] = resolve_baseline_for_sweep(
+            baseline_config,
+            sweep_index=sweep_index,
+        )
     else:
         result["baseline"] = {}
     if random_input_len is not None:
@@ -670,4 +751,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=None,
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )
+    parser.addoption(
+        "--assert-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
+            "(default: off)."
+        ),
     )
