@@ -73,10 +73,15 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
 
     client = Client()
 
-    await client.configure("openbmb/MiniCPM-o-4_5", timeout_s=1)
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        idle_timeout_s=900,
+        timeout_s=1,
+    )
 
     session = client.sent[0]["session"]
     assert "ref_audio" not in session
+    assert session["idle_timeout_s"] == 900
 
 
 @pytest.mark.asyncio
@@ -100,6 +105,7 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
     session = client.sent[0]["session"]
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert "idle_timeout_s" not in session
 
 
 @pytest.mark.asyncio

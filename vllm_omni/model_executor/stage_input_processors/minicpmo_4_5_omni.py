@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -32,6 +33,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     llm_output_text_utf8: torch.Tensor | None = None
     duplex_turn_id: int | None = None
     duplex_epoch: int | None = None
+    duplex_input_seq: int | None = None
     segment_end: bool | None = None
     turn_end: bool | None = None
     tts_is_last_chunk: bool | None = None
@@ -219,6 +221,7 @@ def tts2code2wav_async_chunk(
     native_duplex = bool(_coerce_int(output_meta.get("native_duplex")))
     duplex_epoch = _coerce_int(output_meta.get("duplex_epoch"))
     duplex_turn_id = _coerce_int(output_meta.get("duplex_turn_id"))
+    duplex_input_seq = _coerce_int(output_meta.get("duplex_input_seq"))
     segment_text_utf8 = output_meta.get("llm_output_text_utf8")
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
@@ -260,7 +263,14 @@ def tts2code2wav_async_chunk(
         return None
 
     if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
-        return None
+        # The connector still emits a control-only segment boundary when the
+        # terminal payload was already sent. Mark that boundary as a complete
+        # snapshot so the receiver clears, rather than replays, the previous
+        # terminal Code2Wav payload.
+        return OmniPayloadStruct(
+            meta=_MiniCPMO45MetaStruct(replace_runtime_additional_information=True),
+            request_id=request_id,
+        )
 
     state = container.get(_MINICPMO45_ASYNC_STATE)
     if not isinstance(state, dict):
@@ -370,9 +380,11 @@ def tts2code2wav_async_chunk(
             req_id=[request_id],
             duplex_epoch=duplex_epoch,
             duplex_turn_id=duplex_turn_id,
+            duplex_input_seq=duplex_input_seq,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
+            replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
@@ -432,6 +444,7 @@ def tts2code2wav_full_payload(
             finished=finished,
             req_id=[request_id],
             ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
+            replace_runtime_additional_information=True,
             native_duplex_segment_text=(
                 str(meta_info["native_duplex_segment_text"])
                 if isinstance(meta_info.get("native_duplex_segment_text"), str)
@@ -439,6 +452,7 @@ def tts2code2wav_full_payload(
             ),
             duplex_turn_id=_coerce_int(duplex_info.get("model_turn_id", duplex_info.get("turn_id"))),
             duplex_epoch=_coerce_int(duplex_info.get("epoch")),
+            duplex_input_seq=_coerce_int(duplex_info.get("input_seq", duplex_info.get("seq"))),
             segment_end=bool(meta_info.get("segment_end", False)),
             turn_end=bool(meta_info.get("turn_end", False)),
             tts_is_last_chunk=True,
@@ -625,7 +639,10 @@ def _native_duplex_segment_output_ids(
     return segment_ids, segment_text, turn_start
 
 
-def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
+def _native_duplex_data_plane_metadata(
+    streaming_context,
+    mm_output: Mapping[str, object] | None = None,
+) -> dict[str, object] | None:
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
         return None
@@ -646,6 +663,17 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id"))
     if isinstance(turn_id, int):
         metadata["turn_id"] = turn_id
+    mm_meta = mm_output.get("meta") if isinstance(mm_output, Mapping) else None
+    if isinstance(mm_meta, Mapping):
+        input_seq = _coerce_int(mm_meta.get("duplex_input_seq"))
+        output_epoch = _coerce_int(mm_meta.get("duplex_epoch"))
+        output_turn_id = _coerce_int(mm_meta.get("duplex_turn_id"))
+        if input_seq is not None:
+            metadata["input_seq"] = input_seq
+        if output_epoch is not None:
+            metadata["epoch"] = output_epoch
+        if output_turn_id is not None:
+            metadata["turn_id"] = output_turn_id
     session_config = duplex_state.get("session_config")
     if isinstance(session_config, dict):
         metadata["session_config"] = dict(session_config)
@@ -905,7 +933,7 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             meta = model_intermediate_buffer.setdefault("meta", {})
-            data_plane_metadata = _native_duplex_data_plane_metadata(_streaming_context)
+            data_plane_metadata = _native_duplex_data_plane_metadata(_streaming_context, mm_output)
             if data_plane_metadata is not None:
                 model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
@@ -948,6 +976,8 @@ def llm2tts(
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
+            if is_native_duplex_handoff:
+                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
             if not is_native_duplex_handoff or native_turn_start:

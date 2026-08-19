@@ -6,7 +6,10 @@
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 session_mode: duplex
-active_stream_window: 1
+# Keep the connector admission window aligned with the declared duplex
+# Session and per-stage sequence capacity. A smaller global window serializes
+# downstream Talker/Code2Wav work and can starve the second live Session.
+active_stream_window: 2
 duplex_session:
   idle_ttl_s: 300
   disconnect_grace_s: 30

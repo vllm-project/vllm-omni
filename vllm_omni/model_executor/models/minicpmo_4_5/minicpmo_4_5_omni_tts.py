@@ -27,6 +27,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -45,7 +46,6 @@ _CODEC_TOP_K = 25
 _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
-_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 
 
 @dataclass(slots=True)
@@ -360,8 +360,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 bool(meta.get("turn_start", False)) or bool(meta.get("turn_end", False))
             )
             if native_duplex:
-                max_tokens = _DUPLEX_CODEC_TOKENS_PER_CHUNK
-                min_tokens = 0 if duplex_boundary else _DUPLEX_CODEC_TOKENS_PER_CHUNK
+                max_tokens = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                min_tokens = 0 if duplex_boundary else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
             else:
                 max_tokens = _max_audio_tokens(int(token_ids.numel()))
                 min_tokens = self._codec_min_tokens
@@ -502,6 +502,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
+        duplex_input_seqs: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
@@ -517,6 +518,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     duplex_info = {}
                 epoch = duplex_info.get("epoch", -1)
                 turn_id = duplex_info.get("turn_id", -1)
+                input_seq = duplex_info.get("input_seq", -1)
                 if native_duplex and not all(
                     isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
                 ):
@@ -544,6 +546,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                duplex_input_seqs.append(
+                    torch.tensor(input_seq if isinstance(input_seq, int) else -1, dtype=torch.long)
+                )
                 segment_texts_utf8.append(
                     torch.tensor(
                         list(segment_text.encode("utf-8")),
@@ -655,6 +660,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "native_duplex": native_duplex_flags,
                     "duplex_epoch": duplex_epochs,
                     "duplex_turn_id": duplex_turn_ids,
+                    "duplex_input_seq": duplex_input_seqs,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                 }

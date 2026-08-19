@@ -507,6 +507,9 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [101, 102],
                     "special_token_ids": {"listen_token_id": 701},
+                    "epoch": 3,
+                    "seq": 11,
+                    "turn_id": 7,
                 },
             },
             {
@@ -514,6 +517,10 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                 "duplex": {
                     "duplex_prompt_token_ids": [201, 202, 203],
                     "special_token_ids": {"listen_token_id": 702},
+                    "epoch": 4,
+                    "seq": 12,
+                    "input_seq": 9,
+                    "turn_id": 8,
                 },
             },
         ],
@@ -521,10 +528,13 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
 
     prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
     listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
+    input_seq_rows = output.multimodal_outputs["meta"]["duplex_input_seq"]
     assert to_payload_element(prompt_rows, 0, 0, 2) == [101, 102]
     assert to_payload_element(prompt_rows, 1, 2, 4) == [201, 202, 203]
     assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
     assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+    assert int(to_payload_element(input_seq_rows, 0, 0, 2).reshape(-1)[0]) == 11
+    assert int(to_payload_element(input_seq_rows, 1, 2, 4).reshape(-1)[0]) == 9
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():

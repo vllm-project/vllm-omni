@@ -329,7 +329,7 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         {
             "request_id": "req-a",
             "native_duplex": True,
-            "duplex": {"epoch": 3, "turn_id": 7},
+            "duplex": {"epoch": 3, "turn_id": 7, "input_seq": 11},
             "ids": {"tts": [41]},
             "meta": {
                 "native_duplex_segment_text": "first",
@@ -340,7 +340,7 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         {
             "request_id": "req-b",
             "native_duplex": True,
-            "duplex": {"epoch": 4, "turn_id": 8},
+            "duplex": {"epoch": 4, "turn_id": 8, "input_seq": 12},
             "ids": {"tts": [42, 99]},
             "meta": {
                 "native_duplex_segment_text": "second",
@@ -360,6 +360,7 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
     assert [value.item() for value in meta["native_duplex"]] == [True, True]
     assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
     assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
+    assert [value.item() for value in meta["duplex_input_seq"]] == [11, 12]
     assert "native_duplex_segment_text" not in meta
     assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
         "first",

@@ -157,3 +157,15 @@ def test_finish_requests_leaves_healthy_running_intact(
     )
 
     assert scheduler.running == [alive]
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
+def test_finish_requests_does_not_reopen_off_queue_deferred_free_terminal(scheduler_cls) -> None:
+    terminal = _StubRequest("req-deferred-free", RequestStatus.FINISHED_STOPPED)
+    terminal.resumable = True
+    scheduler = _make_scheduler(scheduler_cls, requests={terminal.request_id: terminal}, running=[], waiting=[])
+    scheduler._free_request = lambda *args, **kwargs: pytest.fail("off-queue request was freed")
+
+    assert scheduler_cls.finish_requests(scheduler, [terminal.request_id], RequestStatus.FINISHED_ABORTED) == []
+    assert scheduler.requests == {terminal.request_id: terminal}
+    assert terminal.status == RequestStatus.FINISHED_STOPPED

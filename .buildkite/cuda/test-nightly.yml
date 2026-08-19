@@ -19,9 +19,10 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
-        timeout_in_minutes: 50
+        timeout_in_minutes: 120
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and omni" --run-level "full_model"
+          - export VLLM_OMNI_RUN_OMNIINTERACT_E2E=1
+          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py 'tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_minicpmo_4_5_omniinteract_e2e' -m "full_model and cuda and H100 and omni" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Doc Test with L4"

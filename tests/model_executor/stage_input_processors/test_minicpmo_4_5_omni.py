@@ -111,6 +111,7 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
                 "chunk_eos_token_id": 9308,
                 "chunk_tts_eos_token_id": 9309,
                 "turn_eos_token_id": 9310,
+                "duplex_input_seq": 11,
             },
         },
     )
@@ -135,6 +136,7 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
+    assert info["duplex"]["input_seq"] == 11
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:

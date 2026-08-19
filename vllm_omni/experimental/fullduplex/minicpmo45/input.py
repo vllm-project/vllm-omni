@@ -223,6 +223,10 @@ class MiniCPMO45PcmAppendBuffer:
         flush: bool = False,
         allow_emit: bool = True,
     ) -> MiniCPMO45PcmAppendReservation | None:
+        # Serving adds this field only to internal silence continuations.
+        # Never let a client choose which accepted input a model output ACKs.
+        payload = dict(payload)
+        payload.pop("duplex_origin_input_seq", None)
         fmt = payload.get("format")
         sample_rate_hz = payload.get("sample_rate_hz")
         audio = payload.get("audio")

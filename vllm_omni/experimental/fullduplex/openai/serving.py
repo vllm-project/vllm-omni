@@ -1259,13 +1259,14 @@ class OmniDuplexSessionHandler(
             session.register_history_item(realtime_item_id, committed.message)
         return committed
 
-    @staticmethod
     def _native_audio_committed_payload(
+        self,
         session: DuplexSession,
         *,
         committed: DuplexCommittedInput | None = None,
         realtime_item_id: object | None = None,
         transcript: object | None = None,
+        include_accepted_input_watermark: bool = False,
     ) -> dict[str, object]:
         message = committed.message if committed is not None else None
         if not isinstance(message, dict):
@@ -1292,6 +1293,12 @@ class OmniDuplexSessionHandler(
             payload["transcript"] = transcript
         if isinstance(realtime_item_id, str) and realtime_item_id:
             payload["realtime_item_id"] = realtime_item_id
+        if include_accepted_input_watermark:
+            accepted_input_seq = self._runtime_session_state(session).accepted_input_watermark(
+                epoch=int(payload["epoch"]),
+            )
+            if accepted_input_seq is not None:
+                payload["accepted_input_seq"] = accepted_input_seq
         return payload
 
     @staticmethod

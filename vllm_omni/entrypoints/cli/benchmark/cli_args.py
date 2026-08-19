@@ -186,8 +186,56 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("OmniInteract")
+    group.add_argument(
+        "--omniinteract-root",
+        default=None,
+        help="Local extracted OmniInteract data root (otherwise download from Hugging Face).",
+    )
+    group.add_argument(
+        "--omniinteract-subsets",
+        default="1q1a,1q1a_math,1qna",
+        help="Comma-separated dataset subsets.",
+    )
+    group.add_argument(
+        "--omniinteract-official-output-dir",
+        default=None,
+        help="Write official evaluator artifacts below this directory.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-ref-audio",
+        default=None,
+        help="Reference WAV for MiniCPM-o voice cloning.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-chunk-ms",
+        type=int,
+        default=200,
+        help="PCM append chunk size.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-video-fps",
+        type=float,
+        default=1.0,
+        help="Video frame sampling rate.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-timeout-s",
+        type=float,
+        default=900.0,
+        help="Per-session timeout.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-no-pace",
+        action="store_true",
+        help="Disable realtime pacing for load/debug runs.",
+    )
+
+
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "omniinteract",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -210,7 +258,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [choice for choice in ("openai-image-edits-omni",) if choice not in action.choices]
+                extra = [
+                    choice
+                    for choice in ("openai-image-edits-omni", "minicpmo-realtime")
+                    if choice not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 
@@ -254,6 +306,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

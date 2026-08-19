@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 
 import pytest
 import websockets
 
+from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
+    find_vllm_cli,
+    run_vllm_bench_subprocess,
+)
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     demo_args,
@@ -26,6 +31,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
+from vllm_omni.benchmarks.data_modules.omniinteract import OmniInteractConfig, OmniInteractDataset
 from vllm_omni.experimental.fullduplex.client import build_realtime_url
 
 pytestmark = pytest.mark.omni
@@ -174,3 +180,58 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str,
     for session in result["sessions"]:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
         _assert_session_metrics(session["session_metrics"], expected_count=1)
+
+
+@pytest.mark.full_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(os.environ.get("VLLM_OMNI_RUN_OMNIINTERACT_E2E") != "1", reason="enable real OmniInteract E2E")
+@pytest.mark.parametrize("subset", ("1q1a", "1q1a_math", "1qna"))
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_minicpmo_4_5_omniinteract_e2e(
+    omni_server,
+    model_prefix: str,
+    tmp_path: Path,
+    subset: str,
+) -> None:
+    local = os.environ.get("OMNIINTERACT_ROOT", "").strip()
+    root = Path(local).expanduser() if local else None
+    if root:
+        try:
+            OmniInteractDataset(None, data_root=str(root), subsets=[subset], config=OmniInteractConfig())
+        except (FileNotFoundError, ValueError):
+            root = None
+
+    source = ["--omniinteract-root", str(root.resolve())] if root else ["--dataset-path", "lucky-lance/OmniInteract"]
+    output = tmp_path / "omniinteract"
+    run_vllm_bench_subprocess(
+        find_vllm_cli(),
+        [
+            "bench",
+            "serve",
+            "--omni",
+            "--trust-remote-code",
+            f"--host={omni_server.host}",
+            f"--port={omni_server.port}",
+            "--backend=minicpmo-realtime",
+            "--endpoint=/v1/realtime",
+            f"--model={omni_server.model}",
+            "--dataset-name=omniinteract",
+            *source,
+            f"--omniinteract-subsets={subset}",
+            f"--omniinteract-realtime-ref-audio={resolve_ref_audio(model_prefix)}",
+            f"--omniinteract-official-output-dir={output}",
+            "--num-warmups=0",
+            "--num-prompts=4",
+            "--max-concurrency=2",
+            "--no-oversample",
+            "--disable-shuffle",
+        ],
+    )
+    summary = json.loads((output / "batch_summary.json").read_text())
+    assert (summary["total"], summary["success"], summary["failed"]) == (4, 4, 0)
+    for result in summary["results"]:
+        assert result["input_audio_chunks"] > 0 and result["input_video_frames"] > 0
+        sample = Path(result["output_dir"])
+        assert all((sample / name).is_file() for name in (".done", "output.wav", "wav_transcript.json"))
+        assert json.loads((sample / "wav_transcript.json").read_text())["chunks"]
+    assert len((output / "official_eval_manifest.jsonl").read_text().splitlines()) == 4

@@ -17,12 +17,24 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _is_omniinteract_dataset,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (SimpleNamespace(dataset_name="omniinteract"), True),
+        (SimpleNamespace(dataset_name="random", omniinteract_root="/tmp/OmniInteract"), False),
+    ],
+)
+def test_omniinteract_root_does_not_override_dataset_selection(args, expected):
+    assert _is_omniinteract_dataset(args) is expected
 
 
 class MockResponse:

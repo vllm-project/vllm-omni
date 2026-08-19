@@ -520,6 +520,7 @@ def test_update_additional_information_deserializes_new_request_payload():
     from vllm_omni.engine.serialization import serialize_additional_information
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
     conditioning = {
         "tts_token_ids": torch.tensor([1, 2]),
         "tts_hidden_states": torch.ones(2, 4),
@@ -528,6 +529,7 @@ def test_update_additional_information_deserializes_new_request_payload():
         scheduled_new_reqs=[
             SimpleNamespace(
                 req_id="r1",
+                model_intermediate_buffer={},
                 additional_information=serialize_additional_information(conditioning),
             )
         ],
@@ -541,6 +543,53 @@ def test_update_additional_information_deserializes_new_request_payload():
         runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
         conditioning["tts_hidden_states"],
     )
+
+
+def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    terminal = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    peer = {
+        "codes": {"audio": torch.tensor([9])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 1, "last_chunk": False},
+    }
+    runner.model_intermediate_buffer.update(r1=terminal, r2=peer)
+    marker = {
+        "meta": {
+            "finished": False,
+            "is_segment_finished": True,
+            "request_finished": False,
+        }
+    }
+    new_req = SimpleNamespace(
+        req_id="r1",
+        model_intermediate_buffer=marker,
+        additional_information=serialize_additional_information(terminal),
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[new_req],
+            scheduled_cached_reqs=SimpleNamespace(),
+        ),
+    )
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert "codes" not in info
+    assert info["meta"] == {
+        **marker["meta"],
+        "num_processed_tokens": 0,
+        "resumable": True,
+    }
+    assert runner.requests["r1"].additional_information_cpu == info
+    assert runner.model_intermediate_buffer["r2"] == peer
 
 
 def test_update_intermediate_buffer_skips_empty_update():
@@ -565,7 +614,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.model_intermediate_buffer["r1"] = {
         "duplex": {
-            "session_id": "sid",
+            "input_seq": 1,
             "seq": 1,
         }
     }
@@ -573,7 +622,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     new_req_data = SimpleNamespace(
         model_intermediate_buffer={
             "duplex": {
-                "session_id": "sid",
+                "input_seq": 2,
                 "seq": 2,
                 "payload": {"type": "audio"},
             }
@@ -584,7 +633,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req_data, "r1")
 
     info = runner.model_intermediate_buffer["r1"]
-    assert info["duplex"]["session_id"] == "sid"
+    assert info["duplex"]["input_seq"] == 2
     assert info["duplex"]["seq"] == 2
     assert info["duplex"]["payload"] == {"type": "audio"}
     assert runner.requests["r1"].additional_information_cpu is info

@@ -284,6 +284,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         {
             "duplex_epoch": 3,
             "duplex_turn_id": 7,
+            "duplex_input_seq": 11,
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
@@ -309,6 +310,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "meta" not in payload
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert payload["meta.duplex_input_seq"][0].item() == 11
     torch.testing.assert_close(
         payload["meta.llm_output_text_utf8"][0],
         segment_text_utf8,

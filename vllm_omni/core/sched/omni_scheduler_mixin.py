@@ -149,6 +149,9 @@ class OmniSchedulerMixin:
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(session.external_req_id, None)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
@@ -654,11 +657,22 @@ class OmniSchedulerMixin:
 
         for rid in ids_to_align:
             req = self.requests.get(rid)
-            if req is None or req.is_finished():
+            if req is None:
+                continue
+            # A persistent Session may be closed after its current segment
+            # reached FINISHED_STOPPED but while it is still owned by a live
+            # scheduler/connector queue. vLLM skips already-finished requests
+            # in finish_requests(), leaking the KV and worker slot. Only
+            # recover requests with positive queue ownership; an off-queue
+            # terminal can legitimately be waiting for deferred block free.
+            resumable_segment_stop = bool(
+                getattr(req, "resumable", False) and req.status == RequestStatus.FINISHED_STOPPED
+            )
+            if req.is_finished() and not resumable_segment_stop:
                 continue
             if rid in running_ids and req.status != RequestStatus.RUNNING:
                 req.status = RequestStatus.RUNNING
-            elif rid in waiting_ids and req.status == RequestStatus.RUNNING:
+            elif rid in waiting_ids and (req.status == RequestStatus.RUNNING or resumable_segment_stop):
                 req.status = RequestStatus.WAITING
 
     def _purge_finished_from_running(self) -> None:

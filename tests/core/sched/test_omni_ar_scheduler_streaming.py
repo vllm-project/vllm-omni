@@ -251,11 +251,12 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
 
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
+    session = _make_request()
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=False,
         segment_finished_requests=set(),
+        requests_num_chunks_sent={session.external_req_id: 59},
     )
-    session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = _make_update([10, 20])
     update.additional_information = {
@@ -276,29 +277,33 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
         "meta": {"turn_eos_token_id": 99},
     }
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
 
 
 def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
+    session = _make_request()
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=False,
         segment_finished_requests=set(),
+        requests_num_chunks_sent={session.external_req_id: 4064},
+        _max_model_len=4096,
     )
-    session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    session.prompt_token_ids = [0] * 59
+    session.prompt_token_ids = [0] * 4064
     session._all_token_ids.clear()
     session._all_token_ids.extend(session.prompt_token_ids)
-    session.num_prompt_tokens = 59
-    session.num_computed_tokens = 59
+    session.num_prompt_tokens = 4064
+    session.num_computed_tokens = 4064
     update = _make_update([0] * 10)
     update.additional_information = None
     update.model_intermediate_buffer = {
+        "native_duplex": True,
         "ids": {"tts": list(range(8))},
         "hidden_states": {"tts": [[0.0]] * 8},
         "meta": {
-            "replace_streaming_prompt": True,
             "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
         },
     }
 
@@ -311,3 +316,4 @@ def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}

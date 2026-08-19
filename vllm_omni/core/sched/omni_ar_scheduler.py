@@ -19,6 +19,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.distributed.omni_connectors.adapter import should_replace_next_stage_streaming_prompt
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
@@ -672,10 +673,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             getattr(update, "model_intermediate_buffer", None),
             getattr(update, "additional_information", None),
         )
+        max_model_len = getattr(self.chunk_transfer_adapter, "_max_model_len", None)
         replace_streaming_prompt = any(
             isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
+            and should_replace_next_stage_streaming_prompt(info, session, max_model_len=max_model_len)
             for info in update_infos
         )
         if replace_streaming_prompt:

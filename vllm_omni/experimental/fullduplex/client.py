@@ -418,6 +418,7 @@ class RealtimeDuplexClient:
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
+        idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session_extra_body = dict(extra_body or {})
@@ -453,6 +454,8 @@ class RealtimeDuplexClient:
             extra_body["duplex_initial_user_text"] = initial_user_text
         if session_id:
             session["session_id"] = session_id
+        if idle_timeout_s is not None:
+            session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
         await wait_for(
             lambda: self.events.count("session.created") > 0,

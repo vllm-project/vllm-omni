@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as BinasciiError
+from collections.abc import Mapping
 from typing import Any
 
 from vllm.sampling_params import SamplingParams
@@ -135,29 +136,36 @@ def build_duplex_data_plane_prompt(
         and payload.get("force_listen") is not True
     ):
         payload = {**payload, "force_listen": True}
+    duplex_info: dict[str, Any] = {
+        "fence": fence,
+        "session_id": fence.session_id,
+        "incarnation": fence.incarnation,
+        "epoch": fence.epoch,
+        "seq": seq,
+        "input_seq": seq,
+        "turn_id": fence.turn_id,
+        "response_seq": fence.response_seq,
+        "turn_seq": turn_seq,
+        "mode": mode.value,
+        "payload": payload,
+        "final": final,
+        "data_plane": True,
+        "session_config": dict(session_config),
+        "runtime_config": dict(runtime_config),
+        "scheduler_token_budget": token_budget,
+        "scheduler_token_id": token_id,
+    }
+    origin_input_seq = payload.get("duplex_origin_input_seq") if isinstance(payload, dict) else None
+    if isinstance(origin_input_seq, int) and not isinstance(origin_input_seq, bool) and origin_input_seq > 0:
+        # Serving adds this field only to internal silence continuations. Keep the
+        # control sequence separate while attributing its model decision to the user input.
+        duplex_info["input_seq"] = origin_input_seq
     return {
         "prompt_token_ids": [token_id] * token_budget,
         "model_intermediate_buffer": {
             "request_id": request_id,
             "global_request_id": [fence.session_id],
-            "duplex": {
-                "fence": fence,
-                "session_id": fence.session_id,
-                "incarnation": fence.incarnation,
-                "epoch": fence.epoch,
-                "seq": seq,
-                "turn_id": fence.turn_id,
-                "response_seq": fence.response_seq,
-                "turn_seq": turn_seq,
-                "mode": mode.value,
-                "payload": payload,
-                "final": final,
-                "data_plane": True,
-                "session_config": dict(session_config),
-                "runtime_config": dict(runtime_config),
-                "scheduler_token_budget": token_budget,
-                "scheduler_token_id": token_id,
-            },
+            "duplex": duplex_info,
         },
     }
 
@@ -197,10 +205,10 @@ def _first_completion(output: object) -> object | None:
 
 def _multimodal_output(output: object, completion: object | None) -> dict[str, Any]:
     metadata = getattr(output, "multimodal_output", None)
-    if isinstance(metadata, dict):
-        return metadata
+    if isinstance(metadata, Mapping):
+        return dict(metadata)
     metadata = getattr(completion, "multimodal_output", None) if completion is not None else None
-    return metadata if isinstance(metadata, dict) else {}
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
 def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:

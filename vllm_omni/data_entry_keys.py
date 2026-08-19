@@ -74,6 +74,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
+    next_stage_generation_tokens: int
     replace_streaming_prompt: bool
     ar_width: int
     eol_token_id: int
@@ -174,7 +175,9 @@ class MetaStruct(_StructBase):
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
+    next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
+    replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None

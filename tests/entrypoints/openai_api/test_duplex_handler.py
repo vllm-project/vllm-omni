@@ -47,6 +47,7 @@ from vllm_omni.experimental.fullduplex.openai.serving import (
 from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
 from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,6 +63,30 @@ def test_native_input_append_supports_explicit_session_opt_out():
 
     session.config.extra_body["minicpmo45_native_duplex"] = False
     assert OmniDuplexSessionHandler._uses_native_input_append(session) is False
+
+
+def test_accepted_input_seq_reads_only_control_result_contract_paths():
+    assert OmniDuplexSessionHandler._accepted_input_seq({"accepted_input_seq": 3}) == 3
+    assert (
+        OmniDuplexSessionHandler._accepted_input_seq({"stage_results": [{"result": {"supported": True, "seq": 7}}]})
+        == 7
+    )
+    assert (
+        OmniDuplexSessionHandler._accepted_input_seq({"data_plane_outputs": [{"metadata": {"accepted_input_seq": 99}}]})
+        is None
+    )
+
+
+def test_cancelled_acceptance_preserves_other_deferred_processed_identity():
+    state = MiniCPMO45ServingSessionState()
+    state.begin_input_acceptance()
+    assert state.defer_input_processed(epoch=0, seq=2, outcome="listen", response_id=None)
+
+    state.cancel_input_acceptance()
+    assert state.input_acceptances_inflight == 0
+    state.begin_input_acceptance()
+    assert state.record_accepted_input(epoch=0, seq=2, model_turn_id=0) == ("listen", None)
+    assert state.deferred_processed_inputs == {}
 
 
 class _ModelConfig:
@@ -1414,6 +1439,24 @@ def _install_direct_silence_scheduler(
     native.silence_continuation_scheduler = _schedule
 
 
+def _capture_pending_continuations(
+    handler: OmniDuplexSessionHandler,
+    session: DuplexSession,
+    *accepted: tuple[int, int],
+) -> list[dict[str, object]]:
+    native = handler._minicpmo_session_state(session)
+    for seq, turn_id in accepted:
+        native.record_accepted_input(epoch=session.epoch, seq=seq, model_turn_id=turn_id)
+    captured: list[dict[str, object]] = []
+
+    async def _schedule(payload: dict[str, object], **_kwargs: object) -> bool:
+        captured.append(payload)
+        return True
+
+    native.silence_continuation_scheduler = _schedule
+    return captured
+
+
 def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
     buffer = MiniCPMO45PcmAppendBuffer()
     payload = _native_audio_payload(samples=8000)
@@ -1443,57 +1486,6 @@ def test_minicpmo_pcm_append_buffer_drops_serving_new_user_turn_marker():
     assert "new_user_turn" not in emitted
     assert "new_user_turn_prefix_variant" not in emitted
     assert "force_speak" not in emitted
-
-
-def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
-    first = _native_audio_payload(samples=8000)
-    second = _native_audio_payload(samples=8000, value=0.0, is_speech=False)
-
-    merged = OmniDuplexSessionHandler._merge_native_audio_payloads(first, second)
-
-    assert merged["is_speech"] is True
-
-
-def test_minicpmo_merge_drops_serving_new_user_turn_marker():
-    first = _native_audio_payload(samples=8000)
-    first.update(
-        new_user_turn=True,
-        new_user_turn_prefix_variant="clean_response_done",
-        force_speak=True,
-    )
-    second = _native_audio_payload(samples=8000, is_speech=False)
-
-    merged = OmniDuplexSessionHandler._merge_native_audio_payloads(first, second)
-
-    assert merged["is_speech"] is True
-    assert "new_user_turn" not in merged
-    assert "new_user_turn_prefix_variant" not in merged
-    assert "force_speak" not in merged
-
-
-@pytest.mark.asyncio
-async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task():
-    async def _pending() -> bool:
-        await asyncio.sleep(3600)
-        return True
-
-    native = MiniCPMO45ServingSessionState()
-    task = asyncio.create_task(_pending())
-    native.continuation_owner_id = "owner"
-    native.continuation_units = 1
-    native.pending_silence_task = task
-    native.pending_silence_owner_id = "owner"
-
-    native.clear_continuation()
-
-    assert native.continuation_owner_id is None
-    assert native.continuation_units == 0
-    assert native.pending_silence_task is None
-    assert native.pending_silence_owner_id is None
-    assert not task.cancelled()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
 
 def test_auto_response_playback_overlap_keeps_model_owned_listen_speak_decision():
@@ -2139,10 +2131,19 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
 
 
 def test_direct_listen_decision_survives_inner_completion_metadata():
+    raw_metadata = MultimodalPayload(
+        metadata={
+            "meta": {
+                "duplex_epoch": 0,
+                "duplex_input_seq": 7,
+                "duplex_turn_id": 2,
+            }
+        }
+    )
     inner_output = SimpleNamespace(
         outputs=[
             SimpleNamespace(
-                multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+                multimodal_output=raw_metadata,
             )
         ]
     )
@@ -2151,7 +2152,10 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
         final_stage_id=1,
         segment_finished=True,
         segment_token_ids=(151705,),
-        segment_output_metadata={"special_token_ids": {"listen_token_id": 151705}},
+        segment_output_metadata={
+            **dict(raw_metadata),
+            "special_token_ids": {"listen_token_id": 151705},
+        },
         output=inner_output,
     )
     assert decision is not None
@@ -2182,6 +2186,8 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
     assert results[0]["is_listen"] is True
     assert results[0]["model_listen"] is True
     assert results[0]["listen_source"] == "model_listen"
+    assert results[0]["input_seq"] == 7
+    assert results[0]["model_turn_id"] == 2
     assert results[0]["stage_metrics"] == output.metrics["stage_metrics"]
 
 
@@ -2389,6 +2395,7 @@ def test_duplex_data_plane_listen_preserves_model_turn_identity():
             "duplex_native_decision": "listen",
             "meta.duplex_turn_id": np.array([2], dtype=np.int32),
             "meta.duplex_epoch": np.array([0], dtype=np.int32),
+            "meta.duplex_input_seq": np.array([9], dtype=np.int32),
         },
     )
 
@@ -2397,6 +2404,7 @@ def test_duplex_data_plane_listen_preserves_model_turn_identity():
     assert len(results) == 1
     assert results[0]["is_listen"] is True
     assert results[0]["model_turn_id"] == 2
+    assert results[0]["input_seq"] == 9
 
 
 def test_duplex_data_plane_does_not_drop_future_model_turn_while_response_active():
@@ -2748,7 +2756,7 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
 
 @pytest.mark.asyncio
 async def test_native_append_propagates_current_turn_fence_to_engine():
-    engine = FakeEngineClient()
+    engine = FakeEngineClient(control_result={"ok": True, "stage_results": [{"result": {"supported": True, "seq": 7}}]})
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(
         session_id="sid-fenced-append",
@@ -2756,7 +2764,8 @@ async def test_native_append_propagates_current_turn_fence_to_engine():
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.turn_id = 2
-    session.begin_response(turn_id=2)
+    session.bind_request("duplex-sid-fenced-append-e0-stage0")
+    continuations = _capture_pending_continuations(handler, session)
     ws = TimedWebSocket()
 
     await handler._append_runtime_input(
@@ -2769,6 +2778,8 @@ async def test_native_append_propagates_current_turn_fence_to_engine():
     )
 
     assert engine.appended_fences == [DuplexFence("sid-fenced-append", epoch=0, turn_id=2)]
+    assert len(continuations) == 1
+    assert continuations[0]["duplex_origin_input_seq"] == 7
 
 
 @pytest.mark.asyncio
@@ -2922,7 +2933,7 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
+async def test_minicpmo_auto_response_continuation_uses_large_safety_cap():
     request_id = "duplex-sid-long-response-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
@@ -2938,7 +2949,7 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
     _install_direct_silence_scheduler(handler, session)
     ws = TimedWebSocket()
 
-    for _ in range(9):
+    for _ in range(handler._NATIVE_AUTO_RESPONSE_FORCE_LISTEN_UNITS):
         await handler._maybe_continue_native_response(
             ws.send_json,
             session=session,
@@ -2946,24 +2957,28 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
         )
     await asyncio.sleep(0.02)
 
-    assert len(engine.appended) == 9
+    assert len(engine.appended) == handler._NATIVE_AUTO_RESPONSE_FORCE_LISTEN_UNITS
     assert all(payload["duplex_turn_id"] == 0 for _, _, payload, _ in engine.appended)
-    assert all("force_speak" not in payload for _, _, payload, _ in engine.appended)
+    assert all(not {"force_speak", "force_listen"} & payload.keys() for _, _, payload, _ in engine.appended[:-1])
+    assert engine.appended[-1][2]["force_listen"] is True
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_pre_speak_listen_continues_same_response():
-    request_id = "duplex-sid-pre-speak-listen-e0-stage0"
+@pytest.mark.parametrize("audio_sent", (False, True), ids=("pre-speak", "post-speak"))
+async def test_minicpmo_auto_response_nonterminal_listen_continues_same_response(audio_sent: bool):
+    request_id = "duplex-sid-nonterminal-listen-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(
-        session_id="sid-pre-speak-listen",
+        session_id="sid-nonterminal-listen",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     response_id = session.begin_response(turn_id=0)
     session.turn_id = 1
     session.bind_request(request_id)
+    if audio_sent:
+        session.mark_audio_sent(100)
     _install_direct_silence_scheduler(handler, session)
     ws = TimedWebSocket()
 
@@ -3028,29 +3043,21 @@ async def test_minicpmo_auto_response_listen_before_response_keeps_resumable_req
     assert ws.sent_types().count("response.listen") == 1
 
 
-@pytest.mark.asyncio
-async def test_minicpmo_auto_response_listen_without_response_does_not_defer_commit():
-    session_id = "sid-listen-before-response-commit"
-    request_id = duplex_resource_request_id(DuplexFence(session_id), "stage0")
-    inner_output = SimpleNamespace(
-        outputs=[
-            SimpleNamespace(
-                multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
-            )
-        ]
-    )
+def _native_listen_append_result(session_id: str, request_id: str, seq: int) -> dict[str, object]:
+    metadata = MultimodalPayload(metadata={"meta": {"duplex_epoch": 0, "duplex_input_seq": seq, "duplex_turn_id": 0}})
+    inner = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output=metadata)])
     decision = MiniCPMO45DuplexRuntimeExtension().decide_output(
         stage_id=0,
         final_stage_id=1,
         segment_finished=True,
         segment_token_ids=(151705,),
-        segment_output_metadata={"special_token_ids": {"listen_token_id": 151705}},
-        output=inner_output,
+        segment_output_metadata={**dict(metadata), "special_token_ids": {"listen_token_id": 151705}},
+        output=inner,
     )
     assert decision is not None
     listen_output = attach_duplex_output_decision(
         OmniRequestOutput.from_stage_output(
-            inner_output,
+            inner,
             request_id=request_id,
             finished=True,
             stage_id=0,
@@ -3058,28 +3065,138 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
         ),
         decision,
     )
-    append_result = {
+    return {
         "operation": "append",
         "session_id": session_id,
         "ok": True,
-        "unsupported_count": 0,
-        "error_count": 0,
-        "stage_results": [
-            {
-                "stage_id": 0,
-                "replica_id": 0,
-                "result": {
-                    "supported": True,
-                    "implementation_level": "model_native_duplex",
-                    "data_plane_append": True,
-                    "request_id": request_id,
-                    "response_stage_id": 1,
-                },
-            }
-        ],
+        "stage_results": [{"result": {"supported": True, "data_plane_append": True, "seq": seq}}],
         "data_plane_outputs": [listen_output],
     }
-    engine = FakeEngineClient(append_result=append_result)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_emits_processed_watermark_when_output_precedes_append_result():
+    control_result = {
+        "operation": "append",
+        "ok": True,
+        "stage_results": [{"result": {"supported": True, "seq": 2}}],
+    }
+    engine = FakeEngineClient(control_result=control_result)
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-processed-before-accepted",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    ws = TimedWebSocket()
+    request_id = "duplex-sid-processed-before-accepted-stage0"
+    session.bind_request(request_id)
+    continuations = _capture_pending_continuations(handler, session)
+    native = handler._minicpmo_session_state(session)
+    native.record_accepted_input(epoch=0, seq=1, model_turn_id=0)
+    native.record_final_input(epoch=0, seq=1)
+    original_append = engine.append_duplex_input_async
+    listen = {
+        "supported": True,
+        "stage_role": "llm",
+        "is_listen": True,
+        "data_plane_request_id": request_id,
+        "input_seq": 2,
+        "end_of_turn": False,
+    }
+
+    async def output_before_append_result(session_id: str, **kwargs: Any):
+        await handler._send_one_native_duplex_event(
+            ws.send_json,
+            {**listen, "model_listen": False},
+            session=session,
+            expected_epoch=0,
+        )
+        assert "input.processed" not in ws.sent_types()
+        assert continuations == []
+        session.begin_response(turn_id=0)
+        session.mark_audio_sent(1)
+        await handler._send_one_native_duplex_event(
+            ws.send_json, {**listen, "model_listen": True}, session=session, expected_epoch=0
+        )
+        assert "input.processed" not in ws.sent_types()
+        kwargs.pop("expected_epoch", None)
+        return await original_append(session_id, **kwargs)
+
+    engine.append_duplex_input_async = output_before_append_result  # type: ignore[method-assign]
+
+    append_ok, _ = await handler._append_runtime_input(
+        session,
+        {"audio": "", "format": "pcm_f32le"},
+        final=True,
+        send_json=ws.send_json,
+        mode="append_audio_chunk",
+        expected_epoch=0,
+    )
+
+    assert append_ok is True
+    assert continuations == []
+    processed = [(e["processed_input_seq"], e["outcome"]) for e in ws.sent if e.get("type") == "input.processed"]
+    assert processed == [(2, "listen")]
+    assert handler._minicpmo_session_state(session).pending_input_identity(epoch=0) == (1, 0)
+    assert handler._minicpmo_session_state(session).final_input_identity(epoch=0) is None
+    assert "response.done" in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_acceptance_promotes_unresolved_input_after_turn_completion():
+    engine = FakeEngineClient(control_result={"ok": True, "stage_results": [{"result": {"supported": True, "seq": 1}}]})
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-accept-turn-race", config=DuplexSessionConfig(extra_body={"auto_response": True})
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(handler._native_stage0_request_id(session, 0))
+    continuations = _capture_pending_continuations(handler, session)
+    original_append = engine.append_duplex_input_async
+
+    async def complete_turn_before_ack(session_id: str, **kwargs: Any):
+        session.complete_model_turn(0)
+        kwargs.pop("expected_epoch", None)
+        return await original_append(session_id, **kwargs)
+
+    engine.append_duplex_input_async = complete_turn_before_ack  # type: ignore[method-assign]
+    send_json = TimedWebSocket().send_json
+    assert (await handler._append_runtime_input(session, {}, final=False, send_json=send_json))[0]
+    native = handler._minicpmo_session_state(session)
+    assert native.pending_input_identity(epoch=0) == (1, 1)
+    assert continuations == []
+    session.complete_model_turn(1)
+    await handler._continue_pending_native_input(send_json, session=session, expected_epoch=0, final_commit=True)
+    assert native.pending_input_identity(epoch=0) == (1, 2)
+    assert len(continuations) == 1
+    assert continuations[0]["duplex_turn_id"] == 2
+    assert continuations[0]["duplex_origin_input_seq"] == 1
+    assert native.final_input_identity(epoch=0) == 1
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_listen_without_response_does_not_defer_commit():
+    session_id = "sid-listen-before-response-commit"
+    request_id = duplex_resource_request_id(DuplexFence(session_id), "stage0")
+
+    class BlockingFinalAppendEngine(FakeEngineClient):
+        def __init__(self):
+            super().__init__(
+                append_results=[_native_listen_append_result(session_id, request_id, seq) for seq in (1, 2)]
+            )
+            self.final_append_started = asyncio.Event()
+            self.release_final_append = asyncio.Event()
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            if kwargs.get("final") is True:
+                self.final_append_started.set()
+                await self.release_final_append.wait()
+            return result
+
+    engine = BlockingFinalAppendEngine()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
@@ -3121,7 +3238,11 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
         }
     )
 
-    await handler.handle_realtime_session(ws)
+    handler_task = asyncio.create_task(handler.handle_realtime_session(ws))
+    await asyncio.wait_for(engine.final_append_started.wait(), timeout=1)
+    assert "input_audio_buffer.committed" not in ws.sent_types()
+    engine.release_final_append.set()
+    await asyncio.wait_for(handler_task, timeout=2)
 
     committed = [event for event in ws.sent if event.get("type") == "input_audio_buffer.committed"]
     assert len(engine.appended) == 2
@@ -3129,6 +3250,9 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
     assert len(committed) == 1
     assert committed[0].get("event", {}).get("overlap_deferred") is not True
     assert committed[0].get("event", {}).get("response_create_deferred") is not True
+    assert committed[0]["accepted_input_seq"] == 2
+    processed = [event for event in ws.sent if event.get("type") == "input_audio_buffer.processed"]
+    assert [event["processed_input_seq"] for event in processed] == [1, 2]
     assert "response.created" not in ws.sent_types()
 
 
@@ -3200,21 +3324,41 @@ async def test_minicpmo_pcm_f32_residual_commit_releases_pending_input_bytes():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_post_speak_listen_continues_same_response():
-    request_id = "duplex-sid-post-speak-listen-e0-stage0"
+async def test_minicpmo_final_pending_listen_completes_active_response():
+    request_id = "duplex-sid-final-pending-listen-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(
-        session_id="sid-post-speak-listen",
+        session_id="sid-final-pending-listen",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
-    response_id = session.begin_response(turn_id=0)
-    session.turn_id = 1
+    response_id = session.begin_response(turn_id=3)
     session.bind_request(request_id)
-    session.mark_audio_sent(100)
-    _install_direct_silence_scheduler(handler, session)
+    native = handler._minicpmo_session_state(session)
+    native.record_accepted_input(epoch=0, seq=300, model_turn_id=4)
+    native.record_final_input(epoch=0, seq=300)
     ws = TimedWebSocket()
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "tts",
+            "is_listen": False,
+            "data_plane_request_id": request_id,
+            "text": "old answer",
+            "audio_data": "audio",
+            "audio_format": "pcm16",
+            "audio_duration_ms": 100,
+            "end_of_turn": False,
+            "model_turn_id": 3,
+            "input_seq": 300,
+        },
+        session=session,
+        expected_epoch=0,
+    )
+    assert native.pending_input_identity(epoch=0) is None
 
     await handler._send_one_native_duplex_event(
         ws.send_json,
@@ -3225,20 +3369,31 @@ async def test_minicpmo_auto_response_post_speak_listen_continues_same_response(
             "model_listen": True,
             "data_plane_request_id": request_id,
             "end_of_turn": False,
+            "model_turn_id": 3,
+            "input_seq": 300,
             "uses_model_runner_scheduler": True,
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",
         },
         session=session,
-        expected_epoch=session.epoch,
+        expected_epoch=0,
     )
-    await asyncio.sleep(0.01)
 
-    assert len(engine.appended) == 1
-    assert session.active_response_id == response_id
+    processed = next(event for event in ws.sent if event.get("type") == "input.processed")
+    assert processed == {
+        "type": "input.processed",
+        "session_id": session.session_id,
+        "epoch": 0,
+        "processed_input_seq": 300,
+        "outcome": "speak",
+        "response_id": response_id,
+    }
+    assert "response.listen" in ws.sent_types()
+    assert any(event.get("type") == "response.done" and event.get("response_id") == response_id for event in ws.sent)
+    assert session.active_response_id is None
     assert session.active_request_id == request_id
-    assert "response.listen" not in ws.sent_types()
-    assert "response.done" not in ws.sent_types()
+    assert session.history[-1] == {"role": "assistant", "content": "old answer"}
+    assert handler._minicpmo_data_plane.is_terminal(request_id)
 
 
 @pytest.mark.asyncio
@@ -3252,6 +3407,7 @@ async def test_minicpmo_auto_response_turn_end_preserves_resumable_request():
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.begin_response(turn_id=0)
     session.bind_request(request_id)
+    continuations = _capture_pending_continuations(handler, session, (6, 0), (7, 1))
     ws = TimedWebSocket()
 
     await handler._send_one_native_duplex_event(
@@ -3267,6 +3423,7 @@ async def test_minicpmo_auto_response_turn_end_preserves_resumable_request():
             "audio_duration_ms": 100,
             "end_of_turn": True,
             "model_turn_id": 0,
+            "input_seq": 6,
             "uses_model_runner_scheduler": True,
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",
@@ -3278,6 +3435,8 @@ async def test_minicpmo_auto_response_turn_end_preserves_resumable_request():
     assert session.active_response_id is None
     assert session.active_request_id == request_id
     assert "response.done" in ws.sent_types()
+    assert len(continuations) == 1
+    assert continuations[0]["duplex_origin_input_seq"] == 7
 
 
 @pytest.mark.asyncio
@@ -3290,6 +3449,7 @@ async def test_minicpmo_auto_response_empty_turn_end_emits_model_listen():
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.bind_request(request_id)
+    continuations = _capture_pending_continuations(handler, session, (6, 0), (7, 1))
     ws = TimedWebSocket()
 
     close_reason, emitted = await handler._send_one_native_duplex_event(
@@ -3305,6 +3465,7 @@ async def test_minicpmo_auto_response_empty_turn_end_emits_model_listen():
             "end_of_turn": True,
             "abort_data_plane_request": True,
             "model_turn_id": 0,
+            "input_seq": 6,
             "uses_model_runner_scheduler": True,
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",
@@ -3318,9 +3479,12 @@ async def test_minicpmo_auto_response_empty_turn_end_emits_model_listen():
     assert session.turn_id == 1
     assert session.active_request_id == request_id
     assert session.active_response_id is None
-    assert ws.sent_types() == ["response.listen"]
-    assert ws.sent[0]["model_listen"] is True
-    assert ws.sent[0]["reason"] == "model_turn_completed_without_output"
+    assert ws.sent_types() == ["input.processed", "response.listen"]
+    assert ws.sent[1]["model_listen"] is True
+    assert ws.sent[1]["reason"] == "model_turn_completed_without_output"
+    assert len(continuations) == 1
+    assert continuations[0]["duplex_turn_id"] == 1
+    assert continuations[0]["duplex_origin_input_seq"] == 7
 
 
 @pytest.mark.asyncio
@@ -3590,12 +3754,12 @@ async def test_minicpmo_native_duplex_session_close_cleans_auto_response_data_pl
 
     event = _native_session_create(session_id)
     event["session"]["extra_body"]["auto_response"] = True
+    event["session"]["idle_timeout_s"] = 3
     ws = TimedWebSocket()
     ws.put(event)
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
-
     assert not handler._minicpmo_data_plane.has_request(request_id)
     assert session_id not in handler._minicpmo_sessions
 
@@ -5347,6 +5511,7 @@ async def test_failed_final_append_keeps_committed_audio_for_response_retry():
     assert len(engine.appended) == 2
     assert engine.appended[0][2]["audio"] == engine.appended[1][2]["audio"]
     assert engine.append_operation_ids[0] == engine.append_operation_ids[1]
+    assert any(event.get("code") == "runtime_append_failed" for event in ws.sent)
 
 
 @pytest.mark.asyncio
@@ -5838,10 +6003,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
 ):
     request_id = "duplex-sid-native-late-output-e0-stage0"
     late_output = object()
-    engine = FakeEngineClient(
-        collect_outputs=[[], [], [], [late_output]],
-        collect_delay_s=0.05,
-    )
+    engine = FakeEngineClient(collect_outputs=[[], [], [], [late_output]], collect_delay_s=0.05)
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
@@ -5854,6 +6016,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
     session.capabilities = DuplexCapabilities.minicpmo45_native()
     session.bind_request(request_id)
     native = handler._minicpmo_session_state(session)
+    ws = TimedWebSocket()
     projected_batches: list[object] = []
     projected = asyncio.Event()
 
@@ -5878,7 +6041,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
 
     assert (
         await handler._start_native_data_plane_stream_task(
-            None,
+            ws.send_json,
             result,
             session=session,
             expected_epoch=session.epoch,
@@ -5891,7 +6054,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
 
     assert (
         await handler._start_native_data_plane_stream_task(
-            None,
+            ws.send_json,
             result,
             session=session,
             expected_epoch=session.epoch,
@@ -5903,6 +6066,87 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
 
     assert len(engine.collected) == 4
     assert projected_batches == [{"data_plane_outputs": [late_output]}]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_closing_session_is_not_restarted_after_continuation_wait(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    request_id = "duplex-sid-native-close-during-continuation-e0-stage0"
+    engine = FakeEngineClient(collect_outputs=[[], [], []])
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-native-close-during-continuation",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.record_accepted_input(epoch=0, seq=7, model_turn_id=0)
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+
+    async def blocked_continuation(payload: object, **kwargs: Any) -> bool:
+        continuation_started.set()
+        await release_continuation.wait()
+        if handler._native_silence_continuation_is_stale(
+            session,
+            request_id=kwargs["request_id"],
+            response_id=kwargs["response_id"],
+            response_owned=kwargs["response_owned"],
+            expected_epoch=kwargs["expected_epoch"],
+            expected_incarnation=kwargs["expected_incarnation"],
+            expected_model_turn_id=kwargs["expected_model_turn_id"],
+        ):
+            return False
+        append_ok, _ = await handler._append_runtime_input(
+            session,
+            payload,
+            final=False,
+            send_json=kwargs["send_json"],
+            mode="append_audio_chunk",
+            expected_epoch=kwargs["expected_epoch"],
+        )
+        return append_ok
+
+    native.silence_continuation_scheduler = blocked_continuation
+    monkeypatch.setattr(handler, "_runtime_control_timeout_s", lambda _session: 0.001)
+    result = {
+        "stage_results": [
+            {
+                "result": {
+                    "data_plane_append": True,
+                    "request_id": request_id,
+                    "response_stage_id": 1,
+                }
+            }
+        ]
+    }
+
+    assert await handler._start_native_data_plane_stream_task(
+        TimedWebSocket().send_json,
+        result,
+        session=session,
+        expected_epoch=0,
+    )
+    drain = native.data_plane_task
+    assert drain is not None
+    assert not await handler._start_native_data_plane_stream_task(
+        TimedWebSocket().send_json,
+        result,
+        session=session,
+        expected_epoch=0,
+    )
+    await asyncio.wait_for(continuation_started.wait(), timeout=1)
+
+    session.mark_closing()
+    release_continuation.set()
+    await asyncio.wait_for(drain, timeout=1)
+
+    assert session.active_request_id == request_id
+    assert native.data_plane_task is None
+    assert engine.appended == []
+    assert len(engine.collected) == 3
 
 
 @pytest.mark.asyncio
@@ -6051,22 +6295,24 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
 
 @pytest.mark.asyncio
 async def test_minicpmo_native_auto_response_commit_finalizes_after_streamed_full_chunk():
-    control_result = {
-        "operation": "append",
-        "session_id": "sid-native-auto-finalize",
-        "ok": True,
-        "unsupported_count": 0,
-        "error_count": 0,
-        "stage_results": [],
-    }
-    engine = FakeEngineClient(control_result=control_result)
+    session_id = "sid-native-auto-finalize"
+    request_id = f"duplex-{session_id}-stage0"
+    stage_result = {"supported": True, "data_plane_append": True, "seq": 1}
+    stage_result.update(request_id=request_id, response_stage_id=1)
+    first = {"ok": True, "stage_results": [{"result": stage_result}]}
+    engine = FakeEngineClient(append_results=[first, _native_listen_append_result(session_id, request_id, 1)])
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
         config_timeout_s=0.1,
         idle_timeout_s=1,
     )
-    ws = TimedWebSocket()
-    event = _native_session_create("sid-native-auto-finalize")
+
+    def close_on_listen(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") == "response.listen":
+            ws.put({"type": "session.close"})
+
+    ws = TimedWebSocket(on_send=close_on_listen, receive_timeout_s=3)
+    event = _native_session_create(session_id)
     event["session"]["extra_body"]["auto_response"] = True
     ws.put(event)
     ws.put(
@@ -6078,13 +6324,18 @@ async def test_minicpmo_native_auto_response_commit_finalizes_after_streamed_ful
         }
     )
     ws.put({"type": "input_audio_buffer.commit", "final": True})
-    ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
 
-    assert len(engine.appended) == 1
+    assert len(engine.appended) == 2
     assert engine.appended[0][3] is False
+    assert engine.appended[1][2]["duplex_origin_input_seq"] == 1
     assert "response.created" not in ws.sent_types()
+    committed = next(message for message in ws.sent if message.get("type") == "input.committed")
+    assert [committed[key] for key in ("session_id", "epoch", "accepted_input_seq")] == [session_id, 0, 1]
+    processed = next(message for message in ws.sent if message.get("type") == "input.processed")
+    keys = ("session_id", "epoch", "processed_input_seq", "outcome")
+    assert [processed[key] for key in keys] == [session_id, 0, 1, "listen"]
 
 
 @pytest.mark.asyncio

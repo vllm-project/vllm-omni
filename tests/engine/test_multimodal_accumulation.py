@@ -47,3 +47,14 @@ def test_chunk_accumulation_policy_replaces_snapshots_and_drains_delta_state():
     assert "meta.tts_is_last_chunk" not in merged
     assert "meta.turn_end" not in merged
     assert merged.metadata["meta.stable_request_value"] == "keep"
+
+
+def test_chunk_accumulation_replaces_duplex_input_seq_snapshot():
+    accumulated = MultimodalPayload.from_dict({"meta.duplex_input_seq": torch.tensor(7)})
+    incoming = MultimodalPayload.from_dict({"meta.duplex_input_seq": torch.tensor(8)})
+    assert accumulated is not None and incoming is not None
+    replace_snapshot_keys(accumulated, incoming)
+    merged = accumulated.merged_with(incoming)
+    assert merged.tensors["meta.duplex_input_seq"].item() == 8
+    drain_delta_payload(merged)
+    assert "meta.duplex_input_seq" not in merged

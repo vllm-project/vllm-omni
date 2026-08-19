@@ -216,13 +216,40 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     return sum_user_len + assistant_len
 
 
-def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> None:
+def should_replace_next_stage_streaming_prompt(
+    payload_data: dict[str, Any], request: Any, *, max_model_len: int | None = None
+) -> bool:
+    meta = payload_data.get("meta", {})
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("replace_streaming_prompt") is True:
+        return True
+    next_prompt_len = meta.get("next_stage_prompt_len")
+    next_generation_tokens = meta.get("next_stage_generation_tokens")
+    min_tokens = getattr(getattr(request, "sampling_params", None), "min_tokens", 0)
+    generation_reserve = max(
+        next_generation_tokens if isinstance(next_generation_tokens, int) else 0,
+        min_tokens if isinstance(min_tokens, int) else 0,
+    )
+    return (
+        payload_data.get("native_duplex") is True
+        and isinstance(max_model_len, int)
+        and max_model_len > 0
+        and isinstance(next_prompt_len, int)
+        and request.num_computed_tokens + next_prompt_len + generation_reserve > max_model_len
+    )
+
+
+def construct_next_stage_streaming_input_prompt(
+    payload_data: dict[str, Any], request: Any, *, max_model_len: int | None = None
+) -> bool:
     """Update a downstream streaming request prompt from connector payload ids.
 
     Async-chunk downstream stages are prewarmed before the real Talker prompt is
     known. When a Thinker payload carries ``ids.prompt``, this helper:
 
-    * Preserves ``num_computed_tokens`` (the scheduler token watermark).
+    * Preserves ``num_computed_tokens`` while extending the current prompt.
+      Explicit replacements and capacity rollovers reset it with the prompt.
     * Moves already-computed output tokens into ``prompt_token_ids``.
     * Appends a new placeholder prompt slice sized from the upstream ids.
     * Refreshes block hashes so the scheduler allocates KV slots for the
@@ -230,8 +257,8 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     """
     ids = payload_data.get("ids", {})
     meta = payload_data.get("meta", {})
-    replace_prompt = isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True
     next_stage_prompt_len = meta.get("next_stage_prompt_len") if isinstance(meta, dict) else None
+    replace_prompt = should_replace_next_stage_streaming_prompt(payload_data, request, max_model_len=max_model_len)
     if replace_prompt and isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer
@@ -244,10 +271,10 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
         request.num_computed_tokens = 0
         request.num_prompt_tokens = next_stage_prompt_len
         request.update_block_hashes()
-        return
+        return True
     prompt_token_ids = ids.get("prompt", None)
     if not prompt_token_ids:
-        return
+        return False
     num_computed_tokens = request.num_computed_tokens
     kept_output_tokens = request._all_token_ids[request.num_prompt_tokens : num_computed_tokens]
     del request._all_token_ids[num_computed_tokens:]
@@ -264,3 +291,4 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     request.prompt_token_ids.extend(new_prompt or ())
     request.update_block_hashes()
     request.num_prompt_tokens = len(request.prompt_token_ids)
+    return False

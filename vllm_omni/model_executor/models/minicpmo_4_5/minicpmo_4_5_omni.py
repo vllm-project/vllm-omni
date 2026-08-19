@@ -380,6 +380,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
+        update_result.update(
+            {
+                key: duplex[key]
+                for key in ("session_id", "incarnation", "epoch", "seq", "input_seq", "turn_id")
+                if key in duplex
+            }
+        )
         if result.get("success") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": update_result}
@@ -607,6 +614,30 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         ]
                         for key in sorted(special_keys)
                     }
+                duplex_meta = multimodal_outputs.setdefault("meta", {})
+                for output_key, input_key in (
+                    ("duplex_epoch", "epoch"),
+                    ("duplex_input_seq", "input_seq"),
+                    ("duplex_turn_id", "turn_id"),
+                ):
+                    duplex_meta[output_key] = [
+                        (
+                            torch.tensor(
+                                [int(value)],
+                                dtype=torch.long,
+                                device=text_hidden_states.device,
+                            )
+                            if isinstance(value, int) and not isinstance(value, bool)
+                            else None
+                        )
+                        for duplex_info in duplex_rows
+                        for value in [
+                            duplex_info.get(
+                                input_key,
+                                duplex_info.get("seq") if input_key == "input_seq" else None,
+                            )
+                        ]
+                    ]
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,

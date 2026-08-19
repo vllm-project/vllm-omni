@@ -188,6 +188,7 @@ def print_metrics(
     outputs: list[RequestFuncOutput] | None = None,
     selected_percentiles: list[float] | None = None,
     print_stage: bool = False,
+    continuous_session: bool = False,
 ):
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -204,9 +205,13 @@ def print_metrics(
         print("{:<40} {:<10.2f}".format("Peak concurrent requests:", metrics.max_concurrent_requests))
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
-    print_text_metrics(task_type, selected_percentile_metrics, metrics)
+    if continuous_session:
+        print("{:<40} {:<10}".format("Token / TPOT / ITL metrics:", "N/A"))
+        print("Use OmniInteract response metrics for response latency and audio RTF.")
+    else:
+        print_text_metrics(task_type, selected_percentile_metrics, metrics)
     if task_type == TaskType.GENERATION:
-        if _has_audio_output(metrics):
+        if not continuous_session and _has_audio_output(metrics):
             print_audio_metrics(selected_percentile_metrics, metrics)
         if _has_image_output(metrics):
             print_image_metrics(selected_percentiles or [], metrics)
@@ -698,6 +703,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    continuous_session: bool = False,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -961,5 +967,6 @@ def calculate_metrics(
         outputs=outputs,
         selected_percentiles=selected_percentiles,
         print_stage=print_stage,
+        continuous_session=continuous_session,
     )
     return metrics, actual_output_lens

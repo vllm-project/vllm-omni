@@ -69,6 +69,17 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
 # OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
 # override). A step carrying only these has no producer payload at all.
 _RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+_PRODUCER_META_KEYS = frozenset(
+    {
+        "cache_epoch",
+        "chunk_seq",
+        "code_flat_numel",
+        "last_chunk",
+        "prompt_cache_id",
+        "prompt_wav",
+        "ref_audio_sr",
+    }
+)
 
 
 def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
@@ -77,9 +88,12 @@ def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> 
     Any real async-chunk payload brings producer metadata along, whether the
     transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
     """
+    codes = info.get("codes")
+    if isinstance(codes, Mapping) and any(value is not None for value in codes.values()):
+        return True
     if any(key not in _RUNNER_STAMPED_KEYS for key in info):
         return True
-    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
+    return any(meta.get(key) is not None for key in _PRODUCER_META_KEYS)
 
 
 @dataclass(frozen=True)
@@ -113,6 +127,7 @@ class _WorkItem:
     runtime_prompt_key: str | None
     duplex_epoch: int
     duplex_turn_id: int
+    duplex_input_seq: int
     segment_text_utf8: torch.Tensor
     tts_is_last_chunk: bool
     segment_end: bool
@@ -126,6 +141,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     input_modalities = "audio"
     have_multimodal_outputs = True
     enable_update_additional_information = True
+    replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
     has_preprocess = False
@@ -354,6 +370,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_prompt_key=None,
                 duplex_epoch=-1,
                 duplex_turn_id=-1,
+                duplex_input_seq=-1,
                 segment_text_utf8=torch.empty(0, dtype=torch.uint8),
                 tts_is_last_chunk=False,
                 segment_end=False,
@@ -451,6 +468,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             runtime_prompt_key=runtime_prompt_key,
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
+            duplex_input_seq=int(_scalar(meta.get("duplex_input_seq"), -1)),
             segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
@@ -708,6 +726,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # processor before the full-duplex data plane consumes them.
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "meta.duplex_input_seq": [torch.tensor(item.duplex_input_seq, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],

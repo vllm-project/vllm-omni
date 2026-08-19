@@ -355,6 +355,7 @@ class DuplexSessionRunnerMixin:
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
+                        track_input_watermark=not silence_continuation,
                     )
                     if append_ok:
                         if pcm_reservation is not None:
@@ -503,22 +504,21 @@ class DuplexSessionRunnerMixin:
             clear_completed_pending_silence()
             pending_silence = native.pending_silence_task
             if pending_silence is not None and not pending_silence.done():
-                if pending_silence is asyncio.current_task():
-                    return False
-                try:
-                    if not await pending_silence:
+                if pending_silence is not asyncio.current_task():
+                    try:
+                        if not await pending_silence:
+                            return False
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
                         return False
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                    return False
-                except Exception:
-                    return False
-                clear_completed_pending_silence()
-                pending_silence = native.pending_silence_task
-                if pending_silence is not None and not pending_silence.done():
-                    return False
+                    except Exception:
+                        return False
+                    clear_completed_pending_silence()
+                    pending_silence = native.pending_silence_task
+                    if pending_silence is not None and not pending_silence.done():
+                        return False
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
@@ -1632,16 +1632,8 @@ class DuplexSessionRunnerMixin:
                                 transcript=event.get("transcript"),
                                 turn_id=data_plane_turn_id,
                             )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                            )
                             if final_payload is not None:
-                                await start_native_append(
+                                append_task = await start_native_append(
                                     {
                                         **final_payload,
                                         "duplex_turn_id": data_plane_turn_id,
@@ -1650,6 +1642,24 @@ class DuplexSessionRunnerMixin:
                                     precreate_response=False,
                                     operation_id=commit_reservation.operation_id,
                                     retained_committed_payload=final_payload,
+                                )
+                                if append_task is None or not await append_task:
+                                    continue
+                            await emit_event(
+                                self._native_audio_committed_payload(
+                                    session,
+                                    committed=committed,
+                                    realtime_item_id=event.get("realtime_item_id"),
+                                    transcript=event.get("transcript"),
+                                    include_accepted_input_watermark=True,
+                                )
+                            )
+                            if final_payload is None:
+                                await self._continue_pending_native_input(
+                                    emit_event,
+                                    session=session,
+                                    expected_epoch=session.epoch,
+                                    final_commit=True,
                                 )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":

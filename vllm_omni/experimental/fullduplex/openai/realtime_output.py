@@ -218,14 +218,27 @@ class RealtimeOutputProjector:
                 self._conversation_items[item_id] = item
                 created_payload.extend(self._conversation_item_added_events(item))
             item["status"] = "completed"
-            payloads = created_payload + [
-                self._input_audio_buffer_committed_event(item_id=item_id, event=event),
-            ]
+            committed_event = self._input_audio_buffer_committed_event(item_id=item_id, event=event)
+            for key in ("session_id", "epoch", "accepted_input_seq"):
+                if key in event:
+                    committed_event[key] = event[key]
+            payloads = created_payload + [committed_event]
             transcription_event = self._input_audio_transcription_completed_event(item_id, item)
             if transcription_event is not None:
                 payloads.append(transcription_event)
             payloads.append(self._conversation_item_done_event(item))
             return payloads
+        if event_type == "input.processed":
+            return [
+                {
+                    "type": "input_audio_buffer.processed",
+                    "session_id": event.get("session_id"),
+                    "epoch": event.get("epoch"),
+                    "processed_input_seq": event.get("processed_input_seq"),
+                    "outcome": event.get("outcome"),
+                    **({"response_id": event["response_id"]} if isinstance(event.get("response_id"), str) else {}),
+                }
+            ]
         if event_type == "input.cancelled":
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
