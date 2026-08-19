@@ -753,6 +753,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if _image_gen_height is not None and _image_gen_width is not None
                     else None
                 )
+                self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
                     if idx == comprehension_idx:
@@ -1323,6 +1324,34 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             and delta_message is not None
             and delta_message.tool_calls
         )
+
+    @staticmethod
+    def _apply_text_chat_ar_task_mode(
+        sampling_params_list: list[Any],
+        request: ChatCompletionRequest,
+    ) -> None:
+        """Mark AR stages of a text-only chat request as per-request comprehension.
+
+        A generation deployment (e.g. HunyuanImage3 AR+DiT with
+        ``engine_output_type="latent"``) also serves plain chat completions
+        whose answer is text (I2T/T2T). Without a per-request marker the AR
+        model sampler applies its image-generation stage transitions to those
+        requests and leaks DiT scaffold tokens (``<recaption>``/``<answer>``/
+        ``<boi>``/``<img_size_*>``/``<cfg>``) into the text answer (#6088).
+
+        Sets ``extra_args["ar_task_mode"] = "comprehension"`` on every plain
+        ``SamplingParams`` stage when the request output is text-only. Does
+        nothing for image/audio/video-output requests, never overrides an
+        explicit caller-provided ``ar_task_mode``, and models that don't opt
+        into reading extra_args are unaffected.
+        """
+        if set(getattr(request, "modalities", None) or []) - {"text"}:
+            return
+        for sp in sampling_params_list:
+            if isinstance(sp, SamplingParams) and not isinstance(sp, OmniDiffusionSamplingParams):
+                extra_args = dict(getattr(sp, "extra_args", None) or {})
+                extra_args.setdefault("ar_task_mode", "comprehension")
+                sp.extra_args = extra_args
 
     def _build_sampling_params_list_from_request(
         self,

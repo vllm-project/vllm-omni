@@ -863,3 +863,54 @@ class TestResolveHeightWidth:
         h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "invalid"})
         assert h is None
         assert w is None
+
+
+# Tests for _apply_text_chat_ar_task_mode (#6088)
+
+
+def _tag_request(modalities):
+    return SimpleNamespace(modalities=modalities)
+
+
+def _apply_tag(params, modalities):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    OmniOpenAIServingChat._apply_text_chat_ar_task_mode(params, _tag_request(modalities))
+    return params
+
+
+@pytest.mark.parametrize("modalities", [None, [], ["text"]])
+def test_text_only_chat_tags_ar_stage_as_comprehension(modalities):
+    ar = SamplingParams()
+    params = _apply_tag([ar], modalities)
+    assert params[0].extra_args == {"ar_task_mode": "comprehension"}
+
+
+@pytest.mark.parametrize("modalities", [["image"], ["text", "audio"], ["video"]])
+def test_non_text_output_request_is_untouched(modalities):
+    ar = SamplingParams()
+    _apply_tag([ar], modalities)
+    assert ar.extra_args is None
+
+
+def test_diffusion_stage_params_are_untouched():
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    ar = SamplingParams()
+    dit = OmniDiffusionSamplingParams()
+    dit_extra_before = getattr(dit, "extra_args", None)
+    _apply_tag([ar, dit], ["text"])
+    assert ar.extra_args == {"ar_task_mode": "comprehension"}
+    assert getattr(dit, "extra_args", None) == dit_extra_before
+
+
+def test_explicit_caller_ar_task_mode_is_preserved():
+    ar = SamplingParams(extra_args={"ar_task_mode": "generation"})
+    _apply_tag([ar], ["text"])
+    assert ar.extra_args["ar_task_mode"] == "generation"
+
+
+def test_existing_extra_args_are_merged_not_replaced():
+    ar = SamplingParams(extra_args={"custom": 1})
+    _apply_tag([ar], None)
+    assert ar.extra_args == {"custom": 1, "ar_task_mode": "comprehension"}
