@@ -36,6 +36,7 @@ classifiers = [
 [project.optional-dependencies]
 
 dev = [
+    "tomli>=2.0.0; python_version < '3.11'",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
