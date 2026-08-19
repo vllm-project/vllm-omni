@@ -19,6 +19,8 @@ from vllm_omni.utils.mm_outputs import to_payload_element
 
 logger = init_logger(__name__)
 
+_SPARSE_AUDIO_PROTOCOL_KEYS = frozenset({"meta.req_id", "meta.sparse_audio"})
+
 
 def unwrap_combined_payload_value(
     value: Any,
@@ -35,20 +37,12 @@ def unwrap_combined_payload_value(
     if isinstance(value, list):
         if list_idx < len(value):
             return True, value[list_idx]
-        if len(value) == 1:
-            # Length-1 lists are batch-shared passthrough metadata
-            # (e.g. `meta.sparse_audio: ["1"]`) that the prefix-cache
-            # merge broadcasts to every request; unwrap the shared
-            # element.
-            return True, value[0]
-        # A multi-element list shorter than the request's index is
-        # per-request data that lost alignment. Never substitute
-        # another request's element (`v[0]` used to ship request 0's
+        # A list shorter than the request's index is per-request data that
+        # lost alignment. Never substitute another request's element
+        # (`v[0]` used to ship request 0's
         # payload as `rid`'s); drop the key loudly instead — the SAME
         # protocol-break policy as the sparse mismatch in
-        # `build_omni_mm_payload`. Not a raise: in-tree producers can
-        # emit subset-length lists without the sparse marker (voxcpm2
-        # dense-mode coalesce), and v1 runners do not catch
+        # `build_omni_mm_payload`. Not a raise: v1 runners do not catch
         # per-request exceptions, so raising would turn a per-request
         # protocol break into a whole-stage outage.
         logger.error(
@@ -84,6 +78,8 @@ def build_combined_prefix_cache_mm_payload(
     """
     payload: dict[str, object] = {}
     for mm_key in combined_multimodal_outputs.keys():
+        if mm_key in _SPARSE_AUDIO_PROTOCOL_KEYS:
+            continue
         keep, unwrapped = unwrap_combined_payload_value(
             combined_multimodal_outputs[mm_key][rid],
             rid=rid,
@@ -125,7 +121,7 @@ def build_omni_mm_payload(
         return mm_payload
 
     for mm_key, mm_val in mm_cpu.items():
-        if mm_key in {"meta.req_id", "meta.sparse_audio"}:
+        if mm_key in _SPARSE_AUDIO_PROTOCOL_KEYS:
             continue
         if audio_sparse_output and isinstance(mm_val, list):
             sparse_idx = sparse_mm_index.get(rid)

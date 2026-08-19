@@ -2,6 +2,8 @@ import asyncio
 import copy
 import re
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -311,6 +313,8 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
 
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"], "sparse_audio": ["1"]}}) == ["r1"]
     assert sparse_audio.resolve_sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"req_id": ["r1"]}, "meta.sparse_audio": ["1"]}) == ["r1"]
+    assert sparse_audio.resolve_sparse_mm_req_ids({"meta": {"sparse_audio": ["1"]}, "meta.req_id": ["r1"]}) == ["r1"]
 
 
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
@@ -1337,6 +1341,123 @@ class TestSparseAudioMarkerRobustness:
         assert index == {}
         assert is_sparse is True
 
+    def test_fail_closed_routing_error_remains_observable(self):
+        def route_invalid_marker():
+            return sparse_audio.resolve_sparse_mm_routing(
+                engine_output_type="audio",
+                req_ids_output_copy=["r0"],
+                downstream_req_ids=["r0"],
+                multimodal_outputs={
+                    "meta": {"req_id": ["r0"], "sparse_audio": torch.tensor([1, 1])},
+                    "model_outputs": [torch.zeros(1)],
+                },
+            )
+
+        with (
+            patch.object(sparse_audio, "_logged_offenders", set()),
+            patch.object(sparse_audio, "_fail_closed_last_log_at", None),
+            patch.object(sparse_audio, "_fail_closed_suppressed", 0),
+            patch.object(sparse_audio.time, "monotonic", side_effect=[100.0, 120.0, 161.0]),
+            patch.object(sparse_audio.logger, "error") as err,
+        ):
+            for _ in range(3):
+                assert route_invalid_marker() == ([], {}, True)
+
+        routing_errors = [call for call in err.call_args_list if "no multimodal payload" in call.args[0]]
+        assert len(routing_errors) == 2
+        assert [call.args[1] for call in routing_errors] == [0, 1]
+
+    def test_fail_closed_logging_is_thread_safe(self):
+        workers = 8
+        ready = Barrier(workers)
+
+        def route_invalid_marker():
+            return sparse_audio.resolve_sparse_mm_routing(
+                engine_output_type="audio",
+                req_ids_output_copy=["r0"],
+                downstream_req_ids=["r0"],
+                multimodal_outputs={
+                    "meta": {"req_id": ["r0"], "sparse_audio": torch.tensor([1, 1])},
+                },
+            )
+
+        def route_concurrently(_):
+            ready.wait(timeout=10)
+            return route_invalid_marker()
+
+        with (
+            patch.object(sparse_audio, "_logged_offenders", set()),
+            patch.object(sparse_audio, "_fail_closed_last_log_at", None),
+            patch.object(sparse_audio, "_fail_closed_suppressed", 0),
+            patch.object(sparse_audio.time, "monotonic", return_value=100.0) as clock,
+            patch.object(sparse_audio.logger, "error") as err,
+        ):
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(route_concurrently, range(workers)))
+            assert results == [([], {}, True)] * workers
+
+            clock.return_value = 161.0
+            assert route_invalid_marker() == ([], {}, True)
+
+        routing_errors = [call for call in err.call_args_list if "no multimodal payload" in call.args[0]]
+        assert len(routing_errors) == 2
+        assert [call.args[1] for call in routing_errors] == [0, workers - 1]
+        classifier_errors = [call for call in err.call_args_list if "Illegal sparse-audio marker" in call.args[0]]
+        assert len(classifier_errors) == 1
+
+    def test_duplicate_sparse_metadata_must_be_consistent(self):
+        equal = {
+            "meta": {"req_id": ["r1"], "sparse_audio": ["1"]},
+            "meta.req_id": ["r1"],
+            "meta.sparse_audio": ["true"],
+        }
+        assert sparse_audio.resolve_sparse_mm_req_ids(equal) == ["r1"]
+
+        invalid_declarations = (
+            {
+                "meta": {"req_id": ["r1"], "sparse_audio": ["1"]},
+                "meta.req_id": ["r2"],
+            },
+            {
+                "meta": {"req_id": ["r1"], "sparse_audio": ["1"]},
+                "meta.req_id": "r1",
+            },
+            {
+                "meta": {"req_id": ["r1"], "sparse_audio": ["0"]},
+                "meta.sparse_audio": ["1"],
+            },
+            {"meta": {"req_id": ["r1", "r1"], "sparse_audio": ["1"]}},
+        )
+        with patch.object(sparse_audio, "_logged_offenders", set()):
+            for declaration in invalid_declarations:
+                with pytest.raises(sparse_audio.InvalidSparseDeclarationError):
+                    sparse_audio.resolve_sparse_mm_req_ids(declaration)
+
+    def test_conflicting_sparse_metadata_fails_closed_at_public_boundary(self):
+        downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
+            engine_output_type="audio",
+            req_ids_output_copy=["r1", "r2"],
+            downstream_req_ids=["r1", "r2"],
+            multimodal_outputs={
+                "meta": {"req_id": ["r1"], "sparse_audio": ["1"]},
+                "meta.req_id": ["r2"],
+            },
+        )
+        assert downstream == []
+        assert index == {}
+        assert is_sparse is True
+
+    def test_flat_marker_with_nested_req_ids_is_not_erased(self):
+        downstream, index, is_sparse = sparse_audio.resolve_sparse_mm_routing(
+            engine_output_type="audio",
+            req_ids_output_copy=["r0", "r1"],
+            downstream_req_ids=["r0", "r1"],
+            multimodal_outputs={"meta": {"req_id": ["r1"]}, "meta.sparse_audio": ["1"]},
+        )
+        assert downstream == ["r1"]
+        assert index == {"r1": 0}
+        assert is_sparse is True
+
     def test_sparse_marker_with_unusable_req_ids_fails_closed(self):
         # The marker says "sparse" but the alignment list is unusable - the
         # declaration as a whole is out of contract; same fail-closed shape.
@@ -1394,12 +1515,24 @@ class TestSparseAudioMarkerRobustness:
         payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=1)
         assert torch.equal(payload["codes.audio"], torch.ones(1))
 
-    def test_combined_payload_broadcasts_shared_singleton(self):
-        # Length-1 lists are batch-shared passthrough metadata (e.g.
-        # `meta.sparse_audio: ["1"]`) duplicated per request by the merge.
-        combined = {"meta.sparse_audio": {"req-1": ["1"]}}
+    def test_combined_payload_retains_singleton_at_index_zero(self):
+        combined = {"codes.audio": {"req-1": [torch.ones(1)]}}
+        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=0)
+        assert torch.equal(payload["codes.audio"], torch.ones(1))
+
+    def test_combined_payload_drops_sparse_protocol_metadata(self):
+        combined = {
+            "meta.sparse_audio": {"req-1": ["1"]},
+            "meta.req_id": {"req-1": ["req-1"]},
+            "sr": {"req-1": 22050},
+        }
         payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=2)
-        assert payload["meta.sparse_audio"] == "1"
+        assert payload == {"sr": 22050}
+
+    def test_combined_payload_singleton_is_not_broadcast_to_another_request(self):
+        combined = {"codes.audio": {"req-2": [torch.ones(1)]}}
+        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-2", list_idx=1)
+        assert payload == {}
 
     def test_combined_payload_misalignment_drops_key_not_request_zero(self):
         # A short multi-element list used to silently return `v[0]` - request
@@ -1683,6 +1816,7 @@ class TestPreferModelSamplerNoneFallback:
             "higgs_audio_v3",
             "hunyuan_image3",
             "minicpmo_4_5",
+            "minimax_music3",
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"
