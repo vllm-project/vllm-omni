@@ -195,23 +195,6 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_magi_human_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MagiHumanPipeline") == frozenset(
-        {
-            "seconds",
-            "audio_path",
-            "image_path",
-            "sr_height",
-            "sr_width",
-            "sr_num_inference_steps",
-        }
-    )
-    assert get_extra_output_params("MagiHumanPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_ltx_extra_registry_declares_official_guidance_params() -> None:
     expected = frozenset(
         {
