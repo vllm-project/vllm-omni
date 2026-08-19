@@ -92,6 +92,30 @@ class TestParallelConfigPropagation:
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.num_gpus == 2
 
+    def test_dp_is_inferred_from_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, ulysses_degree=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=8)
+        assert od.parallel_config.data_parallel_size == 2
+        assert od.parallel_config.world_size == 8
+
+    def test_explicit_dp_is_validated_against_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 2
+
+        with pytest.raises(ValueError, match="does not match WORLD-derived value"):
+            OmniDiffusionConfig.from_kwargs(
+                model="x",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2),
+                num_gpus=8,
+            )
+
+    def test_hsdp_does_not_infer_ordinary_dp(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 1
+        assert od.parallel_config.world_size == 4
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""

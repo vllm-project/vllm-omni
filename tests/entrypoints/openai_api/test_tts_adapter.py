@@ -22,6 +22,10 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
+    MossTTSAdapter,
+    MossTTSNanoAdapter,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
@@ -92,6 +96,20 @@ def test_all_adapters_are_ar_or_diffusion():
     for cls in TTS_ADAPTER_REGISTRY.values():
         assert issubclass(cls, (ARTTSAdapter, DiffusionTTSAdapter))
         assert cls.backend in ("ar", "diffusion")
+
+
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
+    adapter = adapter_cls(SimpleNamespace(server=object()))
+    stage_defaults = [SimpleNamespace(max_tokens=4096)]
+
+    overridden = adapter.apply_sampling_overrides(
+        stage_defaults,
+        SimpleNamespace(max_new_tokens=512),
+    )
+
+    assert overridden[0].max_tokens == 512
+    assert stage_defaults[0].max_tokens == 4096
 
 
 def test_qwen3_tts_metadata():
