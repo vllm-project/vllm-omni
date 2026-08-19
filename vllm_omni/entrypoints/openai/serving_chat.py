@@ -3528,12 +3528,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return self._create_error_response(str(exc), status_code=400)
 
             logger.info(
-                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
+                "Diffusion chat request %s: ref_images=%d, params=%s",
                 request_id,
-                prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
                 {key: value for key, value in extra_body.items() if value is not None},
             )
+            _rl = getattr(self, "request_logger", None)
+            if _rl:
+                base_len = len(f"Diffusion chat request {request_id}: prompt=")
+                raw_max = getattr(_rl, "max_log_len", None)
+                cap = raw_max if isinstance(raw_max, int) else 200
+                text = prompt[: max(cap - base_len, 0)]
+                logger.debug("Diffusion chat request %s: prompt=%r", request_id, text)
 
             # Decode reference images if provided
             pil_images: list[Image.Image] = []

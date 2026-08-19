@@ -4059,9 +4059,7 @@ class TestTTSAsyncOffloading:
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
-            call.args
-            and call.args[0] == "TTS speech request %s: text=%r, model=%s"
-            and call.args[3] == adapter_model_type
+            call.args and call.args[0] == "TTS speech request %s: model=%s" and call.args[2] == adapter_model_type
             for call in log_info.call_args_list
         )
 

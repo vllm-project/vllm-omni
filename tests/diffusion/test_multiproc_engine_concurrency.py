@@ -413,6 +413,26 @@ class TestRequestModeDispatch:
         assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
         executor.collective_rpc.assert_called_once()
 
+    def test_dlo_dp_forwards_request_metadata_envelopes_as_one_wave(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.diffusion_kv_metadata = SimpleNamespace(request_id=new_req.request_id)
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+        forwarded_envelopes = executor.collective_rpc.call_args.kwargs["args"][0]
+        assert forwarded_envelopes is scheduler_output.scheduled_new_reqs
+        assert [envelope.diffusion_kv_metadata.request_id for envelope in forwarded_envelopes] == ["A", "B"]
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [

@@ -190,12 +190,15 @@ configured parallelism strategy:
 - `WeightsMapper` transformations must be applied before matching ignored-layer
   lists or component prefixes.
 
-Distributed layerwise offload has an additional boundary: its sharded mmap
-AllGather path is not compatible with online quantization because the path
-expects already materialized checkpoint weights. Use the rank-local
-`--dlo-no-use-allgather` path or a compatible pre-quantized checkpoint when
-combining these features. See the [DLO design document](offloader/distributed_layerwise_offload.md)
-for the full compatibility matrix.
+Distributed layerwise offload has an additional boundary: direct checkpoint
+mmap cannot prepare online-quantized tensors because it bypasses the ordinary
+loader that creates their runtime weights and scales. Per-tensor online FP8
+linears can still use DLO AllGather through the ordinary loader: each rank first
+finalizes the FP8 tensors, then DLO shards those runtime tensors for
+reconstruction during prefetch. Other online methods remain limited to
+`--dlo-no-use-allgather` until their packing and scale layouts are validated.
+See the [DLO design document](offloader/distributed_layerwise_offload.md) for
+the full compatibility matrix.
 
 ## Adding a quantization backend
 
