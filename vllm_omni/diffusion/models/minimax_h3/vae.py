@@ -294,12 +294,34 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             dtype=latent.dtype,
         ).view(1, channels, 1, 1, 1)
         decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+        # C: collapse processor.revert_tensor (3 full-size copies: Normalize
+        # output, clamp output, final contiguous) into 1 copy: the Normalize
+        # denorm is unavoidable, but clamp runs in place and the trailing
+        # contiguous is dropped (downstream only slices / casts / D2Hs, none of
+        # which need contiguity). NPU's in-place broadcast is unreliable here,
+        # so the denorm still goes through the proven torchvision Normalize.
+        frames = self._inplace_revert(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    def _inplace_revert(self, decoded: torch.Tensor) -> torch.Tensor:
+        """Memory-lean equivalent of ``processor.revert_tensor``.
+
+        Channel-wise denormalize via the processor's torchvision ``Normalize``
+        (1 unavoidable copy), then clamp in place and reshape — skipping the
+        separate clamp copy and the final contiguous that ``revert_tensor``
+        allocates.
+        """
+        transform_rev = self.model.processor.transform_rev
+        if decoded.ndim == 5:
+            B, C, T, H, W = decoded.shape
+            flat = decoded.reshape(B * T, C, H, W)
+            return transform_rev(flat).clamp_(0, 1).reshape(B, C, T, H, W)
+        # 4D NCHW
+        return transform_rev(decoded).clamp_(0, 1)
 
 
 class MiniMaxH3AudioVAE(nn.Module):

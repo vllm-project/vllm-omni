@@ -488,6 +488,14 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
 
 def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
+    # Fast path: a payload that is already uint8 HWC frames (e.g. MiniMax-H3
+    # on-device quantized decode) skips the float normalization round-trip
+    # entirely — a ~8x postprocess speedup for long videos.
+    if isinstance(video, np.ndarray) and video.dtype == np.uint8 and video.ndim == 4:
+        return np.ascontiguousarray(video)
+    if isinstance(video, list) and video and all(isinstance(f, np.ndarray) and f.dtype == np.uint8 for f in video):
+        return np.ascontiguousarray(np.stack(video, axis=0))
+
     frames = _coerce_video_to_frames(video)
     if not frames:
         raise ValueError("No frames found to encode.")

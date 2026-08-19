@@ -201,9 +201,17 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+        video = video.detach().cpu()
+        if video.is_floating_point():
+            # Legacy float [0,1] path (on-device uint8 quantization disabled).
+            video = video.float().clamp(0, 1).permute(0, 2, 3, 4, 1).numpy()
+            video = [sample for sample in video]
+        else:
+            # D′ uint8 path: already quantized 0-255 by decode(). Emit uint8
+            # HWC frames so the mp4 encoder short-circuits the float round-trip.
+            video = video.permute(0, 2, 3, 4, 1).squeeze(0).contiguous().numpy()
+            video = [video[i] for i in range(video.shape[0])]
         audio = audio.detach().float().cpu().numpy()
-        video = [sample for sample in video]
     return {
         "video": video,
         "audio": audio,
@@ -1598,13 +1606,22 @@ class MiniMaxH3Pipeline(
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with self._component_on_device(self.video_vae):
+            # cache_enabled=False: VAE weights are fp32 and each is consumed
+            # only once per tile within this region, so autocast's fp16 cast
+            # cache has zero reuse and would pin ~4.5 GiB for the whole decode.
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
                 enabled=True,
+                cache_enabled=False,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        video = video[..., :height, :width]
+        # D′: quantize to uint8 on-device. decode_latent already clamps to
+        # [0,1] in-place (see vae.py), so this only adds a cheap scale+cast.
+        # uint8 cuts the D2H transfer 4x (2.41 -> 0.6 GiB) and lets the mp4
+        # encoder skip a full float->uint8 recompute (~250 -> ~31 ms).
+        video = video.clamp(0, 1).mul(255).round().to(torch.uint8)
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio

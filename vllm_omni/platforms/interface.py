@@ -251,12 +251,22 @@ class OmniPlatform(Platform):
         device_type: str,
         dtype: torch.dtype,
         enabled: bool = True,
+        cache_enabled: bool = True,
     ):
         if not enabled:
             return nullcontext()
 
         try:
-            return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+            # cache_enabled controls the autocast weight-cast cache. Disable it
+            # for workloads where each weight is consumed only once inside the
+            # region (e.g. MiniMax-H3 tiled VAE decode): the cached fp16 copies
+            # would live for the whole region with zero reuse, wasting HBM.
+            return torch.autocast(
+                device_type=device_type,
+                dtype=dtype,
+                enabled=True,
+                cache_enabled=cache_enabled,
+            )
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
             return nullcontext()

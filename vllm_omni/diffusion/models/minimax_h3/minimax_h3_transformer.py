@@ -125,6 +125,15 @@ _LOCAL_SP_PREPARE_HOOK = "sp_input---local_sp_prepare"
 # kernel-scale/output multiplies are exact in floating point.
 MINIMAX_H3_LASER_INPUT_SCALE = 256.0
 
+# Opt-in fp16-range protection for the NPU ascend_laser_attention kernel
+# (consumed only via the "laser_input_scale" extra key; other backends and
+# platforms ignore it). The kernel stores unscaled QK^T in an fp16 GM
+# workspace, and H3's outlier activations (per-element amax in the hundreds)
+# push dot products past fp16 max 65504, turning whole 128-row blocks NaN.
+# 256 is a power of two, so pre-dividing q/k/v and the compensating
+# kernel-scale/output multiplies are exact in floating point.
+MINIMAX_H3_LASER_INPUT_SCALE = 256.0
+
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
     if key not in kwargs or kwargs[key] is None:
