@@ -71,7 +71,7 @@ def _default_oom_device_spec() -> str:
 
 OOM_INJECTION_CONFIG = {
     "device": _default_oom_device_spec(),
-    "target_mem_ratio": 0.92,
+    "target_mem_ratio": 0.95,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,

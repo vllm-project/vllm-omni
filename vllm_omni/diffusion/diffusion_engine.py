@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import inspect
 import queue
 import threading
@@ -17,18 +18,23 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import PIL.Image
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
+    get_dummy_run_num_image_inputs,
     image_color_format,
     supports_audio_output,
     supports_multimodal_input,
@@ -184,12 +190,39 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        # Set after the paged-KV profile request has gone through model-owned
+        # preprocessing. Real requests are admitted only within this measured
+        # activation envelope: (max execution sequences, max seq_len,
+        # max target_len).
+        self._diffusion_kv_profile_limits: tuple[int, int, int] | None = None
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
-            self._init_scheduler(od_config, scheduler)
+            profile_requests = self._prepare_diffusion_kv_profile_requests()
+            kv_control_plane = initialize_diffusion_kv_control_plane(
+                self.executor,
+                od_config,
+                profile_requests=profile_requests,
+            )
+            if kv_control_plane is None:
+                self._init_scheduler(od_config, scheduler)
+            else:
+                (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                ) = kv_control_plane
+                self._init_scheduler(
+                    od_config,
+                    scheduler,
+                    kv_cache_config,
+                    scheduler_block_size=scheduler_block_size,
+                    hash_block_size=hash_block_size,
+                    kv_vllm_config=kv_vllm_config,
+                )
             self._init_runtime_state()
             self._init_execute_fn()
             self._log_execution_mode(od_config)
@@ -242,6 +275,11 @@ class DiffusionEngine:
         self,
         od_config: OmniDiffusionConfig,
         scheduler: BaseScheduler | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         if scheduler is not None:
             self.scheduler = scheduler
@@ -249,7 +287,16 @@ class DiffusionEngine:
             self.scheduler = StepScheduler()
         else:
             self.scheduler = RequestScheduler()
-        self.scheduler.initialize(od_config)
+        if kv_cache_config is None:
+            self.scheduler.initialize(od_config)
+        else:
+            self.scheduler.initialize(
+                od_config,
+                kv_cache_config=kv_cache_config,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                kv_vllm_config=kv_vllm_config,
+            )
 
     def _init_runtime_state(self) -> None:
         # DP multi-concurrency: allow batching dp_size requests so each
@@ -339,7 +386,16 @@ class DiffusionEngine:
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
-                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                try:
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                except (TimeoutError, asyncio.TimeoutError):
+                    describe = getattr(self.executor, "describe_pending_state", None)
+                    logger.error(
+                        "Timed out after %.0fs waiting for async output; executor state: %s",
+                        _ASYNC_OUTPUT_TIMEOUT,
+                        describe(output.async_output_id) if describe else "unavailable",
+                    )
+                    raise
             postprocess_start_time = time.perf_counter()
             formatted_outputs = self.postprocess_output(request, output)
             postprocess_time = time.perf_counter() - postprocess_start_time
@@ -694,9 +750,36 @@ class DiffusionEngine:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
         pre_process_func = getattr(self, "pre_process_func", None)
-        if pre_process_func is None:
-            return request
-        return pre_process_func(request)
+        if pre_process_func is not None:
+            request = pre_process_func(request)
+        self._validate_diffusion_kv_profile_limits(request)
+        return request
+
+    def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
+        """Keep admitted paged-KV requests within the profiled activation shape."""
+
+        profile_limits = getattr(self, "_diffusion_kv_profile_limits", None)
+        if profile_limits is None:
+            return
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            return
+
+        request_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        if any(actual > profiled for actual, profiled in zip(request_limits, profile_limits, strict=True)):
+            request_sequences, request_seq_len, request_target_len = request_limits
+            profile_sequences, profile_seq_len, profile_target_len = profile_limits
+            raise ValueError(
+                f"Diffusion KV request {request.request_id!r} exceeds the startup memory-profile envelope: "
+                f"sequences={request_sequences} (profiled={profile_sequences}), "
+                f"max_seq_len={request_seq_len} (profiled={profile_seq_len}), "
+                f"max_target_len={request_target_len} (profiled={profile_target_len}). "
+                "Reduce the request shape or extend the model's paged-KV profile recipe."
+            )
 
     def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
         """Admit a request whose model-owned preprocessing is complete."""
@@ -860,47 +943,111 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        num_inference_steps = 1
-        height = 512
-        width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+    def _make_dummy_request(
+        self,
+        *,
+        height: int,
+        width: int,
+        guidance_scale: float,
+        num_image_inputs: int = 1,
+    ) -> OmniDiffusionRequest | None:
+        """Build a one-step model request for startup profiling or warmup."""
 
+        prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
-            # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+            images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
+            prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
 
         if supports_audio_input:
             audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+            prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:
-            logger.info("Skipping dummy warmup run (num_frames=0)")
-            return
-        req = OmniDiffusionRequest(
+            return None
+        return OmniDiffusionRequest(
             prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=1,
                 num_frames=num_frames,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
+                guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
+
+    def _prepare_diffusion_kv_profile_requests(self) -> list[OmniDiffusionRequest] | None:
+        """Prepare the per-rank request batch used to profile paged-KV headroom.
+
+        The profile executes directly on each Worker before the Scheduler and
+        its KV manager exist. It uses the maximum number of requests that one
+        rank can execute together. DLO+DP is the exception because each rank
+        executes one request from the collective wave.
+
+        Hunyuan is currently the only model integrated with
+        ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum advertised
+        reference-image count exercise its first-step activation peak.
+        Admission compares each preprocessed request's CFG count and tokenized
+        sequence/target shape with the resulting per-request profile envelope.
+        Future paged model integrations must extend this recipe for their
+        serving limits (for example, video frame count) rather than reusing it
+        silently.
+        """
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            return None
+        request = self._make_dummy_request(
+            height=1024,
+            width=1024,
+            guidance_scale=5.0,
+            num_image_inputs=get_dummy_run_num_image_inputs(self.od_config.model_class_name),
+        )
+        if request is None:
+            raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
+        request = self._prepare_request_for_admission(request)
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            raise RuntimeError("paged_scheduler profile preprocessing must produce Diffusion KV requests")
+        self._diffusion_kv_profile_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
+            self.od_config
+        )
+        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_requests: list[OmniDiffusionRequest] = []
+        for index in range(profile_batch_size):
+            profile_request = copy.copy(request)
+            profile_request.request_id = f"{DUMMY_DIFFUSION_REQUEST_ID}/kv-profile-{index}"
+            profile_request.sampling_params = copy.deepcopy(request.sampling_params)
+            # Preprocessing owns request geometry and prepared model inputs,
+            # but native KV requests remain Scheduler-only mutable state. The
+            # profile bypasses Scheduler admission and must not send them to
+            # the Worker.
+            profile_request.diffusion_kv_requests = None
+            profile_requests.append(profile_request)
+        return profile_requests
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        req = self._make_dummy_request(
+            height=512,
+            width=512,
+            guidance_scale=0.0,
+        )
+        if req is None:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         logger.info("dummy run to warm up the model")
         output = self.add_req_and_wait_for_response(req)
         if output.error:
@@ -1117,5 +1264,8 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.async_output_id is not None:
             return DiffusionOutput(async_output_id=runner_output.async_output_id)
+
+        if state.status == DiffusionRequestStatus.FINISHED_ERROR and state.error:
+            return DiffusionOutput(error=state.error)
 
         return DiffusionOutput(error=missing_result_error)

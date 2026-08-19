@@ -72,8 +72,8 @@ def make_output_msg(
         final_output_type=final_output_type,
         images=images or [],
         stage_durations={},
+        outputs=[SimpleNamespace(text=payload, index=0)],
     )
-    engine_output.payload = payload
     return OutputMessage(
         request_id=request_id,
         stage_id=stage_id,
@@ -474,7 +474,7 @@ async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.Mo
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [2]
-    assert [output.request_output.payload for output in outputs] == ["final"]
+    assert [output.outputs[0].text for output in outputs] == ["final"]
     assert "req-1" not in app.request_states
 
 
@@ -492,7 +492,7 @@ async def test_async_omni_accepts_multiple_final_stage_streams(monkeypatch: pyte
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 2, 2, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0-0",
         "req-1-stage0-1",
         "req-1-stage0-2",
@@ -517,7 +517,7 @@ async def test_async_omni_stops_on_final_stage_finished(monkeypatch: pytest.Monk
     finally:
         app.shutdown()
 
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0",
         "req-1-stage2-final",
     ]
@@ -544,7 +544,7 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
     assert outputs[0].stage_id == 0
     assert outputs[0].final_output_type == "image"
     assert outputs[0].images == ["req-1-image"]
-    assert outputs[0].request_output.payload == "req-1-diffusion-final"
+    assert outputs[0].outputs[0].text == "req-1-diffusion-final"
 
 
 @pytest.mark.asyncio
@@ -565,7 +565,7 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "text", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-text-0",
         "req-1-text-1",
         "req-1-text-2",
@@ -695,7 +695,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
 
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 2, 0, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-stage0-0",
         f"{engine.submitted[0]['request_id']}-stage2-final",
         f"{engine.submitted[1]['request_id']}-stage0-0",
@@ -739,7 +739,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
     assert len(outputs) == 2
     assert [output.stage_id for output in outputs] == [0, 0]
     assert [output.final_output_type for output in outputs] == ["image", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-diffusion-final",
         f"{engine.submitted[1]['request_id']}-diffusion-final",
     ]
@@ -767,7 +767,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 1, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "image", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-text-0",
         f"{engine.submitted[0]['request_id']}-image-final",
         f"{engine.submitted[1]['request_id']}-text-0",
@@ -1046,7 +1046,6 @@ def _enqueue_stage_error(
     if kill_engine:
         engine._alive = False
     engine_output = OmniRequestOutput.from_error(msg["request_id"], error_text)
-    engine_output.payload = ""
     engine.output_q.put_nowait(
         OutputMessage(
             request_id=msg["request_id"],

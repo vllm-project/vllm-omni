@@ -392,7 +392,7 @@ def main(args):
     total_requests = len(prompts)
     processed_count = 0
     for stage_outputs in omni_generator:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text

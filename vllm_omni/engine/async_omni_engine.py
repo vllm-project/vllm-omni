@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import dataclasses
 import json
 import queue
 import threading
@@ -24,7 +23,6 @@ import janus
 import torch
 from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
-from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
@@ -34,7 +32,6 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
-    strip_parent_engine_args,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
@@ -69,7 +66,6 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
-    is_new_format_deploy_config,
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
@@ -85,39 +81,6 @@ if TYPE_CHECKING:
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-# ============================================================================
-# Parent-EngineArgs field-routing contracts (consumed by
-# AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
-# ============================================================================
-
-# Fields that must survive the "equal to default → strip" filter because
-# diffusion stages need them even when equal to vllm's default value
-# (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
-_PARENT_ARGS_KEEP: frozenset[str] = frozenset(
-    {
-        "worker_extension_cls",
-        "allowed_local_media_path",
-        "allowed_media_domains",
-        # Legacy stage-config YAMLs may intentionally leave parallel or
-        # distributed knobs unspecified at the stage level and rely on
-        # top-level CLI values to fill them in during the per-stage merge.
-        # Keep these fields so stages that omit them can inherit CLI values,
-        # while stages with explicit YAML values still win because the legacy
-        # stage-config loader prefers stage-local engine args.
-        "tensor_parallel_size",
-    }
-)
-
-# Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
-# must never leak into per-stage EngineArgs (``stage_configs_path`` would
-# trigger the ``create_model_config`` guard).
-_PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
-
-
-# Fields always populated by callers (via ``from_cli_args`` / ``asdict``) so
-# their presence as an override is never a surprise — suppress the
-# "override ignored" warning for these.
-_PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
 
 
 class AsyncOmniEngine:
@@ -210,10 +173,8 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get pipeline-wide settings
-        # beforehand. The stage CLI exposes the same deploy YAML through
-        # stage_configs_path.
-        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # Stage resolution pops deploy_config, so get pipeline-wide settings beforehand.
+        deploy_config_path = kwargs.get("deploy_config")
         # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
         # specified" so stage-config resolution can defer to the deploy yaml's
         # per-stage value (see ``with_trust_remote_code_override``). The
@@ -782,23 +743,31 @@ class AsyncOmniEngine:
             enqueue_ts=time.perf_counter(),
         )
 
-    def _enqueue_cfg_companions(
+    def _build_cfg_companions(
         self,
         parent_id: str,
         original_prompt: Any,
         stage0_params: Any,
         sampling_params_list: list[Any],
-    ) -> None:
-        """Expand prompt into CFG companions, process through InputProcessor, and enqueue."""
-        try:
-            expanded = self.prompt_expand_func(original_prompt, stage0_params)
-        except Exception:
-            logger.exception("[AsyncOmniEngine] prompt_expand_func failed for req %s", parent_id)
-            return
+    ) -> list[AddCompanionRequestMessage]:
+        """Expand a prompt into its CFG companions, without enqueueing any.
 
+        Construction is separated from admission so a guided request is
+        all-or-nothing. A model whose guidance is mandatory cannot decode a
+        request whose companion never arrived: the pair never completes, the
+        request occupies scheduler and KV capacity for the scheduler's whole
+        hold budget, and then produces no audio. Raising here instead means the
+        caller learns immediately and nothing was admitted.
+
+        Raises:
+            Exception: Whatever prompt expansion or input processing raised.
+                The caller is expected to let it reach the client.
+        """
+        expanded = self.prompt_expand_func(original_prompt, stage0_params)
         if not expanded:
-            return
+            return []
 
+        companions: list[AddCompanionRequestMessage] = []
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
@@ -814,6 +783,14 @@ class AsyncOmniEngine:
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
+            # Same restore the parent request gets: the upstream input
+            # processor drops omni-only prompt fields, so without this the
+            # companion reaches the worker with no additional_information at
+            # all. That is where ``global_request_id`` lives, and it is what
+            # was just injected above, so skipping it silently undoes the
+            # injection: the model sees the companion row with no id and
+            # cannot match it to its conditioned partner.
+            request = upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
             # Companions are stage-0-final for ordinary downstream payloads,
             # but diffusion still needs their CFG KV caches.
@@ -822,7 +799,7 @@ class AsyncOmniEngine:
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
             # admission through StagePool.submit_initial(..., affinity_request_id=...).
-            self.request_queue.sync_q.put(
+            companions.append(
                 AddCompanionRequestMessage(
                     companion_id=cid,
                     parent_id=parent_id,
@@ -832,11 +809,35 @@ class AsyncOmniEngine:
                     sampling_params_list=companion_spl,
                 )
             )
+        return companions
+
+    def _enqueue_cfg_companions(
+        self,
+        parent_id: str,
+        original_prompt: Any,
+        stage0_params: Any,
+        sampling_params_list: list[Any],
+    ) -> None:
+        """Build and enqueue CFG companions, tolerating a build failure.
+
+        Kept for callers that admit the parent first and cannot roll it back.
+        Prefer building with :meth:`_build_cfg_companions` before the parent is
+        admitted, so the pair is atomic.
+        """
+        try:
+            companions = self._build_cfg_companions(parent_id, original_prompt, stage0_params, sampling_params_list)
+        except Exception:
+            logger.exception("[AsyncOmniEngine] CFG companion build failed for req %s", parent_id)
+            return
+        for companion in companions:
+            self.request_queue.sync_q.put(companion)
+        if not companions:
+            return
 
         logger.info(
             "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
             parent_id,
-            len(expanded),
+            len(companions),
         )
 
     @staticmethod
@@ -1026,6 +1027,9 @@ class AsyncOmniEngine:
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
+            # Default-stage construction bypasses the structured projection.
+            # Runner selection remains owned by the selected engine/platform.
+            "engine_backend": kwargs.get("engine_backend", "default"),
             "model_class_name": kwargs.get("model_class_name", None),
             "task_type": kwargs.get("task_type", None),
             "model_config": kwargs.get("model_config", None),
@@ -1123,40 +1127,6 @@ class AsyncOmniEngine:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
-    @staticmethod
-    def _strip_single_engine_args(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Remove parent ``EngineArgs`` fields from *kwargs*.
-
-        When ``stage_configs_path`` is set, per-stage engine args are defined
-        in the YAML.  Top-level single-engine fields (``compilation_config``,
-        ``tensor_parallel_size``, …) must not leak into per-stage configs via
-        the ``base_engine_args`` merge in ``load_stage_configs_from_yaml`` —
-        they can cause type errors (e.g. ``compilation_config`` as a JSON
-        string rejected by ``VllmConfig``) or silently override YAML values.
-
-        Logs a warning for any parent field whose value differs from the
-        dataclass default, so users know their explicit overrides are ignored.
-        See the module-level ``_PARENT_ARGS_*`` constants for the routing
-        contracts this method enforces.
-        """
-        parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        result, overridden = strip_parent_engine_args(
-            kwargs,
-            parent_fields=parent_fields,
-            keep_keys=_PARENT_ARGS_KEEP,
-            strip_keys=_PARENT_ARGS_STRIP,
-            no_warn_keys=_PARENT_ARGS_NO_WARN,
-        )
-
-        if overridden:
-            logger.warning(
-                "stage_configs_path is set — the following top-level engine "
-                "args are ignored (per-stage YAML takes precedence): %s",
-                ", ".join(sorted(overridden)),
-            )
-
-        return result
-
     def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
         """Apply a strategy-derived ``omni_lb_policy`` to the engine.
 
@@ -1195,34 +1165,20 @@ class AsyncOmniEngine:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        stage_configs_path = kwargs.get("stage_configs_path", None)
+        for legacy_arg in ("stage_configs_path", "stage_configs"):
+            if legacy_arg in kwargs:
+                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        explicit_stage_configs = kwargs.pop("stage_configs", None)
-        if explicit_stage_configs is not None:
-            logger.warning(
-                "`stage_configs` is not part of the public API. "
-                "Ignoring it and resolving stages from stage_configs_path/model factory."
-            )
-
-        # Legacy ``stage_args`` YAMLs own per-stage EngineArgs completely, so
-        # strip parent CLI fields. New-format deploy YAMLs (also accepted via
-        # ``--stage-configs-path``) merge CLI overrides the same way as
-        # ``--deploy-config`` — do not strip, or flags like
-        # ``interleave_mm_strings`` / ``media_io_kwargs`` are silently dropped.
-        if stage_configs_path is not None and not is_new_format_deploy_config(stage_configs_path):
-            base_kwargs = self._strip_single_engine_args(kwargs)
-        else:
-            base_kwargs = kwargs
 
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
-            stage_configs_path,
-            base_kwargs,
+            kwargs,
             trust_remote_code=trust_remote_code,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
@@ -1370,16 +1326,28 @@ class AsyncOmniEngine:
             reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
-        self.request_queue.sync_q.put(msg)
-
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
+        # CFG companions are built before the parent is admitted, so the group
+        # is all-or-nothing: a build failure raises here, nothing is enqueued,
+        # and the caller sees the error. Admitting the parent first would leave
+        # an orphan holding scheduler and KV capacity that can never complete,
+        # because a model whose guidance is mandatory cannot decode a request
+        # whose companion never arrived.
+        companions: list[AddCompanionRequestMessage] = []
         if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.original_prompt
             effective_spl = msg.sampling_params_list
             stage0_params = effective_spl[0] if effective_spl else None
             if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+                companions = self._build_cfg_companions(request_id, msg.original_prompt, stage0_params, effective_spl)
+
+        self.request_queue.sync_q.put(msg)
+        for companion in companions:
+            self.request_queue.sync_q.put(companion)
+        if companions:
+            logger.info(
+                "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
+                request_id,
+                len(companions),
+            )
 
     async def add_request_async(
         self,

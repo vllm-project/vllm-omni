@@ -30,6 +30,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     # the HF config without manual overrides.
     "PersonaPlexTalkerForConditionalGeneration": "personaplex",
     "PersonaPlexCode2Wav": "personaplex",
+    # NemotronVoiceChat ships a NeMo-style config.json without model_type;
+    # create_model_config() patches model_type=nemotron_voicechat from the arch.
+    "NemotronVoiceChatThinkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -55,6 +60,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
+        )
+        from vllm_omni.model_executor.models.nemotron_voicechat.configuration_nemotron_voicechat import (
+            NemotronVoiceChatConfig,
         )
         from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
             PersonaPlexConfig,
@@ -87,6 +95,7 @@ def _register_omni_hf_configs() -> None:
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("personaplex", PersonaPlexConfig),
+        ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
@@ -158,9 +167,6 @@ class OmniEngineArgs(EngineArgs):
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
-        stage_configs_path: Optional path to a JSON/YAML file containing
-            stage configurations for the multi-stage pipeline. If None,
-            stage configs are resolved from the model's default configuration.
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
@@ -222,11 +228,11 @@ class OmniEngineArgs(EngineArgs):
     omni_dp_size_local: int = 1
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = 30.0
-    stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -324,6 +330,19 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
+        # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
+        # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
+        # subfolder auto-detect below would wrongly pick up. The text tokenizer
+        # is the Nemotron backbone's, resolved from a local override or its
+        # HF id (cache-friendly).
+        if not self.tokenizer and self.model_arch in (
+            "NemotronVoiceChatThinkerForConditionalGeneration",
+            "NemotronVoiceChatTalkerForConditionalGeneration",
+            "NemotronVoiceChatCode2Wav",
+        ):
+            self.tokenizer = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+            logger.info("NemotronVoiceChat: using text tokenizer from %s", self.tokenizer)
+
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
         if not self.tokenizer and self.model:
@@ -391,6 +410,7 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
         )
         return omni_config
 
@@ -468,7 +488,6 @@ class OrchestratorArgs:
     ray_address: str | None = None
 
     # === Config Files ===
-    stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
@@ -560,7 +579,6 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
-        "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
     }

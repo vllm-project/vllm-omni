@@ -184,9 +184,6 @@ Failed jobs: 1/2
     # Reliability: HunyuanImage DiT (H100 × 4)
     pytest -s -v dfx/reliability/test_reliability_hunyuan_image.py -m slow
 
-    # Reliability: VoxCPM2 (L4)
-    pytest -s -v dfx/reliability/test_reliability_voxcpm2.py -m slow
-
     ```
 
     The latest L5 CI jobs (reliability + invalid-parameter weekly steps) are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml).
