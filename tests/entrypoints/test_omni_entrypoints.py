@@ -1183,6 +1183,40 @@ def test_omni_base_errored_false_when_stage_resources_engine_dead():
 # ───────── Omni (sync) EngineDeadError / EngineGenerateError ─────────
 
 
+def _enqueue_request_failure_or_success(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    if msg["prompt"] == "fail":
+        engine.output_q.put_nowait(
+            ErrorMessage(
+                request_id=msg["request_id"],
+                stage_id=0,
+                error="replica failed",
+            )
+        )
+    else:
+        _enqueue_async_diffusion_only_output(engine, msg)
+
+
+def test_sync_omni_request_error_does_not_abort_surviving_batch_request(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=[THREE_STAGE_META[-1]],
+        on_add_request=_enqueue_request_failure_or_success,
+    )
+    _patch_engine(monkeypatch, engine)
+    app = Omni("dummy-model")
+    try:
+        outputs = app.generate(["fail", "survive"], use_tqdm=False)
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 2
+    failed = next(output for output in outputs if output.error is not None)
+    succeeded = next(output for output in outputs if output.error is None)
+    assert failed.error == "replica failed"
+    assert failed.finished is True
+    assert succeeded.finished is True
+    assert engine.aborted == []
+
+
 def test_omni_propagates_engine_dead_error(monkeypatch: pytest.MonkeyPatch):
     """When the engine is dead and a stage error output arrives,
     ``Omni.generate()`` must raise ``EngineDeadError``."""

@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
-from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -169,6 +169,29 @@ class Omni(OmniBase):
 
             while active_reqs:
                 msg = self.engine.try_get_output()
+
+                # A request-scoped replica failure is terminal for that request,
+                # not for the shared synchronous batch. Surface it as one error
+                # output and keep consuming results from surviving replicas.
+                if (
+                    isinstance(msg, ErrorMessage)
+                    and not msg.fatal
+                    and msg.request_id is not None
+                    and msg.request_id in active_reqs
+                ):
+                    error_output = OmniRequestOutput.from_error(
+                        msg.request_id,
+                        msg.error,
+                        status_code=msg.status_code,
+                        error_type=msg.error_type,
+                    )
+                    error_output.stage_id = msg.stage_id
+                    active_reqs.discard(msg.request_id)
+                    if pbar is not None:
+                        pbar.update(1)
+                    self._log_summary_and_cleanup(msg.request_id)
+                    yield error_output
+                    continue
 
                 should_continue, req_id, stage_id, req_state = self._handle_output_message(msg)
                 if should_continue:

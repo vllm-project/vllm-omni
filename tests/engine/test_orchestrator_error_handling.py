@@ -503,7 +503,7 @@ async def test_handle_dead_replica_fails_only_bound_requests() -> None:
         assert r0.shutdown_calls == 1
         msg = queues[1].async_q.get_nowait()
         assert isinstance(msg, ErrorMessage)
-        assert msg.fatal is True
+        assert msg.fatal is False
         assert msg.request_id == "req-0"
         assert msg.stage_id == 0
         assert "replica-0 dead" in msg.error
@@ -737,7 +737,7 @@ async def test_dispatch_death_evicts_so_subsequent_requests_reroute_to_survivor(
         assert r0.shutdown_calls == 1
         assert r1.shutdown_calls == 0
         msg = queues[1].async_q.get_nowait()
-        assert isinstance(msg, ErrorMessage) and msg.fatal is True and msg.request_id == "req-dead"
+        assert isinstance(msg, ErrorMessage) and msg.fatal is False and msg.request_id == "req-dead"
         assert queues[1].async_q.empty()
         assert "req-dead" not in orchestrator.request_states
         assert "req-live" in orchestrator.request_states and pool.get_bound_replica_id("req-live") == 1

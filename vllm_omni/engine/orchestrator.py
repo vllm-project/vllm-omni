@@ -1098,7 +1098,7 @@ class Orchestrator:
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error=str(error),
-                        fatal=True,
+                        fatal=not stage_has_live,
                         request_id=req_id,
                         stage_id=stage_id,
                     )
@@ -1202,9 +1202,10 @@ class Orchestrator:
                 dead_replica,
                 e,
             )
-            await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
+            else:
+                await self._fail_request_dead_stage(req_id, stage_id)
             return False
 
     # ---- Shared helpers ----
