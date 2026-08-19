@@ -77,21 +77,35 @@ vllm serve /path/to/indextts-2.5 \
   --deploy-config vllm_omni/deploy/indextts2_5.yaml
 ```
 
-#### Optional: NVIDIA MPS for higher single-GPU throughput
+For the validated high-throughput path, select the continuous recipe. It uses
+continuous CFM batching, a 64 MiB bounded reference-conditioning prefix cache,
+and the fused BigVGAN CUDA activation (with eager fallback):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+MODEL_VERSION=2.5 \
+MODEL=/path/to/indextts-2.5 \
+DEPLOY_CONFIG=vllm_omni/deploy/indextts2_5_continuous.yaml \
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+```
+
+#### Recommended: NVIDIA MPS for continuous single-GPU serving
 
 Stage 0 and Stage 1 run in separate processes on the same GPU. Enabling
 NVIDIA Multi-Process Service (MPS) can improve steady-state throughput by
-allowing work from both stages to overlap more effectively. MPS is an opt-in
-deployment optimization: this recipe does not start it automatically, and the
-gain depends on the request mix and concurrency, so benchmark it with the
-intended workload before enabling it in production.
+allowing work from both stages to overlap more effectively. The launcher above
+enables a per-launch, user-scoped MPS daemon by default for
+`indextts2_5_continuous.yaml`, and stops only that daemon on exit. Set
+`INDEXTTS_MPS=0` to disable it. The standard recipe remains unchanged.
 
-Pay attention to CUDA device renumbering. For example, if the MPS control
-daemon is started with physical `CUDA_VISIBLE_DEVICES=1`, that GPU is exposed
-to MPS clients as logical device `0`; launch the server with
-`CUDA_VISIBLE_DEVICES=0`, not `1`. Use a dedicated MPS pipe/log directory when
-the host is shared with other services, and stop only the MPS daemon owned by
-this deployment.
+`CUDA_VISIBLE_DEVICES` must name exactly one physical GPU index or UUID. The
+launcher handles MPS device renumbering and uses a unique pipe/log directory,
+so it does not attach to or stop another deployment's MPS daemon. MPS is
+recommended on an exclusive GPU: the launcher refuses to start it when active
+compute processes are detected. `INDEXTTS_MPS_ALLOW_SHARED_GPU=1` overrides
+that guard, but should only be used when the operator owns every workload on
+the device. Benchmark the intended workload before relying on the measured
+throughput gain; MPS remains workload and GPU dependent.
 
 #### Verification
 

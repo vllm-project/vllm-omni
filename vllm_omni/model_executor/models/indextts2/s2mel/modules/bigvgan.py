@@ -15,6 +15,9 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import Snake, SnakeBeta
+from vllm_omni.model_executor.models.indextts2.s2mel.modules.alias_free_cuda.activation import (
+    OfficialFusedAliasFreeActivation1d,
+)
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.commons import AttrDict
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,11 @@ def init_weights(m, mean=0.0, std=0.01):
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
+
+
+def _alias_activation(h: AttrDict, activation: nn.Module) -> AliasFreeActivation1d:
+    activation_type = OfficialFusedAliasFreeActivation1d if h.get("use_cuda_kernel", False) else AliasFreeActivation1d
+    return activation_type(activation=activation)
 
 
 # ---------------------------------------------------------------------------
@@ -96,15 +104,12 @@ class AMPBlock1(torch.nn.Module):
 
         if activation == "snake":
             self.activations = nn.ModuleList(
-                [
-                    AliasFreeActivation1d(activation=Snake(channels, alpha_logscale=h.snake_logscale))
-                    for _ in range(self.num_layers)
-                ]
+                [_alias_activation(h, Snake(channels, alpha_logscale=h.snake_logscale)) for _ in range(self.num_layers)]
             )
         elif activation == "snakebeta":
             self.activations = nn.ModuleList(
                 [
-                    AliasFreeActivation1d(activation=SnakeBeta(channels, alpha_logscale=h.snake_logscale))
+                    _alias_activation(h, SnakeBeta(channels, alpha_logscale=h.snake_logscale))
                     for _ in range(self.num_layers)
                 ]
             )
@@ -167,15 +172,12 @@ class AMPBlock2(torch.nn.Module):
 
         if activation == "snake":
             self.activations = nn.ModuleList(
-                [
-                    AliasFreeActivation1d(activation=Snake(channels, alpha_logscale=h.snake_logscale))
-                    for _ in range(self.num_layers)
-                ]
+                [_alias_activation(h, Snake(channels, alpha_logscale=h.snake_logscale)) for _ in range(self.num_layers)]
             )
         elif activation == "snakebeta":
             self.activations = nn.ModuleList(
                 [
-                    AliasFreeActivation1d(activation=SnakeBeta(channels, alpha_logscale=h.snake_logscale))
+                    _alias_activation(h, SnakeBeta(channels, alpha_logscale=h.snake_logscale))
                     for _ in range(self.num_layers)
                 ]
             )
@@ -217,6 +219,7 @@ class BigVGAN(
     def __init__(self, h: AttrDict, use_cuda_kernel: bool = False):
         super().__init__()
         self.h = h
+        self.h.use_cuda_kernel = bool(use_cuda_kernel)
 
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
@@ -269,7 +272,7 @@ class BigVGAN(
                 "activation incorrectly specified. check the config file and look for 'activation'."
             )
 
-        self.activation_post = AliasFreeActivation1d(activation=activation_post)
+        self.activation_post = _alias_activation(h, activation_post)
 
         # Whether to use bias for the final conv_post
         self.use_bias_at_final = h.get("use_bias_at_final", True)
@@ -347,7 +350,7 @@ class BigVGAN(
             )
 
         h = load_hparams_from_json(_resolve("config.json"))
-        model = cls(h)
+        model = cls(h, use_cuda_kernel=bool(kwargs.get("use_cuda_kernel", False)))
 
         checkpoint_dict = torch.load(_resolve("bigvgan_generator.pt"), map_location=map_location)
         try:

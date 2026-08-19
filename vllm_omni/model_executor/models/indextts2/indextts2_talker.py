@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -171,6 +172,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.omni_payload_at_request_end = self.config.model_type == "indextts2_5"
         self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
+        self.stage0_conditioning_prefix_cache = bool(getattr(self.config, "stage0_conditioning_prefix_cache", False))
+        self.stage0_conditioning_prefix_cache_max_bytes = max(
+            0,
+            int(getattr(self.config, "stage0_conditioning_prefix_cache_max_bytes", 64 * 1024**2)),
+        )
+        self._conditioning_prefix_cache: OrderedDict[tuple[object, ...], torch.Tensor] = OrderedDict()
+        self._conditioning_prefix_cache_bytes = 0
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "mel"),
             ("meta", "mel_start_offset"),
@@ -541,6 +549,42 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             },
         )
 
+    def _get_conditioning_prefix_cache(
+        self,
+        key: tuple[object, ...] | None,
+    ) -> torch.Tensor | None:
+        if not self.stage0_conditioning_prefix_cache or key is None:
+            return None
+        cached = self._conditioning_prefix_cache.pop(key, None)
+        if cached is None:
+            return None
+        self._conditioning_prefix_cache[key] = cached
+        return cached
+
+    def _put_conditioning_prefix_cache(
+        self,
+        key: tuple[object, ...] | None,
+        prefix: torch.Tensor,
+    ) -> None:
+        if not self.stage0_conditioning_prefix_cache or key is None:
+            return
+        cached = prefix.detach()
+        size = cached.numel() * cached.element_size()
+        if size > self.stage0_conditioning_prefix_cache_max_bytes:
+            return
+
+        previous = self._conditioning_prefix_cache.pop(key, None)
+        if previous is not None:
+            self._conditioning_prefix_cache_bytes -= previous.numel() * previous.element_size()
+        self._conditioning_prefix_cache[key] = cached
+        self._conditioning_prefix_cache_bytes += size
+        while (
+            self._conditioning_prefix_cache
+            and self._conditioning_prefix_cache_bytes > self.stage0_conditioning_prefix_cache_max_bytes
+        ):
+            _, evicted = self._conditioning_prefix_cache.popitem(last=False)
+            self._conditioning_prefix_cache_bytes -= evicted.numel() * evicted.element_size()
+
     def _preprocess_prefill(
         self,
         input_ids: torch.Tensor,
@@ -590,11 +634,27 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # --- Speaker cache lookup ---
         _voice_name = _first("voice_name")
         _voice_created_at = int(_first("voice_created_at", 0))
+        _voice_cache_key = _first("voice_cache_key")
         _speaker_cache_key = None
         _cached = None
         if _voice_name:
             _speaker_cache_key = self._speaker_cache.make_cache_key(_voice_name, "indextts2", _voice_created_at)
+        elif _voice_cache_key:
+            # Keep content-derived identities separate from uploaded names.
+            _speaker_cache_key = self._speaker_cache.make_cache_key(f"artifact:{_voice_cache_key}", "indextts2", 0)
+        if _speaker_cache_key is not None:
             _cached = self._speaker_cache.get(_speaker_cache_key)
+        _default_conditioning = (
+            _speaker_cache_key is not None
+            and emo_audio_path is None
+            and not use_emo_text
+            and emo_vector is None
+            and not use_random
+        )
+        _conditioning_cache_key = None
+        if _default_conditioning:
+            _conditioning_cache_key = (*_speaker_cache_key, device.type, device.index)
+        conds_prefix = self._get_conditioning_prefix_cache(_conditioning_cache_key)
 
         # --- Load audio and extract features ---
         # Keep the speaker-cache hit path truly lazy: cached speaker artifacts are
@@ -606,10 +666,12 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         w2v_proc = None
 
         if _cached is not None:
-            s_ref = _cached["S_ref"].to(device)
-            style = _cached["style"].to(device)
-            ref_mel = _cached["ref_mel"].to(device)
-            spk_cond_emb = _cached["spk_cond_emb"].to(device)
+            s_ref_cpu = _cached["S_ref"].detach().cpu().contiguous()
+            style_cpu = _cached["style"].detach().cpu().contiguous()
+            ref_mel_cpu = _cached["ref_mel"].detach().cpu().contiguous()
+            if conds_prefix is None:
+                style = style_cpu.to(device)
+                spk_cond_emb = _cached["spk_cond_emb"].to(device)
         else:
             wav_16k, wav_22k = load_reference_audio(voice_path, device, mode="speaker")
             w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
@@ -637,69 +699,78 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
             ref_mel = self._compute_mel_22k(wav_22k, device)  # [1, 80, T_ref]
 
+            # Stage 1 consumes these tensors on CPU. Build one host copy and
+            # share it with the speaker cache instead of synchronizing and
+            # copying the same GPU results again while constructing the payload.
+            s_ref_cpu = s_ref.detach().cpu().contiguous()
+            style_cpu = style.detach().cpu().contiguous()
+            ref_mel_cpu = ref_mel.detach().cpu().contiguous()
+
             if _speaker_cache_key is not None:
                 self._speaker_cache.put(
                     _speaker_cache_key,
                     {
-                        "S_ref": s_ref.detach().cpu().contiguous(),
-                        "style": style.detach().cpu().contiguous(),
-                        "ref_mel": ref_mel.detach().cpu().contiguous(),
+                        "S_ref": s_ref_cpu,
+                        "style": style_cpu,
+                        "ref_mel": ref_mel_cpu,
                         "spk_cond_emb": spk_cond_emb.detach().cpu().contiguous(),
                     },
                 )
 
-        if self.conditioning_policy.uses_campplus_projection:
-            model_dtype = self.spk_emb_proj.weight.dtype
-        else:
-            model_dtype = next(self.conditioning_encoder.parameters()).dtype
-        spk_cond_emb = spk_cond_emb.to(device=device, dtype=model_dtype)
-        if self.conditioning_policy.uses_conformer_perceiver:
-            spk_lens = torch.tensor([spk_cond_emb.shape[1]], device=device, dtype=torch.long)
-            speech_cond, mask = self.conditioning_encoder(spk_cond_emb, spk_lens)
-            conds_mask = self.cond_mask_pad(mask.squeeze(1))
-            conds = self.perceiver_encoder(speech_cond, conds_mask)
+        if conds_prefix is None:
+            if self.conditioning_policy.uses_campplus_projection:
+                model_dtype = self.spk_emb_proj.weight.dtype
+            else:
+                model_dtype = next(self.conditioning_encoder.parameters()).dtype
+            spk_cond_emb = spk_cond_emb.to(device=device, dtype=model_dtype)
+            if self.conditioning_policy.uses_conformer_perceiver:
+                spk_lens = torch.tensor([spk_cond_emb.shape[1]], device=device, dtype=torch.long)
+                speech_cond, mask = self.conditioning_encoder(spk_cond_emb, spk_lens)
+                conds_mask = self.cond_mask_pad(mask.squeeze(1))
+                conds = self.perceiver_encoder(speech_cond, conds_mask)
 
-        emo_vec = self._compute_emotion_vector(
-            wav_16k=wav_16k,
-            speaker_audio_path=voice_path,
-            emo_audio_path=emo_audio_path,
-            emo_voice_name=emo_voice_name,
-            main_text=text,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text,
-            emo_vector=emo_vector,
-            emo_alpha=emo_alpha,
-            use_random=use_random,
-            style=style,
-            spk_cond_emb=spk_cond_emb,
-            w2v_model=w2v_model,
-            w2v_proc=w2v_proc,
-            device=device,
-        )
-
-        if self.conditioning_policy.uses_campplus_projection:
-            speaker_token = self.spk_emb_proj(style.to(dtype=model_dtype)).unsqueeze(1)
-            zero_tokens = torch.zeros(
-                speaker_token.shape[0],
-                2,
-                self.model_dim,
+            emo_vec = self._compute_emotion_vector(
+                wav_16k=wav_16k,
+                speaker_audio_path=voice_path,
+                emo_audio_path=emo_audio_path,
+                emo_voice_name=emo_voice_name,
+                main_text=text,
+                use_emo_text=use_emo_text,
+                emo_text=emo_text,
+                emo_vector=emo_vector,
+                emo_alpha=emo_alpha,
+                use_random=use_random,
+                style=style,
+                spk_cond_emb=spk_cond_emb,
+                w2v_model=w2v_model,
+                w2v_proc=w2v_proc,
                 device=device,
-                dtype=speaker_token.dtype,
             )
-            conds_prefix = torch.cat(
-                [speaker_token + emo_vec.unsqueeze(1), zero_tokens],
-                dim=1,
-            )
-        else:
-            speed_zero = torch.zeros(1, device=device, dtype=torch.long)
-            speed_one = torch.ones(1, device=device, dtype=torch.long)
-            duration_emb = self.speed_emb(speed_zero)
-            duration_emb_half = self.speed_emb(speed_one)
-            conds_with_emo = conds + emo_vec.unsqueeze(1)
-            conds_prefix = torch.cat(
-                [conds_with_emo, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)],
-                dim=1,
-            )
+
+            if self.conditioning_policy.uses_campplus_projection:
+                speaker_token = self.spk_emb_proj(style.to(dtype=model_dtype)).unsqueeze(1)
+                zero_tokens = torch.zeros(
+                    speaker_token.shape[0],
+                    2,
+                    self.model_dim,
+                    device=device,
+                    dtype=speaker_token.dtype,
+                )
+                conds_prefix = torch.cat(
+                    [speaker_token + emo_vec.unsqueeze(1), zero_tokens],
+                    dim=1,
+                )
+            else:
+                speed_zero = torch.zeros(1, device=device, dtype=torch.long)
+                speed_one = torch.ones(1, device=device, dtype=torch.long)
+                duration_emb = self.speed_emb(speed_zero)
+                duration_emb_half = self.speed_emb(speed_one)
+                conds_with_emo = conds + emo_vec.unsqueeze(1)
+                conds_prefix = torch.cat(
+                    [conds_with_emo, duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)],
+                    dim=1,
+                )
+            self._put_conditioning_prefix_cache(_conditioning_cache_key, conds_prefix)
 
         text_tokens, lang_id = self._tokenize_text(
             text,
@@ -733,9 +804,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 "mel_start_offset": mel_start_offset,
                 "prefill_mel_index": prefill_mel_index,
                 "mel_code_count": 0,
-                "S_ref": s_ref.cpu().contiguous(),
-                "ref_mel": ref_mel.cpu().contiguous(),
-                "style": style.cpu().contiguous(),
+                "S_ref": s_ref_cpu,
+                "ref_mel": ref_mel_cpu,
+                "style": style_cpu,
                 "use_gpt_latent": self.use_gpt_latent,
                 "duration_factor": duration_factor,
             },

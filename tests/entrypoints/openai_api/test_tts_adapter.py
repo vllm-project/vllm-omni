@@ -224,6 +224,34 @@ def test_indextts25_build_uses_configured_tokenizer_file(
     assert captured["tokenizer_file"] == expected_tokenizer_file
 
 
+def test_indextts25_inline_reference_forwards_artifact_cache_key():
+    async def resolve_ref_audio(source):
+        assert source == "data:audio/wav;base64,AAAA"
+        return [0.0, 0.25], 16000
+
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _resolve_ref_audio=resolve_ref_audio,
+        _get_resolved_ref_audio_artifact_key=lambda source: (
+            "content-sha1" if source == "data:audio/wav;base64,AAAA" else None
+        ),
+    )
+    adapter = IndexTTS25Adapter(SimpleNamespace(server=server))
+    request = SimpleNamespace(
+        input="hello",
+        voice="default",
+        ref_audio="data:audio/wav;base64,AAAA",
+        extra_params={"lang": "en"},
+        speed=1.0,
+    )
+
+    params = asyncio.run(adapter._build_params(request))
+
+    assert params["voice"] == [[[0.0, 0.25], 16000]]
+    assert params["voice_cache_key"] == ["content-sha1"]
+    assert params["lang"] == ["en"]
+
+
 def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"

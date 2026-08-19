@@ -370,6 +370,7 @@ class OmniSchedulerMixin:
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        stepwise_req_ids: list[str] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -385,6 +386,7 @@ class OmniSchedulerMixin:
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
+            stepwise_req_ids=list(stepwise_req_ids or ()),
         )
 
     def _rewrap_scheduled_new_reqs(self, scheduler_output: SchedulerOutput) -> None:

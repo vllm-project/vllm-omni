@@ -13,6 +13,10 @@ from vllm_omni.config.stage_config import (
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.indextts2"
+_GENERATION_SCHEDULER = (
+    "vllm_omni.model_executor.models.indextts2.scheduler."
+    "IndexTTS2GenerationScheduler"
+)
 
 INDEXTTS2_PIPELINE = PipelineConfig(
     model_type="indextts2",
@@ -42,6 +46,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="IndexTTS2S2MelDecoder",
+            scheduler_cls=_GENERATION_SCHEDULER,
             sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
             extras={"skip_tokenizer_init": True},
             sampling_constraints={"detokenize": True},
@@ -78,6 +83,7 @@ INDEXTTS25_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="IndexTTS25S2MelDecoder",
+            scheduler_cls=_GENERATION_SCHEDULER,
             sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
             extras={"skip_tokenizer_init": True},
             sampling_constraints={"detokenize": True},

@@ -51,12 +51,15 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             to the orchestrator output processor.
     """
 
-    multimodal_outputs: list[dict[str, object]] | None = None
-    inter_stage_outputs: list[dict[str, object]] | None = None
+    multimodal_outputs: list[dict[str, object] | None] | None = None
+    inter_stage_outputs: list[dict[str, object] | None] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    # Opt-in non-AR step execution: only these requests completed their
+    # recurrent model state during this runner invocation.
+    generation_finished_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

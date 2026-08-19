@@ -11,7 +11,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
+from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -37,7 +40,10 @@ from .preprocess_utils import (
     resolve_model_file,
 )
 from .s2mel.modules.commons import AttrDict, MyModel
-from .s2mel.modules.flow_matching import build_cfm_unpad_data
+from .s2mel.modules.flow_matching import (
+    EulerRequestState,
+    build_cfm_unpad_data,
+)
 
 logger = init_logger(__name__)
 
@@ -47,6 +53,28 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _bigvgan_models: dict[tuple[str, str], nn.Module] = {}
+
+
+@dataclass
+class _ContinuousDecoderRequestState:
+    """Decoder-owned state retained while one request advances through CFM."""
+
+    cfm_state: EulerRequestState
+    target_length: int
+    ref_length: int
+    output_emitted: bool = False
+    vocoder_queued: bool = False
+    cfm_admit_after: float = 0.0
+
+
+@dataclass
+class _PendingVocoderBatch:
+    """CUDA work retained until its completion event can be polled."""
+
+    request_ids: tuple[str, ...]
+    states: tuple[_ContinuousDecoderRequestState, ...]
+    wavs: tuple[torch.Tensor, ...]
+    event: Any
 
 
 def _raise_if_cuda_runtime_error(error: BaseException) -> None:
@@ -142,8 +170,14 @@ def _precast_cfm_estimator_bf16(
     return parameter_count
 
 
-def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = torch.float32):
-    cache_key = (vocoder_name, str(device), str(dtype))
+def _load_bigvgan(
+    vocoder_name: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    *,
+    use_cuda_kernel: bool = False,
+):
+    cache_key = (vocoder_name, str(device), str(dtype), bool(use_cuda_kernel))
     if cache_key in _bigvgan_models:
         return _bigvgan_models[cache_key]
 
@@ -156,7 +190,8 @@ def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = 
                 from .s2mel.modules import bigvgan as bigvgan_mod
 
                 _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
-                bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)
+                load_kwargs = {"use_cuda_kernel": True} if use_cuda_kernel else {}
+                bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name, **load_kwargs)
             except (ImportError, ModuleNotFoundError):
                 import bigvgan
 
@@ -229,6 +264,28 @@ class IndexTTS2S2MelDecoder(nn.Module):
         self.s2mel_cfm_batch_size: int = int(getattr(self.config, "s2mel_cfm_batch_size", 1))
         if self.s2mel_cfm_batch_size < 1:
             raise ValueError("s2mel_cfm_batch_size must be at least 1")
+        self.stepwise_generation = bool(getattr(self.config, "stepwise_generation", False))
+        self.s2mel_continuous_max_padding_ratio = float(
+            getattr(self.config, "s2mel_continuous_max_padding_ratio", 1.15)
+        )
+        if self.s2mel_continuous_max_padding_ratio < 1.0:
+            raise ValueError("s2mel_continuous_max_padding_ratio must be at least 1.0")
+        self.s2mel_continuous_singleton_wait_ms = float(getattr(self.config, "s2mel_continuous_singleton_wait_ms", 0.0))
+        if self.s2mel_continuous_singleton_wait_ms < 0:
+            raise ValueError("s2mel_continuous_singleton_wait_ms must be non-negative")
+        self.requires_request_ids = self.stepwise_generation
+        self._continuous_cfm_states: dict[str, _ContinuousDecoderRequestState] = {}
+        self._last_finished_request_ids: set[str] = set()
+        self._deferred_cleanup_ids: set[str] = set()
+        self.s2mel_async_vocoder: bool = bool(getattr(self.config, "s2mel_async_vocoder", False))
+        self.s2mel_async_vocoder_max_pending_batches = int(
+            getattr(self.config, "s2mel_async_vocoder_max_pending_batches", 2)
+        )
+        if self.s2mel_async_vocoder_max_pending_batches < 1:
+            raise ValueError("s2mel_async_vocoder_max_pending_batches must be at least 1")
+        self._async_vocoder_stream: torch.cuda.Stream | None = None
+        self._pending_vocoder_batches: deque[_PendingVocoderBatch] = deque()
+        self._ready_vocoder_outputs: dict[str, tuple[_ContinuousDecoderRequestState, torch.Tensor]] = {}
 
         # Run the DiT estimator under bf16 autocast (flash attention + faster
         # GEMMs); the CFM Euler solver stays float32. Disable via deploy YAML
@@ -247,6 +304,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         )
         self._vocoder_graph: Any = None
         self._compiled_vocoder: Any = None
+        self.s2mel_vocoder_fused_activation = bool(getattr(self.config, "s2mel_vocoder_fused_activation", False))
         # Capture the DiT transformer core into per-shape CUDA graphs.
         # Enable via `s2mel_dit_cuda_graph: true`.
         self.s2mel_dit_cuda_graph: bool = getattr(self.config, "s2mel_dit_cuda_graph", False)
@@ -268,19 +326,21 @@ class IndexTTS2S2MelDecoder(nn.Module):
         self.s2mel_vocoder_compile_shapes: list[int] | None = getattr(self.config, "s2mel_vocoder_compile_shapes", None)
         logger.info(
             "[S2Mel] dit_bf16=%s, vocoder_bf16=%s, "
-            "vocoder_cuda_graph=%s, vocoder_torch_compile=%s, "
+            "vocoder_cuda_graph=%s, vocoder_torch_compile=%s, fused_activation=%s, "
             "dit_cuda_graph=%s, dit_torch_compile=%s, dit_compile_mode=%s, "
-            "dit_graph_lru=%d, cfm_batch_size=%d, vocoder_buckets=%s, "
+            "dit_graph_lru=%d, cfm_batch_size=%d, continuous_batching=%s, vocoder_buckets=%s, "
             "vocoder_compile_shapes=%s",
             self.s2mel_dit_bf16,
             self.s2mel_vocoder_bf16,
             self.s2mel_vocoder_cuda_graph,
             self.s2mel_vocoder_torch_compile,
+            self.s2mel_vocoder_fused_activation,
             self.s2mel_dit_cuda_graph,
             self.s2mel_dit_torch_compile,
             self.s2mel_dit_torch_compile_mode,
             self.s2mel_dit_cuda_graph_max_graphs,
             self.s2mel_cfm_batch_size,
+            self.stepwise_generation,
             self.s2mel_vocoder_capture_sizes,
             self.s2mel_vocoder_compile_shapes,
         )
@@ -315,12 +375,30 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if model_intermediate_buffer:
             request_infos = [info for info in model_intermediate_buffer if isinstance(info, dict)]
         additional_information: dict[str, Any] = request_infos[0] if request_infos else {}
-        self._validate_payload_policy(request_infos)
-        self._validate_payload_contract(request_infos)
 
         device = input_ids.device
         model_dtype = self._s2mel_model_dtype()
 
+        request_ids = kwargs.get("request_ids")
+        if self.stepwise_generation and (request_infos or request_ids is not None):
+            if not isinstance(request_ids, (list, tuple)):
+                raise ValueError("IndexTTS continuous batching requires request_ids in batch order")
+            if len(request_ids) != len(request_infos):
+                raise ValueError(
+                    "IndexTTS continuous request/payload batch mismatch: "
+                    f"request_ids={len(request_ids)} payloads={len(request_infos)}"
+                )
+            self._validate_payload_policy(request_infos)
+            self._validate_payload_contract(request_infos)
+            return self._forward_continuous(
+                request_ids=[str(request_id) for request_id in request_ids],
+                request_infos=request_infos,
+                device=device,
+                model_dtype=model_dtype,
+            )
+
+        self._validate_payload_policy(request_infos)
+        self._validate_payload_contract(request_infos)
         logger.debug(
             "[S2Mel forward] model_intermediate_buffer len=%d, keys=%s",
             len(model_intermediate_buffer) if model_intermediate_buffer else 0,
@@ -600,7 +678,12 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # 6. BigVGAN vocoding
         vocoder_name = self._get_resolved_vocoder_source()
         voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
-        bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+        bigvgan = _load_bigvgan(
+            vocoder_name,
+            device,
+            voc_dtype,
+            use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+        )
         vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
         with torch.no_grad():
             wavs = self._vocode_mels(
@@ -831,6 +914,476 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if any(output is None for output in outputs):
             raise RuntimeError("IndexTTS CFM failed to produce every request output")
         return [output for output in outputs if output is not None]
+
+    def take_finished_request_ids(self) -> set[str]:
+        """Return this tick's completed requests exactly once."""
+        finished = self._last_finished_request_ids
+        self._last_finished_request_ids = set()
+        return finished
+
+    def on_requests_finished(self, request_ids: Iterable[str]) -> None:
+        """Defer cleanup because the runner invokes this hook before forward."""
+        self._deferred_cleanup_ids.update(str(request_id) for request_id in request_ids)
+
+    def _discard_continuous_requests(self, request_ids: set[str]) -> None:
+        if not request_ids:
+            return
+        cfm = self.s2mel.models["cfm"]
+        cfm.discard_euler_group_cache(request_ids)
+        for request_id in request_ids:
+            self._continuous_cfm_states.pop(request_id, None)
+            self._ready_vocoder_outputs.pop(request_id, None)
+        self._reap_cancelled_vocoder_batches()
+
+    def _flush_deferred_cleanup(self) -> None:
+        if not self._deferred_cleanup_ids:
+            return
+        cleanup_ids = self._deferred_cleanup_ids
+        self._discard_continuous_requests(cleanup_ids)
+        self._deferred_cleanup_ids = set()
+
+    def flush_finished_requests(self) -> None:
+        """Release deferred state when the runner has no in-flight stepwise work."""
+        self._flush_deferred_cleanup()
+
+    def _get_or_initialize_continuous_request(
+        self,
+        *,
+        request_id: str,
+        info: dict[str, Any],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> _ContinuousDecoderRequestState:
+        state = self._continuous_cfm_states.get(request_id)
+        if state is not None:
+            return state
+        state = self._initialize_continuous_request(
+            request_id=request_id,
+            info=info,
+            device=device,
+            model_dtype=model_dtype,
+        )
+        self._continuous_cfm_states[request_id] = state
+        return state
+
+    def _initialize_continuous_request(
+        self,
+        *,
+        request_id: str,
+        info: dict[str, Any],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> _ContinuousDecoderRequestState:
+        (
+            mel_codes,
+            latent,
+            _,
+            code_lens,
+            s_ref,
+            ref_mel,
+            style,
+            ref_lengths,
+        ) = self._build_batched_inputs(
+            [info],
+            device=device,
+            model_dtype=model_dtype,
+        )
+        code_length = code_lens[0]
+        if code_length < 1:
+            raise ValueError(f"IndexTTS continuous request {request_id} has no semantic codes")
+
+        semantic_codec = load_semantic_codec(
+            self.model_path,
+            self.config.semantic_codec,
+            device,
+            codec_type=self.semantic_codec_type,
+            checkpoint_name=getattr(
+                self.config,
+                "semantic_codec_checkpoint",
+                None,
+            ),
+        )
+        semantic = self._build_semantic_embedding(
+            codec=semantic_codec,
+            mel_codes=mel_codes[:, :code_length],
+            latent=(latent[:, :code_length] if latent is not None else None),
+            dtype=model_dtype,
+        )
+        semantic_time_scale = (
+            int(getattr(semantic_codec, "downsample_scale", 1) or 1) if self.semantic_codec_type == "enhanced" else 1
+        )
+        duration_factor = self._duration_factors([info], 1)[0]
+        target_length = int(code_length * semantic_time_scale * self.mel_code_to_frame_ratio * duration_factor)
+        if target_length < 1:
+            raise ValueError(f"IndexTTS continuous request {request_id} has no target frames")
+        target_lengths = torch.tensor([target_length], device=device, dtype=torch.long)
+        condition = self.s2mel.models["length_regulator"](
+            semantic,
+            ylens=target_lengths,
+            n_quantizers=3,
+            f0=None,
+            max_ylen=target_length,
+        )[0]
+
+        ref_length = 0
+        if s_ref is not None and ref_mel is not None:
+            ref_length = ref_lengths[0]
+            if s_ref.ndim == 3:
+                s_ref_emb = s_ref.to(device=device, dtype=model_dtype)
+            else:
+                if self.semantic_codec_type != "repcodec":
+                    raise ValueError("IndexTTS 2.5 expects W2V-BERT reference embeddings, not semantic-code indices")
+                codebook_size = self.config.semantic_codec.get("codebook_size", 8192)
+                s_ref_codes = s_ref.long().clamp(0, codebook_size - 1)
+                with torch.no_grad():
+                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(1))
+                s_ref_emb = s_ref_emb.transpose(1, 2).to(dtype=model_dtype)
+            prompt_condition = self.s2mel.models["length_regulator"](
+                s_ref_emb,
+                ylens=torch.tensor([ref_length], device=device, dtype=torch.long),
+                n_quantizers=3,
+                f0=None,
+                max_ylen=ref_length,
+            )[0]
+            mu = torch.cat([prompt_condition, condition], dim=1)
+        else:
+            ref_mel = torch.zeros(1, 80, 0, device=device, dtype=model_dtype)
+            mu = condition
+
+        if style is None:
+            style = torch.zeros(1, 192, device=device, dtype=model_dtype)
+        elif style.ndim == 1:
+            style = style.unsqueeze(0)
+
+        self._configure_dit_runtime(device)
+        cfm = self.s2mel.models["cfm"]
+        cfm.estimator_autocast_dtype = torch.bfloat16 if self.s2mel_dit_bf16 else None
+        estimator = cfm.estimator
+        required_cache_batch = max(
+            2,
+            self.s2mel_cfm_batch_size * (2 if self.inference_cfg_rate > 0 else 1),
+        )
+        if (
+            estimator.transformer.freqs_cis is None
+            or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
+        ):
+            estimator.setup_caches(max_batch_size=required_cache_batch, max_seq_length=16384)
+        self._set_dit_full_mask_fast_path(estimator, enabled=True)
+        self._enable_dit_cuda_graph(estimator)
+
+        total_length = ref_length + target_length
+        seeds = self._cfm_request_seeds([info], batch_size=1)
+        initial_noise = self._sample_cfm_noise(
+            seeds=seeds,
+            channels=cfm.in_channels,
+            length=total_length,
+            device=device,
+            dtype=torch.float32,
+        )
+        cfm_state = cfm.init_euler_state(
+            request_id=request_id,
+            mu=mu.float(),
+            x_lens=torch.tensor([total_length], device=device, dtype=torch.long),
+            prompt=ref_mel.float(),
+            style=style.float(),
+            n_timesteps=self.diffusion_steps,
+            inference_cfg_rate=self.inference_cfg_rate,
+            initial_noise=initial_noise,
+            prompt_lens=torch.tensor([ref_length], device=device, dtype=torch.long),
+        )
+        return _ContinuousDecoderRequestState(
+            cfm_state=cfm_state,
+            target_length=target_length,
+            ref_length=ref_length,
+        )
+
+    def _advance_continuous_cfm(
+        self,
+        request_ids: list[str],
+    ) -> list[_ContinuousDecoderRequestState]:
+        """Advance length-compatible request groups by one Euler step."""
+        grouped: dict[tuple[object, ...], list[_ContinuousDecoderRequestState]] = {}
+        finished: list[_ContinuousDecoderRequestState] = []
+        for request_id in request_ids:
+            state = self._continuous_cfm_states[request_id]
+            if getattr(state, "vocoder_queued", False):
+                continue
+            if getattr(state, "output_emitted", False):
+                continue
+            if state.cfm_state.finished:
+                finished.append(state)
+                continue
+            cfm_state = state.cfm_state
+            key = (
+                getattr(cfm_state, "inference_cfg_rate", None),
+                cfm_state.x.dtype,
+                cfm_state.x.device,
+            )
+            grouped.setdefault(key, []).append(state)
+
+        cfm = self.s2mel.models["cfm"]
+        max_group_size = self.s2mel_cfm_batch_size
+        max_padding_ratio = self.s2mel_continuous_max_padding_ratio
+        for compatible_states in grouped.values():
+            compatible_states.sort(key=lambda state: int(state.cfm_state.x.shape[-1]))
+            ratio_groups: list[list[_ContinuousDecoderRequestState]] = []
+            group: list[_ContinuousDecoderRequestState] = []
+            group_min_length = 0
+            for state in compatible_states:
+                state_length = int(state.cfm_state.x.shape[-1])
+                if group and (len(group) >= max_group_size or state_length / group_min_length > max_padding_ratio):
+                    ratio_groups.append(group)
+                    group = []
+                if not group:
+                    group_min_length = state_length
+                group.append(state)
+            if group:
+                ratio_groups.append(group)
+
+            if self.s2mel_continuous_singleton_wait_ms:
+                now = time.monotonic()
+                wait_s = self.s2mel_continuous_singleton_wait_ms / 1000.0
+                runnable_groups: list[list[_ContinuousDecoderRequestState]] = []
+                for group in ratio_groups:
+                    state = group[0]
+                    if len(group) > 1 or state.cfm_state.step_index > 0:
+                        runnable_groups.append(group)
+                    elif state.cfm_admit_after and now >= state.cfm_admit_after:
+                        runnable_groups.append(group)
+                    else:
+                        if not state.cfm_admit_after:
+                            state.cfm_admit_after = now + wait_s
+                ratio_groups = runnable_groups
+
+            for group in ratio_groups:
+                euler_states = [state.cfm_state for state in group]
+                physical_lengths = [int(state.x.shape[-1]) for state in euler_states]
+                estimator = getattr(cfm, "estimator", None)
+                if estimator is not None:
+                    full_mask = len(set(physical_lengths)) == 1
+                    self._set_dit_full_mask_fast_path(estimator, enabled=full_mask)
+                    if full_mask:
+                        self._enable_dit_cuda_graph(estimator)
+                cfm.run_euler_step(euler_states)
+                finished.extend(state for state in group if state.cfm_state.finished)
+        return finished
+
+    def _forward_continuous(
+        self,
+        *,
+        request_ids: list[str],
+        request_infos: list[dict[str, Any]],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> OmniOutput:
+        existing_request_ids = set(self._continuous_cfm_states)
+        try:
+            return self._forward_continuous_impl(
+                request_ids=request_ids,
+                request_infos=request_infos,
+                device=device,
+                model_dtype=model_dtype,
+            )
+        except Exception:
+            initialized_request_ids = set(self._continuous_cfm_states).difference(existing_request_ids)
+            self._discard_continuous_requests(initialized_request_ids)
+            raise
+        finally:
+            self._flush_deferred_cleanup()
+
+    def _async_vocoder_enabled(self, device: torch.device) -> bool:
+        return self.s2mel_async_vocoder and device.type == "cuda"
+
+    def _get_async_vocoder_stream(
+        self,
+        device: torch.device,
+    ) -> torch.cuda.Stream:
+        stream = self._async_vocoder_stream
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._async_vocoder_stream = stream
+        return stream
+
+    def _enqueue_async_vocoder(
+        self,
+        *,
+        states: list[_ContinuousDecoderRequestState],
+        request_ids: list[str],
+        mels: list[torch.Tensor],
+        vocode: Any,
+        voc_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        stream = self._get_async_vocoder_stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        for mel in mels:
+            mel.record_stream(stream)
+        with torch.cuda.stream(stream):
+            wavs = self._vocode_mels(mels=mels, vocode=vocode, voc_dtype=voc_dtype)
+            event = torch.cuda.Event()
+            event.record(stream)
+        for wav in wavs:
+            wav.record_stream(stream)
+        self._pending_vocoder_batches.append(
+            _PendingVocoderBatch(tuple(request_ids), tuple(states), tuple(wavs), event)
+        )
+        for state in states:
+            state.vocoder_queued = True
+
+    def _collect_ready_vocoder_outputs(
+        self,
+        request_ids: set[str],
+    ) -> dict[str, torch.Tensor]:
+        """Poll CUDA work and stage outputs scheduled in this tick."""
+        remaining: deque[_PendingVocoderBatch] = deque()
+        while self._pending_vocoder_batches:
+            batch = self._pending_vocoder_batches.popleft()
+            if not batch.event.query():
+                remaining.append(batch)
+                continue
+            for request_id, state, wav in zip(
+                batch.request_ids,
+                batch.states,
+                batch.wavs,
+                strict=True,
+            ):
+                if self._continuous_cfm_states.get(request_id) is not state:
+                    continue
+                self._ready_vocoder_outputs[request_id] = (state, wav)
+        self._pending_vocoder_batches = remaining
+
+        audio_by_request: dict[str, torch.Tensor] = {}
+        for request_id in request_ids:
+            ready = self._ready_vocoder_outputs.get(request_id)
+            if ready is None:
+                continue
+            state, wav = ready
+            if self._continuous_cfm_states.get(request_id) is state:
+                audio_by_request[request_id] = wav.cpu()
+            else:
+                self._ready_vocoder_outputs.pop(request_id, None)
+        return audio_by_request
+
+    def _commit_ready_vocoder_outputs(self, request_ids: set[str]) -> None:
+        """Consume staged async outputs after the tick output is materialized."""
+        for request_id in request_ids:
+            ready = self._ready_vocoder_outputs.pop(request_id, None)
+            if ready is None:
+                continue
+            state, _ = ready
+            if self._continuous_cfm_states.get(request_id) is state:
+                state.output_emitted = True
+
+    def _make_async_vocoder_room(
+        self,
+        request_ids: set[str],
+    ) -> dict[str, torch.Tensor]:
+        """Bound retained GPU batches, blocking only when the queue is full."""
+        audio_by_request: dict[str, torch.Tensor] = {}
+        while len(self._pending_vocoder_batches) >= self.s2mel_async_vocoder_max_pending_batches:
+            self._pending_vocoder_batches[0].event.synchronize()
+            audio_by_request.update(self._collect_ready_vocoder_outputs(request_ids))
+        return audio_by_request
+
+    def _reap_cancelled_vocoder_batches(self) -> None:
+        """Release ready batches whose requests were all cancelled."""
+        remaining: deque[_PendingVocoderBatch] = deque()
+        while self._pending_vocoder_batches:
+            batch = self._pending_vocoder_batches.popleft()
+            has_live_request = any(
+                self._continuous_cfm_states.get(request_id) is state
+                for request_id, state in zip(
+                    batch.request_ids,
+                    batch.states,
+                    strict=True,
+                )
+            )
+            if has_live_request:
+                remaining.append(batch)
+        self._pending_vocoder_batches = remaining
+
+    def _forward_continuous_impl(
+        self,
+        *,
+        request_ids: list[str],
+        request_infos: list[dict[str, Any]],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> OmniOutput:
+        self._last_finished_request_ids = set()
+        audio_by_request = self._collect_ready_vocoder_outputs(set(request_ids))
+        for request_id, info in zip(request_ids, request_infos, strict=True):
+            self._get_or_initialize_continuous_request(
+                request_id=request_id,
+                info=info,
+                device=device,
+                model_dtype=model_dtype,
+            )
+
+        finished_states = self._advance_continuous_cfm(request_ids)
+        sync_output_states: dict[str, _ContinuousDecoderRequestState] = {}
+        if finished_states:
+            cfm = self.s2mel.models["cfm"]
+            finished_mels: list[torch.Tensor] = []
+            finished_ids: list[str] = []
+            for state in finished_states:
+                cfm_output = cfm.finalize_euler_state(state.cfm_state)
+                start = state.ref_length
+                finished_mels.append(cfm_output[0, :, start : start + state.target_length])
+                finished_ids.append(state.cfm_state.request_id)
+
+            vocoder_name = self._get_resolved_vocoder_source()
+            voc_dtype = torch.bfloat16 if self.s2mel_vocoder_bf16 and device.type == "cuda" else torch.float32
+            bigvgan = _load_bigvgan(
+                vocoder_name,
+                device,
+                voc_dtype,
+                use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+            )
+            vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
+            if self._async_vocoder_enabled(device):
+                audio_by_request.update(self._make_async_vocoder_room(set(request_ids)))
+                self._enqueue_async_vocoder(
+                    states=finished_states,
+                    request_ids=finished_ids,
+                    mels=finished_mels,
+                    vocode=vocode,
+                    voc_dtype=voc_dtype,
+                    device=device,
+                )
+            else:
+                wavs = self._vocode_mels(
+                    mels=finished_mels,
+                    vocode=vocode,
+                    voc_dtype=voc_dtype,
+                )
+                for state, request_id, wav in zip(
+                    finished_states,
+                    finished_ids,
+                    wavs,
+                    strict=True,
+                ):
+                    audio_by_request[request_id] = wav.cpu()
+                    sync_output_states[request_id] = state
+
+        if not audio_by_request:
+            return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
+
+        finished_request_ids = set(audio_by_request)
+        sample_rate = torch.tensor(22050, dtype=torch.int32)
+        output = OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "audio": [audio_by_request.get(request_id) for request_id in request_ids],
+                "sr": [sample_rate if request_id in audio_by_request else None for request_id in request_ids],
+            },
+        )
+        self._commit_ready_vocoder_outputs(finished_request_ids)
+        for request_id, state in sync_output_states.items():
+            if self._continuous_cfm_states.get(request_id) is state:
+                state.output_emitted = True
+        self._last_finished_request_ids = finished_request_ids
+        return output
 
     @staticmethod
     def _cfm_group_indices(
@@ -1262,7 +1815,21 @@ class IndexTTS2S2MelDecoder(nn.Module):
         try:
             vocoder_name = self._get_resolved_vocoder_source()
             voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
-            bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+            bigvgan = _load_bigvgan(
+                vocoder_name,
+                device,
+                voc_dtype,
+                use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+            )
+            if getattr(self, "s2mel_vocoder_fused_activation", False) and device.type == "cuda":
+                from vllm_omni.model_executor.models.indextts2.s2mel.modules.alias_free_cuda.activation import (
+                    OfficialFusedAliasFreeActivation1d,
+                )
+
+                if OfficialFusedAliasFreeActivation1d.preload_extension():
+                    logger.info("IndexTTS fused BigVGAN activation preloaded")
+                else:
+                    logger.warning("IndexTTS fused BigVGAN activation unavailable; using eager activation")
             load_semantic_codec(
                 self.model_path,
                 self.config.semantic_codec,

@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     IndexTTS2Config,
     IndexTTS25Config,
@@ -32,6 +33,9 @@ def test_indextts25_defaults_are_distinct_from_v2():
     assert v25.semantic_codec_checkpoint == "codec.pth"
     assert v25.tokenizer_file == "multilingual_zh_ja_yue_char_del.tiktoken"
     assert v25.vocab_size == v25.gpt["number_mel_codes"]
+    assert v25.stage0_conditioning_prefix_cache is False
+    assert v25.stage0_conditioning_prefix_cache_max_bytes == 64 * 1024**2
+    assert v25.s2mel_vocoder_fused_activation is False
 
 
 def test_indextts25_explicit_overrides_win_over_defaults():
@@ -63,6 +67,22 @@ def test_indextts25_pipeline_is_registered_with_two_distinct_stages():
         "IndexTTS25S2MelDecoder",
     ]
     assert all("tokenizer" not in stage.extras for stage in INDEXTTS25_PIPELINE.stages)
+    assert INDEXTTS25_PIPELINE.stages[1].scheduler_cls == (
+        "vllm_omni.model_executor.models.indextts2.scheduler.IndexTTS2GenerationScheduler"
+    )
+
+
+def test_indextts25_continuous_deploy_selects_model_owned_worker():
+    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "indextts2_5_continuous.yaml"
+    stages = merge_pipeline_deploy(
+        INDEXTTS25_PIPELINE,
+        load_deploy_config(deploy_path),
+    )
+    stage1 = next(stage for stage in stages if stage.stage_id == 1)
+
+    assert stage1.yaml_engine_args["worker_cls"] == (
+        "vllm_omni.model_executor.models.indextts2.runner.IndexTTS2GenerationWorker"
+    )
 
 
 def test_indextts25_default_deploy_selects_validated_triton_backend():

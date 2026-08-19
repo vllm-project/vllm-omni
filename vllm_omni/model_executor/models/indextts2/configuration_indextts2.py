@@ -188,7 +188,10 @@ class IndexTTS25Config(IndexTTS2Config):
             "semantic_codec_checkpoint": "codec.pth",
             "semantic_codec_type": "enhanced",
             "use_gpt_latent": False,
+            "stage0_conditioning_prefix_cache": False,
+            "stage0_conditioning_prefix_cache_max_bytes": 64 * 1024**2,
             "version": 2.5,
+            "s2mel_vocoder_fused_activation": False,
         }
     )
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -474,3 +475,24 @@ def test_v25_default_emotion_reuses_speaker_w2v_features(monkeypatch):
         "emo": speaker_features,
         "alpha": 1.0,
     }
+
+
+def test_conditioning_prefix_cache_is_bounded_lru():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.stage0_conditioning_prefix_cache = True
+    talker.stage0_conditioning_prefix_cache_max_bytes = 16
+    talker._conditioning_prefix_cache = OrderedDict()
+    talker._conditioning_prefix_cache_bytes = 0
+
+    first = torch.arange(2, dtype=torch.float32)
+    second = first + 2
+    third = first + 4
+    talker._put_conditioning_prefix_cache(("first",), first)
+    talker._put_conditioning_prefix_cache(("second",), second)
+    assert torch.equal(talker._get_conditioning_prefix_cache(("first",)), first)
+    talker._put_conditioning_prefix_cache(("third",), third)
+
+    assert talker._get_conditioning_prefix_cache(("second",)) is None
+    assert torch.equal(talker._get_conditioning_prefix_cache(("first",)), first)
+    assert torch.equal(talker._get_conditioning_prefix_cache(("third",)), third)

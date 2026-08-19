@@ -90,7 +90,7 @@ class InterpolateRegulator(nn.Module):
 
                 self.vq = VectorQuantize(channels, codebook_size, 8)
 
-    def forward(self, x, ylens=None, n_quantizers=None, f0=None):
+    def forward(self, x, ylens=None, n_quantizers=None, f0=None, max_ylen: int | None = None):
         # apply token drop
         if self.training:
             n_quantizers = torch.ones((x.shape[0],)) * self.n_codebooks
@@ -120,9 +120,10 @@ class InterpolateRegulator(nn.Module):
         else:
             x = self.content_in_proj(x)
         # x in (B, T, D)
-        mask = sequence_mask(ylens).unsqueeze(-1)
+        mask = sequence_mask(ylens, max_ylen).unsqueeze(-1)
+        interpolate_size = max_ylen if max_ylen is not None else ylens.max()
         if self.interpolate:
-            x = F.interpolate(x.transpose(1, 2).contiguous(), size=ylens.max(), mode="nearest")
+            x = F.interpolate(x.transpose(1, 2).contiguous(), size=interpolate_size, mode="nearest")
         else:
             x = x.transpose(1, 2).contiguous()
             mask = mask[:, : x.size(2), :]
@@ -135,7 +136,11 @@ class InterpolateRegulator(nn.Module):
                 quantized_f0 = f0_to_coarse(f0, self.n_f0_bins)
                 quantized_f0 = quantized_f0.clamp(0, self.n_f0_bins - 1).long()
                 f0_emb = self.f0_embedding(quantized_f0)
-                f0_emb = F.interpolate(f0_emb.transpose(1, 2).contiguous(), size=ylens.max(), mode="nearest")
+                f0_emb = F.interpolate(
+                    f0_emb.transpose(1, 2).contiguous(),
+                    size=interpolate_size,
+                    mode="nearest",
+                )
                 x = x + f0_emb
         out = self.model(x).transpose(1, 2).contiguous()
         if hasattr(self, "vq"):

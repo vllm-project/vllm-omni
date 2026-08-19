@@ -1,0 +1,78 @@
+async_chunk: false
+trust_remote_code: true
+pipeline: indextts2_5
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+stages:
+  - stage_id: 0
+    max_num_seqs: 32
+    attention_backend: TRITON_ATTN
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    skip_tokenizer_init: true
+    async_scheduling: true
+    max_num_batched_tokens: 2560
+    max_model_len: 2560
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    hf_overrides:
+      use_gpt_latent: false
+      # Reuse exact Stage 0 artifacts for repeated reference audio. The GPU
+      # prefix is bounded by this LRU; custom emotion controls bypass it.
+      stage0_conditioning_prefix_cache: true
+      stage0_conditioning_prefix_cache_max_bytes: 67108864
+    # Stage 0 uses plain vLLM sampling, not the upstream default
+    # num_beams=3 beam search. Use upstream num_beams=1 for parity comparisons.
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      max_tokens: 1500
+      repetition_penalty: 10.0
+      stop_token_ids: [8193]
+      detokenize: false
+  - stage_id: 1
+    worker_cls: vllm_omni.model_executor.models.indextts2.runner.IndexTTS2GenerationWorker
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    enforce_eager: true
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    max_model_len: 32768
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    hf_overrides:
+      use_gpt_latent: false
+      diffusion_steps: 25
+      s2mel_dit_bf16: true
+      s2mel_cfm_batch_size: 32
+      stepwise_generation: true
+      s2mel_continuous_max_padding_ratio: 1.15
+      # Experimental one-tick admission delay for new singleton CFM groups.
+      # Keep disabled until a full Seed-TTS latency/throughput A/B is run.
+      s2mel_continuous_singleton_wait_ms: 0.0
+      inference_cfg_rate: 0.7
+      s2mel_dit_cuda_graph: false
+      s2mel_dit_torch_compile: true
+      s2mel_dit_torch_compile_mode: default
+      # Built during Stage 1 warmup; unsupported systems fall back to eager.
+      s2mel_vocoder_fused_activation: true
+      s2mel_vocoder_torch_compile: false
+      # Experimental: overlap completed BigVGAN work with later CFM ticks.
+      # Keep disabled until full-model throughput and cancellation tests pass.
+      s2mel_async_vocoder: false
+      s2mel_async_vocoder_max_pending_batches: 2
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 32767

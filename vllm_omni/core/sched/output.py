@@ -113,3 +113,6 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # Ordered stateful-generation requests that must advance even though they
+    # have no token or KV-cache work in this scheduler tick.
+    stepwise_req_ids: list[str] = field(default_factory=list)
