@@ -40,7 +40,16 @@ def _cleanup_shm_handle(value: object) -> None:
 
 def _result_queue_worker(connection, rank: int) -> None:
     """Send one nested NumPy result through a worker-owned MessageQueue."""
-    result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+    # The payload itself is small because the large arrays travel through
+    # separate shared-memory handles. Avoid the 240 MiB MessageQueue default
+    # per worker so this lifecycle test also fits in constrained CI /dev/shm.
+    result_mq = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        local_reader_ranks=[0],
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=2,
+    )
     try:
         connection.send(result_mq.export_handle())
         assert connection.recv() == "reader-ready"
@@ -70,7 +79,9 @@ def _result_queue_worker(connection, rank: int) -> None:
 
 def test_per_worker_result_queues_release_nested_numpy_shm_and_processes() -> None:
     """Exercise the production per-worker queue/pump/SHM lifecycle."""
-    ctx = mp.get_context("spawn")
+    # This test covers queue/pump/SHM cleanup rather than process bootstrap.
+    # Fork avoids re-importing the pytest runner in every constrained CI child.
+    ctx = mp.get_context("fork")
     parent_connections = []
     processes = []
     result_mqs = []
