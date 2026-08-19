@@ -167,6 +167,9 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = 50 * 1024 * 1024
 MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 MINIMAX_H3_MAX_REFERENCE_COUNT = 12
+MINIMAX_H3_MAX_REFERENCE_IMAGE_COUNT = 9
+MINIMAX_H3_MAX_REFERENCE_VIDEO_COUNT = 3
+MINIMAX_H3_MAX_REFERENCE_AUDIO_COUNT = 3
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
@@ -3196,6 +3199,30 @@ async def _persist_uploaded_media_references(
     return images, videos, audios
 
 
+def _validate_minimax_h3_typed_reference_counts(
+    image_items: list[Any],
+    video_items: list[Any],
+    audio_items: list[Any],
+) -> None:
+    counts = (
+        ("image", len(image_items), MINIMAX_H3_MAX_REFERENCE_IMAGE_COUNT),
+        ("video", len(video_items), MINIMAX_H3_MAX_REFERENCE_VIDEO_COUNT),
+        ("audio", len(audio_items), MINIMAX_H3_MAX_REFERENCE_AUDIO_COUNT),
+    )
+    for kind, count, maximum in counts:
+        if count > maximum:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"MiniMax H3 accepts at most {maximum} {kind} references.",
+            )
+    total = len(image_items) + len(video_items) + len(audio_items)
+    if total > MINIMAX_H3_MAX_REFERENCE_COUNT:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"MiniMax H3 accepts at most {MINIMAX_H3_MAX_REFERENCE_COUNT} total references.",
+        )
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
@@ -3335,6 +3362,11 @@ async def _parse_video_form(
         )
 
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
+    image_items = _reference_list(request.image_reference)
+    video_items = _reference_list(request.video_reference)
+    audio_items = _reference_list(request.audio_reference)
+    if supports_mixed_reference_inputs:
+        _validate_minimax_h3_typed_reference_counts(image_items, video_items, audio_items)
     if input_reference is not None:
         input_reference_bytes = await _read_upload_limited(
             input_reference,
@@ -3375,11 +3407,14 @@ async def _parse_video_form(
     else:
         video_paths: list[str] = []
         try:
-            image_items = _reference_list(request.image_reference)
-            video_items = _reference_list(request.video_reference)
             image_data = []
             for item in image_items:
-                media_data = await decode_input_reference(item, None, None)
+                media_data = await decode_input_reference(
+                    item,
+                    None,
+                    None,
+                    max_image_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES if supports_mixed_reference_inputs else None,
+                )
                 if not isinstance(media_data, Image.Image):
                     raise InvalidInputReferenceError("image_reference did not decode to an image")
                 image_data.append(media_data)
@@ -3392,6 +3427,7 @@ async def _parse_video_form(
                     None,
                     max_video_frames=decode_spec.max_frames,
                     video_keep=decode_spec.keep,
+                    max_video_bytes=MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES if supports_mixed_reference_inputs else None,
                 )
                 if not isinstance(media_data, VideoFrames):
                     raise InvalidInputReferenceError("video_reference did not decode to a video")
@@ -3435,15 +3471,22 @@ async def _parse_video_form(
     audio_paths = [] if reference_audio is None else list(_reference_list(reference_audio.path))
     if request.audio_reference is not None:
         try:
-            for audio_reference in _reference_list(request.audio_reference):
-                audio_paths.append(await decode_audio_url(audio_reference.audio_url))
-        except InvalidInputReferenceError as exc:
+            for audio_reference in audio_items:
+                audio_paths.append(
+                    await decode_audio_url(
+                        audio_reference.audio_url,
+                        max_bytes=MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES if supports_mixed_reference_inputs else None,
+                    )
+                )
+        except Exception as exc:
             _cleanup_video_references(reference_video, reference_audio)
             cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
             for path in audio_paths:
                 if path not in cleanup_paths and os.path.exists(path):
                     os.unlink(path)
-            raise HTTPException(400, detail=str(exc)) from exc
+            if isinstance(exc, InvalidInputReferenceError):
+                raise HTTPException(400, detail=str(exc)) from exc
+            raise
     if audio_paths:
         cleanup_paths = (
             tuple(audio_paths)
@@ -3485,6 +3528,12 @@ async def create_video(
     persists a queued job record, and starts generation in the background.
     """
     request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
+    if request.num_outputs_per_prompt != 1:
+        _cleanup_video_references(reference_video, reference_audio)
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="The asynchronous video endpoint currently supports num_outputs_per_prompt=1 only.",
+        )
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(

@@ -700,7 +700,7 @@ def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: M
     )
     test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
     response = test_client.post(
-        "/v1/videos",
+        "/v1/videos/sync",
         data={
             "prompt": "Use both references.",
             "image_reference": json.dumps(
@@ -721,8 +721,6 @@ def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: M
     )
 
     assert response.status_code == 200
-    video_id = response.json()["id"]
-    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     engine = test_client.app.state.openai_serving_video._engine_client
     multi_modal_data = engine.captured_prompt["multi_modal_data"]
     assert len(multi_modal_data["image"]) == 2
@@ -733,6 +731,19 @@ def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: M
     assert b"ftyp" in engine.captured_reference_video_bytes[0][:32]
     assert isinstance(multi_modal_data["audio"], str)
     assert engine.captured_sampling_params_list[0].num_outputs_per_prompt == 2
+
+
+def test_async_video_endpoint_rejects_multiple_outputs(test_client):
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "fan out", "num_outputs_per_prompt": "2"},
+    )
+
+    assert response.status_code == 400
+    assert "num_outputs_per_prompt=1" in response.json()["detail"]
+    assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
@@ -1493,6 +1504,120 @@ async def test_h3_upload_limit_checks_declared_size_before_read():
             OversizedUpload(),
             max_bytes=api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "items", "message"),
+    [
+        ("image_reference", [{"image_url": "https://example.com/image.png"}] * 10, "at most 9 image"),
+        ("video_reference", [{"video_url": "https://example.com/video.mp4"}] * 4, "at most 3 video"),
+        ("audio_reference", [{"audio_url": "https://example.com/audio.mp3"}] * 4, "at most 3 audio"),
+    ],
+)
+def test_h3_typed_reference_counts_are_rejected_before_decode(
+    test_client,
+    mocker: MockerFixture,
+    field: str,
+    items: list[dict[str, str]],
+    message: str,
+):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    decode_input = mocker.patch(
+        "vllm_omni.entrypoints.openai.api_server.decode_input_reference",
+        new=mocker.AsyncMock(side_effect=AssertionError("oversized list must not be decoded")),
+    )
+    decode_audio = mocker.patch(
+        "vllm_omni.entrypoints.openai.api_server.decode_audio_url",
+        new=mocker.AsyncMock(side_effect=AssertionError("oversized list must not be decoded")),
+    )
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "too many references", field: json.dumps(items)},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    decode_input.assert_not_called()
+    decode_audio.assert_not_called()
+
+
+def test_h3_total_typed_reference_count_is_rejected_before_decode(test_client, mocker: MockerFixture):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    decode_input = mocker.patch(
+        "vllm_omni.entrypoints.openai.api_server.decode_input_reference",
+        new=mocker.AsyncMock(side_effect=AssertionError("oversized list must not be decoded")),
+    )
+    decode_audio = mocker.patch(
+        "vllm_omni.entrypoints.openai.api_server.decode_audio_url",
+        new=mocker.AsyncMock(side_effect=AssertionError("oversized list must not be decoded")),
+    )
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "too many total references",
+            "image_reference": json.dumps([{"image_url": "https://example.com/image.png"}] * 9),
+            "video_reference": json.dumps([{"video_url": "https://example.com/video.mp4"}] * 3),
+            "audio_reference": json.dumps([{"audio_url": "https://example.com/audio.mp3"}]),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "at most 12 total references" in response.json()["detail"]
+    decode_input.assert_not_called()
+    decode_audio.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "constant", "data_url"),
+    [
+        ("image_reference", "MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES", "data:image/png;base64,YWJjZGU="),
+        ("video_reference", "MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES", "data:video/mp4;base64,YWJjZGU="),
+        ("audio_reference", "MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES", "data:audio/mp3;base64,YWJjZGU="),
+    ],
+)
+def test_h3_typed_reference_payload_limits(
+    test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    constant: str,
+    data_url: str,
+):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    monkeypatch.setattr(api_server, constant, 4)
+    url_field = {"image_reference": "image_url", "video_reference": "video_url", "audio_reference": "audio_url"}[field]
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "oversized reference", field: json.dumps({url_field: data_url})},
+    )
+
+    assert response.status_code == 400
+    assert "size limit" in response.json()["detail"]
+
+
+def test_malformed_audio_data_url_cleans_persisted_video_reference(test_client, mocker: MockerFixture, tmp_path):
+    source_path = tmp_path / "decoded.mp4"
+    source_path.write_bytes(b"video")
+    frames = video_api_utils.VideoFrames([Image.new("RGB", (8, 6))], source_path=str(source_path))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.api_server.decode_input_reference",
+        new=mocker.AsyncMock(return_value=frames),
+    )
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "malformed audio",
+            "video_reference": json.dumps({"video_url": "https://example.com/video.mp4"}),
+            "audio_reference": json.dumps({"audio_url": "data:audio/mp3;base64"}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "malformed audio data URL" in response.json()["detail"]
+    assert not source_path.exists()
 
 
 def test_invalid_seconds_returns_422(test_client):

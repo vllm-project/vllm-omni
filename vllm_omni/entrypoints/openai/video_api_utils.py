@@ -153,10 +153,18 @@ def _decode_media_bytes(
             ) from video_exc
 
 
-def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
+def _validate_payload_size(payload: bytes, *, max_bytes: int | None, source: str) -> None:
+    if max_bytes is not None and len(payload) > max_bytes:
+        raise InvalidInputReferenceError(f"Invalid {source}: payload exceeds the {max_bytes}-byte size limit.")
+
+
+def _decode_base64_image(input_reference: str, *, source: str, max_bytes: int | None = None) -> Image.Image:
     if input_reference:
         if input_reference.startswith("data:image"):
-            _, b64_data = input_reference.split(",", 1)
+            try:
+                _, b64_data = input_reference.split(",", 1)
+            except ValueError as exc:
+                raise InvalidInputReferenceError(f"Invalid {source}: malformed image data URL.") from exc
         else:
             b64_data = input_reference
 
@@ -164,13 +172,14 @@ def _decode_base64_image(input_reference: str, *, source: str) -> Image.Image:
             image_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: image data is not valid base64.") from exc
+        _validate_payload_size(image_bytes, max_bytes=max_bytes, source=source)
         return _decode_image_bytes(image_bytes, source=source)
     raise InvalidInputReferenceError(f"Invalid {source}: image data is empty.")
 
 
-async def decode_image_url(image_url: str) -> Image.Image:
+async def decode_image_url(image_url: str, *, max_bytes: int | None = None) -> Image.Image:
     if image_url.startswith("data:image"):
-        return _decode_base64_image(image_url, source="image_reference.image_url")
+        return _decode_base64_image(image_url, source="image_reference.image_url", max_bytes=max_bytes)
 
     if image_url.startswith(("http://", "https://")):
         allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
@@ -191,6 +200,7 @@ async def decode_image_url(image_url: str) -> Image.Image:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc
+        _validate_payload_size(response.content, max_bytes=max_bytes, source="image_reference.image_url")
         return _decode_image_bytes(response.content, source="image_reference.image_url")
 
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
@@ -203,10 +213,14 @@ def _decode_base64_video(
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
     source_path: str | None = None,
+    max_bytes: int | None = None,
 ) -> VideoFrames:
     if video_reference:
         if video_reference.startswith("data:video"):
-            _, b64_data = video_reference.split(",", 1)
+            try:
+                _, b64_data = video_reference.split(",", 1)
+            except ValueError as exc:
+                raise InvalidInputReferenceError(f"Invalid {source}: malformed video data URL.") from exc
         else:
             b64_data = video_reference
 
@@ -214,6 +228,7 @@ def _decode_base64_video(
             video_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
+        _validate_payload_size(video_bytes, max_bytes=max_bytes, source=source)
         if source_path is not None:
             with open(source_path, "wb") as output:
                 output.write(video_bytes)
@@ -232,6 +247,7 @@ async def decode_video_url(
     *,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
+    max_bytes: int | None = None,
 ) -> VideoFrames:
     if video_url.startswith("data:video"):
         path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
@@ -242,6 +258,7 @@ async def decode_video_url(
                 max_frames=max_frames,
                 keep=keep,
                 source_path=path,
+                max_bytes=max_bytes,
             )
         except Exception:
             if os.path.exists(path):
@@ -257,6 +274,7 @@ async def decode_video_url(
                 raise InvalidInputReferenceError(
                     "Invalid video_reference.video_url: failed to download video."
                 ) from exc
+        _validate_payload_size(response.content, max_bytes=max_bytes, source="video_reference.video_url")
         path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         try:
             with open(path, "wb") as output:
@@ -281,14 +299,17 @@ async def decode_video_url(
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
 
-async def decode_audio_url(audio_url: str) -> str:
+async def decode_audio_url(audio_url: str, *, max_bytes: int | None = None) -> str:
     """Decode an audio URL or data-URL to a temporary file path."""
     import tempfile
 
     audio_bytes: bytes | None = None
 
     if audio_url.startswith("data:audio"):
-        _, b64_data = audio_url.split(",", 1)
+        try:
+            _, b64_data = audio_url.split(",", 1)
+        except ValueError as exc:
+            raise InvalidInputReferenceError("Invalid audio_reference.audio_url: malformed audio data URL.") from exc
         try:
             audio_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:
@@ -310,6 +331,7 @@ async def decode_audio_url(audio_url: str) -> str:
 
     if not audio_bytes:
         raise InvalidInputReferenceError("Invalid audio_reference: audio data is empty.")
+    _validate_payload_size(audio_bytes, max_bytes=max_bytes, source="audio_reference.audio_url")
 
     suffix = ".wav"
     if audio_url.startswith("data:audio/"):
@@ -335,6 +357,8 @@ async def decode_input_reference(
     *,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
+    max_image_bytes: int | None = None,
+    max_video_bytes: int | None = None,
 ) -> Image.Image | VideoFrames | None:
     """Decode media input from multipart bytes, data URLs, or typed references."""
 
@@ -351,7 +375,7 @@ async def decode_input_reference(
         )
 
     if isinstance(image_reference, UrlImageReference):
-        return await decode_image_url(image_reference.image_url)
+        return await decode_image_url(image_reference.image_url, max_bytes=max_image_bytes)
     elif isinstance(image_reference, FileImageReference):
         raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
 
@@ -360,6 +384,7 @@ async def decode_input_reference(
             video_reference.video_url,
             max_frames=max_video_frames,
             keep=video_keep,
+            max_bytes=max_video_bytes,
         )
     elif isinstance(video_reference, FileVideoReference):
         raise InvalidInputReferenceError("Invalid video_reference: file_id is not supported yet.")
