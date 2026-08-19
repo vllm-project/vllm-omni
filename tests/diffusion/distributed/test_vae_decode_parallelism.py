@@ -72,8 +72,7 @@ def _to_float_array(data: Any) -> np.ndarray:
 
 
 def _extract_output_array(output: Any) -> np.ndarray:
-    req_out = output.request_output
-    payload = req_out.images[0]
+    payload = output.images[0]
     return _to_float_array(payload)
 
 

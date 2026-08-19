@@ -39,7 +39,7 @@ Other hardware is welcome as community validation lands.
 Launch the two-stage talker:
 
 ```bash
-vllm-omni serve inclusionAI/Ming-omni-tts-0.5B \
+vllm serve inclusionAI/Ming-omni-tts-0.5B \
     --deploy-config vllm_omni/deploy/ming_tts.yaml \
     --omni \
     --port 8091 \
@@ -169,6 +169,35 @@ python examples/online_serving/text_to_speech/ming_tts/openai_speech_client.py \
 
 `--ref-audio` matches upstream `use_spk_emb=True`; do not add `--ref-text`
 for the dialect case.
+
+**Offline smoke result on ROCm 7.2:**
+
+A later offline smoke run used the same MI300X model with the following software:
+
+- GPU: one AMD Instinct MI300X with 191.69 GiB visible HBM and gfx942
+- Kernel: Linux 6.8.0-134-generic, x86_64
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- ROCm or HIP: 7.2.53211
+- vLLM: 0.27.0+rocm723
+- vLLM Omni checkout: `73e1368c7bb940efe1a025859c9d6c8eeeb2e3f0`
+
+```bash
+python3 examples/offline_inference/text_to_speech/ming_tts/end2end.py \
+    --model inclusionAI/Ming-omni-tts-0.5B \
+    --deploy-config vllm_omni/deploy/ming_tts.yaml \
+    --case basic \
+    --text "你好，这是 AMD MI300X ROCm 配方验证。" \
+    --output-dir ./ming_tts_output \
+    --output-name ming_omni_tts_mi300x.wav \
+    --enforce-eager \
+    --log-stats \
+    --metadata-json ./ming_tts_manifest.json
+```
+
+The checked run produced a valid 44.1 kHz mono WAV with 4.80 seconds of audio, RMS 0.1449, and peak absolute amplitude 0.8621. The first request took 20.406 seconds, which gives a real time factor of 4.25. The stage weight loads used 1.31 GiB and 1.47 GiB and took 1.756 seconds and 1.264 seconds. The largest one second whole device memory sample was 91.05 GiB, including the reserved KV cache. Both stages used eager mode, and the AR stage selected `TRITON_ATTN`.
+
+The run used the official ROCm image built from `docker/Dockerfile.rocm`.
 
 ## Notes
 

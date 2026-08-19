@@ -364,7 +364,7 @@ async def test_omni_generate_request_id():
     Text modality only; asserts caller-visible ids are preserved across the
     multi-stage orchestrator path on H100.
     """
-    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=OMNI_STAGE_CONFIG)
+    engine = AsyncOmni(model=OMNI_MODEL, deploy_config=OMNI_STAGE_CONFIG)
     try:
         for req_id in _OMNI_REQ_IDS:
             async for output in engine.generate(

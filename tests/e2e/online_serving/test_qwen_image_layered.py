@@ -44,8 +44,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):

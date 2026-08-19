@@ -411,6 +411,51 @@ async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orch
             orchestrator_fixture.thread.join(timeout=5)
 
 
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_without_prompt_token_ids_fails_only_that_request(
+    orchestrator_factory,
+) -> None:
+    """R1.3 of #4855: an async-chunk request whose stage-0 prompt carries no
+    token ids cannot prewarm anything, so it must fail with a client error
+    instead of stalling.
+
+    Non-fatal is the point: ``fatal=True`` reads as "the engine died" and the
+    entrypoints act on it (``OmniLLM.generate`` raises out of its batch loop,
+    the serving layer calls ``terminate_if_errored``). One client's embeds-only
+    prompt must not reach other requests.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], async_chunk=True)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-embeds",
+            # No prompt_token_ids: what an embeds-only prompt looks like here.
+            prompt=SimpleNamespace(request_id="req-embeds"),
+            original_prompt={"prompt": "embeds only"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-embeds")
+        assert error_msg.fatal is False
+        assert error_msg.status_code == 400
+        assert error_msg.error_type == "BadRequestError"
+        assert error_msg.stage_id == 0
+        assert "prompt_token_ids" in error_msg.error
+
+        # Nothing was prewarmed downstream, and the request is gone.
+        assert stage1.add_request_calls == []
+        await _wait_for(lambda: "req-embeds" not in orchestrator_fixture.orchestrator.request_states)
+        assert orchestrator_fixture.thread.is_alive()
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
 # ───────── Direct unit tests for the fault-isolation helpers ─────────
 
 

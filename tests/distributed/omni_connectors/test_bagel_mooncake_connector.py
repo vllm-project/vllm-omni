@@ -314,7 +314,7 @@ def test_bagel_text2img_mooncake_connector(run_level):
         temp_config_file = _resolve_deploy_config(temp_config_file, run_level)
         with OmniRunner(
             "ByteDance-Seed/BAGEL-7B-MoT",
-            stage_configs_path=temp_config_file,
+            deploy_config=temp_config_file,
             stage_init_timeout=300,
         ) as runner:
             generated_image = _generate_bagel_image(runner.omni)
