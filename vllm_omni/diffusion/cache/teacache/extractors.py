@@ -1259,11 +1259,11 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
+    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        _BF16_DTYPE,
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
-        _modulate_scale_shift,
+        _build_rope_table,
         _required_kwarg,
     )
 
@@ -1318,7 +1318,7 @@ def extract_minimax_h3_context(
         raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
     device = x.device
 
-    rope_freqs = module.rope(img_position_ids).to(device)
+    rope_table = _build_rope_table(module.rope(img_position_ids).to(device))
 
     decoder_input, t_emb = module._embed(
         x=x,
@@ -1332,6 +1332,7 @@ def extract_minimax_h3_context(
         refiner_max_seqlen=refiner_max,
         seq_len=seq_len,
         device=device,
+        local_span=(0, seq_len),
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1339,19 +1340,18 @@ def extract_minimax_h3_context(
     cu_seqlens = cu_seqlens.to(device)
 
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
-    modulated_hidden = module.blocks[0].norm1(decoder_input)
-    modulated_input = _modulate_scale_shift(
-        modulated_hidden,
+    modulated_input = module.blocks[0].norm1(decoder_input)
+    modulated_input = indexed_scale_shift_(
+        modulated_input,
         shift_msa,
         scale_msa,
         combined_indices,
-        dtype=_BF16_DTYPE,
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         hidden, block_rope, block_combined = module.sp_prepare(
             decoder_input,
-            rope_freqs,
+            rope_table,
             combined_indices,
         )
         for block in module.blocks:
@@ -1359,7 +1359,7 @@ def extract_minimax_h3_context(
                 hidden,
                 t_emb=t_emb,
                 combined_indices=block_combined,
-                rope_freqs=block_rope,
+                rope_table=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,

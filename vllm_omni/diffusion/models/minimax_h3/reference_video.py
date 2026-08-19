@@ -44,31 +44,33 @@ def _nearest_multiple(value: float, multiple: int) -> int:
 
 
 def _probe_video(path: str) -> dict[str, Any]:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-count_frames",
-            "-show_entries",
-            (
-                "stream=codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,nb_frames,duration,"
-                "sample_aspect_ratio:format=format_name,size,duration"
-            ),
-            "-of",
-            "json",
-            path,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    show_entries = (
+        "stream=codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,nb_frames,duration,"
+        "sample_aspect_ratio:format=format_name,size,duration"
     )
+    command = ["ffprobe", "-v", "error", "-show_entries", show_entries, "-of", "json", path]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
     probe = json.loads(result.stdout)
     streams = probe.get("streams") or []
     video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
     if not video_streams:
         raise OmniClientError(f"media has no video stream: {path}")
     stream = video_streams[0]
+    raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
+    if raw_count in (None, "", "N/A"):
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", *command[3:]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        probe = json.loads(result.stdout)
+        streams = probe.get("streams") or []
+        video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+        if not video_streams:
+            raise OmniClientError(f"media has no video stream: {path}")
+        stream = video_streams[0]
+        raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
     try:
         numerator, denominator = str(stream["r_frame_rate"]).split("/", 1)
         fps = float(numerator) / float(denominator)
@@ -76,7 +78,6 @@ def _probe_video(path: str) -> dict[str, Any]:
         raise OmniClientError(f"cannot determine video FPS: {path}") from exc
     if not math.isfinite(fps) or fps <= 0:
         raise OmniClientError(f"cannot determine video FPS: {path}")
-    raw_count = stream.get("nb_read_frames") or stream.get("nb_frames")
     if raw_count in (None, "", "N/A"):
         raise OmniClientError(f"cannot determine video frame count: {path}")
     raw_duration = stream.get("duration")
@@ -404,19 +405,83 @@ def load_video_frames(path: str) -> np.ndarray:
     try:
         import decord
     except ImportError:
-        import av
-
-        with av.open(path) as container:
-            frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
-        if not frames:
-            raise OmniClientError(f"video has no frames: {path}")
-        return np.stack(frames)
+        meta = _probe_video(path)
+        return _decode_video_frames_ffmpeg(
+            path,
+            frame_count=int(meta["frame_count"]),
+            width=int(meta["width"]),
+            height=int(meta["height"]),
+        )
 
     reader = decord.VideoReader(path)
     if len(reader) <= 0:
         raise OmniClientError(f"video has no frames: {path}")
     frames = reader.get_batch(list(range(len(reader))))
     return frames.asnumpy() if hasattr(frames, "asnumpy") else np.asarray(frames)
+
+
+def _decode_video_frames_ffmpeg(
+    path: str,
+    *,
+    frame_count: int,
+    width: int,
+    height: int,
+    indices: list[int] | None = None,
+) -> np.ndarray:
+    frame_count = int(frame_count)
+    width = int(width)
+    height = int(height)
+    if frame_count <= 0:
+        raise OmniClientError(f"video has no frames: {path}")
+    if width <= 0 or height <= 0:
+        raise OmniClientError(f"video has invalid dimensions {width}x{height}: {path}")
+    if indices is not None and (not indices or any(index < 0 or index >= frame_count for index in indices)):
+        raise OmniClientError(f"invalid frame indices for {path}: {indices}")
+
+    output_frame_count = frame_count if indices is None else len(indices)
+    command = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-threads",
+        "0",
+        "-i",
+        path,
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if indices is not None:
+        select = "+".join(f"eq(n\\,{index})" for index in indices)
+        command.extend(["-vf", f"select={select}"])
+    command.extend(
+        [
+            "-vsync",
+            "0",
+            "-frames:v",
+            str(output_frame_count),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]
+    )
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+    )
+    frame_size = width * height * 3
+    expected_size = output_frame_count * frame_size
+    if len(result.stdout) != expected_size:
+        raise OmniClientError(f"decoded {len(result.stdout)} bytes from {path}, expected {expected_size}")
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape(
+        output_frame_count,
+        height,
+        width,
+        3,
+    )
 
 
 def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
@@ -434,11 +499,17 @@ def sample_reference_video_frames(prepared_path: str) -> dict[str, Any]:
     if not indices:
         raise OmniClientError(f"no frames sampled from {prepared_path}")
 
-    # The preparation step emits a lossless RGB stream. Decode it once and
-    # sample from that array so Qwen3VL sees exactly the same pixels as the
-    # video VAE, without starting one full-video ffmpeg decode per sample.
-    decoded_frames = load_video_frames(prepared_path)
-    frames = [np.asarray(decoded_frames[source_index]) for source_index in indices]
+    # The preparation step emits a lossless RGB stream. Decode only the sampled
+    # frames in one ffmpeg process so Qwen3VL sees the exact prepared pixels
+    # without decoding the entire high-bitrate stream into host memory.
+    decoded_frames = _decode_video_frames_ffmpeg(
+        prepared_path,
+        frame_count=int(meta["frame_count"]),
+        indices=indices,
+        width=meta["width"],
+        height=meta["height"],
+    )
+    frames = [np.asarray(frame) for frame in decoded_frames]
 
     timestamps = [index / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS for index in range(len(indices))]
     timestamps += [timestamps[-1]] * ((-len(timestamps)) % MINIMAX_H3_QWEN_TEMPORAL_PATCH)

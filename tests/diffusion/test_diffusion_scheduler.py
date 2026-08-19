@@ -8,12 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVContext, DiffusionKVRequest
+from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import (
     BaseScheduler,
@@ -85,6 +87,52 @@ def _new_ids(sched_output) -> list[str]:
 
 def _cached_ids(sched_output) -> list[str]:
     return list(sched_output.scheduled_cached_reqs.request_ids)
+
+
+def _initialize_paged_scheduler(
+    scheduler: BaseScheduler,
+    *,
+    num_blocks: int = 64,
+    max_num_seqs: int = 1,
+) -> None:
+    native_kv_managers.register_all_kvcache_specs(None)
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+    )
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layer0"])],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
+    )
+    scheduler.initialize(
+        SimpleNamespace(
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            max_model_len=64,
+            max_num_seqs=max_num_seqs,
+        ),
+        kv_cache_config=config,
+        scheduler_block_size=4,
+        hash_block_size=4,
+        kv_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=64),
+            max_in_flight_tokens=64,
+        ),
+    )
+
+
+def _attach_diffusion_kv(request: OmniDiffusionRequest, *, seq_len: int = 8) -> None:
+    request.diffusion_kv_requests = (
+        DiffusionKVRequest(
+            f"{request.request_id}/diffusion-kv/0",
+            sequence_id=0,
+            prefix_len=4,
+            target_len=4,
+            seq_len=seq_len,
+        ),
+    )
 
 
 class _StubScheduler:
@@ -217,13 +265,21 @@ class TestGetRequestBatchSamplingParamsKey:
         num_inference_steps: int = 2,
         seed: int | None = 123,
         generator: torch.Generator | None = None,
+        extra_args: dict | None = None,
+        condition_key: tuple | None = None,
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
             seed=seed,
             generator=generator,
+            extra_args=extra_args or {},
         )
-        return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=f"req-{num_inference_steps}")
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-{num_inference_steps}",
+            batch_compatibility_key=condition_key,
+        )
 
     def test_distinguishes_num_inference_steps(self) -> None:
         scheduler = RequestScheduler()
@@ -239,6 +295,57 @@ class TestGetRequestBatchSamplingParamsKey:
         assert scheduler._build_sampling_params_key(
             self._make(seed=1, generator=gen_a)
         ) == scheduler._build_sampling_params_key(self._make(seed=2, generator=gen_b))
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_distinguishes_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) != scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": " Euler "}, {"sample_solver": "euler"}),
+            ({"flow_shift": "5.0"}, {"flow_shift": 5.0}),
+        ],
+    )
+    def test_normalizes_equivalent_wan_scheduler_structure(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(extra_args=first_extra_args)
+        ) == scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
+
+    def test_uses_none_for_unspecified_wan_scheduler_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        key = scheduler._build_sampling_params_key(self._make())
+
+        assert key.sample_solver is None
+        assert key.flow_shift is None
+
+    def test_distinguishes_pipeline_condition_structure(self) -> None:
+        scheduler = RequestScheduler()
+
+        assert scheduler._build_sampling_params_key(
+            self._make(condition_key=("wan22_s2v_condition", True))
+        ) != scheduler._build_sampling_params_key(self._make(condition_key=("wan22_s2v_condition", False)))
 
 
 class TestRequestScheduler:
@@ -341,18 +448,16 @@ class TestRequestScheduler:
         assert self.scheduler.has_requests() is False
 
     def test_diffusion_kv_request_moves_to_scheduler_state(self) -> None:
-        self.scheduler.initialize(SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER))
+        _initialize_paged_scheduler(self.scheduler)
         request = _make_request("diffusion-kv")
         prepared_layout = object()
         request.prepared_layout = prepared_layout
-        text_context = DiffusionKVContext(context_id="text", cache_role="cross.text", num_tokens=8)
         kv_request = DiffusionKVRequest(
             "diffusion-kv/diffusion-kv/0",
             sequence_id=0,
             prefix_len=4,
             target_len=8,
             seq_len=16,
-            kv_contexts=(text_context,),
         )
         request.diffusion_kv_requests = (kv_request,)
 
@@ -362,12 +467,179 @@ class TestRequestScheduler:
 
         assert state is not None
         assert state.diffusion_kv_requests == (kv_request,)
-        assert state.diffusion_kv_requests[0].kv_contexts == (text_context,)
         assert request.diffusion_kv_requests is None
         assert scheduler_output.scheduled_new_reqs[0].req.prepared_layout is prepared_layout
+        metadata = scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata
+        assert metadata is not None
+        assert metadata.request_id == request.request_id
+        assert len(metadata.sequences[0].block_ids[0]) == 4
+
+    def test_diffusion_kv_capacity_backpressures_fifo_until_blocks_are_freed(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=3, max_num_seqs=2)
+        first_request = _make_request("first")
+        second_request = _make_request("second")
+        _attach_diffusion_kv(first_request)
+        _attach_diffusion_kv(second_request)
+        self.scheduler.add_request(first_request)
+        self.scheduler.add_request(second_request)
+
+        first_output = self.scheduler.schedule()
+
+        assert _new_ids(first_output) == ["first"]
+        assert first_output.num_waiting_reqs == 1
+
+        self.scheduler.update_from_output(first_output, _make_request_output("first"))
+        second_output = self.scheduler.schedule()
+
+        assert _new_ids(second_output) == ["second"]
+        assert second_output.num_waiting_reqs == 0
+        # The same output carries both the release and the newly admitted block
+        # table; the future Worker data plane must process finished ids first.
+        assert second_output.finished_req_ids == {"first"}
+        assert second_output.scheduled_new_reqs[0].diffusion_kv_metadata is not None
+
+    def test_impossible_diffusion_kv_capacity_finishes_only_that_request(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=2, max_num_seqs=2)
+        impossible = _make_request("impossible")
+        schedulable = _make_request("schedulable")
+        _attach_diffusion_kv(impossible, seq_len=8)
+        schedulable.diffusion_kv_requests = (
+            DiffusionKVRequest(
+                "schedulable/diffusion-kv/0",
+                sequence_id=0,
+                prefix_len=0,
+                target_len=4,
+                seq_len=4,
+            ),
+        )
+        self.scheduler.add_request(impossible)
+        self.scheduler.add_request(schedulable)
+
+        sched_output = self.scheduler.schedule()
+
+        failed_state = self.scheduler.get_request_state("impossible")
+        assert failed_state is not None
+        assert failed_state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert failed_state.error is not None
+        assert "cannot fit even when the block pool is empty" in failed_state.error
+        assert sched_output.finished_req_ids == {"impossible"}
+        assert _new_ids(sched_output) == ["schedulable"]
+
+        finished = self.scheduler.update_from_output(
+            sched_output,
+            _make_request_output("schedulable"),
+        )
+
+        assert finished == {"impossible", "schedulable"}
+
+    def test_impossible_diffusion_kv_capacity_does_not_block_waiters_under_load(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=4, max_num_seqs=2)
+        running = _make_request("running")
+        _attach_diffusion_kv(running)
+        self.scheduler.add_request(running)
+        assert _new_ids(self.scheduler.schedule()) == ["running"]
+
+        impossible = _make_request("impossible")
+        impossible.diffusion_kv_requests = tuple(
+            DiffusionKVRequest(
+                f"impossible/diffusion-kv/{sequence_id}",
+                sequence_id=sequence_id,
+                prefix_len=0,
+                target_len=4,
+                seq_len=4,
+            )
+            for sequence_id in range(4)
+        )
+        schedulable = _make_request("schedulable")
+        schedulable.diffusion_kv_requests = (
+            DiffusionKVRequest(
+                "schedulable/diffusion-kv/0",
+                sequence_id=0,
+                prefix_len=0,
+                target_len=4,
+                seq_len=4,
+            ),
+        )
+        self.scheduler.add_request(impossible)
+        self.scheduler.add_request(schedulable)
+
+        sched_output = self.scheduler.schedule()
+
+        failed_state = self.scheduler.get_request_state("impossible")
+        assert failed_state is not None
+        assert failed_state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert failed_state.error is not None
+        assert "required_blocks=4, available_blocks=3" in failed_state.error
+        assert sched_output.finished_req_ids == {"impossible"}
+        assert _new_ids(sched_output) == ["schedulable"]
+
+    def test_diffusion_kv_internal_allocation_error_finishes_request(self, monkeypatch) -> None:
+        _initialize_paged_scheduler(self.scheduler)
+        request = _make_request("native-error")
+        _attach_diffusion_kv(request)
+        self.scheduler.add_request(request)
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+
+        def raise_native_error(*args, **kwargs):
+            raise ValueError("native allocation bug")
+
+        monkeypatch.setattr(
+            manager,
+            "reserve_request",
+            raise_native_error,
+        )
+
+        sched_output = self.scheduler.schedule()
+
+        state = self.scheduler.get_request_state("native-error")
+        assert state is not None
+        assert state.status == DiffusionRequestStatus.FINISHED_ERROR
+        assert state.error == "native allocation bug"
+        assert sched_output.finished_req_ids == {"native-error"}
+        assert sched_output.scheduled_request_ids == []
+
+    def test_diffusion_kv_preemption_retains_allocation(self) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=3)
+        request = _make_request("preempted")
+        _attach_diffusion_kv(request)
+        self.scheduler.add_request(request)
+        self.scheduler.schedule()
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        metadata = manager.get_metadata("preempted")
+
+        assert self.scheduler.preempt_request("preempted") is True
+        resumed_output = self.scheduler.schedule()
+
+        assert resumed_output.scheduled_new_reqs == []
+        assert _cached_ids(resumed_output) == ["preempted"]
+        assert manager.get_metadata("preempted") == metadata
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            DiffusionRequestStatus.FINISHED_COMPLETED,
+            DiffusionRequestStatus.FINISHED_ABORTED,
+            DiffusionRequestStatus.FINISHED_ERROR,
+        ],
+    )
+    def test_diffusion_kv_terminal_status_releases_allocation(self, status: DiffusionRequestStatus) -> None:
+        _initialize_paged_scheduler(self.scheduler, num_blocks=3)
+        request = _make_request("terminal")
+        _attach_diffusion_kv(request)
+        self.scheduler.add_request(request)
+        self.scheduler.schedule()
+        manager = self.scheduler._diffusion_kv_manager
+        assert manager is not None
+        assert manager.has_request("terminal") is True
+
+        self.scheduler.finish_requests("terminal", status)
+
+        assert manager.has_request("terminal") is False
 
     def test_paged_scheduler_rejects_missing_kv_request(self) -> None:
-        self.scheduler.initialize(SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER))
+        _initialize_paged_scheduler(self.scheduler)
         request = _make_request("diffusion-kv")
 
         with pytest.raises(ValueError, match="did not produce DiffusionKVRequest"):
@@ -384,7 +656,7 @@ class TestRequestScheduler:
         ],
     )
     def test_diffusion_kv_request_rejects_legacy_dense_kv(self, owner_name: str, field_name: str) -> None:
-        self.scheduler.initialize(SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER))
+        _initialize_paged_scheduler(self.scheduler)
         request = _make_request("diffusion-kv")
         owner = request if owner_name == "request" else request.sampling_params
         setattr(owner, field_name, object())
@@ -602,6 +874,38 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
+    def test_batches_incompatible_pipeline_conditions_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        request_a = OmniDiffusionRequest(
+            prompt="a",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=123),
+            request_id="a",
+            batch_compatibility_key=("wan22_s2v_condition", True),
+        )
+        request_b = OmniDiffusionRequest(
+            prompt="b",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, seed=456),
+            request_id="b",
+            batch_compatibility_key=("wan22_s2v_condition", False),
+        )
+        scheduler.add_request(request_a)
+        scheduler.add_request(request_b)
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == ["a"]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(first, _make_request_output("a"))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == ["b"]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
+
     def test_batches_different_request_local_seed_together(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))
@@ -624,6 +928,47 @@ class TestRequestScheduler:
         assert _new_ids(first) == [req_id_a, req_id_b]
         assert first.num_running_reqs == 2
         assert first.num_waiting_reqs == 0
+
+    @pytest.mark.parametrize(
+        ("first_extra_args", "second_extra_args"),
+        [
+            ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
+            ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+            ({"sample_solver": "unipc"}, {}),
+            ({"flow_shift": 3.0}, {}),
+        ],
+    )
+    def test_batches_incompatible_wan_scheduler_structure_separately(
+        self,
+        first_extra_args: dict,
+        second_extra_args: dict,
+    ) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        first_id = scheduler.add_request(
+            _make_step_request(
+                "a",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=first_extra_args,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    extra_args=second_extra_args,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [first_id]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
 
     def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
         scheduler = RequestScheduler()
@@ -789,6 +1134,45 @@ class TestDiffusionEngine:
         assert engine.scheduler.max_num_running_reqs == 1
         fake_executor_cls.assert_called_once_with(od_config)
 
+    def test_initializes_paged_scheduler_from_native_control_plane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
+        fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
+        scheduler = mocker.Mock()
+        kv_cache_config = object()
+        kv_vllm_config = object()
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+            lambda *args, **kwargs: (kv_cache_config, 16, 16, kv_vllm_config),
+        )
+
+        engine = DiffusionEngine(od_config, scheduler=scheduler)
+
+        assert engine.scheduler is scheduler
+        scheduler.initialize.assert_called_once_with(
+            od_config,
+            kv_cache_config=kv_cache_config,
+            scheduler_block_size=16,
+            hash_block_size=16,
+            kv_vllm_config=kv_vllm_config,
+        )
+
     def test_scheduler_alias_keeps_default_request_scheduler(self) -> None:
         scheduler = Scheduler()
         scheduler.initialize(SimpleNamespace())
@@ -854,6 +1238,21 @@ class TestDiffusionEngine:
 
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
+
+    def test_finalize_finished_request_returns_scheduler_admission_error(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+
+        req_id = engine.scheduler.add_request(_make_request("req-error"))
+        engine.scheduler._finish_requests(
+            {req_id: DiffusionRequestStatus.FINISHED_ERROR},
+            {req_id: "KV request cannot fit"},
+        )
+
+        output = engine._finalize_finished_request(req_id)
+
+        assert output.error == "KV request cannot fit"
 
     @pytest.mark.asyncio
     async def test_streaming_runner_output_notifies_each_chunk(self) -> None:

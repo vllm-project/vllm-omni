@@ -191,6 +191,49 @@ def test_model_load_weights_transforms_before_calling_vllm_loader():
     ]
 
 
+def test_loader_adapter_declares_equivalent_direct_mmap_transform(monkeypatch):
+    from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
+        get_direct_mmap_adapter,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+
+    arch = h3.MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        rope_inv_freq_len=1,
+    )
+    attention = h3.MiniMaxH3Attention(
+        arch,
+        quant_config=None,
+        prefix="blocks.0.attn",
+    )
+    transformer = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(transformer)
+    transformer.blocks = nn.ModuleList([nn.Module()])
+    transformer.blocks[0].attn = attention
+    pipeline = nn.Module()
+    pipeline.transformer = transformer
+
+    adapter = get_direct_mmap_adapter(pipeline)
+    assert adapter is not None
+    policy = adapter.policy_for(
+        "transformer.blocks.0.attn.qkv_proj.weight",
+        attention.qkv_proj.weight,
+    )
+    assert policy is not None
+    assert policy.allow_custom_loader
+    assert policy.transform is not None
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+
+    assert policy.transform(checkpoint_weight)[:, 0].tolist() == [0, 3, 1, 4, 2, 5]
+    assert not hasattr(attention.qkv_proj.weight, "mmap_weight_transform")
+
+
 def test_pipeline_resolves_transformer_component_quant_config():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_component_quant_config,
@@ -211,3 +254,18 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
+
+
+def test_pipeline_strips_prequantized_text_encoder_config():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_text_encoder_quant_config
+    from vllm_omni.quantization import ComponentQuantizationConfig
+
+    prequantized = Mock()
+    prequantized.get_name.return_value = "modelopt"
+    online_fp8 = Mock()
+    online_fp8.get_name.return_value = "fp8"
+    component_config = ComponentQuantizationConfig({"text_encoder": prequantized})
+
+    assert _resolve_minimax_h3_text_encoder_quant_config(online_fp8) is online_fp8
+    assert _resolve_minimax_h3_text_encoder_quant_config(prequantized) is None
+    assert _resolve_minimax_h3_text_encoder_quant_config(component_config) is None

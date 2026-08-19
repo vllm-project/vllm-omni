@@ -17,6 +17,7 @@ import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm import envs
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -172,11 +173,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
         return _decode_base64_image(image_url, source="image_reference.image_url")
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
+        allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
+        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
             try:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response.has_redirect_location and not allow_redirects:
+                    raise InvalidInputReferenceError(
+                        "Invalid image_reference.image_url: redirect response was rejected because "
+                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
+                    ) from exc
+                raise InvalidInputReferenceError(
+                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                ) from exc
+            except httpx.RequestError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc

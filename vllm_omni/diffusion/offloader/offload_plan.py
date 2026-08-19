@@ -55,20 +55,3 @@ class OffloadPlan:
 def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:
     """Retrieve the OffloadPlan declared by the pipeline, if any."""
     return getattr(pipeline, "_offload_plan", None)
-
-
-def supports_mmap_loading(pipeline: nn.Module) -> bool:
-    """Whether the pipeline supports mmap weight loading.
-
-    A pipeline supports mmap if any module defines ``_remap_ckpt_key``,
-    which maps checkpoint keys to model parameter names.  Models without
-    this method must use the regular ``load_weights()`` path.
-
-    This check is shared between ``diffusers_loader.py`` (to decide whether
-    to skip ``load_weights``) and ``DistributedLayerwiseOffloadBackend.enable()``
-    (to decide whether to call ``_load_weights_via_mmap``), ensuring both
-    paths use the same gate condition.
-    """
-    return bool(getattr(pipeline, "_supports_mmap_loading", True)) and any(
-        callable(getattr(type(m), "_remap_ckpt_key", None)) for m in pipeline.modules()
-    )

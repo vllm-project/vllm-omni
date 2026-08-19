@@ -154,8 +154,8 @@ class DiffusionParallelConfig:
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel stages."""
 
-    data_parallel_size: int = 1
-    """Number of data parallel groups."""
+    data_parallel_size: int | None = None
+    """Number of data parallel groups. Inferred from WORLD when omitted."""
 
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
@@ -243,7 +243,7 @@ class DiffusionParallelConfig:
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
-        assert self.data_parallel_size > 0, "Data parallel size must be > 0"
+        assert self.data_parallel_size is None or self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
@@ -283,10 +283,12 @@ class DiffusionParallelConfig:
                 self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
             )
 
-        # Calculate world_size from other parallelism dimensions
+        # Until the runtime WORLD size is known, an omitted DP dimension means
+        # one replica. OmniDiffusionConfig resolves it against num_gpus below.
+        data_parallel_size = self.data_parallel_size or 1
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * self.data_parallel_size
+            * data_parallel_size
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -297,13 +299,17 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
-                raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
-                    f"data_parallel_size={self.data_parallel_size}). "
-                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
-                )
+            incompatible = []
+            if self.tensor_parallel_size > 1:
+                incompatible.append("TP")
+            if data_parallel_size > 1:
+                incompatible.append("DP")
+            if self.pipeline_parallel_size > 1:
+                incompatible.append("PP")
+            if self.enable_expert_parallel:
+                incompatible.append("EP")
+            if incompatible:
+                raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:
@@ -337,6 +343,42 @@ class DiffusionParallelConfig:
                     self.world_size = other_parallel_world_size
         else:
             self.world_size = other_parallel_world_size
+
+    def resolve_data_parallel_size(self, world_size: int) -> int:
+        """Resolve or validate diffusion DP against the actual WORLD size."""
+        if world_size <= 0:
+            raise ValueError(f"WORLD size must be > 0, but got {world_size}")
+
+        if self.use_hsdp:
+            if self.data_parallel_size not in (None, 1):
+                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            expected_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
+            if world_size != expected_world_size:
+                raise ValueError(
+                    f"WORLD size ({world_size}) must equal HSDP size "
+                    f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
+                )
+            self.data_parallel_size = 1
+            self.world_size = world_size
+            return 1
+
+        non_dp_size = (
+            self.pipeline_parallel_size
+            * self.tensor_parallel_size
+            * self.sequence_parallel_size
+            * self.cfg_parallel_size
+        )
+        if world_size % non_dp_size != 0:
+            raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
+        inferred_data_parallel_size = world_size // non_dp_size
+        if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "
+                f"({inferred_data_parallel_size})"
+            )
+        self.data_parallel_size = inferred_data_parallel_size
+        self.world_size = world_size
+        return inferred_data_parallel_size
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DiffusionParallelConfig":
@@ -538,7 +580,11 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
-def resolve_model_class_name(model: str | None, diffusion_load_format: str = "default") -> str | None:
+def resolve_model_class_name(
+    model: str | None,
+    diffusion_load_format: str = "default",
+    revision: str | None = None,
+) -> str | None:
     """Resolve the diffusion pipeline class name from the model config.
 
     Read-only counterpart of ``OmniDiffusionConfig.enrich_config``, safe to call
@@ -550,11 +596,10 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     if not model:
         return None
-
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
     # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model)
+    model_index = get_diffusion_model_index(model, revision=revision)
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -562,7 +607,7 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     # Other models: map model_type / architecture from config.json.
     try:
-        cfg = get_hf_file_to_dict("config.json", model) or {}
+        cfg = get_hf_file_to_dict("config.json", model, revision=revision) or {}
     except Exception:
         cfg = {}
     model_type = cfg.get("model_type")
@@ -848,6 +893,14 @@ class OmniDiffusionConfig:
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
+    # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
+    # These mirror the structured stage cache/scheduler config until all
+    # diffusion runtime construction consumes VllmOmniConfig directly.
+    kv_cache_memory_bytes: int | None = None
+    gpu_memory_utilization: float = 0.9
+    max_num_batched_tokens: int | None = None
+    max_model_len: int | None = None
+
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
@@ -933,6 +986,14 @@ class OmniDiffusionConfig:
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
+            raise ValueError("kv_cache_memory_bytes must be non-negative")
+        if not 0.0 < self.gpu_memory_utilization <= 1.0:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+        if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
+            raise ValueError("max_model_len must be positive or -1")
 
         if self.omni_kv_config is None:
             self.omni_kv_config = {}
@@ -980,10 +1041,7 @@ class OmniDiffusionConfig:
             else:
                 self.num_gpus = 1
 
-        if self.num_gpus < self.parallel_config.world_size:
-            raise ValueError(
-                f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
-            )
+        self.parallel_config.resolve_data_parallel_size(self.num_gpus)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1210,9 +1268,20 @@ class OmniDiffusionConfig:
                             exc,
                         )
                 else:
-                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                    from vllm_omni.model_extras import get_transformer_config_subfolder
+
+                    transformer_subfolder = get_transformer_config_subfolder(
+                        self.model_class_name,
+                        model=self.model,
+                        revision=self.revision,
+                    )
+                    tf_config_dict = get_hf_file_to_dict(
+                        f"{transformer_subfolder}/config.json",
+                        self.model,
+                        revision=self.revision,
+                    )
                     if tf_config_dict is None:
-                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model)
+                        tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
                     if tf_config_dict is not None:
                         self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
                     else:
@@ -1232,7 +1301,7 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
-                cfg = get_hf_file_to_dict("config.json", self.model)
+                cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
@@ -1304,6 +1373,12 @@ class OmniDiffusionConfig:
                         self.update_multimodal_support()
                     else:
                         raise
+                elif cfg.get("type") == "pi0":
+                    # π0 (Pi-Zero) VLA — the LeRobot config.json uses ``type: "pi0"``.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi0Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry

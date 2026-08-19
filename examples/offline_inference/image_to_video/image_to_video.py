@@ -68,6 +68,7 @@ from vllm_omni.model_extras import (
 from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
+    should_preserve_reference_image_size,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -454,7 +455,13 @@ def main():
 
     media_inputs: dict[str, Any] = {}
     if image is not None:
-        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        preserve_image_size = should_preserve_reference_image_size(
+            model_class_name,
+            model=args.model,
+        )
+        media_inputs["image"] = (
+            image if preserve_image_size else image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        )
     if last_image is not None:
         media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if mask_image is not None:
@@ -646,8 +653,8 @@ def main():
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

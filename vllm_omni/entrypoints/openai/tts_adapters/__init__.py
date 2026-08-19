@@ -9,8 +9,6 @@ key alone cannot distinguish.
 That metadata is the single source of truth. :func:`detect_tts_model_type` and
 :func:`all_tts_stage_keys` derive the whole stage -> model-type mapping from it,
 so a new TTS model is one adapter file and needs no edit to ``serving_speech.py``.
-Models still awaiting an adapter are listed explicitly in
-:data:`LEGACY_TTS_DETECTORS`.
 """
 
 from vllm.logger import init_logger
@@ -18,7 +16,6 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     DiffusionTTSAdapter,
-    LegacyDetector,
     OutputPolicy,
     PreparedRequest,
     SpeechServingContext,
@@ -28,10 +25,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 logger = init_logger(__name__)
 
 TTS_ADAPTER_REGISTRY: dict[str, type[TTSModelAdapter]] = {}
-
-#: Model types the serving layer detects that have no adapter yet. See
-#: :class:`LegacyDetector`. This list must only ever shrink.
-LEGACY_TTS_DETECTORS: tuple[LegacyDetector, ...] = ()
 
 
 def register_tts_adapter(cls: type[TTSModelAdapter]) -> type[TTSModelAdapter]:
@@ -57,16 +50,13 @@ def resolve_adapter(model_type: str | None) -> type[TTSModelAdapter] | None:
     return TTS_ADAPTER_REGISTRY.get(model_type)
 
 
-def iter_tts_detectors() -> list[type[TTSModelAdapter] | LegacyDetector]:
+def iter_tts_detectors() -> list[type[TTSModelAdapter]]:
     """Every detector, in resolution order.
 
     Sorted by ``detect_priority`` then ``name``, so the order is total and does
     not depend on adapter import order.
     """
-    detectors: list[type[TTSModelAdapter] | LegacyDetector] = [
-        *TTS_ADAPTER_REGISTRY.values(),
-        *LEGACY_TTS_DETECTORS,
-    ]
+    detectors = list(TTS_ADAPTER_REGISTRY.values())
     detectors.sort(key=lambda d: (d.detect_priority, d.name))
     return detectors
 
@@ -121,6 +111,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     indextts2,
     ming_flash_omni_tts,
     ming_tts,
+    minimax_music3,
     moss_tts,
     omnivoice,
     qwen3_tts,
@@ -132,12 +123,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
-    "LegacyDetector",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
     "TTSModelAdapter",
-    "LEGACY_TTS_DETECTORS",
     "TTS_ADAPTER_REGISTRY",
     "all_tts_model_types",
     "all_tts_stage_keys",

@@ -480,11 +480,9 @@ def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
         OmniRequestOutput(
             request_id="duplex-sid-e0-stage0",
             stage_id=0,
-            request_output=SimpleNamespace(
-                outputs=[],
-                multimodal_output=SimpleNamespace(kind="processed-payload"),
-                _custom_output={"inner": "completion"},
-            ),
+            outputs=[],
+            _multimodal_output={"kind": "processed-payload"},
+            _custom_output={"inner": "completion"},
         ),
         decision,
     )
@@ -557,7 +555,7 @@ async def test_async_omni_duplex_collect_wraps_raw_response_stage_output():
     assert outputs[0].finished is False
     assert outputs[0].stage_id == 1
     assert outputs[0].final_output_type == "audio"
-    assert outputs[0].request_output is raw_stage1_output
+    assert outputs[0].peak_memory_mb == raw_stage1_output.peak_memory_mb
 
 
 def test_async_omni_duplex_request_info_includes_response_stage():
