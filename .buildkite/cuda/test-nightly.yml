@@ -395,7 +395,7 @@ steps:
       - label: ":full_moon: Diffusion · Quantization Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pip install "vllm-gguf-plugin>=0.0.3"
+          - pip install "vllm-gguf-plugin==0.0.4"
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_1
 
