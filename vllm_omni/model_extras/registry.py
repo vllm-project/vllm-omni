@@ -8,10 +8,6 @@ from typing import Any, Literal, Protocol
 
 from PIL import Image
 
-from vllm_omni.model_extras.audiox import (
-    AUDIOX_EXTRA_BODY_PARAMS,
-    AUDIOX_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -165,10 +161,6 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
-    "AudioXPipeline": {
-        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
-        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
-    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,

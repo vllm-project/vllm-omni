@@ -59,7 +59,6 @@ EXCLUDED_MODELS = [
     "HeliosPyramidPipeline",
     "DreamIDOmniPipeline",
     "SenseNovaU1Pipeline",
-    "AudioXPipeline",
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
