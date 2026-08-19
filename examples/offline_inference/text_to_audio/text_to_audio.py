@@ -38,7 +38,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -306,17 +305,13 @@ def main():
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
 
-    parallel_config = DiffusionParallelConfig(
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-    )
-
     # Initialize Omni. AudioX requires an explicit pipeline class; Stable Audio
     # is resolved from its config.
     omni_kwargs: dict[str, Any] = dict(
         model=args.model,
-        parallel_config=parallel_config,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,

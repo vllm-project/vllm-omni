@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 import os
 import warnings
@@ -2505,6 +2506,17 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+def _get_audio_cache_length(past_key_values: Any) -> int:
+    cache = getattr(past_key_values, "self_attention_cache", past_key_values)
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if callable(get_seq_length):
+        try:
+            return int(get_seq_length())
+        except TypeError:
+            return int(get_seq_length(0))
+    return int(cache[0][0].shape[2])
+
+
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
@@ -2516,6 +2528,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
+        )
+        attention_parameters = inspect.signature(self.self_attn.forward).parameters
+        self._past_key_values_kwarg = (
+            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2554,16 +2570,18 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_values,
-        )
+        attention_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "layer_head_mask": layer_head_mask,
+            "output_attentions": output_attentions,
+            self._past_key_values_kwarg: past_key_values,
+        }
+        attn_out = self.self_attn(**attention_kwargs)
         hidden_states = attn_out[0]
         attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
+        if len(attn_out) > 2:
+            past_key_values = attn_out[2]
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -2769,7 +2787,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
             else:
                 pass
-            past_key_values_length = past_key_values.self_attention_cache.get_usable_length(inputs_embeds.shape[1])
+            past_key_values_length = _get_audio_cache_length(past_key_values)
             if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
                 logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
                 embed_pos_front = embed_pos[past_key_values_length:, :]
@@ -4468,7 +4486,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             return []
 
         if self.audio_past_key_values is not None:
-            cache_length = self.audio_past_key_values[0][0].shape[2]
+            cache_length = _get_audio_cache_length(self.audio_past_key_values)
             apm_max_len = self.apm.embed_positions.weight.shape[0]
             if cache_length + current_seq_len >= apm_max_len:
                 logger.warning(
@@ -4480,7 +4498,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         past_len = 0
         if self.audio_past_key_values is not None:
-            past_len = self.audio_past_key_values[0][0].shape[2]
+            past_len = _get_audio_cache_length(self.audio_past_key_values)
         total_seq_len = past_len + current_seq_len
         audio_attention_mask = torch.zeros(
             (batch_size, 1, current_seq_len, total_seq_len),
