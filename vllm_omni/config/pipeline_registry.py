@@ -103,10 +103,6 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
-from vllm_omni.model_executor.models.soulx_singer.pipeline import (
-    SOULXSINGER_SVC_PIPELINE,
-    SOULXSINGER_SVS_PIPELINE,
-)
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -184,8 +180,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
-    "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
-    "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }
 
 
