@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.metrics.concurrency_trace import emit_concurrency_trace
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -694,7 +695,7 @@ def llm2tts(
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
 
-    for llm_output in llm_outputs:
+    for i, llm_output in enumerate(llm_outputs):
         output = llm_output.outputs[0]
         request_mm_output = getattr(llm_output, "multimodal_output", None)
         completion_mm_output = getattr(output, "multimodal_output", None)
@@ -958,6 +959,14 @@ def llm2tts(
                 llm_output_ids,
                 prompt_token_ids,
             )
+        emit_concurrency_trace(
+            "stage1_input_ready",
+            request_id=str(llm_output.request_id),
+            batch_index=i,
+            batch_size=len(llm_outputs),
+            has_tts_input=tts_token_ids_slice is not None and tts_hidden_slice is not None,
+            tts_token_count=int(tts_token_ids_slice.numel()) if tts_token_ids_slice is not None else 0,
+        )
         tts_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,

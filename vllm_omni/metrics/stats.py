@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.concurrency_trace import emit_concurrency_trace
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
 
 if TYPE_CHECKING:
@@ -598,19 +599,42 @@ class OrchestratorAggregator:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
         self.stage_events.setdefault(str(stats.request_id), []).append(stats)
 
+        emit_concurrency_trace(
+            "stage_completed",
+            request_id=str(stats.request_id),
+            stage_id=stats.stage_id,
+            replica_id=stats.replica_id,
+            batch_id=stats.batch_id,
+            batch_size=stats.batch_size,
+            num_tokens_in=stats.num_tokens_in,
+            num_tokens_out=stats.num_tokens_out,
+            stage_gen_time_ms=stats.stage_gen_time_ms,
+            postprocess_time_ms=stats.postprocess_time_ms,
+            final_output_type=stats.final_output_type,
+        )
+
         self.record_transfer_rx(stats)
 
     def record_stage_postprocess_time(self, stage_id: int, req_id: Any, postproc_time_ms: float) -> None:
+        recorded = False
         if req_id in self.stage_events:
             for stats in self.stage_events[req_id]:
                 if stats.stage_id == stage_id:
                     stats.postprocess_time_ms = float(postproc_time_ms)
+                    recorded = True
                     break
         else:
             logger.warning(
                 "Failed to record postprocess time for request %s at stage %s: no stage event found",
                 req_id,
                 stage_id,
+            )
+        if recorded:
+            emit_concurrency_trace(
+                "stage_postprocess_completed",
+                request_id=str(req_id),
+                stage_id=stage_id,
+                postprocess_time_ms=float(postproc_time_ms),
             )
 
     @contextmanager
@@ -678,6 +702,15 @@ class OrchestratorAggregator:
             tx_time_ms=tx_ms,
             used_shm=used_shm,
         )
+        emit_concurrency_trace(
+            "stage_transfer",
+            request_id=str(req_id),
+            from_stage=from_stage,
+            to_stage=to_stage,
+            size_bytes=size_bytes,
+            tx_time_ms=tx_ms,
+            used_shm=used_shm,
+        )
 
     def on_finalize_request(
         self,
@@ -721,6 +754,15 @@ class OrchestratorAggregator:
             ),
         )
         self.e2e_events.append(per_req_record)
+        emit_concurrency_trace(
+            "request_completed",
+            request_id=rid_key,
+            stage_id=stage_id,
+            e2e_total_ms=e2e_ms,
+            e2e_total_tokens=total_tokens,
+            transfers_total_time_ms=per_req_record.transfers_total_time_ms,
+            transfers_total_bytes=per_req_record.transfers_total_bytes,
+        )
         # Drop per-request replica snapshots once the request is finalized.
         if self._replica_cache:
             for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
