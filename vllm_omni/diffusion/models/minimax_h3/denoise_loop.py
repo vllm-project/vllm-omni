@@ -125,6 +125,22 @@ class MiniMaxH3DenoiseBranch:
             latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
         )
 
+    def prepare_rope_table(self, model: Any) -> None:
+        """Materialize the branch-local DiT RoPE table once per denoise run.
+
+        ``img_position_ids`` is immutable for this branch while latents and
+        timesteps change every scheduler step. Keeping the table in
+        ``static_kwargs`` makes every model call reuse the exact same BF16
+        tensor without extending its lifetime beyond this request branch.
+        """
+        prepare = getattr(model, "prepare_rope_table", None)
+        if not callable(prepare):
+            return
+        self.static_kwargs["rope_table"] = prepare(
+            self.static_kwargs["img_position_ids"],
+            seq_len=self.seq_len,
+        )
+
     def forward_kwargs(
         self,
         *,
@@ -241,6 +257,7 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    positive.prepare_rope_table(model)
     video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
