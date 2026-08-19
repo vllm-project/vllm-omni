@@ -600,12 +600,17 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             * self.cfg_parallel_size
         )
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
-                raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
-                    f"data_parallel_size={self.data_parallel_size})"
-                )
+            incompatible = []
+            if self.tensor_parallel_size > 1:
+                incompatible.append("TP")
+            if self.data_parallel_size > 1:
+                incompatible.append("DP")
+            if self.pipeline_parallel_size > 1:
+                incompatible.append("PP")
+            if self.enable_expert_parallel:
+                incompatible.append("EP")
+            if incompatible:
+                raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")

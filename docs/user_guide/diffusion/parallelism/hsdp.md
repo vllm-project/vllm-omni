@@ -152,7 +152,8 @@ In `DiffusionParallelConfig`:
 **Constraints:**
 
 - `hsdp_replicate_size × hsdp_shard_size == world_size`
-- HSDP cannot be used with Tensor Parallelism (`tensor_parallel_size` must be 1)
+- HSDP cannot be used with Tensor Parallelism, ordinary Data Parallelism,
+  Pipeline Parallelism, or Expert Parallelism.
 
 ---
 

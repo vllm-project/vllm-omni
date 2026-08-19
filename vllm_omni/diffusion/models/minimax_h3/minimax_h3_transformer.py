@@ -28,11 +28,18 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -187,30 +194,6 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
     return RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _modulate_scale_shift(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
-    return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(dtype)
-
-
-def _modulate_gate(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    other: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    # Apply the per-index gated residual: x + gate[idx] * other.
-    return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
 def _sequence_parallel_local_span(
@@ -586,6 +569,7 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
         )
+        self.act_fn = SiluAndMul()
         # Chunk the fused fc1 output as [gate, up], then compute
         # silu(gate) * up.
         self.fc2 = RowParallelLinear(
@@ -600,8 +584,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        gate, up = hidden.chunk(2, dim=-1)
-        hidden = nn.functional.silu(gate) * up
+        hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
 
@@ -794,8 +777,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE)
+        h = rms_norm_indexed_scale_shift(
+            x,
+            self.norm1.weight,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            self.norm1.variance_epsilon,
+        )
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -805,13 +794,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
-
+        x, h = indexed_gate_rms_norm_scale_shift(
+            residual,
+            gate_msa,
+            h,
+            self.norm2.weight,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            self.norm2.variance_epsilon,
+        )
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE)
         h = self.mlp(h)
-        return _modulate_gate(residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE)
+        return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -866,7 +861,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        h = indexed_scale_shift_(h, shift, scale, inverse_indices)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)
