@@ -61,6 +61,16 @@ repos:
       types: [python]
       files: ^tests/
 
+    - id: check-tts-adapter-migration
+      name: Ratchet TTS per-model branches out of serving_speech.py
+      entry: python tools/pre_commit/check_tts_adapter.py
+      language: python
+      pass_filenames: false
+      files: ^(vllm_omni/entrypoints/openai/serving_speech\.py|tools/pre_commit/check_tts_adapter\.py)$
+      # The budget-is-now-slack reminder is printed on a PASSING run, and
+      # pre-commit hides output from passing hooks unless the hook is verbose.
+      verbose: true
+
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion

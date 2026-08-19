@@ -31,9 +31,8 @@ also provided.
   - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
   - Recommended 2-GPU continuous-batching layout:
-    [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
-  - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
+  - 3-GPU layout:
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
@@ -68,9 +67,38 @@ Code2Wav consumes them through a shared-memory async connector.
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
 request-local codec generation and Code2Wav owns waveform state and
 reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
-single-GPU entry point; `minicpmo_4_5_batching.yaml` is the recommended
+single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
+
+### Graph execution
+
+Graph boundaries follow each stage's state model:
+
+| Stage | Graph mode on Ascend | Eager boundary |
+| --- | --- | --- |
+| 0 Thinker | vLLM `PIECEWISE` | multimodal preprocessing and output routing |
+| 1 Talker | vLLM `PIECEWISE` | conditioning preprocessing, codec sampling, request-state updates |
+| 2 Code2Wav | inner exact-shape NPUGraph for the CFM DiT estimator | encoder, timestep embedding, HiFT/RNG, request parsing, stream-state commit |
+
+Stage 2 keeps `enforce_eager: true` for the generation runner because its
+Python request metadata and per-request cache dictionaries are not valid
+outer-graph inputs. The backend captures only the deterministic CFM DiT
+estimator, with an exact graph key for each tensor shape. Timestep embedding
+stays eager because the upstream implementation creates a CPU frequency tensor;
+HiFT stays eager because it generates random phase. The graph cache stores up
+to 32 entries by default, after which unseen shapes run eagerly.
+
+An ACL graph capture failure is fatal to that Stage-2 process because older
+torch-npu releases can leave allocator and RNG capture state invalid. Restart
+the service after a capture failure. To run without capture, set
+`code2wav_enable_npu_graph: false` under the Stage-2
+`platforms.npu.stages[].additional_config` block before startup. Tune the cache
+limit there with `code2wav_max_npu_graphs`. Graph mode also requires
+`ASCEND_LAUNCH_BLOCKING` to be unset or set to `0`.
+
+The inner NPUGraph is independent of the outer runner setting, so do not use a
+global `--enforce-eager` override when Stage 0/1 `PIECEWISE` replay is desired.
 
 ## GPU
 
@@ -79,7 +107,9 @@ a fallback because it would duplicate state machines and correctness paths.
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
 co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
-`gpu_memory_utilization` budgets are 0.55, 0.22, and 0.22. All stages admit
+`gpu_memory_utilization` budgets are 0.55, 0.15, and 0.15. The remaining
+device memory is left available for runtime workspaces such as the HiFi-GAN
+vocoder's cuDNN kernels. All stages admit
 up to four sequences. Startup video profiling is bounded to 32 frames per
 video. Use the two-GPU profile for production throughput.
 
@@ -105,7 +135,7 @@ The deploy config is auto-loaded by the model registry — no
 For the recommended two-GPU layout, add:
 
 ```bash
---deploy-config vllm_omni/deploy/minicpmo_4_5_batching.yaml
+--deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml
 ```
 
 #### Performance comparison
@@ -175,16 +205,18 @@ in another choice's `message.audio.data` (24 kHz mono, see Notes). With
 `modalities: ["text", "audio"]` you typically get two `choices` entries
 (one text, one audio).
 
-**Streaming text + speech**:
+**Streaming text + speech** (use `--stream`):
 
 ```bash
-python examples/online_serving/minicpmo/streaming_chat_completion.py \
-    --base-url http://localhost:8099/v1 \
-    --output minicpmo_stream.wav
+python examples/online_serving/minicpmo/openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Say hello, then introduce vLLM in one sentence." \
+    --port 8099 \
+    --stream
 ```
 
-The client prints text deltas as they arrive and reconstructs one valid WAV
-from the independently encoded audio deltas.
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
 
 **Gradio demo (text + image + audio + video UI)**:
 
@@ -202,14 +234,15 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.22, and
-  0.22 of GPU 0. The larger Thinker share protects its multimodal KV cache;
-  all three model processes still share one CUDA device.
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.55, 0.15, and
+  0.15 of GPU 0. The larger Thinker share protects its multimodal KV cache,
+  while the unreserved memory remains available to runtime kernels; all three
+  model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
-- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
-  eager because its request-owned Flow/HiFT caches and variable chunk/cache
-  shapes are not yet exposed through a static exact-shape graph wrapper.
+- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 keeps its
+  request orchestration eager while using inner CFM and HiFT CUDA Graphs. On
+  Ascend, the exact-shape CFM DiT estimator instead uses inner NPUGraph replay.
 - All default stages use `max_num_seqs: 4` to reduce cross-process GPU
   contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
@@ -220,8 +253,8 @@ speech output (TTS)"** checkbox on / off.
 - `StageRequestStats.batch_size` is a request-scoped placeholder, not the
   scheduler's execution batch.
 - Single-GPU co-location trades throughput for hardware density: Stage 0/1
-  CUDA Graph replay and eager Stage 2 vocoder kernels compete across three
-  CUDA contexts. Use the 8x4090 config or a custom multi-GPU mapping for
+  CUDA Graph replay and Stage 2 vocoder kernels compete across three CUDA
+  contexts. Use the 8x4090 config or a custom multi-GPU mapping for
   throughput-sensitive serving.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)

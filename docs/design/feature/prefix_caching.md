@@ -41,7 +41,7 @@ With this in mind, consider the set of blocks in a 2D layout, where the row repr
 
 ### Example
 !!! note "Note 3"
-    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. It can be enabled/disabled per-stage via the `enable_prefix_caching` parameter in the model's stage config.
+    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config.
 
 The way in which vLLM-Omni ties into vLLM's prefix caching is best understood by example. Say that we have the following:
 

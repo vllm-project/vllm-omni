@@ -6,9 +6,13 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -26,6 +30,16 @@ class DiffusionRequestStatus(enum.IntEnum):
     @staticmethod
     def is_finished(status: DiffusionRequestStatus) -> bool:
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
+
+
+@dataclass(frozen=True)
+class _AdmissionWaitDecision:
+    """Internal scheduler policy for delaying the next admission wave."""
+
+    should_wait: bool
+    deadline: float | None = None
+    stable_window_s: float = 0.0
+    max_batch: int = 1
 
 
 @dataclass(frozen=True, eq=True)
@@ -55,6 +69,10 @@ class StepBatchSamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Request-scoped execution policy. A batch must use one quality mode
+    # because model acceleration hooks are shared by the whole worker batch.
+    quality: str | None = None
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
@@ -70,9 +88,10 @@ class RequestBatchSamplingParamsKey:
     """Request level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only request-batch-wide fields belong here. Request-local values such as
-    seeds, generators, latent tensors, timesteps, and pipeline-specific
+    seeds, generators, latent tensors, timesteps, and request-local
     ``extra_args`` are read per request from
-    ``DiffusionRequestBatch.sampling_params_list``.
+    ``DiffusionRequestBatch.sampling_params_list``. Structural ``extra_args``
+    that affect batching are listed explicitly below.
     """
 
     # Spatial / temporal shape.
@@ -108,6 +127,21 @@ class RequestBatchSamplingParamsKey:
     layers: int = 4
     use_en_prompt: bool = False
 
+    # Request-scoped execution policy. Keep accelerated and reference-path
+    # requests in separate worker batches. ``None`` delegates the default to
+    # the model and must remain distinct from explicit ``lossless``.
+    quality: str | None = None
+
+    # Wan scheduler structure is carried through extra_args. Requests using
+    # different solvers or flow shifts must not share a request batch.
+    sample_solver: str | None = None
+    flow_shift: float | None = None
+
+    # Pipeline-specific condition structure populated during preprocessing.
+    # It prevents independently valid requests with incompatible conditions
+    # from being admitted to the same request batch.
+    condition_key: tuple[Any, ...] | None = None
+
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
@@ -120,6 +154,7 @@ class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -138,10 +173,39 @@ class NewRequestData:
 
     request_id: str
     req: OmniDiffusionRequest
+    diffusion_kv_metadata: DiffusionKVMetadata | None = None
 
     @classmethod
-    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
-        return cls(request_id=state.request_id, req=state.req)
+    def from_state(
+        cls,
+        state: SchedulerRequestState,
+        *,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
+    ) -> NewRequestData:
+        return cls(
+            request_id=state.request_id,
+            req=state.req,
+            diffusion_kv_metadata=diffusion_kv_metadata,
+        )
+
+
+def validate_new_request_data_identity(new_req: NewRequestData) -> None:
+    """Ensure an envelope and its forwarded request describe the same request."""
+    forwarded_request_id = new_req.req.request_id
+    if new_req.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"envelope request_id={new_req.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
+
+    metadata = new_req.diffusion_kv_metadata
+    if metadata is not None and metadata.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"metadata request_id={metadata.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
 
 
 @dataclass

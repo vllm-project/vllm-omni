@@ -30,7 +30,7 @@ omitted (add rows here when those features land).
 From ``tests/``::
 
     pytest -s -v e2e/online_serving/test_boogu_image_expansion.py \
-        -m "full_model and diffusion and H100" --run-level=full_model
+        -m "slow and diffusion and H100"
 """
 
 import os
@@ -42,7 +42,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHand
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Boogu/Boogu-Image-0.1-Base"
 T2I_PROMPT = "A mountain lake at sunset, photorealistic, cinematic lighting"

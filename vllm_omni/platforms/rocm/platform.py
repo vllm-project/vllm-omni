@@ -75,7 +75,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        """Get the diffusion attention backend class path for ROCm platform.
+
+        ROCm supports FLASH_ATTN via the aiter library, and SDPA as fallback.
+
+        Args:
+            selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
+                "TORCH_SDPA"). If None, uses platform default.
+            head_size: Attention head size.
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
+        Returns:
+            Fully qualified class path of the selected backend.
+        """
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         # Check if aiter is available for Flash Attention support
@@ -88,6 +102,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "

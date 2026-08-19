@@ -17,7 +17,7 @@ Summary:
 - **Reliability:** `tests/dfx/reliability/`
 - Do **not** add new top-level `tests/` directories unrelated to a component (or to `e2e` / `dfx` / `helpers` / `examples` / `buildkite`)
 
-Deploy YAMLs: `vllm_omni/deploy/` via `tests.helpers.stage_config.get_deploy_config_path` (see [stage configs](../../configuration/stage_configs.md)).
+Deploy YAMLs: `vllm_omni/deploy/` via `tests.helpers.stage_config.get_deploy_config_path` (see [pipeline and deploy configs](../../configuration/stage_configs.md)).
 
 ## Markers for Tests
 
@@ -562,7 +562,6 @@ L5 level testing focuses on the performance of model services under ***long-runn
     -   `test_reliability_qwen3_omni.py` — Qwen3-Omni chat / multimodal reliability (GPU OOM, process kill, recovery, error contract under `--async-chunk` vs default).
     -   `test_reliability_wan22.py` — Wan2.2 I2V video API reliability (`/v1/videos` under OOM and process kill, recovery).
     -   `test_reliability_hunyuan_image.py` — HunyuanImage-3.0-Instruct DiT-only reliability (`/v1/images/generations` under OOM and process kill; deploy `hunyuan_image3_dit.yaml`, H100 × 4).
-    -   `test_reliability_voxcpm2.py` — VoxCPM2 TTS reliability (`/v1/audio/speech` under OOM and process kill; deploy `voxcpm2.yaml`, L4 × 1).
     -   `helpers.py` — Shared primitives used by current suites: raw HTTP probes for `/v1/chat/completions` and `/health`, OpenAI-style error parsing, GPU OOM sidecar (`inject_gpu_oom` / `stop_gpu_oom_hogs`), and `pgrep`-based process-kill injector construction (`make_process_kill_fault_injector`).
     -   `conftest.py` — `fault_injector` and `omni_server_after_fault` / `omni_server_after_fault_function` fixtures to run a callable **after** the server is ready.
     -   `README.md` — Short local run commands for this directory.
@@ -582,7 +581,7 @@ When you want to add L5-level stability test cases, add or extend the appropriat
     "test_name": "test_qwen3_omni_stability",
     "server_params": {
         "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        "stage_config_name": "qwen3_omni.yaml"
+        "stage_config_name": "qwen3_omni_moe.yaml"
     },
     "benchmark_params": [
         {
@@ -608,7 +607,7 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 | Field            | Required | Description                                                                 |
 | ---------------- | -------- | --------------------------------------------------------------------------- |
 | test_name        | Yes      | Unique identifier for the stability test case                               |
-| server_params    | Yes      | Server-side configuration parameters (model, stage configuration, etc.)     |
+| server_params    | Yes      | Server-side configuration parameters (model, deploy configuration, etc.)    |
 | benchmark_params | Yes      | Stability benchmark running parameters (supports multiple configurations)   |
 
 ##### server_params Configuration
@@ -618,7 +617,7 @@ When you want to add L5-level stability test cases, add or extend the appropriat
 | Parameter         | Required | Example                            | Description                         |
 | ----------------- | -------- | ---------------------------------- | ----------------------------------- |
 | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path                  |
-| stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name       |
+| stage_config_name | Yes      | "qwen3_omni_moe.yaml"              | Deploy configuration file name      |
 
 ###### Dynamic Configuration (update/delete)
 
@@ -662,13 +661,12 @@ Reliability tests are **short fault-injection** integration runs (L5 **(b)** in 
 | `test_reliability_qwen3_omni.py` | Qwen3-Omni: OOM vs **text vs text+audio** error contract, large multimodal chat under OOM, concurrent pressure, **SIGKILL** on `VLLM::Worker`, `/health` → 503 + fast-fail + concurrent chat; optional OOM recovery scenario (may be skipped while tracked in issues). |
 | `test_reliability_wan22.py` | Wan2.2 I2V: large `/v1/videos` under OOM, **SIGKILL** on `multiprocessing.spawn` chain, health / fast-fail / concurrent video requests; optional recovery test (may be skipped). |
 | `test_reliability_hunyuan_image.py` | HunyuanImage DiT-only: large `/v1/images/generations` under OOM, **SIGKILL** on `vLLM-Omni::` workers and serve/tree targets, health / fast-fail / concurrent image requests; some OOM/recovery cases may be skipped while tracked in issues. |
-| `test_reliability_voxcpm2.py` | VoxCPM2: `/v1/audio/speech` under OOM (error contract), **SIGKILL** on `VLLM::` workers and serve/tree targets, health / fast-fail / concurrent speech requests; some OOM cases may be skipped while tracked in issues. |
 | `README.md` | Minimal run / collect examples. |
 
 ##### Parametrization and markers
 
 - Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths (including XPU substitutions where applicable) and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
-- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** or **`@hardware_test(res={"cuda": "L4"}, num_cards=1)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100; VoxCPM2 **1**× L4).
+- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100).
 - **Process-kill** tests use **`@pytest.mark.skipif(os.name == "nt", ...)`** because injection uses POSIX **`pgrep` / `kill`**.
 
 ##### CI trigger
@@ -680,13 +678,11 @@ Weekly Buildkite (`.buildkite/cuda/test-weekly.yml`) runs one step per model sui
 | Reliability Test - qwen3-omni | `test_reliability_qwen3_omni.py` | H100 × 2 (`mithril-h100-pool`) |
 | Reliability Test - wan22 | `test_reliability_wan22.py` | H100 × 2 (`mithril-h100-pool`) |
 | Reliability Test - hunyuan-image | `test_reliability_hunyuan_image.py` | H100 × 4 (`mithril-h100-pool`) |
-| Reliability Test - voxcpm2 | `test_reliability_voxcpm2.py` | L4 × 1 (`gpu_1_queue`) |
 
 ```bash
 pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
 pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
 pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
-pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
 ```
 
 ##### Local commands
@@ -696,17 +692,16 @@ pytest --collect-only tests/dfx/reliability
 pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m slow
 pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m slow
 pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m slow
-pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m slow
 ```
 
 ##### Adding a new model suite
 
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
-2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e stage-config directory (same pattern as existing files).
-3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs stage YAML.
+2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e deploy-config directory (same pattern as existing files).
+3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs deploy YAML.
 4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
 
 </details>
 
 -   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `voxcpm2`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)
+    -   ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`; add `test_reliability_<suite>.py` and a matching step in `.buildkite/cuda/test-weekly.yml` for new models)

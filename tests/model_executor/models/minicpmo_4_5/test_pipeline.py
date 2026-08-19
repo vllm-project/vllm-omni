@@ -24,6 +24,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
+    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -36,7 +37,6 @@ _PIPELINE_KEY = "minicpmo_4_5"
 _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
-    "minicpmo_4_5_batching.yaml": ["0", "1", "1"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
@@ -158,24 +158,56 @@ class TestDeployTopology:
         assert connector["name"] == "SharedMemoryConnector"
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
+        assert connector["extra"]["enable_hift_graph"] is True
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+            memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
+            assert memory_utilizations == [
                 0.55,
-                0.22,
-                0.22,
+                0.15,
+                0.18,
             ]
-            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {"video": {"count": 1, "num_frames": 32}}
-        elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:
+            assert sum(memory_utilizations) <= 0.9 + 1e-6
+            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+                "image": 64,
+                "audio": 64,
+                "video": 1,
+            }
+        elif filename in {"minicpmo_4_5_2gpu.yaml"}:
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,
                 0.55,
                 0.35,
             ]
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_2gpu.yaml",
+            "minicpmo_4_5_3gpu.yaml",
+        ],
+    )
+    def test_npu_graph_configuration_is_stage_scoped(self, filename: str) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / filename)
+        connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert "code2wav_enable_npu_graph" not in connector_extra
+        assert "code2wav_max_npu_graphs" not in connector_extra
+
+        deploy = _apply_platform_overrides(deploy, platform="npu")
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        assert stages[2].yaml_engine_args["enforce_eager"] is True
+        assert stages[2].yaml_engine_args["additional_config"] == {
+            "code2wav_enable_npu_graph": True,
+            "code2wav_max_npu_graphs": 32,
+        }
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]

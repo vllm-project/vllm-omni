@@ -11,7 +11,6 @@ import numpy as np
 from PIL import Image
 from vllm.multimodal.media.audio import load_audio
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -138,7 +137,7 @@ def _extract_peak_memory_mb(result: Any) -> float:
         return 0.0
     val = getattr(result, "peak_memory_mb", 0.0)
     if not val:
-        inner = getattr(result, "request_output", None)
+        inner = result
         if isinstance(inner, list):
             inner = inner[0] if inner else None
         val = getattr(inner, "peak_memory_mb", 0.0)
@@ -197,14 +196,6 @@ def main() -> None:
             },
         )
 
-    parallel_config = DiffusionParallelConfig(
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-    )
-
     cache_config = None
     if args.cache_backend == "cache_dit":
         cache_config = {
@@ -222,7 +213,11 @@ def main() -> None:
 
     omni_kwargs = dict(
         model=args.model,
-        parallel_config=parallel_config,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
         model_type=args.model_type,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,

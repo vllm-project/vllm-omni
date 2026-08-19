@@ -34,8 +34,23 @@ docker_build() {
     docker build "${out[@]}" "$@" -f docker/Dockerfile.xpu .
 }
 
+build_vllm_base() (
+    local vllm_source_dir
+    vllm_source_dir=$(mktemp -d)
+    trap 'rm -rf "${vllm_source_dir}"' EXIT
+
+    git clone --depth 1 --branch "${VLLM_VERSION}" \
+        https://github.com/vllm-project/vllm "${vllm_source_dir}"
+
+    local out=("${export_args[@]/'{{IMAGE}}'/${base_image_name}}")
+    docker build "${out[@]}" \
+        --target vllm-openai \
+        -f "${vllm_source_dir}/docker/Dockerfile.xpu" \
+        "${vllm_source_dir}"
+)
+
 if [ -z "$(docker images -q "${base_image_name}")" ]; then
-    docker_build "${base_image_name}" --target vllm-base --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+    build_vllm_base
 fi
 
 # Try building the docker image
@@ -72,8 +87,9 @@ time timeout -k 30 30m docker run \
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
-    pytest -v -s -m "core_model and xpu and B60"
+    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e"
+    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
     pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s -m "advanced_model and xpu and B60"
-    pytest -v -s -m "omni and xpu and B60"
+    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
+    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
 '

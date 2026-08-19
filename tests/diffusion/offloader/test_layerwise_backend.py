@@ -79,11 +79,11 @@ def dist_group():
 
 
 @pytest.fixture
-def patched_offload_runtime(mocker):
-    mocker.patch.object(layerwise_backend_module.current_omni_platform, "Stream", DummyStream)
-    mocker.patch.object(layerwise_backend_module.current_omni_platform, "Event", DummyEvent)
-    mocker.patch.object(layerwise_backend_module.current_omni_platform, "current_stream", lambda: DummyStream())
-    mocker.patch.object(layerwise_backend_module.current_omni_platform, "stream", dummy_stream)
+def patched_offload_runtime(monkeypatch):
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Stream", DummyStream)
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Event", DummyEvent)
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "current_stream", lambda: DummyStream())
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "stream", dummy_stream)
 
 
 class TinyBlock(nn.Module):
@@ -127,6 +127,33 @@ class TestLayerwiseOffloadHook:
         assert current_block.weight.to_local().is_meta
         assert current_block.weight.to_local().shape == torch.Size([4])
         assert not hook.is_materialized
+
+    def test_prefetch_preserves_transposed_weight_stride(self, patched_offload_runtime):
+        """Online-FP8 Cutlass weights must retain their transposed layout."""
+
+        class StridedBlock(nn.Module):
+            def __init__(self, start: float):
+                super().__init__()
+                base = torch.arange(start, start + 12).reshape(3, 4)
+                self.weight = nn.Parameter(base.t(), requires_grad=False)
+
+        current_block = StridedBlock(1.0)
+        next_block = StridedBlock(20.0)
+        expected = next_block.weight.detach().clone()
+        expected_stride = next_block.weight.stride()
+        assert expected_stride == (1, 4)
+
+        hook = LayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            stream=DummyStream(),
+            pin_memory=False,
+        )
+        hook.initialize_hook(current_block)
+        hook.prefetch_layer(non_blocking=False)
+
+        assert next_block.weight.stride() == expected_stride
+        assert torch.equal(next_block.weight, expected)
 
 
 class _DummyBlock(nn.Module):

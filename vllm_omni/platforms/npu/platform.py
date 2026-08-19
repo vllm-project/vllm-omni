@@ -36,6 +36,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+            apply_minicpmo_4_5_code2wav_patch,
+        )
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
@@ -44,6 +47,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         )
 
         adapt_patch(is_global_patch=True)
+        apply_minicpmo_4_5_code2wav_patch()
         apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
@@ -80,6 +84,19 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
+        from vllm_omni.platforms.npu.models.minimax_h3 import (
+            apply_minimax_h3_qwen3vl_patch,
+            apply_minimax_h3_qwen3vl_swiglu_patch,
+        )
+
+        # Both patches import the MiniMax encoder package, whose __init__ loads
+        # pipeline_minimax_h3 → diffusion.data. Doing that during platform
+        # construction races vllm_omni/__init__.py (patch before config) and
+        # closes a cycle through pipeline_registry → PI0_PIPELINE →
+        # DiffusionOutput. Apply them only after the platform exists, before
+        # the diffusion pipeline is loaded.
+        apply_minimax_h3_qwen3vl_patch()
+        apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
@@ -130,6 +147,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -137,6 +155,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                     "FLASH_ATTN."
                 )
                 backend_upper = "FLASH_ATTN"
+
+            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
+                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
+                # forward, but CANN snapshots the custom-op registry at the
+                # first custom-op regInfo lookup in the process (e.g. a
+                # vllm-ascend custom op during model load/warmup). Import
+                # mindiesd here so its env.py prepends the mindiesd vendor
+                # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
+                # that snapshot; otherwise aclnnLaserAttention /
+                # FusedAttentionScore fail with EZ1001 "does not support
+                # opType" for the rest of the process.
+                import mindiesd  # noqa: F401
 
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
