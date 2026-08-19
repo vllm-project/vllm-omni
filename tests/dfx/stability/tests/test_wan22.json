@@ -1,6 +1,7 @@
 [
     {
-        "test_name": "test_wan22_i2v_stability_v1_videos",
+        "test_name": "test_wan22_i2v_stability_ulysses2_vae_patch2_hsdp_slicing_tiling",
+        "description": "Ulysses=2 + VAE patch parallel=2 + HSDP + VAE slicing + tiling",
         "mark": [
             {
                 "hardware_marks": {
@@ -41,7 +42,8 @@
         ]
     },
     {
-        "test_name": "test_wan22_i2v_stability_npu",
+        "test_name": "test_wan22_i2v_stability_usp2_vae_patch2_hsdp_slicing",
+        "description": "USP=2 + VAE patch parallel=2 + HSDP + VAE slicing",
         "mark": [
             {
                 "hardware_marks": {

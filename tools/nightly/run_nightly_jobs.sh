@@ -20,9 +20,8 @@
 #   acc      — label contains "Accuracy Test" (incl. GEBench / GEdit-Bench style)
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
-#              Auto-builds pytest -m from runtime hardware/platform so JSON hardware_marks
-#              (e.g. H800 vs A3) select the matching case; legacy configs without hardware
-#              tags still run. Override with PYTEST_MARK / --pytest-mark.
+#              Uses --pytest-mark / PYTEST_MARK for pytest -m (hardware via JSON marks).
+#              When unset, -m defaults to MODEL_TYPE family only (omni / tts / diffusion).
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
 #              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
@@ -45,9 +44,9 @@
 #                   whose filename contains the substring (benchmark runner chosen by JSON family).
 #
 #   stability (when included in TEST_TYPE):
-#     From repo root: pytest -s -v --run-level full_model -m "<auto>" tests/dfx/stability/scripts/test_stability_*.py
-#     -m is built from MODEL_TYPE family + detected hardware (H800, A3, …) or platform (cuda/npu).
-#     Set PYTEST_MARK / --pytest-mark to override the auto expression.
+#     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
+#     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. "diffusion and H800 and local_model").
+#     Otherwise -m is MODEL_TYPE family only. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni; tts → qwen3_tts; diffusion → qwen_image + wan22 + hunyuan_image; all → all five
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
@@ -78,7 +77,7 @@
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
 #   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
 #                   local: substring of test_*.py basename or tests/dfx/perf/tests/*.json filename
-#   PYTEST_MARK   - override auto pytest -m for stability jobs (also --pytest-mark)
+#   PYTEST_MARK   - pytest -m expression for stability jobs only (also --pytest-mark)
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
 #   RUN_JOB_TIMEOUT_KILL_AFTER - seconds after SIGTERM before SIGKILL on inline pytest
 #                              timeout (default: 60; baked into generated job scripts)
@@ -611,86 +610,21 @@ def _stability_model_matches(model_types: list[str], families: tuple[str, ...]) 
     return bool(set(model_types) & set(families))
 
 
-STABILITY_PLATFORM_MARKERS: tuple[str, ...] = ("cuda", "npu", "rocm", "xpu", "musa")
-_STABILITY_FALLBACK_HARDWARE_MARKERS: frozenset[str] = frozenset(
-    {"H100", "H800", "H200", "L4", "B200", "MI325", "B60", "S5000", "A2", "A3"}
-)
+def _stability_family_marker_expr(model_types: list[str]) -> str:
+    """Default pytest -m when --pytest-mark is unset: MODEL_TYPE family only."""
+    if "all" in model_types:
+        return "omni or tts or diffusion"
+    if len(model_types) == 1:
+        return model_types[0]
+    return f"({' or '.join(model_types)})"
 
 
-def _stability_hardware_mark_list() -> frozenset[str]:
-    try:
-        from tests.helpers.mark import get_hardware_mark_list
-
-        marks = get_hardware_mark_list()
-        if marks:
-            return marks
-    except Exception:
-        pass
-    return _STABILITY_FALLBACK_HARDWARE_MARKERS
-
-
-def _detect_stability_hardware_marker() -> str | None:
-    try:
-        from tests.dfx.conftest import get_runtime_resource_label
-
-        label = get_runtime_resource_label(refresh=True)
-    except Exception:
-        label = None
-    if not label or label == "na":
-        return None
-    allowed = {name.upper() for name in _stability_hardware_mark_list()}
-    token = str(label).strip()
-    if token.upper() in allowed:
-        return token
-    return None
-
-
-def _detect_stability_platform_marker() -> str | None:
-    try:
-        from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_cuda():
-            return "cuda"
-        if current_omni_platform.is_npu():
-            return "npu"
-        if current_omni_platform.is_rocm():
-            return "rocm"
-        if current_omni_platform.is_xpu():
-            return "xpu"
-    except Exception:
-        pass
-    if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
-        return "npu"
-    return None
-
-
-def _stability_marker_or_unmarked(detected: str, universe: list[str]) -> str:
-    """Match ``detected``-tagged cases, or cases with no tag from ``universe``."""
-    union = " or ".join(universe)
-    return f"({detected} or not ({union}))"
-
-
-def stability_pytest_marker_expr(families: tuple[str, ...]) -> str:
-    """Build pytest -m for stability: model family + runtime hardware/platform."""
-    if not families:
-        family_expr = "omni or tts or diffusion"
-    elif len(families) == 1:
-        family_expr = families[0]
-    else:
-        family_expr = f"({' or '.join(families)})"
-
-    parts = [family_expr]
-    hw = _detect_stability_hardware_marker()
-    if hw:
-        hw_list = sorted(_stability_hardware_mark_list(), key=str.lower)
-        parts.append(_stability_marker_or_unmarked(hw, hw_list))
-    else:
-        platform = _detect_stability_platform_marker()
-        if platform:
-            parts.append(
-                _stability_marker_or_unmarked(platform, list(STABILITY_PLATFORM_MARKERS))
-            )
-    return " and ".join(parts)
+def _stability_pytest_mark(model_types: list[str]) -> str:
+    """Return explicit --pytest-mark or the MODEL_TYPE family default."""
+    override = (os.environ.get("PYTEST_MARK") or "").strip()
+    if override:
+        return override
+    return _stability_family_marker_expr(model_types)
 
 
 def _write_job_script(key: str, script_lines: list[str], jobs_dir: Path) -> None:
@@ -872,7 +806,8 @@ def run_local_mode(
 
 def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
     matched = 0
-    pytest_mark_override = (os.environ.get("PYTEST_MARK") or "").strip()
+    marker_expr = _stability_pytest_mark(model_types)
+    mark_from_cli = bool((os.environ.get("PYTEST_MARK") or "").strip())
     for key, rel_posix, families in STABILITY_CASES:
         if not _stability_model_matches(model_types, families):
             continue
@@ -888,14 +823,13 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
         if not rel_path.is_file():
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
-        marker_expr = pytest_mark_override or stability_pytest_marker_expr(families)
         pytest_line = f'pytest -s -v --run-level full_model -m "{marker_expr}" {rel_posix}'
         matched += 1
         script_lines = [
             "#!/usr/bin/env bash",
             f"# Stability: {key} — {rel_posix}",
             f"# pytest -m {marker_expr!r}"
-            + (" (PYTEST_MARK override)" if pytest_mark_override else " (auto)"),
+            + (" (--pytest-mark)" if mark_from_cli else " (MODEL_TYPE default)"),
             "set -euo pipefail",
             f'cd "{REPO_ROOT}"',
             pytest_line,
@@ -912,6 +846,14 @@ def main() -> None:
     want_local = "local" in test_types
     yaml_test_types = [t for t in test_types if t not in ("stability", "local")]
     needs_yaml = bool(yaml_test_types)
+
+    pytest_mark = (os.environ.get("PYTEST_MARK") or "").strip()
+    if pytest_mark and not want_stability:
+        print(
+            "PYTEST_MARK / --pytest-mark is only supported when --test-type includes stability",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     jobs_dir = LOG_DIR / "jobs"
     if not DRY_RUN:
