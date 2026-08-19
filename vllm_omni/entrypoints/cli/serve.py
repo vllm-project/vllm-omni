@@ -829,7 +829,7 @@ class OmniServeCommand(CLISubcommand):
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)
@@ -945,8 +945,6 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        # The serve CLI no longer accepts legacy stage_args YAMLs.
-        None,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.

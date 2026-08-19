@@ -38,17 +38,6 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "fishaudio/s2-pro"
-DEFAULT_STAGE_CONFIG = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "vllm_omni",
-    "model_executor",
-    "stage_configs",
-    "fish_speech_s2_pro.yaml",
-)
 
 
 def build_prompt(
@@ -154,8 +143,6 @@ def _build_omni_kwargs(args, model_name: str) -> dict:
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    else:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path or DEFAULT_STAGE_CONFIG
     return omni_kwargs
 
 
@@ -277,12 +264,6 @@ def parse_args():
         type=str,
         default=None,
         help="Deploy config YAML path (under vllm_omni/deploy/).",
-    )
-    parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="Path to stage configs YAML (legacy, prefer --deploy-config).",
     )
     parser.add_argument(
         "--output-dir",

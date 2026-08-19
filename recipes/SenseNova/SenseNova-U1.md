@@ -178,6 +178,48 @@ with the expected 1536×2720 resolution.
 - The LLM transformer uses `QKVParallelLinear` and `MergedColumnParallelLinear`
   for fused QKV and gate/up projections with TP support.
 
+### 1x AMD MI300X 192GB
+
+#### Environment
+
+- OS: Linux 6.8.0-134-generic, x86_64
+- Container: official ROCm image built from `docker/Dockerfile.rocm`
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- Driver / runtime: AMD 6.19.14.31400000 / ROCm 7.2.53211
+- GPU: one AMD Instinct MI300X, `gfx942:sramecc+:xnack-`, 191.69 GiB visible HBM
+- vLLM version: 0.27.0+rocm723
+- vLLM Omni version or commit: `a704c8759c96e123c0d7c89b11f120b1c0f120cf`
+- Installed vLLM Omni package metadata: `0.27.0rc2.dev44+g55abdade9.rocm`
+
+#### Command
+
+```bash
+python3 examples/offline_inference/text_to_image/text_to_image.py \
+    --model SenseNova/SenseNova-U1-8B-MoT \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light, emotional documentary look." \
+    --width 1536 \
+    --height 2720 \
+    --seed 42 \
+    --num-inference-steps 50 \
+    --cfg-scale 4.0 \
+    --extra-body '{"think": true, "cfg_norm": "none", "timestep_shift": 3.0, "t_eps": 0.02}' \
+    --enable-diffusion-pipeline-profiler \
+    --log-stats \
+    --output sensenova_u1_mi300x.png
+```
+
+#### Verification
+
+The command completed and wrote a valid 1536 by 2720 RGB PNG.
+
+#### Notes
+
+- Generation with 50 inference steps took 34.011 seconds.
+- Model loading used 32.774 GiB and took 13.987 seconds.
+- The internal profiler recorded 35.67 GB reserved and 35.10 GB allocated for the request.
+- The highest one second whole device memory sample was 37.93 GiB.
+
 ## Online Serving
 
 SenseNova-U1 supports all four modalities via the OpenAI-compatible

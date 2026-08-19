@@ -17,7 +17,6 @@ Key integration points:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from collections.abc import Iterable
@@ -28,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
+from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -40,6 +40,9 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.transformers_utils.configs.sensenova_u1 import (
+    SenseNovaU1Config,
+)
 
 from .sensenova_u1_transformer import (
     SenseNovaU1ForCausalLM,
@@ -86,16 +89,12 @@ SYSTEM_MESSAGE_FOR_GEN = (
 
 
 # ---------------------------------------------------------------------------
-# Config parsed from config.json
+# Config
 # ---------------------------------------------------------------------------
-
-
 def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
         return model_path
-    from huggingface_hub import snapshot_download
-
     return snapshot_download(model_path)
 
 
@@ -180,73 +179,6 @@ def _load_image_native(
     )
     grid_hw = torch.tensor([[grid_h, grid_w]])
     return flatten_pv, grid_hw
-
-
-def _load_sensenova_u1_config(model_path: str):
-    """Parse config.json and return (top_config, llm_config, vision_config) namespaces."""
-    local_path = _resolve_model_path(model_path)
-    cfg_path = os.path.join(local_path, "config.json")
-    with open(cfg_path, encoding="utf-8") as f:
-        raw = json.load(f)
-
-    llm_raw = raw.get("llm_config", {})
-    vis_raw = raw.get("vision_config", {})
-
-    # LLM config needs these extra fields for 3D RoPE
-    llm_cfg = SimpleNamespace(
-        hidden_size=llm_raw.get("hidden_size", 4096),
-        intermediate_size=llm_raw.get("intermediate_size", 11008),
-        num_hidden_layers=llm_raw.get("num_hidden_layers", 32),
-        num_attention_heads=llm_raw.get("num_attention_heads", 32),
-        num_key_value_heads=llm_raw.get("num_key_value_heads", llm_raw.get("num_attention_heads", 32)),
-        head_dim=llm_raw.get("head_dim", llm_raw.get("hidden_size", 4096) // llm_raw.get("num_attention_heads", 32)),
-        hidden_act=llm_raw.get("hidden_act", "silu"),
-        rms_norm_eps=llm_raw.get("rms_norm_eps", 1e-6),
-        vocab_size=llm_raw.get("vocab_size", 152064),
-        rope_theta=llm_raw.get("rope_theta", 1000000.0),
-        rope_theta_hw=llm_raw.get("rope_theta_hw", 10000.0),
-        max_position_embeddings=llm_raw.get("max_position_embeddings", 40960),
-        max_position_embeddings_hw=llm_raw.get("max_position_embeddings_hw", 10000),
-        attention_bias=llm_raw.get("attention_bias", True),
-        layer_types=llm_raw.get("layer_types", ["full_attention"] * llm_raw.get("num_hidden_layers", 32)),
-        tie_word_embeddings=llm_raw.get("tie_word_embeddings", False),
-    )
-
-    vis_cfg = SimpleNamespace(
-        num_channels=vis_raw.get("num_channels", 3),
-        patch_size=vis_raw.get("patch_size", 16),
-        hidden_size=vis_raw.get("hidden_size", 1024),
-        llm_hidden_size=vis_raw.get("llm_hidden_size", [llm_cfg.hidden_size]),
-        downsample_ratio=vis_raw.get("downsample_ratio", [0.5]),
-        rope_theta_vision=vis_raw.get("rope_theta_vision", 10000.0),
-        max_position_embeddings_vision=vis_raw.get("max_position_embeddings_vision", 10000),
-        output_hidden_states=vis_raw.get("output_hidden_states", False),
-        use_return_dict=vis_raw.get("use_return_dict", True),
-    )
-
-    top_cfg = SimpleNamespace(
-        downsample_ratio=raw.get("downsample_ratio", 0.5),
-        template=raw.get("template", "neo1_0"),
-        fm_head_layers=raw.get("fm_head_layers", 2),
-        fm_head_dim=raw.get("fm_head_dim", 4096),
-        fm_head_mlp_ratio=raw.get("fm_head_mlp_ratio", 1.0),
-        use_pixel_head=raw.get("use_pixel_head", False),
-        noise_scale=raw.get("noise_scale", 1.0),
-        noise_scale_mode=raw.get("noise_scale_mode", "none"),
-        noise_scale_base_image_seq_len=raw.get("noise_scale_base_image_seq_len", 256),
-        noise_scale_max_value=raw.get("noise_scale_max_value", 10.0),
-        add_noise_scale_embedding=raw.get("add_noise_scale_embedding", False),
-        time_schedule=raw.get("time_schedule", "standard"),
-        time_shift_type=raw.get("time_shift_type", "exponential"),
-        base_shift=raw.get("base_shift", 0.5),
-        max_shift=raw.get("max_shift", 1.15),
-        base_image_seq_len=raw.get("base_image_seq_len", 256),
-        max_image_seq_len=raw.get("max_image_seq_len", 4096),
-        concat_time_token_num=raw.get("concat_time_token_num", 0),
-        t_eps=raw.get("t_eps", 0.02),
-    )
-
-    return top_cfg, llm_cfg, vis_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +481,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
 
-        self.top_cfg, self.llm_cfg, self.vis_cfg = _load_sensenova_u1_config(model_path)
+        self.model_cfg = SenseNovaU1Config.from_pretrained(self.local_model_path)
+        self.llm_cfg = self.model_cfg.llm_config
+        self.vis_cfg = self.model_cfg.vision_config
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_path)
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
@@ -573,13 +507,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         # FM modules
         llm_hidden_size = self.llm_cfg.hidden_size
         patch_size = self.vis_cfg.patch_size
-        merge_size = int(1 / self.top_cfg.downsample_ratio)
+        merge_size = int(1 / self.model_cfg.downsample_ratio)
         output_dim = 3 * (patch_size * merge_size) ** 2
 
         vision_model_mot_gen = NEOVisionModel(self.vis_cfg)
         timestep_embedder = TimestepEmbedder(llm_hidden_size)
 
-        if self.top_cfg.use_pixel_head:
+        if self.model_cfg.use_pixel_head:
             fm_head = ConvDecoder(llm_hidden_size)
         else:
             # The reference implementation uses a fixed 2-layer GELU MLP with a 4096-d
@@ -601,13 +535,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             }
         )
 
-        if self.top_cfg.add_noise_scale_embedding:
+        if self.model_cfg.add_noise_scale_embedding:
             self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(llm_hidden_size)
 
         # Config shortcuts
         self.patch_size = patch_size
         self.merge_size = merge_size
-        self.downsample_ratio = self.top_cfg.downsample_ratio
+        self.downsample_ratio = self.model_cfg.downsample_ratio
 
         # Weight sources for diffusers_loader
         self.weights_sources = [
@@ -727,6 +661,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         t,
         z,
         image_token_num,
+        t_eps: float,
         image_size=None,
         cache_dit_skip=False,
         **_kw,
@@ -748,7 +683,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         )
         last_hidden_state = outputs.hidden_states
 
-        if self.top_cfg.use_pixel_head:
+        if self.model_cfg.use_pixel_head:
             merge_size = self.merge_size
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
@@ -765,7 +700,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         else:
             x_pred = self.fm_modules["fm_head"](last_hidden_state[:, -image_token_num:].view(B, L, -1)).view(B, L, -1)
 
-        v_pred = (x_pred - z) / (1 - t).clamp_min(self.top_cfg.t_eps)
+        v_pred = (x_pred - z) / (1 - t).clamp_min(t_eps)
         return v_pred
 
     def _apply_time_schedule(self, t, image_seq_len, timestep_shift):
@@ -1055,14 +990,14 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         token_w = p.image_size[0] // (self.patch_size * merge_size)
         grid_hw = torch.tensor([[grid_h, grid_w]] * p.batch_size, device=self.device)
 
-        noise_scale = self.top_cfg.noise_scale
-        if self.top_cfg.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
-            base = float(self.top_cfg.noise_scale_base_image_seq_len)
+        noise_scale = self.model_cfg.noise_scale
+        if self.model_cfg.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
+            base = float(self.model_cfg.noise_scale_base_image_seq_len)
             scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
-            noise_scale = scale * float(self.top_cfg.noise_scale)
-            if self.top_cfg.noise_scale_mode == "dynamic_sqrt":
+            noise_scale = scale * float(self.model_cfg.noise_scale)
+            if self.model_cfg.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
-        noise_scale = min(noise_scale, self.top_cfg.noise_scale_max_value)
+        noise_scale = min(noise_scale, self.model_cfg.noise_scale_max_value)
 
         generator = torch.Generator(self.device).manual_seed(p.seed)
         image_prediction = noise_scale * torch.randn(
@@ -1101,6 +1036,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             z=z,
             image_token_num=ns.token_h * ns.token_w,
             image_size=p.image_size,
+            t_eps=p.t_eps,
         )
         if cache_dit_skip:
             kwargs["cache_dit_skip"] = True
@@ -1241,7 +1177,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         p = self._parse_request(req)
-        self.top_cfg.t_eps = p.t_eps
 
         input_images = self._extract_input_images(p.first_prompt)
         modalities = p.first_prompt.get("modalities", []) if isinstance(p.first_prompt, dict) else []
@@ -1438,8 +1373,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.top_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.top_cfg.noise_scale_max_value)
+            if self.model_cfg.add_noise_scale_embedding:
+                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
                 ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
                     p.batch_size,
                     ns.token_h * ns.token_w,

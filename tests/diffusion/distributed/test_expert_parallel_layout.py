@@ -92,9 +92,8 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
     monkeypatch.setattr(parallel_state, "init_vllm_model_parallel_group", fake_init_vllm_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -229,9 +228,8 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
@@ -257,6 +255,33 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
     assert parallel_state._EXPERT_PARALLEL_GROUP_RANKS == [
         [0, 1, 2, 3, 4, 5, 6, 7],
     ]
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
+def test_destroy_model_parallel_clears_vllm_pipeline_group(monkeypatch):
+    """A destroyed diffusion PP group must not block the next initialization."""
+
+    class _DestroyableGroup:
+        def __init__(self) -> None:
+            self.destroy_calls = 0
+
+        def destroy(self) -> None:
+            self.destroy_calls += 1
+
+    pipeline_group = _DestroyableGroup()
+    for name in ("_DP", "_CFG", "_SP"):
+        monkeypatch.setattr(parallel_state, name, None)
+    monkeypatch.setattr(parallel_state, "_PP", pipeline_group)
+    monkeypatch.setattr(parallel_state, "_EXPERT_PARALLEL_GROUP_RANKS", None)
+    for name in ("_DP", "_PCP", "_TP", "_EP"):
+        monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
+    monkeypatch.setattr(parallel_state.vllm_parallel_state, "_PP", pipeline_group, raising=False)
+
+    parallel_state.destroy_model_parallel()
+
+    assert pipeline_group.destroy_calls == 1
+    assert parallel_state.vllm_parallel_state._PP is None
 
 
 @pytest.mark.cpu
@@ -295,9 +320,8 @@ def test_non_moe_ep_fails_before_vllm_ep_remap(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
     monkeypatch.setattr(parallel_state, "get_forward_context", lambda: fake_forward_context)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
-    monkeypatch.setattr(parallel_state, "init_dit_group", lambda *_args, **_kwargs: None)
 
-    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_EXPERT_PARALLEL_GROUP_RANKS"):
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
     for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)

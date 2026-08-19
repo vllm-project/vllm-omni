@@ -32,7 +32,7 @@ def _get_diffusion_feature_cases():
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
@@ -60,7 +60,7 @@ def test_basic_001(
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",

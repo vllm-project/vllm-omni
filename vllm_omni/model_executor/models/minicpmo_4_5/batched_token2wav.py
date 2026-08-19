@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from .cuda_graph_wrapper import HiFTGraphWrapper
+from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 
 logger = init_logger(__name__)
 
@@ -58,6 +58,25 @@ class BatchedToken2WavState:
     hift_cache: dict[str, torch.Tensor]
 
 
+def _undecorate_dynamo(module: nn.Module, method: str) -> None:
+    """Restore ``method`` on ``module`` if TorchDynamo wrapped it.
+
+    ``cosyvoice2`` decorates ``UpsampleConformerEncoderV2.forward_chunk`` with
+    ``torch.compile(backend="eager")``. That backend performs no Inductor
+    optimisation, so the wrapper only adds tracing and guard construction, and
+    duplex pays it again on every unseen chunk shape -- seconds inside a live
+    response. Dropping the wrapper leaves the original implementation, which is
+    what the eager backend was executing anyway.
+    """
+    bound = getattr(module, method, None)
+    original = getattr(bound, "_torchdynamo_orig_callable", None) or getattr(bound, "__wrapped__", None)
+    if original is None:
+        return
+    function = getattr(original, "__func__", original)
+    module.__dict__[method] = function.__get__(module, type(module))
+    logger.info("Bypassed TorchDynamo wrapper on %s.%s", type(module).__name__, method)
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -73,6 +92,7 @@ class BatchedToken2Wav(nn.Module):
         *,
         connector_config: Mapping[str, int] | None = None,
         hift_graph_config: Mapping[str, Any] | None = None,
+        cfm_graph_config: Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -81,6 +101,7 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        _undecorate_dynamo(self.flow.encoder, "forward_chunk")
         hift_parameter = next(self.hift.parameters(), None)
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
@@ -135,6 +156,22 @@ class BatchedToken2Wav(nn.Module):
                 with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                     self.hift_graph_wrapper.capture()
                 logger.info("HiFT CUDA Graph captured successfully")
+        self._cfm_graph_wrapper: CFMGraphWrapper | None = None
+        cfm_graph_cfg = dict(cfm_graph_config or {})
+        if bool(cfm_graph_cfg.get("enabled", False)):
+            flow_parameter = next(self.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type == "cuda":
+                estimator = self.flow.decoder.estimator
+                self._cfm_graph_wrapper = CFMGraphWrapper(
+                    graph_fn=estimator.blocks_forward_chunk,
+                    max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                )
+                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
+            else:
+                logger.info(
+                    "CFM CUDA Graph is disabled on device type %s",
+                    flow_parameter.device.type if flow_parameter is not None else "unknown",
+                )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
 
     def _hift_inference(
@@ -265,6 +302,19 @@ class BatchedToken2Wav(nn.Module):
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+        if self._cfm_graph_wrapper is not None:
+            if cnn_cache is None:
+                cnn_cache = torch.zeros_like(cnn_out)
+            if att_cache is None:
+                att_cache = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+            return self._cfm_graph_wrapper.replay(
+                estimator_input,
+                time_embedding,
+                cnn_cache,
+                att_cache,
+                cnn_out,
+                att_out,
+            )
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         result = estimator.blocks_forward_chunk(

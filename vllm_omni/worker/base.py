@@ -74,7 +74,7 @@ class OmniGPUWorkerBase(GPUWorker):
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "
-                "For omni models, add profiler_config to your stage config file."
+                "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
             from vllm_omni.profiler import OmniTorchProfilerWrapper

@@ -106,7 +106,10 @@ The following tables show which models support each feature:
 
 > Notes:
 
-> 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only. Split models like Cosmos3 (no separate text encoder) swap their reasoner/generator components for module-wise offload; see the [CPU Offload Guide](diffusion/cpu_offload.md).
+> 1. CPU Offload has three strategies: model-level, layerwise, and distributed
+>    layerwise. The tables below show **layerwise support** only. Split models
+>    like Cosmos3 swap their reasoner/generator components for model-level
+>    offload; see the [CPU Offload Guide](diffusion/cpu_offload.md).
 > 2. The **💾Quantization** column is collapsed for readability. See [Quantization](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
@@ -158,12 +161,21 @@ The following tables show which models support each feature:
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
+| **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
+| **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+
+> Notes:
+> 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
+>    recurrence carries state across frames, so a rank cannot denoise a slice of
+>    the token sequence in isolation. Doing so would need a distributed scan or
+>    an all-gather before every GDN block. The remaining ❌ columns are simply
+>    unvalidated on this model, not known-broken.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
@@ -171,7 +183,7 @@ The following tables show which models support each feature:
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, Helios, HunyuanVideo-1.5, DreamID-Omni
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM
 
 ### AudioGen
 
@@ -214,7 +226,7 @@ The following tables show which models support each feature:
     3. CPU Offloading (Layerwise) and CPU Offloading (Module-wise) are not compatible.
     4. The CPU Offloading (Layerwise) row describes local layerwise offload.
        Multi-device Distributed Layerwise Offload has a separate topology and
-       compatibility matrix in the [CPU Offloading guide](diffusion/cpu_offload.md#distributed-layerwise-offloading).
+       compatibility matrix in the [Distributed Layerwise Offloading guide](diffusion/offloader/distributed_layerwise_offload.md).
     5. The compatibility matrix uses FP8 as the representative quantization method.
     6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
 
