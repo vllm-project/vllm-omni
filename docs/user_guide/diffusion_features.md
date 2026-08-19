@@ -164,7 +164,6 @@ The following tables show which models support each feature:
 | **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-| **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
@@ -183,7 +182,7 @@ The following tables show which models support each feature:
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, SANA-WM
 
 ### AudioGen
 

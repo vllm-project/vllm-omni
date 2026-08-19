@@ -261,11 +261,6 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
-    "DreamIDOmniPipeline": (
-        "dreamid_omni",
-        "pipeline_dreamid_omni",
-        "DreamIDOmniPipeline",
-    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -595,7 +590,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
-    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",

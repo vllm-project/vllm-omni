@@ -3,20 +3,14 @@
 
 import argparse
 import json
-import re
 import time
 from typing import Any
 
 import numpy as np
-from PIL import Image
-from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,59 +18,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Model ckpt root directory.")
     parser.add_argument(
         "--model-type",
-        default="dreamid-omni",
-        choices=["dreamid-omni", "magi-human"],
+        default="magi-human",
+        choices=["magi-human"],
         help="Model type.",
     )
     parser.add_argument("--prompt", default=None, help="Text prompt.")
-
-    parser.add_argument("--image-path", type=str, nargs="+", help="list of image-path")
-    parser.add_argument("--audio-path", type=str, nargs="+", help="list of audio-path")
-    parser.add_argument("--prompt-file", type=str, default=None, help="Text prompt in json format.")
     parser.add_argument(
         "--extra-body",
         type=str,
         default=None,
-        help="[magi-human] JSON dict of model-specific extra params (declared in vllm_omni/model_extras/), "
+        help="JSON dict of model-specific extra params (declared in vllm_omni/model_extras/), "
         'merged into sampling extra_args. Example: \'{"image_path": "/path/to/img.jpg", "seconds": 5}\'.',
     )
 
-    parser.add_argument("--height", type=int, default=704, help="Video height.")
-    parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--num-inference-steps", type=int, default=45, help="Sampling steps.")
-    parser.add_argument("--solver-name", default="unipc", help="Solver name: unipc|dpm++|euler.")
-    parser.add_argument("--shift", type=float, default=5.0, help="Scheduler shift.")
-    parser.add_argument("--seed", type=int, default=103, help="Random seed for reproducible generation.")
+    parser.add_argument("--height", type=int, default=256, help="Video height.")
+    parser.add_argument("--width", type=int, default=448, help="Video width.")
+    parser.add_argument("--num-inference-steps", type=int, default=8, help="Sampling steps.")
+    parser.add_argument("--seed", type=int, default=52, help="Random seed for reproducible generation.")
     parser.add_argument(
         "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2, 3, 4],
-        help="Number of GPUs used for classifier free guidance parallel size (max 4 branches).",
+        help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
         default=1,
-        help=("Number of GPUs used for tensor parallelism (TP) inside the DiT."),
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
-    parser.add_argument(
-        "--video-negative-prompt",
-        default="jitter, bad hands, blur, distortion",
-        help="Negative prompt for video.",
-    )
-    parser.add_argument(
-        "--audio-negative-prompt",
-        default="robotic, muffled, echo, distorted",
-        help="Negative prompt for audio.",
-    )
-    parser.add_argument("--output", default="dreamid_output.mp4", help="Output video path.")
+    parser.add_argument("--output", default="output_magihuman.mp4", help="Output video path.")
     parser.add_argument(
         "--quantization",
         type=str,
         default=None,
         choices=["fp8", "int8"],
-        help=("Online (dynamic) quantization method for the DreamID-Omni transformer. "),
+        help="Online (dynamic) quantization method for the transformer.",
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -93,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-hsdp",
         action="store_true",
-        help="Enable HSDP for DreamID-Omni fused transformer blocks.",
+        help="Enable HSDP for DiT weight sharding.",
     )
     parser.add_argument(
         "--hsdp-shard-size",
@@ -108,22 +86,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of HSDP replica groups. Default 1 means pure sharding.",
     )
     return parser.parse_args()
-
-
-def load_image_and_audio(image_paths, audio_paths):
-    image = []
-    audio = []
-
-    for path in image_paths:
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            image.append(img)
-
-    for path in audio_paths:
-        audio_array, sr = load_audio(path, sr=16000)
-        audio_array = audio_array[int(sr * 1) : int(sr * 3)]
-        audio.append(audio_array)
-    return image, audio
 
 
 def _extract_peak_memory_mb(result: Any) -> float:
@@ -149,52 +111,17 @@ def _extract_peak_memory_mb(result: Any) -> float:
 
 def main() -> None:
     args = parse_args()
-    if args.prompt is None and args.prompt_file is None:
-        raise ValueError("Either --prompt or --prompt-file must be provided.")
+    if args.prompt is None:
+        raise ValueError("--prompt must be provided.")
 
-    text_prompt = args.prompt
-    if args.prompt_file:
-        with open(args.prompt_file) as f:
-            text_prompt = json.load(f)
-            text_prompt = re.sub(
-                r"\[SPEAKER_TIMESTAMPS_START\].*?\[SPEAKER_TIMESTAMPS_END\]", "", text_prompt, flags=re.DOTALL
-            ).strip()
-            text_prompt = re.sub(
-                r"\[AUDIO_DESCRIPTION_START].*?\[AUDIO_DESCRIPTION_END]", "", text_prompt, flags=re.DOTALL
-            ).strip()
-            text_prompt = re.sub(r"\[[A-Z_]+\]", "", text_prompt)
-            text_prompt = re.sub(r"\n\s*\n", "\n", text_prompt).strip()
-
-    if args.model_type == "magi-human":
-        prompt = text_prompt
-        extra_args = json.loads(args.extra_body) if args.extra_body else {}
-        sampling_params = OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            seed=args.seed,
-            extra_args=extra_args,
-        )
-    else:
-        image, audio = load_image_and_audio(args.image_path, args.audio_path)
-
-        prompt = {
-            "prompt": text_prompt,
-            "video_negative_prompt": args.video_negative_prompt,
-            "audio_negative_prompt": args.audio_negative_prompt,
-            "multi_modal_data": {"image": image, "audio": audio},
-        }
-
-        sampling_params = OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.num_inference_steps,
-            seed=args.seed,
-            extra_args={
-                "solver_name": args.solver_name,
-                "shift": args.shift,
-            },
-        )
+    extra_args = json.loads(args.extra_body) if args.extra_body else {}
+    sampling_params = OmniDiffusionSamplingParams(
+        height=args.height,
+        width=args.width,
+        num_inference_steps=args.num_inference_steps,
+        seed=args.seed,
+        extra_args=extra_args,
+    )
 
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -228,7 +155,7 @@ def main() -> None:
         omni_kwargs["quantization"] = args.quantization
     omni = Omni(**omni_kwargs)
     start = time.perf_counter()
-    outputs = omni.generate(prompt, sampling_params)
+    outputs = omni.generate(args.prompt, sampling_params)
     elapsed = time.perf_counter() - start
 
     if not outputs:
@@ -240,35 +167,23 @@ def main() -> None:
     mm = result.multimodal_output or {}
     generated_audio = mm.get("audio")
 
-    if args.model_type == "magi-human":
-        # MagiHuman returns frames already as (F, H, W, C) uint8, ready to mux.
-        fps = float(mm.get("fps", 25))
-        sample_rate = int(mm.get("audio_sample_rate", 24000))
-        frames = generated_video
-    else:
-        fps = float(mm.get("fps", 24))
-        sample_rate = int(mm.get("audio_sample_rate", 16000))
-        # DreamID-Omni returns video as (C, F, H, W) float32 in [-1, 1].
-        # mux_video_audio_bytes expects (F, H, W, C) uint8.
-        if not isinstance(generated_video, np.ndarray) or generated_video.ndim != 4:
-            raise RuntimeError(f"Unexpected video shape: {getattr(generated_video, 'shape', None)}")
-        frames = generated_video.transpose(1, 2, 3, 0)
-        frames = (np.clip((frames + 1.0) / 2.0, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    fps = float(mm.get("fps", 25))
+    sample_rate = int(mm.get("audio_sample_rate", 24000))
+    frames = generated_video
 
     audio_np = None
     if generated_audio is not None:
         audio_np = np.squeeze(np.asarray(generated_audio)).astype(np.float32)
 
-    output_path = args.output
     video_bytes = mux_video_audio_bytes(
         frames,
         audio_np,
         fps=float(fps),
         audio_sample_rate=sample_rate,
     )
-    with open(output_path, "wb") as f:
+    with open(args.output, "wb") as f:
         f.write(video_bytes)
-    print(f"Saved generated video to {output_path}")
+    print(f"Saved generated video to {args.output}")
     print(f"Total time: {elapsed:.2f}s")
     peak_mb = _extract_peak_memory_mb(outputs)
     if peak_mb:

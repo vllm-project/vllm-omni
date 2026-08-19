@@ -58,7 +58,6 @@ EXCLUDED_MODELS = [
     "OmniGen2Pipeline",
     "HeliosPipeline",
     "HeliosPyramidPipeline",
-    "DreamIDOmniPipeline",
     "SenseNovaU1Pipeline",
     "AudioXPipeline",
     "HunyuanVideo15Pipeline",
