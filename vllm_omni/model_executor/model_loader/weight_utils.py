@@ -111,8 +111,8 @@ def resolve_model_to_local_path(
             best-effort callers (e.g. stage init path indirection).
 
     Returns:
-        Path to a local directory containing the model files, or *model*
-        itself when ``strict=False`` and resolution fails.
+        Path to a local directory containing the model files,
+        or **model** itself when strict=False and resolution fails.
     """
     if os.path.isdir(model):
         return model
