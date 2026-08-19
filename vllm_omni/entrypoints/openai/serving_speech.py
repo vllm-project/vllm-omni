@@ -122,6 +122,8 @@ _TTS_LANGUAGES = frozenset(
 )
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
+_REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
+_REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
@@ -1542,11 +1544,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Validate ref_audio is a supported URI format. Returns error or None."""
         if not isinstance(ref_audio, str):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
-        if not (
-            ref_audio.startswith(("http://", "https://"))
-            or ref_audio.startswith("data:")
-            or ref_audio.startswith("file://")
-        ):
+        scheme = (urlparse(ref_audio).scheme or "").lower()
+        if scheme not in {"http", "https", "data", "file"}:
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
         return None
 
@@ -1699,7 +1698,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             _resolve_keys.append(cache_key)
             return wav_list, sr, cache_key
 
-        async def _encode_ref(ref_str: str) -> torch.Tensor:
+        async def _encode_ref(ref_str: str, *, named_voice: bool) -> torch.Tensor:
+            # Named-voice cache is (voice_name, created_at). TTSD speaker 2 is a
+            # different clip, so it must stay anonymous or it reuses speaker 1.
+            use_named = named_voice and bool(_voice)
             return await encode_reference_codes(
                 ref_str,
                 processor=proc,
@@ -1708,17 +1710,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 variant=v,
                 n_vq=n_vq,
                 sr_target=sr_target,
-                voice_name=_voice or None,
-                voice_created_at=_voice_created,
+                voice_name=_voice if use_named else None,
+                voice_created_at=_voice_created if use_named else 0,
             )
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
         if v in ("tts", "local"):
-            user_kwargs["reference"] = [await _encode_ref(request.ref_audio)]
+            user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
         elif v == "ttsd":
-            refs = [await _encode_ref(request.ref_audio)]
+            refs = [await _encode_ref(request.ref_audio, named_voice=True)]
             if request.ref_audio_2:
-                refs.append(await _encode_ref(request.ref_audio_2))
+                refs.append(await _encode_ref(request.ref_audio_2, named_voice=False))
             user_kwargs["reference"] = refs
         elif v == "sound_effect":
             user_kwargs["text"] = request.input or ""  # may be empty
@@ -1973,6 +1975,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return adapter
 
     @staticmethod
+    def _local_ref_audio_stat_path(ref_audio_str: str) -> str | None:
+        """Filesystem path to stat for a local locator, else ``None``.
+
+        Scheme comparison is case-insensitive (``urlparse`` lowercases it), so
+        ``FILE:///...`` is treated as a local file the same way ``file://`` is.
+        Remote ``http`` / ``https`` / ``data`` locators, including ``HTTP://``,
+        return ``None`` and stay string-keyed.
+        """
+        parsed = urlparse(ref_audio_str)
+        scheme = (parsed.scheme or "").lower()
+        if scheme in _REMOTE_REF_AUDIO_SCHEMES:
+            return None
+        if scheme == "file":
+            netloc = parsed.netloc or ""
+            if netloc.lower() not in ("", "localhost"):
+                raise OSError(f"file:// URI with non-local authority {netloc!r} cannot be stat'd")
+            return url2pathname(parsed.path or "")
+        if scheme:
+            return None
+        return ref_audio_str
+
+    @staticmethod
     def _get_ref_audio_cache_key(
         ref_audio_str: str,
         allowed_local_media_path: str | None = None,
@@ -1998,19 +2022,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         (the stale entry is never *used*) but doubles memory until eviction.
         """
         cache_key_source = ref_audio_str
-        if not ref_audio_str.startswith(("http://", "https://", "data:")):
+        try:
+            path = OmniOpenAIServingSpeech._local_ref_audio_stat_path(ref_audio_str)
+        except OSError as exc:
+            path = None
+            logger.debug("Skipping local-file cache metadata for %s: %s", ref_audio_str[:80], exc)
+        if path is not None:
             try:
-                if ref_audio_str.startswith("file://"):
-                    parsed = urlparse(ref_audio_str)
-                    # RFC 8089: only "" and "localhost" are valid for local
-                    # files; drop them so the path stays absolute.
-                    netloc = parsed.netloc or ""
-                    if netloc.lower() in ("", "localhost"):
-                        path = url2pathname(parsed.path or "")
-                    else:
-                        raise OSError(f"file:// URI with non-local authority {netloc!r} cannot be stat'd")
-                else:
-                    path = ref_audio_str
                 # Only stat paths the server operator has explicitly permitted
                 # via --allowed-local-media-path.  The default is "" (and
                 # diffusion mode passes None); MediaConnector refuses local
@@ -2037,6 +2055,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
         return hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()
 
+    async def _ref_audio_cache_key(self, ref_audio_str: str, allowed_local_media_path: str | None) -> str:
+        """Stat local files off the event loop; remote locators stay a cheap hash."""
+        return await asyncio.to_thread(
+            self._get_ref_audio_cache_key,
+            ref_audio_str,
+            allowed_local_media_path,
+        )
+
+    def _finalize_fetched_ref_audio(self, wav_np: np.ndarray, sr: int) -> tuple[list[float], int, str, float]:
+        wav_np = np.asarray(wav_np, dtype=np.float32)
+        if wav_np.ndim > 1:
+            wav_np = np.mean(wav_np, axis=-1)
+        sr = int(sr)
+        duration = len(wav_np) / sr if sr > 0 else 0.0
+        if duration < _REF_AUDIO_MIN_DURATION:
+            raise ValueError(
+                f"Reference audio too short ({duration:.1f}s). "
+                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
+            )
+        if duration > _REF_AUDIO_MAX_DURATION:
+            raise ValueError(
+                f"Reference audio too long ({duration:.1f}s). "
+                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
+            )
+        artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
+        return wav_np.tolist(), sr, artifact_key, duration
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int, str]:
         """Resolve ref_audio to (wav_samples, sample_rate, cache_key).
 
@@ -2051,66 +2096,75 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         The returned *cache_key* should be passed to
         ``_get_resolved_ref_audio_artifact_key`` when the caller needs the
         artifact key, avoiding a redundant ``os.stat`` and the TOCTOU window.
+        After a cache miss the file is re-stat'd; a metadata change retries
+        the fetch so the stored waveform matches the key.
         """
         # Pass the allowed-local-media-path so the stat is restricted to
         # paths the server operator has explicitly permitted.
         allowed_path = None
         if not self._diffusion_mode:
             allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
-        cache_key = self._get_ref_audio_cache_key(ref_audio_str, allowed_local_media_path=allowed_path)
-        cached = self._ref_audio_resolve_cache.get(cache_key)
-        if cached is not None:
-            self._ref_audio_resolve_cache.move_to_end(cache_key)
-            wav_list, sr, _, _ = cached
+
+        wav_list: list[float] | None = None
+        sr = 0
+        artifact_key = ""
+        post_key = ""
+        connector: MediaConnector | None = None
+        for attempt in range(_REF_AUDIO_METADATA_FETCH_ATTEMPTS):
+            cache_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
+            cached = self._ref_audio_resolve_cache.get(cache_key)
+            if cached is not None:
+                self._ref_audio_resolve_cache.move_to_end(cache_key)
+                wav_list, sr, _, _ = cached
+                logger.debug(
+                    "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
+                    len(wav_list),
+                    sr,
+                    len(wav_list) / sr if sr > 0 else 0.0,
+                )
+                return wav_list, sr, cache_key
+
+            if connector is None:
+                # In diffusion mode, model_config may not be available
+                if self._diffusion_mode:
+                    connector = MediaConnector()
+                else:
+                    model_config = self.model_config
+                    connector = MediaConnector(
+                        allowed_local_media_path=model_config.allowed_local_media_path,
+                        allowed_media_domains=model_config.allowed_media_domains,
+                    )
+
+            fetch_start_s = time.perf_counter()
+            wav_np, fetched_sr = await connector.fetch_audio_async(ref_audio_str)
+            fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
+            tolist_start_s = time.perf_counter()
+            wav_list, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)
+            tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
             logger.debug(
-                "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
+                "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
+                fetch_decode_ms,
+                tolist_ms,
                 len(wav_list),
                 sr,
-                len(wav_list) / sr if sr > 0 else 0.0,
+                duration,
             )
-            return wav_list, sr, cache_key
+            post_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
+            if post_key == cache_key:
+                self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
+                return wav_list, sr, cache_key
+            logger.debug(
+                "ref_audio metadata changed during fetch (attempt %d/%d); retrying",
+                attempt + 1,
+                _REF_AUDIO_METADATA_FETCH_ATTEMPTS,
+            )
 
-        # In diffusion mode, model_config may not be available
-        if self._diffusion_mode:
-            connector = MediaConnector()
-        else:
-            model_config = self.model_config
-            connector = MediaConnector(
-                allowed_local_media_path=model_config.allowed_local_media_path,
-                allowed_media_domains=model_config.allowed_media_domains,
-            )
-        fetch_start_s = time.perf_counter()
-        wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
-        fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
-        wav_np = np.asarray(wav_np, dtype=np.float32)
-        if wav_np.ndim > 1:
-            wav_np = np.mean(wav_np, axis=-1)
-        sr = int(sr)
-        artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
-        duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < _REF_AUDIO_MIN_DURATION:
-            raise ValueError(
-                f"Reference audio too short ({duration:.1f}s). "
-                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-            )
-        if duration > _REF_AUDIO_MAX_DURATION:
-            raise ValueError(
-                f"Reference audio too long ({duration:.1f}s). "
-                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-            )
-        tolist_start_s = time.perf_counter()
-        wav_list = wav_np.tolist()
-        tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
-        logger.debug(
-            "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
-            fetch_decode_ms,
-            tolist_ms,
-            len(wav_np),
-            sr,
-            duration,
+        logger.warning(
+            "ref_audio file changed during fetch after %d attempts; skipping resolve cache",
+            _REF_AUDIO_METADATA_FETCH_ATTEMPTS,
         )
-        self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
-        return wav_list, sr, cache_key
+        assert wav_list is not None and post_key
+        return wav_list, sr, post_key
 
     @staticmethod
     def _make_ref_audio_artifact_cache_key(wav: np.ndarray, sr: int) -> str:

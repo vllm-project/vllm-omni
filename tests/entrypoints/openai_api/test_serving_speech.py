@@ -1313,6 +1313,67 @@ class TestTTSMethods:
             expected = hashlib.sha1(file_uri.encode("utf-8")).hexdigest()
             assert key == expected, "Empty-string allowlist should skip stat and use string-only key"
 
+    def test_uppercase_file_uri_uses_local_metadata(self):
+        """FILE:// must be treated as a local file, not a string-only locator."""
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_file = pathlib.Path(tmp_dir) / "test.wav"
+            test_file.write_text("data")
+            upper_uri = f"FILE://{test_file}"
+            key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(
+                upper_uri,
+                allowed_local_media_path=tmp_dir,
+            )
+            string_only = hashlib.sha1(upper_uri.encode("utf-8")).hexdigest()
+            assert key != string_only
+
+    def test_uppercase_http_uri_is_remote(self, speech_server):
+        url = "HTTP://example.com/audio.wav"
+        key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(url)
+        assert key == hashlib.sha1(url.encode("utf-8")).hexdigest()
+        assert speech_server._validate_ref_audio_format(url) is None
+        assert speech_server._validate_ref_audio_format("FILE:///tmp/a.wav") is None
+        assert speech_server._validate_ref_audio_format("/tmp/a.wav") is not None
+
+    @pytest.mark.asyncio
+    async def test_resolve_ref_audio_retries_when_file_changes_during_fetch(self, speech_server, mocker):
+        import pathlib
+        import tempfile
+
+        wav = np.linspace(-0.5, 0.5, 48000, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = pathlib.Path(tmp_dir) / "spk.wav"
+            path.write_bytes(b"v1")
+            uri = f"file://{path}"
+            speech_server.model_config.allowed_local_media_path = tmp_dir
+            speech_server.model_config.allowed_media_domains = None
+            speech_server._diffusion_mode = False
+
+            fetches = {"n": 0}
+
+            async def fake_fetch(_ref):
+                fetches["n"] += 1
+                if fetches["n"] == 1:
+                    path.write_bytes(b"v2-longer-content")
+                return wav, 24000
+
+            mock_connector = mocker.MagicMock()
+            mock_connector.fetch_audio_async = fake_fetch
+            mocker.patch(
+                "vllm_omni.entrypoints.openai.serving_speech.MediaConnector",
+                return_value=mock_connector,
+            )
+
+            wav_list, sr, cache_key = await speech_server._resolve_ref_audio(uri)
+            expected_key = OmniOpenAIServingSpeech._get_ref_audio_cache_key(uri, allowed_local_media_path=tmp_dir)
+            assert sr == 24000
+            assert len(wav_list) == 48000
+            assert fetches["n"] == 2
+            assert cache_key == expected_key
+            assert cache_key in speech_server._ref_audio_resolve_cache
+
     def test_conditioning_cache_salt_changes_with_ref_audio_cache_key(self):
         """Prefix-cache salt must fold the content-aware resolve key so a
         same-path file rewrite cannot reuse KV from the previous reference."""
@@ -1461,6 +1522,43 @@ class TestTTSMethods:
             voice_created_at=100,
         )
         assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+
+    @pytest.mark.asyncio
+    async def test_ttsd_second_reference_does_not_use_named_voice(self, speech_server, mocker):
+        """Uploaded voice names speaker 1 only; speaker 2 must stay anonymous."""
+        speech_server._moss_variant = "ttsd"
+        speech_server.uploaded_speakers = {"alice": {}}
+        mocker.patch.object(speech_server, "_voice_created_at", return_value=42)
+
+        proc = mocker.MagicMock()
+        proc.model_config.n_vq = 8
+        proc.model_config.sampling_rate = 24000
+        proc.build_user_message.return_value = "msg"
+        proc.return_value = {"input_ids": [torch.zeros((4, 9), dtype=torch.int64)]}
+        mocker.patch.object(speech_server, "_get_moss_processor", return_value=proc)
+
+        seen: list[tuple[str, str | None]] = []
+
+        async def fake_encode(ref_str, **kwargs):
+            seen.append((ref_str, kwargs.get("voice_name")))
+            return torch.zeros(3, dtype=torch.int64)
+
+        mocker.patch(
+            "vllm_omni.model_executor.models.moss_tts.reference_encoder.encode_reference_codes",
+            fake_encode,
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="hello",
+            voice="alice",
+            ref_audio="data:audio/wav;base64,aaa",
+            ref_audio_2="data:audio/wav;base64,bbb",
+        )
+        await speech_server._build_moss_tts_params(req, has_inline_ref_audio=False)
+        assert seen == [
+            ("data:audio/wav;base64,aaa", "alice"),
+            ("data:audio/wav;base64,bbb", None),
+        ]
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
