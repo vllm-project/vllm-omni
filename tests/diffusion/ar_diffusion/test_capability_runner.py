@@ -144,6 +144,23 @@ def make_runner(
     return runner
 
 
+def test_tp_available_memory_uses_minimum_rank_budget(monkeypatch):
+    runner = object.__new__(ARDiffusionModelRunner)
+    runner.device = torch.device("cpu")
+    tp_group = SimpleNamespace(world_size=2, device_group=object())
+    monkeypatch.setattr("vllm_omni.experimental.ar_diffusion.runner.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("vllm_omni.experimental.ar_diffusion.runner.get_tp_group", lambda: tp_group)
+
+    def reduce_min(tensor, *, op, group):
+        assert op is torch.distributed.ReduceOp.MIN
+        assert group is tp_group.device_group
+        tensor.fill_(128)
+
+    monkeypatch.setattr("vllm_omni.experimental.ar_diffusion.runner.dist.all_reduce", reduce_min)
+
+    assert runner._minimum_tp_available_memory_bytes(256) == 128
+
+
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
     state = runner._get_or_create_session(session_id)
     ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx

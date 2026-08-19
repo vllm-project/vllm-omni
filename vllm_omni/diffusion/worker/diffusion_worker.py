@@ -72,6 +72,9 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
 
+_RESULT_QUEUE_MAX_CHUNK_BYTES = 4 * 1024 * 1024
+_RESULT_QUEUE_MAX_CHUNKS = 4
+
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
 # Maximum time (in seconds) to wait for pending background D2H / SHM packing
 # to drain before the worker executes memory-releasing lifecycle tasks
@@ -916,12 +919,7 @@ class WorkerProc:
         self.result_mq = None
         self.result_mq_handle = None
 
-        # Each worker creates its own result MessageQueue (as writer).
-        # The executor creates one reader per worker to collect responses.
-        # This supports DP multi-concurrency where all ranks reply independently.
-        self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-        self.result_mq_handle = self.result_mq.export_handle()
-        logger.info(f"Worker {gpu_id} created result MessageQueue")
+        self._init_result_mq()
 
         assert od_config.master_port is not None
 
@@ -950,6 +948,18 @@ class WorkerProc:
     @staticmethod
     def _generate_async_output_id() -> str:
         return uuid.uuid4().hex
+
+    def _init_result_mq(self) -> None:
+        """Create a bounded per-worker queue for small SHM-handle envelopes."""
+        self.result_mq = MessageQueue(
+            n_reader=1,
+            n_local_reader=1,
+            local_reader_ranks=[0],
+            max_chunk_bytes=_RESULT_QUEUE_MAX_CHUNK_BYTES,
+            max_chunks=_RESULT_QUEUE_MAX_CHUNKS,
+        )
+        self.result_mq_handle = self.result_mq.export_handle()
+        logger.info("Worker %s created result MessageQueue", self.gpu_id)
 
     def _create_worker(
         self,

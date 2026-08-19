@@ -481,7 +481,7 @@ class DiffusersPipelineLoader:
                             planned_weights=self.host_weight_plan.bindings,
                         )
                 else:
-                    if _dist_offload and _use_ag and _has_online_quant:
+                    if _dist_offload and _use_ag and _dlo_group_size > 1 and _has_online_quant:
                         unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
                         if unsupported_methods:
                             raise ValueError(

@@ -6,6 +6,8 @@ import time
 from collections import OrderedDict
 
 import torch
+import torch.distributed as dist
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -88,6 +90,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion KV preallocation currently requires a CUDA device")
         return int(torch.cuda.mem_get_info(self.device)[0])
 
+    def _minimum_tp_available_memory_bytes(self, available_bytes: int) -> int:
+        """Use one conservative KV budget across every tensor-parallel rank."""
+        if not dist.is_initialized():
+            return available_bytes
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return available_bytes
+        budget = torch.tensor(available_bytes, dtype=torch.int64, device=self.device)
+        dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=tp_group.device_group)
+        return int(budget.item())
+
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
         if bool(getattr(self.od_config, "step_execution", False)):
@@ -123,6 +136,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
+        effective_available_bytes = self._available_memory_bytes() if available_bytes is None else available_bytes
+        if available_bytes is None:
+            effective_available_bytes = self._minimum_tp_available_memory_bytes(effective_available_bytes)
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
@@ -131,7 +147,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             dtype=self.od_config.dtype,
             block_size=spec.tokens_per_frame,
             max_model_len=spec.max_model_len,
-            available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
+            available_bytes=effective_available_bytes,
             kv_branches=spec.kv_branches,
             session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,

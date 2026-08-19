@@ -37,6 +37,23 @@ def _make_worker_proc(step_execution=False):
     return proc
 
 
+def test_worker_result_queue_uses_bounded_ring(mocker):
+    proc = object.__new__(WorkerProc)
+    proc.gpu_id = 3
+    mq_cls = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.MessageQueue")
+
+    proc._init_result_mq()
+
+    mq_cls.assert_called_once_with(
+        n_reader=1,
+        n_local_reader=1,
+        local_reader_ranks=[0],
+        max_chunk_bytes=4 * 1024 * 1024,
+        max_chunks=4,
+    )
+    assert proc.result_mq_handle is mq_cls.return_value.export_handle.return_value
+
+
 class _OverlapDetectingQueue:
     """Fails if two threads are inside enqueue() at the same time.
 

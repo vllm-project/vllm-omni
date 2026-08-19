@@ -477,6 +477,42 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
         loader.load_model(load_device="cpu")
 
 
+def test_rank_local_dlo_allows_unvalidated_online_quant_method(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    class UnsupportedOnlineMethod:
+        uses_meta_device = True
+
+    od_config = _make_dlo_online_quant_config()
+    od_config.parallel_config.data_parallel_size = 1
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = UnsupportedOnlineMethod()
+    calls: list[object] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader._request_offload_after_quant = lambda _model: 1  # type: ignore[method-assign]
+    loader.load_weights = (  # type: ignore[method-assign]
+        lambda _model, *, stream_online_quant_to_cpu=False: calls.append(("load", stream_online_quant_to_cpu))
+    )
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(None, "online quantization requires the ordinary loader"),
+    )
+    monkeypatch.setattr(
+        loader,
+        "_unsupported_dlo_allgather_online_quant_methods",
+        lambda _model: pytest.fail("rank-local DLO must not run the AllGather allowlist"),
+    )
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cpu")) is model
+    assert calls == [("load", True), "process"]
+
+
 def test_hsdp_processes_quantized_weights_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
