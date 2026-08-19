@@ -15,12 +15,7 @@ from torch.distributed.fsdp import (
 )
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_fs_group,
-    get_fully_shard_rank,
-    get_fully_shard_world_size,
-    get_world_group,
-)
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -54,7 +49,7 @@ class HSDPInferenceConfig:
 def _create_hsdp_mesh(
     device_type: str,
     replicate_size: int,
-    shard_pg: torch.distributed.ProcessGroup,
+    shard_size: int,
 ) -> DeviceMesh:
     """Create a DeviceMesh for HSDP using an existing ProcessGroup for the shard dimension.
 
@@ -65,7 +60,7 @@ def _create_hsdp_mesh(
     Args:
         device_type: The device type (e.g., "cuda", "npu")
         replicate_size: Number of replica groups
-        shard_pg: The ProcessGroup for the shard dimension (from FS GroupCoordinator)
+        shard_size: Number of ranks in each FSDP shard group
 
     Returns:
         A DeviceMesh representing the HSDP topology.
@@ -73,8 +68,13 @@ def _create_hsdp_mesh(
     if replicate_size <= 0:
         raise ValueError(f"Invalid replicate_size: {replicate_size}. HSDP replica size must be a positive integer.")
 
-    shard_size = torch.distributed.get_world_size(shard_pg)
     world_size = replicate_size * shard_size
+    actual_world_size = torch.distributed.get_world_size()
+    if world_size != actual_world_size:
+        raise ValueError(
+            f"HSDP mesh dimensions ({replicate_size} x {shard_size} = {world_size}) "
+            f"must equal WORLD size ({actual_world_size})"
+        )
 
     # Build mesh tensor and create DeviceMesh (reusing the existing FS ProcessGroup).
     # Shape is (replicate_size, shard_size) for 2D, or (shard_size,) for 1D.
@@ -93,9 +93,6 @@ def _create_hsdp_mesh(
             mesh_dim_names=("shard",),
         )
 
-    # Note: init_device_mesh creates new ProcessGroups internally.
-    # For consistency, we verify the mesh structure matches our FS group.
-    # In a future optimization, we could pass the existing ProcessGroups directly.
     logger.debug(
         "Created HSDP mesh: replicate_size=%d, shard_size=%d, mesh=%s",
         replicate_size,
@@ -131,34 +128,24 @@ def apply_hsdp_to_model(
     if not hsdp_config.enabled:
         raise ValueError("HSDP is not enabled in config")
 
-    # Use GroupCoordinator for distributed info
     world_group = get_world_group()
-    fs_group = get_fs_group()
-
     world_size = world_group.world_size
     rank = world_group.rank_in_group
-    fs_world_size = get_fully_shard_world_size()
-    fs_rank = get_fully_shard_rank()
 
     hsdp_replicate_size = hsdp_config.hsdp_replicate_size
     hsdp_shard_size = hsdp_config.hsdp_shard_size
 
-    # Validate that the FS group matches the HSDP shard size
-    if fs_world_size != hsdp_shard_size:
+    if hsdp_replicate_size * hsdp_shard_size != world_size:
         raise ValueError(
-            f"FS group world_size ({fs_world_size}) does not match "
-            f"HSDP shard_size ({hsdp_shard_size}). "
-            "Ensure fully_shard_degree is set correctly in initialize_model_parallel."
+            f"HSDP mesh dimensions ({hsdp_replicate_size} x {hsdp_shard_size}) must equal WORLD size ({world_size})"
         )
 
     logger.info(
-        "HSDP Inference: replicate_size=%d, shard_size=%d, world_size=%d, rank=%d, fs_world_size=%d, fs_rank=%d",
+        "HSDP Inference (FSDP2): replicate_size=%d, shard_size=%d, world_size=%d, rank=%d",
         hsdp_replicate_size,
         hsdp_shard_size,
         world_size,
         rank,
-        fs_world_size,
-        fs_rank,
     )
 
     # When the model contains FP8 parameters (online quantization), let FSDP
@@ -183,7 +170,7 @@ def apply_hsdp_to_model(
     device_mesh = _create_hsdp_mesh(
         device_type=device_type,
         replicate_size=hsdp_replicate_size,
-        shard_pg=fs_group.device_group,
+        shard_size=hsdp_shard_size,
     )
 
     hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)

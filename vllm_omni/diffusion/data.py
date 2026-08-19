@@ -154,8 +154,8 @@ class DiffusionParallelConfig:
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel stages."""
 
-    data_parallel_size: int = 1
-    """Number of data parallel groups."""
+    data_parallel_size: int | None = None
+    """Number of data parallel groups. Inferred from WORLD when omitted."""
 
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
@@ -243,7 +243,7 @@ class DiffusionParallelConfig:
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
-        assert self.data_parallel_size > 0, "Data parallel size must be > 0"
+        assert self.data_parallel_size is None or self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
@@ -283,10 +283,12 @@ class DiffusionParallelConfig:
                 self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
             )
 
-        # Calculate world_size from other parallelism dimensions
+        # Until the runtime WORLD size is known, an omitted DP dimension means
+        # one replica. OmniDiffusionConfig resolves it against num_gpus below.
+        data_parallel_size = self.data_parallel_size or 1
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * self.data_parallel_size
+            * data_parallel_size
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -297,13 +299,17 @@ class DiffusionParallelConfig:
         # 1. Standalone: when other parallelism is all 1, HSDP determines world_size
         # 2. Combined: HSDP overlays on top of other parallelism
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
-                raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
-                    f"data_parallel_size={self.data_parallel_size}). "
-                    "Set tensor_parallel_size=1 and data_parallel_size=1 when using HSDP."
-                )
+            incompatible = []
+            if self.tensor_parallel_size > 1:
+                incompatible.append("TP")
+            if data_parallel_size > 1:
+                incompatible.append("DP")
+            if self.pipeline_parallel_size > 1:
+                incompatible.append("PP")
+            if self.enable_expert_parallel:
+                incompatible.append("EP")
+            if incompatible:
+                raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:
@@ -337,6 +343,42 @@ class DiffusionParallelConfig:
                     self.world_size = other_parallel_world_size
         else:
             self.world_size = other_parallel_world_size
+
+    def resolve_data_parallel_size(self, world_size: int) -> int:
+        """Resolve or validate diffusion DP against the actual WORLD size."""
+        if world_size <= 0:
+            raise ValueError(f"WORLD size must be > 0, but got {world_size}")
+
+        if self.use_hsdp:
+            if self.data_parallel_size not in (None, 1):
+                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            expected_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
+            if world_size != expected_world_size:
+                raise ValueError(
+                    f"WORLD size ({world_size}) must equal HSDP size "
+                    f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
+                )
+            self.data_parallel_size = 1
+            self.world_size = world_size
+            return 1
+
+        non_dp_size = (
+            self.pipeline_parallel_size
+            * self.tensor_parallel_size
+            * self.sequence_parallel_size
+            * self.cfg_parallel_size
+        )
+        if world_size % non_dp_size != 0:
+            raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
+        inferred_data_parallel_size = world_size // non_dp_size
+        if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
+            raise ValueError(
+                f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "
+                f"({inferred_data_parallel_size})"
+            )
+        self.data_parallel_size = inferred_data_parallel_size
+        self.world_size = world_size
+        return inferred_data_parallel_size
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DiffusionParallelConfig":
@@ -999,10 +1041,7 @@ class OmniDiffusionConfig:
             else:
                 self.num_gpus = 1
 
-        if self.num_gpus < self.parallel_config.world_size:
-            raise ValueError(
-                f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
-            )
+        self.parallel_config.resolve_data_parallel_size(self.num_gpus)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []

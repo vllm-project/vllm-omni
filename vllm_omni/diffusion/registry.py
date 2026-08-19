@@ -171,6 +171,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ming_imagegen",
         "MingImagePipeline",
     ),
+    "SanaWmPipeline": (
+        "sana_wm",
+        "pipeline_sana_wm",
+        "SanaWmPipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
@@ -633,6 +638,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
+    "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",

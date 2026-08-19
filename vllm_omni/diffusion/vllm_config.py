@@ -81,6 +81,9 @@ class _DiffusionVllmModelConfig:
     use_mla: bool = False
     is_moe: bool = False
 
+    # Needed for models that bundle things like LogitsProcessors, e.g., SenseNova
+    head_dtype: torch.dtype | None = None
+
     @property
     def is_quantized(self) -> bool:
         return self.quantization is not None
