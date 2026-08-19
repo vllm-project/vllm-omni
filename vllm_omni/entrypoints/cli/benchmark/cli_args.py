@@ -133,6 +133,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Which Seed-TTS split to load: en/meta.lst or zh/meta.lst under the dataset root.",
     )
     group.add_argument(
+        "--seed-tts-turns-per-session",
+        type=int,
+        default=1,
+        help="Group this many Seed-TTS target texts into one Realtime session. "
+        "The first row's reference audio and transcript are reused for every turn.",
+    )
+    group.add_argument(
         "--seed-tts-root",
         type=str,
         default=None,

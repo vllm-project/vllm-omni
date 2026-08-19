@@ -51,6 +51,19 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_native_input_append_supports_explicit_session_opt_out():
+    session = DuplexSession(
+        "sid-explicit-tts",
+        DuplexSessionConfig(model="test-model"),
+        capabilities=DuplexCapabilities.minicpmo45_native(),
+    )
+
+    assert OmniDuplexSessionHandler._uses_native_input_append(session) is True
+
+    session.config.extra_body["minicpmo45_native_duplex"] = False
+    assert OmniDuplexSessionHandler._uses_native_input_append(session) is False
+
+
 class _ModelConfig:
     model = "test-model"
 
@@ -2143,12 +2156,12 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
     )
     assert decision is not None
     output = attach_duplex_output_decision(
-        OmniRequestOutput(
+        OmniRequestOutput.from_stage_output(
+            inner_output,
             request_id="duplex-direct-listen",
             finished=True,
             stage_id=0,
             final_output_type=decision.final_output_type,
-            request_output=inner_output,
             metrics={
                 "stage_metrics": {
                     "0": {
@@ -3036,12 +3049,12 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
     )
     assert decision is not None
     listen_output = attach_duplex_output_decision(
-        OmniRequestOutput(
+        OmniRequestOutput.from_stage_output(
+            inner_output,
             request_id=request_id,
             finished=True,
             stage_id=0,
             final_output_type=decision.final_output_type,
-            request_output=inner_output,
         ),
         decision,
     )

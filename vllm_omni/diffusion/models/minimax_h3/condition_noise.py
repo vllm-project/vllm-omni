@@ -83,9 +83,10 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     row_offset = 0
     timestep = torch.tensor(noise_aug, dtype=torch.float32, device="cpu")
     for latent_t, latent_h, latent_w in parsed_shapes:
-        full_t = target_latent_t + imgvid_cond_num_frames
-        if full_t < latent_t:
-            raise ValueError(f"condition latent_t {latent_t} exceeds the noise draw length {full_t}")
+        # Official Ref2VA allows a reference video to be longer than the
+        # generated clip.  The old implementation sized the draw only from
+        # the target clip and consequently rejected valid long references.
+        full_t = max(target_latent_t + imgvid_cond_num_frames, latent_t)
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
         noise = torch.randn(
             1,

@@ -94,8 +94,8 @@ def _generate_single_stage_image(
     if hasattr(first_output, "images") and first_output.images:
         images = first_output.images
     else:
-        assert hasattr(first_output, "request_output") and first_output.request_output
-        request_output = first_output.request_output
+        assert isinstance(first_output, OmniRequestOutput) and first_output
+        request_output = first_output
         if isinstance(request_output, list):
             req_out = request_output[0]
         else:

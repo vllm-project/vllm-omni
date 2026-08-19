@@ -38,11 +38,12 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 |-------|------|----------|---------|-------------|
 | `stage_id` | int | required | — | Stage identity; matched against `PipelineConfig.stages[*].stage_id`. |
 | `max_num_seqs` | int | optional | `64` | Max concurrent sequences per stage. |
-| `gpu_memory_utilization` | float | optional | `0.9` | Per-stage memory budget. |
+| `gpu_memory_utilization` | float | optional | `0.9` | Per-stage total memory target; used for automatic KV-cache sizing. |
+| `kv_cache_memory_bytes` | int \| null | optional | `null` | Explicit per-rank KV-cache budget in bytes; overrides automatic sizing. |
 | `tensor_parallel_size` | int | optional | `1` | TP degree for this stage. |
 | `enforce_eager` | bool | optional | `false` | Disable CUDA graphs. |
-| `max_num_batched_tokens` | int | optional | `32768` | Prefill budget. |
-| `max_model_len` | int \| null | optional | `null` | Per-stage context length (auto-sets `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` when larger than HF default). |
+| `max_num_batched_tokens` | int | optional | `32768` | Per-stage prefill/token budget; also contributes to the native maximum in-flight token limit. |
+| `max_model_len` | int \| null | optional | `null` | Per-sequence context or KV length; `-1` enables native cache-capacity auto-fitting, while values above the HF default auto-set `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`. |
 | `async_scheduling` | bool \| null | optional | `null` | Per-stage async scheduling toggle. |
 | `devices` | str | optional | `"0"` | `CUDA_VISIBLE_DEVICES`-style device list. |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
@@ -387,8 +388,8 @@ that support request-level batching with `step_execution` disabled.
 
 Use this together with `max_num_seqs > 1` for bursty serving traffic. `0`
 disables admission waiting and preserves the lowest first-request latency.
-For diffusion request-level batching tuning, see
-[Request-Level Batching](../user_guide/diffusion/request_batching.md).
+For diffusion execution and batching tuning, see
+[Diffusion Execution Modes](../user_guide/diffusion/execution_modes.md).
 
 Default: `0.0`
 

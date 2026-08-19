@@ -1,6 +1,8 @@
 import asyncio
+import copy
 from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -32,6 +34,160 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
+    received: dict[str, object] = {}
+
+    def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
+        received.update(
+            input_ids=input_ids.clone(),
+            hidden_states=hidden_states.clone(),
+            req_ids=list(req_ids),
+            req_infos=copy.deepcopy(req_infos),
+        )
+        return torch.tensor([[11, 12, 13]], dtype=torch.long)
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = async_scheduling
+    runner.model = SimpleNamespace(post_sample_talker_mtp=post_sample_talker_mtp)
+    runner.requests = {req_id: SimpleNamespace() for req_id in buffers}
+    runner.model_intermediate_buffer = buffers
+    return runner, received
+
+
+def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=False,
+        buffers={
+            "ready": {"duplex": {"data_plane": True}},
+            "partial-prefill": {
+                "duplex": {"data_plane": True},
+                "codes": {"audio": torch.tensor([[99]])},
+            },
+            "offline": {},
+        },
+    )
+
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["ready", "partial-prefill", "offline"],
+        valid_sampled_token_ids=[[101], [], [102]],
+        sampled_token_ids=torch.tensor([[101], [0], [102]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        ),
+        multimodal_outputs={
+            "codes": {
+                "audio": torch.tensor(
+                    [[70, 71, 72], [80, 81, 82], [90, 91, 92]],
+                    dtype=torch.long,
+                )
+            },
+            "meta": {"source": "temporal"},
+        },
+    )
+
+    assert received["req_ids"] == ["ready"]
+    assert received["input_ids"].tolist() == [101]
+    assert received["hidden_states"].tolist() == [[1.0, 2.0]]
+    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert runner.model_intermediate_buffer["ready"]["codes"]["audio"].tolist() == [[11, 12, 13]]
+    # A partial-prefill row has no sampled token yet. It must not replay the
+    # prior frame's codes into the current connector payload.
+    audio = multimodal["codes"]["audio"]
+    assert audio[0].tolist() == [[11, 12, 13]]
+    assert audio[1].numel() == 0
+    # Mixed batches must retain outputs produced by non-duplex rows.
+    assert audio[2].tolist() == [[90, 91, 92]]
+    assert multimodal["meta"] == {"source": "temporal"}
+
+
+def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=True,
+        buffers={
+            "ready": {"duplex": {"data_plane": True}},
+            "discarded-prefill": {"duplex": {"data_plane": True}},
+        },
+    )
+
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["ready", "discarded-prefill"],
+        valid_sampled_token_ids=[],
+        sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.long),
+        invalid_req_indices=[1],
+        sample_hidden_states=torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]],
+        ),
+        multimodal_outputs=None,
+    )
+
+    assert received["req_ids"] == ["ready"]
+    assert received["input_ids"].tolist() == [101]
+    assert received["hidden_states"].tolist() == [[1.0, 2.0]]
+    assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
+    assert multimodal["codes"]["audio"][0].tolist() == [[11, 12, 13]]
+    assert multimodal["codes"]["audio"][1].numel() == 0
+
+
+def test_post_sample_talker_mtp_skips_shape_validation_without_duplex_rows() -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = False
+    runner.model = SimpleNamespace(
+        post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
+    )
+    runner.model_intermediate_buffer = {"offline": {}}
+    multimodal = {"codes": {"audio": torch.tensor([[7, 8]], dtype=torch.long)}}
+
+    result = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["offline"],
+        valid_sampled_token_ids=[[101, 102]],
+        sampled_token_ids=torch.tensor([[101, 102]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor([[1.0, 2.0]]),
+        multimodal_outputs=multimodal,
+    )
+
+    assert result is multimodal
+
+
+@pytest.mark.parametrize(
+    ("sampled_token_ids", "error_match"),
+    [
+        (torch.tensor([101], dtype=torch.long), "rows do not match requests"),
+        (
+            torch.tensor([[101, 102]], dtype=torch.long),
+            "does not support speculative token rows",
+        ),
+    ],
+)
+def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
+    sampled_token_ids: torch.Tensor,
+    error_match: str,
+) -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.use_async_scheduling = False
+    runner.model = SimpleNamespace(
+        post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
+    )
+    runner.model_intermediate_buffer = {
+        "duplex": {"duplex": {"data_plane": True}},
+    }
+
+    with pytest.raises(ValueError, match=error_match):
+        GPUARModelRunner._run_post_sample_talker_mtp(
+            runner,
+            req_ids=["duplex"],
+            valid_sampled_token_ids=[[101]],
+            sampled_token_ids=sampled_token_ids,
+            invalid_req_indices=[],
+            sample_hidden_states=torch.tensor([[1.0, 2.0]]),
+            multimodal_outputs=None,
+        )
+
+
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
     requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
     request = OpenAICreateSpeechRequest.model_validate(
@@ -44,6 +200,15 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
         async def build(self, request, sampling_params_list, has_inline_ref_audio):
             return PreparedRequest(prompt={"prompt": request.input}, tts_params={}, model_type="higgs_audio_v3")
+
+        def apply_sampling_overrides(
+            self,
+            sampling_params_list: list,
+            request: "OpenAICreateSpeechRequest",
+            prompt: dict[str, Any] | None = None,
+            request_id: str | None = None,
+        ) -> list:
+            return sampling_params_list
 
     engine = SimpleNamespace(
         errored=False,
@@ -897,3 +1062,139 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     assert output.inter_stage_outputs is not None
     assert "hidden" in output.inter_stage_outputs[0]
     assert "audio" not in output.inter_stage_outputs[0]
+
+
+def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkeypatch):
+    """When only a subset of req_ids_output_copy need the downstream
+    pooler payload, multimodal_outputs (not just hidden_states, which
+    test_build_omni_output_copies_hidden_for_partial_downstream_batch
+    already covers) must be attached only to the downstream requests, in
+    the right per-request slot -- a skipped middle request must not shift
+    a later request's slice onto the wrong index."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.requests = {"r1": object(), "r2": object(), "r3": object()}
+    runner.omni_prefix_cache = object()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", ["r1", "r3"]),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
+    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda *args, **kwargs: (None, None, None),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    codes = torch.tensor([[11.0, 12.0], [21.0, 22.0], [31.0, 32.0]], dtype=torch.float32)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes.audio": codes},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[], [], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    # Exact indices pin the mapping: r3 keeps slot 2 rather than shifting into
+    # the skipped r2's slot.
+    assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
+    assert output.inter_stage_outputs[1] is None
+    assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], codes[2:3])
+
+
+def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_downstream_batch(monkeypatch):
+    """When the prefix-cache merge path is engaged (i.e.
+    _prepare_prefix_cache_pooler_payload_sources returns a non-None
+    combined_multimodal_outputs), _build_omni_mm_payload must take the
+    _build_combined_prefix_cache_mm_payload branch -- keyed by req_id,
+    not by row/slice -- rather than falling back to build_mm_cpu, and
+    must still map correctly onto a partial downstream batch. This is a
+    distinct code path from test_build_omni_output_filters_multimodal_by_partial_downstream_batch,
+    which only exercises the no-prefix-cache-merge (mm_cpu) fallback.
+
+    The merge itself is stubbed out here; what this pins is the branch selection
+    plus _unwrap_lists' batch-index selection for a list-valued key.
+    """
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.requests = {"r1": object(), "r2": object(), "r3": object()}
+    runner.omni_prefix_cache = object()
+
+    # codes.ref arrives whole for every request: the prefix-cache merge uses
+    # pass_lists_through, so selecting this request's entry is _unwrap_lists'
+    # job, and it selects by batch index (r3 -> 2), not by downstream position.
+    ref_codes = [torch.tensor([1]), torch.tensor([2]), torch.tensor([3])]
+    combined_mm = {
+        "codes.audio": {
+            "r1": torch.tensor([[11.0, 12.0]]),
+            "r3": torch.tensor([[31.0, 32.0]]),
+        },
+        "codes.ref": {"r1": list(ref_codes), "r3": list(ref_codes)},
+    }
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", ["r1", "r3"]),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
+    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda *args, **kwargs: (None, None, combined_mm),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1", "r2", "r3"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
+        valid_sampled_token_ids=[[], [], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+    )
+
+    assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], combined_mm["codes.audio"]["r1"])
+    assert output.inter_stage_outputs[1] is None
+    assert torch.equal(output.inter_stage_outputs[2]["codes.audio"], combined_mm["codes.audio"]["r3"])
+
+    assert torch.equal(output.inter_stage_outputs[0]["codes.ref"], ref_codes[0])
+    assert torch.equal(output.inter_stage_outputs[2]["codes.ref"], ref_codes[2])

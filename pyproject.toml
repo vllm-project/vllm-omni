@@ -40,6 +40,7 @@ dev = [
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "pytest-mock==3.15.1",
+    "pytest-shard==0.1.2",
     "websockets==16.1",
     "pytest-subtests==0.15.0",
     "datasets==3.6.0",
@@ -70,8 +71,7 @@ dev = [
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
     "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
-    "step-audio2==1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
-    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
+    "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
 demo = [
@@ -85,9 +85,24 @@ forced-aligner = [
     "qwen-asr>=0.0.6",  # faithful Japanese/Korean word segmentation for the TTS forced aligner
 ]
 
+indextts2 = [
+    "fugashi>=1.2.0",
+    "unidic-lite>=1.0.0",
+    "wetext>=0.0.9; sys_platform != 'linux'",
+    "WeTextProcessing; sys_platform == 'linux'",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
+]
+
+# LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
+# separation and loudness normalization.
+longcat-video-avatar = [
+    "audio-separator==0.44.2",
+    "pyloudnorm==0.1.1",
+    "soundfile>=0.13.1",
 ]
 
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
@@ -109,6 +124,7 @@ docs = [
     "mkdocstrings-python",
     "mkdocs-gen-files",
     "mkdocs-awesome-nav",
+    "mkdocs-redirects",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
@@ -191,6 +207,12 @@ ignore = [
 # These files keep upstream conventions (star imports, long lines, math-symbol
 # argument names) so they stay easy to diff against upstream releases.
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+# NemotronVoiceChat inference modules vendored from NVIDIA-NeMo/Speech (branch
+# nemotron-labs-voicechat). Numerics-bearing code is kept byte-close to
+# upstream to stay diffable and parity-safe, so upstream style (long lines,
+# legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
+# F-correctness rules still apply.
+"vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -250,13 +272,16 @@ markers = [
     "npu: Tests that run on NPU/Ascend (auto-added)",
     "musa: Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
-    "H100: Tests that require H100 GPU",
-    "L4: Tests that require L4 GPU",
-    "MI325: Tests that require MI325 GPU (AMD/ROCm)",
-    "B60: Tests that require Intel Arc Pro B60 XPU",
-    "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
-    "A2: Tests that require A2 NPU",
-    "A3: Tests that require A3 NPU",
+    # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
+    "H100: [hardware-resource] Tests that require H100 GPU",
+    "H200: [hardware-resource] Tests that require H200 GPU",
+    "L4: [hardware-resource] Tests that require L4 GPU",
+    "B200: [hardware-resource] Tests that require B200 GPU",
+    "MI325: [hardware-resource] Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: [hardware-resource] Tests that require Intel Arc Pro B60 XPU",
+    "S5000: [hardware-resource] Tests that require S5000 GPU (Moore Threads/MUSA)",
+    "A2: [hardware-resource] Tests that require A2 NPU",
+    "A3: [hardware-resource] Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
     "distributed_xpu: Tests that require multi cards on XPU platform",
@@ -277,6 +302,21 @@ filterwarnings = [
     "ignore:.*does not have '__bases__' attribute.*:UserWarning",
 ]
 
+[tool.coverage.run]
+core = "sysmon"
+source = ["vllm_omni"]
+# Online-serving tests launch the server via subprocess.Popen and stop it with
+# SIGTERM. pytest-cov no longer instruments subprocesses implicitly, and a
+# SIGTERM-ed process discards its data, so without patch/sigterm a coverage run
+# over an online test measures only the pytest parent.
+patch = ["subprocess"]
+concurrency = ["multiprocessing", "thread"]
+sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
 [tool.typos.default]
 extend-ignore-identifiers-re = [
     ".*_thw",
@@ -296,6 +336,10 @@ extend-ignore-identifiers-re = [
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
+    # NemotronVoiceChat vendored triton kernel: dout/DOUT abbreviate d_out
+    # (output feature dim), not "doubt".
+    ".*dout.*",
+    ".*DOUT.*",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -316,3 +360,10 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# Ryan Leary: author credited in the NemotronVoiceChat vendored NeMo
+# features.py copyright header. A surname, not a typo of "leery".
+Leary = "Leary"
+# IndexTTS 2.5 language codes and speech-emotion-recognition event token.
+fo = "fo"
+ba = "ba"
+SER = "SER"

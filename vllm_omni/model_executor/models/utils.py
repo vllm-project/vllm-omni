@@ -137,3 +137,17 @@ def reinit_rotary_inv_freq(
             inv_freq.copy_(new_inv_freq.to(dtype=inv_freq.dtype))
         n_fixed += 1
     return n_fixed
+
+
+def is_interleaved(config) -> bool:
+    """Detect if the model with this config is used with interleaved attention.
+
+    Replicates the helper that was removed from upstream
+    ``vllm.transformers_utils.config`` (vLLM commit 26d725c334,
+    "[Model] Add VaultGemma via Transformers modeling backend") so models
+    that still need the check can share one copy.
+    """
+    text_config = config.get_text_config()
+    if layer_types := getattr(text_config, "layer_types", None):
+        return len(set(layer_types)) > 1
+    return False

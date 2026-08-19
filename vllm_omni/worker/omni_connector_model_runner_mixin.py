@@ -25,7 +25,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    get_stage_connector_role,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -44,6 +47,19 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _should_create_payload_connector(model_config: Any) -> bool:
+    """Whether this stage owns runner payload transport for its edge.
+
+    Sender edges may instead be owned solely by KV transfer. Receivers still
+    need a connector even though they do not declare a downstream payload hook.
+    """
+    if get_stage_connector_role(model_config) != "sender":
+        return True
+
+    next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+    return isinstance(next_stage_func, str) and bool(next_stage_func)
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -96,7 +112,9 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        self._omni_connector: OmniConnectorBase | None = (
+            self._create_connector(model_config) if _should_create_payload_connector(model_config) else None
+        )
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -388,11 +406,13 @@ class OmniConnectorModelRunnerMixin:
         # thread by one execute_model() cycle, especially when the request was
         # added after the current scheduler_output snapshot.
         #
-        # Orphaned pending recv entries (e.g. from upstream stage crash)
-        # are handled by OmniSchedulingCoordinator.collect_timed_out_request_ids()
-        # which detects wait-time violations.  The scheduler then removes the
-        # request from its queues, sets FINISHED_ERROR, and calls _free_request()
-        # which ultimately triggers cleanup_finished_request() here.
+        # Orphaned pending recv entries (e.g. from upstream stage crash) are
+        # handled by collect_timed_out_request_ids() -- on
+        # OmniSchedulingCoordinator for full-payload requests, and on
+        # OmniChunkTransferAdapter for async-chunk ones -- which detect
+        # wait-time violations.  The scheduler then removes the request from
+        # its queues, sets FINISHED_ERROR, and calls _free_request() which
+        # ultimately triggers cleanup_finished_request() here.
         for attr_name in (
             "_request_ids_mapping",
             "_get_req_chunk",

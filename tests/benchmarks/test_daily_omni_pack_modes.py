@@ -2,9 +2,8 @@
 
 The ``minicpm-interleave`` mode is an accuracy-critical protocol: MiniCPM-o only reaches
 OpenBMB's reported Daily-Omni score when frames and 1s audio segments arrive strictly
-interleaved, with ``max_slice_nums=1`` / ``use_image_id=False`` and an empty MiniCPM
-system message (not the Qwen system prompt). These tests pin that contract so a refactor
-cannot silently regress the score.
+interleaved, with ``max_slice_nums=1`` / ``use_image_id=False`` and no Qwen system prompt.
+These tests pin that contract so a refactor cannot silently regress the score.
 
 vllm stubs are installed by tests/benchmarks/conftest.py before collection.
 """
@@ -99,22 +98,13 @@ def _stub_extract(monkeypatch, dataset: DailyOmniDataset, counter: list[int]) ->
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("n", "k"), [(10, 4), (100, 64), (1000, 64), (7, 7), (3, 5), (1, 1)])
-def test_uniform_sample_indices_matches_openbmb_midpoint(n: int, k: int) -> None:
-    """Pin OpenBMB midpoint-bin sampling (not np.linspace endpoints)."""
+@pytest.mark.parametrize(("n", "k"), [(10, 4), (100, 64), (7, 7), (3, 5), (1, 1)])
+def test_uniform_sample_indices_matches_numpy_linspace(n: int, k: int) -> None:
     got = _uniform_sample_indices(n, k)
     if n <= k:
         assert got == list(range(n))
     else:
-        gap = n / k
-        expected = [int(i * gap + gap / 2) for i in range(k)]
-        assert got == expected
-        # Endpoints differ from linspace for typical Daily-Omni downsample sizes.
-        linspace = [int(i) for i in np.linspace(0, n - 1, k, dtype=int)]
-        if n == 1000 and k == 64:
-            assert got[0] == 7 and got[-1] == 992
-            assert linspace[0] == 0 and linspace[-1] == 999
-            assert got != linspace
+        assert got == [int(i) for i in np.linspace(0, n - 1, k, dtype=int)]
 
 
 def test_uniform_sample_indices_non_positive_k() -> None:
@@ -223,16 +213,14 @@ def test_minicpm_interleave_missing_local_video_returns_none(qa_json, tmp_path) 
 # ---------------------------------------------------------------------------
 
 
-def test_minicpm_interleave_keeps_empty_system_message(monkeypatch, qa_json, video_dir) -> None:
-    """Official MiniCPM omni mode still sends role=system with empty content."""
+def test_minicpm_interleave_omits_qwen_system_message(monkeypatch, qa_json, video_dir) -> None:
     ds = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
     _stub_extract(monkeypatch, ds, [])
     parts, _extra, _position = ds._compose_daily_omni_multimodal(_VIDEO_ID, None)
 
     messages = ds._build_daily_omni_openai_messages(parts, "q?", {"A": "a"})
 
-    assert [m["role"] for m in messages] == ["system", "user"]
-    assert messages[0]["content"][0]["text"] == ""
+    assert [m["role"] for m in messages] == ["user"]
 
 
 def test_qwen_pack_mode_keeps_system_message(qa_json, video_dir) -> None:
