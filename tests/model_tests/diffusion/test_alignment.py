@@ -81,6 +81,7 @@ EXCLUDED_MODELS = [
     "Pi0Pipeline",
     "SoulXSingerPipeline",
     "SoulXSingerSVCPipeline",
+    "SanaWmPipeline",
 ]
 
 
