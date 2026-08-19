@@ -1,6 +1,6 @@
 import contextlib
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -311,6 +311,28 @@ class OmniGPUModelRunner(GPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
+    def _create_request_generator(self, sampling_params: Any | None) -> torch.Generator | None:
+        """Create the request-owned RNG used by sampling and opted-in TTS models."""
+        if sampling_params is None:
+            return None
+
+        seed = None
+        if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+            # Preserve native vLLM request-seeded sampling behavior.
+            seed = sampling_params.seed
+        elif getattr(self.model, "requires_tts_local_generator", False):
+            # Greedy TTS requests normally have no vLLM sampler generator. An
+            # explicit speech seed still needs one for model-local stochastic
+            # work such as Voxtral's flow-matching acoustic noise.
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if isinstance(extra_args, Mapping):
+                seed = extra_args.get("tts_local_seed")
+
+        if seed is None:
+            return None
+
+        return torch.Generator(device=self.device).manual_seed(int(seed))
+
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
 
@@ -557,11 +579,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
-            if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+            generator = self._create_request_generator(sampling_params)
 
             if self.is_pooling_model:
                 assert pooling_params is not None

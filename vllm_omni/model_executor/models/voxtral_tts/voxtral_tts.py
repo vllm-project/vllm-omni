@@ -100,6 +100,10 @@ class VoxtralTTSForConditionalGeneration(
     SupportsMultiModal,
     CustomProcessMixin,
 ):
+    # Voxtral consumes request-local randomness outside the vLLM token sampler,
+    # including when stage-0 token sampling is greedy.
+    requires_tts_local_generator = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -339,6 +343,52 @@ class VoxtralTTSForConditionalGeneration(
             dtype=input_hidden_states.dtype,
         )
 
+    def _make_acoustic_noise(
+        self,
+        input_hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata | None,
+    ) -> torch.Tensor | None:
+        """Build row-local acoustic noise from active request generators.
+
+        Returning ``None`` preserves the legacy batched/global RNG path when
+        none of the active rows has a request-owned generator.
+        """
+        generators = getattr(sampling_metadata, "generators", None)
+        if not generators:
+            return None
+
+        batch_size = input_hidden_states.shape[0]
+        row_generators = [generators.get(row_idx) for row_idx in range(batch_size)]
+        if not any(generator is not None for generator in row_generators):
+            return None
+
+        n_acoustic_codebook = self.model.acoustic_transformer.model_args.n_acoustic_codebook
+        noise = torch.empty(
+            (batch_size, n_acoustic_codebook),
+            device=input_hidden_states.device,
+            dtype=input_hidden_states.dtype,
+        )
+        for row_idx, generator in enumerate(row_generators):
+            if generator is None:
+                noise[row_idx].normal_()
+                continue
+
+            generator_device = torch.device(generator.device)
+            output_device = noise.device
+            same_device_index = (
+                generator_device.index is None
+                or output_device.index is None
+                or generator_device.index == output_device.index
+            )
+            if generator_device.type != output_device.type or not same_device_index:
+                raise RuntimeError(
+                    "Request-local acoustic generator for row "
+                    f"{row_idx} is on {generator_device}, but acoustic noise is on {output_device}."
+                )
+            noise[row_idx].normal_(generator=generator)
+
+        return noise
+
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
     ) -> OmniOutput:
@@ -348,13 +398,21 @@ class VoxtralTTSForConditionalGeneration(
                 assert logits_index is not None
                 input_hidden_states = hidden_states[logits_index]
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
+                noise = self._make_acoustic_noise(
+                    input_hidden_states,
+                    kwargs.get("sampling_metadata"),
+                )
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states,
+                        cfg_alpha=cfg_alpha,
+                        noise=noise,
                     )
                 else:
                     fake_eos, multimodal_outputs = self.model.compute_mm_logits(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states,
+                        cfg_alpha=cfg_alpha,
+                        noise=noise,
                     )
                 hidden_states[logits_index, 0] = fake_eos
                 return OmniOutput(

@@ -3995,6 +3995,25 @@ class TestTTSAsyncOffloading:
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._build_voxtral_prompt_async.assert_awaited_once()
 
+    def test_prepare_speech_generation_voxtral_seed_sets_tts_local_seed(self, voxtral_server, mocker: MockerFixture):
+        voxtral_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(max_tokens=2048, seed=None, extra_args=None)
+        ]
+        voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test", seed=42)
+
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+
+        stage0_params = voxtral_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 42
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert voxtral_server.engine_client.default_sampling_params_list[0].extra_args is None
+
     def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server, mocker: MockerFixture):
         """Qwen3 TTS path should call _estimate_prompt_len_async."""
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)

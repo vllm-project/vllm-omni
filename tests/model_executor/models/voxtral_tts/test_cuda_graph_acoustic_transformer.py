@@ -112,6 +112,7 @@ class SyntheticModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise: torch.Tensor | None = None,
     ):
         """Eager fallback path: replicate what the wrapper does."""
         _, AudioSpecialTokens = _voxtral_cudagraph_deps()
@@ -130,7 +131,11 @@ class SyntheticModel(nn.Module):
 
         # Flow matching Euler ODE
         should_decode = semantic_code.squeeze(1) != end_audio_id
-        x = torch.randn(B, at.model_args.n_acoustic_codebook, device=hidden_states.device, dtype=hidden_states.dtype)
+        x = (
+            torch.randn(B, at.model_args.n_acoustic_codebook, device=hidden_states.device, dtype=hidden_states.dtype)
+            if noise is None
+            else noise
+        )
         hidden_zero = torch.zeros_like(hidden_states)
         timesteps = torch.linspace(0, 1, 16, device=hidden_states.device, dtype=hidden_states.dtype)
 
@@ -324,3 +329,75 @@ def test_deterministic_across_calls(model, wrapper):
         eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
     torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+
+
+def test_explicit_noise_is_reused_across_graph_replays(wrapper):
+    hidden = _random_hidden(4)
+    alpha = _cfg_alpha(4)
+    noise = torch.randn((4, N_ACOUSTIC_CODEBOOK), device=DEVICE, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        eos1, codes1 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise))
+        torch.randn((4096,), device=DEVICE)
+        eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise))
+
+    torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
+    torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+
+
+def test_different_explicit_noise_changes_graph_output(wrapper):
+    hidden = _random_hidden(4)
+    alpha = _cfg_alpha(4)
+    noise_a = torch.full((4, N_ACOUSTIC_CODEBOOK), -0.75, device=DEVICE, dtype=torch.bfloat16)
+    noise_b = torch.full((4, N_ACOUSTIC_CODEBOOK), 0.75, device=DEVICE, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        _, codes_a = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise_a))
+        _, codes_b = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise_b))
+
+    assert not torch.equal(codes_a[:, 1:], codes_b[:, 1:])
+
+
+def test_explicit_noise_clears_padded_graph_rows(wrapper):
+    hidden = _random_hidden(3)
+    alpha = _cfg_alpha(3)
+    noise = torch.randn((3, N_ACOUSTIC_CODEBOOK), device=DEVICE, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        eos1, codes1 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise))
+        wrapper.static_noise[4][3:].fill_(100)
+        eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise))
+
+    torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
+    torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+    torch.testing.assert_close(wrapper.static_noise[4][3:], torch.zeros_like(wrapper.static_noise[4][3:]))
+
+
+@pytest.mark.parametrize("fallback", ["disabled", "capturing", "oversized", "missing_graph"])
+def test_eager_fallback_forwards_explicit_noise(model, wrapper, fallback, monkeypatch):
+    batch_size = 4 if fallback == "disabled" else 33
+    if fallback in {"capturing", "missing_graph"}:
+        batch_size = 4
+    hidden = _random_hidden(batch_size)
+    alpha = _cfg_alpha(batch_size)
+    noise = torch.randn((batch_size, N_ACOUSTIC_CODEBOOK), device=DEVICE, dtype=torch.bfloat16)
+    was_enabled = wrapper.enabled
+    removed_graph = None
+    if fallback == "disabled":
+        wrapper.enabled = False
+    elif fallback == "capturing":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    elif fallback == "missing_graph":
+        removed_graph = wrapper.graphs.pop(4)
+
+    try:
+        with torch.no_grad():
+            eager_eos, eager_codes = _unpack_audio_codes(model.compute_mm_logits(hidden, cfg_alpha=alpha, noise=noise))
+            graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise=noise))
+    finally:
+        wrapper.enabled = was_enabled
+        if removed_graph is not None:
+            wrapper.graphs[4] = removed_graph
+
+    torch.testing.assert_close(graph_eos, eager_eos, atol=0, rtol=0)
+    torch.testing.assert_close(graph_codes, eager_codes, atol=0, rtol=0)
