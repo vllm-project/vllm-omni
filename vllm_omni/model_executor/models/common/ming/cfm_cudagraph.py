@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.common.ming.fm import build_timesteps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import build_timesteps
 
 
 class CFMSampler(nn.Module):

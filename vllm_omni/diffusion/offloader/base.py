@@ -62,7 +62,7 @@ class OffloadConfig:
         dp_size = 1
         if parallel_config is not None:
             dp_size = getattr(parallel_config, "data_parallel_size", 1)
-            # HSDP's fully_shard_degree also contributes to effective DP
+            # HSDP shard and replica sizes determine the effective group size.
             hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
             hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
             if use_hsdp and hsdp_shard_size > 0:

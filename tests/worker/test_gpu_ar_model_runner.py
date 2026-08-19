@@ -2,6 +2,7 @@ import asyncio
 import copy
 from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -199,6 +200,15 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
         async def build(self, request, sampling_params_list, has_inline_ref_audio):
             return PreparedRequest(prompt={"prompt": request.input}, tts_params={}, model_type="higgs_audio_v3")
+
+        def apply_sampling_overrides(
+            self,
+            sampling_params_list: list,
+            request: "OpenAICreateSpeechRequest",
+            prompt: dict[str, Any] | None = None,
+            request_id: str | None = None,
+        ) -> list:
+            return sampling_params_list
 
     engine = SimpleNamespace(
         errored=False,

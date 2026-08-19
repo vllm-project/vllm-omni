@@ -913,7 +913,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -932,6 +932,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -953,6 +954,10 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            paged_kv_cache_role="primary",
+            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
+            # bfloat16 autocast, independent of the weight-loading dtype.
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     @staticmethod
@@ -1095,7 +1100,7 @@ class ImageKVCacheManager:
         )
         return key, value
 
-    def __call__(
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,

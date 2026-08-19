@@ -20,7 +20,7 @@ MODEL = os.getenv("VLLM_TEST_LTX25_MODEL", DEFAULT_MODEL)
 MODEL_REVISION = os.getenv("VLLM_TEST_LTX25_MODEL_REVISION", DEFAULT_REVISION if MODEL == DEFAULT_MODEL else "")
 PROMPT = "A red fox walks through a snowy forest while the camera remains fixed."
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
