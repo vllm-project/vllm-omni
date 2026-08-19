@@ -18,7 +18,7 @@ To add a new pipeline:
 Out of tree pipeline configs or resolvers can also be registered with register_pipeline.
 
 NOTE: Generic single-stage diffusion is selected by ``config.resolver`` when
-no registered Omni pipeline or legacy stage config matches.
+no registered Omni pipeline matches.
 """
 
 from __future__ import annotations

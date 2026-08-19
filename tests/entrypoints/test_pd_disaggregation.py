@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for PD (Prefill-Decode) disaggregation in the Omni orchestrator.
 
 Tests the PD detection, validation, config parsing, sampling param
@@ -74,7 +77,7 @@ class _FakeStageConfig:
 
 class _FakeQueue:
     def __init__(self, maxsize=0):
-        self._queue = Queue(maxsize=maxsize)
+        self._queue: Queue[Any] = Queue(maxsize=maxsize)
 
     def put(self, item):
         self._queue.put(item)
@@ -343,7 +346,7 @@ def mock_get_config(monkeypatch):
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_config", lambda model, **kwargs: fake_hf_config, raising=False
     )
-    monkeypatch.setattr("vllm_omni.config.resolver.get_config", lambda model, **kwargs: fake_hf_config, raising=False)
+    monkeypatch.setattr("vllm_omni.config.config_factory.get_config", lambda model, **kwargs: fake_hf_config)
 
     def _mock_cached_file(path_or_repo_id, *args, **kwargs):
         import os

@@ -794,12 +794,12 @@ class _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
-        config_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
-        parse_diffusion_offload_config(config_kwargs.get("diffusion_offload_config"))
+        parse_diffusion_offload_config(normalized_kwargs.get("diffusion_offload_config"))
         valid_fields = {f.name for f in fields(cast(Any, cls))}
-        return cls(**{k: v for k, v in config_kwargs.items() if k in valid_fields})
+        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not

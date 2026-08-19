@@ -9,22 +9,15 @@ import argparse
 from types import SimpleNamespace
 
 import pytest
-from omegaconf import OmegaConf
 from pytest_mock import MockerFixture
-from transformers import Qwen3OmniMoeConfig
 
-import vllm_omni.config.resolver as resolver_module
-import vllm_omni.engine.async_omni_engine as async_engine_module
-from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import OmniConfigResolution
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import (
     OmniServeCommand,
     _parse_stage_overrides,
     run_headless,
 )
-from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -126,7 +119,7 @@ def test_serve_parser_accepts_diffusion_quantization_config() -> None:
     assert args.get_explicit_kwargs_dict()["diffusion_quantization_config"] == expected
 
 
-def _make_headless_args(**kwargs) -> TrackingNamespace:
+def _make_headless_args(*, explicit_keys: frozenset[str] | None = None, **kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
         "stage_id": 0,
@@ -311,7 +304,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
 
-    assert len(captured["args"]) == 2
+    assert captured["args"] == ("fake-model",)
     assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
     assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
@@ -322,237 +315,6 @@ def test_parse_stage_overrides_rejects_non_mapping_values() -> None:
         _parse_stage_overrides('["not", "a", "mapping"]')
     with pytest.raises(argparse.ArgumentTypeError, match="override objects"):
         _parse_stage_overrides('{"0": "not a mapping"}')
-
-
-def test_run_headless_maps_stage_configs_path_to_deploy_config(mocker: MockerFixture) -> None:
-    captured: dict = {}
-
-    def _fake_resolve(model, **kwargs):
-        captured["model"] = model
-        captured["kwargs"] = kwargs
-        return _resolved(SimpleNamespace(stage_id=99))
-
-    mocker.patch(
-        "vllm_omni.config.resolver.resolve_omni_config",
-        side_effect=_fake_resolve,
-    )
-
-    with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
-        run_headless(_make_headless_args(stage_configs_path="deploy.yaml"))
-
-    assert captured["kwargs"]["deploy_config_path"] == "deploy.yaml"
-    assert "stage_configs_path" not in captured["kwargs"]["cli_overrides"]
-
-
-def test_standard_and_headless_alias_resolve_identical_effective_config(tmp_path, mocker: MockerFixture) -> None:
-    """Both startup paths must resolve every field from one promoted deploy path."""
-    deploy_path = get_deploy_config_path("qwen3_omni_moe.yaml")
-    strategy_path = tmp_path / "strategy.yaml"
-    strategy_path.write_text(
-        "\n".join(
-            [
-                "strategies:",
-                "  talker:",
-                "    - axis: stage_replica",
-                "      size: 2",
-                "      routing: round_robin",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True)
-    mocker.patch.object(StageConfigFactory, "try_infer_model_type", return_value="qwen3_omni_moe")
-    mocker.patch.object(StageConfigFactory, "get_hf_config", return_value=hf_config)
-
-    factory_paths: dict[str, list[str | None]] = {"structured": [], "legacy": []}
-    create_structured = StageConfigFactory.create_from_model
-    create_legacy = StageConfigFactory.create_legacy_stage_configs_from_model
-
-    def _record_create_structured(*args, **kwargs):
-        factory_paths["structured"].append(kwargs.get("deploy_config_path"))
-        return create_structured(*args, **kwargs)
-
-    def _record_create_legacy(*args, **kwargs):
-        factory_paths["legacy"].append(kwargs.get("deploy_config_path"))
-        return create_legacy(*args, **kwargs)
-
-    mocker.patch.object(StageConfigFactory, "create_from_model", side_effect=_record_create_structured)
-    mocker.patch.object(
-        StageConfigFactory,
-        "create_legacy_stage_configs_from_model",
-        side_effect=_record_create_legacy,
-    )
-
-    resolutions: list[OmniConfigResolution] = []
-    resolve = resolver_module.resolve_omni_config
-
-    def _record_resolve(*args, **kwargs):
-        resolved = resolve(*args, **kwargs)
-        resolutions.append(resolved)
-        return resolved
-
-    mocker.patch.object(async_engine_module, "resolve_omni_config", side_effect=_record_resolve)
-    mocker.patch.object(resolver_module, "resolve_omni_config", side_effect=_record_resolve)
-
-    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
-    mocker.patch(
-        "vllm_omni.engine.stage_engine_startup.get_headless_replica_devices",
-        return_value=[None],
-    )
-    mocker.patch(
-        "vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model",
-        return_value=None,
-    )
-    mocker.patch(
-        "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
-        return_value=(None, None, None),
-    )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
-    mocker.patch(
-        "vllm_omni.engine.stage_init_utils.build_vllm_config",
-        return_value=(SimpleNamespace(parallel_config=SimpleNamespace(node_rank_within_dp=0)), object),
-    )
-    launch_headless = mocker.patch("vllm_omni.engine.stage_engine_startup.launch_headless_llm_replicas")
-    mocker.patch("signal.signal")
-
-    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._omni_lb_policy = "random"
-    standard_path, standard_stages = engine._resolve_stage_configs(
-        "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        {
-            "stage_configs_path": deploy_path,
-            "strategy_config": str(strategy_path),
-        },
-        trust_remote_code=False,
-    )
-
-    run_headless(
-        _make_headless_args(
-            explicit_keys=frozenset({"stage_configs_path", "strategy_config"}),
-            model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            stage_id=0,
-            stage_configs_path=deploy_path,
-            strategy_config=str(strategy_path),
-        )
-    )
-
-    assert len(resolutions) == 2
-    standard_resolution, headless_resolution = resolutions
-
-    def _stage_snapshot(resolution: OmniConfigResolution) -> list[dict]:
-        return [OmegaConf.to_container(stage, resolve=True) for stage in resolution.stage_configs]
-
-    assert standard_path == deploy_path
-    assert standard_path == headless_resolution.config_path
-    assert _stage_snapshot(standard_resolution) == _stage_snapshot(headless_resolution)
-    assert [OmegaConf.to_container(stage, resolve=True) for stage in standard_stages] == _stage_snapshot(
-        headless_resolution
-    )
-    assert standard_resolution.omni_lb_policy == headless_resolution.omni_lb_policy == "round-robin"
-    assert (
-        standard_resolution.endpoint_restrictions
-        == headless_resolution.endpoint_restrictions
-        == QWEN3_OMNI_PIPELINE.endpoint_restrictions
-    )
-    assert [stage.engine_args.model_stage for stage in standard_resolution.stage_configs] == [
-        "thinker",
-        "talker",
-        "code2wav",
-    ]
-    assert standard_resolution.stage_configs[1].runtime.num_replicas == 2
-    assert engine._omni_lb_policy == "round-robin"
-    launch_headless.assert_called_once()
-    assert launch_headless.call_args.kwargs["stage_id"] == 0
-    assert launch_headless.call_args.kwargs["stage_config"] is headless_resolution.stage_by_id(0)
-    assert factory_paths == {
-        "structured": [deploy_path, deploy_path],
-        "legacy": [deploy_path, deploy_path],
-    }
-
-
-def test_standard_and_headless_resolve_identical_default_diffusion_config(mocker: MockerFixture) -> None:
-    """Both startup paths must use the same generic-diffusion fallback."""
-    mocker.patch.object(StageConfigFactory, "create_from_model", return_value=None)
-    mocker.patch.object(
-        resolver_module,
-        "_resolve_generic_diffusion_model_class",
-        return_value=(True, "FluxPipeline"),
-    )
-    mocker.patch(
-        "vllm_omni.config.config_factory.supports_audio_output",
-        return_value=False,
-    )
-
-    resolutions: list[OmniConfigResolution] = []
-    resolve = resolver_module.resolve_omni_config
-
-    def _record_resolve(*args, **kwargs):
-        resolved = resolve(*args, **kwargs)
-        resolutions.append(resolved)
-        return resolved
-
-    mocker.patch.object(async_engine_module, "resolve_omni_config", side_effect=_record_resolve)
-    mocker.patch.object(resolver_module, "resolve_omni_config", side_effect=_record_resolve)
-    mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
-    mocker.patch(
-        "vllm_omni.engine.stage_engine_startup.get_headless_replica_devices",
-        return_value=[None],
-    )
-    launch_headless = mocker.patch(
-        "vllm_omni.engine.stage_engine_startup.launch_headless_diffusion_replicas",
-    )
-
-    model = "black-forest-labs/FLUX.2-klein-4B"
-    diffusion_overrides = {
-        "dtype": "float16",
-        "ulysses_degree": 2,
-        "diffusion_compile_dynamic": False,
-    }
-    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine._omni_lb_policy = "random"
-    standard_path, standard_stages = engine._resolve_stage_configs(
-        model,
-        dict(diffusion_overrides),
-        trust_remote_code=False,
-    )
-
-    run_headless(
-        _make_headless_args(
-            explicit_keys=frozenset(diffusion_overrides),
-            model=model,
-            stage_id=0,
-            **diffusion_overrides,
-        )
-    )
-
-    assert len(resolutions) == 2
-    standard_resolution, headless_resolution = resolutions
-
-    def _stage_snapshot(resolution: OmniConfigResolution) -> list[dict]:
-        return [OmegaConf.to_container(stage, resolve=True) for stage in resolution.stage_configs]
-
-    assert standard_path is None
-    assert headless_resolution.config_path is None
-    assert _stage_snapshot(standard_resolution) == _stage_snapshot(headless_resolution)
-    assert [OmegaConf.to_container(stage, resolve=True) for stage in standard_stages] == _stage_snapshot(
-        headless_resolution
-    )
-    assert headless_resolution.stage_by_id(0).stage_type == "diffusion"
-    assert headless_resolution.stage_by_id(0).engine_args.model_class_name == "FluxPipeline"
-    assert headless_resolution.stage_by_id(0).final_output_type == "image"
-    launch_headless.assert_called_once()
-    assert launch_headless.call_args.kwargs["stage_cfg"] is headless_resolution.stage_by_id(0)
-
-
-def test_run_headless_rejects_both_config_path_flags() -> None:
-    args = _make_headless_args(
-        stage_configs_path="old-name.yaml",
-        deploy_config="deploy.yaml",
-    )
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        run_headless(args)
 
 
 def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture) -> None:

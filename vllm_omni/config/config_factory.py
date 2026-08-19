@@ -32,7 +32,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.io_support import supports_audio_output
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -612,22 +612,26 @@ class StageConfigFactory:
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
 
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
+        if kwargs.get("num_gpus") is not None:
+            parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
         engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
 
         extras = dict(engine_args.get("extras") or {})
-        extras.setdefault("auxiliary_text_encoder", kwargs.get("auxiliary_text_encoder"))
-        extras.setdefault(
-            "default_llama_model_id",
-            kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        )
+        for key, default in (
+            ("auxiliary_text_encoder", None),
+            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        ):
+            value = kwargs.get(key)
+            if value is not None:
+                extras[key] = value
+            else:
+                extras.setdefault(key, default)
         engine_args["extras"] = extras
 
         model_class_name = engine_args.get("model_class_name")
-        final_output_type = "image"
-        if model_class_name and supports_audio_output(model_class_name):
-            final_output_type = "audio"
+        final_output_type = get_diffusion_output_type(model_class_name)
         logger.info(
             "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
             final_output_type,

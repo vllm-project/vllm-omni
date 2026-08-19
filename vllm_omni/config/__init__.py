@@ -45,8 +45,10 @@ from vllm_omni.config.yaml_util import (
 # `from vllm_omni.config.lora import LoRAConfig` (used while data.py is still
 # loading) cannot close a circular import through DiffusionOutput.
 _LAZY_ATTRS = {
+    "OmniConfigResolution": ("vllm_omni.config.resolver", "OmniConfigResolution"),
     "StageConfigFactory": ("vllm_omni.config.config_factory", "StageConfigFactory"),
     "register_pipeline": ("vllm_omni.config.pipeline_registry", "register_pipeline"),
+    "resolve_omni_config": ("vllm_omni.config.resolver", "resolve_omni_config"),
 }
 
 __all__ = [

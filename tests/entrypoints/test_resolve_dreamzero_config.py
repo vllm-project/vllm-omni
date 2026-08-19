@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from vllm_omni.config.resolver import resolve_omni_config
@@ -38,9 +41,6 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
 
 
 def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch):
-    def _get_hf_config(path, _model):
-        return None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]}
-
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
         lambda path, _model, **_kwargs: (

@@ -48,6 +48,17 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 """
 
 
+def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
+    """Parse and validate ``--stage-overrides`` at the CLI boundary."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
+    if not isinstance(parsed, dict) or any(not isinstance(overrides, dict) for overrides in parsed.values()):
+        raise argparse.ArgumentTypeError("--stage-overrides must be a JSON object of stage-id to override objects")
+    return parsed
+
+
 def _nonneg_finite_float(value: str) -> float:
     """Argparse type for finite, non-negative floats (rejects nan/inf)."""
     try:
@@ -982,18 +993,9 @@ def run_headless(args: TrackingNamespace) -> None:
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
 
-    deploy_config_path = args_dict.get("deploy_config")
-    if stage_configs_path is not None:
-        if deploy_config_path is not None:
-            raise ValueError("--stage-configs-path and --deploy-config are mutually exclusive")
-        logger.warning(
-            "--stage-configs-path is deprecated and now aliases --deploy-config; "
-            "legacy stage_args YAML files are no longer supported."
-        )
-        deploy_config_path = stage_configs_path
-    # This compatibility alias belongs to the CLI boundary and must not leak
-    # into registry/deploy merging as a per-stage engine argument.
-    args_dict.pop("stage_configs_path", None)
+    deploy_config_path = args_dict.pop("deploy_config", None)
+    strategy_config_path = args_dict.pop("strategy_config", None)
+    stage_overrides = args_dict.pop("stage_overrides", None)
 
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry
@@ -1007,21 +1009,17 @@ def run_headless(args: TrackingNamespace) -> None:
             "master server.",
             args.replica_id,
         )
+        args_dict.pop("replica_id")
 
-    # Parse --stage-overrides (raw JSON string) exactly like the standard
-    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
-    # standard launches resolve to the same per-stage device layout.
-    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
-
-    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+    resolved = resolve_omni_config(
         model,
-        args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.
         trust_remote_code=getattr(args, "trust_remote_code", None) or None,
-        deploy_config_path=args_dict.get("deploy_config"),
+        cli_overrides=args_dict,
+        deploy_config_path=deploy_config_path,
         stage_overrides=stage_overrides,
-        strategy_config_path=args_dict.get("strategy_config"),
+        strategy_config_path=strategy_config_path,
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
