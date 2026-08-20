@@ -31,17 +31,26 @@ def unwrap_combined_payload_value(
 ) -> tuple[bool, Any]:
     """Unwrap one value from the prefix-cache-merged payload.
 
-    Returns ``(keep, unwrapped)``: ``keep`` is False when the value is a
-    misaligned per-request list and must be dropped.
+    Returns ``(keep, unwrapped)``: ``keep`` is False when a non-singleton
+    per-request list is misaligned and must be dropped. A singleton list is
+    request-invariant passthrough data and is shared across the batch.
     """
     if isinstance(value, list):
+        if len(value) == 1:
+            # Prefix-cache passthrough intentionally preserves list
+            # containers and copies the whole list under every request id.
+            # Qwen3-Omni uses this shape for its request-invariant TTS
+            # BOS/EOS/PAD embeddings, so every batch index unwraps the same
+            # singleton. Sparse one-request lists are safe here too: routing
+            # limits them to the declared request at sparse index zero.
+            return True, value[0]
         if list_idx < len(value):
             return True, value[list_idx]
-        # A list shorter than the request's index is per-request data that
-        # lost alignment. Never substitute another request's element
-        # (`v[0]` used to ship request 0's
-        # payload as `rid`'s); drop the key loudly instead — the SAME
-        # protocol-break policy as the sparse mismatch in
+        # A non-singleton list shorter than the request's index is per-request
+        # data that lost alignment. Never substitute another request's
+        # element (`v[0]` used to ship request 0's payload as `rid`'s); drop
+        # the key loudly instead — the SAME protocol-break policy as the
+        # sparse mismatch in
         # `build_omni_mm_payload`. Not a raise: v1 runners do not catch
         # per-request exceptions, so raising would turn a per-request
         # protocol break into a whole-stage outage.

@@ -1515,10 +1515,31 @@ class TestSparseAudioMarkerRobustness:
         payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=1)
         assert torch.equal(payload["codes.audio"], torch.ones(1))
 
-    def test_combined_payload_retains_singleton_at_index_zero(self):
-        combined = {"codes.audio": {"req-1": [torch.ones(1)]}}
-        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=0)
-        assert torch.equal(payload["codes.audio"], torch.ones(1))
+    def test_combined_payload_broadcasts_qwen_request_invariant_singletons(self):
+        req_ids = ("r0", "r1")
+        tts_embeddings = {
+            "embed.tts_bos": torch.full((1, 1, 2), 1.0),
+            "embed.tts_eos": torch.full((1, 1, 2), 2.0),
+            "embed.tts_pad": torch.full((1, 1, 2), 3.0),
+        }
+        combined = {key: {rid: [value.clone()] for rid in req_ids} for key, value in tts_embeddings.items()}
+
+        for idx, rid in enumerate(req_ids):
+            payload = payload_build.build_omni_mm_payload(
+                combined_multimodal_outputs=combined,
+                mm_cpu=None,
+                rid=rid,
+                idx=idx,
+                start=idx,
+                end=idx + 1,
+                audio_sparse_output=False,
+                sparse_mm_index={},
+                hidden_seq_len=len(req_ids),
+                scheduled_seq_len=len(req_ids),
+            )
+            assert payload.keys() == tts_embeddings.keys()
+            for key, expected in tts_embeddings.items():
+                assert torch.equal(payload[key], expected)
 
     def test_combined_payload_drops_sparse_protocol_metadata(self):
         combined = {
@@ -1529,19 +1550,13 @@ class TestSparseAudioMarkerRobustness:
         payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-1", list_idx=2)
         assert payload == {"sr": 22050}
 
-    def test_combined_payload_singleton_is_not_broadcast_to_another_request(self):
-        combined = {"codes.audio": {"req-2": [torch.ones(1)]}}
-        payload = payload_build.build_combined_prefix_cache_mm_payload(combined, rid="req-2", list_idx=1)
-        assert payload == {}
-
     def test_combined_payload_misalignment_drops_key_not_request_zero(self):
         # A short multi-element list used to silently return `v[0]` - request
         # 0's payload shipped under request `rid`. Never substitute another
         # request's data; the key is dropped with an error log (same policy
         # as the non-combined sparse mismatch) rather than raised - v1
         # runners don't catch per-request exceptions, so a raise would turn a
-        # per-request protocol break (reachable via voxcpm2's dense coalesce)
-        # into a whole-stage outage.
+        # per-request protocol break into a whole-stage outage.
         combined = {
             "codes.audio": {"req-3": [torch.zeros(1), torch.ones(1)]},
             "sr": {"req-3": 22050},
