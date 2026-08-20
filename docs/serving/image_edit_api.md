@@ -123,7 +123,14 @@ When `stream=false` or omitted, the endpoint returns the standard image edit res
     }
   ],
   "output_format": null,
-  "size": null
+  "size": null,
+  "metrics": {
+    "stage_durations": {
+      "queue_wait_ms": 1.0,
+      "stage_0_gen_ms": 2.0
+    },
+    "peak_memory_mb": 1024.0
+  }
 }
 ```
 

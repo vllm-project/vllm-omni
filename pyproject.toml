@@ -225,19 +225,14 @@ ignore = [
 "torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
-python_version = "3.12, 3.13"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
+python_version = "3.12"
+# Align with vLLM: silent follow for library code; missing third-party stubs
+# are ignored everywhere (including tests). tests/ still get
+# --follow-imports skip from tools/pre_commit/mypy.py.
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
 check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
+follow_imports = "silent"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -343,6 +338,8 @@ extend-ignore-identifiers-re = [
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
+    # setuptools-scm / git-describe local versions, e.g. 0.26.1.dev14+gae6577ea
+    "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
@@ -367,3 +364,5 @@ Leary = "Leary"
 fo = "fo"
 ba = "ba"
 SER = "SER"
+# NumPy ndarray.flags.writeable (canonical flag name, not "writable").
+writeable = "writeable"

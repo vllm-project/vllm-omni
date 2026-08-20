@@ -160,7 +160,9 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
-        _undecorate_dynamo(self.flow.encoder, "forward_chunk")
+        encoder = getattr(self.flow, "encoder", None)
+        if encoder is not None:
+            _undecorate_dynamo(encoder, "forward_chunk")
         hift_parameter = next(self.hift.parameters(), None)
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
