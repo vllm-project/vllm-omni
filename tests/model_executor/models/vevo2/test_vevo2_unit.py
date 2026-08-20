@@ -21,6 +21,7 @@ GPU-resident weights and the Amphion clone on PYTHONPATH):
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,7 +31,9 @@ np = pytest.importorskip("numpy")
 from vllm_omni.model_executor.models.output_templates import OmniOutput  # noqa: E402
 from vllm_omni.model_executor.models.vevo2.configuration_vevo2 import Vevo2Config  # noqa: E402
 from vllm_omni.model_executor.models.vevo2.modeling_vevo2 import (  # noqa: E402
+    _LLAMA_CONFIG_POSITIONAL_ORDER,
     Vevo2ForCausalLM,
+    _llama_config_positional_args,
     _materialise_ref_audio,
     _pick,
 )
@@ -56,8 +59,44 @@ def _make_bare_model() -> Vevo2ForCausalLM:
 
     model._lock = threading.Lock()
     model._stream_gens = {}
+    # ``__init__`` initialises three pieces of streaming state; all three are
+    # needed by ``forward()``. ``_finished_keys`` in particular is the guard
+    # against re-running inference after a waveform was emitted (the runaway
+    # generation bug), so the lifecycle tests below depend on it being here.
+    model._finished_keys = set()
     model._ar_last_chunk_flags = []
     return model
+
+
+def _stub_pipeline(calls: list, waveform: torch.Tensor | None = None):
+    """A stand-in for ``Vevo2InferencePipeline`` that records its calls.
+
+    Lets the streaming lifecycle be driven on CPU with no Amphion clone and
+    no model weights: ``_stream_waveform`` only needs an object exposing
+    ``inference_ar_and_fm``.
+    """
+
+    def inference_ar_and_fm(**kwargs):
+        calls.append(kwargs)
+        return torch.arange(8, dtype=torch.float32) if waveform is None else waveform
+
+    return SimpleNamespace(inference_ar_and_fm=inference_ar_and_fm)
+
+
+def _request(text: str = "hello", req_id: str = "req-1", **extra) -> dict:
+    """Build a ``runtime_additional_information`` row.
+
+    Values are wrapped in one-element lists exactly as the serving layer
+    wraps them, and ``prompt_audio_path`` points at a path that is never
+    opened because the pipeline is stubbed.
+    """
+    info = {
+        "text": [text],
+        "prompt_audio_path": ["/nonexistent/ref.wav"],
+        "global_request_id": [req_id],
+    }
+    info.update({k: [v] for k, v in extra.items()})
+    return info
 
 
 # --------------------------------------------------------------------------
@@ -228,17 +267,16 @@ def test_compute_logits_pads_missing_flags_as_finished() -> None:
 
 
 def test_create_stream_gen_raises_on_empty_text() -> None:
+    """Validation is eager: the call itself raises, no ``next()`` needed."""
     model = _make_bare_model()
-    gen = model._create_stream_gen({"text": ""})
     with pytest.raises(ValueError, match="empty text"):
-        next(gen)
+        model._create_stream_gen({"text": ""})
 
 
 def test_create_stream_gen_raises_on_missing_ref() -> None:
     model = _make_bare_model()
-    gen = model._create_stream_gen({"text": "hello"})
     with pytest.raises(ValueError, match="reference wav"):
-        next(gen)
+        model._create_stream_gen({"text": "hello"})
 
 
 # --------------------------------------------------------------------------
@@ -275,3 +313,263 @@ def test_vevo2_config_kwargs_override_defaults() -> None:
     cfg = Vevo2Config(audio_sample_rate=16000, vocab_size=200000)
     assert cfg.audio_sample_rate == 16000
     assert cfg.vocab_size == 200000
+
+
+# --------------------------------------------------------------------------
+# Streaming lifecycle (waveform -> sentinel -> EOS -> cleanup)
+# --------------------------------------------------------------------------
+
+
+def test_forward_emits_waveform_then_sentinel_and_never_reruns_inference() -> None:
+    """The full per-request lifecycle, including the runaway-generation guard.
+
+    The AR scheduler keeps calling ``forward()`` after the waveform has been
+    emitted (its EOS only takes effect on the following step, and there is a
+    ``max_tokens`` backstop behind that). Re-creating the generator on those
+    later steps would re-run ``inference_ar_and_fm`` and concatenate the whole
+    waveform again -- the bug that once produced 2.4 hours of audio for one
+    short prompt. ``_finished_keys`` is what prevents it.
+    """
+    model = _make_bare_model()
+    calls: list = []
+    model._pipeline = _stub_pipeline(calls)
+    info = _request()
+
+    # Step 1: the whole waveform arrives as a single non-final delta chunk.
+    out = model.forward(runtime_additional_information=[info])
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 8
+    assert model._ar_last_chunk_flags == [False]
+    assert len(calls) == 1
+    assert "req-1" in model._stream_gens
+
+    # Step 2: the empty sentinel finishes the row and drops the generator.
+    out = model.forward(runtime_additional_information=[info])
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert model._ar_last_chunk_flags == [True]
+    assert "req-1" in model._finished_keys
+    assert "req-1" not in model._stream_gens
+
+    # Steps 3+: silence, and crucially no further inference.
+    for _ in range(3):
+        out = model.forward(runtime_additional_information=[info])
+        assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+        assert model._ar_last_chunk_flags == [True]
+    assert len(calls) == 1, "inference_ar_and_fm must not re-run after the waveform was emitted"
+
+    # Scheduler cleanup releases the marker so the id can be reused.
+    model.on_requests_finished({"req-1"})
+    assert "req-1" not in model._finished_keys
+
+
+def test_forward_keeps_batched_requests_isolated() -> None:
+    """Two rows in one step get their own generators and their own waveforms."""
+    model = _make_bare_model()
+    calls: list = []
+    model._pipeline = _stub_pipeline(calls)
+    infos = [_request("first", req_id="a"), _request("second", req_id="b")]
+
+    out = model.forward(runtime_additional_information=infos)
+
+    assert len(out.multimodal_outputs["model_outputs"]) == 2
+    assert model._ar_last_chunk_flags == [False, False]
+    assert {"a", "b"} == set(model._stream_gens)
+    # Each row drove inference with its own text, in order.
+    assert [c["target_text"] for c in calls] == ["first", "second"]
+
+
+def test_forward_rejects_malformed_row_before_advancing_siblings() -> None:
+    """A bad row in a batch must not discard a sibling's waveform.
+
+    ``_create_stream_gen`` validates eagerly and ``forward()`` creates every
+    generator before advancing any, so the sibling's generator is still
+    un-advanced when the bad row raises -- its waveform is pending, not
+    produced-and-thrown-away.
+    """
+    model = _make_bare_model()
+    calls: list = []
+    model._pipeline = _stub_pipeline(calls)
+    good = _request("ok", req_id="good")
+    bad = {"text": [""], "global_request_id": ["bad"]}
+
+    with pytest.raises(ValueError, match="empty text"):
+        model.forward(runtime_additional_information=[good, bad])
+
+    assert calls == [], "no inference should have run before the batch was rejected"
+    assert "good" in model._stream_gens
+
+    # The retry delivers the sibling's audio.
+    out = model.forward(runtime_additional_information=[good])
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 8
+
+
+# --------------------------------------------------------------------------
+# Seed handling / global RNG hygiene
+# --------------------------------------------------------------------------
+
+
+def _random_pipeline():
+    """A stub whose output depends on the global torch RNG."""
+    return SimpleNamespace(inference_ar_and_fm=lambda **kwargs: torch.rand(4))
+
+
+def test_seed_makes_output_reproducible() -> None:
+    def run(seed: int) -> torch.Tensor:
+        model = _make_bare_model()
+        model._pipeline = _random_pipeline()
+        out = model.forward(runtime_additional_information=[_request(seed=seed)])
+        return out.multimodal_outputs["model_outputs"][0]
+
+    assert torch.equal(run(1234), run(1234)), "the same seed must produce the same waveform"
+    assert not torch.equal(run(1234), run(4321)), "a different seed must change the waveform"
+
+
+def test_seeded_request_restores_global_rng_state() -> None:
+    """Seeding must not outlive the inference call it was applied to.
+
+    The seeded region wraps only ``inference_ar_and_fm``, never the ``yield``.
+    A region that spanned the yield would leave the process RNG seeded for as
+    long as the generator stayed suspended -- i.e. while sibling requests in
+    the same batch run.
+    """
+    model = _make_bare_model()
+    model._pipeline = _random_pipeline()
+
+    torch.manual_seed(999)
+    before = torch.get_rng_state()
+
+    model.forward(runtime_additional_information=[_request(seed=1234)])
+
+    assert torch.equal(torch.get_rng_state(), before), "seeded request leaked RNG state to the process"
+
+
+def test_unseeded_request_is_unaffected_by_a_seeded_sibling() -> None:
+    """An unseeded row's output must not depend on its position in the batch."""
+
+    def unseeded_chunk(seeded_first: bool) -> torch.Tensor:
+        model = _make_bare_model()
+        model._pipeline = _random_pipeline()
+        seeded = _request("s", req_id="seeded", seed=1234)
+        plain = _request("p", req_id="plain")
+        infos = [seeded, plain] if seeded_first else [plain, seeded]
+        torch.manual_seed(7)
+        out = model.forward(runtime_additional_information=infos)
+        return out.multimodal_outputs["model_outputs"][infos.index(plain)]
+
+    assert torch.equal(unseeded_chunk(seeded_first=True), unseeded_chunk(seeded_first=False)), (
+        "an unseeded request inherited RNG state from a seeded batch sibling"
+    )
+
+
+def test_unseeded_request_does_not_touch_global_rng_bookkeeping() -> None:
+    """Without a seed the manager is a no-op: RNG advances, nothing is restored."""
+    model = _make_bare_model()
+    model._pipeline = _random_pipeline()
+
+    torch.manual_seed(31337)
+    before = torch.get_rng_state()
+
+    model.forward(runtime_additional_information=[_request()])
+
+    assert not torch.equal(torch.get_rng_state(), before), (
+        "an unseeded request should consume global RNG, not save/restore around it"
+    )
+
+
+def test_request_sampling_knobs_reach_the_pipeline() -> None:
+    """top_k / top_p / temperature / flow_matching_steps are forwarded."""
+    model = _make_bare_model()
+    calls: list = []
+    model._pipeline = _stub_pipeline(calls)
+
+    info = _request(top_k=7, top_p=0.5, temperature=0.25, flow_matching_steps=8)
+    model.forward(runtime_additional_information=[info])
+
+    assert len(calls) == 1
+    assert calls[0]["top_k"] == 7
+    assert calls[0]["top_p"] == 0.5
+    assert calls[0]["temperature"] == 0.25
+    assert calls[0]["flow_matching_steps"] == 8
+
+
+def test_pipeline_defaults_apply_when_knobs_are_absent() -> None:
+    model = _make_bare_model()
+    calls: list = []
+    model._pipeline = _stub_pipeline(calls)
+
+    model.forward(runtime_additional_information=[_request()])
+
+    assert calls[0]["top_k"] == 25
+    assert calls[0]["top_p"] == 0.8
+    assert calls[0]["temperature"] == 1.0
+    assert calls[0]["flow_matching_steps"] == 32
+
+
+# --------------------------------------------------------------------------
+# LlamaConfig positional-argument shim (transformers>=5)
+# --------------------------------------------------------------------------
+
+
+def test_llama_config_shim_maps_positional_args() -> None:
+    """Amphion's ``LlamaConfig(0, 256, 1024, 1, 1)`` builds inside the manager."""
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    with _llama_config_positional_args():
+        cfg = LlamaConfig(0, 256, 1024, 1, 1)
+
+    assert cfg.vocab_size == 0
+    assert cfg.hidden_size == 256
+    assert cfg.intermediate_size == 1024
+    assert cfg.num_hidden_layers == 1
+    assert cfg.num_attention_heads == 1
+
+
+def test_llama_config_shim_backfills_rope_theta_without_clobbering_rope_parameters() -> None:
+    """``rope_theta`` is restored; ``rope_parameters`` must survive intact.
+
+    transformers>=5 exposes ``rope_scaling`` as a property over
+    ``rope_parameters`` whose setter writes through, so a ``rope_scaling =
+    None`` backfill would clear the rope configuration. The shim therefore
+    backfills only ``rope_theta``, which really is absent.
+    """
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    with _llama_config_positional_args():
+        cfg = LlamaConfig(0, 256, 1024, 1, 1)
+
+    assert cfg.rope_theta == 10000.0
+    assert cfg.rope_parameters, "rope_parameters must not be cleared by the shim"
+
+
+def test_llama_config_shim_is_scoped_to_the_context() -> None:
+    """The patch must not outlive the ``with`` block."""
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    original = LlamaConfig.__init__
+    with _llama_config_positional_args():
+        assert LlamaConfig.__init__ is not original
+    assert LlamaConfig.__init__ is original
+
+
+def test_llama_config_shim_restores_on_exception() -> None:
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    original = LlamaConfig.__init__
+    with pytest.raises(RuntimeError), _llama_config_positional_args():
+        raise RuntimeError("construction blew up")
+    assert LlamaConfig.__init__ is original
+
+
+def test_llama_config_shim_rejects_duplicate_argument() -> None:
+    """A positional/keyword collision raises rather than silently picking one."""
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    with _llama_config_positional_args(), pytest.raises(TypeError, match="multiple values"):
+        LlamaConfig(32000, vocab_size=64000)
+
+
+def test_llama_config_shim_rejects_too_many_positional_args() -> None:
+    LlamaConfig = pytest.importorskip("transformers.models.llama.configuration_llama").LlamaConfig
+
+    too_many = tuple(range(len(_LLAMA_CONFIG_POSITIONAL_ORDER) + 1))
+    with _llama_config_positional_args(), pytest.raises(TypeError, match="exceed the known"):
+        LlamaConfig(*too_many)

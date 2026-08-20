@@ -20,7 +20,14 @@ Prerequisites
 
 2. Download the checkpoint (CC BY-NC-ND 4.0 -- non-commercial only):
 
-       huggingface-cli download RMSnow/Vevo2 --local-dir ./ckpts/Vevo2
+       hf download RMSnow/Vevo2 --local-dir ./ckpts/Vevo2
+
+3. Initialise it once. The published repo ships no root ``config.json``, no
+   root weight file and no root tokenizer files, so it cannot be loaded as
+   downloaded. This script writes them and is idempotent, so it is safe to
+   re-run (and repairs a half-initialised checkpoint in place):
+
+       python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py ./ckpts/Vevo2
 
 Usage
 -----
@@ -138,42 +145,39 @@ def main(args) -> None:
         flow_matching_steps=args.flow_matching_steps,
     )
 
-    for stage_outputs in omni.generate(inputs, sampling_params):
-        # ``stage_outputs.request_output`` returns either a list of
-        # ``RequestOutput`` objects (older API) or a single ``RequestOutput``
-        # (vllm-omni 0.20+). Defensively normalise.
-        req_outputs = stage_outputs.request_output
-        if not isinstance(req_outputs, (list, tuple)):
-            req_outputs = [req_outputs]
-        for i, req_output in enumerate(req_outputs):
-            for j, out in enumerate(req_output.outputs):
-                mm = out.multimodal_output
-                if mm is None:
-                    print(f"  [req {i}] No audio output.")
+    # Each item yielded by ``Omni.generate`` is itself an ``OmniRequestOutput``
+    # (it subclasses ``RequestOutput``), so the generation content is read off
+    # the object directly -- same shape as
+    # ``examples/offline_inference/text_to_speech/gepard/end2end.py``.
+    for i, req_output in enumerate(omni.generate(inputs, sampling_params)):
+        for j, out in enumerate(req_output.outputs):
+            mm = out.multimodal_output
+            if mm is None:
+                print(f"  [req {i}] No audio output.")
+                continue
+            # Vevo2 yields delta audio chunks; the engine concatenates
+            # them at finish into a single ``audio`` tensor (key set by
+            # ``_consolidate_multimodal_tensors`` in
+            # vllm_omni/engine/output_processor.py). Defensively handle
+            # the pre-consolidation list form too.
+            audio = mm.get("audio")
+            if audio is None:
+                audio = mm.get("model_outputs")
+            if audio is None:
+                print(f"  [req {i}] No waveform in multimodal_output.")
+                continue
+            if isinstance(audio, list):
+                non_empty = [c for c in audio if hasattr(c, "numel") and c.numel() > 0]
+                if not non_empty:
+                    print(f"  [req {i}] Empty waveform list.")
                     continue
-                # Vevo2 yields delta audio chunks; the engine concatenates
-                # them at finish into a single ``audio`` tensor (key set by
-                # ``_consolidate_multimodal_tensors`` in
-                # vllm_omni/engine/output_processor.py). Defensively handle
-                # the pre-consolidation list form too.
-                audio = mm.get("audio")
-                if audio is None:
-                    audio = mm.get("model_outputs")
-                if audio is None:
-                    print(f"  [req {i}] No waveform in multimodal_output.")
-                    continue
-                if isinstance(audio, list):
-                    non_empty = [c for c in audio if hasattr(c, "numel") and c.numel() > 0]
-                    if not non_empty:
-                        print(f"  [req {i}] Empty waveform list.")
-                        continue
-                    audio = torch.cat([c.reshape(-1) for c in non_empty], dim=0)
-                sr_tensor = mm.get("sr")
-                if isinstance(sr_tensor, list) and sr_tensor:
-                    sr_tensor = sr_tensor[-1]
-                sr = int(sr_tensor.item()) if sr_tensor is not None and hasattr(sr_tensor, "item") else 24000
-                out_path = str(output_dir / f"output_{i}_{j}.wav")
-                save_audio(audio, out_path, sr)
+                audio = torch.cat([c.reshape(-1) for c in non_empty], dim=0)
+            sr_tensor = mm.get("sr")
+            if isinstance(sr_tensor, list) and sr_tensor:
+                sr_tensor = sr_tensor[-1]
+            sr = int(sr_tensor.item()) if sr_tensor is not None and hasattr(sr_tensor, "item") else 24000
+            out_path = str(output_dir / f"output_{i}_{j}.wav")
+            save_audio(audio, out_path, sr)
 
     print("Done.")
 

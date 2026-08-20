@@ -18,8 +18,10 @@ mid-module restart.
 from __future__ import annotations
 
 import base64
+import io
 import os
 import urllib.request
+import wave
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -55,6 +57,37 @@ def _resolve_vevo2_model() -> str:
 MODEL = _resolve_vevo2_model()
 REF_AUDIO_URL = "https://raw.githubusercontent.com/open-mmlab/Amphion/main/models/vc/vevo/wav/arabic_male.wav"
 REF_AUDIO_TRANSCRIPT = "Philip stood undecided, his ears strained to catch the slightest sound."
+
+# Vevo2 emits 24 kHz mono. Every prompt in this file is one short sentence, so a
+# handful of seconds is the expected output; tens of seconds means the AR loop
+# never stopped. The offline suite pins this with its own MAX_REASONABLE_DURATION_S
+# and without an equivalent here a runaway generation would still satisfy the
+# transcript-similarity checks.
+SAMPLE_RATE = 24000
+MAX_REASONABLE_DURATION_S = 60.0
+
+
+def _audio_bytes(responses) -> bytes:
+    """Pull the WAV payload out of a ``send_audio_speech_request`` result."""
+    items = responses if isinstance(responses, list) else [responses]
+    assert items, "Expected at least one response"
+    audio = getattr(items[0], "audio_bytes", None)
+    assert audio, "Expected WAV bytes on the response"
+    return audio
+
+
+def _assert_reasonable_duration(audio: bytes) -> None:
+    """Assert the WAV is real 24 kHz audio of a plausible length."""
+    with wave.open(io.BytesIO(audio)) as wav:
+        frames = wav.getnframes()
+        rate = wav.getframerate()
+    assert rate == SAMPLE_RATE, f"Expected {SAMPLE_RATE} Hz, got {rate}"
+    duration_s = frames / float(rate)
+    assert duration_s > 0.0, "Synthesized zero frames of audio"
+    assert duration_s <= MAX_REASONABLE_DURATION_S, (
+        f"Synthesized {duration_s:.0f}s for a single short prompt "
+        f"(> {MAX_REASONABLE_DURATION_S}s) — likely a runaway generation bug"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -116,7 +149,8 @@ def test_vevo2_basic(omni_server, openai_client, ref_audio_data_url) -> None:
         "transcript_escalation_model": "large-v3",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    responses = openai_client.send_audio_speech_request(request_config)
+    _assert_reasonable_duration(_audio_bytes(responses))
 
 
 @pytest.mark.slow
@@ -135,7 +169,8 @@ def test_vevo2_chinese(omni_server, openai_client, ref_audio_data_url) -> None:
         "transcript_escalation_model": "large-v3",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    responses = openai_client.send_audio_speech_request(request_config)
+    _assert_reasonable_duration(_audio_bytes(responses))
 
 
 @pytest.mark.slow
@@ -153,7 +188,8 @@ def test_vevo2_no_ref_text(omni_server, openai_client, ref_audio_data_url) -> No
         "transcript_escalation_model": "large-v3",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    responses = openai_client.send_audio_speech_request(request_config)
+    _assert_reasonable_duration(_audio_bytes(responses))
 
 
 @pytest.mark.slow
@@ -161,22 +197,61 @@ def test_vevo2_no_ref_text(omni_server, openai_client, ref_audio_data_url) -> No
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_vevo2_missing_ref_audio_rejected(omni_server, openai_client) -> None:
-    """``ref_audio`` is required by Vevo2; the server should reject the request."""
-    import httpx
+    """``ref_audio`` is required by Vevo2; the request must be rejected with a 400.
 
+    Pinned to exactly 400 rather than "any status >= 400": a 5xx would mean the
+    server crashed on the missing reference instead of validating it, which is
+    a different (and worse) outcome that must not pass as a rejection.
+    """
     request_config = {
         "model": omni_server.model,
         "input": "This request should fail because ref_audio is missing.",
         "stream": False,
         "response_format": "wav",
         "voice": "default",
+        "status_code": 400,
+        "err_message": "ref_audio",
     }
 
-    base_url = openai_client.base_url.rstrip("/")
-    with httpx.Client(timeout=60) as client:
-        resp = client.post(
-            f"{base_url}/v1/audio/speech",
-            json=request_config,
-            headers={"Authorization": f"Bearer {openai_client.client.api_key}"},
+    openai_client.send_audio_speech_request(request_config)
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_vevo2_same_seed_is_reproducible(omni_server, openai_client, ref_audio_data_url) -> None:
+    """Two identical seeded requests must return identical audio.
+
+    Vevo2 samples inside Amphion's ``inference_ar_and_fm``, which reads its
+    seed from ``additional_information``; the ``SamplingParams`` the dummy AR
+    scheduler carries never reach it. An adapter that dropped ``seed`` on the
+    floor would leave the offline path reproducible and the online path not,
+    which is exactly the regression this pins.
+    """
+
+    def synthesize(seed: int) -> bytes:
+        responses = openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Determinism check for the online seed path.",
+                "stream": False,
+                "response_format": "wav",
+                "ref_audio": ref_audio_data_url,
+                "ref_text": REF_AUDIO_TRANSCRIPT,
+                "seed": seed,
+            }
         )
-    assert resp.status_code >= 400, f"Expected 4xx, got {resp.status_code}: {resp.text[:200]}"
+        audio = _audio_bytes(responses)
+        _assert_reasonable_duration(audio)
+        return audio
+
+    first = synthesize(1234)
+    second = synthesize(1234)
+    assert first == second, (
+        f"Same seed returned different audio ({len(first)} vs {len(second)} bytes); "
+        f"the request seed is not reaching the model"
+    )
+
+    different = synthesize(4321)
+    assert different != first, "A different seed must change the output; seed appears to be ignored"

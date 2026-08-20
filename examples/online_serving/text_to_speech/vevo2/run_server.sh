@@ -8,7 +8,12 @@
 #        pip install -r Amphion/models/svc/vevo2/requirements.txt
 #
 #   2. Vevo2 checkpoint downloaded (CC BY-NC-ND 4.0 -- non-commercial only):
-#        huggingface-cli download RMSnow/Vevo2 --local-dir ./ckpts/Vevo2
+#        hf download RMSnow/Vevo2 --local-dir ./ckpts/Vevo2
+#
+#   3. One-time checkpoint init. The published repo ships no root config.json,
+#      no root weight file and no root tokenizer files, so the server cannot
+#      load it as downloaded. This writes them (idempotent; safe to re-run):
+#        python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py ./ckpts/Vevo2
 #
 # Usage:
 #   ./run_server.sh

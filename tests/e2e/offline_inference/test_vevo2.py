@@ -122,39 +122,47 @@ def _build_request(
     }
 
 
-def _as_request_outputs(stage_outputs):
-    """Normalise ``stage_outputs.request_output`` to a list.
+def _extract_audio(req_output) -> tuple[torch.Tensor, int]:
+    """Read the waveform and sample rate off one ``OmniRequestOutput``.
 
-    Older vllm-omni returned a list of ``RequestOutput``; 0.20+ returns a
-    single ``RequestOutput``. Iterating the latter raises ``TypeError:
-    'RequestOutput' object is not iterable``, so coerce defensively (the
-    offline example does the same).
+    ``OmniRequestOutput`` subclasses ``RequestOutput``, so the generation
+    content lives on the object itself; it is not iterable and carries no
+    nested ``request_output`` (see ``tests/docs/test_example_output_accessors``).
     """
-    req_outputs = stage_outputs.request_output
-    if not isinstance(req_outputs, (list, tuple)):
-        req_outputs = [req_outputs]
-    return req_outputs
+    mm = req_output.outputs[0].multimodal_output
+    assert mm is not None, "Expected multimodal_output to be non-None"
+    audio = mm.get("audio")
+    if audio is None:
+        audio = mm.get("model_outputs")
+    assert audio is not None, "Expected 'audio' / 'model_outputs' in multimodal_output"
+    if isinstance(audio, list):
+        non_empty = [c for c in audio if hasattr(c, "numel") and c.numel() > 0]
+        assert non_empty, "Audio chunk list was empty"
+        audio = torch.cat([c.reshape(-1) for c in non_empty], dim=0)
+    assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
+    sr = mm.get("sr")
+    if isinstance(sr, list) and sr:
+        sr = sr[-1]
+    return audio.cpu(), int(sr.item()) if sr is not None and hasattr(sr, "item") else SAMPLE_RATE
 
 
 def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
-    for stage_outputs in omni.generate(request, DEFAULT_SAMPLING):
-        for req_output in _as_request_outputs(stage_outputs):
-            mm = req_output.outputs[0].multimodal_output
-            assert mm is not None, "Expected multimodal_output to be non-None"
-            audio = mm.get("audio")
-            if audio is None:
-                audio = mm.get("model_outputs")
-            assert audio is not None, "Expected 'audio' / 'model_outputs' in multimodal_output"
-            if isinstance(audio, list):
-                non_empty = [c for c in audio if hasattr(c, "numel") and c.numel() > 0]
-                assert non_empty, "Audio chunk list was empty"
-                audio = torch.cat([c.reshape(-1) for c in non_empty], dim=0)
-            assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
-            sr = mm.get("sr")
-            if isinstance(sr, list) and sr:
-                sr = sr[-1]
-            return audio.cpu(), int(sr.item()) if sr is not None and hasattr(sr, "item") else SAMPLE_RATE
+    for req_output in omni.generate(request, DEFAULT_SAMPLING):
+        return _extract_audio(req_output)
     raise AssertionError("No stage outputs received")
+
+
+def _assert_sane_audio(audio: torch.Tensor, sr: int) -> None:
+    """Assert a waveform is real, finite speech of a plausible length."""
+    assert sr == SAMPLE_RATE, f"Expected sample_rate={SAMPLE_RATE}, got {sr}"
+    assert audio.numel() > 0, "Audio tensor should not be empty"
+    assert not torch.all(audio == 0), "Audio should not be all-zeros (silence)"
+    assert torch.isfinite(audio).all(), "Audio should not contain NaN / Inf"
+    duration_s = audio.numel() / sr
+    assert duration_s <= MAX_REASONABLE_DURATION_S, (
+        f"Audio is {duration_s:.0f}s for a single short prompt "
+        f"(> {MAX_REASONABLE_DURATION_S}s) — likely a runaway generation bug"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -170,15 +178,7 @@ def test_vevo2_english(omni_engine, ref_audio_path):
     req = _build_request("Hello, this is a short Vevo2 voice cloning demo.", ref_audio_path)
     audio, sr = _collect_audio(omni_engine, req)
 
-    assert sr == SAMPLE_RATE, f"Expected sample_rate={SAMPLE_RATE}, got {sr}"
-    assert audio.numel() > 0, "Audio tensor should not be empty"
-    assert not torch.all(audio == 0), "Audio should not be all-zeros (silence)"
-    assert torch.isfinite(audio).all(), "Audio should not contain NaN / Inf"
-    duration_s = audio.numel() / sr
-    assert duration_s <= MAX_REASONABLE_DURATION_S, (
-        f"Audio is {duration_s:.0f}s for a single short prompt "
-        f"(> {MAX_REASONABLE_DURATION_S}s) — likely a runaway generation bug"
-    )
+    _assert_sane_audio(audio, sr)
 
 
 @pytest.mark.slow
@@ -189,44 +189,77 @@ def test_vevo2_chinese(omni_engine, ref_audio_path):
     req = _build_request("你好，这是一段Vevo2的语音合成测试。", ref_audio_path)
     audio, sr = _collect_audio(omni_engine, req)
 
-    assert sr == SAMPLE_RATE
-    assert audio.numel() > 0
-    assert not torch.all(audio == 0)
-    assert torch.isfinite(audio).all()
-    assert audio.numel() / sr <= MAX_REASONABLE_DURATION_S, (
-        f"Audio is {audio.numel() / sr:.0f}s for a single short prompt — likely a runaway generation bug"
+    _assert_sane_audio(audio, sr)
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"})
+def test_vevo2_batch_isolation(omni_engine, ref_audio_path):
+    """A batch of two requests returns correctly-attributed audio for each.
+
+    Attribution is checked by length rather than by transcript so the test
+    needs no ASR model: the long prompt must yield audibly more audio than
+    the short one.  A wrong-audio-to-wrong-request swap therefore fails here.
+    """
+    short_text = "Short one."
+    long_text = (
+        "This is a considerably longer request, written so that its synthesized "
+        "waveform is unmistakably longer than the short prompt it shares a batch with."
+    )
+    requests = [
+        _build_request(short_text, ref_audio_path, seed=11),
+        _build_request(long_text, ref_audio_path, seed=11),
+    ]
+
+    # Omni.generate expects one SamplingParams per *stage* (Vevo2 is single-stage),
+    # not one per request; per-request differentiation is carried in each
+    # request's additional_information.
+    by_request_id = {}
+    for req_output in omni_engine.generate(requests, DEFAULT_SAMPLING):
+        assert req_output.request_id not in by_request_id, (
+            f"Duplicate request_id {req_output.request_id!r} in one batch"
+        )
+        by_request_id[req_output.request_id] = _extract_audio(req_output)
+
+    assert len(by_request_id) == 2, f"Expected 2 outputs, got {len(by_request_id)}"
+
+    results = list(by_request_id.values())
+    for audio, sr in results:
+        _assert_sane_audio(audio, sr)
+
+    short_audio, long_audio = (r[0] for r in sorted(results, key=lambda r: r[0].numel()))
+    # The long prompt is ~10x the short one; require a clear margin so this
+    # only passes when each waveform really belongs to its own request.
+    assert long_audio.numel() > 1.5 * short_audio.numel(), (
+        f"Expected the long prompt to yield clearly more audio, got "
+        f"{short_audio.numel()} vs {long_audio.numel()} samples — outputs may be "
+        f"misattributed between batched requests"
     )
 
 
 @pytest.mark.slow
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"})
-def test_vevo2_batch(omni_engine, ref_audio_path):
-    """Batch of two requests returns audio for each (per-request state isolation)."""
-    requests = [
-        _build_request("First request, just a quick test.", ref_audio_path, seed=11),
-        _build_request("Second request, also short.", ref_audio_path, seed=22),
-    ]
-    results = []
-    # Omni.generate expects one SamplingParams per *stage* (Vevo2 is single-stage),
-    # not one per request; per-request differentiation (the seeds) is carried in
-    # each request's additional_information.
-    for stage_outputs in omni_engine.generate(requests, DEFAULT_SAMPLING):
-        for req_output in _as_request_outputs(stage_outputs):
-            mm = req_output.outputs[0].multimodal_output
-            assert mm is not None
-            audio = mm.get("audio")
-            if audio is None:
-                audio = mm.get("model_outputs")
-            if isinstance(audio, list):
-                non_empty = [c for c in audio if hasattr(c, "numel") and c.numel() > 0]
-                audio = torch.cat([c.reshape(-1) for c in non_empty], dim=0) if non_empty else None
-            assert audio is not None and audio.numel() > 0
-            assert audio.numel() / SAMPLE_RATE <= MAX_REASONABLE_DURATION_S, (
-                f"Audio is {audio.numel() / SAMPLE_RATE:.0f}s — likely a runaway generation bug"
-            )
-            results.append(audio.cpu())
+def test_vevo2_seed_is_reproducible(omni_engine, ref_audio_path):
+    """The same text and seed synthesize identical audio; a different seed does not.
 
-    assert len(results) == 2, f"Expected 2 outputs, got {len(results)}"
-    # Different seeds should produce non-identical outputs (modulo rounding).
-    assert results[0].shape != results[1].shape or not torch.allclose(results[0], results[1])
+    This is the regression guard for seed plumbing: an implementation that
+    dropped ``seed`` on the floor would fail the second assertion, and one
+    that leaked RNG state between requests would fail the first.
+    """
+    text = "Determinism check for the Vevo2 seed path."
+
+    audio_a, sr_a = _collect_audio(omni_engine, _build_request(text, ref_audio_path, seed=1234))
+    audio_b, sr_b = _collect_audio(omni_engine, _build_request(text, ref_audio_path, seed=1234))
+    audio_c, _ = _collect_audio(omni_engine, _build_request(text, ref_audio_path, seed=4321))
+
+    _assert_sane_audio(audio_a, sr_a)
+    assert sr_a == sr_b
+
+    assert audio_a.shape == audio_b.shape, f"Same seed produced different lengths: {audio_a.shape} vs {audio_b.shape}"
+    assert torch.equal(audio_a, audio_b), "Same text and seed must synthesize identical audio"
+
+    assert audio_a.shape != audio_c.shape or not torch.allclose(audio_a, audio_c), (
+        "A different seed must change the output; seed appears to be ignored"
+    )

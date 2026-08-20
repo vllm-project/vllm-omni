@@ -38,6 +38,7 @@ AR backbone, and CUDA-graph capture of the FM Euler solver.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import tempfile
@@ -126,8 +127,9 @@ _LLAMA_CONFIG_POSITIONAL_ORDER = (
 )
 
 
-def _shim_llama_config_positional_args() -> None:
-    """Let Amphion build ``LlamaConfig`` positionally under transformers>=5.
+@contextlib.contextmanager
+def _llama_config_positional_args():
+    """Temporarily let Amphion build ``LlamaConfig`` positionally under transformers>=5.
 
     Amphion's ``models/base/llama_nar.py`` constructs
     ``LlamaConfig(0, 256, 1024, 1, 1)`` with positional arguments, which is
@@ -136,21 +138,23 @@ def _shim_llama_config_positional_args() -> None:
     transformers>=5. Rather than pin transformers<5 (which conflicts with the
     ``transformers >= 5.5.3`` floor in ``requirements/common.txt`` and vLLM's
     own constraint), map the positional arguments back to their 4.x keyword
-    names at import time, and backfill the legacy top-level ``rope_theta`` /
-    ``rope_scaling`` attributes that transformers>=5 moved into a nested
-    ``rope_parameters`` dict but Amphion's ``llama_nar.py`` still reads directly
-    -- the same lightweight-shim approach already used for the missing
-    ``IPython`` dependency. Idempotent and a no-op if transformers is absent.
+    names -- the same lightweight-shim approach already used for the missing
+    ``IPython`` dependency.
+
+    Scoped as a context manager rather than installed permanently: the patch
+    replaces ``LlamaConfig.__init__`` for *every* caller in the worker
+    process, and nothing outside Amphion wants 4.x positional semantics. It
+    is restored on exit even if construction raises. A no-op if transformers
+    is absent.
     """
     try:
         from transformers.models.llama import configuration_llama as _cfg_mod
     except Exception:  # pragma: no cover - transformers layout changed
-        return
-    llama_config_cls = _cfg_mod.LlamaConfig
-    orig_init = llama_config_cls.__init__
-    if getattr(orig_init, "_vevo2_posarg_shim", False):
+        yield
         return
 
+    llama_config_cls = _cfg_mod.LlamaConfig
+    orig_init = llama_config_cls.__init__
     order = _LLAMA_CONFIG_POSITIONAL_ORDER
 
     @functools.wraps(orig_init)
@@ -162,25 +166,36 @@ def _shim_llama_config_positional_args() -> None:
                     f"exceed the known transformers-4.x order {order}."
                 )
             for name, value in zip(order, args):
-                kwargs.setdefault(name, value)
+                if name in kwargs:
+                    # Mirror Python's own behaviour instead of silently
+                    # dropping one of the two values.
+                    raise TypeError(f"Vevo2 LlamaConfig shim: got multiple values for argument {name!r}.")
+                kwargs[name] = value
         orig_init(self, **kwargs)
-        # transformers>=5 moved ``rope_theta`` / ``rope_scaling`` into a nested
-        # ``rope_parameters`` dict, but Amphion's ``llama_nar.py`` reads them as
-        # top-level attributes (the transformers-4 layout, e.g.
-        # ``self.rope_theta = config.rope_theta`` in OldLlamaAttention). A 4.x
-        # positional build set those to their defaults, so restore them when the
-        # attribute is absent on this config instance.
+        # transformers>=5 moved ``rope_theta`` into a nested ``rope_parameters``
+        # dict, but Amphion's ``llama_nar.py`` reads it as a top-level attribute
+        # (the transformers-4 layout, e.g. ``self.rope_theta =
+        # config.rope_theta`` in OldLlamaAttention), so restore it.
+        #
+        # ``rope_scaling`` deliberately gets no matching backfill. On
+        # transformers>=5 it is a *property* over ``rope_parameters`` that is
+        # always present -- a positional build yields
+        # ``{'rope_theta': 10000.0, 'rope_type': 'default'}``, the equivalent
+        # of what 4.x expressed as None -- and its setter writes through, so
+        # forcing it to None would also clear ``rope_parameters`` and break
+        # rope initialisation.
         if not hasattr(self, "rope_theta"):
             rope_params = getattr(self, "rope_parameters", None)
             theta = 10000.0
             if isinstance(rope_params, dict) and rope_params.get("rope_theta"):
                 theta = rope_params["rope_theta"]
             self.rope_theta = theta
-        if not hasattr(self, "rope_scaling"):
-            self.rope_scaling = None
 
-    __init__._vevo2_posarg_shim = True  # type: ignore[attr-defined]
     llama_config_cls.__init__ = __init__
+    try:
+        yield
+    finally:
+        llama_config_cls.__init__ = orig_init
 
 
 def _import_vevo2_pipeline():
@@ -192,9 +207,11 @@ def _import_vevo2_pipeline():
     message.
     """
     _stub_optional_dependencies()
-    _shim_llama_config_positional_args()
     try:
-        from models.svc.vevo2.vevo2_utils import Vevo2InferencePipeline  # type: ignore
+        # Scoped over the import as well as construction: Amphion may build a
+        # positional ``LlamaConfig`` at module scope.
+        with _llama_config_positional_args():
+            from models.svc.vevo2.vevo2_utils import Vevo2InferencePipeline  # type: ignore
     except ImportError as exc:  # pragma: no cover - environment-dependent
         raise ImportError(
             "Vevo2 requires Amphion to be installed and importable. "
@@ -225,6 +242,42 @@ def _resolve_amphion_root() -> str | None:
         if os.path.isfile(candidate):
             return entry
     return None
+
+
+@contextlib.contextmanager
+def _seeded_rng(seed: int | None):
+    """Seed the process-global torch RNG for the duration of one inference call.
+
+    Amphion's ``inference_ar_and_fm`` samples from the global torch RNG and
+    accepts no generator argument, so per-request determinism has to be done
+    by seeding the process. That makes *scope* the whole problem: this manager
+    must wrap only the synchronous inference call, never a ``yield`` back to
+    the scheduler.
+
+    A seeded region that spans a yield leaves the global RNG seeded while the
+    generator is suspended, so sibling requests in the same batch (``forward()``
+    drives up to ``max_num_seqs`` generators per step) would inherit it, and
+    nested save/restore across suspended generators never returns the process
+    to its original state. Restoring before control leaves this function keeps
+    seeding invisible to everything else in the batch.
+
+    A no-op when ``seed`` is None, so unseeded requests neither read nor write
+    global RNG state.
+    """
+    if seed is None:
+        yield
+        return
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
 
 
 def _pick(info: dict, key: str, default):
@@ -389,17 +442,18 @@ class Vevo2ForCausalLM(nn.Module):
             try:
                 if amphion_root is not None:
                     os.chdir(amphion_root)
-                self._pipeline = Vevo2InferencePipeline(
-                    prosody_tokenizer_ckpt_path=prosody_tok,
-                    content_style_tokenizer_ckpt_path=content_style_tok,
-                    ar_cfg_path=ar_cfg,
-                    ar_ckpt_path=ar_dir,
-                    fmt_cfg_path=fmt_cfg,
-                    fmt_ckpt_path=fmt_dir,
-                    vocoder_cfg_path=vocoder_cfg,
-                    vocoder_ckpt_path=vocoder_dir,
-                    device=device,
-                )
+                with _llama_config_positional_args():
+                    self._pipeline = Vevo2InferencePipeline(
+                        prosody_tokenizer_ckpt_path=prosody_tok,
+                        content_style_tokenizer_ckpt_path=content_style_tok,
+                        ar_cfg_path=ar_cfg,
+                        ar_ckpt_path=ar_dir,
+                        fmt_cfg_path=fmt_cfg,
+                        fmt_ckpt_path=fmt_dir,
+                        vocoder_cfg_path=vocoder_cfg,
+                        vocoder_ckpt_path=vocoder_dir,
+                        device=device,
+                    )
             finally:
                 os.chdir(prev_cwd)
 
@@ -453,11 +507,13 @@ class Vevo2ForCausalLM(nn.Module):
     # ------------------------------------------------------------------
 
     def _create_stream_gen(self, info: dict[str, Any]):
-        """Create a per-request generator yielding ``(chunk, is_last)``.
+        """Validate one request, then return its ``(chunk, is_last)`` generator.
 
-        The MVP runs ``inference_ar_and_fm`` to completion in one call and
-        yields the full waveform once, then a final empty sentinel so
-        ``compute_logits()`` can drive the AR scheduler to EOS.
+        Validation runs **eagerly**, here, rather than inside the returned
+        generator's body. That matters for batching: ``forward()`` creates
+        every generator for a step before advancing any of them, so a
+        malformed request rejects while its siblings are still untouched
+        instead of aborting a step that has already consumed their chunks.
         """
         text: str = str(_pick(info, "text", "") or "").strip()
         if not text:
@@ -468,6 +524,22 @@ class Vevo2ForCausalLM(nn.Module):
             # has no validation layer in front of the model.
             raise ValueError("Vevo2 received empty text; provide non-empty input.")
 
+        if _pick(info, "prompt_audio_array", None) is None and _pick(info, "prompt_audio_path", None) is None:
+            # Checked eagerly for the same reason. Upstream's
+            # inference_ar_and_fm asserts timbre_ref_wav_path is not None, so a
+            # missing reference would otherwise crash deeper with a less
+            # actionable message.
+            raise ValueError("Vevo2 requires a reference wav (ref_audio) for timbre; none was provided.")
+
+        return self._stream_waveform(info, text)
+
+    def _stream_waveform(self, info: dict[str, Any], text: str):
+        """Yield the full waveform as one delta chunk, then an empty sentinel.
+
+        The MVP runs ``inference_ar_and_fm`` to completion in one call, so
+        ``compute_logits()`` drives the AR scheduler to EOS on the step after
+        the sentinel. Inputs are already validated by ``_create_stream_gen``.
+        """
         ref_text: str = str(_pick(info, "ref_text", "") or "")
         prompt_audio_array = _pick(info, "prompt_audio_array", None)
         prompt_audio_path: str | None = _pick(info, "prompt_audio_path", None)
@@ -481,12 +553,10 @@ class Vevo2ForCausalLM(nn.Module):
             prompt_audio_path = prompt_audio_tmp
 
         if prompt_audio_path is None:
-            # Same rationale as the empty-text guard above: raise instead of
-            # yielding silence so the offline path fails loudly. Upstream's
-            # inference_ar_and_fm asserts timbre_ref_wav_path is not None, so a
-            # missing reference would otherwise crash deeper with a less
-            # actionable message.
-            raise ValueError("Vevo2 requires a reference wav (ref_audio) for timbre; none was provided.")
+            # Backstop: presence was validated in ``_create_stream_gen``, so
+            # reaching here means ``_materialise_ref_audio`` failed to stage the
+            # waveform (malformed ``prompt_audio_array``).
+            raise ValueError("Vevo2 could not stage the reference wav (ref_audio) for timbre.")
 
         timbre_ref_path: str = str(_pick(info, "timbre_ref_path", "") or "") or prompt_audio_path
 
@@ -496,33 +566,31 @@ class Vevo2ForCausalLM(nn.Module):
         flow_matching_steps = int(_pick(info, "flow_matching_steps", _DEFAULT_FLOW_MATCHING_STEPS))
         use_prosody_code = bool(_pick(info, "use_prosody_code", _DEFAULT_USE_PROSODY_CODE))
 
-        seed: int | None = _pick(info, "seed", None)
-        if seed is not None:
-            seed = int(seed)
-            _cpu_rng_state = torch.get_rng_state()
-            _cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        else:
-            _cpu_rng_state = None
-            _cuda_rng_state = None
+        seed_value = _pick(info, "seed", None)
+        seed: int | None = int(seed_value) if seed_value is not None else None
 
         try:
             # Upstream returns either a torch.Tensor or numpy array of shape
             # (1, T) at 24 kHz. Coerce to a 1-D float32 tensor for the
             # serving layer.
-            audio = self._pipeline.inference_ar_and_fm(
-                target_text=text,
-                style_ref_wav_path=prompt_audio_path,
-                style_ref_wav_text=ref_text,
-                timbre_ref_wav_path=timbre_ref_path,
-                use_prosody_code=use_prosody_code,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                flow_matching_steps=flow_matching_steps,
-            )
+            #
+            # The seeded window wraps *only* this call, never the ``yield``
+            # below: the generator suspends at the yield until a later
+            # forward() step resumes it, so a seeded region spanning the
+            # yield would leave the process-global RNG seeded while sibling
+            # requests in the same batch run. See ``_seeded_rng``.
+            with _seeded_rng(seed):
+                audio = self._pipeline.inference_ar_and_fm(
+                    target_text=text,
+                    style_ref_wav_path=prompt_audio_path,
+                    style_ref_wav_text=ref_text,
+                    timbre_ref_wav_path=timbre_ref_path,
+                    use_prosody_code=use_prosody_code,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    flow_matching_steps=flow_matching_steps,
+                )
             chunk = torch.as_tensor(audio, dtype=torch.float32).detach().cpu()
             if chunk.ndim == 2:
                 # Upstream emits (channels, samples); mix down to mono if
@@ -549,10 +617,6 @@ class Vevo2ForCausalLM(nn.Module):
                     Path(prompt_audio_tmp).unlink(missing_ok=True)
                 except Exception:
                     pass
-            if _cpu_rng_state is not None:
-                torch.set_rng_state(_cpu_rng_state)
-            if _cuda_rng_state is not None:
-                torch.cuda.set_rng_state_all(_cuda_rng_state)
 
         # Sentinel: signals the last chunk has been delivered so the AR
         # scheduler finishes the request on the next forward() step.
@@ -603,11 +667,15 @@ class Vevo2ForCausalLM(nn.Module):
         srs: list[torch.Tensor] = []
         last_chunk_flags: list[bool] = []
 
+        # Pass 1: resolve each row's key and create any missing generator.
+        # ``_create_stream_gen`` validates eagerly, so a malformed request in
+        # the batch raises here — before any sibling generator is advanced and
+        # therefore before any sibling's chunk could be produced and discarded.
+        # ``None`` marks a dummy row.
+        pending: list[str | None] = []
         for info in infos:
             if info.get("_is_dummy"):
-                outputs.append(empty)
-                srs.append(sr_tensor)
-                last_chunk_flags.append(True)
+                pending.append(None)
                 continue
 
             # Per-request key. The engine sets ``global_request_id`` /
@@ -622,6 +690,18 @@ class Vevo2ForCausalLM(nn.Module):
                 req_marker = req_marker[0] if req_marker else None
             request_key = str(req_marker) if req_marker is not None else str(id(info))
 
+            if request_key not in self._finished_keys and request_key not in self._stream_gens:
+                self._stream_gens[request_key] = self._create_stream_gen(info)
+            pending.append(request_key)
+
+        # Pass 2: advance one step per row.
+        for request_key in pending:
+            if request_key is None:
+                outputs.append(empty)
+                srs.append(sr_tensor)
+                last_chunk_flags.append(True)
+                continue
+
             # Once a request's waveform has been fully emitted, any further
             # forward() steps (the scheduler keeps decoding until its EOS /
             # max_tokens backstop fires) must yield silence — never recreate
@@ -632,9 +712,6 @@ class Vevo2ForCausalLM(nn.Module):
                 last_chunk_flags.append(True)
                 srs.append(sr_tensor)
                 continue
-
-            if request_key not in self._stream_gens:
-                self._stream_gens[request_key] = self._create_stream_gen(info)
 
             generator = self._stream_gens[request_key]
             try:
@@ -649,6 +726,17 @@ class Vevo2ForCausalLM(nn.Module):
                 # generator and mark the request finished so it isn't
                 # recreated, then propagate so the request fails loudly
                 # instead of completing with empty audio.
+                #
+                # Propagating here fails the whole scheduler step, not just
+                # this row. That is deliberate but not ideal: ``OmniOutput``
+                # carries no per-row error channel (``OmniRequestOutput.error``
+                # is only settable by the orchestrator), so the alternative is
+                # returning empty audio and a 200, which hides a real runtime
+                # failure. Caller errors — the failures that actually occur —
+                # are validated eagerly in pass 1 above and so never reach
+                # here mid-batch; what remains is genuine runtime failure
+                # (OOM, an undecodable reference clip). Revisit once a
+                # per-request error channel exists (RFC #4327).
                 self._stream_gens.pop(request_key, None)
                 self._finished_keys.add(request_key)
                 raise
