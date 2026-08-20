@@ -10,9 +10,8 @@ owners:
 primary_code_paths:
   - vllm_omni/config/**
   - vllm_omni/deploy/**
-  - vllm_omni/model_executor/stage_configs/**
-related_code_paths:
-  - vllm_omni/platforms/*/stage_configs/**
+  - vllm_omni/model_executor/models/*/pipeline.py
+related_code_paths: []
 depends_on: []
 validation_paths:
   - tests/config/**
@@ -95,7 +94,7 @@ parallel input is effective for a diffusion stage.
 ## Safe-change guide while deferred
 
 Changes should trace every affected producer to its runtime consumer and test
-the structured, legacy, CLI, and deployment paths that are actually supported.
+the structured pipeline, CLI, and deployment paths that are actually supported.
 For inherited vLLM fields, tests should separately cover constructor behavior
 and effective `EngineArgs` projection. Do not infer a stable contract from
 this placeholder page.
