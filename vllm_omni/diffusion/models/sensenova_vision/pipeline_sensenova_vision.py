@@ -26,6 +26,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision import (
+    VLLMSenseNovaVisionTokenizer,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -266,8 +269,21 @@ class SenseNovaVisionPipeline(BagelPipeline):
     which the BAGEL core needs for ``SiglipImageProcessor``.  When it is
     missing, :meth:`__init__` patches a temp directory with a generated
     BAGEL-compatible ``preprocessor_config.json`` plus symlinks to every
-    checkpoint file and points a copy of ``od_config`` at it.  Checkpoints that
-    already ship the file (e.g. BAGEL itself) take the unpatched path.
+    checkpoint file and points a copy of ``od_config`` at it.
+
+     :meth:`__init__` constructs
+    :class:`~vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision.VLLMSenseNovaVisionTokenizer`
+    in-process from the checkpoint path and passes it to the BAGEL core via
+    the ``tokenizer`` kwarg.  This is required because the BAGEL core
+    otherwise loads the tokenizer with
+    ``AutoTokenizer.from_pretrained(..., trust_remote_code=True)``, and the
+    SenseNova-Vision checkpoint's stock tokenizer would renumber its 2033
+    added tokens (including the four control tokens BAGEL uses) past the
+    LLM's 152064 embedding rows — see :mod:`tokenization_sensenova_vision`
+    for the full explanation.  Loading the class directly keeps those ids
+    verbatim with **zero writes** to the checkpoint directory (no
+    ``tokenizer_config.json`` rewrite, no copied source file, no temp dir
+    for the tokenizer).
     """
 
     # SenseNovaVision checkpoint overrides applied on top of BAGEL.
@@ -309,7 +325,19 @@ class SenseNovaVisionPipeline(BagelPipeline):
             )
             od_config = replace(od_config, model=patched_dir)
 
-        super().__init__(od_config=od_config, prefix=prefix)
+        # Construct the custom tokenizer in-process and inject it into the BAGEL
+        # core.  ``VLLMSenseNovaVisionTokenizer`` loads the base vocab and the
+        # checkpoint's ``added_tokens_decoder`` ids verbatim, so no
+        # ``tokenizer_config.json`` rewrite and no source file are needed — the
+        # BAGEL core receives a ready-made tokenizer via the ``tokenizer`` kwarg
+        # instead of calling ``AutoTokenizer.from_pretrained`` itself.
+        tokenizer = VLLMSenseNovaVisionTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+
+        super().__init__(od_config=od_config, prefix=prefix, tokenizer=tokenizer)
         self._apply_sensenova_vision_defaults()
 
     def _apply_sensenova_vision_defaults(self) -> None:

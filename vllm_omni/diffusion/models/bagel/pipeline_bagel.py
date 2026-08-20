@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.bagel import BagelConfig
@@ -169,7 +170,13 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         "bagel.vit_pos_embed",
     ]
 
-    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        od_config: OmniDiffusionConfig,
+        prefix: str = "",
+        tokenizer: PreTrainedTokenizerBase | None = None,
+    ):
         super().__init__()
         self.od_config = od_config
         self.device = get_local_device()
@@ -207,11 +214,16 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         # Tokenizer and special tokens.
         # Bagel uses a Qwen2 tokenizer variant; prefer trust_remote_code to get the
         # correct tokenizer implementation from the checkpoint repo when available.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-        )
+        # A caller (e.g. SenseNovaVisionPipeline) may inject an already-constructed
+        # tokenizer to avoid re-loading/re-registering from checkpoint files.
+        if tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                local_files_only=True,
+                trust_remote_code=True,
+            )
+        else:
+            self.tokenizer = tokenizer
 
         # Try finding vision_config or interpolate from top-level config
         vit_cfg_dict = bagel_cfg.get("vit_config") or {}
