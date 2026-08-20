@@ -24,6 +24,8 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.block_discovery import (
+    ChunkOwnedBlock,
+    ChunkOwnership,
     get_blocks_attr_names,
     get_blocks_from_dit,
     set_blocks_attr_names,
@@ -550,6 +552,97 @@ class TestDistributedLayerwiseOffloadHook:
         specs = backend._block_tensor_specs(block)
         local = next(tensor for name, tensor, _ in specs if name == "weight")
         assert torch.equal(local, torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+    def test_transform_changing_numel_or_dtype_family_rejected(self, dist_group, patched_offload_runtime):
+        """Transforms that alter numel or dtype family fail fast (review: #6374)."""
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+            ),
+            torch.device("cpu"),
+        )
+
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor[:2]
+        with pytest.raises(RuntimeError, match="changed numel"):
+            backend._block_tensor_specs(block)
+
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor.to(torch.int32)
+        with pytest.raises(RuntimeError, match="changed the dtype family"):
+            backend._block_tensor_specs(block)
+
+        # A view-only transform (stride change) stays legal.
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor.view(2, 2).t()
+        specs = backend._block_tensor_specs(block)
+        local = next(tensor for name, tensor, _ in specs if name == "weight")
+        assert local.shape == (2, 2)
+
+    def test_drain_transport_continues_after_hook_failure(self, dist_group, patched_offload_runtime):
+        """A failing hook does not stop the remaining hooks from draining (review: #6374)."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+            ),
+            torch.device("cpu"),
+        )
+        drained: list[str] = []
+
+        class _StubHook:
+            def __init__(self, name, exc=None):
+                self.name = name
+                self._exc = exc
+
+            def drain_request(self):
+                drained.append(self.name)
+                if self._exc is not None:
+                    raise self._exc
+
+        backend._all_hook_groups = [
+            [_StubHook("ok-1"), _StubHook("bad", RuntimeError("future failed")), _StubHook("ok-2")]
+        ]
+        backend._shared_slot_group = None
+
+        with pytest.raises(RuntimeError, match="future failed"):
+            backend._drain_transport()
+        assert drained == ["ok-1", "bad", "ok-2"]
+
+    def test_prepare_host_storage_aborts_cleanly_on_pin_failure(self, dist_group, patched_offload_runtime):
+        """An agreed pin failure with policy=fail drops packed state (review: #6374)."""
+        import vllm_omni.diffusion.offloader.distributed_layerwise_backend as backend_module
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=True,
+                dlo_pin_failure_policy="fail",
+                weight_shard_size=1,
+            ),
+            torch.device("cpu"),
+        )
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        ownership = ChunkOwnership()
+        ownership.block_ids[id(block)] = 0
+        ownership.blocks.append(ChunkOwnedBlock(module=block, path="blocks.0"))
+        backend._planned_manifests = {id(block): None}  # pack is monkeypatched; manifest unused
+        backend._forced_fallback_reason = None
+        backend._prepared_host_parts = {id(block): {"cpu_shards": {}}}
+        released = []
+        backend._release_mmap_handles = lambda: released.append(True)
+
+        def _raising_pack(*args, **kwargs):
+            raise RuntimeError("pin_memory failed")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backend_module, "pack_local_shard", _raising_pack)
+            with pytest.raises(RuntimeError, match="pinned allocation failed"):
+                backend._prepare_host_storage(ownership)
+        assert backend._prepared_host_parts == {}
+        assert released == [True]
 
     def test_rank_local_mmap_retains_source_and_uses_staging(self, dist_group, patched_offload_runtime):
         current_block = nn.Linear(2, 2, bias=False)

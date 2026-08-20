@@ -1765,7 +1765,24 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 if not getattr(tensor, "mmap_weight_transform_pending", False):
                     transform = None
             if callable(transform):
-                local = transform(local)
+                transformed = transform(local)
+                # A layout transform may only change the view (stride/order),
+                # never the element count or the dtype family — otherwise the
+                # manifest metadata would silently misdescribe the tensor and
+                # the transport would move corrupted bytes (review: #6374).
+                if transformed.numel() != local.numel():
+                    raise RuntimeError(
+                        f"mmap weight transform for {name!r} changed numel "
+                        f"({local.numel()} -> {transformed.numel()}); the manifest "
+                        "would describe incorrect transport metadata"
+                    )
+                if transformed.is_floating_point() != local.is_floating_point():
+                    raise RuntimeError(
+                        f"mmap weight transform for {name!r} changed the dtype family "
+                        f"({local.dtype} -> {transformed.dtype}); the manifest "
+                        "would describe incorrect transport metadata"
+                    )
+                local = transformed
             specs.append((name, local, is_buffer))
         return specs
 
@@ -1861,7 +1878,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             if fallback_reason is None:
                 try:
                     cpu_shards = pack_local_shard(chunk_specs, manifest)
-                except MemoryError as exc:
+                except (MemoryError, RuntimeError, OSError) as exc:
+                    # The pinned allocator can also fail with RuntimeError/OS
+                    # errors (lock limit, driver); treat every allocation
+                    # failure uniformly through the FS vote (review: #6374).
                     failed = 1
                     detail = f"pinned Host allocation failed for {block.path}: {exc}"
 
@@ -1873,6 +1893,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     if detail is None:
                         detail = "another FS rank failed"
                     logger.error("DLO pinned Host allocation failed: %s", detail)
+                    # Do not leave a partially prepared backend behind: drop
+                    # every shard packed so far (freeing pinned Host memory)
+                    # and close the mmap handles (review: #6374).
+                    self._abort_prepared_host_storage()
                     raise RuntimeError("pinned allocation failed on at least one FS rank")
                 fallback_reason = detail or "another FS rank failed"
                 cpu_shards = None
@@ -1938,6 +1962,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             fallback_blocks,
             len(ownership.blocks),
         )
+
+    def _abort_prepared_host_storage(self) -> None:
+        """Best-effort cleanup after a failed _prepare_host_storage.
+
+        Drops every shard packed so far (freeing pinned Host memory) and
+        closes the mmap handles, so the backend is not left in a partially
+        initialized state (review: #6374).
+        """
+        self._prepared_host_parts.clear()
+        self._planned_manifests = {}
+        self.pin_budget = None
+        self._release_mmap_handles()
 
     def _agree_pin_failure(self, failed: int) -> bool:
         """Return the FS-wide OR of per-rank pinned allocation failure."""
@@ -2018,13 +2054,24 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.end_request()
 
     def _drain_transport(self) -> None:
+        # A hook whose drain raises (e.g. from future.result()) must not stop
+        # the remaining hooks from draining — otherwise their futures, pinned
+        # buffers and prefetch threads leak. Drain everything, then re-raise
+        # the first error (review: #6374).
+        first_error: BaseException | None = None
         for group in self._all_hook_groups:
             for hook in group:
-                hook.drain_request()
+                try:
+                    hook.drain_request()
+                except BaseException as exc:  # noqa: BLE001
+                    if first_error is None:
+                        first_error = exc
         if self._shared_slot_group is not None:
             for slot in range(len(self._shared_slot_group)):
                 self._shared_slot_group[slot] = -1
                 self._shared_slot_owners[slot] = None
+        if first_error is not None:
+            raise first_error
 
     def get_transport_metrics(self) -> dict[str, Any]:
         """Report the exact Host/device staging cost of the chunked transport."""
@@ -2835,17 +2882,28 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             current_omni_platform.synchronize()
 
         # Join outstanding submits and retire every bootstrap/tail ticket
-        # before closing the transport state.
+        # before closing the transport state.  One hook's failure must not
+        # skip the others (review: #6374); the first error is re-raised after
+        # every hook has been drained and closed.
+        first_error: BaseException | None = None
         for group in self._all_hook_groups:
             for hook in group:
-                hook.drain_request()
+                try:
+                    hook.drain_request()
+                except BaseException as exc:  # noqa: BLE001
+                    if first_error is None:
+                        first_error = exc
 
         # Close every hook's transport so pinned Host shards are released and
         # the slot state machine is locked against further use.
         for group in self._all_hook_groups:
             for hook in group:
-                if hook.transport is not None:
-                    hook.transport.close()
+                try:
+                    if hook.transport is not None:
+                        hook.transport.close()
+                except BaseException as exc:  # noqa: BLE001
+                    if first_error is None:
+                        first_error = exc
                 hook.cpu_shards = {}  # drop pinned-memory references
                 hook.cpu_sources = {}  # drop retained mmap views
 
@@ -2877,6 +2935,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
 
         logger.info("Distributed layer-wise offloading disabled")
+        if first_error is not None:
+            raise first_error
 
     def _allocate_shared_buffers(
         self,
