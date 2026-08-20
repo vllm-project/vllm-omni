@@ -17,8 +17,10 @@ rotate-half partner is re-read from the same row rather than materialized as a
 concatenation, and the RMS is a per-head scalar, so the partner needs no second
 reduction.
 
-Measured on OmniVoice (28 layers x 32 unmasking steps, A800, float16), this
-replaced 8 launches per layer with 1 and cut the generator's forward by 27%.
+Measured on OmniVoice (28 layers x 32 unmasking steps, A800, float16), the
+unfused path launches 18 kernels between the packed projection and attention
+and this replaces them with 1, cutting the generator's forward by 25-36%
+depending on target length.
 
 Falls back to an eager reference for non-CUDA tensors, missing Triton, or a
 geometry the tiling cannot express.
