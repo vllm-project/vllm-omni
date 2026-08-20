@@ -72,14 +72,13 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 )
 # RFC#2366 signal x target matrix (aligned with test_reliability_qwen3_omni.py):
 # - worker: SIGTERM, SIGKILL
-# - serve-root: SIGTERM, SIGINT; SIGKILL skipped (issue#3725)
+# - serve-root: SIGTERM, SIGINT, SIGKILL
 # - serve-tree no-load: SIGTERM, SIGKILL
 # - serve-tree with-load: SIGTERM, SIGKILL
-_SERVE_ROOT_SIGKILL_SKIP = pytest.mark.skip(reason="issue#3725")
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGINT", id="sigint"),
-    pytest.param("SIGKILL", id="sigkill", marks=_SERVE_ROOT_SIGKILL_SKIP),
+    pytest.param("SIGKILL", id="sigkill"),
 ]
 TREE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
@@ -255,7 +254,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 ) -> None:
     """Black-box: after process kill, /v1/videos fails fast and concurrent calls don't hang.
 
-    /health→503 is checked last: optional ``pytest.skip`` then ``assert`` (drop the ``if`` to harden).
+    /health→503 is checked last.
     """
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
@@ -335,7 +334,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         f"conc_debug={conc_debug}"
     )
 
-    # Phase-3: /health→503 after fault. Optional skip today; remove the ``if`` later to harden.
+    # Phase-3: /health→503 after fault.
     deadline = time.monotonic() + 20.0
     last_observation = ""
     final_health_status: int | None = None
@@ -349,8 +348,6 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         except Exception as exc:  # noqa: BLE001
             last_observation = f"exception={exc!r}"
         time.sleep(0.5)
-    if final_health_status != 503:
-        pytest.skip("issue#3050")
     assert final_health_status == 503, (
         "[process_kill health] expected /health 503 after fatal fault, "
         f"got status={final_health_status}, last_observation={last_observation}"
@@ -390,7 +387,6 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="issue#2327")
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_video_oom_recovers_after_fault_removed(
     omni_server_function,
