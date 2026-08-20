@@ -95,7 +95,7 @@ def test_audiox_determinism(omni_runner: OmniRunner) -> None:
                 },
             ),
         )
-        audio = outputs[0].request_output.multimodal_output.get("audio")
+        audio = outputs[0].multimodal_output.get("audio")
         assert isinstance(audio, np.ndarray)
         return audio
 
