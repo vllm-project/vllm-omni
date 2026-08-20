@@ -39,6 +39,8 @@ SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH = (
     "请用这种声音风格来为用户提供帮助。 请认真、高质量地回复用户的问题。 "
     "请用高自然度的方式和用户聊天。"
 )
+SEED_TTS_OFFICIAL_TTS_SUFFIX = "请用这种声音风格来为用户提供帮助。 直接作答，不要有冗余内容"
+SEED_TTS_OFFICIAL_TTS_USER_PREFIX = "请朗读以下内容。"
 
 # Matches Qwen3-Omni serving examples (``openai_chat_completion_client_for_multimodal_generation`` /
 # ``qwen3_omni/gradio_demo``) plus explicit TTS / voice-clone instructions for chat completions.

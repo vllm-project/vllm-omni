@@ -25,6 +25,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
     SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
     SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
+    SEED_TTS_OFFICIAL_TTS_USER_PREFIX,
     SeedTTSSampleRequest,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
@@ -52,6 +53,9 @@ def test_seed_tts_zh_request_uses_official_audio_contract():
     assert content[1]["audio_url"]["url"] == ref_audio
     assert content[2]["text"] == SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH
     assert rfi.extra_body["ref_audio"] == ref_audio
+    assert rfi.omni_chat_messages[1]["content"] == [
+        {"type": "text", "text": f"{SEED_TTS_OFFICIAL_TTS_USER_PREFIX} 目标文本"}
+    ]
 
 
 def test_seed_tts_missing_reference_keeps_text_only_system_message():
