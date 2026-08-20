@@ -234,11 +234,16 @@ def test_vevo2_same_seed_is_reproducible(omni_server, openai_client, ref_audio_d
         responses = openai_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
-                "input": "Determinism check for the online seed path.",
+                # Plain dictionary words only: Whisper mishears "seed" as
+                # "seat", which drops transcript similarity to 0.90 and trips
+                # the shared helper's threshold -- the same reason the tests
+                # above avoid the coined word "Vevo2" in spoken text.
+                "input": "The morning train arrives at the station on time.",
                 "stream": False,
                 "response_format": "wav",
                 "ref_audio": ref_audio_data_url,
                 "ref_text": REF_AUDIO_TRANSCRIPT,
+                "transcript_escalation_model": "large-v3",
                 "seed": seed,
             }
         )
