@@ -416,9 +416,10 @@ For example, keep the first main block's attention projections in BF16 with:
 ```
 
 The structured option replaces `--quantization fp8`. Online FP8 can be used
-with H3 layerwise offload and with distributed layerwise offload's full-weight
-per-rank path (`--dlo-no-use-allgather`). The sharded DLO AllGather path is not
-supported for runtime-created FP8 weights.
+with H3 layerwise offload and with both DLO transfer paths. The default
+AllGather path uses the ordinary loader to finalize FP8 weights and scales
+before sharding them across ranks. `--dlo-no-use-allgather` instead retains
+complete rank-local tensors and avoids the synchronized request-wave contract.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -870,8 +871,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   H3 native `tile` mode only.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
-- Runtime-created FP8 weights do not support the sharded DLO AllGather path;
-  use `--dlo-no-use-allgather` when combining online FP8 with DLO.
+- Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
+  in host memory on every rank during startup before retaining only each rank's
+  shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone
