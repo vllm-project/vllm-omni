@@ -1323,7 +1323,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_graph_safe = True
         self.talker_mtp_output_key = ("audio_codes", "current")
-        self.use_async_omni_output = False
+        # ``make_omni_output`` keeps code rows fixed-shape and performs all
+        # state updates eagerly, so the runner can safely pack/snapshot them
+        # before CUDA-graph buffers are reused.  This moves the pinned D2H and
+        # output materialization off the Stage-0 execution thread.
+        self.use_async_omni_output = True
         self.eager_omni_postprocess_before_async_output = True
         self.omni_pooler_payload_include_hidden = False
         self.postprocess_uses_multimodal_outputs = False
@@ -1466,7 +1470,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build per-step input embeddings (text + audio additive fusion).
 
-        Prefill: initialise the per-request ``{is_stopping, step}`` state.
+        Prefill: initialise the per-request ``{is_stopping}`` state.
         Decode: combine the forced text token (from ``compute_logits``) with
         the audio codes the local transformer produced last step.
         """
@@ -1474,8 +1478,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         audio_state = info_dict.get("audio_state")
         is_first_call = not isinstance(audio_state, dict)
+        is_prefill = bool(info_dict.get("_omni_is_prefill", False))
 
-        if span_len > 1 or is_first_call:
+        if span_len > 1 or is_first_call or is_prefill:
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
@@ -1668,9 +1673,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 should_continue = codes.ne(self.audio_pad_token_id).any(dim=-1)
                 should_values.append(should_continue.reshape(-1)[:1])
                 have_mtp_output = True
-                emitted_codes = codes[should_continue]
-                per_req_codes.append(emitted_codes)
-                have_codes = have_codes or emitted_codes.numel() > 0
+                # Do not boolean-index a CUDA tensor here.  Even for the
+                # common single-row case, ``codes[should_continue]`` must
+                # discover a dynamic output size on the host and therefore
+                # synchronizes the CUDA stream once per request.  Keep the
+                # fixed-shape row (including an all-pad stop row); the async
+                # chunk processor already filters all-pad rows on CPU.
+                per_req_codes.append(codes)
+                have_codes = True
             else:
                 should_values.append(torch.ones((1,), device=hidden.device, dtype=torch.bool))
                 per_req_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))

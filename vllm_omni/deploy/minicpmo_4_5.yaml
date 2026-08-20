@@ -32,7 +32,7 @@ stages:
     max_num_batched_tokens: 16384
     devices: "0"
     # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
-    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    # Keep these in YAML so they are applied through --deploy-config.
     interleave_mm_strings: true
     media_io_kwargs:
       video:

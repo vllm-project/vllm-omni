@@ -14,7 +14,7 @@ from huggingface_hub import snapshot_download
 from vllm.config.load import LoadConfig
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -89,6 +89,17 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
 
     loader.get_all_weights = _iter_weights  # type: ignore[assignment]
     return loader
+
+
+def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(
+        model="",
+        dtype=torch.float32,
+        quantization_config="fp8",
+        parallel_config=DiffusionParallelConfig(data_parallel_size=2),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
 
 
 def test_strict_check_only_validates_source_prefix_parameters():
@@ -392,6 +403,78 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     assert loader.load_model(load_device="cpu") is model
     assert calls == ["load", "process"]
     assert loader.take_host_weight_plan() is None
+
+
+def test_dlo_allgather_online_fp8_uses_ordinary_loader(monkeypatch):
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
+
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(Fp8PerTensorOnlineLinearMethod)
+    model.transformer.quant_method.uses_meta_device = True
+    calls: list[object] = []
+    allowlist_models: list[nn.Module] = []
+
+    original_allowlist_check = loader._unsupported_dlo_allgather_online_quant_methods
+
+    def check_allowlist(candidate: nn.Module) -> tuple[str, ...]:
+        allowlist_models.append(candidate)
+        return original_allowlist_check(candidate)
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    monkeypatch.setattr(loader, "_unsupported_dlo_allgather_online_quant_methods", check_allowlist)
+    loader._request_offload_after_quant = lambda _model: 1  # type: ignore[method-assign]
+    loader.load_weights = (  # type: ignore[method-assign]
+        lambda _model, *, stream_online_quant_to_cpu=False: calls.append(("load", stream_online_quant_to_cpu))
+    )
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cpu")) is model
+    assert allowlist_models == [model]
+    assert calls == [("load", True), "process"]
+    assert loader.take_host_weight_plan() is None
+
+
+def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    class UnsupportedOnlineMethod:
+        uses_meta_device = True
+
+    od_config = _make_dlo_online_quant_config()
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = UnsupportedOnlineMethod()
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: HostWeightPlanResult(
+            None,
+            "online quantization requires the ordinary loader",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="per-tensor FP8 linears"):
+        loader.load_model(load_device="cpu")
 
 
 def test_hsdp_processes_quantized_weights_before_sharding(mocker):
