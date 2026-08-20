@@ -154,8 +154,6 @@ def _positive_finite(value: float, flag: str) -> float:
 def build_omni_kwargs(
     args: argparse.Namespace,
     paths: LingBotPaths,
-    *,
-    parallel_config: Any,
 ) -> dict[str, Any]:
     """Build Omni configuration without overriding checkpoint class discovery."""
 
@@ -167,7 +165,7 @@ def build_omni_kwargs(
     return {
         "model": model,
         "flow_shift": flow_shift,
-        "parallel_config": parallel_config,
+        "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": args.enforce_eager,
         "model_config": {"lingbot_action_root": str(paths.action_root)},
     }
@@ -262,12 +260,10 @@ def main(argv: Sequence[str] | None = None) -> Path:
     # helper tests work on machines without the native vLLM runtime.
     from diffusers.utils import export_to_video
 
-    from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    parallel_config = DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size)
-    omni_kwargs = build_omni_kwargs(args, paths, parallel_config=parallel_config)
+    omni_kwargs = build_omni_kwargs(args, paths)
     omni = Omni(**omni_kwargs)
     try:
         outputs = omni.generate(

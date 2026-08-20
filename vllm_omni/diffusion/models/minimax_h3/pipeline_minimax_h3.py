@@ -29,7 +29,7 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_dit_group,
+    get_world_group,
     init_world_group,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -423,7 +423,7 @@ def _validate_reference_image(image: Image.Image) -> None:
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
-    group = get_dit_group()
+    group = get_world_group().device_group
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
@@ -1715,7 +1715,7 @@ class MiniMaxH3Pipeline(
                     dist.broadcast(
                         has_audio_tensor,
                         src=0,
-                        group=get_dit_group(),
+                        group=get_world_group().device_group,
                     )
                 has_audio = [bool(value) for value in has_audio_tensor.tolist()]
 

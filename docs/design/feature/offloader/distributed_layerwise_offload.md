@@ -10,6 +10,30 @@ For user-facing commands, see the
 [distributed layerwise offloading guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md)
 and the [Cosmos3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md).
 
+## Feature compatibility
+
+Host-storage optimization and runtime compatibility are separate decisions.
+When direct checkpoint mmap is unavailable, DLO can still use tensors produced
+by the ordinary loader. "Compatibility path" below means that fallback is
+implemented but has less end-to-end coverage than the primary path.
+
+Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsupported.
+
+| Feature | DLO + AllGather | DLO without AllGather |
+|---|---|---|
+| **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
+| **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
+| **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
+| **HSDP** | ❌ Rejected to avoid double-sharding parameters. | ⚠️ Limited end-to-end coverage. |
+| **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
+| **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
+| **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
+
+See [Parallelism compatibility](#parallelism-compatibility) and
+[Request and loading constraints](#request-and-loading-constraints) for the
+detailed contracts and validation boundaries.
+
 ## Status
 
 DLO is implemented for multi-device diffusion execution. The default
@@ -181,8 +205,11 @@ requirements.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
-ordinary loader. Online quantization remains incompatible with DLO AllGather;
-use `--dlo-no-use-allgather` or disable online quantization.
+ordinary loader. Per-tensor online FP8 linears can use DLO AllGather after the
+ordinary loader finalizes their runtime weights and scales; DLO then shards and
+reconstructs those tensors with their recorded layouts. Other online methods
+must use `--dlo-no-use-allgather` or disable online quantization until their
+runtime layouts are validated.
 
 A normalized runtime mmap cache, built through the ordinary loader, is the
 proposed general mechanism for sharing transformed TP or quantized layouts.
@@ -197,6 +224,8 @@ Current source-level validation includes:
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
+- ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
+  sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
 - rank-local mmap source retention, bounded two-slot staging, and adapter
   transforms without parameter-side flags;

@@ -75,14 +75,6 @@ def mock_dist(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def mock_dit_group(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_dit_group",
-        lambda: None,
-    )
-
-
-@pytest.fixture(autouse=True)
 def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(DistributedVaeExecutor, "gather_tensors", lambda self, x: [x])
     monkeypatch.setattr(DistributedVaeExecutor, "broadcast_tensor", lambda self, x: x)

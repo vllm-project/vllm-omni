@@ -56,7 +56,6 @@ import numpy as np
 import PIL.Image
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -503,17 +502,6 @@ def main():
         }
 
     profiler_enabled = args.profiler_config is not None
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-        pipeline_parallel_size=args.pipeline_parallel_size,
-    )
     omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
@@ -524,7 +512,15 @@ def main():
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,

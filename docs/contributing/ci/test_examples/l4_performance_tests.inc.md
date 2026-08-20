@@ -31,7 +31,7 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
     ],
     "server_params": {
         "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        "stage_config_name": "qwen3_omni.yaml"
+        "stage_config_name": "qwen3_omni_moe.yaml"
     },
     "benchmark_params": [
         {
@@ -155,7 +155,7 @@ See also [Markers for Tests](#markers-for-tests) for registered hardware markers
 | Parameter         | Required | Example                            | Description                   |
 | ----------------- | -------- | ---------------------------------- | ----------------------------- |
 | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path            |
-| stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name |
+| stage_config_name | Yes      | "qwen3_omni_moe.yaml"              | Deploy configuration file name |
 
 *Dynamic Configuration (update/delete)*
 
@@ -171,15 +171,15 @@ Supports incremental modifications based on the basic configuration:
 ```
 "update": {
     "async_chunk": true,  // Enable asynchronous chunk processing
-    "stage_args": {
+    "stages": {
         "0": {
-            "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+            "max_num_seqs": 64
         }
     }
 },
 "delete": {
-    "stage_args": {
-        "2": ["custom_process_input_func"]  // Delete this configuration for stage 2
+    "stages": {
+        "2": ["max_num_batched_tokens"]  // Delete this deploy override for stage 2
     }
 }
 ```
