@@ -288,6 +288,17 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+        # The official benchmark uses concurrency one. Keep the CFG rows in
+        # place and return detached views instead of rebuilding/cloning every
+        # cache tensor on each streamed chunk.
+        if batch_size == 1:
+            return [{
+                "conformer_cnn_cache": cache["conformer_cnn_cache"][:1].detach(),
+                "conformer_att_cache": cache["conformer_att_cache"][:, :1].detach(),
+                "estimator_cnn_cache": cache["estimator_cnn_cache"][:, :, :2].detach(),
+                "estimator_att_cache": cache["estimator_att_cache"][:, :, :2].detach(),
+            }]
+
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             result.append(
@@ -314,6 +325,11 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        if len(states) == 1:
+            # The singleton path is the formal A3 case: avoid cat() and keep
+            # the request-owned cache without a device copy.
+            return {name: value.detach() for name, value in states[0].flow_cache.items()}
+
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
@@ -454,9 +470,14 @@ class BatchedToken2Wav(nn.Module):
             },
             batch_size,
         )
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        if batch_size == 1:
+            old_mel = states[0].hift_cache["mel"]
+            old_source = states[0].hift_cache["source"]
+            old_speech = states[0].hift_cache["speech"]
+        else:
+            old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
+            old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
+            old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         speech, source = self.hift(mel, old_source)
         if old_speech.shape[-1] > 0:
@@ -468,12 +489,20 @@ class BatchedToken2Wav(nn.Module):
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
         emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
-        next_states = [
-            BatchedToken2WavState(
-                flow_cache=new_flow[row],
-                hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
-            )
-            for row in range(batch_size)
-        ]
+        if batch_size == 1:
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[0],
+                    hift_cache={name: value[:1].detach() for name, value in next_hift.items()},
+                )
+            ]
+        else:
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[row],
+                    hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
+                )
+                for row in range(batch_size)
+            ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
         return audios, next_states
