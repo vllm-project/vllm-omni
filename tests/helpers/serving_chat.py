@@ -70,25 +70,46 @@ def mock_audio_choices(index: int = 0, role: str = "assistant"):
     ]
 
 
-def build_serving_chat():
-    """Create a minimal OmniOpenAIServingChat for testing."""
-    mock_engine = MagicMock()
-    mock_engine.errored = False
+def build_serving_chat(
+    *,
+    engine_client=None,
+    models=None,
+    online_renderer=None,
+    response_role: str = "assistant",
+    request_logger=None,
+    chat_template=None,
+    chat_template_content_format="auto",
+    **init_overrides,
+) -> OmniOpenAIServingChat:
+    """Create a real OmniOpenAIServingChat via its actual __init__.
 
-    models = OpenAIServingModels(
-        engine_client=mock_engine,
-        base_model_paths=[],
-    )
-    mock_render = MagicMock()
+    engine_client/models/online_renderer default to minimal mocks; pass your
+    own to wire in test-specific behavior (e.g. engine_client.stage_configs).
+    Any other OmniOpenAIServingChat.__init__ keyword — enable_auto_tools,
+    enable_prompt_tokens_details, trust_request_chat_template, etc. — can be
+    passed through **init_overrides instead of set on the instance after
+    construction.
+    """
+    if engine_client is None:
+        engine_client = MagicMock()
+        engine_client.errored = False
+    if models is None:
+        models = OpenAIServingModels(
+            engine_client=engine_client,
+            base_model_paths=[],
+        )
+    if online_renderer is None:
+        online_renderer = MagicMock()
 
     instance = OmniOpenAIServingChat(
-        engine_client=mock_engine,
+        engine_client=engine_client,
         models=models,
-        response_role="assistant",
-        online_renderer=mock_render,
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="auto",
+        response_role=response_role,
+        online_renderer=online_renderer,
+        request_logger=request_logger,
+        chat_template=chat_template,
+        chat_template_content_format=chat_template_content_format,
+        **init_overrides,
     )
     instance._create_audio_choice = MagicMock(
         side_effect=lambda omni_res, role, request, stream=False: mock_audio_choices(
@@ -128,10 +149,7 @@ def parse_sse_chunks(lines: list[str]) -> list[dict]:
         payload = line[len(prefix) :].strip()
         if payload == "[DONE]":
             continue
-        try:
-            chunks.append(json.loads(payload))
-        except json.JSONDecodeError:
-            pass
+        chunks.append(json.loads(payload))
     return chunks
 
 
