@@ -81,9 +81,7 @@ class VaceWanTransformerBlock(WanTransformerBlock):
 class WanVACETransformer3DModel(WanTransformer3DModel):
     """VACE-extended WAN Transformer with conditioning blocks for video editing."""
 
-    # TODO: `vace_blocks` are not layerwise-offloaded yet. The current offloader only
-    # supports a single block group (`blocks`); extend it to support both
-    # `vace_blocks` and `blocks`.
+    _layerwise_offload_blocks_attrs = ["vace_blocks", "blocks"]
 
     # Shard hidden_states before VACE blocks (replaces parent's blocks.0)
     _sp_plan = {

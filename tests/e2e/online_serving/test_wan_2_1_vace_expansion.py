@@ -26,7 +26,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
 PROMPT = "A cat walking slowly across a sunlit garden path"
@@ -37,6 +37,18 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_vace_feature_cases():
     return [
+        # Single GPU: CPU offload
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="single_card_cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         # Single GPU: Cache-DiT + layerwise CPU offload
         pytest.param(
             OmniServerParams(

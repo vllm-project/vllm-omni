@@ -37,11 +37,10 @@ python openai_chat_client.py --task tv2a \
 
 The client sends:
 
-- `num_inference_steps`, `guidance_scale`, `seed` as first-class OpenAI chat-completion fields
-- `audiox_task`, `seconds_start`, `seconds_total`, `sigma_min`, `sigma_max` nested under
-  `extra_args` (a reserved dict on the request body that the server forwards verbatim into
-  the pipeline's `sampling_params.extra_args` — the same escape hatch `serving_video.py` exposes
-  as `extra_params` on /v1/videos)
+- `num_inference_steps`, `guidance_scale`, `seed`, `audiox_task`, `seconds_start`,
+  `seconds_total`, `sigma_min`, `sigma_max` as flattened keys under `extra_body`. The server
+  routes the declared knobs (see `vllm_omni/model_extras/audiox.py`) into the pipeline's
+  `sampling_params.extra_args`.
 - For `v2*` / `tv2*` tasks, the video as a `video_url` content item (data URI for local files)
 
 ## curl
@@ -52,10 +51,10 @@ curl -sS -X POST http://localhost:8099/v1/chat/completions \
   -d '{
     "model": "zhangj1an/AudioX",
     "messages": [{"role": "user", "content": [{"type": "text", "text": "Uplifting ukulele"}]}],
-    "num_inference_steps": 250,
-    "guidance_scale": 7.0,
-    "seed": 42,
-    "extra_args": {
+    "extra_body": {
+      "num_inference_steps": 250,
+      "guidance_scale": 7.0,
+      "seed": 42,
       "audiox_task": "t2m",
       "seconds_total": 10.0,
       "sigma_min": 0.3,

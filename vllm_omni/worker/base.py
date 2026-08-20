@@ -74,7 +74,7 @@ class OmniGPUWorkerBase(GPUWorker):
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "
-                "For omni models, add profiler_config to your stage config file."
+                "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
             from vllm_omni.profiler import OmniTorchProfilerWrapper
@@ -121,6 +121,11 @@ class OmniGPUWorkerBase(GPUWorker):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+        # Upstream 58b2012aa2 added `total_consumed` to the profiling result
+        # and reads it in GPUWorker.compile_or_warm_up_model() (when
+        # kv_cache_memory_bytes is None and peak_activation_memory is set, both
+        # true here). Mirror upstream so the omni override keeps it populated.
+        self.total_consumed = profile_result.total_consumed
 
         process_memory = (
             get_process_gpu_memory(self.local_rank)

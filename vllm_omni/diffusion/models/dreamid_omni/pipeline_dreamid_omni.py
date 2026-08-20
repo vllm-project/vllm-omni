@@ -5,6 +5,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
 import torch.distributed
@@ -23,8 +24,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 try:
     from dreamid_omni.utils.divisible_crop import DivisibleCrop
@@ -95,8 +96,14 @@ VIDEO_CONFIG = {
 }
 
 
-class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, SupportAudioInput):
+class DreamIDOmniPipeline(
+    nn.Module, CFGParallelMixin, SupportImageInput, SupportAudioInput, SupportsComponentDiscovery
+):
     """DreamID-Omni pipeline for vLLM-Omni."""
+
+    _dit_modules: ClassVar[list[str]] = ["model"]
+    _encoder_modules: ClassVar[list[str]] = ["text_model"]
+    _vae_modules: ClassVar[list[str]] = ["vae_model_video", "vae_model_audio"]
 
     def __init__(
         self,
@@ -475,7 +482,7 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
     def forward(
         self,
-        request: OmniDiffusionRequest,
+        request: DiffusionRequestBatch,
         **kwargs,
     ) -> DiffusionOutput:
         """Main forward pass for DreamID-Omni pipeline for R2AV task."""

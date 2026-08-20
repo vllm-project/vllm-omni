@@ -12,7 +12,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -46,12 +46,14 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder.t5_gemma_encoder import T5GemmaEncoderModelTP
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .magi_human_dit import (
     DiTModel,
@@ -1679,7 +1681,11 @@ def _resolve_subdir(
 # ===========================================================================
 # Main Pipeline
 # ===========================================================================
-class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+    _dit_modules: ClassVar[list[str]] = ["dit", "sr_dit"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
+
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
         model_path = od_config.model
@@ -2155,7 +2161,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
     @torch.inference_mode()
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | None = None,
         height: int = 256,
         width: int = 448,

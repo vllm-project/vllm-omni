@@ -27,14 +27,23 @@ _e2e_latency_family = Histogram(
     labelnames=_labelnames,
     buckets=defs.SECONDS_BUCKETS,
 )
+_prompt_tokens_family = Counter(
+    defs.PROMPT_TOKENS,
+    "Total prompt (input) tokens processed across all pipeline stages.",
+    labelnames=_labelnames,
+)
+_generation_tokens_family = Counter(
+    defs.GENERATION_TOKENS,
+    "Total generation (output) tokens produced across all pipeline stages.",
+    labelnames=_labelnames,
+)
 
 
 class OmniPrometheusMetrics:
     """Label-bound wrapper around the raw Prometheus metrics.
 
-    Metric collectors use the ``vllm:omni_`` prefix to avoid being
-    removed by upstream vLLM's ``unregister_vllm_metrics()``, which
-    strips every collector whose ``_name`` contains ``"vllm"``.
+    Metric collectors use the ``vllm_omni:`` prefix, distinct from the
+    upstream ``vllm:*`` families.
     """
 
     def __init__(self, model_name: str, log_stats: bool = True) -> None:
@@ -43,6 +52,8 @@ class OmniPrometheusMetrics:
         self._running = _running_family.labels(model_name=model_name)
         self._waiting = _waiting_family.labels(model_name=model_name)
         self._e2e_latency = _e2e_latency_family.labels(model_name=model_name)
+        self._prompt_tokens = _prompt_tokens_family.labels(model_name=model_name)
+        self._generation_tokens = _generation_tokens_family.labels(model_name=model_name)
 
     def set_running(self, n: int) -> None:
         if not self._log_stats:
@@ -53,6 +64,14 @@ class OmniPrometheusMetrics:
         if not self._log_stats:
             return
         self._waiting.set(n)
+
+    def observe_tokens(self, prompt_tokens: int, generation_tokens: int) -> None:
+        if not self._log_stats:
+            return
+        if prompt_tokens > 0:
+            self._prompt_tokens.inc(prompt_tokens)
+        if generation_tokens > 0:
+            self._generation_tokens.inc(generation_tokens)
 
     def request_succeeded(
         self,

@@ -14,7 +14,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "HiDream-ai/HiDream-I1-Full"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
@@ -46,6 +46,7 @@ def _get_hidream_i1_image_feature_cases(model: str):
     _get_hidream_i1_image_feature_cases(MODEL),
     indirect=True,
 )
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4662")
 def test_hidream_i1_image(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,

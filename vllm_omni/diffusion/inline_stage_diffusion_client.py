@@ -8,12 +8,11 @@ IPC overhead. Used when there is only a single diffusion stage.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
-import torch
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -23,7 +22,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -68,6 +67,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self._tasks: dict[str, asyncio.Task] = {}
         self._engine_dead = False
         self._shutting_down = False
+        self._shutdown_complete = False
+        self._shutdown_lock = threading.Lock()
 
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
@@ -103,6 +104,10 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        # Each request mutates its sampling state while it is normalized and
+        # executed. Callers commonly reuse one params object for concurrent
+        # requests, so take the copy synchronously before either task starts.
+        sampling_params = sampling_params.clone()
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
@@ -128,129 +133,33 @@ class InlineStageDiffusionClient(StageClientBase):
     ) -> None:
         try:
             request = OmniDiffusionRequest(
-                prompts=[prompt],
+                prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
             )
 
-            results = await self._engine.step(request)
-            result = results[0]
-            if not result.request_id:
-                result.request_id = request_id
-
-            self._output_queue.put_nowait(result)
+            if self.od_config.streaming_output:
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                    if not result.request_id:
+                        result.request_id = request_id
+                    self._output_queue.put_nowait(result)
+            else:
+                # Non-streaming callers share the streaming engine path but
+                # only publish the final output.
+                result = None
+                async for results in self._engine.step_streaming(request):
+                    result = results[0]
+                if result is None:
+                    raise RuntimeError("Diffusion execution finished without output.")
+                if not result.request_id:
+                    result.request_id = request_id
+                self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
-            status_code, error_type = client_error_metadata(e)
-            error_output = OmniRequestOutput.from_error(
-                request_id=request_id,
-                error_message=str(e),
-                status_code=status_code,
-                error_type=error_type,
-            )
-            self._output_queue.put_nowait(error_output)
-        finally:
-            self._tasks.pop(request_id, None)
-
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        logger.debug(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
-            self.stage_id,
-            self.replica_id,
-            request_id,
-            len(prompts),
-        )
-        task = asyncio.create_task(
-            self._dispatch_batch(
-                request_id,
-                prompts,
-                sampling_params,
-                kv_sender_info,
-            )
-        )
-        self._tasks[request_id] = task
-
-    async def _dispatch_batch(
-        self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[str, Any] | None = None,
-    ) -> None:
-        try:
-            request = OmniDiffusionRequest(
-                prompts=prompts,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                kv_sender_info=kv_sender_info,
-            )
-
-            results = await self._engine.step(request)
-
-            all_images: list = []
-            merged_mm: dict[str, Any] = {}
-            merged_metrics: dict[str, Any] = {}
-            merged_durations: dict[str, float] = {}
-            merged_custom: dict[str, Any] = {}
-            peak_mem = 0.0
-            latents = None
-            trajectory_latents: list[torch.Tensor] | None = None
-            trajectory_timesteps: list[torch.Tensor] | None = None
-            trajectory_log_probs: torch.Tensor | None = None
-            trajectory_decoded: list[Image.Image] | None = None
-            final_output_type = "image"
-
-            for r in results:
-                all_images.extend(r.images)
-                merged_mm.update(r._multimodal_output)
-                merged_metrics.update(r.metrics)
-                merged_durations.update(r.stage_durations)
-                merged_custom.update(r._custom_output)
-                peak_mem = max(peak_mem, r.peak_memory_mb)
-                if latents is None and r.latents is not None:
-                    latents = r.latents
-                if trajectory_latents is None:
-                    trajectory_latents = r.trajectory_latents
-                if trajectory_timesteps is None:
-                    trajectory_timesteps = r.trajectory_timesteps
-                if trajectory_log_probs is None:
-                    trajectory_log_probs = r.trajectory_log_probs
-                if trajectory_decoded is None:
-                    trajectory_decoded = r.trajectory_decoded
-                if r.final_output_type != "image":
-                    final_output_type = r.final_output_type
-
-            result = OmniRequestOutput.from_diffusion(
-                request_id=request_id,
-                images=all_images,
-                prompt=prompts[0] if len(prompts) == 1 else None,
-                metrics=merged_metrics,
-                latents=latents,
-                trajectory_latents=trajectory_latents,
-                trajectory_timesteps=trajectory_timesteps,
-                trajectory_log_probs=trajectory_log_probs,
-                trajectory_decoded=trajectory_decoded,
-                custom_output=merged_custom or None,
-                multimodal_output=merged_mm or None,
-                final_output_type=final_output_type,
-                stage_durations=merged_durations,
-                peak_memory_mb=peak_mem,
-            )
-
-            self._output_queue.put_nowait(result)
-        except DiffusionRequestAbortedError as e:
-            logger.info("request_id: %s aborted: %s", request_id, str(e))
-        except Exception as e:
-            logger.exception("Batch diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
             error_output = OmniRequestOutput.from_error(
                 request_id=request_id,
@@ -276,6 +185,25 @@ class InlineStageDiffusionClient(StageClientBase):
             if task:
                 task.cancel()
             self._engine.abort(rid)
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+        timeout: float | None = None,
+    ) -> Any:
+        """Apply a midway interaction to an active streaming request."""
+        logger.debug(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] interaction: %s",
+            self.stage_id,
+            self.replica_id,
+            request_id,
+        )
+        return await self.collective_rpc_async(
+            "submit_interaction",
+            timeout=timeout,
+            args=(request_id, interaction),
+        )
 
     async def collective_rpc_async(
         self,
@@ -377,19 +305,25 @@ class InlineStageDiffusionClient(StageClientBase):
             raise
 
     def shutdown(self) -> None:
-        self._shutting_down = True
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutting_down = True
 
-        # Cancel all pending tasks
-        for task in self._tasks.values():
-            task.cancel()
+            # Cancel all pending tasks
+            for task in self._tasks.values():
+                task.cancel()
 
-        try:
-            # Cancel queued futures and wait for the running one to complete deterministically
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        except Exception:
-            pass
+            try:
+                # Stop the engine first so any control RPC running in the thread
+                # pool can observe shutdown instead of keeping stage teardown
+                # blocked while the executor waits for that RPC.
+                self._engine.close()
+            except Exception:
+                pass
 
-        try:
-            self._engine.close()
-        except Exception:
-            pass
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            self._shutdown_complete = True

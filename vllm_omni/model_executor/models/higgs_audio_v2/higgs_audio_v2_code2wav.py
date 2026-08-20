@@ -41,6 +41,7 @@ from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
     load_higgs_audio_codec,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
     "HiggsAudioV2Code2Wav",
@@ -173,7 +174,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
         2. Otherwise fall back to ``<model_dir>/<audio_tokenizer_subdir>``.
         """
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
         audio_tokenizer_path = self._resolve_audio_tokenizer_path(model_dir)
         quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(audio_tokenizer_path, device)
         if len(quantizer.quantizers) != self.num_codebooks:

@@ -15,9 +15,9 @@ Contents:
 - ``observe_audio_streaming_finalize``: emits ``audio_underrun_s`` +
   ``audio_continuity_ok_total`` at SSE close using accumulated per-chunk
   arrival timestamps.
-- ``_extract_mm_output`` / ``_count_audio_frames``: shape-tolerant helpers
-  for the heterogeneous multimodal_output payloads emitted by different
-  audio pipelines.
+- ``extract_mm_output`` / ``count_audio_frames`` (from ``metrics.utils``):
+  shape-tolerant helpers for the heterogeneous multimodal_output payloads
+  emitted by different audio pipelines.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from typing import Any
 from prometheus_client import Counter, Histogram
 
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.utils import count_audio_frames, extract_mm_output
 
 _stage_labels = list(defs.STAGE_LABELS)
 
@@ -74,6 +75,35 @@ _audio_skipped_family = Counter(
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
     "Silent-loss counter — code2wav rejected malformed codec input and returned 200 OK with empty audio.",
     labelnames=list(defs.AUDIO_SKIPPED_LABELS),
+)
+
+
+# ----------------------------------------------------------------------------
+# Diffusion family
+# ----------------------------------------------------------------------------
+_diffusion_exec_family = Histogram(
+    defs.DIFFUSION_EXEC_S,
+    "DiT forward pass execution time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_diffusion_exec_per_step_family = Histogram(
+    defs.DIFFUSION_EXEC_PER_STEP_S,
+    "DiT forward pass execution time per denoising step in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_diffusion_preprocess_family = Histogram(
+    defs.DIFFUSION_PREPROCESS_S,
+    "Diffusion input preprocessing time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_diffusion_postprocess_family = Histogram(
+    defs.DIFFUSION_POSTPROCESS_S,
+    "Diffusion output postprocessing (VAE decode) time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
 )
 
 
@@ -138,52 +168,43 @@ class OmniModalityMetrics:
             reason=reason or "unknown",
         ).inc()
 
+    # ---- Diffusion --------------------------------------------------------
 
-def _extract_mm_output(engine_outputs: Any) -> dict[str, Any]:
-    """Return the multimodal_output dict regardless of where it's nested.
+    def observe_diffusion_exec(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_exec_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
 
-    Three shapes seen in the wild:
-      * ``engine_outputs.multimodal_output`` — synthesized on OmniRequestOutput
-        for some pipelines (often empty for AR audio)
-      * ``engine_outputs.outputs[0].multimodal_output`` — vllm CompletionOutput
-        nesting (where actual qwen3-omni audio data lives)
-      * neither — returns ``{}``
-    """
-    mm = getattr(engine_outputs, "multimodal_output", None)
-    if isinstance(mm, dict) and mm:
-        return mm
-    outs = getattr(engine_outputs, "outputs", None)
-    if outs:
-        nested = getattr(outs[0], "multimodal_output", None)
-        if isinstance(nested, dict):
-            return nested
-    return {}
+    def observe_diffusion_exec_per_step(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_exec_per_step_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
 
+    def observe_diffusion_preprocess(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_preprocess_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
 
-def _count_audio_frames(mm_out: dict[str, Any]) -> int:
-    """Sum the per-tensor sample count of audio chunks in mm_out["audio"].
-
-    Returns the total number of audio frames (samples) across all chunks.
-    For multi-dim tensors (e.g. shape [channels, samples]) the last axis is
-    treated as the sample dim; for 1-D tensors the only axis is the sample
-    dim; scalars count as 1.
-    """
-    audio_chunks = mm_out.get("audio") if isinstance(mm_out, dict) else None
-    if audio_chunks is None:
-        return 0
-    chunks = audio_chunks if isinstance(audio_chunks, list) else [audio_chunks]
-    n = 0
-    for t in chunks:
-        try:
-            ndim = getattr(t, "ndim", 0)
-            shape = getattr(t, "shape", None)
-            if ndim == 0 or shape is None or len(shape) == 0:
-                n += 1
-            else:
-                n += int(shape[-1])
-        except Exception:
-            continue
-    return n
+    def observe_diffusion_postprocess(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats:
+            return
+        _diffusion_postprocess_family.labels(
+            model_name=self._model_name,
+            stage=stage,
+            replica=replica,
+        ).observe(seconds)
 
 
 def observe_modality_at_finalize(
@@ -207,43 +228,49 @@ def observe_modality_at_finalize(
     """
     if replica_id is None or stage_metrics is None or output_type is None:
         return
-    if output_type != "audio":
-        return
 
     stage_label = str(stage_id)
     replica_label = str(replica_id)
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
-    mm_out = _extract_mm_output(engine_outputs)
+    mm_out = extract_mm_output(engine_outputs)
 
-    sample_rate = defs.resolve_audio_sample_rate(mm_out)
-    # `stage_metrics.audio_generated_frames` is the legacy per-chunk
-    # accumulator field on StageRequestStats. No production path currently
-    # fills it, so the fallback below is the live source — but we leave the
-    # field lookup in place in case the accumulator gets re-wired upstream.
-    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-    if n_frames == 0:
-        n_frames = _count_audio_frames(mm_out)
-    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-    if duration_s > 0:
-        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-        mod_metrics.observe_audio_rtf(
-            stage_label,
-            replica_label,
-            defs.compute_audio_rtf(gen_time_s, duration_s),
-        )
-    else:
-        # Request completed (finish_reason ∈ {stop, length} — error paths
-        # don't reach finalize) but no audio samples were produced. Covers
-        # silent `return None` skips in the talker→code2wav stage
-        # processors and the `parsed.append((0,0))` malformed-length path
-        # in qwen3-tts code2wav. raise-paths surface via the upstream
-        # vllm:request_success_total{finished_reason="error"} channel and
-        # never reach this branch.
-        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-    # audio_underrun / continuity are emitted from the streaming path in
-    # observe_audio_streaming_finalize; finalize is too late for the
-    # per-chunk timeline they need.
+    if output_type == "audio":
+        sample_rate = defs.resolve_audio_sample_rate(mm_out)
+        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+        if n_frames == 0:
+            n_frames = count_audio_frames(mm_out)
+        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+        if duration_s > 0:
+            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+            mod_metrics.observe_audio_rtf(
+                stage_label,
+                replica_label,
+                defs.compute_audio_rtf(gen_time_s, duration_s),
+            )
+        else:
+            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+
+    dm = getattr(stage_metrics, "diffusion_metrics", None)
+    if dm:
+        _key_map = {
+            "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
+            "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
+            "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
+        }
+        for key, observe_fn in _key_map.items():
+            val = dm.get(key)
+            if val is not None:
+                observe_fn(stage_label, replica_label, float(val))
+
+        exec_time = dm.get("diffusion_engine_exec_time_s")
+        num_steps = dm.get("num_inference_steps")
+        if exec_time is not None and num_steps and num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(
+                stage_label,
+                replica_label,
+                float(exec_time) / int(num_steps),
+            )
 
 
 def observe_audio_first_packet(

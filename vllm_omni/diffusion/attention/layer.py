@@ -11,8 +11,10 @@ from dataclasses import replace
 
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
@@ -61,12 +63,23 @@ class Attention(nn.Module):
         # perf for this layer (e.g. Wan2.2 cross-attn has short sequences and
         # block-FP8 quant offers no win). Default False = follow global config.
         disable_kv_quant: bool = False,
+        # Opt-in marker for Scheduler-managed paged KV. Unmarked diffusion
+        # attention remains dense and contributes no native KVCacheSpec.
+        paged_kv_cache_role: str | None = None,
+        paged_kv_cache_dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
         self.role = role
         self.role_category = role_category
         self.qkv_layout = qkv_layout
+        if paged_kv_cache_role == "":
+            raise ValueError("paged_kv_cache_role must be non-empty when provided")
+        self.paged_kv_cache_role = paged_kv_cache_role
+        self.paged_kv_cache_dtype = paged_kv_cache_dtype
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
 
         # Resolve backend via role-aware config.
         # The global diffusion config is set during model init via
@@ -77,14 +90,29 @@ class Attention(nn.Module):
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
 
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+        model_class_name = getattr(config, "model_class_name", None) if config is not None else None
+        allow_trtllm_default = get_diffusion_model_metadata(model_class_name).attention_mask_free
+
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
             head_size=head_size,
             attention_config=attention_config,
             role_category=role_category,
+            allow_trtllm_default=allow_trtllm_default,
         )
+        parallel_config = getattr(config, "parallel_config", None)
+        allgather_degree = getattr(parallel_config, "allgather_degree", 1)
+        # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
+        # so validation does not depend on backend names.
+        if not skip_sequence_parallel and allgather_degree > 1 and attn_backend_cls.get_name() == "TRTLLM_ATTN":
+            raise ValueError(
+                "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
+                "Set --allgather-degree 1 or select another diffusion attention backend."
+            )
         if spec is not None:
-            backend_kwargs = spec.extra or None
+            backend_kwargs = spec.backend_kwargs()
             self.backend_pref = spec.backend
             logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
@@ -99,7 +127,9 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
             qkv_layout=qkv_layout,
+            prefix=prefix,
             backend_kwargs=backend_kwargs,
+            role=role,
         )
         # Instantiate fallback backend for float32 support
         self.sdpa_fallback = SDPABackend.get_impl_cls()(
@@ -140,6 +170,7 @@ class Attention(nn.Module):
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            causal=causal,
         )
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
@@ -152,6 +183,25 @@ class Attention(nn.Module):
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """Return native rank-local geometry for an opted-in paged cache."""
+
+        if self.paged_kv_cache_role is None:
+            return None
+        dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
+        # Keep backend layout discovery under the same config context used by
+        # upstream vLLM's attention-spec collector.
+        with set_current_vllm_config(vllm_config):
+            indexes_kv_by_block_stride = self.attn_backend.indexes_kv_by_block_stride()
+        return FullAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            dtype=dtype,
+            indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+            non_causal=not self.causal,
+        )
 
     def _get_active_parallel_strategy(self):
         """Get the parallel strategy based on current SP active state.
@@ -231,6 +281,34 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling() and is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            parallel_config = getattr(od_config, "parallel_config", None)
+            if getattr(parallel_config, "use_hsdp", False):
+                # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
+                # attention graph; otherwise scheduler dependency analysis can
+                # fail on the fused attention region.
+                return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
+
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    @torch.compiler.disable
+    def _forward_hsdp_compile_boundary(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    def _forward_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
 
@@ -254,6 +332,8 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
+        self._assert_piecewise_compatible(attn_metadata)
+
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
@@ -264,7 +344,28 @@ class Attention(nn.Module):
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
+    def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
+        if attn_metadata is None or attn_metadata.full_attn_spans is None:
+            return
+        if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
+            return
+        backend_name = self.attn_backend.get_name()
+        if not self.attn_backend.supports_piecewise_spans:
+            raise ValueError(
+                f"Attention backend '{backend_name}' does not support "
+                f"piecewise attention (full_attn_spans without a 4D attn_mask). "
+                f"Use a Flash backend (FLASH_ATTN / FLASH_ATTN_HUB / FLASH_ATTN_3_HUB), "
+                f"or provide a 4D attn_mask that encodes the mixed causal/full pattern."
+            )
+
     def _run_ring_attention(self, query, key, value, attn_metadata):
+        skip = getattr(self.attention, "skip", None)
+        if skip is not None and getattr(skip, "configured", False):
+            raise NotImplementedError(
+                "Skip-Softmax (TRTLLM_ATTN) is not supported with ring sequence parallelism: "
+                "the ring path bypasses the backend, so the skip config would be silently ignored. "
+                "Use Ulysses SP instead, or remove the skip_softmax config."
+            )
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(

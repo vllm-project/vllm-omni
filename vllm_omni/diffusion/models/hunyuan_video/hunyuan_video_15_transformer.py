@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import (
     CombinedTimestepTextProjEmbeddings,
     TimestepEmbedding,
@@ -22,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
@@ -591,6 +593,13 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
     tensor-parallel layers for the 54 main transformer blocks.
     """
 
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_0,
+        },
+        has_separate_cfg=True,
+    )
+
     _repeated_blocks = ["HunyuanVideo15TransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     packed_modules_mapping = {
@@ -805,7 +814,13 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
 
         ctx = get_forward_context()
         hidden_states_mask = None
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
@@ -814,10 +829,24 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-
-            # if mask is all true, set it to None
             if hidden_states_mask.all():
                 hidden_states_mask = None
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
 
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(

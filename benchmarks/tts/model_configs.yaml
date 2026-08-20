@@ -7,6 +7,17 @@
 # is tracked here.
 
 models:
+  IndexTeam/IndexTTS-2.5:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone:
+        extra_params:
+          lang: en
+          text_normalization: true
+
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
   # at model runtime).  Use -Base for voice_clone.
@@ -74,6 +85,17 @@ models:
       voice_clone: {}
 
   OpenMOSS-Team/MOSS-TTS-Realtime:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
+  # MOSS-TTS-Local-Transformer-v1.5: Qwen3 backbone + 1-layer GPT2-style local
+  # depth transformer (n_vq=12), paired with the 48 kHz stereo
+  # MOSS-Audio-Tokenizer-v2 codec. Same voice-clone request shape as the
+  # other MOSS-TTS variants.
+  OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech

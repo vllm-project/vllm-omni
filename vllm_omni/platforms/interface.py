@@ -70,13 +70,31 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
-        if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
-        raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
+    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
 
     @classmethod
-    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+    def register_additional_diffusion_fused_moe_hooks(cls, moe_runner: Any) -> None:
+        # One-shot lazy kernel initialisation on the first forward (no-op unless
+        # the runner exposes an uninitialised quant_method). Mirrors the prior
+        # wrapper behaviour exactly, just bound to the runner module.
+        init_handle: Any = None
+
+        def _kernel_init_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
+            nonlocal init_handle
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None and getattr(quant_method, "moe_kernel", None) is None:
+                quant_method.process_weights_after_loading(module)
+            if init_handle is not None:
+                init_handle.remove()
+
+        init_handle = moe_runner.register_forward_pre_hook(
+            _kernel_init_pre_hook,
+            with_kwargs=True,
+        )
+
+    @classmethod
+    def reset_diffusion_fused_moe_forward_context(cls) -> None:
         return None
 
     @classmethod
@@ -91,6 +109,7 @@ class OmniPlatform(Platform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
         """Get the diffusion attention backend class path for this platform.
 
@@ -101,6 +120,7 @@ class OmniPlatform(Platform):
             selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
                 "TORCH_SDPA", "SAGE_ATTN"). If None, uses platform default.
             head_size: Attention head size.
+            allow_trtllm_default: Whether TRTLLM may be chosen as the default.
 
         Returns:
             Fully qualified class path of the selected backend.
@@ -108,9 +128,37 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def validate_diffusion_attn_backend(cls, selected_backend: str) -> None:
+        """Reject an explicitly selected backend this platform cannot run.
+
+        Platforms call this from ``get_diffusion_attn_backend_cls`` so that a
+        backend restricted to other hardware, or one whose kernel package is
+        missing, fails during resolution rather than at the first forward.
+        """
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        backend_upper = selected_backend.upper()
+        backend_cls = DiffusionAttentionBackendEnum[backend_upper].get_class()
+
+        supported = backend_cls.supported_platforms
+        platform = cls._omni_enum.value
+        if supported is not None and platform not in supported:
+            raise ValueError(
+                f"The {backend_upper} diffusion attention backend runs on {', '.join(supported)} only, "
+                f"but the current platform is {platform}. Select a backend supported here, "
+                "such as FLASH_ATTN or TORCH_SDPA."
+            )
+        backend_cls.validate_available()
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """Whether a model may capture its dedicated talker MTP graph."""
+        return True
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
@@ -137,6 +185,24 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
+    def init_diffusion_worker_vllm_config(
+        cls,
+        vllm_config: Any,
+    ) -> None:
+        """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+        device: torch.device,
+    ) -> None:
+        """Initialize platform-specific runtime state for diffusion model runners."""
+        return None
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         raise NotImplementedError
 
@@ -152,8 +218,30 @@ class OmniPlatform(Platform):
     def synchronize(cls) -> None:
         raise NotImplementedError
 
+    # ── Async diffusion output: cross-stream sync ──
+
+    @classmethod
+    def record_device_event(cls):
+        """Record a device event on the default stream to mark tensor readiness.
+
+        On platforms where distributed communication (e.g. HCCL) may use
+        internal streams not visible to the default stream, this method
+        should synchronize the default stream before recording the event
+        to ensure the event captures all completed work including
+        cross-device communication results.
+
+        Returns ``None`` by default so that platforms without a native
+        implementation (ROCm, XPU, MUSA) fall through to a safe no-op.
+        Override in platform subclasses to provide real event support.
+        """
+        return None
+
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
+        raise NotImplementedError
+
+    @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
         raise NotImplementedError
 
     @classmethod
@@ -242,6 +330,10 @@ class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
     _enum = PlatformEnum.UNSPECIFIED
     device_type = "cpu"
+
+    @classmethod
+    def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
+        return torch.device("cpu")
 
     @classmethod
     def get_device_count(cls) -> int:

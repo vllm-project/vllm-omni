@@ -6,13 +6,21 @@ Unit tests for patch.py
 """
 
 import asyncio
+import base64
 import json
+import time
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    async_request_openai_chat_omni_completions,
+    async_request_openai_realtime_duplex,
+)
+from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -38,6 +46,156 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
+    class FakeRealtimeClient:
+        last_instance = None
+
+        def __init__(self, url):
+            assert url == "ws://localhost:8000/v1/realtime?duplex=1"
+            self.events = RealtimeEventCollector()
+            self.configure_kwargs = None
+            self.sent = []
+            self.response_count = 0
+            self.ack_count = 0
+            type(self).last_instance = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def configure(self, model, **kwargs):
+            assert model == "openbmb/MiniCPM-o-4_5"
+            self.configure_kwargs = kwargs
+
+        async def send(self, event):
+            self.sent.append(event)
+            if event["type"] != "response.create":
+                return
+            self.response_count += 1
+            response_id = f"resp-{self.response_count}"
+            now = time.monotonic()
+            self.events.add(
+                {"type": "response.created", "response": {"id": response_id}},
+                received_at_s=now + 0.01,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": response_id,
+                    "delta": f"turn {self.response_count}",
+                },
+                received_at_s=now + 0.02,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {"audio_duration_ms": 100},
+                },
+                received_at_s=now + 0.03,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": response_id}},
+                received_at_s=now + 0.04,
+            )
+
+        async def acknowledge_playback(self):
+            self.ack_count += 1
+
+        async def close_session(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "vllm_omni.benchmarks.patch.patch.RealtimeDuplexClient",
+        FakeRealtimeClient,
+    )
+    request_input = RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="hello",
+        api_url="http://localhost:8000/v1/realtime",
+        prompt_len=1,
+        output_len=20,
+        logprobs=None,
+        multi_modal_content=None,
+        ignore_eos=False,
+        extra_body={"save_duplex_request_metrics": True},
+    )
+    request_input.seed_tts_speech_extra = {"ref_audio": "data:audio/wav;base64,AAAA"}
+    request_input.seed_tts_system_prompt = "Speak exactly."
+    request_input.seed_tts_turns = tuple(
+        SimpleNamespace(utterance_id=f"utt-{index}", target_text=f"text {index}") for index in range(4)
+    )
+
+    output = await async_request_openai_realtime_duplex(
+        request_input,
+        session=None,
+    )
+
+    client = FakeRealtimeClient.last_instance
+    assert client.configure_kwargs["native_duplex"] is False
+    assert client.configure_kwargs["extra_body"] == {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+    }
+    assert client.sent == [
+        event
+        for index in range(4)
+        for event in (
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"text {index}"}],
+                },
+            },
+            {"type": "response.create"},
+        )
+    ]
+    assert client.ack_count == 4
+    assert output.success is True
+    assert output.generated_text == "turn 1 turn 2 turn 3 turn 4"
+    assert output.audio_duration == pytest.approx(0.4)
+    assert output.ttft > 0
+    assert output.audio_ttfp > output.ttft
+    assert output.audio_rtf > 0
+    assert output.latency > 0
+    assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
+    assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
+    session_id = output.duplex_request_metrics[0]["session_id"]
+    assert len(output.duplex_request_metrics) == 4
+    for index, metrics in enumerate(output.duplex_request_metrics):
+        assert metrics == {
+            "session_id": session_id,
+            "request_index": index,
+            "utterance_id": f"utt-{index}",
+            "response_id": f"resp-{index + 1}",
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+            },
+            "ttft_ms": pytest.approx(20.0, abs=2.0),
+            "ttfp_ms": pytest.approx(30.0, abs=2.0),
+            "rtf": pytest.approx(0.3, abs=0.03),
+            "audio_generation_ms": pytest.approx(30.0, abs=2.0),
+            "audio_duration_ms": 100.0,
+        }
+    assert output.duplex_session_metrics == {
+        "session_id": session_id,
+        "audio_turn_count": 4,
+        "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
+        "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
+        "mean_rtf": pytest.approx(0.3, abs=0.03),
+    }
 
 
 def create_sse_chunk(data_dict):
@@ -133,7 +291,9 @@ async def test_output_tokens_not_assigned_without_metrics(mocker: MockerFixture)
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when no metrics"
+    # Without server metrics we no longer infer count from SSE chunks because
+    # one chunk may carry multiple tokens. output_tokens stays 0 here.
+    assert output.output_tokens == 0, "output_tokens should be 0 when no server metrics are present"
     assert output.generated_text == "Hello world"
 
 
@@ -277,7 +437,7 @@ async def test_output_tokens_with_missing_num_tokens_out(mocker: MockerFixture):
 
     # Assert
     assert output.success is True
-    assert output.output_tokens == 0, "output_tokens should default to 0 when num_tokens_out is missing"
+    assert output.output_tokens == 0, "output_tokens should be 0 when num_tokens_out is missing"
 
 
 @pytest.mark.asyncio
@@ -577,6 +737,167 @@ class TestTextLatencyAttribute:
 # ============================================================================
 # prompt_len Tests
 # ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_skips_empty_role_chunk_for_ttft_and_itl(mocker: MockerFixture):
+    """Role/empty text chunks must not count toward TTFT or ITL."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"role": "assistant", "content": ""}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": " world"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.01)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 2
+    assert len(output.itl) == 1
+    assert output.ttft > 0
+    assert output.text_latency - output.ttft == pytest.approx(sum(output.itl), rel=1e-6, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_bundled_tokens_split_itl_from_usage(mocker: MockerFixture):
+    """Multiple tokens in one SSE chunk should expand ITL via usage deltas."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "A"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "BCD"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.02)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 4
+    assert len(output.itl) == 3
+    assert output.text_latency - output.ttft == pytest.approx(sum(output.itl), rel=1e-6, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_output_tokens_prefers_usage_over_metrics(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Hello"}}],
+                "modality": "text",
+                "metrics": {"num_tokens_out": 5},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 8
+
+
+@pytest.mark.asyncio
+async def test_metrics_only_chunk_updates_output_tokens(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "Text response"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "modality": "text",
+                "metrics": {"num_tokens_out": 25, "num_tokens_in": 10},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 25
 
 
 @pytest.mark.asyncio

@@ -30,7 +30,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion, pytest.mark.cache, pytest.mark.slow]
+pytestmark = [pytest.mark.diffusion, pytest.mark.cache, pytest.mark.slow]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_MODEL_PATH = REPO_ROOT / "dreamid_omni"

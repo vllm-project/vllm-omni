@@ -22,7 +22,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
@@ -65,6 +65,17 @@ def _get_diffusion_feature_cases(model: str):
     """
 
     return [
+        # CPU offload (single-card)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                ],
+            ),
+            id="single_card_cpu_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         # TeaCache (single-card)
         pytest.param(
             OmniServerParams(

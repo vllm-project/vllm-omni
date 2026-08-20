@@ -45,6 +45,8 @@ def patched_mgr_env(sp_size=1):
     target = _TRANSFORMER_MODULE
     patches = [
         patch(f"{target}.get_sequence_parallel_world_size", return_value=sp_size),
+        patch(f"{target}.get_allgather_parallel_world_size", return_value=sp_size),
+        patch(f"{target}.get_ulysses_parallel_world_size", return_value=1, create=True),
         patch(f"{target}.get_sequence_parallel_rank", return_value=0),
         patch(f"{target}.Attention", MockAttention),
     ]
@@ -114,6 +116,14 @@ def _call_mgr(
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
     )
+
+
+def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
+    mgr = _make_cache_mgr()
+
+    assert isinstance(mgr, nn.Module)
+    assert dict(mgr.named_modules())["attn"] is mgr.attn
+    assert mgr.state_dict() == {}
 
 
 # ============================================================

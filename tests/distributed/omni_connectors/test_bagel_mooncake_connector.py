@@ -25,6 +25,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
@@ -32,7 +33,7 @@ BAGEL_MOONCAKE_CI_DEPLOY = get_deploy_config_path("ci/bagel_mooncake.yaml")
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
-# "Generated with seed=52, num_inference_steps=14,
+# "Generated with seed=52, num_inference_steps=15,
 # prompt='A cute cat'"
 REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
@@ -63,7 +64,7 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, num_inference_steps: int = 14) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
@@ -95,8 +96,8 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
     for req_output in omni_outputs:
         if images := getattr(req_output, "images", None):
             return images[0]
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            stage_out = req_output.request_output
+        if isinstance(req_output, OmniRequestOutput) and req_output:
+            stage_out = req_output
             if hasattr(stage_out, "images") and stage_out.images:
                 return stage_out.images[0]
     return None
@@ -266,7 +267,6 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     return temp_file.name
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -314,7 +314,7 @@ def test_bagel_text2img_mooncake_connector(run_level):
         temp_config_file = _resolve_deploy_config(temp_config_file, run_level)
         with OmniRunner(
             "ByteDance-Seed/BAGEL-7B-MoT",
-            stage_configs_path=temp_config_file,
+            deploy_config=temp_config_file,
             stage_init_timeout=300,
         ) as runner:
             generated_image = _generate_bagel_image(runner.omni)

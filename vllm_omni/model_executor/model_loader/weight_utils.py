@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -85,3 +86,46 @@ def download_weights_from_hf_specific(
                 time_taken,
             )
     return hf_folder
+
+
+def resolve_model_to_local_path(
+    model: str,
+    *,
+    allow_download: bool = False,
+    allow_patterns: list[str] | None = None,
+    cache_dir: str | None = None,
+) -> str:
+    """Resolve a model reference to a local directory.
+    Failure is always raised: whether a failure is fatal is the caller's decision.
+
+    Args:
+        model: A local directory or an HF Hub repo ID.
+        allow_download: Fetch missing files instead of requiring a warm cache.
+            Downloads go through :func:`download_weights_from_hf_specific`
+        allow_patterns: Restrict the fetch to these glob patterns.
+            Defaults to the whole repository. Ignored when model is already a directory.
+        cache_dir: Download cache location; None uses the HF default.
+
+    Returns:
+        Path to a local directory containing the model files.
+    """
+    if os.path.isdir(model):
+        return model
+
+    if allow_download:
+        return download_weights_from_hf_specific(
+            model_name_or_path=model,
+            cache_dir=cache_dir,
+            allow_patterns=allow_patterns or ["*"],
+            require_all=True,
+        )
+
+    # Cache-only lookups stay on huggingface_hub even under VLLM_USE_MODELSCOPE:
+    # ModelScope's snapshot_download has no local_files_only equivalent,
+    # so a ModelScope deployment that needs resolution here must pass allow_download.
+    return huggingface_hub.snapshot_download(
+        model,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+        local_files_only=True,
+    )

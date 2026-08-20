@@ -1,0 +1,41 @@
+# GR00T N1.7 deploy: single diffusion stage.
+#
+# Topology is declared in vllm_omni/model_executor/models/gr00t/pipeline.py.
+# This default uses one GPU with TP=1 and CFG parallel disabled.
+
+pipeline: Gr00tN1d7
+# Required: async_chunk defaults to True, which the deploy validator rejects for a
+# single-stage pipeline (no next-stage processor). Must be false here.
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Gr00tN1d7Pipeline
+    model_config:
+      embodiment_tag: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+      # OpenPI client handshake — model/embodiment-specific values for GR00T-N1.7.
+      # Sent verbatim to the client (the pipeline never reads these); they describe the
+      # action space / inputs the client must produce for this checkpoint + embodiment.
+      policy_server_config:
+        image_resolution: [180, 320]
+        needs_session_id: true
+        embodiment_tag: OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+        action_horizon: 40
+        action_keys:
+          - eef_9d
+          - gripper_position
+          - joint_position
+        supported_embodiments:
+          - OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT
+          - XDOF
+          - XDOF_SUBTASK
+          - REAL_G1
+          - REAL_R1_PRO_SHARPA
+          - REAL_R1_PRO_SHARPA_HUMAN
+          - REAL_R1_PRO_SHARPA_MAXINSIGHTS
+          - REAL_R1_PRO_SHARPA_MECKA
+          - LIBERO_PANDA
+          - SIMPLER_ENV_GOOGLE
+          - SIMPLER_ENV_WIDOWX

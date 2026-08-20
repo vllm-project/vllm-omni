@@ -23,10 +23,11 @@ from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import (
     build_higgs_audio_acoustic_decoder,
     load_higgs_audio_codec,
 )
-from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
     HiggsAudioV3Config,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 __all__ = [
     "HiggsAudioV3Code2Wav",
@@ -126,13 +127,88 @@ class HiggsAudioV3Code2Wav(nn.Module):
             else:
                 raise FileNotFoundError(f"No cached snapshot for {tokenizer_id}")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = current_omni_platform.get_torch_device()
         quantizer, fc2, acoustic_decoder, _cfg = load_higgs_audio_codec(tokenizer_dir, device)
         self.quantizer = quantizer
         self.fc2 = fc2
         self.acoustic_decoder = acoustic_decoder
         self._loaded = True
         logger.info("Loaded HiggsAudioV3Code2Wav from standalone tokenizer repo.")
+
+    def _resolve_model_dir(self) -> str | None:
+        """Resolve ``self._model_path`` to a local checkpoint directory.
+
+        Accepts an already-local path or an HF repo id (resolved via the
+        local cache). Returns ``None`` when nothing is reachable on disk.
+        """
+        path = self._model_path
+        if not path:
+            return None
+        if os.path.isdir(path):
+            return path
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id=path, filename="config.json")
+        if isinstance(cached, str) and os.path.isfile(cached):
+            return os.path.dirname(cached)
+        return None
+
+    def _read_bundled_codec_state(self) -> dict[str, torch.Tensor]:
+        """Read bundled codec tensors directly from the on-disk checkpoint.
+
+        Returns the ``_CODEC_PREFIX``-stripped tensors, or an empty dict when
+        the checkpoint cannot be located (so callers can fall back).
+        """
+        model_dir = self._resolve_model_dir()
+        if model_dir is None:
+            return {}
+        import glob
+
+        from safetensors import safe_open
+
+        codec_state: dict[str, torch.Tensor] = {}
+        for st in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+            with safe_open(st, framework="pt") as f:
+                for key in f.keys():
+                    if key.startswith(_CODEC_PREFIX):
+                        codec_state[key[len(_CODEC_PREFIX) :]] = f.get_tensor(key)
+        return codec_state
+
+    def _ensure_codec_loaded(self) -> None:
+        """Build the codec when vLLM's weight loader skipped ``load_weights``.
+
+        ``load_format=dummy`` (and any loader that bypasses
+        ``model.load_weights``) never hands us the checkpoint weight iterator,
+        so the lazily-built codec submodules stay ``None`` and the warmup
+        ``_dummy_run`` crashes in :meth:`decode_codes`. Mirror fish_speech's
+        ``_ensure_codec_loaded`` and load the bundled V3 codec directly from
+        the on-disk checkpoint, falling back to the standalone tokenizer repo.
+        A no-op once ``load_weights`` has already populated the codec.
+        """
+        if self._loaded:
+            return
+
+        device: torch.device | None = None
+        if self.vllm_config is not None:
+            try:
+                device = self.vllm_config.device_config.device
+            except AttributeError:
+                device = None
+
+        codec_state = self._read_bundled_codec_state()
+        if codec_state:
+            self._load_from_bundled_state(codec_state, device)
+            logger.info(
+                "Lazily loaded HiggsAudioV3Code2Wav from bundled V3 checkpoint "
+                "(%d codec keys) because the weight loader skipped load_weights "
+                "(e.g. load_format=dummy).",
+                len(codec_state),
+            )
+            return
+
+        # No bundled checkpoint reachable on disk — fall back to the standalone
+        # tokenizer repo (raises a clear error if that is missing too).
+        self._load_from_tokenizer_repo()
 
     # ------------------------------------------------------------------ engine hooks
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -203,7 +279,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         )
 
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         # The bundled codec may use boson-ai key naming. Try remapping.
         needs_remap = any(k.startswith("quantizer.vq.layers.") for k in codec_state)
@@ -371,7 +447,9 @@ class HiggsAudioV3Code2Wav(nn.Module):
     def decode_codes(self, audio_codes: torch.Tensor) -> torch.Tensor:
         """Decode [B, num_codebooks=8, T] codes to PCM [B, 1, T*960]."""
         if not self._loaded:
-            raise RuntimeError("HiggsAudioV3Code2Wav not loaded.")
+            # load_weights may have been skipped (e.g. load_format=dummy);
+            # build the codec lazily from the on-disk checkpoint.
+            self._ensure_codec_loaded()
 
         codes = self._validate_codes(audio_codes)
         rvq_codes = codes.transpose(0, 1).long()

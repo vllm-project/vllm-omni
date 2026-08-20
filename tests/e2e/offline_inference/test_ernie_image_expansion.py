@@ -17,7 +17,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 MODEL = "baidu/ERNIE-Image"
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
+# (model, deploy_config_path, extra_omni_kwargs) for ``omni_runner`` indirect parametrize
 _OMNI_RUNNER_PARAM = (
     MODEL,
     None,
@@ -30,7 +30,7 @@ _OMNI_RUNNER_PARAM = (
 )
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

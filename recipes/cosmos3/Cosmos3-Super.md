@@ -57,7 +57,10 @@ vllm serve nvidia/Cosmos3-Super \
 
 Guardrails are on by default (gated `nvidia/Cosmos-1.0-Guardrail` — `pip install
 cosmos-guardrail`, accept the license, set `HF_TOKEN`); add `--no-guardrails` to
-disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs.
+disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
+generation from ~83 GB to ~55 GB per GPU (2-GPU) with BF16-level quality (T2V
+composition can shift at the same seed).
 
 #### Verification
 
@@ -122,3 +125,134 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   under the top-level `action` field. Verified on the 64B Super under
   `--cfg-parallel-size 2`: async `policy` returns the predicted action (`[16, 10]`)
   and the rollout video reliably.
+
+## NPU
+
+### 8× Ascend910 (A2, A3)
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: Ascend NPU driver with CANN toolkit
+- Recommended operator library: **mindie-sd** (Ascend high-performance fused
+  operators — enables `adalayernorm` and other fused kernels automatically upon
+  installation)
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+A pre-built Docker image is available on
+[Docker Hub](https://hub.docker.com/r/vllm/vllm-omni) and
+[Quay.io](https://quay.io/ascend/vllm-omni). Ensure the image tag matches your
+vLLM-Omni checkout so that NPU-specific code is in sync with the container.
+
+#### Prerequisites
+
+Install the **mindie-sd** operator library to enable Ascend-optimized fused
+operators (`adalayernorm`, etc.):
+
+```bash
+git clone https://gitcode.com/Ascend/MindIE-SD.git && cd MindIE-SD
+
+# Comment out the tik_ops build step (not needed for this use case)
+sed -i 's|^\(\s*\)source ${current_script_dir}/build_tik_ops.sh|\1# source ${current_script_dir}/build_tik_ops.sh|' build/build_ops.sh
+
+python setup.py bdist_wheel
+cd dist
+pip install mindiesd-*.whl
+```
+
+After installation, enable the Laser Attention kernel for significant
+long-sequence speedups:
+
+```bash
+export MINDIE_SD_FA_TYPE=ascend_laser_attention
+```
+
+#### Command
+
+```bash
+export MINDIE_SD_FA_TYPE=ascend_laser_attention
+
+vllm serve nvidia/Cosmos3-Super \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 8 \
+  --model-class-name Cosmos3OmniDiffusersPipeline \
+  --no-guardrails \
+  --init-timeout 1800
+```
+
+#### Verification
+
+Same requests as the GPU section above — all modes (T2I, T2V, I2V, V2V,
+T2VS, I2VS) work identically on NPU. Quick reference with
+`--no-guardrails`:
+
+```bash
+curl http://localhost:8000/v1/models
+
+# T2I (1024x1024, 50 steps)
+curl -sS -X POST http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "nvidia/Cosmos3-Super",
+    "prompt": "A photorealistic red sports car on a city street at golden hour, cinematic lighting.",
+    "size": "1024x1024", "n": 1, "response_format": "b64_json",
+    "num_inference_steps": 50, "guidance_scale": 7.0, "seed": 42
+  }' | python3 -c "import sys,json,base64; open('cosmos3_super_t2i.png','wb').write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))"
+
+# T2V (1280×720, 189 frames, 35 steps — official params)
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=A robot arm is cleaning a plate in the kitchen" \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":false}' \
+  -F "seed=17" -o cosmos3_super_t2v.mp4
+
+# I2V — add an uploaded reference image
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=The scene comes to life with smooth, natural motion." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":false}' \
+  -F "seed=1111" -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
+  -o cosmos3_super_i2v.mp4
+
+# V2V — add an uploaded reference video. condition_video_keep can be "first" or "last".
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=Continue the same scene with smooth natural motion." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"condition_frame_indexes_vision":[0,1],"condition_video_keep":"first","guardrails":false}' \
+  -F "seed=2222" -F "input_reference=@/path/to/reference.mp4;type=video/mp4" \
+  -o cosmos3_super_v2v.mp4
+
+# T2V + sound — add generate_sound/sound_duration (output muxes AAC 48 kHz stereo)
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=A robot arm is cleaning a plate in the kitchen" \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F "generate_sound=true" -F "sound_duration=7.875" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":false}' \
+  -F "seed=17" -o cosmos3_super_t2vs.mp4
+
+# I2V + sound — reference image with synchronized audio
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=The scene comes to life with smooth, natural motion and ambient sound." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F "generate_sound=true" -F "sound_duration=7.875" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":false}' \
+  -F "seed=1111" -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
+  -o cosmos3_super_i2vs.mp4
+```
+
+#### Notes
+
+- **Parallelism:** `--tensor-parallel-size 8` matches the model's 8 KV heads (`num_key_value_heads: 8`, `num_attention_heads: 64` → GQA). This uses 8 davinci devices (NPU 0–3, both cores each). The remaining NPU 4–7 stay idle.
+- **Model config:** 64 layers × 5120 hidden size × 64 attention heads, ~120 GB transformer on disk (27 shards). Each NPU device loads ~15 GB of model weights.
+- **Peak HBM:** ~22.7 GB per device at startup (bf16 weights). Additional memory is allocated per-generation for KV cache and activations — resolution and frame count drive the peak.
+- **Performance (verified on 8× Ascend910):** T2I 256² / 2 steps / guidance 1.0 → ~1.5 s.
+- **Guardrails** are disabled with `--no-guardrails` (guards are on by default). The gated `nvidia/Cosmos-1.0-Guardrail` model and `cosmos-guardrail` package are not shipped. Add `guardrails: false` in `extra_params` for per-request overrides when the server has guardrails enabled.
+- **Known limitations:** FP8 quantization not yet validated on Ascend NPU. `--enable-layerwise-offload` is available but untested on NPU.

@@ -12,8 +12,12 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.ming_tts"
 
 MING_TTS_PIPELINE = PipelineConfig(
     model_type="ming_tts",
+    default_deploy_config_name="ming_tts.yaml",
     model_arch="MingTTSForConditionalGeneration",
-    hf_architectures=("MingTTSForConditionalGeneration",),
+    hf_architectures=("MingTTSForConditionalGeneration", "BailingMMNativeForConditionalGeneration"),
+    # The dense (0.5B) and MoE (16.8B) share architectures=["BailingMMNativeForConditionalGeneration"]
+    # Here we disambiguate by the model_type the upstream HF config reports
+    hf_config_predicate=lambda c: str(getattr(c, "model_type", "")) == "dense",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -51,4 +55,19 @@ MING_TTS_PIPELINE = PipelineConfig(
             },
         ),
     ),
+)
+
+
+# MoE variant (inclusionAI/Ming-omni-tts-16.8B-A3B)
+# Same two-stage topology and model class as the above,
+# but with a distinct model_type reported by the upstream HF config.
+# Keep this for auto-detection of deploy config yaml.
+MING_TTS_MOE_PIPELINE = PipelineConfig(
+    model_type="ming_tts_moe",
+    default_deploy_config_name="ming_tts_moe.yaml",
+    model_arch="MingTTSForConditionalGeneration",
+    hf_architectures=("MingTTSForConditionalGeneration", "BailingMMNativeForConditionalGeneration"),
+    # Disambiguate from the dense-0.5B ming_tts pipeline
+    hf_config_predicate=lambda c: str(getattr(c, "model_type", "")) == "bailingmm",
+    stages=MING_TTS_PIPELINE.stages,
 )

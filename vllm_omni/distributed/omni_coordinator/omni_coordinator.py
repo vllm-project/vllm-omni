@@ -190,6 +190,15 @@ class OmniCoordinator:
         except zmq.ZMQError:
             pass
 
+    def wait_for_shutdown(self) -> None:
+        """Block until the coordinator is asked to stop.
+
+        ``OmniCoordinatorRuntime`` runs the coordinator in a child process.
+        The child needs a small, explicit blocking lifecycle API so it does
+        not return immediately after construction.
+        """
+        self._stop_event.wait()
+
     def _parse_replica_event(self, data: dict[str, Any]) -> ReplicaEvent | None:
         """Parse wire payload dict into ReplicaEvent. Returns None if invalid."""
         try:

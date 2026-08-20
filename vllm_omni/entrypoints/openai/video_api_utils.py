@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections import deque
+import os
+import tempfile
 from io import BytesIO
 from typing import Any, Literal
 
@@ -16,6 +17,13 @@ import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm import envs
+from vllm.multimodal.video import (
+    VIDEO_LOADER_REGISTRY,
+    VideoBackend,
+    VideoSourceMetadata,
+    VideoTargetMetadata,
+)
 
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -28,11 +36,65 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 
 
+class VideoFrames(list[Image.Image]):
+    """Decoded video frames plus source metadata."""
+
+    def __init__(
+        self,
+        frames: list[Image.Image] | None = None,
+        *,
+        fps: float | None = None,
+        source_path: str | None = None,
+    ) -> None:
+        super().__init__(frames or [])
+        self.fps = fps
+        self.frame_rate = fps
+        self.source_path = source_path
+
+
+def positive_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
+        value = value.item()
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result <= 0:
+        return None
+    return result
+
+
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
         return Image.open(BytesIO(image_bytes)).convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
+
+
+@VIDEO_LOADER_REGISTRY.register("omni")
+class OmniVideoBackend(VideoBackend):
+    """Video backend that selects sequential first-N or last-N frames."""
+
+    @classmethod
+    def compute_frames_index_to_sample(
+        cls,
+        source: VideoSourceMetadata,
+        target: VideoTargetMetadata,
+        *,
+        keep: Literal["first", "last"] = "first",
+        **kwargs,
+    ) -> list[int]:
+        num_frames_to_sample = source.total_frames_num
+        if target.num_frames > 0:
+            num_frames_to_sample = min(num_frames_to_sample, target.num_frames)
+        num_frames_to_sample = max(1, num_frames_to_sample)
+        if num_frames_to_sample >= source.total_frames_num:
+            return list(range(source.total_frames_num))
+        if keep == "last":
+            return list(range(source.total_frames_num - num_frames_to_sample, source.total_frames_num))
+        return list(range(num_frames_to_sample))
 
 
 def _decode_video_bytes(
@@ -41,39 +103,31 @@ def _decode_video_bytes(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
-    try:
-        import av
-    except ImportError as exc:  # pragma: no cover - av is a serving dependency via media_utils
-        raise InvalidInputReferenceError(f"Invalid {source}: video decoding requires PyAV.") from exc
-
+    source_path: str | None = None,
+) -> VideoFrames:
     if keep not in {"first", "last"}:
         raise InvalidInputReferenceError(f"Invalid {source}: video frame selection must be 'first' or 'last'.")
     if max_frames is not None and max_frames <= 0:
         raise InvalidInputReferenceError(f"Invalid {source}: max video frames must be positive.")
 
-    frames: list[Image.Image] = []
-    tail_frames: deque[Image.Image] | None = (
-        deque(maxlen=max_frames) if keep == "last" and max_frames is not None else None
-    )
+    loader = VIDEO_LOADER_REGISTRY.load("omni")
+    num_frames = max_frames if max_frames is not None else -1
     try:
-        with av.open(BytesIO(video_bytes)) as container:
-            for frame in container.decode(video=0):
-                image = frame.to_image().convert("RGB")
-                if tail_frames is not None:
-                    tail_frames.append(image)
-                else:
-                    frames.append(image)
-                if keep == "first" and max_frames is not None and len(frames) >= max_frames:
-                    break
+        frames_array, metadata = loader.load_bytes(
+            video_bytes,
+            num_frames=num_frames,
+            backend="pyav",
+            keep=keep,
+        )
     except Exception as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.") from exc
 
-    if tail_frames is not None:
-        frames = list(tail_frames)
+    fps: float | None = positive_float(metadata.get("fps"))
+
+    frames = [Image.fromarray(f, "RGB") for f in frames_array]
     if not frames:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.")
-    return frames
+    return VideoFrames(frames, fps=fps, source_path=source_path)
 
 
 def _decode_media_bytes(
@@ -82,7 +136,7 @@ def _decode_media_bytes(
     source: str,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
-) -> Image.Image | list[Image.Image]:
+) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
     except InvalidInputReferenceError:
@@ -119,11 +173,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
         return _decode_base64_image(image_url, source="image_reference.image_url")
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
+        allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
+        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
             try:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response.has_redirect_location and not allow_redirects:
+                    raise InvalidInputReferenceError(
+                        "Invalid image_reference.image_url: redirect response was rejected because "
+                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
+                    ) from exc
+                raise InvalidInputReferenceError(
+                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                ) from exc
+            except httpx.RequestError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc
@@ -138,7 +202,8 @@ def _decode_base64_video(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
+    source_path: str | None = None,
+) -> VideoFrames:
     if video_reference:
         if video_reference.startswith("data:video"):
             _, b64_data = video_reference.split(",", 1)
@@ -149,7 +214,16 @@ def _decode_base64_video(
             video_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
-        return _decode_video_bytes(video_bytes, source=source, max_frames=max_frames, keep=keep)
+        if source_path is not None:
+            with open(source_path, "wb") as output:
+                output.write(video_bytes)
+        return _decode_video_bytes(
+            video_bytes,
+            source=source,
+            max_frames=max_frames,
+            keep=keep,
+            source_path=source_path,
+        )
     raise InvalidInputReferenceError(f"Invalid {source}: video data is empty.")
 
 
@@ -158,14 +232,21 @@ async def decode_video_url(
     *,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
-) -> list[Image.Image]:
+) -> VideoFrames:
     if video_url.startswith("data:video"):
-        return _decode_base64_video(
-            video_url,
-            source="video_reference.video_url",
-            max_frames=max_frames,
-            keep=keep,
-        )
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        try:
+            return _decode_base64_video(
+                video_url,
+                source="video_reference.video_url",
+                max_frames=max_frames,
+                keep=keep,
+                source_path=path,
+            )
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
 
     if video_url.startswith(("http://", "https://")):
         async with httpx.AsyncClient(timeout=60) as client:
@@ -176,12 +257,26 @@ async def decode_video_url(
                 raise InvalidInputReferenceError(
                     "Invalid video_reference.video_url: failed to download video."
                 ) from exc
-        return _decode_video_bytes(
-            response.content,
-            source="video_reference.video_url",
-            max_frames=max_frames,
-            keep=keep,
-        )
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        try:
+            with open(path, "wb") as output:
+                output.write(response.content)
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
+        try:
+            return _decode_video_bytes(
+                response.content,
+                source="video_reference.video_url",
+                max_frames=max_frames,
+                keep=keep,
+                source_path=path,
+            )
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
 
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
@@ -240,7 +335,7 @@ async def decode_input_reference(
     *,
     max_video_frames: int | None = None,
     video_keep: Literal["first", "last"] = "first",
-) -> Image.Image | list[Image.Image] | None:
+) -> Image.Image | VideoFrames | None:
     """Decode media input from multipart bytes, data URLs, or typed references."""
 
     provided = sum(item is not None for item in (input_reference_bytes, image_reference, video_reference))
@@ -277,9 +372,6 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
     video_tensor = video_tensor.detach().cpu()
     if video_tensor.dim() == 5:
         raise ValueError("Batched video tensors are not supported for single-video encoding.")
-    elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
-        # [C, F, H, W] -> [F, H, W, C]
-        video_tensor = video_tensor.permute(1, 2, 3, 0)
 
     if video_tensor.is_floating_point():
         # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no
@@ -298,6 +390,8 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
 
     if video_array.ndim == 4:
         # Convert channel-first layouts to channel-last
+        # Prefer an explicit channel-last dimension for ambiguous 3/4-frame
+        # videos before interpreting a leading dimension as channels.
         if video_array.shape[0] in (3, 4) and video_array.shape[-1] not in (3, 4):
             video_array = np.transpose(video_array, (1, 2, 3, 0))
         elif video_array.shape[1] in (3, 4) and video_array.shape[-1] not in (3, 4):
@@ -392,6 +486,40 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     return arr.astype(np.float32)
 
 
+def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
+    """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
+    frames = _coerce_video_to_frames(video)
+    if not frames:
+        raise ValueError("No frames found to encode.")
+
+    frame_shape = frames[0].shape
+    has_alpha = len(frame_shape) == 3 and frame_shape[-1] == 4
+    output_shape = (*frame_shape[:-1], 3) if has_alpha else frame_shape
+    frames_u8 = np.empty((len(frames), *output_shape), dtype=np.uint8)
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
+
+    # Convert one frame at a time instead of stacking the normalized float
+    # payload first. Long videos can otherwise require another full-size
+    # float array plus conversion temporaries before encoding.
+    for index, frame in enumerate(frames):
+        if frame.shape != frame_shape:
+            raise ValueError("All video frames must have the same shape.")
+        frame = frame[..., :3] if has_alpha else frame
+        if frame.dtype == np.uint8:
+            frames_u8[index] = frame
+            continue
+
+        # np.stack(), used by the previous implementation, promoted mixed
+        # frame dtypes before scaling. Preserve those rounding semantics
+        # without allocating a full-video float buffer.
+        scaled = np.clip(frame.astype(common_dtype, copy=False), 0.0, 1.0)
+        scaled *= 255.0
+        np.rint(scaled, out=scaled)
+        frames_u8[index] = scaled
+
+    return frames_u8
+
+
 def _encode_video_bytes(
     video: Any,
     fps: int,
@@ -402,33 +530,64 @@ def _encode_video_bytes(
     """Encode a video payload into MP4 bytes, optionally muxing audio."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
-    frames = _coerce_video_to_frames(video)
-    if not frames:
-        raise ValueError("No frames found to encode.")
-
-    frames_np = np.stack(frames, axis=0)
-    if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
-        frames_np = frames_np[..., :3]
-
-    if frames_np.dtype == np.uint8:
-        frames_u8 = frames_np
-    else:
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_np *= 255.0
-        frames_u8 = np.round(frames_np).astype(np.uint8)
-
-    # Ensure contiguous memory layout for faster PyAV muxing
-    frames_u8 = np.ascontiguousarray(frames_u8)
-
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
 
     return mux_video_audio_bytes(
-        frames_u8,
+        _coerce_video_to_uint8_frames(video),
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or 24000,
         video_codec_options=video_codec_options,
     )
+
+
+class FragmentedMP4VideoEncoder:
+    """Normalize video chunks and append them to one fragmented MP4 stream."""
+
+    def __init__(
+        self,
+        *,
+        fps: int | float,
+        video_codec_options: dict[str, str] | None = None,
+    ) -> None:
+        self._fps = float(fps)
+        self._video_codec_options = video_codec_options
+        self._muxer: Any | None = None
+
+    def encode(self, video: Any) -> bytes:
+        """Encode one generated video chunk and return newly emitted fMP4 bytes."""
+        from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
+
+        frames_u8 = _coerce_video_to_uint8_frames(video)
+        if self._muxer is None:
+            self._muxer = FragmentedMP4Muxer(
+                width=frames_u8.shape[2],
+                height=frames_u8.shape[1],
+                fps=self._fps,
+                video_codec_options=self._video_codec_options,
+            )
+        return self._muxer.mux_video_frames(frames_u8)
+
+    def close(self) -> bytes:
+        """Close the underlying fMP4 muxer and return trailing bytes, if any."""
+        if self._muxer is None:
+            return b""
+        return self._muxer.close()
+
+
+StreamingVideoFormat = Literal["m4s"]
+
+
+def create_streaming_video_encoder(
+    *,
+    output_format: StreamingVideoFormat,
+    fps: int | float,
+    video_codec_options: dict[str, str] | None = None,
+) -> FragmentedMP4VideoEncoder:
+    """Create an incremental encoder for the requested WebSocket video format."""
+    if output_format == "m4s":
+        return FragmentedMP4VideoEncoder(fps=fps, video_codec_options=video_codec_options)
+    raise ValueError(f"Unsupported streaming video format: {output_format}")
 
 
 def encode_video_base64(

@@ -22,6 +22,9 @@ from vllm import SamplingParams
 
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 pytestmark = pytest.mark.skip(reason="Temporarily skip PD entrypoint tests while PD config is being removed.")
 
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
@@ -121,9 +124,7 @@ class _FakeStage:
         self._in_q = in_q
         self._out_q = out_q
 
-    def init_stage_worker(
-        self, model: str, *, is_async=False, shm_threshold_bytes=65536, ctx=None, batch_timeout=10, **kwargs
-    ):
+    def init_stage_worker(self, model: str, *, is_async=False, ctx=None, batch_timeout=10, **kwargs):
         self._proc = _ns(
             start=lambda: None,
             join=lambda timeout=None: None,
@@ -307,21 +308,11 @@ def mock_get_config(monkeypatch):
     """Auto-mock get_config and related model loading functions."""
     import sys
 
-    fake_tokenizer = _ns()
-    fake_tokenizer.encode = lambda *args, **kwargs: [1, 2, 3]
-    fake_tokenizer.decode = lambda *args, **kwargs: "test"
-
-    def _mock_init_tokenizer_from_configs(model_config=None, **kwargs):
-        return fake_tokenizer
-
-    monkeypatch.setattr(
-        "vllm.transformers_utils.tokenizer.init_tokenizer_from_configs",
-        _mock_init_tokenizer_from_configs,
-        raising=False,
-    )
-    tokenizer_module_path = "vllm.transformers_utils.tokenizer"
-    if tokenizer_module_path in sys.modules:
-        setattr(sys.modules[tokenizer_module_path], "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
+    # TODO(pd-unskip): the tokenizer mock that lived here targeted
+    # vllm.transformers_utils.tokenizer.init_tokenizer_from_configs, which was
+    # deleted in vLLM 0.26 (the raising=False setattr made it a silent no-op).
+    # When the module-level skip is lifted, mock whatever tokenizer seam the
+    # revived PD entrypoint code actually uses.
 
     def _mock_length_from_prompt_token_ids_or_embeds(prompt_token_ids=None, prompt_embeds=None):
         if prompt_token_ids is not None:
@@ -345,13 +336,6 @@ def mock_get_config(monkeypatch):
             "length_from_prompt_token_ids_or_embeds",
             _mock_length_from_prompt_token_ids_or_embeds,
         )
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.async_omni.init_tokenizer_from_configs", _mock_init_tokenizer_from_configs, raising=False
-    )
-    async_omni_path = "vllm_omni.entrypoints.async_omni"
-    if async_omni_path in sys.modules:
-        setattr(sys.modules[async_omni_path], "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
 
     fake_hf_config = _ns()
     fake_hf_config.model_type = "qwen2_5_omni"

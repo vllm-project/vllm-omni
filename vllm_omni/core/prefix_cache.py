@@ -2,6 +2,8 @@
 Utilities for Prefix Caching in Omni models.
 """
 
+from dataclasses import dataclass, field
+
 import torch
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -9,6 +11,23 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PendingAsyncWrite:
+    """One in-flight async write into the prefix cache.
+
+    Holds the CPU tensors that PyTorch implicitly allocated via
+    ``.to("cpu", non_blocking=True)`` together with a CUDA event recorded
+    on the copy stream. The consumer calls ``event.synchronize()`` once
+    (blocking) to guarantee the D2H has completed before reading.
+    """
+
+    event: "torch.cuda.Event"
+    num_tokens: int
+    slots_cpu: torch.Tensor
+    hidden_cpu: torch.Tensor | None
+    mm_cpu: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class OmniTensorPrefixCache:
@@ -49,6 +68,19 @@ class OmniTensorPrefixCache:
         self._new_req_cache_hit_ids: set[str] = set()
         self._deferred_mm_outputs: dict[str, dict[str, list[tuple[int, torch.Tensor]]]] = {}
 
+        # Async write pipeline state:
+        #   - one dedicated copy stream
+        #   - one in-flight pending write at a time (the producer is exactly
+        #     one forward step ahead of the consumer)
+        #   - schedule_async_write() consumes the *previous* pending write
+        #     (via event.synchronize() + scatter) before kicking off the new
+        #     D2H. By the time we hit synchronize, the previous step's GPU
+        #     work has been done for ~one forward step, so the sync is
+        #     near-zero wall-clock.
+        self._async_initialized: bool = False
+        self._async_copy_stream: torch.cuda.Stream | None = None
+        self._pending_write: _PendingAsyncWrite | None = None
+
     def maybe_init_missing_mm_cache_keys(self, multimodal_outputs: dict, seq_len: int):
         """Given multimodal outputs from executing the model, dynamically
         determine which multimodal outputs are tensors depending on sequence
@@ -84,13 +116,185 @@ class OmniTensorPrefixCache:
                 logger.info("Initializing multimodal output cache of size %s for key: %s", list(new_tensor_shape), key)
 
     def _get_cache_tensor(self, dtype: torch.dtype, hidden_size: int | None = None) -> torch.Tensor:
-        """Allocate a CPU cache tensor for a specific key."""
+        """Allocate a CPU cache tensor for a specific key.
+
+        When CUDA is available the tensor is pinned: this is what lets the
+        async-write pipeline ride the GPU->CPU copy on the dedicated copy
+        stream as a true async ``cudaMemcpyAsync`` and lets the post-copy CPU
+        scatter avoid page-resolution stalls. On CPU-only builds pinning is
+        unsupported (``torch.zeros(pin_memory=True)`` raises), and the async
+        pipeline is disabled anyway (``schedule_async_write`` early-returns
+        when ``torch.cuda.is_available()`` is False), so we fall back to a
+        plain pageable allocation with no behavioral change.
+        """
         actual_hidden_size = hidden_size if hidden_size is not None else self.default_hidden_size
         return torch.zeros(
             (self.num_blocks, self.block_size, actual_hidden_size),
             dtype=dtype,
             device="cpu",
+            pin_memory=torch.cuda.is_available(),
         )
+
+    # =====================================================================
+    # Async write pipeline:
+    #   schedule_async_write : called per forward step, enqueues a
+    #                          non-blocking D2H + records a CUDA event
+    #   drain_ready_async_writes : non-blocking poll, applies any writes
+    #                              whose D2H has completed
+    # =====================================================================
+
+    def _ensure_async_resources(self) -> None:
+        """Lazily allocate the dedicated copy stream.
+
+        The per-step CPU staging tensors are allocated by PyTorch on demand
+        inside ``.to("cpu", non_blocking=True)``, which gives them
+        implicitly-pinned memory and lets PyTorch's allocator amortize /
+        reuse them.
+        """
+        if self._async_initialized:
+            return
+        if not torch.cuda.is_available():
+            return
+        self._async_copy_stream = torch.cuda.Stream()
+        self._async_initialized = True
+        logger.info("Omni prefix cache async-write copy stream initialized.")
+
+    def schedule_async_write(
+        self,
+        hidden_states_gpu: torch.Tensor | None,
+        multimodal_outputs_gpu: dict[str, torch.Tensor] | None,
+        slot_mapping_gpu: torch.Tensor,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        skip_mm_cache_keys: set[str] | None = None,
+    ) -> None:
+        """Kick off a non-blocking GPU->CPU copy for this step's writes.
+
+        1. **Consume the previous step's write** (if any): block on its
+           event and scatter the CPU tensors into the cache. By the time we
+           reach this point, the previous step's GPU work has been done for
+           ~one forward step, so the synchronize is near-zero wall-clock.
+        2. **Schedule THIS step's D2H** on a dedicated copy stream using
+           ``.to("cpu", non_blocking=True)``. PyTorch allocates the pinned
+           destination implicitly.
+        3. **Record an event** and stash everything for the next step's
+           consume.
+
+        Holding exactly one in-flight write at a time keeps the design
+        simple: no ring, no event-polling, no driver-mutex pressure from
+        repeated event.query() calls.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        self._ensure_async_resources()
+        if not self._async_initialized:
+            return
+
+        # Decide which mm keys we'll cache. Init the dest cache tensors
+        # before scheduling the copies so the apply step has somewhere
+        # to scatter into.
+        skip = skip_mm_cache_keys or set()
+        cacheable_mm_keys: list[str] = []
+        if multimodal_outputs_gpu:
+            self.maybe_init_missing_mm_cache_keys(multimodal_outputs_gpu, seq_len=num_tokens_padded)
+            for k in self.mm_cache_keys:
+                if k in skip:
+                    continue
+                v = multimodal_outputs_gpu.get(k)
+                if not isinstance(v, torch.Tensor) or v.ndim < 2:
+                    continue
+                if v.shape[0] < num_tokens_unpadded:
+                    continue
+                cacheable_mm_keys.append(k)
+
+        # Step 1: consume the previous step's write FIRST. The previous
+        # step's event was recorded ~one forward step ago, so
+        # synchronize() is effectively a no-op cost-wise; the scatter
+        # into pinned CPU caches is also fast.
+        self._consume_pending_write()
+
+        if hidden_states_gpu is None and not cacheable_mm_keys:
+            return  # nothing to schedule this step
+
+        # Step 2: schedule the D2H on the copy stream. PyTorch implicitly
+        # allocates pinned host destinations for the ``.to("cpu",
+        # non_blocking=True)`` results.
+        copy_stream = self._async_copy_stream
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+
+            # slot_mapping: copy as-is; the int64 cast required by
+            # ``index_copy_`` is deferred to ``_consume_pending_write``
+            # so we avoid launching an extra GPU kernel here that would
+            # contend the driver mutex with the compute stream.
+            slots_cpu = slot_mapping_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
+            hidden_cpu: torch.Tensor | None = None
+            if hidden_states_gpu is not None:
+                hidden_cpu = hidden_states_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
+            mm_cpu: dict[str, torch.Tensor] = {}
+            for k in cacheable_mm_keys:
+                mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
+
+            event = torch.cuda.Event()
+            event.record()
+
+        # Step 3: stash for next step's consume.
+        self._pending_write = _PendingAsyncWrite(
+            event=event,
+            num_tokens=num_tokens_unpadded,
+            slots_cpu=slots_cpu,
+            hidden_cpu=hidden_cpu,
+            mm_cpu=mm_cpu,
+        )
+
+    def drain_ready_async_writes(self) -> int:
+        """Consume one in-flight write if it has finished (non-blocking).
+
+        Exposed so the model runner can drain at the top of
+        ``execute_model`` regardless of whether a new write will be
+        scheduled this step.
+        """
+        if self._pending_write is None:
+            return 0
+        if not self._pending_write.event.query():
+            return 0
+        self._consume_pending_write()
+        return 1
+
+    def _consume_pending_write(self) -> None:
+        """Synchronize on the pending event and scatter the CPU tensors
+        into the destination caches. Drops state on completion.
+        """
+        entry = self._pending_write
+        if entry is None:
+            return
+        self._pending_write = None
+        entry.event.synchronize()
+        n = entry.num_tokens
+        if n <= 0:
+            return
+
+        slots = entry.slots_cpu
+        if slots.dtype != torch.int64:
+            slots = slots.to(torch.int64)
+
+        # NOTE: ``index_copy_(0, idx, src)`` is the row-scatter primitive in
+        # PyTorch. It's semantically identical to ``flat[idx] = src`` but
+        # dispatches to a much simpler CPU implementation (single dim,
+        # no broadcasting, no accumulate), which on pinned memory at large
+        # row sizes is observed to be much faster than the generic
+        # ``aten::index_put_`` path used by advanced-indexing assignment.
+        if entry.hidden_cpu is not None:
+            flat = self.hidden_states_cache.view(-1, self.hidden_states_cache.shape[-1])
+            flat.index_copy_(0, slots, entry.hidden_cpu)
+        for k, src_cpu in entry.mm_cpu.items():
+            mm_cache = self.mm_outputs_cache.get(k)
+            if mm_cache is None:
+                continue
+            flat = mm_cache.view(-1, mm_cache.shape[-1])
+            flat.index_copy_(0, slots, src_cpu)
 
     def add_prefix_cached_new_req_id(self, req_id: str):
         """Adds a new request ID to the set of prefix cache hits on the batch."""
@@ -173,9 +377,17 @@ class OmniTensorPrefixCache:
                 num_tokens_unpadded,
                 hidden_states_cpu,
             )
-            # View the cache as 2D so that we can treat our slots as row indices
+            # View the cache as 2D so that we can treat our slots as row indices.
+            # ``index_copy_`` is the row-scatter primitive — it's semantically
+            # ``cache[idx] = src`` but dispatches to a faster CPU path than the
+            # generic advanced-indexing assignment (which goes through
+            # ``aten::index_put_`` and is dominated by per-row dispatch
+            # overhead on large feature widths).
             flat_cache = self.hidden_states_cache.view(-1, self.hidden_states_cache.shape[-1])
-            flat_cache[unpadded_slot_mapping] = hidden_states
+            slot_idx = unpadded_slot_mapping
+            if slot_idx.dtype != torch.int64:
+                slot_idx = slot_idx.to(torch.int64)
+            flat_cache.index_copy_(0, slot_idx, hidden_states)
             logger.debug("Writing to hidden states for %s tokens", num_tokens_unpadded)
 
         # Do the same for the stage's cached multimodal outputs
@@ -195,7 +407,10 @@ class OmniTensorPrefixCache:
                     mm_state = multimodal_outputs[mm_out_key][:num_tokens_unpadded]
                     mm_state = OmniTensorPrefixCache._coerce_to_cpu_tensor(mm_state)
                     flat_cache = mm_cache.view(-1, mm_cache.shape[-1])
-                    flat_cache[unpadded_slot_mapping] = mm_state
+                    slot_idx = unpadded_slot_mapping
+                    if slot_idx.dtype != torch.int64:
+                        slot_idx = slot_idx.to(torch.int64)
+                    flat_cache.index_copy_(0, slot_idx, mm_state)
             logger.debug("Writing to mm output cache for %s tokens", num_tokens_unpadded)
 
     def stage_deferred_mm_outputs(
@@ -331,7 +546,9 @@ class OmniTensorPrefixCache:
         mm_state_cpu = OmniTensorPrefixCache._coerce_to_cpu_tensor(mm_state[: slots.numel()])
         mm_cache = self.mm_outputs_cache[mm_key]
         flat_cache = mm_cache.view(-1, mm_cache.shape[-1])
-        flat_cache[slots] = mm_state_cpu
+        if slots.dtype != torch.int64:
+            slots = slots.to(torch.int64)
+        flat_cache.index_copy_(0, slots, mm_state_cpu)
 
     def _get_slot_ids_for_token_range(
         self,

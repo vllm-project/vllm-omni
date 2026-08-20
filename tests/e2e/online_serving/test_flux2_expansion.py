@@ -19,7 +19,7 @@ from tests.helpers.runtime import (
     dummy_messages_from_mix_data,
 )
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"
@@ -31,6 +31,19 @@ NEGATIVE_PROMPT = "blurry, low quality"
 # cross-feature compatibility more generally.
 def _get_diffusion_feature_cases(model: str):
     return [
+        # CPU offload + TP=2 (model needs TP=2)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--tensor-parallel-size",
+                    "2",
+                ],
+            ),
+            id="cpu_offload",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
         # FP8 / Hybrid sequence parallelism
         pytest.param(
             OmniServerParams(

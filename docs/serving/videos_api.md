@@ -73,7 +73,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
-| `num_frames` | integer | model default | Number of generated frames |
+| `num_frames` | integer | 1 | Number of generated frames |
 | `fps` | integer | model default | Output frames per second |
 | `num_inference_steps` | integer | model default | Number of diffusion steps |
 | `guidance_scale` | number | null | CFG guidance scale for the low-noise stage |
@@ -160,7 +160,20 @@ JSON references currently support `image_url`/`video_url`; `file_id` references
 are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
-decoded reference frames are used as clean conditioning.
+decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
+transfer options such as `control_path`, `control_guidance`,
+`control_guidance_interval`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
+Cosmos3 recipe for complete examples.
+
+HTTP redirects for `image_reference.image_url` follow vLLM's
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
+`1` (the default) to allow redirects or `0` to reject them. A redirect target
+can differ from the original host, and vLLM-Omni does not yet fully implement
+upstream vLLM's media URL allowlist protection. Deployments should therefore
+treat remote media URLs as untrusted and choose this setting as part of their
+URL access policy.
 
 ### Speech-to-Video
 
@@ -195,12 +208,15 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_STORAGE_PATH` to control where asynchronous video outputs are
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
 stored:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
 ```
+
+> `VLLM_OMNI_STORAGE_PATH` is deprecated and will be removed in a future release;
+> use `VLLM_OMNI_SERVER_STORAGE__PATH` instead.
 
 ## Model-Specific Examples
 

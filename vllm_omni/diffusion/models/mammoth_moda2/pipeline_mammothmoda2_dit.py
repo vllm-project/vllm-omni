@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
@@ -9,8 +9,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -18,8 +20,10 @@ from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DMode
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
+logger = init_logger(__name__)
 
-class MammothModa2DiTPipeline(nn.Module):
+
+class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -28,12 +32,17 @@ class MammothModa2DiTPipeline(nn.Module):
 
     """
 
+    _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
+    _vae_modules: ClassVar[list[str]] = ["gen_vae"]
+
     have_multimodal_outputs = True
 
     # Load only gen_* weights; ignore llm_model.* to prevent loading the entire LLM backbone in the DiT stage.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "llm_model.": None,
+            "gen_tokenizer.": None,
         }
     )
 
@@ -54,16 +63,38 @@ class MammothModa2DiTPipeline(nn.Module):
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
-        llm_hidden_size = int(getattr(self.config.llm_config, "hidden_size", 0) or 0)
+        # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
+        llm_hidden_size = 0
+        text_config = self.config.get_text_config()
+        if text_config is None:
+            logger.warning("No text config; failed to infer llm_hidden_size.")
+        elif not hasattr(text_config, "hidden_size"):
+            logger.warning("Text config exists, but has no hidden_size attribute; failed to infer llm_hidden_size.")
+        else:
+            llm_hidden_size = int(text_config.hidden_size or 0)
         if llm_hidden_size <= 0:
-            raise ValueError("Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.hidden_size")
+            raise ValueError(
+                "Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.text_config.hidden_size"
+            )
         self._reinit_caption_embedder(llm_hidden_size)
 
-        # Optional: image condition refiner (Q-Former)
-        if self.config.gen_image_condition_refiner_config is not None:
+        # Optional image condition Q-Former. Preview stores it as a standalone
+        # module; Dev stores it under the DiT timestep/caption embedder.
+        llm_model_type = getattr(self.config.llm_config, "model_type", "")
+        refiner_config = self.config.gen_image_condition_refiner_config
+        if refiner_config is not None and llm_model_type == "mammothmoda2_qwen3_vl":
+            dit_hidden_size = int(self.gen_transformer.hidden_size)
+            self.gen_transformer.time_caption_embed.image_embedder = SimpleQFormerImageRefiner(
+                hidden_size=llm_hidden_size,
+                output_hidden_size=dit_hidden_size,
+                num_heads=max(1, dit_hidden_size // 128),
+                **refiner_config,
+            )
+            self.gen_image_condition_refiner = None
+        elif refiner_config is not None:
             self.gen_image_condition_refiner = SimpleQFormerImageRefiner(
                 hidden_size=llm_hidden_size,
-                **self.config.gen_image_condition_refiner_config,
+                **refiner_config,
             )
         else:
             self.gen_image_condition_refiner = None
@@ -127,6 +158,43 @@ class MammothModa2DiTPipeline(nn.Module):
             dtype=dtype,
         )
 
+    def _split_ar_conditions(
+        self,
+        *,
+        full_hidden_states: torch.Tensor,
+        full_token_ids: list[int],
+        answer_start_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split AR-stage hidden states into text / image condition embeds.
+
+        The token ids that distinguish question (text) tokens, generated visual
+        tokens, and multi-modal placeholder tokens are read from the model config
+        (``gen_vocab_start_index`` and the vision placeholder token ids), so the
+        caller no longer needs to pass them. Mirrors the masking the bespoke
+        MammothModa2 example performed via ar2dit.
+        """
+        gen_vocab_start_index = int(self.config.llm_config.gen_vocab_start_index)
+        visual_ids = [
+            int(self.config.image_token_id),
+            int(self.config.video_token_id),
+            int(self.config.vision_start_token_id),
+            int(self.config.vision_end_token_id),
+        ]
+
+        device = full_hidden_states.device
+        token_ids = torch.tensor(full_token_ids, dtype=torch.long, device=device)
+        positions = torch.arange(token_ids.shape[0], device=device)
+        questions_mask = positions < answer_start_index
+        answers_mask = ~questions_mask
+        gen_token_mask = token_ids >= gen_vocab_start_index
+        visual_token_mask = torch.isin(token_ids, torch.tensor(visual_ids, dtype=torch.long, device=device))
+        text_mask = questions_mask & ~(visual_token_mask | gen_token_mask)
+        image_mask = answers_mask & gen_token_mask
+
+        text_cond = full_hidden_states[text_mask].to(dtype=torch.float32).contiguous()
+        image_cond = full_hidden_states[image_mask].to(dtype=torch.float32).contiguous()
+        return text_cond, image_cond
+
     @torch.inference_mode()
     def forward(
         self,
@@ -136,14 +204,35 @@ class MammothModa2DiTPipeline(nn.Module):
     ) -> OmniOutput:
         runtime_addi = kwargs.get("runtime_additional_information", None)
         info = runtime_addi[0]
-        text_cond = info["text_prompt_embeds"]
-        image_cond = info["image_prompt_embeds"]
+
+        # Sampling knobs are declared in vllm_omni/model_extras/mammothmodal2_preview.py
+        # and routed via extra_body -> sampling_params.extra_args (surfaced here as
+        # ``sampling_extra_args``). Fall back to runtime_additional_information for the
+        # legacy bespoke-example path during the transition.
+        extra_args_list = kwargs.get("sampling_extra_args") or []
+        extra_args = extra_args_list[0] if extra_args_list else {}
+        text_guidance_scale = float(extra_args.get("text_guidance_scale", info["text_guidance_scale"][0]))
+        cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
+        cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
+        num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
+
         negative_cond = info.get("negative_prompt_embeds")
         negative_attention_mask = info.get("negative_prompt_attention_mask")
         image_hw = info["image_height"][0], info["image_width"][0]
-        text_guidance_scale = info["text_guidance_scale"][0]
-        cfg_range = info["cfg_range"][0], info["cfg_range"][1]
-        num_inference_steps = info["num_inference_steps"][0]
+
+        # Split the AR hidden states into text / image conditions. The token ids that
+        # drive the split are sourced from the model config (see _split_ar_conditions),
+        # formerly supplied by the bespoke example via additional_information. Legacy
+        # fallback: ar2dit may have already produced the split conditions.
+        if "text_prompt_embeds" in info:
+            text_cond = info["text_prompt_embeds"]
+            image_cond = info["image_prompt_embeds"]
+        else:
+            text_cond, image_cond = self._split_ar_conditions(
+                full_hidden_states=info["full_hidden_states"],
+                full_token_ids=info["full_token_ids"],
+                answer_start_index=int(info["answer_start_index"][0]),
+            )
 
         # Move to model device/dtype.
         model_device = next(self.parameters()).device
@@ -161,6 +250,13 @@ class MammothModa2DiTPipeline(nn.Module):
 
         text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
         image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
+        if image_cond.shape[0] == 0:
+            answer_token_ids = info.get("full_token_ids", [])[int(info.get("answer_start_index", [0])[0]) :]
+            raise ValueError(
+                "MammothModa2 AR stage produced no visual-token hidden states; "
+                "the DiT stage requires at least one generated visual token. "
+                f"Generated token ids: {answer_token_ids[:32]}"
+            )
         text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
         image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
@@ -187,8 +283,17 @@ class MammothModa2DiTPipeline(nn.Module):
                 device=image_embeds.device,
             )
 
-        prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
-        prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+        nested_image_embedder = getattr(self.gen_transformer.time_caption_embed, "image_embedder", None)
+        if nested_image_embedder is None:
+            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+            prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+            ar_image_embeds = None
+            ar_image_attention_mask = None
+        else:
+            prompt_embeds = text_embeds
+            prompt_attention_mask = text_attention_mask
+            ar_image_embeds = image_embeds
+            ar_image_attention_mask = image_attention_mask
 
         # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
         negative_prompt_embeds = None
@@ -261,6 +366,8 @@ class MammothModa2DiTPipeline(nn.Module):
                 text_hidden_states=prompt_embeds,
                 text_attention_mask=prompt_attention_mask,
                 ref_image_hidden_states=None,
+                ar_image_hidden_states=ar_image_embeds,
+                ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
             )
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0

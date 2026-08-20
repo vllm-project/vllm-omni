@@ -11,10 +11,11 @@ import base64
 import io
 import json
 from argparse import Namespace
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
@@ -23,7 +24,7 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
@@ -118,7 +119,6 @@ class MockGenerationResult:
 
     def __init__(self, images):
         self.images = images
-        self.request_output = SimpleNamespace(images=images)
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -136,10 +136,7 @@ class MockStageResult:
             outputs = [SimpleNamespace(text=text, index=0)]
         else:
             outputs = []
-        self.request_output = SimpleNamespace(
-            outputs=outputs,
-            images=self.images,
-        )
+        self.outputs = outputs
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -220,6 +217,17 @@ def test_client(mock_async_diffusion):
     )
 
     return TestClient(app)
+
+
+@pytest.fixture
+def lingbot_test_client(test_client):
+    test_client.app.state.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args={"model_class_name": "LingBotVideoPipeline"},
+        )
+    ]
+    return test_client
 
 
 @pytest.fixture
@@ -1243,7 +1251,7 @@ def test_parameter_validation():
 
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
-        ImageGenerationRequest(prompt="test", layers=2)
+        ImageGenerationRequest(prompt="test", layers=1)
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
@@ -1298,6 +1306,117 @@ def test_generate_images_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("output_format", "expected_pil_format"),
+    [("png", "PNG"), ("jpeg", "JPEG"), ("webp", "WEBP")],
+)
+def test_image_file_response_format_multiple(test_client, output_format, expected_pil_format):
+    """Test response_format=file with n>1 returns ZIP archive"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 3,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert ".zip" in response.headers.get("content-disposition", "")
+
+    # Verify it's a valid ZIP with 3 correctly labelled image files
+    import zipfile
+
+    zip_buffer = io.BytesIO(response.content)
+    with zipfile.ZipFile(zip_buffer, "r") as zf:
+        files = zf.namelist()
+        assert len(files) == 3
+        assert all(f.endswith(f".{output_format}") for f in files)
+
+        # Verify each file's bytes match its advertised format
+        for filename in files:
+            img_bytes = zf.read(filename)
+            img = Image.open(io.BytesIO(img_bytes))
+            assert img.format == expected_pil_format
+
+
+@pytest.mark.parametrize(
+    ("output_format", "expected_media_type", "expected_pil_format"),
+    [
+        ("png", "image/png", "PNG"),
+        ("jpg", "image/jpeg", "JPEG"),
+        ("jpeg", "image/jpeg", "JPEG"),
+        ("webp", "image/webp", "WEBP"),
+    ],
+)
+def test_image_file_response_format_single(test_client, output_format, expected_media_type, expected_pil_format):
+    """Test response_format=file with n=1 returns a single image file."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": 1,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert f".{output_format}" in response.headers.get("content-disposition", "")
+
+    img = Image.open(io.BytesIO(response.content))
+    assert img.format == expected_pil_format
+
+
+@pytest.mark.parametrize(
+    ("output_format", "image_count", "expected_media_type", "expected_pil_format"),
+    [
+        ("jpeg", 1, "image/jpeg", "JPEG"),
+        ("webp", 2, "application/zip", "WEBP"),
+    ],
+)
+def test_multistage_image_file_response_uses_requested_format(
+    async_omni_test_client,
+    output_format,
+    image_count,
+    expected_media_type,
+    expected_pil_format,
+):
+    engine = async_omni_test_client.app.state.engine_client
+    engine._images = [Image.new("RGB", (16, 16), color="green") for _ in range(image_count)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": image_count,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    if image_count == 1:
+        assert f".{output_format}" in response.headers["content-disposition"]
+        assert Image.open(io.BytesIO(response.content)).format == expected_pil_format
+        return
+
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(response.content), "r") as archive:
+        filenames = archive.namelist()
+        assert len(filenames) == image_count
+        assert all(filename.endswith(f".{output_format}") for filename in filenames)
+        for filename in filenames:
+            assert Image.open(io.BytesIO(archive.read(filename))).format == expected_pil_format
 
 
 def make_test_image_bytes(size=(64, 64)) -> bytes:
@@ -1509,6 +1628,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
             "output_format": "jpeg",
             "num_inference_steps": 20,
             "guidance_scale": 8.0,
+            "guidance_scale_2": 2.0,
             "seed": 1234,
             "negative_prompt": "negative",
             "n": 2,
@@ -1523,6 +1643,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
     assert captured_prompt["negative_prompt"] == "negative"
     assert captured_sampling_params.num_inference_steps == 20
     assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.guidance_scale_2 == 2.0
     assert captured_sampling_params.seed == 1234
     assert captured_sampling_params.num_outputs_per_prompt == 2
     assert captured_sampling_params.width == 16
@@ -1610,13 +1731,13 @@ def test_image_edit_invalid_layers(async_omni_test_client):
         files=[("image", img_bytes)],
         data={
             "prompt": "test",
-            "layers": 2,
+            "layers": 1,
         },
     )
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
     # Test layers above the supported range
     response = async_omni_test_client.post(
@@ -1630,7 +1751,7 @@ def test_image_edit_invalid_layers(async_omni_test_client):
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "Invalid layers" in detail
-    assert "layers must be between 3 and 10 inclusive" in detail
+    assert "layers must be between 2 and 10 inclusive" in detail
 
 
 def test_image_edit_resolution_and_size_conflict(async_omni_test_client):
@@ -1955,28 +2076,76 @@ def test_extract_images_from_result():
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
 
-    # Test dict path: result.request_output["images"]
+    # Test result with "images" attribute set in __init__
     class DictRequestOutput:
         def __init__(self):
-            self.request_output = {"images": [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]}
+            self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
     result = DictRequestOutput()
     images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
-    # Test attribute path: result.request_output.images
+    # Test result with "images" attribute from an inner object
     class AttrRequestOutput:
         def __init__(self):
-            self.request_output = type(
-                "obj", (), {"images": [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]}
-            )()
+            self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
     result = AttrRequestOutput()
     images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+# ---------------------------------------------------------------------------
+# _check_max_generated_image_size unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_width_height_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=)
+    _check_max_generated_image_size(args, 1024, 1024)
+    # Below limit
+    _check_max_generated_image_size(args, 512, 512)
+
+
+def test_width_height_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1025, 1024)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "1025x1024" in exc_info.value.detail
+    assert str(limit) in exc_info.value.detail
+
+
+def test_width_height_error_message_contains_size_hint():
+    args = SimpleNamespace(max_generated_image_size=512 * 512)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, 1024, 512)
+    assert "--max-generated-image-size" in exc_info.value.detail
+
+
+def test_resolution_within_limit_passes():
+    args = SimpleNamespace(max_generated_image_size=1024 * 1024)
+    # Exactly at limit is allowed (> not >=): 1024*1024 == limit
+    _check_max_generated_image_size(args, None, None, resolution=1024)
+    # Below limit
+    _check_max_generated_image_size(args, None, None, resolution=512)
+
+
+def test_resolution_exceeds_limit_raises_400():
+    limit = 1024 * 1024
+    args = SimpleNamespace(max_generated_image_size=limit)
+    with pytest.raises(HTTPException) as exc_info:
+        _check_max_generated_image_size(args, None, None, resolution=1025)
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    detail = exc_info.value.detail
+    assert "1025" in detail
+    assert "1025x1025" in detail
+    assert str(limit) in detail
 
 
 def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from transformers.models.qwen3 import Qwen3Config
 
 
@@ -235,7 +236,80 @@ class MossTTSRealtimeConfig(PretrainedConfig):
         return self.language_config
 
 
+class MossTTSLocalConfig(PretrainedConfig):
+    """Config for MossTTSLocalModel (MOSS-TTS-Local-Transformer-v1.5).
+
+    Like ``MossTTSDelayConfig``, the HF checkpoint stores a nested Qwen3 config
+    (``qwen3_config``) which we unwrap via ``get_text_config()``. It also stores
+    a nested GPT2-style config (``gpt2_config``) describing the single-layer
+    local depth transformer that decodes the ``n_vq`` audio codebooks per frame
+    (see ``modeling_moss_tts_local_depth.py``).
+    """
+
+    model_type = "moss_tts_local"
+
+    def __init__(
+        self,
+        qwen3_config: dict | None = None,
+        gpt2_config: dict | None = None,
+        n_vq: int = 12,
+        audio_vocab_size: int = 1024,
+        audio_pad_token_id: int = 1024,
+        pad_token_id: int = 151643,
+        im_start_token_id: int = 151644,
+        im_end_token_id: int = 151645,
+        audio_start_token_id: int = 151669,
+        audio_end_token_id: int = 151670,
+        audio_user_slot_token_id: int = 151654,
+        audio_assistant_slot_token_id: int = 151656,
+        sampling_rate: int = 48000,
+        audio_tokenizer_name_or_path: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2",
+        local_text_head_mode: str = "binary",
+        **kwargs: object,
+    ) -> None:
+        if qwen3_config is None:
+            qwen3_config = {}
+        if isinstance(qwen3_config, dict):
+            qwen3_config = dict(qwen3_config)
+            qwen3_config.pop("model_type", None)
+            self.qwen3_config = Qwen3Config(**qwen3_config)
+        else:
+            self.qwen3_config = qwen3_config
+
+        if isinstance(gpt2_config, dict):
+            gpt2_config = dict(gpt2_config)
+            gpt2_config.pop("model_type", None)
+            self.gpt2_config = GPT2Config(**gpt2_config)
+        else:
+            self.gpt2_config = gpt2_config
+
+        super().__init__(pad_token_id=pad_token_id, **kwargs)
+
+        self.n_vq = n_vq
+        self.audio_vocab_size = audio_vocab_size
+        self.audio_pad_token_id = audio_pad_token_id
+        self.audio_pad_code = audio_pad_token_id
+        self.im_start_token_id = im_start_token_id
+        self.im_end_token_id = im_end_token_id
+        self.audio_start_token_id = audio_start_token_id
+        self.audio_end_token_id = audio_end_token_id
+        self.audio_user_slot_token_id = audio_user_slot_token_id
+        self.audio_assistant_slot_token_id = audio_assistant_slot_token_id
+        self.sampling_rate = sampling_rate
+        self.audio_tokenizer_name_or_path = audio_tokenizer_name_or_path
+        self.local_text_head_mode = local_text_head_mode
+
+    def get_text_config(self, **_: object) -> Qwen3Config:
+        return self.qwen3_config
+
+
 AutoConfig.register("moss_tts_delay", MossTTSDelayConfig)
 AutoConfig.register("moss_tts_realtime", MossTTSRealtimeConfig)
+AutoConfig.register("moss_tts_local", MossTTSLocalConfig)
 
-__all__ = ["MossTTSDelayConfig", "MossTTSRealtimeConfig", "MossTTSLocalTransformerConfig"]
+__all__ = [
+    "MossTTSDelayConfig",
+    "MossTTSRealtimeConfig",
+    "MossTTSLocalTransformerConfig",
+    "MossTTSLocalConfig",
+]

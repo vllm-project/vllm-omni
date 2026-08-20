@@ -3,11 +3,13 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
 
@@ -20,10 +22,13 @@ async def _noop(*args, **kw):
     pass
 
 
-def get_fake_add_request(submitted_request_ids):
+def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
     async def fake_add_request_async(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+        lora_request = kwargs.get("lora_request")
         del prompt, sampling_params_list, final_stage_id, kwargs
         submitted_request_ids.append(request_id)
+        if submitted_lora_requests is not None:
+            submitted_lora_requests.append(lora_request)
 
     return fake_add_request_async
 
@@ -87,6 +92,37 @@ def test_generate_submits_randomized_id_to_engine():
         assert len(submitted_ids) == 1
         assert submitted_ids[0] != req_id
         assert submitted_ids[0].startswith(f"{req_id}-")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_generate_forwards_lora_request_to_engine():
+    """Ensure the lora_request passed to generate() reaches add_request_async.
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/5369:
+    AsyncOmni.generate() accepted lora_request but silently dropped it when
+    submitting the request, so generation always used the base model.
+    """
+
+    async def run():
+        submitted_ids = []
+        submitted_loras = []
+        omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids, submitted_loras))
+
+        lora = LoRARequest(lora_name="test", lora_int_id=1, lora_path="/tmp/fake")
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="lora-req",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["text"],
+            lora_request=lora,
+        ):
+            pass
+
+        assert len(submitted_ids) == 1
+        assert len(submitted_loras) == 1
+        assert submitted_loras[0] is lora
 
     asyncio.run(run())
 
@@ -199,6 +235,48 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+def test_generate_yields_streaming_diffusion_chunks_before_final():
+    """AsyncOmni.generate yields every intermediate diffusion chunk before the final one."""
+
+    async def streaming_process_results(request_id, metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts):
+        del metrics, final_stage_id_for_e2e, req_start_ts, wall_start_ts
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 0},
+            finished=False,
+        )
+        yield OmniRequestOutput.from_diffusion(
+            request_id=request_id,
+            images=[],
+            final_output_type="image",
+            custom_output={"chunk": 1},
+            finished=True,
+        )
+
+    async def run_test():
+        omni = get_async_omni_instance()
+        omni._process_orchestrator_results = streaming_process_results
+
+        outputs = []
+        async for output in AsyncOmni.generate(
+            omni,
+            prompt={"prompt": "a cat"},
+            request_id="req-stream",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["image"],
+        ):
+            outputs.append(output)
+
+        assert len(outputs) == 2
+        assert [output.finished for output in outputs] == [False, True]
+        assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY, RequestOutputKind.CUMULATIVE]
 )
@@ -229,69 +307,72 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 # End to end tests for ensuring internal manipulation of request ID
 # in diffusion / Omni models don't leak back to the user.
 #
-# NOTE: It seems like we currently need the shutdowns here, otherwise
-# running the tests sequentially seems to leave a zombie process in diffusion
-# that can OOM the Omni tests.
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.omni
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "req_id",
-    ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"],
-    ids=["plain", "prefixed-img", "prefixed-chat"],
-)
-async def test_diffusion_generate_preserves_request_id(req_id):
-    """Ensure diffusion model requests don't leak internal UUID-suffixed req id back to user."""
-    engine = AsyncOmni(model=DIFFUSION_MODEL)
-    try:
-        async for output in engine.generate("a white cat", request_id=req_id):
-            assert output.request_id == req_id
-    finally:
-        engine.shutdown()
+# One AsyncOmni per test function (all cases in a single asyncio loop) to avoid
+# repeated cold starts. Do not use class/module-scoped engine fixtures here:
+# pytest-asyncio uses a function-scoped event loop by default, so reusing an
+# engine across tests can hang on the second generate() call.
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.omni
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "req_id",
-    ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"],
-    ids=["plain", "prefixed-img", "prefixed-chat"],
-)
-async def test_omni_generate_preserves_request_id(req_id):
-    """Ensure omni model requests don't leak internal UUID-suffixed req id back to user."""
-    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=OMNI_STAGE_CONFIG)
-    try:
-        async for output in engine.generate(
-            "Say hello in one word.",
-            request_id=req_id,
-            output_modalities=["text"],
-        ):
-            assert output.request_id == req_id
-    finally:
-        engine.shutdown()
+# Covers:
+#   * plain client ids (``my-req-1``)
+#   * OpenAI-style prefixed ids (``img_gen-*``, ``chatcmpl-*``) that AsyncOmni
+#     suffixes internally for engine routing — streamed outputs must still echo
+#     the caller-visible id, not the internal UUID-suffixed id
+#   * empty ``request_id`` — server assigns a non-empty id for the caller
+_DIFFUSION_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
+_OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
-async def test_diffusion_generate_empty_request_id():
-    """Empty request_id should get a generated internal ID, not stay empty (diffusion)"""
+async def test_diffusion_generate_request_id():
+    """Diffusion E2E request-id contract (``riverclouds/qwen_image_random``).
+
+    Scenarios (one engine, sequential ``generate`` calls):
+    - plain id ``my-req-1``
+    - image-style prefix ``img_gen-abc123``
+    - chat-style prefix ``chatcmpl-xyz``
+    - empty ``request_id`` → output id is non-empty (auto-assigned)
+
+    Each streaming output must expose the user-supplied id unchanged; internal
+    UUID suffixing must not leak into ``output.request_id``.
+    """
     engine = AsyncOmni(model=DIFFUSION_MODEL)
     try:
+        for req_id in _DIFFUSION_REQ_IDS:
+            async for output in engine.generate("a white cat", request_id=req_id):
+                assert output.request_id == req_id
         async for output in engine.generate("a white cat", request_id=""):
             assert output.request_id != ""
     finally:
         engine.shutdown()
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
-async def test_omni_generate_empty_request_id():
-    """Empty request_id should get a generated internal ID, not stay empty (omni)"""
-    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=OMNI_STAGE_CONFIG)
+async def test_omni_generate_request_id():
+    """Omni E2E request-id contract (``Qwen/Qwen2.5-Omni-7B``, thinker-only stage).
+
+    Same scenarios as ``test_diffusion_generate_request_id``:
+    - plain id ``my-req-1``
+    - image-style prefix ``img_gen-abc123``
+    - chat-style prefix ``chatcmpl-xyz``
+    - empty ``request_id`` → output id is non-empty (auto-assigned)
+
+    Text modality only; asserts caller-visible ids are preserved across the
+    multi-stage orchestrator path on H100.
+    """
+    engine = AsyncOmni(model=OMNI_MODEL, deploy_config=OMNI_STAGE_CONFIG)
     try:
+        for req_id in _OMNI_REQ_IDS:
+            async for output in engine.generate(
+                "Say hello in one word.",
+                request_id=req_id,
+                output_modalities=["text"],
+            ):
+                assert output.request_id == req_id
         async for output in engine.generate(
             "Say hello in one word.",
             request_id="",

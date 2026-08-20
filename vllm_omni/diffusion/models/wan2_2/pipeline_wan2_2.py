@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import PIL.Image
 import torch
@@ -24,10 +24,12 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
@@ -35,7 +37,8 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -80,6 +83,24 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_guidance_scales(
+    sampling_params: OmniDiffusionSamplingParams,
+    default_guidance_scale: float,
+) -> tuple[float, float]:
+    guidance_scale = (
+        sampling_params.guidance_scale if sampling_params.guidance_scale_provided else default_guidance_scale
+    )
+    guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
+    guidance_high = (
+        sampling_params.guidance_scale_2
+        if sampling_params.guidance_scale_2_provided and sampling_params.guidance_scale_2 is not None
+        else (
+            guidance_scale[1] if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1 else guidance_low
+        )
+    )
+    return guidance_low, guidance_high
 
 
 def retrieve_latents(
@@ -183,9 +204,11 @@ def get_wan22_post_process_func(
         output_type: str = "np",
         sampling_params=None,
     ):
+        if sampling_params is not None and sampling_params.output_type is not None:
+            output_type = sampling_params.output_type
         if output_type == "latent":
             return video
-        custom_output = {}
+        video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
                 video,
@@ -193,10 +216,10 @@ def get_wan22_post_process_func(
                 scale=sampling_params.frame_interpolation_scale,
                 model_path=sampling_params.frame_interpolation_model_path,
             )
-            custom_output["video_fps_multiplier"] = multiplier
+            video_metadata["video_fps_multiplier"] = multiplier
         return {
-            "video": video_processor.postprocess_video(video, output_type=output_type),
-            "custom_output": custom_output,
+            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+            "metadata": {"video": video_metadata} if video_metadata else {},
         }
 
     return post_process_func
@@ -209,56 +232,71 @@ def get_wan22_pre_process_func(
     import numpy as np
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        has_image = raw_image is not None and (not isinstance(raw_image, list) or bool(raw_image))
+        request.batch_compatibility_key = ("wan22_image_condition", has_image)
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
 
-            if raw_image is None:
-                continue
+        if raw_image is None:
+            request.prompt = prompt
+            return request
 
-            if not isinstance(raw_image, (str, PIL.Image.Image)):
-                raise TypeError(
-                    f"""Unsupported image format {raw_image.__class__}.""",
-                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
-                )
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
-
-            # Calculate dimensions based on aspect ratio if not provided
-            if request.sampling_params.height is None or request.sampling_params.width is None:
-                # Default max area for 720P
-                max_area = 720 * 1280
-                aspect_ratio = image.height / image.width
-
-                # Calculate dimensions maintaining aspect ratio
-                mod_value = 16  # Must be divisible by 16
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = height
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = width
-
-            # Resize image to target dimensions
-            image = image.resize(
-                (request.sampling_params.width, request.sampling_params.height),  # type: ignore # Above has ensured that width & height are not None
-                PIL.Image.Resampling.LANCZOS,
+        if not isinstance(raw_image, (str, PIL.Image.Image)):
+            raise TypeError(
+                f"""Unsupported image format {raw_image.__class__}.""",
+                """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
             )
-            prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
+        image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
 
-            request.prompts[i] = prompt
+        # Calculate dimensions based on aspect ratio if not provided
+        if request.sampling_params.height is None or request.sampling_params.width is None:
+            # Default max area for 720P
+            max_area = 720 * 1280
+            aspect_ratio = image.height / image.width
+
+            # Calculate dimensions maintaining aspect ratio
+            mod_value = 16  # Must be divisible by 16
+            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+
+            if request.sampling_params.height is None:
+                request.sampling_params.height = height
+            if request.sampling_params.width is None:
+                request.sampling_params.width = width
+
+        # Resize image to target dimensions
+        image = image.resize(
+            (request.sampling_params.width, request.sampling_params.height),  # type: ignore # Above has ensured that width & height are not None
+            PIL.Image.Resampling.LANCZOS,
+        )
+        prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
+
+        request.prompt = prompt
         return request
 
     return pre_process_func
 
 
 class Wan22Pipeline(
-    nn.Module, PipelineParallelMixin, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DenoiseProgressMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
+    WanLoraLoaderMixin,
 ):
+    supports_request_batch = True
+    _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,
@@ -448,7 +486,7 @@ class Wan22Pipeline(
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                set_forward_context_denoise_step_idx(step_idx)
+                self.record_denoise_step(step_idx, t)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -528,38 +566,33 @@ class Wan22Pipeline(
 
         return latents
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-        prompt: str | None = None,
-        negative_prompt: str | None = None,
-        height: int = 480,
-        width: int = 832,
-        num_inference_steps: int = 40,
-        guidance_scale: float | tuple[float, float] = 4.0,
-        frame_num: int = 81,
-        output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        attention_kwargs: dict | None = None,
-        **kwargs,
-    ) -> DiffusionOutput:
-        # Get parameters from request or arguments
-        if len(req.prompts) > 1:
-            raise ValueError(
-                """This model only supports a single prompt, not a batched request.""",
-                """Please pass in a single prompt object or string, or a single-item list.""",
-            )
-        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
-        if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        sampling_params_list = req.sampling_params_list
+        common = sampling_params_list[0]
+        prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
+        negative_prompts = [
+            None if isinstance(prompt, str) else prompt.get("negative_prompt") for prompt in req.prompts
+        ]
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": None,
+                "negative_prompt_embeds": None,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        prompt: list[str] | None = prompt_texts if prompt_embeds is None else None
+        negative_prompt: list[str] | None = None
+        if negative_prompt_embeds is None and any(value is not None for value in negative_prompts):
+            negative_prompt = [value or "" for value in negative_prompts]
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        if prompt is not None and not all(prompt):
+            raise ValueError("Prompt is required for Wan2.2 generation when prompt_embeds are not provided.")
+
+        height = common.height or 480
+        width = common.width or 832
+        num_frames = common.num_frames or 81
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -567,29 +600,20 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
-        # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        output_type = common.output_type or "np"
+        num_outputs_per_prompt = common.num_outputs_per_prompt or 1
+        attention_kwargs: dict | None = None
 
-        guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
-        guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
-            else (
-                guidance_scale[1]
-                if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
-                else guidance_low
-            )
-        )
+        guidance_low, guidance_high = resolve_wan_guidance_scales(common, default_guidance_scale=4.0)
 
         # record guidance for properties
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
 
         if boundary_ratio is None:
             boundary_ratio = 0.875
@@ -621,41 +645,49 @@ class Wan22Pipeline(
             # Fallback to text_encoder dtype if no transformer loaded
             dtype = self.text_encoder.dtype
 
-        # Seed / generator
-        if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+        generator = req.collate_request_generators(num_outputs_per_prompt, None)
+        request_latents = req.collate_request_tensors("latents", None)
 
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
+        do_classifier_free_guidance = guidance_low > 1.0 or guidance_high > 1.0
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=common.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            prompt_embeds = prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-            elif guidance_low > 1.0 or guidance_high > 1.0:
-                raise ValueError(
-                    "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
+            elif do_classifier_free_guidance:
+                _, negative_prompt_embeds = self.encode_prompt(
+                    prompt=[""] * req.num_reqs,
+                    negative_prompt=negative_prompt,
+                    do_classifier_free_guidance=True,
+                    num_videos_per_prompt=num_outputs_per_prompt,
+                    max_sequence_length=common.max_sequence_length or 512,
+                    device=device,
+                    dtype=dtype,
                 )
+
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
-        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        first_request = req.requests[0]
+        sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
             self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
             self._sample_solver = sample_solver
@@ -671,37 +703,41 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
-        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
-        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-        if isinstance(raw_image, list):
-            if len(raw_image) > 1:
-                logger.warning(
-                    """Received a list of image. Only a single image is supported by this model."""
-                    """Taking only the first image for now."""
-                )
-            raw_image = raw_image[0]
-        if raw_image is None:
-            image = None
-        elif isinstance(raw_image, str):
-            image = PIL.Image.open(raw_image)
-        else:
-            image = cast(PIL.Image.Image | torch.Tensor, raw_image)
+        images: list[PIL.Image.Image | torch.Tensor | None] = []
+        for request_prompt in req.prompts:
+            multi_modal_data = request_prompt.get("multi_modal_data", {}) if not isinstance(request_prompt, str) else {}
+            raw_image = multi_modal_data.get("image")
+            if isinstance(raw_image, list):
+                if len(raw_image) > 1:
+                    logger.warning("Received multiple images for one Wan request; using only the first image.")
+                raw_image = raw_image[0] if raw_image else None
+            if isinstance(raw_image, str):
+                raw_image = PIL.Image.open(raw_image)
+            images.append(cast(PIL.Image.Image | torch.Tensor | None, raw_image))
 
         latent_condition = None
         first_frame_mask = None
 
-        if self.expand_timesteps and image is not None:
+        if self.expand_timesteps and any(image is not None for image in images):
+            if not all(image is not None for image in images):
+                raise ValueError("Cannot batch Wan requests with a mix of provided and missing image conditions.")
             # I2V mode: encode image and prepare condition
             from diffusers.video_processor import VideoProcessor
 
             video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-            # Preprocess image
-            if isinstance(image, PIL.Image.Image):
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-                image_tensor = video_processor.preprocess(image, height=height, width=width)
-            else:
-                image_tensor = image
+            image_tensors = []
+            for image in images:
+                assert image is not None
+                if isinstance(image, PIL.Image.Image):
+                    image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                    image_tensor = video_processor.preprocess(image, height=height, width=width)
+                else:
+                    image_tensor = image.unsqueeze(0) if image.ndim == 3 else image
+                image_tensors.append(image_tensor)
+            image_tensor = DiffusionRequestBatch.collate_tensors(image_tensors, "image condition", None)
+            assert image_tensor is not None
+            image_tensor = image_tensor.repeat_interleave(num_outputs_per_prompt, dim=0)
 
             # Use out_channels for noise latents (not in_channels which includes condition)
             num_channels_latents = self.transformer_config.out_channels
@@ -717,7 +753,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=request_latents,
             )
 
             # Encode image condition
@@ -728,7 +764,6 @@ class Wan22Pipeline(
             image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
             image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
             latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
-            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
             # Normalize condition latents
             latents_mean = (
@@ -744,7 +779,7 @@ class Wan22Pipeline(
 
             # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
             first_frame_mask = torch.ones(
-                1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
+                batch_size, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
             )
             first_frame_mask[:, :, 0] = 0
         else:
@@ -759,7 +794,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=request_latents,
             )
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -836,8 +871,13 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        return split_diffusion_output_by_request(
+            DiffusionOutput(
+                output=output,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_outputs_per_prompt,
         )
 
     def predict_noise(

@@ -23,7 +23,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 _MODEL_REPO = "stabilityai/stable-audio-open-1.0"
 
@@ -62,9 +62,9 @@ def generate_stable_audio_short_clip(
     # Audio-output diffusion pipelines (those with ``support_audio_output = True``) now have
     # ``final_output_type="audio"`` set on the outer stage metadata as well as the inner request.
     assert first_output.final_output_type == "audio"
-    assert hasattr(first_output, "request_output") and first_output.request_output
+    assert isinstance(first_output, OmniRequestOutput) and first_output
 
-    req_out = first_output.request_output
+    req_out = first_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
@@ -92,6 +92,26 @@ def test_stable_audio_quantization_and_teacache() -> None:
         quantization="fp8",
         cache_backend="tea_cache",
         cache_config={"rel_l1_thresh": 0.2},
+    )
+    try:
+        audio = generate_stable_audio_short_clip(m)
+        assert_audio_valid(
+            audio,
+            sample_rate=_SAMPLE_RATE,
+            channels=2,
+            duration_s=_CLIP_DURATION_S,
+        )
+    finally:
+        m.close()
+
+
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
+def test_stable_audio_cpu_offload() -> None:
+    """Stable Audio Open with FP8 + CPU offload."""
+    m = Omni(
+        model="stabilityai/stable-audio-open-1.0",
+        quantization="fp8",
+        enable_cpu_offload=True,
     )
     try:
         audio = generate_stable_audio_short_clip(m)

@@ -40,6 +40,9 @@ def run_tts_generation(args) -> None:
         "ref_audio": args.ref_audio,
         "ref_text": args.ref_text,
     }
+    if args.stream:
+        payload["stream_format"] = "audio"
+        payload["response_format"] = "pcm"
     if args.max_new_tokens:
         payload["max_new_tokens"] = args.max_new_tokens
 
