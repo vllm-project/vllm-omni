@@ -771,7 +771,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                n_timesteps=int(extra.get("token2wav_n_timesteps", 3)),
             )
         finally:
             torch.set_default_dtype(previous_dtype)
