@@ -155,11 +155,12 @@ override.
 
 #### Verification
 
-All figures below were measured **through vLLM-Omni's own code paths** during
-maintainer review — the offline numbers by running `end2end.py`, the cloning
-and serving numbers through `/v1/audio/speech` — on a 4x L20X node, single
-card, with vLLM 0.27.0 / transformers 5.14.1 / torch 2.13.0+cu130. Transcript
-quality was checked by running Whisper over the generated audio.
+Measured on a single **NVIDIA A10G 24 GB** (`g5.2xlarge`), vLLM 0.27.1,
+transformers 5.15.1, torch 2.13.0+cu130, Amphion @ main on `PYTHONPATH`,
+checkpoint prepared with `init_vevo2_checkpoint.py`. Every number below comes
+from the documented command shown with it — nothing here is transcribed from a
+different code path. WER is whisper-small; F0 is `librosa.pyin` median over
+voiced frames.
 
 **T1 — zero-shot synthesis (offline `end2end.py`)**:
 
@@ -171,18 +172,30 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
     --ref-text "Philip stood undecided, his ears strained to catch the slightest sound."
 ```
 
-Observed: **7.5 s** of audio, Whisper **WER 0.105**, **RMS 0.177** — real
-speech, not silence, at 24 kHz mono.
+| metric | value |
+|--------|-------|
+| audio duration | 7.26 s (174,240 samples @ 24 kHz) |
+| Whisper WER | **0.000** (transcript exact) |
+| RMS | 0.180 |
+| peak | 1.000 |
+| distinct sample values | 30,975 (real speech, not silence) |
+| wall time | ~81 s including ~40 s of engine + Amphion pipeline load |
 
-**T2 — voice cloning through `/v1/audio/speech`** (swap the timbre reference):
+**T2 — voice cloning (swap `--ref-audio`, same text)**:
 
-| timbre reference | reference F0 | output F0 |
-|------------------|-------------:|----------:|
-| male             | 120.7 Hz     | 120.0 Hz  |
-| female           | 231.8 Hz     | 228.5 Hz  |
+```bash
+python examples/offline_inference/text_to_speech/vevo2/end2end.py \
+    --model ./ckpts/Vevo2 --text "The morning train arrives at the station on time." \
+    --ref-audio ./Amphion/models/vc/vevo/wav/{arabic_male,mandarin_female}.wav
+```
+
+| timbre reference | reference median F0 | output median F0 |
+|------------------|--------------------:|-----------------:|
+| `arabic_male`     | 120.7 Hz | 121.4 Hz |
+| `mandarin_female` | 231.8 Hz | 240.7 Hz |
 
 The output tracks the reference, confirming the cloning path conditions on the
-supplied clip rather than on a fixed speaker.
+supplied clip rather than a fixed speaker.
 
 **T3 — online serving (`/v1/audio/speech`)**:
 
@@ -198,14 +211,8 @@ curl -X POST http://127.0.0.1:8092/v1/audio/speech \
     }' --output output.wav
 ```
 
-| request | result |
-|---------|--------|
-| English | 200, 3.6 s |
-| Chinese | 200, 1.7 s |
-| no `ref_text` | 200 |
-| missing `ref_audio` | 400 |
-| empty `input` | 400 |
-| 2 concurrent requests | correct per-request audio; transcripts word-exact, not swapped |
+Server log confirms `Resolved architecture: Vevo2ForCausalLM` and
+`Resolved TTS serving adapter: Vevo2Adapter`.
 
 `ref_audio` accepts a local path (auto-base64), an HTTP(S) URL, or a
 `data:audio/wav;base64,...` data URI. The OpenAI `voice` field is required by
@@ -214,7 +221,18 @@ or a missing `ref_audio` is rejected with a 400 (the model also raises rather
 than emitting a silent WAV, so the offline path fails loudly too).
 
 Per-request `seed` is honoured on both paths: two identical seeded requests
-return byte-identical audio, and a different seed changes the output.
+return byte-identical audio, and a different seed changes the output. This is
+pinned by `test_vevo2_seed_is_reproducible` (offline) and
+`test_vevo2_same_seed_is_reproducible` (online).
+
+**Test suites** (`--run-level full_model`, `-m "tts and cuda"`):
+
+```
+tests/e2e/offline_inference/test_vevo2.py    4 passed in 132.96s
+tests/e2e/online_serving/test_vevo2.py      5 passed in 163.35s
+tests/model_executor/models/vevo2/  +
+  test_tts_adapter.py + tests/docs/        59 passed in 3.87s   (CPU)
+```
 
 **Peak VRAM**: ~7.55 GiB allocated for the pipeline itself.
 
