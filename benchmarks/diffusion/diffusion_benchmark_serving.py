@@ -1112,10 +1112,15 @@ def calculate_metrics(
     stage_durations_p50 = {s: float(np.percentile(v, 50)) for s, v in stage_duration_lists.items()}
     stage_durations_p99 = {s: float(np.percentile(v, 99)) for s, v in stage_duration_lists.items()}
 
+    failure_reasons = [o.error for o in error_outputs if o.error]
+    if failure_reasons:
+        logger.warning("Failed requests: %d, reasons: %s", len(error_outputs), failure_reasons)
+
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
         "failed_requests": len(error_outputs),
+        "failure_reasons": failure_reasons,
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,

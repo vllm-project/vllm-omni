@@ -75,6 +75,7 @@ class FusedMoE:
         # Current vLLM FusedMoE handles output reduction internally.
         kwargs.pop("reduce_results", None)
         # FusedMoE is now a factory function; call it to get a MoERunner.
+        # vLLM >= 0.27 exports this as FusedMoEFactory.
         from vllm.model_executor.layers.fused_moe import FusedMoEFactory as _FusedMoE
 
         moe_runner = _FusedMoE(prefix=prefix, **kwargs)

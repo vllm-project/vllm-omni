@@ -18,6 +18,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -90,6 +91,39 @@ def _all_gather_rank_values(value: Any) -> list[Any]:
     values: list[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(values, value)
     return values
+
+
+@dataclass
+class _DiffusionVllmModelConfig:
+    model: str
+    dtype: torch.dtype
+    quantization: str | None = None
+    quantization_config: Any | None = None
+    hf_config: Any | None = None
+    hf_text_config: Any | None = None
+    multimodal_config: Any | None = None
+    enforce_eager: bool = False
+    disable_cascade_attn: bool = False
+    enable_return_routed_experts: bool = False
+    is_moe: bool = False
+    # vLLM's VllmConfig.use_v2_model_runner reads this while resolving whether
+    # the model defaults to the V2 runner. Out-of-tree layers consult that
+    # property from __init__ (vllm-ascend's AscendRoutedExperts does), so the
+    # attribute has to exist even though diffusion never runs either runner.
+    runner_type: str = "generate"
+
+    def is_quantized(self) -> bool:
+        return self.quantization is not None
+
+    def is_model_moe(self) -> bool:
+        return self.is_moe
+
+    def is_nvfp4_quantized(self) -> bool:
+        return self.quantization == "modelopt_fp4"
+
+    @property
+    def is_diffusion(self) -> bool:
+        return False
 
 
 def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list[Any]:

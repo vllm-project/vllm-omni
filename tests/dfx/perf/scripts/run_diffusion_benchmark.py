@@ -876,6 +876,12 @@ def assert_result(
 ) -> None:
     """Assert that the expected number of requests completed."""
     completed = result.get("completed_requests", result.get("completed", 0))
+    failed = result.get("failed_requests", result.get("failed", 0))
+    if failed > 0:
+        reasons = result.get("failure_reasons", [])
+        print(f"\nFAILED {failed} request(s), reasons:")
+        for reason in reasons:
+            print(f"  - {reason}")
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
 
