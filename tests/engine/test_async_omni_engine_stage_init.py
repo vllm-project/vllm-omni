@@ -212,7 +212,7 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
 
     monkeypatch.setattr(
         runtime_mod,
-        "extract_stage_metadata",
+        "extract_legacy_stage_metadata",
         lambda cfg: _make_llm_metadata(cfg.stage_id),
     )
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
