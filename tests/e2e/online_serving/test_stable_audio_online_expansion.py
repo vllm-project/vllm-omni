@@ -5,8 +5,6 @@ E2E online serving test for Stable Audio Open text-to-audio diffusion.
 
 Stable Audio Open is served through the OpenAI-compatible
 `POST /v1/audio/generate` endpoint (JSON in, binary WAV out).
-This exercises the standard online path used by
-`examples/online_serving/text_to_audio/run_curl_stable_audio.sh`.
 """
 
 import os

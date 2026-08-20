@@ -29,7 +29,6 @@ nav:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
-      - Text-To-Audio: user_guide/examples/online_serving/text_to_audio.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
