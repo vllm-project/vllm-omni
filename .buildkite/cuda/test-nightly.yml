@@ -8,7 +8,7 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     key: nightly-simple-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    if: build.env("NIGHTLY") == "1"
     steps:
 
       - label: ":full_moon: Simple · CPU Coverage Test"
