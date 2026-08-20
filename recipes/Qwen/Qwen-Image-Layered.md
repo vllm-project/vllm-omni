@@ -68,3 +68,60 @@ python examples/offline_inference/image_to_image/image_edit.py \
   --color-format RGBA \
   --enable-layerwise-offload
 ```
+
+#### Verification
+
+Confirm that four non-empty RGBA layers were generated:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+from PIL import Image
+
+for index in range(4):
+    path = Path(f"layered_50_{index}.png")
+    assert path.is_file() and path.stat().st_size > 0, f"Missing or empty: {path}"
+
+    with Image.open(path) as image:
+        assert image.mode == "RGBA", f"{path}: expected RGBA, got {image.mode}"
+        print(f"{path}: size={image.size}, mode={image.mode}")
+PY
+```
+
+Expected output:
+
+```text
+layered_50_0.png: size=(...), mode=RGBA
+layered_50_1.png: size=(...), mode=RGBA
+layered_50_2.png: size=(...), mode=RGBA
+layered_50_3.png: size=(...), mode=RGBA
+```
+
+All four generated layers should also be manually inspected to confirm that they contain meaningful decomposed image content.
+
+#### Observed Results
+
+| Metric                         |                  Result |
+| ------------------------------ | ----------------------: |
+| Inference steps                |                   50/50 |
+| Output layers                  |                       4 |
+| Resolution                     |                     640 |
+| Color format                   |                    RGBA |
+| Layer-wise offload             |                 Enabled |
+| Total generation time          |                155.97 s |
+| Denoising loop                 |                  ~150 s |
+| Average denoising step         |                 ~3.00 s |
+| GPU memory after model loading |              ~17.17 GiB |
+| Peak observed GPU memory       | 26,863 MiB (~26.23 GiB) |
+
+During the main denoising loop, GPU utilization remained approximately 99–100%, while observed GPU memory stayed stable at approximately 26,863 MiB.
+
+#### Notes
+
+* `--enable-layerwise-offload` moves transformer blocks between host memory and GPU memory to reduce GPU-memory requirements.
+* The runtime reported layer-wise offloading across 60 `QwenImageTransformerBlock` instances.
+* The validated machine had 124 GiB of host RAM.
+* Validation used tensor parallel size 1 with no distributed execution.
+* Although `--cfg-scale 4.0` was supplied, true classifier-free guidance was not enabled because no negative prompt was provided.
+* The reported latency and memory measurements are observations from this specific L40S environment and should not be treated as performance guarantees.
+
