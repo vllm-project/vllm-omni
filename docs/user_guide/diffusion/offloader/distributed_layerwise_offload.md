@@ -63,6 +63,17 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--dlo-chunk-size-mb N` | Full-chunk target size in MiB for the chunked H2D + AllGather pipeline | `64` |
+| `--dlo-pin-budget-gb GB` | Pinned host-memory budget for DLO weight shards; unset means unlimited | `None` |
+| `--dlo-pin-failure-policy POLICY` | `fail` aborts on pin-budget or allocation failure; `whole_block_fallback` degrades to pageable whole-block transport | `fail` |
+
+A larger `--dlo-chunk-size-mb` reduces collective overhead per block but raises
+the device staging footprint; a smaller value improves H2D/AllGather overlap
+granularity. Set `--dlo-pin-budget-gb` to cap pinned host memory on nodes
+where replicas compete for it, and pair it with
+`--dlo-pin-failure-policy whole_block_fallback` to degrade to pageable
+whole-block transport instead of aborting when the budget is exceeded or a
+pinned allocation fails.
 
 ## Host-weight loading
 
@@ -136,8 +147,10 @@ must enter each collective.
   outside the Phase A shared-mmap support scope and falls back before model
   mutation to the ordinary TP-aware loader. DLO can stream that runtime layout,
   but it provides no shared-mmap host-memory benefit or guarantee.
-- HSDP plus AllGather is rejected to avoid double sharding. HSDP without
-  AllGather has limited end-to-end validation.
+- HSDP plus AllGather is supported through a single-ownership split: the
+  chunk engine streams the repeated DiT blocks, FSDP shards everything else,
+  and DLO's weight collective runs only on the HSDP fully-shard axis. HSDP
+  without AllGather has limited end-to-end validation.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
   DLO transfer path. With AllGather, every rank temporarily materializes the
   complete FP8 model in host memory before DLO retains only its shard. Other
