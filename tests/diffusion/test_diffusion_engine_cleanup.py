@@ -123,6 +123,121 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     assert engine.scheduler is custom_scheduler
 
 
+def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    od_config = SimpleNamespace(
+        custom_pipeline_args=None,
+        model_class_name="SchedulerInitializationFailurePipeline",
+        streaming_output=False,
+    )
+    initialization_error = RuntimeError("Scheduler initialization failed")
+    custom_scheduler = SimpleNamespace(
+        initialize=Mock(side_effect=initialization_error),
+        close=Mock(),
+    )
+    fake_executor = SimpleNamespace(
+        shutdown=Mock(),
+    )
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+        lambda *args, **kwargs: Mock(return_value=fake_executor),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_request_batch",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        DiffusionEngine(od_config, scheduler=custom_scheduler)
+
+    assert exc_info.value is initialization_error
+    custom_scheduler.initialize.assert_called_once_with(od_config)
+    custom_scheduler.close.assert_called_once_with()
+
+
+def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine, "_init_executor", lambda self, config: setattr(self, "executor", fake_executor)
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        Mock(side_effect=RuntimeError("KV initialization failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="KV initialization failed"):
+        DiffusionEngine(SimpleNamespace())
+
+    fake_executor.shutdown.assert_called_once_with()
+
+
+def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+    expected_profile_requests = [object()]
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    kv_cache_config = object()
+    kv_vllm_config = object()
+    od_config = SimpleNamespace(diffusion_kv_mode="paged_scheduler")
+
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_init_executor",
+        lambda self, config: setattr(self, "executor", fake_executor),
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_prepare_diffusion_kv_profile_requests",
+        lambda self: events.append("prepare-profile") or expected_profile_requests,
+    )
+
+    def initialize(executor, config, *, profile_requests):
+        events.append("profile-workers")
+        assert executor is fake_executor
+        assert config is od_config
+        assert profile_requests is expected_profile_requests
+        return kv_cache_config, 16, 16, kv_vllm_config
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        initialize,
+    )
+
+    def init_scheduler(self, config, scheduler, *args, **kwargs):
+        events.append("initialize-scheduler")
+        self.scheduler = SimpleNamespace(close=Mock())
+
+    monkeypatch.setattr(DiffusionEngine, "_init_scheduler", init_scheduler)
+    monkeypatch.setattr(DiffusionEngine, "_init_runtime_state", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_init_execute_fn", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_log_execution_mode", lambda self, config: None)
+
+    DiffusionEngine(od_config)
+
+    assert events == ["prepare-profile", "profile-workers", "initialize-scheduler"]
+
+
 @pytest.mark.asyncio
 async def test_step_compatibility_wrapper_returns_final_batch() -> None:
     engine = _make_engine()

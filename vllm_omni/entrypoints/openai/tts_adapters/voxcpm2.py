@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -16,7 +16,12 @@ class VoxCPM2Adapter(ARTTSAdapter):
     stage is present (and/or via ``model_arch``)."""
 
     stage_keys = frozenset({"latent_generator"})
+    model_archs = frozenset({"VoxCPM2TalkerForConditionalGeneration"})
     name = "voxcpm2"
+    # The talker architecture is authoritative and is tested ahead of every
+    # stage key, so a VoxCPM2 talker deployed under a stage key another model
+    # claims still resolves to VoxCPM2.
+    detect_priority = 10
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate VoxCPM2 request parameters. Returns error message or None."""
@@ -65,3 +70,12 @@ class VoxCPM2Adapter(ARTTSAdapter):
                 additional["voice_name"] = voice_lower
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)

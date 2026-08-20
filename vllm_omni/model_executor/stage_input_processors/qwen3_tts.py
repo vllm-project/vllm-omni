@@ -29,13 +29,29 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
-def _qwen3_tts_empty_finished_payload():
-    """Empty-but-finished stage payload. Returned instead of None on a degenerate
-    talker take so the Stage-1 wait gate releases (code2wav handles empty codec
-    input -> 0-sample audio, request finished) rather than the connector silently
-    dropping the request and Stage-1 hanging to connector_get_max_wait."""
+def _qwen3_tts_degenerate_finished_payload():
+    """Single-placeholder-frame finished payload for a degenerate talker take.
+
+    Returning ``None`` here makes the connector silently drop the request, and
+    Stage-1's wait gate then polls to ``connector_get_max_wait`` (#4463).
+    Returning an *empty* finished payload (zero codec frames) is no better on
+    full-payload deploys: it produces a zero-token Stage-1 request, which the
+    generation scheduler placeholder-schedules once and then never collects
+    (the ``required_tokens <= 0`` branch only finishes requests through the
+    async-chunk transfer adapter). The request is left parked in ``running``
+    while the base-scheduler fallback schedules it at ``num_new_tokens = -1``,
+    which killed the whole stage EngineCore before #5269 and no-ops after it,
+    so the request never finishes either way (#5196, #5471).
+
+    The placeholder is one all-ones frame, emitted flat (codebook-major, the
+    same wire format the normal path below produces). Its values are valid by
+    ``_filter_audio_codes_qwen3_tts`` (non-negative, not all-zero, below
+    ``_CODEBOOK_SIZE``), so the request runs the normal one-shot code2wav
+    path and finishes cleanly with a single frame (~80 ms at 12 Hz) of
+    placeholder audio.
+    """
     return {
-        "codes": {"audio": torch.zeros(0, dtype=torch.long)},
+        "codes": {"audio": torch.ones(_NUM_QUANTIZERS_DEFAULT, dtype=torch.long)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
 
@@ -148,21 +164,31 @@ def talker2code2wav_async_chunk(
         if finished:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
             )
         return None
 
     if ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        first_chunk = chunk_index <= 0
         emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
         if not emit:
             return None
         if context_length == 0:
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                meta=MetaStruct(
+                    request_id=request_id,
+                    left_context_size=0,
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
             )
     else:
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
         if use_first_chunk and length <= initial_chunk_size:
@@ -177,15 +203,18 @@ def talker2code2wav_async_chunk(
             chunk_length = adjusted % chunk_size
             context_length = chunk_length if chunk_length != 0 else chunk_size
 
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    if finished and first_chunk:
+        context_length = length
 
-    # Prepend the bounded ref_code tail to the first emitted chunk so Code2Wav
-    # can cache the same reference context that mainline would otherwise send on
-    # every chunk. Follow-up chunks send only a metadata handle; Code2Wav restores
-    # this context locally before decode.
+    # Code2Wav keeps the quantizer/conv/Transformer context per request. Ship
+    # only the newly completed codec frames after the first chunk.
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][-context_length:]
+    left_context_size = 0
+
+    # ICL reference codes are part of the first decoder initialization only.
+    # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
+    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -215,13 +244,12 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            ref_context_request_id = request_id
-            emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
+                ref_context_request_id = request_id
                 ref_frames = ref_context.tolist()
                 window_frames = ref_frames + window_frames
                 ref_context_included = True
-            left_context_size += ref_context_size
+                left_context_size = ref_context_size
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
@@ -231,6 +259,7 @@ def talker2code2wav_async_chunk(
     )
 
     meta = MetaStruct(
+        request_id=request_id,
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
     )
@@ -400,7 +429,7 @@ def talker2code2wav_full_payload(
             type(pooling_output).__name__,
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
 
     # codes.audio — try flat dotted first (flatten_payload), then nested fallback.
     audio = pooling_output.get("codes.audio")
@@ -415,7 +444,7 @@ def talker2code2wav_full_payload(
             list(pooling_output.keys()),
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
     audio = audio.to(torch.long)
     audio = _filter_audio_codes_qwen3_tts(audio)
     if audio.numel() == 0:
@@ -424,7 +453,7 @@ def talker2code2wav_full_payload(
             "filter (negative/all-zero/out-of-range rows dropped) for req=%s.",
             rid,
         )
-        return _qwen3_tts_empty_finished_payload()
+        return _qwen3_tts_degenerate_finished_payload()
 
     output_token_ids = list(getattr(request, "output_token_ids", None) or [])
     seq_len = max(len(output_token_ids) - 1, 0)

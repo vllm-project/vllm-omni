@@ -43,7 +43,7 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
-# (model, stage_configs_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+# (model, deploy_config_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
 _OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG)
 
 
@@ -138,7 +138,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

@@ -1,6 +1,6 @@
 # Composable parallel strategies
 
-In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel strategy* on top of the existing stage configs. A strategy YAML maps each pipeline stage (by its `model_stage` name) to a stack of axis declarations — one per parallelism dimension — that the engine translates into per-stage parallel sizing (`tensor_parallel_size`, `data_parallel_size`, `pipeline_parallel_size`, expert-parallel toggle, replica count) and, when relevant, an orchestrator-wide load-balancer policy.
+In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel strategy* on top of the registered pipeline and deploy config. A strategy YAML maps each pipeline stage (by its `model_stage` name) to a stack of axis declarations — one per parallelism dimension — that the engine translates into per-stage parallel sizing (`tensor_parallel_size`, `data_parallel_size`, `pipeline_parallel_size`, expert-parallel toggle, replica count) and, when relevant, an orchestrator-wide load-balancer policy.
 
 Strategies are intentionally narrow: each one only writes the axes it declares, leaving every other engine arg untouched. This makes a strategy file a small, reusable overlay you can swap independently of the deploy YAML (see `configuration/stage_configs.md`).
 
@@ -34,11 +34,7 @@ Two additional `StrategySpec` slots — `layer_hook_specs` and `kernel_specs` �
 | Flag | Description |
 |------|-------------|
 | `--strategy-config PATH` | Path to a `strategy.yaml`. Only takes effect on registry-based deploy paths (`--deploy-config` or the bundled default deploy YAML). Its derived sizing is overlaid onto the merged stages *before* CLI overrides. |
-| `--stage-configs-path PATH` | **Legacy.** Loads the old `stage_args` YAML schema for un-migrated models. Passing `--strategy-config` together with this path is silently inapplicable — vLLM-Omni emits a warning and the strategy is ignored (see `vllm_omni/entrypoints/utils.py`, lines 372–380). |
 | `--omni-lb-policy POLICY` | Orchestrator-wide load-balancer policy. Strategy-derived from any `stage_replica` axis; an explicit CLI value wins and must match the derived one or `AsyncOmniEngine` raises `Conflicting load-balancer policy` at construction. |
-
-!!! warning
-    `--strategy-config` cannot be used with `--stage-configs-path` (the legacy deploy path). If your model has not been migrated to the registry-based pipeline yet, the strategy is silently dropped with a warning. Migrate to a registry-based model or use `--deploy-config` to apply a strategy.
 
 ## Sub-schemas
 
@@ -199,7 +195,7 @@ Because `omni_lb_policy` is read once at `AsyncOmniEngine` construction — not 
 
 Default: no default — required for every entry under `strategies:`.
 
-Strategy keys MUST be `model_stage` *names* (strings), the same labels stage configs use for `engine_args.model_stage` (see [`model_stage` in `stage_configs.md`](stage_configs.md#engine_argsmodel_stage)). Integer `stage_id` values are not accepted; the resolver matches on `model_stage` exactly (`_resolve_stage` in `vllm_omni/config/composable_parallel/apply.py`).
+Strategy keys MUST be `model_stage` *names* (strings), the same labels defined by [`StagePipelineConfig.model_stage`](stage_configs.md#pipeline-configuration). Integer `stage_id` values are not accepted; the resolver matches on `model_stage` exactly (`_resolve_stage` in `vllm_omni/config/composable_parallel/apply.py`).
 
 ## Common pitfalls
 
@@ -215,17 +211,6 @@ Strategy keys MUST be `model_stage` *names* (strings), the same labels stage con
 
 !!! warning "Mixing CLI overrides with a strategy on the same axis"
     A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted from `_reconcile_strategy_with_cli`. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
-
-!!! warning "Passing `--strategy-config` against the legacy `--stage-configs-path`"
-    Composable parallel only applies on the registry-based deploy path. If a model still resolves through the legacy `stage_args` YAML (loaded via `--stage-configs-path`), `--strategy-config` is silently inapplicable and emits:
-
-    ```text
-    --strategy-config (<path>) was provided but model '<model>' resolves via the
-    legacy stage_configs YAML path, which does not support composable-parallel
-    strategies; the strategy is ignored. Use a registry-based model to apply it.
-    ```
-
-    Migrate the model to the new deploy schema (see `configuration/stage_configs.md`) before applying a strategy.
 
 !!! warning "Conflicting `omni_lb_policy` across stages"
     `omni_lb_policy` is a single pipeline-wide knob. If two `stage_replica` axes in different stages derive different policies, `apply_strategy_specs` raises:

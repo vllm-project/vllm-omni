@@ -9,7 +9,7 @@ This guide walks through the process of adding a new multi-stage model to vLLM-O
 3. [Step-by-Step Implementation](#step-by-step-implementation)
 4. [Key Components](#key-components)
 5. [Model Registration](#model-registration)
-6. [Stage Configuration](#stage-configuration)
+6. [Pipeline and Deploy Configuration](#pipeline-and-deploy-configuration)
 7. [Stage Input Processors](#stage-input-processors)
 8. [Testing](#testing)
 9. [Adding a Model Recipe](#adding-a-model-recipe)
@@ -48,8 +48,8 @@ vllm_omni/deploy/
 ```
 
 New in-tree models should register their `PipelineConfig` in
-`vllm_omni/config/pipeline_registry.py`; use `--stage-configs-path` only for
-custom legacy `stage_args` YAMLs.
+`vllm_omni/config/pipeline_registry.py`; use `--deploy-config` for custom
+deployment YAMLs.
 
 ## Step-by-Step Implementation
 
@@ -316,18 +316,28 @@ _OMNI_MODELS = {
 
 The registry uses lazy loading, so the model class is imported only when needed.
 
-## Stage Configuration
+## Pipeline and Deploy Configuration
 
-Create a YAML configuration file in `vllm_omni/deploy/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/deploy/qwen3_omni_moe.yaml).
+Define fixed topology in `vllm_omni/model_executor/models/<model>/pipeline.py`
+with `PipelineConfig` and `StagePipelineConfig`, then register it in
+`vllm_omni/config/pipeline_registry.py`. For a complete example, see the
+[Qwen3-Omni pipeline](gh-file:vllm_omni/model_executor/models/qwen3_omni/pipeline.py).
 
-### Key Configuration Fields
+### Pipeline topology fields
 
-- **`model_stage`**: Which stage to run ("thinker", "talker", "code2wav", etc.)
-- **`model_arch`**: The model architecture name (must match registry)
-- **`engine_input_source`**: List of stage IDs that provide input to this stage
-- **`custom_process_input_func`**: Function to process inputs from previous stages
-- **`final_output`**: Whether this stage produces the final output (True/False)
-- **`final_output_type`**: Type of final output ("text", "audio", "image", etc.)
+- **`model_stage`**: Logical stage name ("thinker", "talker", "code2wav", etc.)
+- **`execution_type`**: Runtime family (`LLM_AR`, `LLM_GENERATION`, or `DIFFUSION`)
+- **`model_arch`**: Stage architecture name, when different from the pipeline default
+- **`input_sources`**: Upstream stage IDs that provide input to this stage
+- **`custom_process_input_func`**: Function that processes inputs from previous stages
+- **`final_output`**: Whether this stage produces user-facing output
+- **`final_output_type`**: Output modality ("text", "audio", "image", etc.)
+- **`owns_tokenizer`**: Whether this stage owns the pipeline tokenizer
+
+Create the matching runtime defaults in `vllm_omni/deploy/<model>.yaml` and set
+`PipelineConfig.default_deploy_config_name` to that file. The deploy YAML owns
+GPU placement, memory sizing, parallelism, connectors, and sampling defaults;
+it must not redefine topology fields.
 
 ## Stage Input Processors
 
@@ -374,7 +384,7 @@ The stage transition process follows these steps:
 
 2. **Transition Detection**: The orchestrator checks if there's a next stage and calls `process_engine_inputs()` on it
 
-3. **Input Processing**: The stage input processor configured in stage YAML (under `vllm_omni/model_executor/stage_input_processors/`) handles the transition:
+3. **Input Processing**: The stage input processor registered by the pipeline (implemented under `vllm_omni/model_executor/stage_input_processors/`) handles the transition:
    ```python
    def process_engine_inputs(
        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
@@ -577,7 +587,7 @@ Adding a new model to vLLM-Omni involves:
 1. **Create model directory structure** with stage implementations
 2. **Implement unified model class** that orchestrates stages
 3. **Register model** in `registry.py`
-4. **Create stage configuration** YAML file
+4. **Define pipeline topology and deploy defaults** in `pipeline.py` and `vllm_omni/deploy/`
 5. **Implement stage input processors** for stage transitions
 6. **Write tests** to verify functionality
 7. **Add model recipe** to the [vllm-project/recipes](https://github.com/vllm-project/recipes) repository (see [Adding a Model Recipe](#adding-a-model-recipe) section)
@@ -590,7 +600,8 @@ For a complete reference implementation, see:
 - **Thinker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py`
 - **Talker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_talker.py`
 - **Code2Wav**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`
-- **Stage config**: `vllm_omni/deploy/qwen3_omni_moe.yaml`
+- **Pipeline topology**: `vllm_omni/model_executor/models/qwen3_omni/pipeline.py`
+- **Deploy config**: `vllm_omni/deploy/qwen3_omni_moe.yaml`
 - **Input processors**: `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
 - **Registry**: `vllm_omni/model_executor/models/registry.py`
 - **Testing**: `vllm_omni/tests/e2e/offline_inference/test_qwen3_omni.py`
@@ -598,4 +609,4 @@ For a complete reference implementation, see:
 For more information, see:
 - [Architecture Overview](../../design/architecture_overview.md)
 - [Supported Models](../../models/supported_models.md)
-- [Stage Configuration Guide](../../configuration/stage_configs.md)
+- [Pipeline and Deploy Configuration Guide](../../configuration/stage_configs.md)

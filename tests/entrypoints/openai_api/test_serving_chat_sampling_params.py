@@ -95,6 +95,7 @@ def test_serving_boundary_normalizes_declared_root_and_nested_extras(serving_cha
         messages=[],
         modalities=["image"],
         num_inference_steps=7,
+        quality="high",
         size="768x512",
         negative_prompt="avoid blur",
         lora={"name": "adapter"},
@@ -110,6 +111,7 @@ def test_serving_boundary_normalizes_declared_root_and_nested_extras(serving_cha
     }
     assert diffusion_request_args["cfg_text_scale"] == 7.0
     assert diffusion_request_args["num_inference_steps"] == 7
+    assert diffusion_request_args["quality"] == "high"
     assert diffusion_request_args["size"] == "768x512"
     assert diffusion_request_args["negative_prompt"] == "avoid blur"
     assert diffusion_request_args["lora"] == {"name": "adapter"}
@@ -131,6 +133,19 @@ def test_unknown_root_extra_does_not_claim_canonical_extra(serving_chat):
         "pipeline_option": "canonical-value",
     }
     assert "pipeline_option" not in diffusion_request_args
+
+
+def test_serving_boundary_rejects_invalid_quality(serving_chat):
+    serving_chat._diffusion_extra_body_params = frozenset()
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[],
+        modalities=["image"],
+        quality="medium",
+    )
+
+    with pytest.raises(ValueError, match="quality must be one of"):
+        serving_chat._normalize_diffusion_request_args(request)
 
 
 def test_unregistered_cfg_scale_aliases_common_true_cfg_scale(serving_chat):
@@ -226,6 +241,7 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(serving_chat, 
         negative_prompt="avoid blur",
         cfg_scale=7.0,
         true_cfg_scale=2.0,
+        quality="high",
         extra_body={"extra_args": {"solver": "ddim"}},
     )
 
@@ -239,6 +255,7 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(serving_chat, 
     }
     assert sampling_params.true_cfg_scale == 2.0
     assert sampling_params.num_inference_steps == 7
+    assert sampling_params.quality == "high"
     assert (sampling_params.height, sampling_params.width) == (512, 768)
     assert captured["prompt"]["negative_prompt"] == "avoid blur"
     assert response.error.message == "No output generated from AsyncOmni"
@@ -310,6 +327,7 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(serving_chat, 
     assert sampling_params_list[0].extra_args == {"target_h": 512, "target_w": 768}
     diffusion_params = sampling_params_list[1]
     assert diffusion_params.num_inference_steps == 7
+    assert diffusion_params.quality is None
     assert (diffusion_params.height, diffusion_params.width) == (512, 768)
     assert diffusion_params.extra_args == {"solver": "euler"}
     assert captured["prompt"]["negative_prompt"] == "avoid blur"

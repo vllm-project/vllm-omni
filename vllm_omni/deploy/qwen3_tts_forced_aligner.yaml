@@ -1,10 +1,12 @@
-# Reference deploy knobs for Qwen/Qwen3-ForcedAligner-0.6B, the shared forced
-# aligner for streaming TTS word timestamps. Pass with --forced-aligner-config;
-# --forced-aligner overrides the model path without editing this file.
+# Default deploy knobs for Qwen/Qwen3-ForcedAligner-0.6B, the TTS word-timestamp
+# aligner. These configure the pooling stage that --forced-aligner appends to
+# the pipeline tail (see utils.forced_aligner.inject_forced_aligner_stage); they are
+# NOT a standalone engine. Pass --forced-aligner-config to override this file;
+# --forced-aligner sets just the model path.
 #
-# Run as LLM(runner="pooling") with pooling_task="token_classify". Prompt tokens,
-# chat template and word segmentation are Qwen-specific and live in
-# qwen3_force_align_processor (not configurable here).
+# The stage runs the model with runner="pooling" + pooling_task="token_classify".
+# Prompt tokens, chat template and word segmentation are Qwen-specific and live
+# in qwen3_force_align_processor (not configurable here).
 
 forced_aligner:
   model: Qwen/Qwen3-ForcedAligner-0.6B
