@@ -125,6 +125,42 @@ def _trace_first_codec_step(
 
 
 
+def _trace_talker_condition(
+    *,
+    request_id: str,
+    token_ids: torch.Tensor,
+    condition: torch.Tensor,
+) -> None:
+    """Write the numeric condition used by this request for oracle replay."""
+    root = os.environ.get(_FIRST_LOGITS_TRACE_ENV, "").strip()
+    if not root or not request_id.startswith("chatcmpl-"):
+        return
+    try:
+        ids = token_ids.detach().cpu().reshape(-1).tolist()
+        values = condition.detach().float().cpu().contiguous()
+        payload = {
+            "stage": "talker.condition",
+            "request_id": request_id,
+            "tts_token_ids": {
+                "shape": [int(dim) for dim in token_ids.shape],
+                "numel": int(token_ids.numel()),
+                "values": [int(item) for item in ids],
+            },
+            "condition": {
+                "shape": [int(dim) for dim in values.shape],
+                "numel": int(values.numel()),
+                "sha256": hashlib.sha256(values.numpy().tobytes()).hexdigest(),
+                "values": [float(item) for item in values.reshape(-1).tolist()],
+            },
+        }
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "condition_trace.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("minicpmo45_condition_trace_failed error=%s", exc)
+
+
+
 def _max_audio_tokens(condition_tokens: int) -> int:
     """Bound codec generation with a conservative text-length estimate.
 
@@ -372,6 +408,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 token_ids,
                 hidden_states,
                 native_duplex=native_duplex,
+            )
+            _trace_talker_condition(
+                request_id=str(info_dict.get("request_id", "0")),
+                token_ids=token_ids,
+                condition=full_embeds,
             )
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
             request_id = str(info_dict.get("request_id", "0"))
