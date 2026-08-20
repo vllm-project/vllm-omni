@@ -1058,6 +1058,69 @@ class TestCodePredictorFusedProjections:
             assert fname in loaded, f"{fname} was not loaded from nested code_predictor shards"
             assert torch.equal(after[fname], expected), f"{fname} does not match the packed shard order"
 
+    def test_wrapper_load_weights_accepts_incremental_non_layer_shard(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Qwen3-Omni splits code-predictor weights across checkpoint shards.
+
+        Its first shard contains the transformer layers, while the next shard
+        re-enters the wrapper with only codec embeddings and LM heads. Loading
+        that second shard must not require every fused layer to appear again.
+        """
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        first_shard: list[tuple[str, torch.Tensor]] = []
+        second_shard: list[tuple[str, torch.Tensor]] = []
+        for name, param in predictor.named_parameters(remove_duplicate=False):
+            if name.startswith("model.codec_embedding.") or name.startswith("lm_head."):
+                second_shard.append((name, torch.randn_like(param)))
+            elif name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                first_shard.extend(
+                    [
+                        (f"{prefix}.q_proj.weight", torch.randn(q_size, hidden)),
+                        (f"{prefix}.k_proj.weight", torch.randn(kv_size, hidden)),
+                        (f"{prefix}.v_proj.weight", torch.randn(kv_size, hidden)),
+                    ]
+                )
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                first_shard.extend(
+                    [
+                        (f"{prefix}.gate_proj.weight", torch.randn(inter, hidden)),
+                        (f"{prefix}.up_proj.weight", torch.randn(inter, hidden)),
+                    ]
+                )
+            else:
+                first_shard.append((name, torch.randn_like(param)))
+
+        assert first_shard and second_shard
+        common_mod.CodePredictorWrapper.load_weights(predictor, first_shard)
+        loaded_second = common_mod.CodePredictorWrapper.load_weights(predictor, second_shard)
+
+        assert {name for name, _ in second_shard} <= loaded_second
+
     def test_load_weights_raises_on_incomplete_shards(self, loaded_target_classes) -> None:
         """Missing one of q/k/v (or gate/up) must surface a clear error.
 

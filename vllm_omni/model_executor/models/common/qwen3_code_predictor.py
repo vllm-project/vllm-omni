@@ -482,6 +482,13 @@ class CodePredictorBaseModel(nn.Module):
         """
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
+        fused_layer_prefixes = {
+            name.split(marker, 1)[0]
+            for name in params_dict
+            for marker in (".self_attn.qkv_proj.", ".mlp.gate_up_proj.")
+            if marker in name
+        }
+        touched_fused_layers: set[str] = set()
 
         # layer_prefix -> {fused_name: {kind: {slice_idx: shard_tensor}}}
         # where ``kind`` is "weight" or "bias".
@@ -540,6 +547,9 @@ class CodePredictorBaseModel(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            touched_fused_layers.update(
+                layer_prefix for layer_prefix in fused_layer_prefixes if name.startswith(f"{layer_prefix}.")
+            )
             if _route_shard(name, loaded_weight, self._FUSED_QKV_SHARDS, parent_attr="self_attn"):
                 continue
             if _route_shard(name, loaded_weight, self._FUSED_GATE_UP_SHARDS, parent_attr="mlp"):
@@ -563,7 +573,9 @@ class CodePredictorBaseModel(nn.Module):
         missing_fused = sorted(
             name
             for name in params_dict
-            if (".self_attn.qkv_proj." in name or ".mlp.gate_up_proj." in name) and name not in loaded_params
+            if (".self_attn.qkv_proj." in name or ".mlp.gate_up_proj." in name)
+            and name not in loaded_params
+            and any(name.startswith(f"{layer_prefix}.") for layer_prefix in touched_fused_layers)
         )
         if missing_fused:
             raise RuntimeError(
