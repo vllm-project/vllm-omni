@@ -21,7 +21,7 @@
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
 #              Uses --pytest-mark / PYTEST_MARK for pytest -m (hardware via JSON marks).
-#              When unset, -m defaults to MODEL_TYPE family only (omni / tts / diffusion).
+#              When unset, -m defaults to H800 (CUDA stability fleet; use --pytest-mark A3 on NPU).
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
 #              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
@@ -45,8 +45,8 @@
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
-#     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. "diffusion and H800 and local_model").
-#     Otherwise -m is MODEL_TYPE family only. PYTEST_MARK is rejected unless stability is enabled.
+#     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
+#     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni; tts → qwen3_tts; diffusion → qwen_image + wan22 + hunyuan_image; all → all five
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
@@ -610,21 +610,24 @@ def _stability_model_matches(model_types: list[str], families: tuple[str, ...]) 
     return bool(set(model_types) & set(families))
 
 
-def _stability_family_marker_expr(model_types: list[str]) -> str:
-    """Default pytest -m when --pytest-mark is unset: MODEL_TYPE family only."""
-    if "all" in model_types:
-        return "omni or tts or diffusion"
-    if len(model_types) == 1:
-        return model_types[0]
-    return f"({' or '.join(model_types)})"
+STABILITY_DEFAULT_PYTEST_MARK = "H800"
+
+
+def _shell_quote_pytest_mark(marker_expr: str) -> str:
+    """Shell-safe pytest ``-m`` value for generated bash job scripts."""
+    expr = (marker_expr or "").strip()
+    if not expr:
+        raise ValueError("pytest -m expression must not be empty")
+    return shlex.quote(expr)
 
 
 def _stability_pytest_mark(model_types: list[str]) -> str:
-    """Return explicit --pytest-mark or the MODEL_TYPE family default."""
+    """Return explicit --pytest-mark or the default CUDA stability hardware marker."""
+    del model_types  # MODEL_TYPE filters scripts; default -m is hardware-specific.
     override = (os.environ.get("PYTEST_MARK") or "").strip()
     if override:
         return override
-    return _stability_family_marker_expr(model_types)
+    return STABILITY_DEFAULT_PYTEST_MARK
 
 
 def _write_job_script(key: str, script_lines: list[str], jobs_dir: Path) -> None:
@@ -739,7 +742,7 @@ def run_local_mode(
 
         if rel_paths:
             paths_arg = " ".join(shlex.quote(p) for p in rel_paths)
-            pytest_line = f'pytest -sv -m "{marker_expr}" {paths_arg}'
+            pytest_line = f"pytest -sv -m {_shell_quote_pytest_mark(marker_expr)} {paths_arg}"
             slug = _local_job_slug(LABEL_SUBSTR)
             key = f"local_pytest_{slug}"
             header = (
@@ -759,7 +762,7 @@ def run_local_mode(
         for json_rel, runner_rel in perf_pairs:
             json_name = Path(json_rel).name
             pytest_line = (
-                f'pytest -s -v -m "{marker_expr}" '
+                f"pytest -s -v -m {_shell_quote_pytest_mark(marker_expr)} "
                 f"{shlex.quote(runner_rel)} "
                 f"--test-config-file {shlex.quote(json_rel)}"
             )
@@ -790,7 +793,7 @@ def run_local_mode(
             )
         return matched
 
-    pytest_line = f'pytest -sv -m "{marker_expr}"'
+    pytest_line = f"pytest -sv -m {_shell_quote_pytest_mark(marker_expr)}"
     key = "local_pytest"
     header = f"# Local marker tests — MODEL_TYPE={','.join(model_types)}"
     script_lines = [
@@ -823,13 +826,17 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
         if not rel_path.is_file():
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
-        pytest_line = f'pytest -s -v --run-level full_model -m "{marker_expr}" {rel_posix}'
+        pytest_line = (
+            f"pytest -s -v --run-level full_model "
+            f"-m {_shell_quote_pytest_mark(marker_expr)} "
+            f"{shlex.quote(rel_posix)}"
+        )
         matched += 1
         script_lines = [
             "#!/usr/bin/env bash",
             f"# Stability: {key} — {rel_posix}",
             f"# pytest -m {marker_expr!r}"
-            + (" (--pytest-mark)" if mark_from_cli else " (MODEL_TYPE default)"),
+            + (" (--pytest-mark)" if mark_from_cli else f" (default {STABILITY_DEFAULT_PYTEST_MARK})"),
             "set -euo pipefail",
             f'cd "{REPO_ROOT}"',
             pytest_line,
