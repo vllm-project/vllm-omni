@@ -17,6 +17,55 @@ substantially more GPU memory:
 MODEL=robbyant/lingbot-video-moe-30b-a3b bash run_server.sh
 ```
 
+## Prompt rewriter
+
+LingBot-Video is trained on structured JSON captions. The optional rewriter
+accepts a plain prompt and runs the official two-turn flow before text
+encoding: the base VLM first expands the prompt, then the rewriter LoRA maps
+the expansion to JSON. Prompts that already start with a JSON object pass
+through unchanged. The rewriter is disabled by default.
+
+The recommended deployment keeps the 27B rewriter outside the diffusion
+worker. Serve the base and adapter-applied mapping models behind
+OpenAI-compatible chat endpoints, then configure the diffusion stage:
+
+```bash
+MODEL=robbyant/lingbot-video-dense-1.3b bash run_server.sh --stage-overrides '{"0":{"model_config":{
+    "rewriter_url":"http://127.0.0.1:30000",
+    "rewriter_map_url":"http://127.0.0.1:30001",
+    "rewriter_expand_model":"Qwen/Qwen3.6-27B",
+    "rewriter_map_model":"lingbot-video-rewriter"
+  }}}'
+```
+
+`rewriter_map_url` may be omitted when one endpoint serves both model names.
+The mapping model must have
+`robbyant/lingbot-video-rewriter-lora` applied or merged. The request fails
+if the mapping turn does not produce parseable JSON; it does not silently run
+the diffusion model with the out-of-distribution plain prompt.
+
+For offline or tightly coupled deployments, the worker can lazily load the
+base model and PEFT adapter on the first plain-text request:
+
+```bash
+MODEL=robbyant/lingbot-video-dense-1.3b bash run_server.sh --stage-overrides '{"0":{"model_config":{
+    "rewriter_model_path":"Qwen/Qwen3.6-27B",
+    "rewriter_adapter_path":"robbyant/lingbot-video-rewriter-lora",
+    "rewriter_device_map":"auto"
+  }}}'
+```
+
+This path requires `peft` and enough memory for the rewriter in addition to
+LingBot. Configure only one of `rewriter_url` and `rewriter_model_path`.
+In distributed execution, rank 0 runs the external or in-process rewriter and
+broadcasts the resulting caption to the other ranks.
+
+Set `"rewriter_auto_negative":true` in the same `model_config` to run one
+additional base-model turn that removes negative-prompt terms which conflict
+with the generated caption. This only edits LingBot's categorized JSON
+negative prompt: free-text or malformed negative prompts pass through
+unchanged, and the model cannot add or reorder terms.
+
 ## Text to image
 
 The image endpoint selects T2I mode and always generates one frame:
