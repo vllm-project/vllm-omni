@@ -152,6 +152,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
+    silence_ban_frames: int
     has_sampling_extra_args: bool
     custom_voice_dir: str
     task_type: str
@@ -387,6 +388,7 @@ class OmniStageModelConfig:
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     has_sampling_extra_args: bool = False
     custom_voice_dir: str | None = None
     task_type: str | None = None

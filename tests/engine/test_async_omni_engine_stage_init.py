@@ -15,6 +15,7 @@ from vllm_omni.engine.stage_init_utils import (
     ReplicaInitPlan,
     build_stage0_input_processor,
     compute_replica_layout,
+    split_devices_for_replicas,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
 
@@ -230,6 +231,76 @@ def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
 
     assert replicas_per_stage == [2]
     assert replica_devices_map == {0: ["0,1", "2,3"]}
+
+
+@pytest.mark.parametrize("num_replicas", [1, 2, 4])
+def test_split_devices_for_replicas_returns_one_slot_per_replica_when_devices_unset(num_replicas):
+    """``devices`` is optional, and the result is indexed by replica id.
+
+    A stage that declares ``num_replicas`` without ``devices`` lets every
+    replica inherit the launcher's CUDA_VISIBLE_DEVICES, so each one still
+    needs its own (empty) slot.
+    """
+    assert split_devices_for_replicas(None, num_replicas, 1, 0) == [None] * num_replicas
+
+
+def test_compute_replica_layout_covers_every_replica_when_devices_unset():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=types.SimpleNamespace(num_replicas=3),
+    )
+
+    replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
+
+    assert replicas_per_stage == [3]
+    assert replica_devices_map == {0: [None, None, None]}
+
+
+def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatch):
+    """Regression: a multi-replica stage with no ``devices`` must still plan.
+
+    ``_build_logical_stage_init_plans`` indexes ``replica_devices_map`` by
+    replica id, so a short list raised ``IndexError`` for every replica after
+    the first.
+    """
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={},
+        runtime=types.SimpleNamespace(num_replicas=3),
+    )
+    runtime = StageRuntime(
+        stage_configs=[stage_cfg],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "extract_legacy_stage_metadata",
+        lambda cfg: _make_llm_metadata(cfg.stage_id),
+    )
+    monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+    monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_args, **_kwargs: (types.SimpleNamespace(), object))
+
+    replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
+    stage_plans = runtime._build_logical_stage_init_plans(
+        omni_transfer_config=None,
+        replicas_per_stage=replicas_per_stage,
+        replica_devices_map=replica_devices_map,
+    )
+
+    assert [replica.replica_id for replica in stage_plans[0].replicas] == [0, 1, 2]
+    assert [replica.stage_cfg.runtime.devices for replica in stage_plans[0].replicas] == [None, None, None]
 
 
 def test_collect_initialized_clients_for_cleanup_deduplicates_clients():

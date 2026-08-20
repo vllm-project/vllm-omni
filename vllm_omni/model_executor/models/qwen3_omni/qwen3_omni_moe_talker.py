@@ -58,8 +58,10 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             "talker.model.": "language_model.model.",
             # Codec head remains separate (outputs audio codes, not text)
             "talker.codec_head.": "codec_head.",
-            # Code predictor: Now matches HF structure exactly (has .model sub-module)
-            # e.g., "talker.code_predictor.model.codec_embedding.0" → "code_predictor.model.codec_embedding.0"
+            # Code predictor: keep the subtree under ``code_predictor.``.
+            # ``CodePredictorWrapper.load_weights`` accepts both current
+            # ``model.*`` body names and legacy body-direct names such as
+            # ``layers.*`` / ``codec_embedding.*``.
             "talker.code_predictor.": "code_predictor.",
             # Projection layers
             "talker.text_projection.": "text_projection.",
