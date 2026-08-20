@@ -3,7 +3,6 @@
 import atexit
 import base64
 import concurrent.futures
-import gc
 import hashlib
 import io
 import logging
@@ -14,7 +13,9 @@ import random
 import re
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -670,59 +671,152 @@ def _serialize_whisper_model_download(model_size: str = "small"):
         f.close()
 
 
-def _whisper_transcribe_in_current_process(
-    output_path: str, model_size: str = "small", language: str | None = None
-) -> str:
-    import whisper
-
+def _select_whisper_device() -> str:
     device_index = None
     from vllm_omni.platforms import current_omni_platform
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
         # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0. Loading Whisper there, once per concurrent
-        # request, competes for VRAM and OOMs. Only borrow an accelerator
-        # when a spare device exists; otherwise validate on CPU.
+        # occupies device 0, and a Whisper model resident there competes with
+        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
+        # exists; otherwise validate on CPU.
         if n > 1:
             device_index = n - 1
 
-    if device_index is not None:
-        torch_device = current_omni_platform.get_torch_device(device_index)
-        current_omni_platform.set_device(torch_device)
-        device = str(torch_device)
-        use_accelerator = True
-    else:
-        use_accelerator = False
-        device = "cpu"
+    if device_index is None:
+        return "cpu"
 
-    with _serialize_whisper_model_download(model_size):
-        model = whisper.load_model(model_size, device=device)
-    try:
-        text = model.transcribe(
-            output_path,
-            temperature=0.0,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            # None keeps whisper's auto-detection. Do not default this to a
-            # language: callers include non-English audio tests.
-            language=language,
-        )["text"]
-    finally:
-        del model
-        gc.collect()
-        if use_accelerator:
-            current_omni_platform.synchronize()
-            current_omni_platform.empty_cache()
+    torch_device = current_omni_platform.get_torch_device(device_index)
+    current_omni_platform.set_device(torch_device)
+    return str(torch_device)
+
+
+# Populated in the transcription worker, not in the pytest process.
+_WHISPER_MODELS: dict[str, Any] = {}
+
+
+def _get_whisper_model(model_size: str) -> Any:
+    model = _WHISPER_MODELS.get(model_size)
+    if model is None:
+        import whisper
+
+        # The device is picked on first load and the model stays on it for the
+        # worker's lifetime: the current server or runner fixture instance, or
+        # the test module for callers that transcribe without those fixtures.
+        device = _select_whisper_device()
+        with _serialize_whisper_model_download(model_size):
+            model = whisper.load_model(model_size, device=device)
+        _WHISPER_MODELS[model_size] = model
+    return model
+
+
+def _whisper_transcribe_in_current_process(
+    output_path: str, model_size: str = "small", language: str | None = None
+) -> str:
+    model = _get_whisper_model(model_size)
+    text = model.transcribe(
+        output_path,
+        temperature=0.0,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        # None keeps whisper's auto-detection. Do not default this to a
+        # language: callers include non-English audio tests.
+        language=language,
+    )["text"]
     return text or ""
 
 
+# Serializes a whole submit->result->cleanup on the parent side, so at most one
+# call is ever in flight on the single-worker pool. The child already runs
+# transcriptions serially, so this costs no throughput; it lets a failed call
+# discard the worker without disrupting another caller's in-flight future.
+_TRANSCRIBER_CALL_LOCK = threading.Lock()
+# Guards the _TRANSCRIBER pointer itself.
+_TRANSCRIBER_LOCK = threading.Lock()
+_TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
+
+
+def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
+    global _TRANSCRIBER
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            ctx = multiprocessing.get_context("spawn")
+            _TRANSCRIBER = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+        return _TRANSCRIBER
+
+
+def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> None:
+    """Drop ``executor``, but only while it is still the current one.
+
+    Identity-checked so a stale reference can never shut down a newer worker that
+    was installed after ``executor`` was replaced.
+    """
+    global _TRANSCRIBER
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is not executor:
+            return
+        _TRANSCRIBER = None
+    # Joining the worker can block; do it outside the lock.
+    executor.shutdown(wait=True)
+
+
+def release_audio_transcriber() -> None:
+    """Shut the transcription worker down, freeing the device memory its models hold.
+
+    Called when a server or runner fixture instance tears down, so that the next
+    one -- including the next parametrization inside the same test module -- does
+    not initialize its model while Whisper still occupies the device. A module
+    teardown fixture repeats it for tests that transcribe without those fixtures.
+
+    Takes the call lock, so it waits for any in-flight transcription to finish
+    rather than shutting the worker down underneath it.
+    """
+    global _TRANSCRIBER
+    with _TRANSCRIBER_CALL_LOCK:
+        with _TRANSCRIBER_LOCK:
+            executor, _TRANSCRIBER = _TRANSCRIBER, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+
 def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
-    """Convert an audio file to text in an isolated subprocess."""
-    ctx = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language)
-        return future.result()
+    """Convert an audio file to text in a reused, isolated subprocess.
+
+    The worker outlives the call so its Whisper model is loaded once rather than
+    once per transcription. The call lock serializes callers onto the single
+    worker (the child already transcribes serially, so this costs no throughput),
+    which lets a failed call tear the worker down without racing another caller.
+    The worker caches one model per size it is asked for, so a run that escalates
+    to a stronger ASR keeps both models resident until release.
+
+    Any failure discards the worker, restoring the failure isolation of the old
+    one-process-per-call design: a failure (a ``torch`` OOM, or a
+    ``KeyboardInterrupt``/``SystemExit`` transported through the future or
+    raised while ``result()`` blocks) propagates unchanged after the worker --
+    and its resident model -- is torn down, and a dead worker
+    (``BrokenProcessPool``) is additionally retried once.
+    """
+    with _TRANSCRIBER_CALL_LOCK:
+        for attempt in range(2):
+            executor = _get_transcriber()
+            try:
+                return executor.submit(
+                    _whisper_transcribe_in_current_process, output_path, model_size, language
+                ).result()
+            except BrokenProcessPool:
+                _discard_transcriber(executor)
+                if attempt == 1:
+                    raise
+            except BaseException:
+                # Any other failure -- a task exception (a torch OOM included), or
+                # a KeyboardInterrupt/SystemExit transported through the future or
+                # interrupting result() -- leaves the worker and its model
+                # resident; drop it so it cannot contaminate later calls, matching
+                # the old per-call teardown. Do not retry.
+                _discard_transcriber(executor)
+                raise
+    raise AssertionError("unreachable")
 
 
 def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", language: str | None = None) -> str:
@@ -749,4 +843,5 @@ __all__ = [
     "get_asset_path",
     "load_test_audio_data_url",
     "preprocess_text",
+    "release_audio_transcriber",
 ]

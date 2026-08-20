@@ -7,7 +7,7 @@ import torch.nn as nn
 from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
-from vllm_omni.model_executor.models.common.ming.dit import CondEmbedder, DiTBlock, FinalLayer
+from vllm_omni.model_executor.models.common.ming.dit_blocks import CondEmbedder, DiTBlock, FinalLayer
 
 
 class DiT(nn.Module):

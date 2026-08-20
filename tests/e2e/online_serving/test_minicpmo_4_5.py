@@ -65,6 +65,15 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+# Close <think> and emit <|tts_bos|> so Talker speaks the answer, not reasoning.
+_TTS_EXTRA_BODY = {
+    "chat_template_kwargs": {
+        "use_tts_template": True,
+        "enable_thinking": False,
+    }
+}
+
+
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -111,6 +120,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"audio": ["Beijing"]},
+        "extra_body": _TTS_EXTRA_BODY,
     }
 
     openai_client.send_omni_request(request_config)
@@ -141,12 +151,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "stream": True,
         "key_words": {"text": ["Beijing"]},
         "modalities": ["text", "audio"],
-        "extra_body": {
-            "chat_template_kwargs": {
-                "use_tts_template": True,
-                "enable_thinking": False,
-            }
-        },
+        "extra_body": _TTS_EXTRA_BODY,
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
@@ -175,6 +180,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
@@ -203,6 +209,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
@@ -236,6 +243,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())

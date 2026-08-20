@@ -24,7 +24,7 @@ stages:
 
 For an experimental whole-transformer compile scope, set
 `--diffusion-compile-granularity full` or use
-`diffusion_compile_granularity: full` in the stage configuration. Full scope may
+`diffusion_compile_granularity: full` in the deploy configuration. Full scope may
 still contain graph breaks; it does not force one graph. It is rejected when
 HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled. Use
 regional scope with those features.
