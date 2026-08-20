@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -131,7 +133,7 @@ def test_codec_sampling_does_not_inherit_generic_generation_config(monkeypatch) 
     assert talker._codec_sampling_source == "official_minicpm_tts"
 
 
-def test_first_codec_step_skips_warpers_but_later_steps_apply(mocker) -> None:
+def test_first_codec_step_skips_warpers_but_later_steps_apply(monkeypatch) -> None:
     talker = _make_talker()
     talker.head_code = nn.ModuleList([nn.Identity()])
     talker._codec_temperature = _CODEC_TEMPERATURE
@@ -139,11 +141,8 @@ def test_first_codec_step_skips_warpers_but_later_steps_apply(mocker) -> None:
     talker._codec_top_p = _CODEC_TOP_P
     talker._codec_repetition_penalty = _CODEC_REPETITION_PENALTY
     talker._request_audio_states["req"] = {"min_tokens": 0}
-    warper = mocker.patch.object(
-        talker_module,
-        "_apply_top_k_top_p",
-        wraps=talker_module._apply_top_k_top_p,
-    )
+    warper = Mock(wraps=talker_module._apply_top_k_top_p)
+    monkeypatch.setattr(talker_module, "_apply_top_k_top_p", warper)
     hidden = torch.arange(8, dtype=torch.float32).reshape(1, 8)
     talker._sample_audio_code(
         hidden,
@@ -158,12 +157,12 @@ def test_first_codec_step_skips_warpers_but_later_steps_apply(mocker) -> None:
         "req",
         step=1,
     )
-    warper.assert_called_once_with(
-        mocker.ANY,
-        top_k=_CODEC_TOP_K,
-        top_p=_CODEC_TOP_P,
-        min_tokens_to_keep=3,
-    )
+    assert warper.call_count == 1
+    assert warper.call_args.kwargs == {
+        "top_k": _CODEC_TOP_K,
+        "top_p": _CODEC_TOP_P,
+        "min_tokens_to_keep": 3,
+    }
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
