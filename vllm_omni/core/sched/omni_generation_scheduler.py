@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -24,6 +25,8 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.outputs import OmniModelRunnerOutput
+
+logger = init_logger(__name__)
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -374,12 +377,30 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # max(0, computed - in_flight), so a leaked counter silently
                 # freezes sliding-window block freeing.
                 request.num_in_flight_tokens -= num_tokens_scheduled
+            # vLLM 0.27 (a0c092ee72) removed the async_tokens_to_discard
+            # handling from the upstream scheduler and replaced it with the
+            # num_stale_output_tokens/is_stale mechanism. Omni's discard
+            # sites (segment stop, streaming-session replacement) record the
+            # in-flight share here; the delayed outputs are dropped below
+            # instead of decrementing num_output_placeholders (which the
+            # discard zeroed) and underflowing the upstream assert.
+            output_is_stale = False
+            if request is not None and request.num_stale_output_tokens > 0:
+                output_is_stale = True
+                request.num_stale_output_tokens -= num_tokens_scheduled
+                assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
                 continue
             if request is None or request.is_finished():
                 # Request may already be finished (e.g., aborted during
                 # execution / pipeline parallelism / async scheduling).
+                continue
+            if output_is_stale:
+                # Output of a step scheduled before the request's in-flight
+                # tokens were discarded (segment stop / session replacement).
+                # num_computed_tokens was rolled back at the discard site, so
+                # this output must not be appended or emitted.
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -424,10 +445,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             is_segment_finished = False
             routed_experts = None
 
+            # Decode the pooling output before stop handling so a decoder
+            # failure finishes the request with FinishReason.ERROR (500).
+            try:
+                pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
+            except Exception as exc:
+                logger.exception("[pooling] decoder hook failed for request %s", req_id)
+                pooling_output_payload = None
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = f"pooling output decode failed: {exc}"
+                request.resumable = False
+
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
             if (
-                request.status == RequestStatus.FINISHED_STOPPED
+                request.status == RequestStatus.FINISHED_ERROR
+                or request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
                     self.chunk_transfer_adapter is not None
@@ -435,7 +468,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
-                request.status = RequestStatus.FINISHED_STOPPED
+                if request.status != RequestStatus.FINISHED_ERROR:
+                    request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
                 stopped = True
@@ -490,7 +524,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     finish_reason=finish_reason,
                     new_logprobs=new_logprobs,
                     new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                    pooling_output=pooler_output,
+                    pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     stop_reason=request.stop_reason,
                     prefill_stats=request.take_prefill_stats(),
@@ -506,7 +540,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Finish async_chunk requests that schedule() collected because their
         # upstream completed with no remaining codec tokens.
         for request in self._pending_finish_reqs:
-            if request.is_finished():
+            if request in stopped_running_reqs or request.is_finished():
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()

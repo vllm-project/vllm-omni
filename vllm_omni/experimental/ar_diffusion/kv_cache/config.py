@@ -23,7 +23,8 @@ class ARDiffusionKVConfig:
     sink_chunks: int = 0
     # Boundary reset vs. sliding replacement.
     reset_at_boundary: bool = False
-    # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
+    # Fraction of free device memory used to admit additional resident
+    # sessions. One session is admitted whenever it fits actual free memory.
     gpu_memory_fraction: float = 0.1
     # When CUDA graph / torch.compile is on (not enforce_eager), pre-capture the
     # DiT graphs for every window-fill shape at load time via a synthetic rollout,

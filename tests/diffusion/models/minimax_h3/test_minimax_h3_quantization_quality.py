@@ -135,18 +135,13 @@ def _generate_joint_output(omni, config: QualityTestConfig):
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
             sigmas=config.sigmas,
+            extra_args={"aspect_ratio": "16:9"},
         ),
     )
     main_process_peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     worker_peak_memory_mb = float(getattr(first, "peak_memory_mb", 0.0) or 0.0)
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        first = first.request_output[0]
-        worker_peak_memory_mb = max(
-            worker_peak_memory_mb,
-            float(getattr(first, "peak_memory_mb", 0.0) or 0.0),
-        )
     if not hasattr(first, "images") or not first.images:
         raise ValueError("Could not extract video frames from H3 output")
     frames = first.images[0]

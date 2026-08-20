@@ -58,6 +58,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -370,6 +371,9 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
+                # The stable adapter entry point still receives the same
+                # legacy stage object as replica planning. Its implementation
+                # switches only at the coordinated RFC #4021 cutover.
                 engine_args_dict = build_engine_args_dict(
                     stage_cfg,
                     self._model,
@@ -573,7 +577,7 @@ class StageRuntime:
                 )
             # Serialize engine-core spawning across all LLM replicas to avoid
             # ZMQ port-allocation races and simultaneous CUDA context init.
-            with self._replica_launch_lock:
+            with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                 with launch_stage_replica(
                     vllm_config=vllm_config,
                     executor_class=executor_class,
@@ -642,7 +646,10 @@ class StageRuntime:
         client = None
         resources = None
         try:
-            with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+            with (
+                stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
+                self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg),
+            ):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)

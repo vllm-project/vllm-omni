@@ -57,6 +57,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     platforms_mock = mocker.MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
     platforms_mock.current_omni_platform.is_npu.return_value = False
+    platforms_mock.current_omni_platform.is_xpu.return_value = False
 
     logger_mock = mocker.MagicMock()
     logger_mock.init_logger = lambda name: mocker.MagicMock()
@@ -283,6 +284,28 @@ class TestCodePredictorDtypeAlignment:
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
+
+    def test_setup_compile_uses_eager_on_xpu(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        """XPU should avoid the torch.compile path used by CUDA."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "supports_torch_inductor", return_value=True)
+        mocker.patch.object(common_mod.current_omni_platform, "is_xpu", return_value=True)
+        compile_mock = mocker.patch.object(common_mod.torch, "compile")
+
+        predictor._setup_compile()
+
+        compile_mock.assert_not_called()
+        assert predictor._compiled_model_fwd == predictor.model.forward
 
     def test_forward_with_mismatched_input_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """forward() should not crash when inputs are float32 but model is float16."""

@@ -31,6 +31,7 @@ import tempfile
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -409,6 +410,7 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     torch.testing.assert_close(v_full, expected_value)
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize(
     "test_model_cls",
     [
@@ -416,10 +418,12 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     ],
 )
 @pytest.mark.parametrize(
-    ("ulysses_degree", "ring_degree", "allgather_degree"),
+    ("ulysses_degree", "ring_degree", "allgather_degree", "num_kv_heads"),
     [
-        pytest.param(2, 2, 1, id="ulysses-ring"),
-        pytest.param(1, 1, 2, id="allgather-kv"),
+        pytest.param(2, 2, 1, None, id="ulysses-ring"),
+        pytest.param(1, 1, 2, None, id="allgather-kv"),
+        pytest.param(1, 2, 1, 2, id="ring-gqa"),
+        pytest.param(1, 2, 1, 1, id="ring-mqa"),
     ],
 )
 @pytest.mark.parametrize("batch_size", [2])
@@ -445,6 +449,7 @@ def test_sequence_parallel(
     seq_len: int,
     num_heads: int,
     head_size: int,
+    num_kv_heads: int | None,
 ):
     """Compare Ulysses/Ring and AllGather-KV SP against a single-rank run."""
     sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
@@ -476,6 +481,7 @@ def test_sequence_parallel(
                 seq_len,
                 num_heads,
                 head_size,
+                num_kv_heads,
                 dtype,
                 causal,
                 use_sync,
@@ -507,6 +513,7 @@ def test_sequence_parallel(
                 seq_len,
                 num_heads,
                 head_size,
+                num_kv_heads,
                 dtype,
                 causal,
                 use_sync,
@@ -603,6 +610,7 @@ def ulysses_attention_on_test_model(
     seq_len: int,
     num_heads: int,
     head_size: int,
+    num_kv_heads: int | None,
     dtype: torch.dtype,
     causal: bool,
     use_sync: bool,
@@ -658,10 +666,13 @@ def ulysses_attention_on_test_model(
         cfg_parallel_size=1,
     )
 
-    od_config = OmniDiffusionConfig(
+    od_config = OmniDiffusionConfig.from_kwargs(
         model="test_model",
         dtype=dtype,
         parallel_config=parallel_config,
+        # This regression targets pytorch_attn_forward(). Do not let an
+        # installed FA/FA3 backend silently bypass the SDPA Ring path.
+        diffusion_attention_backend="TORCH_SDPA",
     )
 
     # Initialize model parallel
@@ -687,7 +698,7 @@ def ulysses_attention_on_test_model(
             "head_size": head_size,
             "hidden_size": hidden_size,
             "causal": causal,
-            "num_kv_heads": None,
+            "num_kv_heads": num_kv_heads,
             "scatter_idx": 2,
             "gather_idx": 1,
             "use_sync": use_sync,

@@ -309,7 +309,7 @@ For Omni or custom models, create:
 
 Required updates:
 1. `docs/user_guide/diffusion/parallelism/overview.md` — parallelism support overview/table
-2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
+2. `docs/user_guide/diffusion/cpu_offload.md` — if CPU offload supported (add to supported models table)
 3. `docs/user_guide/diffusion/cache_acceleration/teacache.md` — if TeaCache supported
 4. `docs/user_guide/diffusion/cache_acceleration/cache_dit.md` — if Cache-DiT supported
 5. Offline example docs under `examples/offline_inference/<name>/` (`README.md` or category-specific `.md`)
@@ -609,6 +609,24 @@ See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.
 3. Controlling profiling via `omni.start_profile()` and `omni.stop_profile()`.
 
 ---
+
+## Pre-commit conventions
+
+New library files must pass the local gates in
+[docs/contributing/README.md](../../../docs/contributing/README.md#linting).
+That page is the full hook list (SPDX, forbidden imports including Hugging Face
+Hub / Triton / pickle, `torch.cuda`, mypy, test marks, markdownlint, Buildkite,
+shellcheck). In particular:
+
+- SPDX copyright is `vLLM-Omni project` (stale `vLLM project` is rewritten).
+- Use `import regex as re` and `pybase64` in `vllm_omni/`; do not import stdlib
+  `re` or `base64`. Hugging Face Hub downloads go through
+  `vllm.transformers_utils.repo_utils`.
+- Do not add `torch.cuda.*` call sites; use `current_omni_platform`.
+- New `tests/**/test_*.py` files need a CI level mark and a hardware mark.
+- Do not expand `CHECK_IMPORTS[*].allowed_files` or `ALLOWED_FILES` without review.
+- GitHub Actions skips SPDX/shellcheck/mypy-3.10/test-marks/markdownlint; run
+  `pre-commit` locally.
 
 ## Iterative Development Tips
 

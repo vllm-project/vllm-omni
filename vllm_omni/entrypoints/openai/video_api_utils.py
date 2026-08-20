@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
+import tempfile
 from io import BytesIO
 from typing import Any, Literal
 
@@ -15,6 +17,7 @@ import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm import envs
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -36,10 +39,17 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 class VideoFrames(list[Image.Image]):
     """Decoded video frames plus source metadata."""
 
-    def __init__(self, frames: list[Image.Image] | None = None, *, fps: float | None = None) -> None:
+    def __init__(
+        self,
+        frames: list[Image.Image] | None = None,
+        *,
+        fps: float | None = None,
+        source_path: str | None = None,
+    ) -> None:
         super().__init__(frames or [])
         self.fps = fps
         self.frame_rate = fps
+        self.source_path = source_path
 
 
 def positive_float(value: Any) -> float | None:
@@ -93,6 +103,7 @@ def _decode_video_bytes(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
+    source_path: str | None = None,
 ) -> VideoFrames:
     if keep not in {"first", "last"}:
         raise InvalidInputReferenceError(f"Invalid {source}: video frame selection must be 'first' or 'last'.")
@@ -116,8 +127,7 @@ def _decode_video_bytes(
     frames = [Image.fromarray(f, "RGB") for f in frames_array]
     if not frames:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.")
-
-    return VideoFrames(frames, fps=fps)
+    return VideoFrames(frames, fps=fps, source_path=source_path)
 
 
 def _decode_media_bytes(
@@ -163,11 +173,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
         return _decode_base64_image(image_url, source="image_reference.image_url")
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
+        allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
+        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
             try:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response.has_redirect_location and not allow_redirects:
+                    raise InvalidInputReferenceError(
+                        "Invalid image_reference.image_url: redirect response was rejected because "
+                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
+                    ) from exc
+                raise InvalidInputReferenceError(
+                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                ) from exc
+            except httpx.RequestError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc
@@ -182,6 +202,7 @@ def _decode_base64_video(
     source: str,
     max_frames: int | None = None,
     keep: Literal["first", "last"] = "first",
+    source_path: str | None = None,
 ) -> VideoFrames:
     if video_reference:
         if video_reference.startswith("data:video"):
@@ -193,7 +214,16 @@ def _decode_base64_video(
             video_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
-        return _decode_video_bytes(video_bytes, source=source, max_frames=max_frames, keep=keep)
+        if source_path is not None:
+            with open(source_path, "wb") as output:
+                output.write(video_bytes)
+        return _decode_video_bytes(
+            video_bytes,
+            source=source,
+            max_frames=max_frames,
+            keep=keep,
+            source_path=source_path,
+        )
     raise InvalidInputReferenceError(f"Invalid {source}: video data is empty.")
 
 
@@ -204,12 +234,19 @@ async def decode_video_url(
     keep: Literal["first", "last"] = "first",
 ) -> VideoFrames:
     if video_url.startswith("data:video"):
-        return _decode_base64_video(
-            video_url,
-            source="video_reference.video_url",
-            max_frames=max_frames,
-            keep=keep,
-        )
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        try:
+            return _decode_base64_video(
+                video_url,
+                source="video_reference.video_url",
+                max_frames=max_frames,
+                keep=keep,
+                source_path=path,
+            )
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
 
     if video_url.startswith(("http://", "https://")):
         async with httpx.AsyncClient(timeout=60) as client:
@@ -220,12 +257,26 @@ async def decode_video_url(
                 raise InvalidInputReferenceError(
                     "Invalid video_reference.video_url: failed to download video."
                 ) from exc
-        return _decode_video_bytes(
-            response.content,
-            source="video_reference.video_url",
-            max_frames=max_frames,
-            keep=keep,
-        )
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        try:
+            with open(path, "wb") as output:
+                output.write(response.content)
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
+        try:
+            return _decode_video_bytes(
+                response.content,
+                source="video_reference.video_url",
+                max_frames=max_frames,
+                keep=keep,
+                source_path=path,
+            )
+        except Exception:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
 
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
@@ -441,18 +492,32 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     if not frames:
         raise ValueError("No frames found to encode.")
 
-    frames_np = np.stack(frames, axis=0)
-    if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
-        frames_np = frames_np[..., :3]
+    frame_shape = frames[0].shape
+    has_alpha = len(frame_shape) == 3 and frame_shape[-1] == 4
+    output_shape = (*frame_shape[:-1], 3) if has_alpha else frame_shape
+    frames_u8 = np.empty((len(frames), *output_shape), dtype=np.uint8)
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
 
-    if frames_np.dtype == np.uint8:
-        frames_u8 = frames_np
-    else:
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_np *= 255.0
-        frames_u8 = np.round(frames_np).astype(np.uint8)
+    # Convert one frame at a time instead of stacking the normalized float
+    # payload first. Long videos can otherwise require another full-size
+    # float array plus conversion temporaries before encoding.
+    for index, frame in enumerate(frames):
+        if frame.shape != frame_shape:
+            raise ValueError("All video frames must have the same shape.")
+        frame = frame[..., :3] if has_alpha else frame
+        if frame.dtype == np.uint8:
+            frames_u8[index] = frame
+            continue
 
-    return np.ascontiguousarray(frames_u8)
+        # np.stack(), used by the previous implementation, promoted mixed
+        # frame dtypes before scaling. Preserve those rounding semantics
+        # without allocating a full-video float buffer.
+        scaled = np.clip(frame.astype(common_dtype, copy=False), 0.0, 1.0)
+        scaled *= 255.0
+        np.rint(scaled, out=scaled)
+        frames_u8[index] = scaled
+
+    return frames_u8
 
 
 def _encode_video_bytes(

@@ -15,19 +15,23 @@ Currently implemented:
 - TestFlux2KleinExtractor: Flux2Klein model extractor
 - TestFlux2Extractor: Flux2 model extractor
 - TestFluxExtractor: Flux model extractor
+- TestMiniMaxH3Extractor: MiniMaxH3DiTModel extractor
 """
 
 from abc import ABC, abstractmethod
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_minimax_h3_context,
 )
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -423,3 +427,288 @@ class TestFluxExtractor(BaseExtractorTest):
                 img_ids=torch.randint(0, 64, (1, 16, 3)),
                 txt_ids=torch.randint(0, 64, (1, 8, 3)),
             )
+
+
+class _MiniMaxH3FakeLinear(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        *,
+        bias=False,
+        params_dtype=None,
+        quant_config=None,
+        prefix="",
+        total_num_heads=None,
+        total_num_kv_heads=None,
+        **kwargs,
+    ):
+        del kwargs
+        super().__init__()
+        self.prefix = prefix
+        self.quant_config = quant_config
+        self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=params_dtype or torch.float32))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=params_dtype or torch.float32))
+        else:
+            self.register_parameter("bias", None)
+        self.num_heads = total_num_heads
+        self.num_kv_heads = total_num_kv_heads
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias), None
+
+
+class _MiniMaxH3FakeMergedLinear(_MiniMaxH3FakeLinear):
+    def __init__(self, in_features, out_features, **kwargs):
+        super().__init__(in_features, sum(out_features), **kwargs)
+
+
+class _MiniMaxH3FakeQKVLinear(_MiniMaxH3FakeLinear):
+    def __init__(
+        self,
+        *,
+        hidden_size,
+        head_size,
+        total_num_heads,
+        total_num_kv_heads,
+        **kwargs,
+    ):
+        qkv_features = (total_num_heads + 2 * total_num_kv_heads) * head_size
+        super().__init__(
+            hidden_size,
+            qkv_features,
+            total_num_heads=total_num_heads,
+            total_num_kv_heads=total_num_kv_heads,
+            **kwargs,
+        )
+
+
+class _MiniMaxH3FakeAttention(nn.Module):
+    class FakeBackend:
+        supports_prefix_kv_slicing = False
+
+        # Mirror AttentionBackend.supports_packed_mask_free: H3's packed
+        # attention path calls attn_backend.supports_packed_mask_free() to decide
+        # whether to build the padding mask. Return False so the fake exercises
+        # the masked path (the abstract backend default).
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
+    def __init__(self, **kwargs):
+        del kwargs
+        super().__init__()
+        self.attn_backend = self.FakeBackend
+        self.use_ring = False
+
+    def forward(self, q, k, v, metadata=None):
+        del k, v, metadata
+        return q
+
+
+def _minimax_h3_small_od_config():
+    arch = {
+        "num_layers": 1,
+        "token_refiner_num_layers": 1,
+        "hidden_size": 8,
+        "num_attention_heads": 1,
+        "attention_head_dim": 8,
+        "ffn_hidden_size": 16,
+        "latents_dim": 2,
+        "audio_latents_dim": 2,
+        "patch_size": (1, 2, 2),
+        "text_dim": 6,
+        "timestep_input_dim": 4,
+        "time_embed_hidden_size": 8,
+        "time_embed_dim": 4,
+        "adaln_out_features": 18 * 8,
+        "final_adaln_out_features": 2 * 8,
+        "rope_inv_freq_len": 1,
+    }
+    return SimpleNamespace(
+        tf_model_config=arch,
+        parallel_config=SimpleNamespace(ulysses_degree=1),
+    )
+
+
+def _minimax_h3_sample_kwargs(*, seq_len: int = 8, device: torch.device | str = "cpu") -> dict:
+    video_row_dim = 2 * 1 * 2 * 2
+    audio_row_dim = 2
+    text_len = 2
+    img_rows = 2
+
+    img_pos = torch.tensor([2, 3], dtype=torch.long, device=device)
+    audio_pos = torch.tensor([4, 5], dtype=torch.long, device=device)
+    text_pos = torch.tensor([0, 1], dtype=torch.long, device=device)
+    infer_out_pos = img_pos.clone()
+
+    token_tags = torch.full((seq_len,), -1, dtype=torch.long, device=device)
+    token_tags[text_pos] = 1
+    token_tags[img_pos] = 0
+    token_tags[audio_pos] = 2
+
+    inverse_indices = torch.zeros(seq_len, dtype=torch.long, device=device)
+
+    return {
+        "x": torch.randn(1, seq_len, video_row_dim, device=device),
+        "audio_x": torch.randn(1, seq_len, audio_row_dim, device=device),
+        "img_position_ids": torch.zeros(1, seq_len, 3, dtype=torch.float64, device=device),
+        "unique_timesteps": torch.tensor([0.5], dtype=torch.float32, device=device),
+        "inverse_indices": inverse_indices,
+        "update_mask": torch.ones(img_rows, dtype=torch.bool, device=device),
+        "token_tags": token_tags,
+        "prompt_embeds": torch.randn(text_len, 6, device=device),
+        "img_pos_info": {"position_ids": img_pos},
+        "audio_pos_info": {"position_ids": audio_pos},
+        "text_pos_info": {"position_ids": text_pos},
+        "img_pos_for_infer_output_info": {"position_ids": infer_out_pos},
+        "packed_seq_params": {
+            "cu_seqlens_q": torch.tensor([0, seq_len], dtype=torch.int32, device=device),
+            "max_seqlen_q": seq_len,
+        },
+        "refiner_packed_seq_params": {
+            "cu_seqlens_q": torch.tensor([0, text_len], dtype=torch.int32, device=device),
+            "max_seqlen_q": text_len,
+        },
+    }
+
+
+@pytest.mark.cpu
+class TestMiniMaxH3Extractor(BaseExtractorTest):
+    """Test extract_minimax_h3_context function."""
+
+    def get_extractor(self):
+        return extract_minimax_h3_context
+
+    @pytest.fixture
+    def minimax_h3_module(self, monkeypatch):
+        """Create a minimal MiniMaxH3DiTModel with fake parallel linears for CPU tests."""
+        from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+        monkeypatch.setattr(h3, "ColumnParallelLinear", _MiniMaxH3FakeLinear)
+        monkeypatch.setattr(h3, "MergedColumnParallelLinear", _MiniMaxH3FakeMergedLinear)
+        monkeypatch.setattr(h3, "QKVParallelLinear", _MiniMaxH3FakeQKVLinear)
+        monkeypatch.setattr(h3, "RowParallelLinear", _MiniMaxH3FakeLinear)
+        monkeypatch.setattr(h3, "Attention", _MiniMaxH3FakeAttention)
+        monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+
+        model = h3.MiniMaxH3DiTModel(_minimax_h3_small_od_config(), quant_config=None)
+        for submodule in model.modules():
+            if isinstance(submodule, h3.MiniMaxH3Attention):
+                submodule.rope._forward_method = submodule.rope.forward_native
+        model.eval()
+        return model
+
+    def get_module(self, minimax_h3_module):
+        return minimax_h3_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        """Create sample packed forward kwargs for MiniMaxH3DiTModel."""
+        return _minimax_h3_sample_kwargs(seq_len=8)
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    def test_modulated_input_shape(self, minimax_h3_module, sample_inputs):
+        """Test that modulated_input matches packed sequence shape [T, H]."""
+        context = extract_minimax_h3_context(minimax_h3_module, **sample_inputs)
+
+        seq_len = sample_inputs["x"].shape[1]
+        assert context.modulated_input.shape == (seq_len, minimax_h3_module.hidden_size)
+
+    def test_run_transformer_blocks_callable(self, minimax_h3_module, sample_inputs):
+        """Test that run_transformer_blocks is callable."""
+        context = extract_minimax_h3_context(minimax_h3_module, **sample_inputs)
+        assert callable(context.run_transformer_blocks)
+
+    def test_postprocess_callable(self, minimax_h3_module, sample_inputs):
+        """Test that postprocess is callable."""
+        context = extract_minimax_h3_context(minimax_h3_module, **sample_inputs)
+        assert callable(context.postprocess)
+
+    def test_postprocess_output_shape(self, minimax_h3_module, sample_inputs):
+        """Test that postprocess returns video/audio logits for infer rows."""
+        context = extract_minimax_h3_context(minimax_h3_module, **sample_inputs)
+        (hidden,) = context.run_transformer_blocks()
+        video_logits, audio_logits = context.postprocess(hidden)
+
+        num_video_rows = sample_inputs["img_pos_info"]["position_ids"].shape[0]
+        num_audio_rows = sample_inputs["audio_pos_info"]["position_ids"].shape[0]
+        assert video_logits.shape[0] == num_video_rows
+        assert audio_logits.shape[0] == num_audio_rows
+
+    def test_extractor_matches_native_forward(self, minimax_h3_module, sample_inputs):
+        """The uncached extractor path must preserve the model's forward result."""
+        expected_video, expected_audio = minimax_h3_module(**sample_inputs)
+
+        context = extract_minimax_h3_context(minimax_h3_module, **sample_inputs)
+        (hidden,) = context.run_transformer_blocks()
+        actual_video, actual_audio = context.postprocess(hidden)
+
+        torch.testing.assert_close(actual_video, expected_video)
+        torch.testing.assert_close(actual_audio, expected_audio)
+
+    def test_run_transformer_blocks_forwards_packed_layout(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """The extractor block call must mirror the native packed contract."""
+        from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+
+        video_layout = VideoTokenLayout(prefix_len=2, latent_grid=(1, 1, 2))
+        inputs = {**sample_inputs, "video_token_layout": video_layout}
+        block = minimax_h3_module.blocks[0]
+        original_forward = block.forward
+        received: list[tuple[int, VideoTokenLayout | None]] = []
+
+        def capture_forward(*args, **kwargs):
+            received.append((kwargs["packed_total"], kwargs["video_layout"]))
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(block, "forward", capture_forward)
+        context = extract_minimax_h3_context(minimax_h3_module, **inputs)
+        context.run_transformer_blocks()
+
+        assert received == [(sample_inputs["x"].shape[1], video_layout)]
+
+    def test_teacache_reuses_h3_block_residual(self, minimax_h3_module, sample_inputs, monkeypatch):
+        """A guaranteed cache hit must skip the H3 transformer block."""
+        from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+        from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+
+        block = minimax_h3_module.blocks[0]
+        original_forward = block.forward
+        block_calls = 0
+
+        def counted_forward(*args, **kwargs):
+            nonlocal block_calls
+            block_calls += 1
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(block, "forward", counted_forward)
+        hook = TeaCacheHook(
+            TeaCacheConfig(
+                transformer_type="MiniMaxH3DiTModel",
+                rel_l1_thresh=0.3,
+            )
+        )
+        hook.initialize_hook(minimax_h3_module)
+
+        hook.new_forward(minimax_h3_module, **sample_inputs)
+        video_logits, audio_logits = hook.new_forward(minimax_h3_module, **sample_inputs)
+
+        assert block_calls == 1
+        assert video_logits.shape[0] == sample_inputs["img_pos_info"]["position_ids"].shape[0]
+        assert audio_logits.shape[0] == sample_inputs["audio_pos_info"]["position_ids"].shape[0]
+
+    def test_invalid_module_raises_error(self):
+        """Test that invalid module without blocks raises ValueError."""
+        invalid_module = Mock()
+        invalid_module.blocks = []
+
+        with pytest.raises(ValueError, match="Module must have blocks"):
+            extract_minimax_h3_context(invalid_module, **_minimax_h3_sample_kwargs())
