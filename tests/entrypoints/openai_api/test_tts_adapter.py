@@ -27,6 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.vevo2 import Vevo2Adapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
@@ -54,6 +55,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "vevo2",
 }
 
 
@@ -236,3 +238,60 @@ def test_diffusion_adapter_extra_body_params_fallback():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------
+# Vevo2: request sampling must reach the model
+# --------------------------------------------------------------------------
+#
+# Vevo2 samples inside Amphion's ``inference_ar_and_fm``, reading its knobs
+# from ``additional_information``. The ``SamplingParams`` the dummy AR
+# scheduler carries only drive the forced-EOS sampler, so anything the adapter
+# does not copy across cannot influence generation at all.
+
+
+def _vevo2_request(**kwargs):
+    defaults = {"seed": None, "extra_params": None, "voice": None}
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def test_vevo2_forwards_request_seed():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(seed=1234), [SimpleNamespace(seed=42)], tts_params)
+    assert tts_params["seed"] == [1234], "an explicit request seed must win over the deploy default"
+
+
+def test_vevo2_falls_back_to_deploy_default_seed():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(), [SimpleNamespace(seed=42)], tts_params)
+    assert tts_params["seed"] == [42], "deploy default_sampling_params.seed must not be a dead setting"
+
+
+def test_vevo2_omits_seed_when_none_is_configured():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(), [SimpleNamespace(seed=None)], tts_params)
+    assert "seed" not in tts_params
+
+
+def test_vevo2_forwards_sampling_knobs_from_extra_params():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(
+        _vevo2_request(extra_params={"top_k": 7, "top_p": 0.5, "temperature": 0.25, "flow_matching_steps": 8}),
+        [SimpleNamespace(seed=None)],
+        tts_params,
+    )
+    assert tts_params["top_k"] == [7]
+    assert tts_params["top_p"] == [0.5]
+    assert tts_params["temperature"] == [0.25]
+    assert tts_params["flow_matching_steps"] == [8]
+
+
+def test_vevo2_leaves_unset_knobs_to_model_defaults():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(
+        _vevo2_request(extra_params={"top_k": 7}), [SimpleNamespace(seed=None)], tts_params
+    )
+    assert tts_params["top_k"] == [7]
+    for absent in ("top_p", "temperature", "flow_matching_steps"):
+        assert absent not in tts_params

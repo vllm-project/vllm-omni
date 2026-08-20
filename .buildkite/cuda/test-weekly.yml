@@ -170,13 +170,20 @@ steps:
           - export PYTHONPATH="/opt/Amphion:${PYTHONPATH:-}"
           - export VEVO2_MODEL_PATH="${VEVO2_MODEL_PATH:-/fsx/hf_cache/vevo2_ckpt/Vevo2}"
           - |
-            # Initialise the checkpoint once onto the persistent cache. Exclude
-            # training-only artifacts (optimizer.pt is ~2 GB; the rng_state_*.pth
-            # files) so the cold download is ~6.5 GB rather than ~11 GB.
-            if [ ! -f "${VEVO2_MODEL_PATH}/config.json" ]; then
+            set -e
+            # Download once onto the persistent cache. The gate is a sub-checkpoint
+            # that only the download provides and the initialiser never writes, so a
+            # partially initialised root can not suppress the download (gating on the
+            # root config.json would, since the initialiser writes that first).
+            # Exclude training-only artifacts (optimizer.pt is ~2 GB; the
+            # rng_state_*.pth files) so the cold download is ~6.5 GB, not ~11 GB.
+            if [ ! -d "${VEVO2_MODEL_PATH}/contentstyle_modeling/posttrained" ]; then
               hf download RMSnow/Vevo2 --local-dir "${VEVO2_MODEL_PATH}" --exclude '*optimizer.pt' --exclude '*rng_state_*.pth' --exclude '*scheduler.pt' --exclude '*trainer_state.json' --exclude '*training_args.bin' --exclude '*optimizer.bin' --exclude '*scheduler.bin' --exclude '*random_states_*.pkl'
-              python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py "${VEVO2_MODEL_PATH}"
             fi
+            # Always run the initialiser: it is idempotent, repairs a partially
+            # initialised checkpoint in place, and exits non-zero if any required
+            # root artifact is still missing afterwards.
+            python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py "${VEVO2_MODEL_PATH}"
           - >-
             pytest -s -v
             tests/e2e/offline_inference/test_vevo2.py tests/e2e/online_serving/test_vevo2.py

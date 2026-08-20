@@ -15,7 +15,7 @@
 > (non-commercial, no-derivatives); the Amphion framework itself is MIT.
 > Commercial deployment of the weights requires contacting the upstream
 > authors. See the
-> [Vevo2 license considerations](../../docs/serving/speech_api.md#vevo2-license-considerations)
+> [Vevo2 license considerations](../../docs/serving/speech_api.md#license-considerations)
 > for the allowed/forbidden-use matrix and a production migration path.
 
 ## When to use this recipe
@@ -70,15 +70,32 @@ validation lands.
 
 ### 1 x 24 GB-class GPU (Single GPU, Minimum Recommended)
 
-The full Vevo2 pipeline fits comfortably on a single 24 GB GPU. The bundled
+The full Vevo2 pipeline fits comfortably on a single 24 GB GPU with the bundled
 default config at
 [`vllm_omni/deploy/vevo2.yaml`](../../vllm_omni/deploy/vevo2.yaml)
 (`gpu_memory_utilization: 0.4`, `max_num_seqs: 4`, `enforce_eager: true`,
-`trust_remote_code: true`) leaves real headroom: the Amphion pipeline is built
-outside vLLM's allocator and peaks at **~7.55 GiB allocated / ~8.80 GiB
-reserved**, so with `gpu_memory_utilization: 0.4` (~9.6 GiB reserved for
-vLLM's own KV cache, which this wrapper barely uses) the total lands near
-~18 GiB / 24 GiB.
+`trust_remote_code: true`).
+
+Note how the budget is accounted, because it is easy to get backwards:
+`gpu_memory_utilization` is the stage's **total** target and the Amphion
+pipeline is **subtracted from** it, not added on top. Amphion builds the
+pipeline outside vLLM's allocator, but it lives in the same process, and
+[`vllm_omni/worker/base.py`](../../vllm_omni/worker/base.py) sizes the KV cache
+per-process:
+
+```text
+requested_memory   = total_gpu_memory * gpu_memory_utilization
+process_memory     = memory used by THIS process (Amphion pipeline included)
+available_kv_cache = requested_memory - process_memory
+```
+
+So on a 24 GB card `0.4` is a ~9.6 GiB total budget, of which the pipeline
+(**~7.55 GiB allocated / ~8.80 GiB reserved**) already accounts for most,
+leaving roughly ~0.8 GiB of KV cache. That is deliberate — this wrapper drives
+Amphion's `inference_ar_and_fm` and barely touches the paged cache — but it
+means `0.4` is a floor to keep, not a ceiling to shrink: lowering it starves
+the cache entirely (at `0.05` the engine logs `Disabling chunked prefill for
+model without KVCache`).
 
 #### Prerequisites
 
@@ -138,10 +155,11 @@ override.
 
 #### Verification
 
-The numbers below were measured during maintainer review (end-to-end on an
-L20X-class GPU, single card) against this recipe's exact `load_weights` +
-`inference_ar_and_fm` call shape. Transcript quality was checked by running
-Whisper over the generated audio.
+All figures below were measured **through vLLM-Omni's own code paths** during
+maintainer review — the offline numbers by running `end2end.py`, the cloning
+and serving numbers through `/v1/audio/speech` — on a 4x L20X node, single
+card, with vLLM 0.27.0 / transformers 5.14.1 / torch 2.13.0+cu130. Transcript
+quality was checked by running Whisper over the generated audio.
 
 **T1 — zero-shot synthesis (offline `end2end.py`)**:
 
@@ -153,21 +171,18 @@ python examples/offline_inference/text_to_speech/vevo2/end2end.py \
     --ref-text "Philip stood undecided, his ears strained to catch the slightest sound."
 ```
 
-Observed (real speech, not silence — RMS 0.155, 24 kHz mono):
+Observed: **7.5 s** of audio, Whisper **WER 0.105**, **RMS 0.177** — real
+speech, not silence, at 24 kHz mono.
 
-| input | Whisper WER | audio duration | s/request | RTF |
-|-------|------------:|---------------:|----------:|----:|
-| long sentence  | **0.00** | 8.14 s | 2.56 | 0.314 |
-| short sentence | 0.20¹    | 4.22 s | 1.69 | 0.400 |
+**T2 — voice cloning through `/v1/audio/speech`** (swap the timbre reference):
 
-¹ Every WER error in the short run is the invented proper noun "Vevo2"; on
-real dictionary words there are zero errors.
+| timbre reference | reference F0 | output F0 |
+|------------------|-------------:|----------:|
+| male             | 120.7 Hz     | 120.0 Hz  |
+| female           | 231.8 Hz     | 228.5 Hz  |
 
-**T2 — voice cloning (swap the timbre reference)**:
-
-Swapping only the timbre reference moves the median output F0 from **119.6 Hz**
-(male reference, source F0 123.4 Hz) to **239.8 Hz** (female reference, source
-F0 229.8 Hz), confirming the cloning path conditions on the reference clip.
+The output tracks the reference, confirming the cloning path conditions on the
+supplied clip rather than on a fixed speaker.
 
 **T3 — online serving (`/v1/audio/speech`)**:
 
@@ -183,11 +198,23 @@ curl -X POST http://127.0.0.1:8092/v1/audio/speech \
     }' --output output.wav
 ```
 
+| request | result |
+|---------|--------|
+| English | 200, 3.6 s |
+| Chinese | 200, 1.7 s |
+| no `ref_text` | 200 |
+| missing `ref_audio` | 400 |
+| empty `input` | 400 |
+| 2 concurrent requests | correct per-request audio; transcripts word-exact, not swapped |
+
 `ref_audio` accepts a local path (auto-base64), an HTTP(S) URL, or a
 `data:audio/wav;base64,...` data URI. The OpenAI `voice` field is required by
 the schema but ignored unless it names an uploaded speaker. An empty `input`
 or a missing `ref_audio` is rejected with a 400 (the model also raises rather
 than emitting a silent WAV, so the offline path fails loudly too).
+
+Per-request `seed` is honoured on both paths: two identical seeded requests
+return byte-identical audio, and a different seed changes the output.
 
 **Peak VRAM**: ~7.55 GiB allocated for the pipeline itself.
 

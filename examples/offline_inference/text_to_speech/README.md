@@ -634,7 +634,7 @@ export PYTHONPATH=$PWD/Amphion:$PYTHONPATH
 pip install -r Amphion/models/svc/vevo2/requirements.txt
 # NOTE: Amphion's flow-matching transformer builds `LlamaConfig` with positional
 # args, which transformers>=5 rejects. vLLM-Omni installs a small import-time
-# shim (`modeling_vevo2._shim_llama_config_positional_args`) that maps those
+# shim (`modeling_vevo2._llama_config_positional_args`) that maps those
 # positionals to keyword names, so you do NOT need to downgrade transformers --
 # the repo's pinned `transformers>=5.5.3` (which vLLM also requires) works as-is.
 # Do not `pip install "transformers<5"`: it conflicts with that floor and breaks
