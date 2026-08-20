@@ -1321,11 +1321,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter_cls = resolve_adapter(self._tts_model_type)
         supported_rates = adapter_cls.supported_output_sample_rates if adapter_cls is not None else frozenset()
         if request.sample_rate not in supported_rates:
-            model_name = adapter_cls.name if adapter_cls is not None else self._tts_model_type
             if supported_rates:
                 rates = ", ".join(str(rate) for rate in sorted(supported_rates))
-                return f"sample_rate={request.sample_rate} is not supported by {model_name}; supported rates: {rates}"
-            return f"sample_rate is not supported by {model_name}"
+                return (
+                    f"sample_rate={request.sample_rate} is not supported by the current TTS model; "
+                    f"supported rates: {rates}"
+                )
+            return "sample_rate is not supported by the current TTS model"
         return None
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
