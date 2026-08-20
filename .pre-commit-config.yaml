@@ -24,7 +24,7 @@ repos:
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: typos-dict-v0.13.13
+    rev: v1.49.0
     hooks:
       - id: typos
         # only for staged files
@@ -38,7 +38,19 @@ repos:
       - id: actionlint
         files: ^\.github/workflows/.*\.ya?ml$
 
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.23.2
+    hooks:
+      - id: markdownlint-cli2
+        language_version: lts
+        args: [--fix]
+        files: (^docs/|^recipes/|(^|/)README\.md$|^CONTRIBUTING\.md$)
+        # Agent skill docs and CLAUDE.md are not user-facing docs/READMEs.
+        exclude: (^|/)CLAUDE\.md$|^\.claude/|^\.cursor/
 
+  # Keep `local` last so `suggestion` stays the final hook. Autofix repos
+  # (ruff, typos, markdownlint, trailing-whitespace, etc.) must run first;
+  # otherwise their "files were modified" output displaces the SKIP tip.
   - repo: local
     hooks:
     - id: signoff-commit
@@ -53,6 +65,45 @@ repos:
       language: system
       verbose: true
       stages: [commit-msg]
+
+    # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup
+    # is less awkward. Local wrapper groups files so follow_imports=skip on
+    # tests does not leak into library code.
+    # mypy-3.10 runs on git commit (changed files). CI SKIPs it because
+    # --all-files is not clean yet. Extra versions are manual-stage only
+    # (not in default `pre-commit run --all-files`):
+    #   pre-commit run --hook-stage manual mypy-3.12
+    - id: mypy-3.10
+      name: Run mypy for Python 3.10
+      entry: python tools/pre_commit/mypy.py "3.10"
+      <<: &mypy_common
+        language: python
+        types_or: [python, pyi]
+        require_serial: true
+        additional_dependencies:
+          - mypy==1.11.1
+          - regex
+          - types-cachetools
+          - types-setuptools
+          - types-PyYAML
+          - types-requests
+          - types-torch
+          - pydantic
+    - id: mypy-3.11
+      name: Run mypy for Python 3.11
+      entry: python tools/pre_commit/mypy.py "3.11"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.12
+      name: Run mypy for Python 3.12
+      entry: python tools/pre_commit/mypy.py "3.12"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.13
+      name: Run mypy for Python 3.13
+      entry: python tools/pre_commit/mypy.py "3.13"
+      <<: *mypy_common
+      stages: [manual]
 
     - id: check-test-ci-coverage
       name: Ensure test files have pytestmarks
@@ -71,7 +122,45 @@ repos:
       # pre-commit hides output from passing hooks unless the hook is verbose.
       verbose: true
 
-    # Keep `suggestion` last
+    - id: shellcheck
+      name: Lint shell scripts
+      # language: script breaks on Windows (shebang path loses slashes).
+      # Invoke the vLLM-style wrapper with bash so Linux CI and Win/Git Bash work.
+      entry: bash
+      args: [tools/pre_commit/shellcheck.sh]
+      language: system
+      types: [shell]
+
+    - id: check-spdx-header
+      name: Check SPDX headers
+      entry: python tools/pre_commit/check_spdx_header.py
+      language: python
+      types_or: [python, pyi, rust, proto, shell]
+      files: \.(py|pyi|rs|proto|sh)$
+
+    - id: check-forbidden-imports
+      name: Check forbidden imports
+      entry: python tools/pre_commit/check_forbidden_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
+    - id: check-torch-cuda-call
+      name: Prevent new torch.cuda API calls
+      entry: python tools/pre_commit/check_torch_cuda.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
+    - id: check-buildkite
+      name: Validate Buildkite Pipelines
+      entry: python tools/pre_commit/check_buildkite.py
+      language: python
+      files: ^\.buildkite/.*\.ya?ml$
+      additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
+
+    # Keep `suggestion` as the final hook. Run after autofix hooks so the
+    # bypass/SKIP tip is not displaced.
     - id: suggestion
       name: Suggestion
       entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
@@ -79,10 +168,3 @@ repos:
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry
-
-    - id: check-pickle-imports
-      name: Prevent new pickle/cloudpickle imports
-      entry: python tools/pre_commit/check_pickle_imports.py
-      language: python
-      types: [python]
-      additional_dependencies: [regex]
