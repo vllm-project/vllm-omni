@@ -24,7 +24,7 @@ Stable Audio Open is served through the OpenAI-compatible
 default) out.
 
 > Stable Audio Open is a gated Hugging Face model. Accept the license on the
-> model card and `huggingface-cli login` before downloading the checkpoint.
+> model card and run `hf auth login` before downloading the checkpoint.
 
 ### Start Server
 

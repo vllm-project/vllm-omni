@@ -19,7 +19,7 @@ Stable Audio Open is served through the OpenAI-compatible
 default) out.
 
 > Stable Audio Open is a gated Hugging Face model. Accept the license on the
-> model card and `huggingface-cli login` before downloading the checkpoint.
+> model card and run `hf auth login` before downloading the checkpoint.
 
 ### Start Server
 
@@ -65,7 +65,7 @@ curl -sS -X POST http://localhost:8091/v1/audio/generate \
 | `guidance_scale` | float | 7.0 | Classifier-free guidance scale |
 | `num_inference_steps` | int | model default | Number of denoising steps |
 | `seed` | int | null | Random seed for reproducibility |
-| `response_format` | string | "wav" | Output format: `wav`, `mp3`, `flac`, `pcm`, `aac`, `opus` |
+| `response_format` | string | "wav" | Output format: `wav`, `mp3`, `flac`, `pcm`, `opus` |
 
 See [`docs/serving/audio_generate_api.md`](../../../docs/serving/audio_generate_api.md)
 for the full API reference.
