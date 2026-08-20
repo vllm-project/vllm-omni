@@ -1205,8 +1205,7 @@ def test_finish_requests_enqueues_connector_cleanup_for_aborts(build_adapter):
 
     tasks = list(adapter._pending_save_reqs)
     assert len(tasks) == 1
-    assert tasks[0]["connector_cleanup"] is True
-    assert tasks[0]["external_req_id"] == "ext-abort"
+    assert tasks[0] == {"connector_cleanup": "ext-abort"}
 
     adapter._send_single_request(tasks[0])
     connector.cleanup.assert_called_once_with("ext-abort")
@@ -1221,11 +1220,11 @@ def test_finish_requests_connector_cleanup_ordered_after_queued_saves(build_adap
     """
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-fifo", RequestStatus.RUNNING, external_req_id="ext-fifo")
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
 
     adapter.finish_requests(["req-fifo"], RequestStatus.FINISHED_ABORTED, {"req-fifo": request})
 
-    kinds = ["cleanup" if task.get("connector_cleanup") else "save" for task in adapter._pending_save_reqs]
+    kinds = ["cleanup" if "connector_cleanup" in task else "save" for task in adapter._pending_save_reqs]
     assert kinds == ["save", "cleanup"]
 
 
@@ -1246,6 +1245,44 @@ def test_finish_requests_skips_connector_cleanup_for_finished_or_unknown(build_a
     assert len(adapter._pending_save_reqs) == 0
 
 
+def test_finish_requests_skips_connector_cleanup_for_non_abort_status(build_adapter):
+    """The sweep is gated on ``finished_status``, not on "request is still
+    live". A live request finished as FINISHED_STOPPED (e.g. a resumable
+    segment stop) keeps an unconsumed terminal chunk downstream; unlinking
+    it would strand the next stage waiting for a finish marker.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-stop", RequestStatus.RUNNING, external_req_id="ext-stop")
+
+    adapter.finish_requests(["req-stop"], RequestStatus.FINISHED_STOPPED, {"req-stop": request})
+
+    assert len(adapter._pending_save_reqs) == 0
+    connector.cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize("finished_status", [RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR])
+def test_finish_requests_sweeps_sender_only_stage_zero(build_adapter, finished_status):
+    """Stage 0 is sender-only: ``process_pending_chunks`` returns early, so
+    the request never lands in a chunk deque and no terminal chunk is ever
+    sent on abort. ``finish_requests`` is the only place its segments can
+    be swept. Regression guard for the talker-side leak in #6352.
+    """
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-talker", RequestStatus.RUNNING, external_req_id="ext-talker")
+    adapter.put_req_chunk["ext-talker"] = 7
+    adapter.requests_num_chunks_sent["ext-talker"] = 7
+
+    adapter.finish_requests(["req-talker"], finished_status, {"req-talker": request})
+
+    tasks = list(adapter._pending_save_reqs)
+    assert tasks == [{"connector_cleanup": "ext-talker"}]
+
+    adapter._send_single_request(tasks[0])
+    connector.cleanup.assert_called_once_with("ext-talker")
+    assert "ext-talker" not in adapter.put_req_chunk
+    assert "ext-talker" not in adapter.requests_num_chunks_sent
+
+
 def test_terminal_send_does_not_sweep_connector_state(build_adapter):
     """Natural finish: the terminal chunk just sent must stay readable for
     the downstream consumer — ``connector.cleanup`` must not run on this
@@ -1255,7 +1292,7 @@ def test_terminal_send_does_not_sweep_connector_state(build_adapter):
     request = _req("req-nat", RequestStatus.FINISHED_STOPPED, external_req_id="ext-nat")
 
     adapter._send_single_request(
-        {"pooling_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
     )
 
     assert connector.put.called

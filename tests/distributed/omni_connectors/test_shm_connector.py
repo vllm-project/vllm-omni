@@ -197,23 +197,24 @@ class TestHeteroTPMultiKey:
 
 class TestCleanup:
     def test_cleanup_removes_unconsumed_segment(self, connector):
-        data = {"leak": True}
-        connector.put("s0", "s1", "cleanup_req_42", data)
-        assert "cleanup_req_42" in connector._pending_keys
+        """KV key shape ``omni_{from}_to_{to}_kv_cache_{request_id}``."""
+        key = "omni_s0_to_s1_kv_cache_req_42"
+        connector.put("s0", "s1", key, {"leak": True})
+        assert key in connector._pending_keys
 
         connector.cleanup("req_42")
-        assert "cleanup_req_42" not in connector._pending_keys
+        assert key not in connector._pending_keys
 
-        result = connector.get("s0", "s1", "cleanup_req_42", metadata=None)
+        result = connector.get("s0", "s1", key, metadata=None)
         assert result is None
 
     def test_cleanup_noop_for_consumed_segment(self, connector):
-        data = {"consumed": True}
-        connector.put("s0", "s1", "consumed_req_99", data)
-        connector.get("s0", "s1", "consumed_req_99", metadata=None)
+        key = "omni_s0_to_s1_kv_cache_req_99"
+        connector.put("s0", "s1", key, {"consumed": True})
+        connector.get("s0", "s1", key, metadata=None)
 
         connector.cleanup("req_99")
-        assert "consumed_req_99" not in connector._pending_keys
+        assert key not in connector._pending_keys
 
     def test_close_cleans_all_pending(self, connector):
         for i in range(3):
@@ -225,8 +226,8 @@ class TestCleanup:
 
     def test_cleanup_sweeps_chunk_keys_and_lock_files(self, connector):
         """Abort sweep: chunk-style keys ``{ext_req_id}_{stage}_{chunk}`` are
-        matched by external-request-id prefix; both the SHM segments and
-        their lock files must be removed, leaving other requests untouched.
+        matched by external request id; both the SHM segments and their
+        lock files must be removed, leaving other requests untouched.
         """
         for chunk in range(2):
             ok, _, _ = connector.put("s0", "s1", f"req-c1_0_{chunk}", {"chunk": chunk})
@@ -244,6 +245,50 @@ class TestCleanup:
         result = connector.get("s0", "s1", "other-req_0_0", metadata=None)
         assert result is not None
         assert result[0] == {"keep": True}
+
+    def test_cleanup_does_not_touch_id_prefixed_sibling(self, connector):
+        """``abc`` must not sweep ``abc_def``. A bare ``request_id + "_"``
+        prefix match would unlink a live sibling's chunks, stranding its
+        consumer on a chunk that no longer exists — strictly worse than
+        the leak this sweep fixes.
+        """
+        connector.put("s0", "s1", "abc_0_0", {"mine": True})
+        connector.put("s0", "s1", "abc_def_0_0", {"sibling": True})
+
+        connector.cleanup("abc")
+
+        assert "abc_0_0" not in connector._pending_keys
+        assert "abc_def_0_0" in connector._pending_keys
+        result = connector.get("s0", "s1", "abc_def_0_0", metadata=None)
+        assert result is not None
+        assert result[0] == {"sibling": True}
+
+    def test_cleanup_does_not_match_bare_id_suffix(self, connector):
+        """Numeric request ids are common, and a bare ``"_" + request_id``
+        suffix match would make ``cleanup("0")`` unlink chunk 0 of every
+        request in flight.
+        """
+        connector.put("s0", "s1", "other-req_0_0", {"keep": True})
+        connector.put("s0", "s1", "0_0_0", {"mine": True})
+
+        connector.cleanup("0")
+
+        assert "0_0_0" not in connector._pending_keys
+        assert "other-req_0_0" in connector._pending_keys
+        result = connector.get("s0", "s1", "other-req_0_0", metadata=None)
+        assert result is not None
+        assert result[0] == {"keep": True}
+
+    def test_cleanup_sweeps_rank_aware_kv_keys(self, connector):
+        """Rank-aware KV shape ``{req}_{from_stage}_{chunk}_{from}_{to}``
+        stays covered; stage names need not be numeric.
+        """
+        connector.put("s0", "s1", "req-tp_s0_0_0_1", {"rank": 1})
+        connector.put("s0", "s1", "req-tp_s0_0_1_0", {"rank": 0})
+
+        connector.cleanup("req-tp")
+
+        assert not any(k.startswith("req-tp") for k in connector._pending_keys)
 
     def test_get_removes_lock_file_even_for_falsy_payload(self, connector):
         """The lock file must be tied to segment consumption, not payload
