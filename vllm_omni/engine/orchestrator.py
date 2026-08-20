@@ -127,8 +127,16 @@ def build_engine_core_request_from_tokens(
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
-        if sampling_params.max_tokens is None and model_config is not None:
-            sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
+        if model_config is not None:
+            remaining = model_config.max_model_len - len(prompt_token_ids)
+            if sampling_params.max_tokens is None:
+                sampling_params.max_tokens = remaining
+            # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
+            # min_tokens wider than the leftover context window never reaches
+            # the length cap: the request stalls once the scheduler can grant
+            # no further tokens. Stage prompts are built here, so clamp now.
+            if sampling_params.min_tokens > remaining:
+                sampling_params.min_tokens = max(0, remaining)
     else:
         pooling_params = params.clone()
 

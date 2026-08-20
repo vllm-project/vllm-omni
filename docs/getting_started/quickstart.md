@@ -66,7 +66,7 @@ from vllm_omni.entrypoints.omni import Omni
 if __name__ == "__main__":
     omni = Omni(
         model="Tongyi-MAI/Z-Image-Turbo",
-        # stage_configs_path="./stage-config.yaml",  # See below
+        # deploy_config="./deploy-config.yaml",  # Optional deploy override
     )
     prompts = [
         "a cup of coffee on a table",

@@ -688,7 +688,7 @@ for result in response.json()["results"]:
 |-----------|--------|---------|-------------|
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
-All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
+All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
 
 For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 
