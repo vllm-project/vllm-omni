@@ -70,7 +70,8 @@ def _latent(h, w):
         (16, 16, 1),  # 256x256 px -> single tile
         (24, 16, 2),  # 384x256 px
         (24, 24, 4),  # 384x384 px
-        (96, 168, 112),  # 1536x2688 px, the shipped H3 resolution
+        (48, 84, 28),  # 768x1344 px, the shipped H3 request
+        (96, 168, 112),  # 1536x2688 px, a larger canvas the request path also allows
     ],
 )
 def test_tile_count_matches_the_checkpoint_grid(h, w, expected):
@@ -168,7 +169,8 @@ def _dispatch_vae(parallel_size):
         (4, 24, 16, True),  # 2 tiles, ranks 2 and 3 would get none
         (4, 16, 16, True),  # 1 tile
         (4, 24, 24, False),  # 4 tiles, exactly enough
-        (4, 96, 168, False),  # 112 tiles
+        (4, 48, 84, False),  # 28 tiles, the shipped 768x1344 request
+        (4, 96, 168, False),  # 112 tiles, 1536x2688
         (2, 24, 16, False),  # 2 tiles across 2 ranks
         (1, 16, 16, False),  # never parallel, nothing to guard
     ],
@@ -201,10 +203,10 @@ def test_decode_latent_isolates_and_restores_the_whole_group_state():
 
 
 def test_decode_latent_leaves_the_group_state_alone_when_the_grid_is_large_enough():
-    """112 tiles, 4 ranks: the guard must not fire and must not touch state."""
+    """The shipped 768x1344 request is 28 tiles: the guard must not fire."""
     vae, state, seen = _dispatch_vae(4)
 
-    MiniMaxH3VideoVAE.decode_latent(vae, _latent(96, 168))
+    MiniMaxH3VideoVAE.decode_latent(vae, _latent(48, 84))
 
     assert seen["sp_size"] == 4
     assert seen["sp_enabled"] is True
