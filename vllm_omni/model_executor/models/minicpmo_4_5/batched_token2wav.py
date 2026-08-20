@@ -19,6 +19,65 @@ from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
+# CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
+# calls ``extend_pe``. After the 2x upsample a single Code2Wav prefill longer
+# than this many codec tokens overflows the PE slice (matrix_ac vs matrix_bd).
+_DEFAULT_RELPOS_MAX_POS = 5000
+_MAX_ENCODE_TOKEN_CAP = 1024
+
+
+def relpos_encode_token_budget(
+    *,
+    max_pos: int,
+    stride: int,
+    cache_offset: int,
+    lookahead: int,
+    cap: int = _MAX_ENCODE_TOKEN_CAP,
+) -> int:
+    """How many codec tokens ``forward_chunk`` can take before RelPos PE wraps.
+
+    ``position_encoding(size)`` needs ``size <= max_pos``. After upsample,
+    ``size = cache_offset * stride + ~stride * token_frames`` (plus last-chunk
+    lookahead pad).
+    """
+    stride = max(1, int(stride))
+    lookahead = max(0, int(lookahead))
+    room = int(max_pos) // stride - max(0, int(cache_offset)) - lookahead - 1
+    return max(lookahead + 1, min(int(cap), room))
+
+
+def plan_token2wav_encode_slices(
+    num_frames: int,
+    *,
+    max_frames: int,
+    min_nonfinal: int,
+    last_chunk: bool,
+) -> list[tuple[int, int]]:
+    """Split a Code2Wav token span so every non-final piece has a lookahead window."""
+    if num_frames <= 0:
+        return []
+    min_nonfinal = max(1, int(min_nonfinal))
+    max_frames = max(int(max_frames), min_nonfinal)
+    last_min = 1 if last_chunk else min_nonfinal
+    if num_frames <= max_frames:
+        return [(0, num_frames)]
+
+    slices: list[tuple[int, int]] = []
+    start = 0
+    while start < num_frames:
+        remaining = num_frames - start
+        if remaining <= max_frames:
+            slices.append((start, num_frames))
+            break
+        take = max_frames
+        tail = remaining - take
+        if tail <= max_frames and tail < last_min:
+            take = remaining - last_min
+        if take < min_nonfinal:
+            take = remaining
+        slices.append((start, start + take))
+        start += take
+    return slices
 
 
 def _autocast_disabled(device: torch.device):
@@ -101,7 +160,9 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
-        _undecorate_dynamo(self.flow.encoder, "forward_chunk")
+        encoder = getattr(self.flow, "encoder", None)
+        if encoder is not None:
+            _undecorate_dynamo(encoder, "forward_chunk")
         hift_parameter = next(self.hift.parameters(), None)
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
@@ -237,6 +298,41 @@ class BatchedToken2Wav(nn.Module):
         width = getattr(layer, "pre_lookahead_len", None)
         return int(width) if width is not None else None
 
+    def _relpos_max_pos(self) -> int:
+        embed = getattr(self.flow.encoder, "embed", None)
+        pe = getattr(embed, "pe", None)
+        if isinstance(pe, torch.Tensor) and pe.numel() > 0:
+            return max(1, int(pe.size(1) // 2))
+        return _DEFAULT_RELPOS_MAX_POS
+
+    def _upsample_stride(self) -> int:
+        stride = getattr(getattr(self.flow.encoder, "up_layer", None), "stride", None)
+        return max(1, int(stride)) if stride is not None else 2
+
+    def _max_encode_token_frames(self, states: list[BatchedToken2WavState]) -> int:
+        att = None
+        if states:
+            att = self._stack_flow_cache(states).get("conformer_att_cache")
+        offset1 = int(att.shape[3] // 2) if att is not None else 0
+        lookahead = self._pre_lookahead_len() or 0
+        return relpos_encode_token_budget(
+            max_pos=self._relpos_max_pos(),
+            stride=self._upsample_stride(),
+            cache_offset=offset1,
+            lookahead=lookahead,
+        )
+
+    def _ensure_relpos_pe(self, tokens: torch.Tensor, att_cache: torch.Tensor | None) -> None:
+        """Grow CosyVoice RelPos PE before ``forward_chunk``, which never calls extend_pe."""
+        embed = getattr(self.flow.encoder, "embed", None)
+        extend_pe = getattr(embed, "extend_pe", None)
+        if not callable(extend_pe):
+            return
+        offset1 = int(att_cache.shape[3] // 2) if att_cache is not None else 0
+        lookahead = self._pre_lookahead_len() or 0
+        needed = offset1 * self._upsample_stride() + self._upsample_stride() * (int(tokens.shape[1]) + lookahead + 1)
+        extend_pe(tokens.new_zeros((1, max(needed, 1))))
+
     def _encode_chunk(
         self,
         tokens: torch.Tensor,
@@ -245,6 +341,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._ensure_relpos_pe(tokens, att_cache)
         embedded = self.flow.input_embedding(tokens)
         hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
             xs=embedded,
@@ -508,14 +605,68 @@ class BatchedToken2Wav(nn.Module):
         # must carry at least one full kernel. Only the final chunk is allowed
         # to be shorter: ``forward_chunk`` zero-pads it by the lookahead width.
         lookahead = self._pre_lookahead_len()
+        num_frames = int(tokens.shape[1])
         if lookahead is not None and not last_chunk:
-            num_frames = int(tokens.shape[1])
             if num_frames <= lookahead:
                 raise RuntimeError(
                     "MiniCPMO45Code2WavBatchError "
                     f'{{"reason":"chunk_below_lookahead_window","frames":{num_frames},'
                     f'"minimum":{lookahead + 1}}}'
                 )
+        # A non-async Talker dump can land thousands of codec tokens in one
+        # Code2Wav prefill. CosyVoice RelPos PE (max_len=5000) plus 2x upsample
+        # cannot score that in one ``forward_chunk`` (6968 vs 985 on NPU).
+        max_frames = self._max_encode_token_frames(states)
+        slices = plan_token2wav_encode_slices(
+            num_frames,
+            max_frames=max_frames,
+            min_nonfinal=(lookahead + 1) if lookahead is not None else 1,
+            last_chunk=last_chunk,
+        )
+        if len(slices) > 1:
+            logger.info(
+                "MiniCPM-o Code2Wav splitting %d codec tokens into %d encoder windows "
+                "(max_frames=%d) to stay inside RelPos PE.",
+                num_frames,
+                len(slices),
+                max_frames,
+            )
+            parts: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+            current = states
+            for index, (start, end) in enumerate(slices):
+                is_last_piece = index == len(slices) - 1
+                audios, current = self._decode_batch_once(
+                    tokens[:, start:end],
+                    features,
+                    current,
+                    last_chunk=last_chunk and is_last_piece,
+                    flush_encoder=flush_encoder and is_last_piece,
+                )
+                for row, audio in enumerate(audios):
+                    parts[row].append(audio)
+            merged = [
+                torch.cat(row_parts) if row_parts else tokens.new_zeros((0,), dtype=torch.float32)
+                for row_parts in parts
+            ]
+            return merged, current
+        return self._decode_batch_once(
+            tokens,
+            features,
+            states,
+            last_chunk=last_chunk,
+            flush_encoder=flush_encoder,
+        )
+
+    def _decode_batch_once(
+        self,
+        tokens: torch.Tensor,
+        features: PromptFeatures,
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunk: bool,
+        flush_encoder: bool = False,
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
+        batch_size = int(tokens.shape[0])
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):

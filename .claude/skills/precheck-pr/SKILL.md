@@ -67,6 +67,8 @@ Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type
 
 **Also run the Examples-Policy check on every PR** using [references/examples-policy.md](references/examples-policy.md). Inspect only Python paths introduced by the diff. Treat a new model-, checkpoint-, vendor-, or family-specific Python example as blocking; do not report pre-existing example debt.
 
+**Also confirm local pre-commit gates** from [docs/contributing/README.md](../../../docs/contributing/README.md#linting). GitHub Actions `SKIP` does not prove they passed. Full new-hook list: Omni SPDX (`vLLM-Omni project`); forbidden imports (stdlib `re`/`base64`, pickle, Hugging Face Hub API, Triton/TileLang); no new `torch.cuda` call sites; shellcheck (macOS/Windows must install the binary); mypy-3.10; test files have CI level + hardware marks; TTS `_tts_model_type` branches in `serving_speech.py` must not increase; markdownlint on `docs/`; Buildkite YAML schema. ✗ for growing `allowed_files` / `ALLOWED_FILES` or raising `MAX_MODEL_TYPE_BRANCHES` without review.
+
 ### Step 5: Print Report
 
 ```

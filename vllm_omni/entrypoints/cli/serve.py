@@ -829,7 +829,7 @@ class OmniServeCommand(CLISubcommand):
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)

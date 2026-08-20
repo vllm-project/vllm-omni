@@ -21,7 +21,10 @@ Make every finding:
 - **Calibrated:** match severity to user and maintainer impact.
 
 Do not report unrelated backlog, style already enforced by pre-commit, or a
-missing test that would not protect changed behavior.
+missing test that would not protect changed behavior. Do report new allowlist
+or budget entries in `check_forbidden_imports.py` / `check_torch_cuda.py` /
+`check_tts_adapter.py` / `check_buildkite.py` unless the PR justifies them:
+those are policy changes, not lint noise.
 
 ## Select the input and depth
 
@@ -92,7 +95,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 
 | Reference | Read when |
 | --- | --- |
-| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, or stage config is added. |
+| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, pipeline config, or deploy config is added. |
 | [perf-verification.md](references/checks/perf-verification.md) | The PR makes a latency, throughput, memory, or quality claim. |
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
