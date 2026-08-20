@@ -25,3 +25,27 @@ exact hits are lossless. Turning off the t2i image-similarity penalty makes it
 worse (27.6 -> 25.0), so it stays on by default.
 
 Raw metrics in `t2i_qwen_image_7975/summary.json`.
+
+## T2V — Wan2.2
+
+200 prompts, 832x480, 81 frames, 40 steps, seed=42. The prompts are a
+CLIP-similarity cluster picked from T2V-CompBench (a seed prompt plus its
+199 nearest neighbours), so semantic reuse kicks in during the warmup pass
+itself.
+
+| stage | wallclock (s) | throughput (req/s) | mean latency (s) | p50 (s) | ViCLIP |
+|-------|---------------|--------------------|-------------------|---------|--------|
+| baseline (cache_dit) | 24946.0 | 0.0080 | 124.73 | 121.9 | 0.2437 |
+| warmup (build cache)  | 24277.3 | 0.0082 | 120.71 | 123.8 | 0.2328 |
+| cache hit (reuse)     | 335.1   | 0.5968 | 0.99   | 0.86  | 0.2328 |
+
+All 200 cache-hit requests were served from cache (hit rate 100%, 126x
+throughput). During warmup, 89 of 199 requests matched a cached neighbour
+semantically and skipped on average 8.1 of 40 denoising steps; 42% of those
+hits were clamped at the 10-step storage cap. Warmup ends 3.2% faster than
+baseline — the skipped steps roughly cancel the cache-write overhead. ViCLIP
+on cache hit is identical to warmup (0.2328): exact reuse is lossless. The
+baseline-vs-warmup ViCLIP gap (0.2437 vs 0.2328) is generation variance, not
+cache degradation.
+
+Raw metrics in `t2v_wan22_200/summary.json`.
