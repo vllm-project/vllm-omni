@@ -2168,6 +2168,31 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.quality == "high"
 
 
+def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "drive forward",
+            "extra_params": json.dumps(
+                {
+                    "sana_wm": {"action": "d-4", "rotation_speed_deg": 1.5},
+                    "sana_wm_native_max_tokens": 30000,
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_params = engine.captured_sampling_params_list[0]
+    # The camera block reaches the model through extra_args; the Sana preprocess
+    # hook is what lifts it onto the prompt.
+    assert captured_params.extra_args["sana_wm"]["action"] == "d-4"
+    assert captured_params.extra_args["sana_wm"]["rotation_speed_deg"] == 1.5
+    assert captured_params.extra_args["sana_wm_native_max_tokens"] == 30000
+
+
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
     """Frame interpolation parameters should be forwarded on the sync path."""
     encode_mock = _mock_encode_video_bytes(mocker)

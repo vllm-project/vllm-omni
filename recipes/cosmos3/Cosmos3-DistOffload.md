@@ -189,8 +189,10 @@ wait
 
 - `--dlo-use-allgather` (default) requires all concurrent requests to have the same
   `num_inference_steps` (AllGather is a collective that needs all ranks synchronized)
-- Online quantization (FP8) is incompatible with the DLO+AllGather mmap path;
-  use `--dlo-no-use-allgather` or disable online quantization
+- Online per-tensor FP8 linears with DLO AllGather use the ordinary loader
+  instead of direct checkpoint mmap, then shard the finalized FP8 weights and
+  scales. Size host memory for a transient complete FP8 model on every rank at
+  startup
 - Tensor Parallel > 1 is rejected in the DLO+AllGather mmap path. TP with
   `--dlo-no-use-allgather` retains the standard TP loader and should be treated
   as an experimental compatibility path

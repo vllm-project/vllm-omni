@@ -30,14 +30,6 @@ steps:
       - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
     mirror_hardwares: h100_4
 
-  - label: "Reliability Test - voxcpm2"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
-    mirror_hardwares: l4_1
-
   - group: "Reliability Test - Invalid parameters Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"

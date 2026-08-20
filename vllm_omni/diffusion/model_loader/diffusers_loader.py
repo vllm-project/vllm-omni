@@ -482,12 +482,17 @@ class DiffusersPipelineLoader:
                         )
                 else:
                     if _dist_offload and _use_ag and _has_online_quant:
-                        raise ValueError(
-                            "Online quantization is incompatible with DLO+AllGather: "
-                            "the sharding + AllGather mechanism flattens weights by "
-                            "dtype, which breaks quantized weight/scale layouts. "
-                            "Please use --dlo-no-use-allgather or disable online "
-                            "quantization."
+                        unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
+                        if unsupported_methods:
+                            raise ValueError(
+                                "DLO+AllGather supports online quantization only for "
+                                "per-tensor FP8 linears; unsupported online methods: "
+                                f"{', '.join(unsupported_methods)}. Please use "
+                                "--dlo-no-use-allgather or disable online quantization."
+                            )
+                        logger.info(
+                            "Online per-tensor FP8 with DLO+AllGather: using the "
+                            "ordinary loader before sharding finalized weights and scales"
                         )
                     if _dist_offload and plan_result is not None:
                         logger.info(
@@ -547,6 +552,29 @@ class DiffusersPipelineLoader:
         materialization onto the ``meta`` device (upstream vLLM
         ``uses_meta_device=True``, e.g. online FP8)."""
         return has_online_quantization(model)
+
+    @staticmethod
+    def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
+        """Return unsupported online-quant methods for DLO AllGather.
+
+        Per-tensor online FP8 is safe after the ordinary loader has finalized
+        its weight and scale parameters. DLO shards those runtime tensors by
+        dtype and reconstructs their recorded shapes and strides before the
+        kernel consumes them. Other online methods may create different scale,
+        packing, or aliasing layouts and remain fail-closed until validated.
+        """
+        from vllm.model_executor.layers.quantization.online.fp8 import (
+            Fp8PerTensorOnlineLinearMethod,
+        )
+
+        unsupported: set[str] = set()
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if not getattr(quant_method, "uses_meta_device", False):
+                continue
+            if not isinstance(quant_method, Fp8PerTensorOnlineLinearMethod):
+                unsupported.add(type(quant_method).__name__)
+        return tuple(sorted(unsupported))
 
     def _apply_skip_softmax_calibration(self, model: nn.Module) -> None:
         from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
