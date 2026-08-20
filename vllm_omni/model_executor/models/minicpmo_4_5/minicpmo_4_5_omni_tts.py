@@ -162,17 +162,16 @@ def _trace_talker_condition(
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
-    """Bound codec generation with a conservative text-length estimate.
+    """Return the checkpoint's native codec generation limit.
 
-    EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
-    limit can terminate short responses before EOS is eligible. The 2048
-    ceiling matches the checkpoint's native generation default and keeps the
-    sequence within the Talker's 4096-position context.
+    The Transformers reference path allows up to 2048 codec tokens and stops
+    on the model EOS token (after the first 50 tokens). A text-length-derived
+    ``condition_tokens * 10`` cap is not part of that contract and can cut off
+    perfectly valid Chinese utterances before EOS; ``condition_tokens`` is
+    retained for API/test compatibility and intentionally unused.
     """
-    return max(
-        _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN),
-    )
+    del condition_tokens
+    return _MAX_AUDIO_TOKENS
 
 
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:

@@ -82,15 +82,9 @@ def _routed(output, index: int):
     )
 
 
-@pytest.mark.parametrize(
-    ("condition_tokens", "expected"),
-    [(3, 64), (100, 1000), (1000, 2048)],
-)
-def test_audio_token_limit_scales_with_condition_length(
-    condition_tokens: int,
-    expected: int,
-) -> None:
-    assert _max_audio_tokens(condition_tokens) == expected
+@pytest.mark.parametrize("condition_tokens", [0, 3, 100, 1000])
+def test_audio_token_limit_matches_checkpoint_native_generation(condition_tokens: int) -> None:
+    assert _max_audio_tokens(condition_tokens) == 2048
 
 
 def test_codec_sampling_does_not_inherit_generic_generation_config(monkeypatch) -> None:
