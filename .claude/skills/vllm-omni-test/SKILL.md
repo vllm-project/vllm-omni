@@ -110,10 +110,10 @@ After choosing offline/online/docs/perf, classify the **product under test** and
 |-----------|------------------------------|----------------------------|----------------------------------------|
 | **What it is** | Multimodal LLM pipeline (thinker/talker/stages; text + vision + audio I/O) | Speech synthesis / voice models | Generative diffusion (noise → image, audio, text, or video) |
 | **Examples** | Qwen2.5-Omni, Qwen3-Omni | Qwen3-TTS, VoxCPM2, Higgs-Audio, Step-Audio2 | Qwen-Image, BAGEL, Wan2.2, HunyuanVideo |
-| **Offline runner** | `omni_runner` + `omni_runner_handler`, `generate_multimodal` | `Omni(...).generate` or stage YAML + TTS params | `Omni(...).generate` + `OmniDiffusionSamplingParams` |
+| **Offline runner** | `omni_runner` + `omni_runner_handler`, `generate_multimodal` | `Omni(...).generate` with deploy YAML + TTS params | `Omni(...).generate` + `OmniDiffusionSamplingParams` |
 | **Online client** | `openai_client.send_omni_request` (chat completions, modalities) | `openai_client.send_audio_speech_request` (`/v1/audio/speech`) | `send_diffusion_request` (chat/T2I), `send_video_diffusion_request` (`/v1/videos`, X2V), or `send_images_generations_http_request` / `send_images_edits_http_request` (DALL-E routes) |
 | **Typical assertions** | Stage outputs, text/audio keywords via `OmniRunnerHandler` / response handler | WAV bytes, stream chunks, speech endpoint contract | Image/video dimensions, `final_output_type`, `assert_diffusion_response` |
-| **Stage / deploy YAML** | Per-model omni stage configs (`ci/qwen3_omni_moe.yaml`, …) | `qwen3_tts.yaml`, `voxcpm2.yaml`, … | Often default serve; parallel/offload YAML for heavy DiT |
+| **Deploy YAML** | Per-model deploy configs (`ci/qwen3_omni_moe.yaml`, …) | `qwen3_tts.yaml`, `voxcpm2.yaml`, … | Often default serve; parallel/offload YAML for heavy DiT |
 | **Nightly group** (`test-nightly.yml`) | **Omni Model Test** — `-m "full_model and omni"` | **TTS Model Test** — `-m "full_model and tts"` | **Diffusion X2I(&A&T)** *or* **Diffusion X2V** (see Step 3 table; same `diffusion` marker, different YAML group / file shard) |
 | **L4 pressure** | Expansion per modality/model as needed | Expansion + accuracy/perf in TTS group | X2I: merge feature combos per [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); X2V: separate nightly group |
 

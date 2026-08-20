@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -50,6 +51,7 @@ from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
+    release_audio_transcriber,
 )
 from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -3143,6 +3145,21 @@ class OmniRunnerHandler:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _whisper_device_free_around():
+    """Keep the Whisper judge off the accelerator around a server/runner lifecycle.
+
+    Released on entry so the next instance -- e.g. the next parametrization in
+    the same module -- initializes on a clean device, and again on exit
+    (including when a test raises) so it does not linger for the instance after.
+    """
+    release_audio_transcriber()
+    try:
+        yield
+    finally:
+        release_audio_transcriber()
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -3152,7 +3169,7 @@ def iter_omni_server(
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
-    with omni_fixture_lock:
+    with omni_fixture_lock, _whisper_device_free_around():
         params: OmniServerParams = request.param
         # For now, when a tiny model is substituted, we preserve the original model
         # name via --served-model-name (so that the server still accepts requests with
@@ -3240,7 +3257,7 @@ def iter_omni_runner(
     """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
-    with omni_fixture_lock:
+    with omni_fixture_lock, _whisper_device_free_around():
         param = request.param
         if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
             raise ValueError(
