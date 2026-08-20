@@ -11,6 +11,7 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -44,6 +45,7 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_CODEC_TRACE_ENV = "MINICPMO45_CODEC_SAMPLING_TRACE"
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -147,12 +149,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._num_audio_tokens = getattr(tts_config, "num_audio_tokens", 6562)
             self._hidden_size = getattr(tts_config, "hidden_size", 768)
             self._normalize = getattr(tts_config, "normalize_projected_hidden", True)
-            self._codec_seed = int(getattr(tts_config, "seed", _CODEC_SEED))
-            self._codec_temperature = float(getattr(tts_config, "temperature", _CODEC_TEMPERATURE))
-            self._codec_top_k = int(getattr(tts_config, "top_k", _CODEC_TOP_K))
-            self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
-            self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
-            self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
+            # MiniCPMTTS.generate_chunk() invokes gen_logits() without
+            # generation-config overrides. These values are part of the
+            # model TTS contract, not generic HF generation config.
+            self._codec_seed = _CODEC_SEED
+            self._codec_temperature = _CODEC_TEMPERATURE
+            self._codec_top_k = _CODEC_TOP_K
+            self._codec_top_p = _CODEC_TOP_P
+            self._codec_repetition_penalty = _CODEC_REPETITION_PENALTY
+            self._codec_min_tokens = _CODEC_MIN_TOKENS
+            self._codec_sampling_source = "official_minicpm_tts"
         else:
             self._tts_config = None
 
@@ -392,12 +398,33 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
-        )
+        # MiniCPMTTS skips logits warpers for the first codec token while
+        # audio_bos is active. Subsequent tokens use the official
+        # TopP-then-TopK order implemented above.
+        apply_warpers = step > 0
+        if apply_warpers:
+            logits = _apply_top_k_top_p(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+        if os.getenv(_CODEC_TRACE_ENV) == "1":
+            logger.warning(
+                "minicpmo45_codec_sampling request_id=%s step=%s source=%s "
+                "seed=%s temperature=%s top_k=%s top_p=%s repetition_penalty=%s "
+                "min_tokens=%s warpers=%s",
+                request_id,
+                step,
+                getattr(self, "_codec_sampling_source", "official_minicpm_tts"),
+                self._codec_seed,
+                self._codec_temperature,
+                self._codec_top_k,
+                self._codec_top_p,
+                self._codec_repetition_penalty,
+                min_tokens,
+                apply_warpers,
+            )
         probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,

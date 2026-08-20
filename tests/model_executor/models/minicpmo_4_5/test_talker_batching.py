@@ -8,11 +8,18 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as talker_module
+
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _CODEC_REPETITION_PENALTY,
+    _CODEC_SEED,
+    _CODEC_TEMPERATURE,
+    _CODEC_TOP_K,
+    _CODEC_TOP_P,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -82,6 +89,81 @@ def test_audio_token_limit_scales_with_condition_length(
     expected: int,
 ) -> None:
     assert _max_audio_tokens(condition_tokens) == expected
+
+
+def test_codec_sampling_does_not_inherit_generic_generation_config(monkeypatch) -> None:
+    config = type(
+        "Config",
+        (),
+        {
+            "tts_config": type(
+                "TTSConfig",
+                (),
+                {
+                    "audio_bos_token_id": 151687,
+                    "text_eos_token_id": 151692,
+                    "num_audio_tokens": 6562,
+                    "hidden_size": 768,
+                    "temperature": 0.1,
+                    "top_k": 100,
+                    "top_p": 0.2,
+                    "repetition_penalty": 1.0,
+                    "seed": 7,
+                    "min_new_tokens": 1,
+                },
+            )(),
+        },
+    )()
+    vllm_config = type("VLLMConfig", (), {"model_config": type("ModelConfig", (), {"hf_config": config})()})()
+    monkeypatch.setattr(
+        MiniCPMO45OmniTTSForConditionalGeneration,
+        "_init_native_talker",
+        lambda self, prefix: None,
+    )
+    talker = MiniCPMO45OmniTTSForConditionalGeneration(
+        vllm_config=vllm_config,
+    )
+    assert talker._codec_seed == _CODEC_SEED
+    assert talker._codec_temperature == _CODEC_TEMPERATURE
+    assert talker._codec_top_k == _CODEC_TOP_K
+    assert talker._codec_top_p == _CODEC_TOP_P
+    assert talker._codec_repetition_penalty == _CODEC_REPETITION_PENALTY
+    assert talker._codec_sampling_source == "official_minicpm_tts"
+
+
+def test_first_codec_step_skips_warpers_but_later_steps_apply(mocker) -> None:
+    talker = _make_talker()
+    talker.head_code = nn.ModuleList([nn.Identity()])
+    talker._codec_temperature = _CODEC_TEMPERATURE
+    talker._codec_top_k = _CODEC_TOP_K
+    talker._codec_top_p = _CODEC_TOP_P
+    talker._codec_repetition_penalty = _CODEC_REPETITION_PENALTY
+    talker._request_audio_states["req"] = {"min_tokens": 0}
+    warper = mocker.patch.object(
+        talker_module,
+        "_apply_top_k_top_p",
+        wraps=talker_module._apply_top_k_top_p,
+    )
+    hidden = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    talker._sample_audio_code(
+        hidden,
+        torch.empty(0, dtype=torch.long),
+        "req",
+        step=0,
+    )
+    assert not warper.called
+    talker._sample_audio_code(
+        hidden,
+        torch.tensor([1]),
+        "req",
+        step=1,
+    )
+    warper.assert_called_once_with(
+        mocker.ANY,
+        top_k=_CODEC_TOP_K,
+        top_p=_CODEC_TOP_P,
+        min_tokens_to_keep=3,
+    )
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
