@@ -11,6 +11,8 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import hashlib
+import json
 import os
 from collections.abc import Iterable
 from typing import Any
@@ -46,6 +48,81 @@ _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 _CODEC_TRACE_ENV = "MINICPMO45_CODEC_SAMPLING_TRACE"
+_FIRST_LOGITS_TRACE_ENV = "MINICPMO45_FIRST_LOGITS_TRACE_DIR"
+
+
+def _trace_first_codec_step(
+    *,
+    request_id: str,
+    step: int,
+    hidden_state: torch.Tensor,
+    raw_logits: torch.Tensor,
+    processed_logits: torch.Tensor,
+    sampled_token: torch.Tensor,
+    history: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    min_tokens: int,
+    seed: int,
+    warpers_applied: bool,
+) -> None:
+    """Write an opt-in first-step diagnostic without changing sampling."""
+    root = os.environ.get(_FIRST_LOGITS_TRACE_ENV, "").strip()
+    if not root or step != 0 or not request_id.startswith("chatcmpl-"):
+        return
+
+    def tensor_summary(value: torch.Tensor, *, include_values: bool = False) -> dict[str, Any]:
+        tensor = value.detach().float().cpu().contiguous()
+        result: dict[str, Any] = {
+            "shape": [int(dim) for dim in tensor.shape],
+            "numel": int(tensor.numel()),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+        if include_values:
+            result["values"] = [float(item) for item in tensor.reshape(-1).tolist()]
+        return result
+
+    def topk_summary(value: torch.Tensor, count: int = 32) -> dict[str, Any]:
+        vector = value.detach().float().reshape(-1)
+        keep = min(count, int(vector.numel()))
+        values, indices = torch.topk(vector, keep)
+        return {
+            "indices": [int(item) for item in indices.cpu().tolist()],
+            "values": [float(item) for item in values.cpu().tolist()],
+        }
+
+    try:
+        os.makedirs(root, exist_ok=True)
+        record = {
+            "stage": "talker.first_codec_step",
+            "request_id": request_id,
+            "step": step,
+            "hidden_state": tensor_summary(hidden_state, include_values=True),
+            "raw_logits": tensor_summary(raw_logits, include_values=True),
+            "raw_topk": topk_summary(raw_logits),
+            "processed_logits": tensor_summary(processed_logits),
+            "processed_topk": topk_summary(processed_logits),
+            "processed_finite_count": int(torch.isfinite(processed_logits).sum().item()),
+            "sampled_token": int(sampled_token.item()),
+            "history": [int(item) for item in history.detach().cpu().reshape(-1).tolist()],
+            "sampling": {
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "repetition_penalty": repetition_penalty,
+                "min_tokens": min_tokens,
+                "seed": seed,
+                "first_step_warpers_applied": warpers_applied,
+            },
+        }
+        with open(os.path.join(root, "first_logits_trace.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("minicpmo45_first_logits_trace_failed error=%s", exc)
+
+
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -383,7 +460,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        raw_logits = self.head_code[0](hidden_state).float()
+        logits = raw_logits / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
@@ -425,12 +503,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 min_tokens,
                 apply_warpers,
             )
-        probabilities = torch.softmax(logits, dim=-1)
-        return torch.multinomial(
+        processed_logits = logits
+        probabilities = torch.softmax(processed_logits, dim=-1)
+        sampled_token = torch.multinomial(
             probabilities,
             num_samples=1,
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
+        _trace_first_codec_step(
+            request_id=request_id,
+            step=step,
+            hidden_state=hidden_state,
+            raw_logits=raw_logits,
+            processed_logits=processed_logits,
+            sampled_token=sampled_token,
+            history=history,
+            temperature=self._codec_temperature,
+            top_k=self._codec_top_k,
+            top_p=self._codec_top_p,
+            repetition_penalty=self._codec_repetition_penalty,
+            min_tokens=min_tokens,
+            seed=self._codec_seed,
+            warpers_applied=apply_warpers,
+        )
+        return sampled_token
 
     def make_omni_output(
         self,
