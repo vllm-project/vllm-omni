@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,16 @@ from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_ops import patch_minimax_h3_video_vae
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+
+def _minimax_h3_vae_use_omni_ops() -> bool:
+    value = os.getenv("MINIMAX_H3_VAE_USE_OMNI_OPS", "0")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -124,6 +131,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # checkpoint through FP16; decode still runs under FP16 autocast.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        self.model = self.remote.model
+        if _minimax_h3_vae_use_omni_ops():
+            patch_minimax_h3_video_vae(self.model)
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
@@ -131,7 +141,6 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device,
                 pin_memory=True,
             )
-        self.model = self.remote.model
         self.use_tiling = True
         self.use_slicing = False
         self.parallel_size = 1
