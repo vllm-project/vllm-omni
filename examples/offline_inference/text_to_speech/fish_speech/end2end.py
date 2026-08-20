@@ -38,17 +38,6 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "fishaudio/s2-pro"
-DEFAULT_DEPLOY_CONFIG = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "vllm_omni",
-    "model_executor",
-    "stage_configs",
-    "fish_speech_s2_pro.yaml",
-)
 
 
 def build_prompt(
@@ -152,7 +141,8 @@ def _build_omni_kwargs(args, model_name: str) -> dict:
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
-    omni_kwargs["deploy_config"] = args.deploy_config or DEFAULT_DEPLOY_CONFIG
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     return omni_kwargs
 
 

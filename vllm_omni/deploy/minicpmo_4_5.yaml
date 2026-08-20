@@ -32,7 +32,7 @@ stages:
     max_num_batched_tokens: 16384
     devices: "0"
     # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
-    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    # Keep these in YAML so they are applied through --deploy-config.
     interleave_mm_strings: true
     media_io_kwargs:
       video:
@@ -111,3 +111,9 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      - stage_id: 2
+        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
+        # estimator kernels through the NPU platform patch.
+        additional_config:
+          code2wav_enable_npu_graph: true
+          code2wav_max_npu_graphs: 32

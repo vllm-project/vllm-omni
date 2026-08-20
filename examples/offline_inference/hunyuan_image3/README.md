@@ -7,17 +7,17 @@ YAMLs under `vllm_omni/deploy/`.
 
 | File | Topology | Default use |
 | :--- | :--- | :--- |
-| `vllm_omni/deploy/hunyuan_image3.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
+| `vllm_omni/deploy/hunyuan_image_3_moe.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
 | `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Default for `img2text` and `text2text`. |
 | `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. Pass it explicitly with `--deploy-config`. |
 
-The example chooses a deploy config automatically when `--deploy-config` and
-`--stage-configs-path` are both omitted:
+The example chooses a deploy config automatically when `--deploy-config` is
+omitted:
 
 | `--modality` | `mode` passed to Omni | Default deploy |
 | :--- | :--- | :--- |
-| `text2img` | `text-to-image` | `hunyuan_image3.yaml` |
-| `img2img` | `image-editing` | `hunyuan_image3.yaml` |
+| `text2img` | `text-to-image` | `hunyuan_image_3_moe.yaml` |
+| `img2img` | `image-editing` | `hunyuan_image_3_moe.yaml` |
 | `img2text` | `image-to-text` | `hunyuan_image3_ar.yaml` |
 | `text2text` | `text-to-text` | `hunyuan_image3_ar.yaml` |
 
@@ -35,8 +35,8 @@ path; the image endpoints infer the image task from the endpoint and payload.
 
 | Online scenario | Server deploy | Request |
 | :--- | :--- | :--- |
-| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
-| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/edits`. |
+| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
+| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml` | `POST /v1/images/edits`. |
 | Image/text to text | `--deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml` | `POST /v1/chat/completions` for text output, for example with `"modalities": ["text"]`. |
 | DiT-only image generation | `--deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml` | `POST /v1/images/generations`. |
 
@@ -96,7 +96,7 @@ Override the default full AR + DiT deploy explicitly:
 python examples/offline_inference/hunyuan_image3/end2end.py \
   --model tencent/HunyuanImage-3.0-Instruct \
   --modality text2img \
-  --deploy-config vllm_omni/deploy/hunyuan_image3.yaml \
+  --deploy-config vllm_omni/deploy/hunyuan_image_3_moe.yaml \
   --prompts "A cute cat"
 ```
 
@@ -117,8 +117,7 @@ python end2end.py --modality text2img \
 
 | Argument | Description |
 | :--- | :--- |
-| `--deploy-config` | Preferred config path for unified deploy YAMLs. |
-| `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
+| `--deploy-config` | Optional path for unified deploy YAML overrides. |
 | `--additional-config` | JSON object forwarded to diffusion worker `additional_config`. |
 | `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
 | `--steps` | Number of diffusion inference steps for image generation. |
@@ -132,7 +131,7 @@ python end2end.py --modality text2img \
 
 - `hunyuan_image3_ar.yaml` is a 4-card AR-only text/comprehension deploy.
 - `hunyuan_image3_dit.yaml` is a single-stage DiT deploy with `stage_id: 0`.
-- The old HunyuanImage3 YAMLs under `model_executor/stage_configs/` and `platforms/*/stage_configs/` have been folded into the deploy YAMLs.
+- Platform-specific overrides are included in the unified deploy YAMLs.
 
 ## Prompt Format
 

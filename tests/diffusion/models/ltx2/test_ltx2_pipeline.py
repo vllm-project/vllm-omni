@@ -20,6 +20,7 @@ from vllm_omni.diffusion.models.ltx2 import (
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     LTX2_COMPONENT_PROFILE,
     LTX2_DISTILLED_COMPONENT_PROFILE,
+    LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     LTX2_TWO_STAGE_COMPONENT_PROFILE,
     LTX23_COMPONENT_PROFILE,
     LTX23_DISTILLED_COMPONENT_PROFILE,
@@ -47,6 +48,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_guidance import (
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import LTXAVState
 from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
+    LTX2_DISTILLED_ONE_STAGE_RECIPE,
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_ONE_STAGE_RECIPE,
     LTX2_TWO_STAGE_RECIPE,
@@ -64,12 +66,14 @@ from vllm_omni.diffusion.models.ltx2.ltx2_request import (
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
+    LTX2DistilledOneStagePipeline,
     LTX2I2VDMD2Pipeline,
     LTX2Pipeline,
     LTX2T2VDMD2Pipeline,
 )
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2DistilledPipeline,
+    LTX2DistilledTwoStagePipeline,
     LTX2TwoStagePipeline,
 )
 
@@ -125,15 +129,21 @@ def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
 
     assert issubclass(LTX2Pipeline, LTXRuntime)
     assert issubclass(LTX2TwoStagePipeline, LTXRuntime)
+    assert issubclass(LTX2DistilledOneStagePipeline, LTXRuntime)
+    assert issubclass(LTX2DistilledTwoStagePipeline, LTXRuntime)
     assert issubclass(LTX2DistilledPipeline, LTXRuntime)
+    assert LTX2DistilledPipeline is LTX2DistilledTwoStagePipeline
     assert LTX2Pipeline.component_profile is LTX2_COMPONENT_PROFILE
     assert LTX2Pipeline.pipeline_recipe is LTX2_ONE_STAGE_RECIPE
     assert LTX2TwoStagePipeline.component_profile is LTX2_TWO_STAGE_COMPONENT_PROFILE
     assert LTX2TwoStagePipeline.pipeline_recipe is LTX2_TWO_STAGE_RECIPE
+    assert LTX2DistilledOneStagePipeline.component_profile is LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE
+    assert LTX2DistilledOneStagePipeline.pipeline_recipe is LTX2_DISTILLED_ONE_STAGE_RECIPE
     assert LTX2DistilledPipeline.component_profile is LTX2_DISTILLED_COMPONENT_PROFILE
     for pipeline_cls, profile in (
         (LTX2Pipeline, LTX2_COMPONENT_PROFILE),
         (LTX2TwoStagePipeline, LTX2_TWO_STAGE_COMPONENT_PROFILE),
+        (LTX2DistilledOneStagePipeline, LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE),
         (LTX2DistilledPipeline, LTX2_DISTILLED_COMPONENT_PROFILE),
     ):
         assert pipeline_cls._dit_modules == list(profile.dit_modules)
@@ -254,7 +264,7 @@ def test_ltx_multistage_rejects_cache_dit_before_component_initialization(tmp_pa
 
     monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
 
-    with pytest.raises(ValueError, match="only one-stage LTX recipes"):
+    with pytest.raises(ValueError, match="not qualified for this LTX recipe"):
         LTX2TwoStagePipeline(
             od_config=SimpleNamespace(
                 model=str(tmp_path),
@@ -709,15 +719,48 @@ def test_ltx_component_loader_installs_omni_connector_attention(monkeypatch):
 
     assert len(installed) == 2
     assert all(processor.__class__.__name__ == "_LTXConnectorAttnProcessor" for processor in installed)
-    assert all(processor.has_learned_registers for processor in installed)
     assert all(kernel["role"] == "ltx2.connector" for kernel in kernels)
     assert all(kernel["role_category"] == "self" for kernel in kernels)
     assert all(kernel["skip_sequence_parallel"] for kernel in kernels)
     assert all(kernel["disable_kv_quant"] for kernel in kernels)
+    assert all(processor.has_learned_registers for processor in installed)
+    assert not any(processor.preserve_learned_register_mask for processor in installed)
 
 
-@pytest.mark.parametrize("has_learned_registers", [False, True])
-def test_ltx_connector_attention_dispatches_through_omni_kernel(has_learned_registers):
+def test_ltx25_connector_attention_preserves_learned_register_mask(monkeypatch):
+    installed = []
+
+    class OmniAttention:
+        def __init__(self, **_kwargs):
+            pass
+
+    class Attention:
+        heads = 32
+        head_dim = 128
+        inner_kv_dim = 4096
+
+        def set_processor(self, processor):
+            installed.append(processor)
+
+    monkeypatch.setattr(ltx2_components, "OmniAttention", OmniAttention)
+    connectors = SimpleNamespace(
+        video_connector=SimpleNamespace(
+            learnable_registers=object(),
+            transformer_blocks=[SimpleNamespace(attn1=Attention())],
+        ),
+        audio_connector=SimpleNamespace(
+            learnable_registers=object(),
+            transformer_blocks=[SimpleNamespace(attn1=Attention())],
+        ),
+    )
+
+    _install_connector_attention(connectors, preserve_learned_register_mask=True)
+
+    assert all(processor.has_learned_registers for processor in installed)
+    assert all(processor.preserve_learned_register_mask for processor in installed)
+
+
+def test_ltx_connector_attention_dispatches_through_omni_kernel():
     calls = []
 
     class Backend:
@@ -732,12 +775,16 @@ def test_ltx_connector_attention_dispatches_through_omni_kernel(has_learned_regi
             calls.append((query, key, value, metadata))
             return query
 
+    class UpcastingNorm(torch.nn.Module):
+        def forward(self, tensor):
+            return tensor.float()
+
     attention = SimpleNamespace(
         heads=2,
         head_dim=4,
         inner_kv_dim=8,
-        norm_q=torch.nn.Identity(),
-        norm_k=torch.nn.Identity(),
+        norm_q=UpcastingNorm(),
+        norm_k=UpcastingNorm(),
         to_q=torch.nn.Identity(),
         to_k=torch.nn.Identity(),
         to_v=torch.nn.Identity(),
@@ -746,24 +793,29 @@ def test_ltx_connector_attention_dispatches_through_omni_kernel(has_learned_regi
         rope_type="split",
         omni_attention=OmniAttention(),
     )
-    hidden_states = torch.randn(2, 3, 8)
+    hidden_states = torch.randn(2, 3, 8, dtype=torch.bfloat16)
     additive_mask = torch.zeros(2, 1, 3, 3)
+    rotary = (
+        torch.randn(2, 2, 3, 2, dtype=torch.float32),
+        torch.randn(2, 2, 3, 2, dtype=torch.float32),
+    )
 
-    output = ltx2_components._LTXConnectorAttnProcessor(has_learned_registers=has_learned_registers)(
+    output = ltx2_components._LTXConnectorAttnProcessor()(
         attention,
         hidden_states,
         attention_mask=additive_mask,
+        query_rotary_emb=rotary,
     )
 
     query, key, value, metadata = calls[0]
     assert query.shape == key.shape == value.shape == (2, 3, 2, 4)
-    if has_learned_registers:
-        assert metadata is None
-    else:
-        assert metadata.attn_mask.shape == (2, 3)
-        assert metadata.attn_mask.dtype == torch.bool
-        assert metadata.attn_mask.all()
-    torch.testing.assert_close(output, hidden_states)
+    assert query.dtype == key.dtype == value.dtype == torch.bfloat16
+    assert metadata.attn_mask.shape == (2, 3)
+    assert metadata.attn_mask.dtype == torch.bool
+    assert metadata.attn_mask.all()
+    expected_rotary = tuple(component.to(torch.bfloat16) for component in rotary)
+    expected = ltx2_components.apply_split_rotary_emb(hidden_states, expected_rotary, head_dim=4)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_ltx2_distilled_pipeline_shares_recipe_runtime():
@@ -1707,6 +1759,7 @@ class TestLTXForwardStages:
         assert seen["request_inputs"].output_type == "latent"
         assert seen["kwargs"] == {
             "request_sigmas": request_sigmas,
+            "request_phase_sigmas": None,
             "image": None,
         }
 
@@ -1824,6 +1877,16 @@ class TestRegistryIntegration:
             "pipeline_ltx2_two_stage",
             "LTX2TwoStagePipeline",
         )
+        assert _DIFFUSION_MODELS["LTX2DistilledOneStagePipeline"] == (
+            "ltx2",
+            "pipeline_ltx2",
+            "LTX2DistilledOneStagePipeline",
+        )
+        assert _DIFFUSION_MODELS["LTX2DistilledTwoStagePipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_two_stage",
+            "LTX2DistilledTwoStagePipeline",
+        )
         assert _DIFFUSION_MODELS["LTX2DistilledPipeline"] == (
             "ltx2",
             "pipeline_ltx2_two_stage",
@@ -1848,6 +1911,8 @@ class TestRegistryIntegration:
         expected = [
             "LTX2Pipeline",
             "LTX2TwoStagePipeline",
+            "LTX2DistilledOneStagePipeline",
+            "LTX2DistilledTwoStagePipeline",
             "LTX2DistilledPipeline",
             "LTX2T2VDMD2Pipeline",
             "LTX2I2VDMD2Pipeline",
@@ -1861,6 +1926,8 @@ class TestRegistryIntegration:
         [
             "LTX2Pipeline",
             "LTX2TwoStagePipeline",
+            "LTX2DistilledOneStagePipeline",
+            "LTX2DistilledTwoStagePipeline",
             "LTX2DistilledPipeline",
             "LTX2T2VDMD2Pipeline",
             "LTX2I2VDMD2Pipeline",

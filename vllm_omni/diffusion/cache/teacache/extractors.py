@@ -1259,12 +1259,11 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
+    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        _BF16_DTYPE,
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
         _build_rope_table,
-        _modulate_scale_shift,
         _required_kwarg,
     )
 
@@ -1333,6 +1332,7 @@ def extract_minimax_h3_context(
         refiner_max_seqlen=refiner_max,
         seq_len=seq_len,
         device=device,
+        local_span=(0, seq_len),
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1340,13 +1340,12 @@ def extract_minimax_h3_context(
     cu_seqlens = cu_seqlens.to(device)
 
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
-    modulated_hidden = module.blocks[0].norm1(decoder_input)
-    modulated_input = _modulate_scale_shift(
-        modulated_hidden,
+    modulated_input = module.blocks[0].norm1(decoder_input)
+    modulated_input = indexed_scale_shift_(
+        modulated_input,
         shift_msa,
         scale_msa,
         combined_indices,
-        dtype=_BF16_DTYPE,
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:

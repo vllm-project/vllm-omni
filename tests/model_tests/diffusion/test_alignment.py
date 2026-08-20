@@ -28,6 +28,8 @@ EXCLUDED_MODELS = [
     "WanPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
+    "LTX2DistilledOneStagePipeline",
+    "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
@@ -62,6 +64,9 @@ EXCLUDED_MODELS = [
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated contract tests and real-checkpoint E2E smoke instead.
+    "LingBotWorldCausalDMDPipeline",
     "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
@@ -72,8 +77,10 @@ EXCLUDED_MODELS = [
     "DreamZeroPipeline",
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
+    "Pi0Pipeline",
     "SoulXSingerPipeline",
     "SoulXSingerSVCPipeline",
+    "SanaWmPipeline",
 ]
 
 
