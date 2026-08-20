@@ -653,6 +653,7 @@ def run_benchmark(
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
     resource_label: str | None = None,
+    num_warmups: int = 2,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -677,7 +678,7 @@ def run_benchmark(
         + args
         + [
             "--num-warmups",
-            "2",
+            str(num_warmups),
             "--save-result",
             "--result-dir",
             os.environ.get("BENCHMARK_DIR", "tests"),

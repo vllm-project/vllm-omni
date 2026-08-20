@@ -207,18 +207,16 @@ outputs = omni.generate(
 )
 ```
 
-## Stage Configuration
+## Deploy Configuration
 
 Use the equivalent engine arguments in a deployment YAML:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: diffusion
-    engine_args:
-      step_execution: false
-      max_num_seqs: 4
-      request_batch_max_wait_ms: 20
+    step_execution: false
+    max_num_seqs: 4
+    request_batch_max_wait_ms: 20
 ```
 
 For step execution, set `step_execution: true` and remove

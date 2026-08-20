@@ -95,7 +95,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 
 | Reference | Read when |
 | --- | --- |
-| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, or stage config is added. |
+| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, pipeline config, or deploy config is added. |
 | [perf-verification.md](references/checks/perf-verification.md) | The PR makes a latency, throughput, memory, or quality claim. |
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |

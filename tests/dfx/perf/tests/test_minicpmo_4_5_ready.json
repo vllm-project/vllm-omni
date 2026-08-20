@@ -37,6 +37,7 @@
           4
         ],
         "no_oversample": true,
+        "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "extra_body": {
