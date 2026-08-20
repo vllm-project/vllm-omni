@@ -184,6 +184,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4285")
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_image_large_request_failure(
@@ -233,6 +234,7 @@ def test_reliability_fault_process_kill_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.skip(reason="issue#4522")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",

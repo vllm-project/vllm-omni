@@ -30,9 +30,14 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
+_SKIP_ISSUE_6417 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/6417",
+)
+
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
+    _SKIP_ISSUE_6417,
 ]
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Realtime"
