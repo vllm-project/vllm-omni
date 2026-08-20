@@ -638,7 +638,6 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 multimodal_outputs={"model_outputs": [empty]},
             )
 
-        is_async_chunk = getattr(self.vllm_config.model_config, "async_chunk", False)
         ids = code_tensor.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_flat_codes_for_requests(
             ids, kwargs.get("seq_token_counts"), runtime_additional_information
@@ -652,16 +651,13 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 multimodal_outputs={"model_outputs": [empty] * len(request_ids_list)},
             )
 
-        if is_async_chunk:
-            audios = self._batch_chunked_decode_streaming(
-                request_ids_list,
-                default_chunk_size=self._codec_chunk_frames,
-                default_left_context_size=self._codec_left_context_frames,
-                per_req_left_context_frames=per_left,
-                per_req_codec_chunk_frames=per_chunk,
-            )
-        else:
-            audios = self._batch_decode_waveforms(request_ids_list)
+        audios = self._batch_chunked_decode_streaming(
+            request_ids_list,
+            default_chunk_size=self._codec_chunk_frames,
+            default_left_context_size=self._codec_left_context_frames,
+            per_req_left_context_frames=per_left,
+            per_req_codec_chunk_frames=per_chunk,
+        )
 
         return OmniOutput(
             text_hidden_states=None,
@@ -714,112 +710,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return code_tensor
 
     @torch.inference_mode()
-    def _batch_decode_waveforms(
-        self,
-        request_codes_list: list[torch.Tensor],
-    ) -> list[torch.Tensor]:
-        """Batch-decode multiple requests' codes in a single decoder forward pass.
-
-        Instead of calling _decode_waveform_from_codes per request (which incurs
-        4 GPU↔CPU round-trips each), this method:
-          1. Extracts audio_codes for all valid requests on CPU (cheap).
-          2. Runs quantizer.decode_vq (embedding lookup) for each on GPU.
-          3. Packs all hidden-states into one tensor and calls
-             decoder(packed_hs, input_lengths) once.
-          4. Splits the output waveforms back to per-request tensors.
-        """
-        empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
-        num_req = len(request_codes_list)
-        if num_req == 0:
-            return [empty]
-
-        tokenizer = self._tokenizer_service.audio_tokenizer
-        group_size = self.streamer_config.group_size
-        audio_channels = self.streamer_config.audio_channels
-
-        cg_wrapper = self._tokenizer_service.cuda_graph_wrapper
-        cg_ready = cg_wrapper is not None and cg_wrapper.is_ready
-
-        extracted: list[tuple[int, torch.Tensor]] = []
-
-        for i, req_codes in enumerate(request_codes_list):
-            if req_codes is None or req_codes.numel() == 0:
-                continue
-            if self._check_dummy_code_tensor(req_codes):
-                continue
-
-            flat_codes = req_codes.detach().to(torch.long).cpu()
-            audio_codes = extract_audio_code_tensor(
-                flat_codes,
-                group_size,
-                audio_channels,
-                self.codes,
-            )
-            if audio_codes is None or audio_codes.numel() == 0:
-                continue
-
-            extracted.append((i, audio_codes))
-
-        if not extracted:
-            return [empty] * num_req
-
-        valid_indices = [t[0] for t in extracted]
-        # CUDA graph decode is single-batch only; avoid duplicate decode_vq for len>1.
-        use_cuda_graph = cg_ready and len(extracted) == 1
-
-        if use_cuda_graph:
-            wav_out = cg_wrapper.decode(extracted[0][1].to(self.device))
-            wav = wav_out.squeeze(0).squeeze(0)
-            cfg = tokenizer.config
-            frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
-            valid_len = extracted[0][1].shape[-1] * frames_per_token
-            if wav.numel() > valid_len:
-                wav = wav[:valid_len]
-            result: list[torch.Tensor] = [empty] * num_req
-            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
-            return result
-
-        hidden_list: list[torch.Tensor] = []
-        lengths: list[int] = []
-        for _, audio_codes in extracted:
-            hs = tokenizer.encoder.decode_vq(audio_codes.to(self.device))
-            hidden_list.append(hs)
-            lengths.append(hs.size(0))
-
-        if len(hidden_list) == 1:
-            packed_hs = hidden_list[0]
-        else:
-            packed_hs = torch.cat(hidden_list, dim=0)
-        input_lengths = torch.tensor(lengths, device=self.device)
-
-        recon_wav = tokenizer.decoder(packed_hs, input_lengths)
-
-        cfg = tokenizer.config
-        frames_per_token = cfg.avg_pooler * cfg.stride_size * cfg.hop_length
-
-        result: list[torch.Tensor] = [empty] * num_req
-        if len(valid_indices) == 1:
-            wav = recon_wav.squeeze(0).squeeze(0)
-            valid_len = lengths[0] * frames_per_token
-            if wav.numel() > valid_len:
-                wav = wav[:valid_len]
-            result[valid_indices[0]] = wav.to(dtype=torch.float32).reshape(-1)
-        else:
-            for j, idx in enumerate(valid_indices):
-                wav = recon_wav[j].squeeze(0)
-                valid_len = lengths[j] * frames_per_token
-                if wav.numel() > valid_len:
-                    wav = wav[:valid_len]
-                result[idx] = wav.to(dtype=torch.float32).reshape(-1)
-
-        return result
-
-    @torch.inference_mode()
     def _batch_chunked_decode_streaming(
         self,
         request_codes_list: list[torch.Tensor],
-        default_chunk_size: int,
-        default_left_context_size: int,
+        default_chunk_size: int = _DEFAULT_CODEC_CHUNK_FRAMES,
+        default_left_context_size: int = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES,
         *,
         per_req_left_context_frames: list[int | None] | None = None,
         per_req_codec_chunk_frames: list[int | None] | None = None,

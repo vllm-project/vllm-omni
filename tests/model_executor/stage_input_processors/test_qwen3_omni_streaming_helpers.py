@@ -569,6 +569,17 @@ def test_mimo_audio_llm2code2wav_token_only_smoke() -> None:
     assert out[0]["additional_information"] is None
 
 
+def _make_mimo_transfer_manager():
+    """Build a minimal transfer_manager mock for llm2code2wav_full_payload."""
+    from collections import defaultdict
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        connector=None,
+        code_prompt_token_ids=defaultdict(list),
+    )
+
+
 def test_mimo_audio_llm2code2wav_full_payload_smoke() -> None:
     """Smoke: mimo_audio producer-side payload builder reads flat codes.audio + flattens."""
     from types import SimpleNamespace
@@ -584,19 +595,19 @@ def test_mimo_audio_llm2code2wav_full_payload_smoke() -> None:
     audio = torch.arange(2 * 1 * 8 * 4, dtype=torch.long).reshape(2, 1, 8, 4)
     audio = audio.clamp(min=1)  # avoid zero-row drop
     pooling_output = {"codes.audio": audio}
-    req = SimpleNamespace(output_token_ids=[])
-    payload = llm2code2wav_full_payload(None, pooling_output, req)
+    tm = _make_mimo_transfer_manager()
+    req = SimpleNamespace(req_id="test-smoke")
+    payload = llm2code2wav_full_payload(tm, pooling_output, req)
     assert payload is not None
-    assert "codes" in payload and "audio" in payload["codes"]
     # Flattened length = numel + B*4 (per-batch pad_vec prepended by prepend_and_flatten_colmajor)
     batch_size = int(audio.shape[0])
-    assert len(payload["codes"]["audio"]) == audio.numel() + batch_size * 4
+    assert payload.codes.audio.numel() == audio.numel() + batch_size * 4
     # prepend_and_flatten_colmajor: PAD appears at column start in col-major flatten.
     # For shape [B=2, 1, 9, 4], each column has 1 PAD then 8 codec vals → PAD at indices 0, 9, 18, 27.
-    out = payload["codes"]["audio"]
-    assert out[0] == TALKER_CODEC_PAD_TOKEN_ID
-    assert out[9] == TALKER_CODEC_PAD_TOKEN_ID
-    assert payload["meta"]["finished"].item() is True
+    out = payload.codes.audio
+    assert out[0].item() == TALKER_CODEC_PAD_TOKEN_ID
+    assert out[9].item() == TALKER_CODEC_PAD_TOKEN_ID
+    assert payload.meta.finished.item() is True
 
 
 def test_mimo_audio_full_payload_nested_fallback() -> None:
@@ -612,10 +623,11 @@ def test_mimo_audio_full_payload_nested_fallback() -> None:
     audio = torch.arange(1 * 1 * 8 * 4, dtype=torch.long).reshape(1, 1, 8, 4)
     audio = audio.clamp(min=1)
     pooling_output = {"codes": {"audio": audio}}  # nested, not flat
-    req = SimpleNamespace(output_token_ids=[])
-    payload = llm2code2wav_full_payload(None, pooling_output, req)
+    tm = _make_mimo_transfer_manager()
+    req = SimpleNamespace(req_id="test-nested")
+    payload = llm2code2wav_full_payload(tm, pooling_output, req)
     assert payload is not None
-    assert len(payload["codes"]["audio"]) == audio.numel() + int(audio.shape[0]) * 4
+    assert payload.codes.audio.numel() == audio.numel() + int(audio.shape[0]) * 4
 
 
 def test_qwen3_tts_talker2code2wav_token_only_smoke() -> None:

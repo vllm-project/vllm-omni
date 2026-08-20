@@ -4,6 +4,7 @@
 E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100).
 """
 
+import itertools
 import os
 from pathlib import Path
 
@@ -46,15 +47,30 @@ try:
     tokenizer_path = download_tokenizer()
     os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
 
-    test_params = [
-        OmniServerParams(
-            model=model,
-            stage_config_path=stage_config,
-            server_args=["--chat-template", CHAT_TEMPLATE_PATH],
+    test_params = list(
+        itertools.chain.from_iterable(
+            [
+                pytest.param(
+                    OmniServerParams(
+                        model=model,
+                        stage_config_path=stage_config,
+                        server_args=["--chat-template", CHAT_TEMPLATE_PATH],
+                    ),
+                    id="async_chunk",
+                ),
+                pytest.param(
+                    OmniServerParams(
+                        model=model,
+                        stage_config_path=stage_config,
+                        server_args=["--chat-template", CHAT_TEMPLATE_PATH, "--no-async-chunk"],
+                    ),
+                    id="no_async_chunk",
+                ),
+            ]
+            for model in models
+            for stage_config in stage_configs
         )
-        for model in models
-        for stage_config in stage_configs
-    ]
+    )
 except Exception as exc:
     pytest.skip(
         f"MiMo-Audio expansion tests skipped: module setup failed ({type(exc).__name__}: {exc})",
@@ -100,7 +116,6 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.skip(reason="CI failed 8571")
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test audio and text input processing and text/audio output generation via OpenAI API.
