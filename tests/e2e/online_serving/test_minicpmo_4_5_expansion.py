@@ -1,7 +1,7 @@
 """E2E online expansion tests for MiniCPM-o 4.5.
 
 These cover modality combinations, separate Code2Wav behavior, sequential
-request isolation, longer audio output, and Chinese speech.
+request isolation, longer audio output, long-form generation, and Chinese speech.
 
 Like Qwen3-Omni expansion, ``default`` exercises ``--no-async-chunk`` and
 ``async_chunk`` exercises ``--async-chunk``.
@@ -75,6 +75,15 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+# Close <think> and emit <|tts_bos|> so Talker speaks the answer, not reasoning.
+_TTS_EXTRA_BODY = {
+    "chat_template_kwargs": {
+        "use_tts_template": True,
+        "enable_thinking": False,
+    }
+}
+
+
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_video_to_text_001(omni_server, openai_client) -> None:
@@ -127,6 +136,7 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
             "model": omni_server.model,
             "messages": messages_1,
             "stream": True,
+            "extra_body": _TTS_EXTRA_BODY,
         },
         request_num=1,
     )
@@ -138,6 +148,7 @@ def test_sequential_requests_independent(omni_server, openai_client) -> None:
             "messages": messages_2,
             "stream": True,
             "key_words": {"text": ["Beijing"]},
+            "extra_body": _TTS_EXTRA_BODY,
         },
         request_num=1,
     )
@@ -164,18 +175,37 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
         "messages": messages,
         "modalities": ["text", "audio"],
         "stream": True,
-        # Delimit the assistant answer with the TTS template so the Talker
-        # does not spend its codec-token budget speaking hidden reasoning.
-        "extra_body": {
-            "chat_template_kwargs": {
-                "use_tts_template": True,
-                "enable_thinking": False,
-            }
-        },
+        "extra_body": _TTS_EXTRA_BODY,
         "key_words": {"audio": ["Beijing"]},
     }
 
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_audio_long_form_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (long-form generation prompt).
+    Output Modal: text, audio (default ``modalities``);
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="帮我讲一个300字的故事.",
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    text = responses[0].text_content if responses else ""
+    word_count = len(text.split())
+    assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
@@ -193,5 +223,6 @@ def test_chinese_text_to_audio(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {"text": ["北京"]},
+        "extra_body": _TTS_EXTRA_BODY,
     }
     openai_client.send_omni_request(request_config)

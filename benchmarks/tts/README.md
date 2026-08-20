@@ -18,8 +18,8 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000
 ```
 
 The server auto-loads its Deploy YAML from `vllm_omni/deploy/qwen3_tts.yaml`
-(Pipeline + Deploy schema introduced in #2383). No `--stage-configs-path` or
-`--deploy-config` flag is needed for any registered model.
+(Pipeline + Deploy schema introduced in #2383). No explicit `--deploy-config`
+flag is needed for a registered model.
 
 ### 2. Run the benchmark (`vllm bench serve --omni`)
 
