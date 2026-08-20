@@ -124,4 +124,3 @@ During the main denoising loop, GPU utilization remained approximately 99–100%
 * Validation used tensor parallel size 1 with no distributed execution.
 * Although `--cfg-scale 4.0` was supplied, true classifier-free guidance was not enabled because no negative prompt was provided.
 * The reported latency and memory measurements are observations from this specific L40S environment and should not be treated as performance guarantees.
-
