@@ -93,7 +93,7 @@ Feel free to ask questions, provide feedbacks and discuss with fellow users of v
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=vllm-project/vllm-omni&type=date&legend=top-left)](https://www.star-history.com/#vllm-project/vllm-omni&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=vllm-project/vllm-omni&type=date&legend=top-left)](https://star-history.dera.page/#vllm-project/vllm-omni&type=date&legend=top-left)
 
 ## License
 
