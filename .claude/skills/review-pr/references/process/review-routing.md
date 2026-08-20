@@ -48,7 +48,7 @@ compatibility changes.
 
 | Signal | Read | Optional repo-local skill |
 | --- | --- | --- |
-| New or expanded model, loader, processor, registry, or stage config | [model-addition-checklist.md](../checks/model-addition-checklist.md) | [`add-tts-model`](../../../add-tts-model/SKILL.md) or [`add-diffusion-model`](../../../add-diffusion-model/SKILL.md) |
+| New or expanded model, loader, processor, registry, pipeline config, or deploy config | [model-addition-checklist.md](../checks/model-addition-checklist.md) | [`add-tts-model`](../../../add-tts-model/SKILL.md) or [`add-diffusion-model`](../../../add-diffusion-model/SKILL.md) |
 | Latency, throughput, memory, scaling, precision, or quality claim | [perf-verification.md](../checks/perf-verification.md) | [`diffusion-perf-opt`](../../../diffusion-perf-opt/SKILL.md) for diffusion |
 | Tests changed, absent for risky behavior, or test-only | [test-quality-evaluation.md](../checks/test-quality-evaluation.md) | [`vllm-omni-test`](../../../vllm-omni-test/SKILL.md) |
 | CI, examples, docs, public behavior, or contributor evidence | [tests-docs-checklist.md](../checks/tests-docs-checklist.md) | None |

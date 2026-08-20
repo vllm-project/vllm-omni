@@ -301,6 +301,10 @@ class ConditionalChatTTSConfig(PretrainedConfig):
         self.top_p = top_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        # Talker stage is a single-vocab codec LM: vLLM's Sampler and
+        # embed_tokens both address this table, not the Thinker text vocab.
+        self.vocab_size = int(num_audio_tokens)
+        self.eos_token_id = int(num_audio_tokens) - 1
 
 
 class MiniCPMOConfig(Qwen2Config):

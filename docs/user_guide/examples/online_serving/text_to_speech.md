@@ -419,7 +419,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
 ```
-Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` on the stage config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
+Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and `async_chunk: true` in the deploy config (default in `qwen3_tts.yaml`). `speed` is not supported when streaming.
 
 ### Streaming WebSocket
 The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:

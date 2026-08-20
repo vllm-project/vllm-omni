@@ -32,6 +32,7 @@ pytestmark = [
 class _Flow(nn.Module):
     def __init__(self, estimator: nn.Module):
         super().__init__()
+        self.encoder = nn.Identity()
         self.decoder = SimpleNamespace(estimator=estimator)
 
 

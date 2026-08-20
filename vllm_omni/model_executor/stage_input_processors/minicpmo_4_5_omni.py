@@ -945,6 +945,9 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
+            # Dummy ids only reserve scheduler slots; prefill overwrites the
+            # embeddings. Talker.sample() blanks the whole prompt out of the
+            # repetition penalty, so codec id 0 is not taxed from step one.
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
