@@ -376,9 +376,13 @@ def aura2tts(
             tts_info["ref_text"] = [ref_text]
             tts_info["x_vector_only_mode"] = [x_vector_only_mode]
         elif task_type == "CustomVoice":
-            tts_info["speaker"] = [
-                _normalize_qwen3_tts_speaker(_first_value(additional_info.get("tts_speaker"), "Vivian"))
-            ]
+            raw_speaker = _first_value(additional_info.get("tts_speaker"), None)
+            if raw_speaker is None:
+                raise ValueError(
+                    "CustomVoice task requires a speaker name in "
+                    "additional_info.tts_speaker"
+                )
+            tts_info["speaker"] = [_normalize_qwen3_tts_speaker(raw_speaker)]
         next_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,

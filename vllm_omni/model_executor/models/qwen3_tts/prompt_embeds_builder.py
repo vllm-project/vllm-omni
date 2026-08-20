@@ -1346,7 +1346,10 @@ class Qwen3TTSPromptEmbedsBuilder:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
             spk_id_map = {k.lower(): v for k, v in (getattr(talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
-                raise ValueError(f"Unsupported speaker: {speaker}")
+                raise ValueError(
+                    f"Unsupported speaker: {speaker}. "
+                    f"Valid speakers: {', '.join(sorted(spk_id_map.keys()))}"
+                )
             spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)

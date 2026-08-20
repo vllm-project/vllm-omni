@@ -61,8 +61,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in server.supported_speakers:
-                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            if request.voice is None:
+                request.voice = next(iter(sorted(server.supported_speakers)))
+            elif request.voice not in server.supported_speakers:
+                return (
+                    f"Invalid voice '{request.voice}'. "
+                    f"Supported: {', '.join(sorted(server.supported_speakers))}"
+                )
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
