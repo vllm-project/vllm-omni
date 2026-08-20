@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 import torch.nn as nn
@@ -11,16 +13,28 @@ import torch.nn as nn
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
+    ConditionalChatTTSConfig,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    _DUPLEX_CODEC_TOKENS_PER_CHUNK,
     _REPETITION_PENALTY_CHUNK_SIZE,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
-    _max_audio_tokens,
+    _native_duplex_chunk_budget,
     _restore_weight_norm_weight,
+    blank_scheduler_prompt_for_penalties,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _PenaltyMetadata:
+    """Stand-in for the penalty-relevant slice of vLLM's SamplingMetadata."""
+
+    prompt_token_ids: torch.Tensor | None
 
 
 class _FakeNativeTalker(nn.Module):
@@ -33,6 +47,12 @@ class _FakeNativeTalker(nn.Module):
     def forward(self, **kwargs):
         self.forward_kwargs = kwargs
         return torch.ones(2, 4)
+
+
+def test_tts_config_exposes_codec_vocab_to_vllm() -> None:
+    cfg = ConditionalChatTTSConfig(num_audio_tokens=6562)
+    assert cfg.vocab_size == 6562
+    assert cfg.eos_token_id == 6561
 
 
 def test_wrapper_always_delegates_talker_to_native_ar_path() -> None:
@@ -55,12 +75,14 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
-    talker._batch_stop_logits = None
-    talker._request_generators = {}
+    talker._codec_eos_id = 7
+    talker._force_eos_rows = None
+    talker._mask_eos_rows = None
     talker._request_audio_states = {}
     talker._deferred_cleanup_ids = set()
-    talker._codec_min_tokens = 50
-    talker._codec_seed = 42
+    talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
+    with torch.no_grad():
+        talker.head_code[0].weight.copy_(torch.eye(8, 2))
     return talker
 
 
@@ -88,46 +110,6 @@ def _reference_repetition_penalty(
     frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
     alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
-
-
-def _make_sampling_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
-    talker = _make_talker()
-    talker._codec_temperature = 0.8
-    talker._codec_top_k = 5
-    talker._codec_top_p = 0.85
-    talker._codec_repetition_penalty = 1.05
-    talker._request_audio_states = {
-        "req-a": {"min_tokens": 2},
-        "req-b": {"min_tokens": 0},
-    }
-    talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
-    with torch.no_grad():
-        talker.head_code[0].weight.copy_(
-            torch.tensor(
-                [
-                    [0.1, -0.3],
-                    [0.2, 0.4],
-                    [-0.5, 0.2],
-                    [0.7, -0.1],
-                    [-0.2, 0.8],
-                    [0.6, 0.3],
-                    [-0.4, -0.7],
-                    [0.3, 0.5],
-                ]
-            )
-        )
-    return talker
-
-
-@pytest.mark.parametrize(
-    ("condition_tokens", "expected"),
-    [(3, 64), (100, 1000), (1000, 2048)],
-)
-def test_audio_token_limit_scales_with_condition_length(
-    condition_tokens: int,
-    expected: int,
-) -> None:
-    assert _max_audio_tokens(condition_tokens) == expected
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
@@ -220,133 +202,212 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
     ]
 
 
-def test_batched_codec_sampling_is_request_order_independent() -> None:
-    talker = _make_sampling_talker()
-    histories = [torch.tensor([1, 1, 2]), torch.tensor([3, 4, 4])]
-    hidden = torch.tensor([[0.25, -0.75], [-0.5, 0.5]])
+def test_scheduler_prompt_is_fully_blanked_for_penalties() -> None:
+    # The handoff path fills the prompt with 0s and the non-handoff path passes
+    # thinker token ids; neither is codec history, so every position is padded.
+    prompt = torch.tensor([[0, 0, 0], [12, 0, 340]])
 
-    forward_order = talker._sample_audio_codes(
-        hidden,
-        histories,
-        ["req-a", "req-b"],
-        [0, 0],
-    )
-    talker._request_generators = {}
-    reverse_order = talker._sample_audio_codes(
-        hidden.flip(0),
-        list(reversed(histories)),
-        ["req-b", "req-a"],
-        [0, 0],
-    )
+    blanked = blank_scheduler_prompt_for_penalties(prompt, vocab_size=8)
 
-    assert torch.equal(forward_order[0], reverse_order[1])
-    assert torch.equal(forward_order[1], reverse_order[0])
+    assert blanked.tolist() == [[8, 8, 8], [8, 8, 8]]
+    assert prompt.tolist() == [[0, 0, 0], [12, 0, 340]]
 
 
-def test_batched_codec_sampling_preserves_request_rng_after_compaction() -> None:
-    talker = _make_sampling_talker()
-    history_a = torch.tensor([1, 1, 2])
-    history_b = torch.tensor([3, 4, 4])
-    hidden_a = torch.tensor([[0.25, -0.75]])
-    hidden_b = torch.tensor([[-0.5, 0.5]])
+def test_blanked_prompt_leaves_every_codec_logit_unpenalized() -> None:
+    from vllm.model_executor.layers.utils import apply_penalties
 
-    first_batch = talker._sample_audio_codes(
-        torch.cat([hidden_a, hidden_b]),
-        [history_a, history_b],
-        ["req-a", "req-b"],
-        [0, 0],
-    )
-    compacted_b = talker._sample_audio_codes(
-        hidden_b,
-        [history_b],
-        ["req-b"],
-        [1],
+    vocab_size = 8
+    logits = torch.arange(1.0, vocab_size + 1.0).unsqueeze(0)
+    prompt = blank_scheduler_prompt_for_penalties(torch.tensor([[0, 0, 3]]), vocab_size)
+
+    penalized = apply_penalties(
+        logits.clone(),
+        prompt,
+        torch.full((1, 1), vocab_size, dtype=torch.long),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.full((1,), 1.02),
     )
 
-    talker._request_generators = {}
-    standalone_b_first = talker._sample_audio_codes(
-        hidden_b,
-        [history_b],
-        ["req-b"],
-        [0],
-    )[0]
-    standalone_b_second = talker._sample_audio_codes(
-        hidden_b,
-        [history_b],
-        ["req-b"],
-        [1],
-    )[0]
-
-    assert torch.equal(first_batch[1], standalone_b_first)
-    assert torch.equal(compacted_b[0], standalone_b_second)
+    torch.testing.assert_close(penalized, logits)
 
 
-def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> None:
+def test_talker_sample_blanks_penalty_prompt_without_touching_runner_state(mocker) -> None:
     talker = _make_talker()
-    seen: list[tuple[str, list[float], list[int]]] = []
+    metadata = _PenaltyMetadata(prompt_token_ids=torch.tensor([[0, 2, 0]]))
+    captured: dict[str, torch.Tensor] = {}
 
-    def sample(hidden, histories, request_ids, steps):
-        assert steps == [0, 0]
-        seen.extend(
-            (request_id, hidden[row].reshape(-1).tolist(), histories[row].tolist())
-            for row, request_id in enumerate(request_ids)
-        )
-        return torch.tensor([2, 3])
+    class _Recorder:
+        def __call__(self, logits, sampling_metadata):
+            captured["prompt"] = sampling_metadata.prompt_token_ids
+            return None
 
-    batched_sample = mocker.patch.object(talker, "_sample_audio_codes", side_effect=sample)
+    mocker.patch(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.Sampler",
+        return_value=_Recorder(),
+    )
+    talker.sample(torch.zeros(1, 8), metadata)
+
+    assert captured["prompt"].tolist() == [[8, 8, 8]]
+    assert metadata.prompt_token_ids.tolist() == [[0, 2, 0]]
+
+
+def test_compute_logits_returns_codec_vocab() -> None:
+    talker = _make_talker()
+    hidden = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    logits = talker.compute_logits(hidden)
+
+    assert logits.shape == (2, 8)
+    assert torch.allclose(logits[0], talker.head_code[0](hidden[0]))
+
+
+def test_compute_logits_forces_eos_for_empty_speech() -> None:
+    talker = _make_talker()
+    talker._request_audio_states["req-empty"] = {"finished": True}
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-empty", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+
+    assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is True
+    assert int(logits.argmax(dim=-1)) == 7
+
+
+def test_native_duplex_chunk_budget_masks_eos_until_generate_chunk_is_full() -> None:
+    assert _native_duplex_chunk_budget({}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, _DUPLEX_CODEC_TOKENS_PER_CHUNK)
+    assert _native_duplex_chunk_budget({"turn_start": True}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, 0)
+    assert _native_duplex_chunk_budget({"turn_end": True}) == (_DUPLEX_CODEC_TOKENS_PER_CHUNK, 0)
+
+    talker = _make_talker()
+    talker._request_audio_states["req-chunk"] = {
+        "finished": False,
+        "step": 0,
+        "max_tokens": _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+        "min_tokens": _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-chunk", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+
+    assert logits[0, 7].item() == float("-inf")
+    assert torch.isfinite(logits[0, 0])
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is False
+
+
+def test_native_duplex_chunk_budget_forces_eos_after_twenty_five_frames() -> None:
+    talker = _make_talker()
+    talker._request_audio_states["req-full"] = {
+        "finished": False,
+        "step": 24,
+        "max_tokens": _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+        "min_tokens": _DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-full", "codes": {"audio": torch.tensor([[3]])}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+
+    assert talker._request_audio_states["req-full"]["step"] == 25
+    assert talker._request_audio_states["req-full"]["finished"] is True
+    assert int(logits.argmax(dim=-1)) == 7
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is True
+
+
+def test_simplex_talker_does_not_force_eos_after_a_duplex_sized_chunk() -> None:
+    talker = _make_talker()
+    talker._request_audio_states["req-simplex"] = {"finished": False, "step": 0}
+
+    output = talker.make_omni_output(
+        torch.tensor([[1.0, 0.0]]),
+        model_intermediate_buffer=[{"request_id": "req-simplex", "codes": {"audio": torch.tensor([[3]])}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+
+    assert talker._request_audio_states["req-simplex"]["step"] == 0
+    assert torch.allclose(logits[0], talker.head_code[0](output.text_hidden_states[0]).float())
+
+
+def test_native_duplex_prefill_records_generate_chunk_budget() -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    talker._text_eos_id = 0
+    talker._tts_bos_id = 0
+
+    _, _, mid_turn = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        request_id="req-mid",
+        native_duplex=True,
+        tts_token_ids=torch.empty(0, dtype=torch.long),
+        tts_hidden_states=torch.empty(0, 2),
+    )
+    _, _, boundary = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        request_id="req-end",
+        native_duplex=True,
+        meta={"turn_end": True},
+        tts_token_ids=torch.empty(0, dtype=torch.long),
+        tts_hidden_states=torch.empty(0, 2),
+    )
+
+    assert mid_turn["audio_state"]["max_tokens"] == _DUPLEX_CODEC_TOKENS_PER_CHUNK
+    assert mid_turn["audio_state"]["min_tokens"] == _DUPLEX_CODEC_TOKENS_PER_CHUNK
+    assert boundary["audio_state"]["min_tokens"] == 0
+
+
+def test_make_omni_output_packs_the_previous_codec_id() -> None:
+    talker = _make_talker()
     infos = [
-        {"request_id": "req-a", "audio_codes": {"accumulated": torch.tensor([1])}},
-        {"request_id": "req-b", "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)}},
+        {"request_id": "req-a", "codes": {"audio": torch.tensor([[2]])}},
+        {"request_id": "req-b", "codes": {"audio": torch.tensor([[3]])}},
     ]
 
     output = talker.make_omni_output(
-        torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
+        torch.ones(2, 2),
         model_intermediate_buffer=infos,
-        request_token_spans=[(0, 2), (2, 3)],
+        request_token_spans=[(0, 1), (1, 2)],
     )
 
-    assert seen == [
-        ("req-a", [2.0, 0.0], [1]),
-        ("req-b", [3.0, 0.0], []),
-    ]
-    batched_sample.assert_called_once()
-    assert infos[0]["audio_codes"]["accumulated"].tolist() == [1, 2]
-    assert infos[1]["audio_codes"]["accumulated"].tolist() == [3]
-    assert set(output.multimodal_outputs) == {"codes", "meta"}
-    assert "model_outputs" not in output.multimodal_outputs
-    assert "sr" not in output.multimodal_outputs
     assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
     assert _routed(output, 1)["codes"]["audio"].tolist() == [[3]]
     assert _routed(output, 0)["meta"]["finished"].item() is False
-    assert set(output.multimodal_outputs["meta"]) == {"finished"}
-    assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
 
 
-def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
+def test_talker_projects_request_aligned_duplex_metadata() -> None:
     talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2, 2]))
     infos = [
         {
             "request_id": "req-a",
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
             "ids": {"tts": [41]},
-            "meta": {
-                "native_duplex_segment_text": "first",
-                "turn_eos_token_id": 99,
-            },
-            "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+            "meta": {"native_duplex_segment_text": "first", "turn_eos_token_id": 99},
+            "codes": {"audio": torch.empty(0)},
         },
         {
             "request_id": "req-b",
             "native_duplex": True,
             "duplex": {"epoch": 4, "turn_id": 8},
             "ids": {"tts": [42, 99]},
-            "meta": {
-                "native_duplex_segment_text": "second",
-                "turn_eos_token_id": 99,
-            },
-            "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+            "meta": {"native_duplex_segment_text": "second", "turn_eos_token_id": 99},
+            "codes": {"audio": torch.empty(0)},
         },
     ]
 
@@ -360,7 +421,6 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
     assert [value.item() for value in meta["native_duplex"]] == [True, True]
     assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
     assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
-    assert "native_duplex_segment_text" not in meta
     assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
         "first",
         "second",
@@ -368,14 +428,9 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
     assert [value.item() for value in meta["turn_end"]] == [False, True]
 
 
-def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
+def test_talker_rejects_native_duplex_without_fence_identity() -> None:
     talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2]))
-    info = {
-        "request_id": "req-missing-fence",
-        "native_duplex": True,
-        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
-    }
+    info = {"request_id": "req-missing-fence", "native_duplex": True, "codes": {"audio": torch.empty(0)}}
 
     with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
         talker.make_omni_output(
@@ -385,113 +440,35 @@ def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
         )
 
 
-def test_incomplete_prefill_emits_no_code_and_does_not_advance_state(mocker) -> None:
+def test_decode_preprocess_embeds_the_sampled_codec_id() -> None:
     talker = _make_talker()
-    sample = mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([2]))
-    infos = [
-        {
-            "request_id": "req-prefill",
-            "audio_state": {"step": 0},
-            "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
-        },
-        {
-            "request_id": "req-decode",
-            "audio_state": {"step": 4},
-            "audio_codes": {"accumulated": torch.tensor([1])},
-        },
-    ]
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    with torch.no_grad():
+        talker.emb_code[0].weight.copy_(torch.arange(32, dtype=torch.float32).reshape(8, 4))
 
-    output = talker.make_omni_output(
-        torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
-        model_intermediate_buffer=infos,
-        request_token_spans=[(0, 2), (2, 3)],
-        request_sample_eligible=[False, True],
+    _, embeds, updates = talker.preprocess(
+        torch.tensor([3]),
+        None,
+        request_id="req-decode",
+        audio_state={"finished": False},
     )
 
-    sample.assert_called_once()
-    assert sample.call_args.args[2] == ["req-decode"]
-    assert infos[0]["audio_state"]["step"] == 0
-    assert infos[0]["audio_codes"]["accumulated"].numel() == 0
-    assert infos[1]["audio_state"]["step"] == 5
-    assert _routed(output, 0)["codes"]["audio"].shape == (0, 1)
-    assert _routed(output, 1)["codes"]["audio"].tolist() == [[2]]
+    assert torch.equal(embeds, talker.emb_code[0](torch.tensor([3])))
+    assert updates["codes"]["audio"].tolist() == [[3]]
 
 
-def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:
+def test_decode_preprocess_drops_codec_eos() -> None:
     talker = _make_talker()
-    sample = mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([7]))
-    info = {
-        "request_id": "req-stop",
-        "audio_state": {"step": 3},
-        "audio_codes": {"accumulated": torch.tensor([4, 5])},
-    }
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
 
-    first = talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[info],
-        request_token_spans=[(0, 1)],
-    )
-    first_logits = talker.compute_logits(first.text_hidden_states)
-    second = talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[info],
-        request_token_spans=[(0, 1)],
+    _, _, updates = talker.preprocess(
+        torch.tensor([7]),
+        None,
+        request_id="req-eos",
+        audio_state={"finished": False},
     )
 
-    sample.assert_called_once()
-    assert info["audio_codes"]["accumulated"].tolist() == [4, 5]
-    assert first.multimodal_outputs["codes"]["audio"][0].shape == (0, 1)
-    assert first.multimodal_outputs["meta"]["finished"][0].item() is True
-    assert second.multimodal_outputs["meta"]["finished"][0].item() is False
-    assert first_logits.argmax(dim=-1).tolist() == [1]
-    assert talker.compute_logits(second.text_hidden_states).argmax(dim=-1).tolist() == [1]
-
-
-def test_max_token_terminal_drops_unconsumed_codec_delta(mocker) -> None:
-    talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([3]))
-    info = {
-        "request_id": "req-limit",
-        "audio_state": {"step": 1, "max_tokens": 2},
-        "audio_codes": {"accumulated": torch.tensor([4, 5])},
-    }
-
-    output = talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[info],
-        request_token_spans=[(0, 1)],
-    )
-
-    # MiniCPMTTS.generate_chunk samples once at the max-token boundary to
-    # advance RNG state, but the sampled code is not fed into KV or returned.
-    assert info["audio_codes"]["accumulated"].tolist() == [4, 5]
-    assert output.multimodal_outputs["codes"]["audio"][0].shape == (0, 1)
-    assert output.multimodal_outputs["meta"]["finished"][0].item() is True
-    assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [1]
-
-
-def test_request_local_state_survives_missing_runner_buffer_update(mocker) -> None:
-    talker = _make_talker()
-    mocker.patch.object(talker, "_sample_audio_codes", return_value=torch.tensor([3]))
-    first_info = {
-        "request_id": "req-local-state",
-        "audio_state": {"step": 1, "max_tokens": 3},
-        "audio_codes": {"accumulated": torch.tensor([4])},
-    }
-
-    talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[first_info],
-        request_token_spans=[(0, 1)],
-    )
-    second = talker.make_omni_output(
-        torch.ones(1, 2),
-        model_intermediate_buffer=[{"request_id": "req-local-state"}],
-        request_token_spans=[(0, 1)],
-    )
-
-    assert second.multimodal_outputs["meta"]["finished"][0].item() is True
-    assert talker._request_audio_states["req-local-state"]["step"] == 3
+    assert updates["codes"]["audio"].numel() == 0
 
 
 def test_missing_conditioning_fails_clearly() -> None:
@@ -524,18 +501,19 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
 
     assert torch.equal(embeds, talker.emb_text(torch.tensor([5, 6])))
     assert updates["audio_state"]["finished"] is True
+    assert updates["codes"]["audio"].numel() == 0
 
-    # Stage 1's sampling min_tokens keeps scheduling decode steps until the stop
-    # token becomes eligible, and those steps have no previous code to embed.
-    _, decode_embeds, _ = talker.preprocess(
+    # min_tokens can keep scheduling leftover decode rows after an empty
+    # speech segment. Those rows have no previous codec id to embed.
+    _, decode_embeds, decode_updates = talker.preprocess(
         torch.zeros(1, dtype=torch.long),
         None,
         request_id="req-empty",
         audio_state=updates["audio_state"],
-        audio_codes=updates["audio_codes"],
     )
 
     assert decode_embeds.shape == (1, 4)
+    assert decode_updates["codes"]["audio"].numel() == 0
 
 
 def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
@@ -544,7 +522,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
     condition = torch.arange(18, dtype=torch.float32).reshape(9, 2)
     mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
 
-    _, embeds, _ = talker.preprocess(
+    _, embeds, updates = talker.preprocess(
         torch.zeros(9, dtype=torch.long),
         None,
         _omni_is_prefill=True,
@@ -556,46 +534,9 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
     )
 
     assert torch.equal(embeds, condition)
+    assert updates["codes"]["audio"].numel() == 0
     state = talker._request_audio_states["req-chunked-prefill"]
-    assert state["min_tokens"] == 50
-    assert state["max_tokens"] == 64
-
-
-@pytest.mark.parametrize(
-    ("meta", "expected_min_tokens"),
-    [
-        ({"turn_start": True}, 0),
-        ({}, 26),
-        ({"turn_end": True}, 0),
-    ],
-)
-def test_native_duplex_prefill_uses_official_chunk_limits(
-    mocker,
-    meta,
-    expected_min_tokens,
-) -> None:
-    talker = _make_talker()
-    talker.emb_text = nn.Embedding(1, 2)
-    mocker.patch.object(
-        talker,
-        "_build_condition_embeddings",
-        return_value=torch.ones(3, 2),
-    )
-
-    talker.preprocess(
-        torch.zeros(3, dtype=torch.long),
-        None,
-        _omni_is_prefill=True,
-        request_id="req-duplex-chunk",
-        native_duplex=True,
-        meta=meta,
-        tts_token_ids=torch.tensor([1]),
-        tts_hidden_states=torch.ones(1, 2),
-    )
-
-    state = talker._request_audio_states["req-duplex-chunk"]
-    assert state["min_tokens"] == expected_min_tokens
-    assert state["max_tokens"] == 26
+    assert state["finished"] is False
 
 
 def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
@@ -626,13 +567,11 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     assert condition.shape[0] == token_ids.shape[0] + 1
 
 
-def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
+def test_request_cleanup_evicts_decode_state() -> None:
     talker = _make_talker()
-    talker._request_generators["req-done"] = torch.Generator()
-    talker._request_audio_states["req-done"] = {"step": 1}
+    talker._request_audio_states["req-done"] = {"finished": False}
 
     talker.on_requests_finished(["req-done"])
     talker._flush_deferred_cleanup()
 
-    assert "req-done" not in talker._request_generators
     assert "req-done" not in talker._request_audio_states

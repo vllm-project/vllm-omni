@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
-from vllm_omni.diffusion.models.pi0.pipeline_pi0 import PI0_PIPELINE
+from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
