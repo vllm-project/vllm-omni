@@ -77,12 +77,17 @@ def upgrade_to_omni_request(
 def apply_omni_final_stage_metadata(
     request: EngineCoreRequest,
     final_stage_id: int,
+    *,
+    force_kv_transfer: bool = False,
 ) -> EngineCoreRequest:
-    """Tag a request so the AR scheduler can skip DiT KV for stage zero."""
+    """Tag a request with its final stage and optional KV-transfer override."""
     merged: dict[str, Any] = {}
     if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
         merged = deserialize_additional_information(request.additional_information)
     merged["omni_final_stage_id"] = final_stage_id
+    merged.pop("omni_force_kv_transfer", None)
+    if force_kv_transfer:
+        merged["omni_force_kv_transfer"] = True
     payload = serialize_additional_information(merged)
     return OmniEngineCoreRequest.from_request(
         request,

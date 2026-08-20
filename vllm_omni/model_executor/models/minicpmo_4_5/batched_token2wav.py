@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -11,8 +12,72 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
+
+from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
+
+logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
+# CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
+# calls ``extend_pe``. After the 2x upsample a single Code2Wav prefill longer
+# than this many codec tokens overflows the PE slice (matrix_ac vs matrix_bd).
+_DEFAULT_RELPOS_MAX_POS = 5000
+_MAX_ENCODE_TOKEN_CAP = 1024
+
+
+def relpos_encode_token_budget(
+    *,
+    max_pos: int,
+    stride: int,
+    cache_offset: int,
+    lookahead: int,
+    cap: int = _MAX_ENCODE_TOKEN_CAP,
+) -> int:
+    """How many codec tokens ``forward_chunk`` can take before RelPos PE wraps.
+
+    ``position_encoding(size)`` needs ``size <= max_pos``. After upsample,
+    ``size = cache_offset * stride + ~stride * token_frames`` (plus last-chunk
+    lookahead pad).
+    """
+    stride = max(1, int(stride))
+    lookahead = max(0, int(lookahead))
+    room = int(max_pos) // stride - max(0, int(cache_offset)) - lookahead - 1
+    return max(lookahead + 1, min(int(cap), room))
+
+
+def plan_token2wav_encode_slices(
+    num_frames: int,
+    *,
+    max_frames: int,
+    min_nonfinal: int,
+    last_chunk: bool,
+) -> list[tuple[int, int]]:
+    """Split a Code2Wav token span so every non-final piece has a lookahead window."""
+    if num_frames <= 0:
+        return []
+    min_nonfinal = max(1, int(min_nonfinal))
+    max_frames = max(int(max_frames), min_nonfinal)
+    last_min = 1 if last_chunk else min_nonfinal
+    if num_frames <= max_frames:
+        return [(0, num_frames)]
+
+    slices: list[tuple[int, int]] = []
+    start = 0
+    while start < num_frames:
+        remaining = num_frames - start
+        if remaining <= max_frames:
+            slices.append((start, num_frames))
+            break
+        take = max_frames
+        tail = remaining - take
+        if tail <= max_frames and tail < last_min:
+            take = remaining - last_min
+        if take < min_nonfinal:
+            take = remaining
+        slices.append((start, start + take))
+        start += take
+    return slices
 
 
 def _autocast_disabled(device: torch.device):
@@ -52,6 +117,25 @@ class BatchedToken2WavState:
     hift_cache: dict[str, torch.Tensor]
 
 
+def _undecorate_dynamo(module: nn.Module, method: str) -> None:
+    """Restore ``method`` on ``module`` if TorchDynamo wrapped it.
+
+    ``cosyvoice2`` decorates ``UpsampleConformerEncoderV2.forward_chunk`` with
+    ``torch.compile(backend="eager")``. That backend performs no Inductor
+    optimisation, so the wrapper only adds tracing and guard construction, and
+    duplex pays it again on every unseen chunk shape -- seconds inside a live
+    response. Dropping the wrapper leaves the original implementation, which is
+    what the eager backend was executing anyway.
+    """
+    bound = getattr(module, method, None)
+    original = getattr(bound, "_torchdynamo_orig_callable", None) or getattr(bound, "__wrapped__", None)
+    if original is None:
+        return
+    function = getattr(original, "__func__", original)
+    module.__dict__[method] = function.__get__(module, type(module))
+    logger.info("Bypassed TorchDynamo wrapper on %s.%s", type(module).__name__, method)
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -60,11 +144,46 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        trt_stepper: Any | None = None,
+        *,
+        connector_config: Mapping[str, int] | None = None,
+        hift_graph_config: Mapping[str, Any] | None = None,
+        cfm_graph_config: Mapping[str, Any] | None = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
+        # Optional TrtDiTStepper (step_audio2_dit_trt): replaces only the
+        # per-timestep DiT estimator call; encoder and HiFT stay on torch.
+        self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        encoder = getattr(self.flow, "encoder", None)
+        if encoder is not None:
+            _undecorate_dynamo(encoder, "forward_chunk")
+        hift_parameter = next(self.hift.parameters(), None)
+        if hift_parameter is not None and hift_parameter.device.type == "cuda":
+            # Prime the CUDA state used by HiFT during backend construction.
+            # Otherwise, the first live audio chunk can fail when async stages
+            # share one GPU.
+            device = hift_parameter.device
+            dtype = hift_parameter.dtype
+            mel_channels = int(self.hift.conv_pre.in_channels)
+            with (
+                torch.inference_mode(),
+                torch.random.fork_rng(devices=[device]),
+                _autocast_disabled(device),
+            ):
+                # 50 mel frames match the default first streamed vocoder chunk.
+                speech, source = self.hift.inference(
+                    torch.zeros((1, mel_channels, 50), device=device, dtype=dtype),
+                    torch.zeros((1, 1, 0), device=device, dtype=dtype),
+                )
+            torch.accelerator.synchronize(device)
+            del speech, source
+            torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
@@ -74,7 +193,56 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self.hift_graph_wrapper: HiFTGraphWrapper | None = None
+        graph_config = dict(hift_graph_config or {})
+        if bool(graph_config.get("enabled", False)):
+            if hift_parameter is None:
+                raise ValueError("MiniCPM-o HiFT Graph requires a parameterized HiFT module")
+            if hift_parameter.device.type != "cuda":
+                logger.info("HiFT CUDA Graph is disabled on device type %s", hift_parameter.device.type)
+            else:
+                if connector_config is None:
+                    raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
+                if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
+                    raise ValueError(
+                        "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
+                    )
+                capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
+                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                self.hift_graph_wrapper = HiFTGraphWrapper(
+                    token2wav=token2wav,
+                    connector_config=dict(connector_config),
+                    capture_batch_sizes=capture_batch_sizes,
+                )
+                with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
+                    self.hift_graph_wrapper.capture()
+                logger.info("HiFT CUDA Graph captured successfully")
+        self._cfm_graph_wrapper: CFMGraphWrapper | None = None
+        cfm_graph_cfg = dict(cfm_graph_config or {})
+        if bool(cfm_graph_cfg.get("enabled", False)):
+            flow_parameter = next(self.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type == "cuda":
+                estimator = self.flow.decoder.estimator
+                self._cfm_graph_wrapper = CFMGraphWrapper(
+                    graph_fn=estimator.blocks_forward_chunk,
+                    max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                )
+                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
+            else:
+                logger.info(
+                    "CFM CUDA Graph is disabled on device type %s",
+                    flow_parameter.device.type if flow_parameter is not None else "unknown",
+                )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+
+    def _hift_inference(
+        self,
+        mel: torch.Tensor,
+        source_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.hift_graph_wrapper is None:
+            return self.hift.inference(mel, source_cache)
+        return self.hift_graph_wrapper.replay(mel, source_cache)
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -130,6 +298,41 @@ class BatchedToken2Wav(nn.Module):
         width = getattr(layer, "pre_lookahead_len", None)
         return int(width) if width is not None else None
 
+    def _relpos_max_pos(self) -> int:
+        embed = getattr(self.flow.encoder, "embed", None)
+        pe = getattr(embed, "pe", None)
+        if isinstance(pe, torch.Tensor) and pe.numel() > 0:
+            return max(1, int(pe.size(1) // 2))
+        return _DEFAULT_RELPOS_MAX_POS
+
+    def _upsample_stride(self) -> int:
+        stride = getattr(getattr(self.flow.encoder, "up_layer", None), "stride", None)
+        return max(1, int(stride)) if stride is not None else 2
+
+    def _max_encode_token_frames(self, states: list[BatchedToken2WavState]) -> int:
+        att = None
+        if states:
+            att = self._stack_flow_cache(states).get("conformer_att_cache")
+        offset1 = int(att.shape[3] // 2) if att is not None else 0
+        lookahead = self._pre_lookahead_len() or 0
+        return relpos_encode_token_budget(
+            max_pos=self._relpos_max_pos(),
+            stride=self._upsample_stride(),
+            cache_offset=offset1,
+            lookahead=lookahead,
+        )
+
+    def _ensure_relpos_pe(self, tokens: torch.Tensor, att_cache: torch.Tensor | None) -> None:
+        """Grow CosyVoice RelPos PE before ``forward_chunk``, which never calls extend_pe."""
+        embed = getattr(self.flow.encoder, "embed", None)
+        extend_pe = getattr(embed, "extend_pe", None)
+        if not callable(extend_pe):
+            return
+        offset1 = int(att_cache.shape[3] // 2) if att_cache is not None else 0
+        lookahead = self._pre_lookahead_len() or 0
+        needed = offset1 * self._upsample_stride() + self._upsample_stride() * (int(tokens.shape[1]) + lookahead + 1)
+        extend_pe(tokens.new_zeros((1, max(needed, 1))))
+
     def _encode_chunk(
         self,
         tokens: torch.Tensor,
@@ -138,6 +341,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._ensure_relpos_pe(tokens, att_cache)
         embedded = self.flow.input_embedding(tokens)
         hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
             xs=embedded,
@@ -179,11 +383,35 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._trt_stepper is not None:
+            out, new_cnn, new_att = self._trt_stepper.step(
+                x=x,
+                mu=mu,
+                t=time,
+                spks=speakers,
+                cond=cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+            return out.to(mu.dtype), new_cnn, new_att
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+        if self._cfm_graph_wrapper is not None:
+            if cnn_cache is None:
+                cnn_cache = torch.zeros_like(cnn_out)
+            if att_cache is None:
+                att_cache = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+            return self._cfm_graph_wrapper.replay(
+                estimator_input,
+                time_embedding,
+                cnn_cache,
+                att_cache,
+                cnn_out,
+                att_out,
+            )
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         result = estimator.blocks_forward_chunk(
@@ -377,14 +605,68 @@ class BatchedToken2Wav(nn.Module):
         # must carry at least one full kernel. Only the final chunk is allowed
         # to be shorter: ``forward_chunk`` zero-pads it by the lookahead width.
         lookahead = self._pre_lookahead_len()
+        num_frames = int(tokens.shape[1])
         if lookahead is not None and not last_chunk:
-            num_frames = int(tokens.shape[1])
             if num_frames <= lookahead:
                 raise RuntimeError(
                     "MiniCPMO45Code2WavBatchError "
                     f'{{"reason":"chunk_below_lookahead_window","frames":{num_frames},'
                     f'"minimum":{lookahead + 1}}}'
                 )
+        # A non-async Talker dump can land thousands of codec tokens in one
+        # Code2Wav prefill. CosyVoice RelPos PE (max_len=5000) plus 2x upsample
+        # cannot score that in one ``forward_chunk`` (6968 vs 985 on NPU).
+        max_frames = self._max_encode_token_frames(states)
+        slices = plan_token2wav_encode_slices(
+            num_frames,
+            max_frames=max_frames,
+            min_nonfinal=(lookahead + 1) if lookahead is not None else 1,
+            last_chunk=last_chunk,
+        )
+        if len(slices) > 1:
+            logger.info(
+                "MiniCPM-o Code2Wav splitting %d codec tokens into %d encoder windows "
+                "(max_frames=%d) to stay inside RelPos PE.",
+                num_frames,
+                len(slices),
+                max_frames,
+            )
+            parts: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+            current = states
+            for index, (start, end) in enumerate(slices):
+                is_last_piece = index == len(slices) - 1
+                audios, current = self._decode_batch_once(
+                    tokens[:, start:end],
+                    features,
+                    current,
+                    last_chunk=last_chunk and is_last_piece,
+                    flush_encoder=flush_encoder and is_last_piece,
+                )
+                for row, audio in enumerate(audios):
+                    parts[row].append(audio)
+            merged = [
+                torch.cat(row_parts) if row_parts else tokens.new_zeros((0,), dtype=torch.float32)
+                for row_parts in parts
+            ]
+            return merged, current
+        return self._decode_batch_once(
+            tokens,
+            features,
+            states,
+            last_chunk=last_chunk,
+            flush_encoder=flush_encoder,
+        )
+
+    def _decode_batch_once(
+        self,
+        tokens: torch.Tensor,
+        features: PromptFeatures,
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunk: bool,
+        flush_encoder: bool = False,
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
+        batch_size = int(tokens.shape[0])
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
@@ -428,7 +710,7 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
-        speech, source = self.hift(mel, old_source)
+        speech, source = self._hift_inference(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)

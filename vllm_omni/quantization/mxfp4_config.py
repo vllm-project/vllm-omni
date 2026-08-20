@@ -66,13 +66,15 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization._copy_missing_attrs import (
+    copy_missing_attrs as _copy_missing_attrs,
+)
 from vllm_omni.quantization.mxfp8_config import (
     MXFPLinearMethodBase,
     _LazyWeightMixin,

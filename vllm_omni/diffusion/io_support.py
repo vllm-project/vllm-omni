@@ -6,6 +6,7 @@ from __future__ import annotations
 import inspect
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 
@@ -47,3 +48,9 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
+
+
+def get_dummy_run_num_image_inputs(model_class_name: str) -> int:
+    """Return the maximum advertised image-input count for profiling."""
+
+    return get_diffusion_model_metadata(model_class_name).max_multimodal_image_inputs or 1

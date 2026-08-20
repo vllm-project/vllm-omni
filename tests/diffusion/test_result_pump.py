@@ -6,6 +6,7 @@ import concurrent.futures
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,6 +36,7 @@ def _make_executor(step_execution=False):
     executor._pump_stop = threading.Event()
     executor._sync_result_buffer = queue.Queue()
     executor._result_mq = MagicMock()
+    executor._result_mqs = []
     executor._broadcast_mq = MagicMock()
     executor._closed = False
     executor._is_failed = False
@@ -157,6 +159,41 @@ class TestResultPumpDispatch:
         retrieved = executor._sync_result_buffer.get_nowait()
         assert isinstance(retrieved, DiffusionOutput)
 
+    def test_start_result_pump_reads_every_worker_queue(self):
+        executor = _make_executor()
+        messages = [DiffusionOutput(output="rank0"), DiffusionOutput(output="rank1")]
+        result_mqs = [MagicMock(), MagicMock()]
+
+        def make_dequeue(message):
+            emitted = False
+
+            def dequeue(timeout=None):
+                nonlocal emitted
+                if not emitted:
+                    emitted = True
+                    return message
+                executor._pump_stop.wait(0.01)
+                raise TimeoutError
+
+            return dequeue
+
+        for result_mq, message in zip(result_mqs, messages, strict=True):
+            result_mq.dequeue = make_dequeue(message)
+
+        executor._result_mqs = result_mqs
+        executor._result_mq = result_mqs[0]
+        executor._start_result_pump()
+        deadline = time.monotonic() + 2.0
+        while executor._sync_result_buffer.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        executor._pump_stop.set()
+        for thread in executor._result_pump_threads:
+            thread.join(timeout=2.0)
+
+        assert len(executor._result_pump_threads) == 2
+        received = [executor._sync_result_buffer.get_nowait().output for _ in range(2)]
+        assert sorted(received) == ["rank0", "rank1"]
+
     def test_compute_done_routes_to_rpc_future(self):
         executor = _make_executor()
         rpc_id = "42"
@@ -228,10 +265,137 @@ class TestResultPumpDispatch:
         fut = executor.wait_output_ready(async_output_id)
         assert fut.done()
         assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+
+    def test_output_ready_atomic_resolution_when_future_already_waiting(self):
+        """When OUTPUT_READY arrives and a future is already waiting, resolve it directly."""
+        executor = _make_executor()
+        async_output_id = "abc123"
+        output = DiffusionOutput(output="waiting")
+        fut = executor.wait_output_ready(async_output_id)
+        assert not fut.done()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=async_output_id,
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.done()
+        assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+        assert async_output_id not in executor._completed_outputs
+
+
+class _FakeBatchOutput:
+    """Batch-level output exposing per-request results."""
+
+    def __init__(self, results):
+        self._results = results
+
+    def get_request_output(self, req_id):
+        result = self._results.get(req_id)
+        if result is None:
+            return None
+        return SimpleNamespace(result=result)
+
+
+def _make_scheduler_output(req_ids):
+    return SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=rid, req=SimpleNamespace()) for rid in req_ids]
+    )
+
+
+class TestBatchSplitDelivery:
+    """execute_batch must resolve per-request futures in either arrival order."""
+
+    @staticmethod
+    def _run(executor, req_ids, batch_id, deliver_early):
+        # Keep execute_batch on the fused request-batch path (not DLO DP).
+        executor.od_config.parallel_config.data_parallel_size = 1
+        executor.od_config.enable_distributed_layerwise_offload = False
+        executor._ensure_open = lambda: None
+
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+
+        def fake_collective_rpc(*args, **kwargs):
+            if deliver_early:
+                # Worker's background D2H/SHM thread wins the race: OUTPUT_READY
+                # is pumped before execute_batch registers the split map.
+                _feed_one_msg_to_pump(executor, ready)
+            return AsyncDiffusionOutput(
+                kind=AsyncOutputKind.COMPUTE_DONE,
+                rpc_id="1",
+                async_output_id=batch_id,
+            )
+
+        executor.collective_rpc = fake_collective_rpc
+        batch = executor.execute_batch(_make_scheduler_output(req_ids))
+        if not deliver_early:
+            _feed_one_msg_to_pump(executor, ready)
+        return batch, outputs
+
+    def test_output_ready_after_split_map(self):
+        executor = _make_executor()
+        req_ids = ["r0", "r1", "r2"]
+        _, outputs = self._run(executor, req_ids, "batch-1", deliver_early=False)
+
+        for rid in req_ids:
+            fut = executor.wait_output_ready(f"batch-1/{rid}")
+            assert fut.done()
+            assert fut.result(timeout=1.0) is outputs[rid]
+
+    def test_output_ready_before_split_map(self):
+        """Regression: the whole batch used to be lost, hanging every request."""
+        executor = _make_executor()
+        req_ids = ["r0", "r1", "r2"]
+        _, outputs = self._run(executor, req_ids, "batch-1", deliver_early=True)
+
+        for rid in req_ids:
+            fut = executor.wait_output_ready(f"batch-1/{rid}")
+            assert fut.done(), f"request {rid} never resolved"
+            assert fut.result(timeout=1.0) is outputs[rid]
+
+        # No stale batch-level state left behind.
+        assert executor._batch_split_map == {}
+        assert executor._completed_outputs == {}
+
+    def test_engine_waiter_before_output_is_resolved(self):
+        """Consumers already blocked in wait_output_ready must be woken."""
+        executor = _make_executor()
+        req_ids = ["r0", "r1"]
+        batch_id = "batch-2"
+        futures = {rid: executor.wait_output_ready(f"{batch_id}/{rid}") for rid in req_ids}
+
+        _, outputs = self._run(executor, req_ids, batch_id, deliver_early=True)
+
+        for rid in req_ids:
+            assert futures[rid].done(), f"request {rid} never resolved"
+            assert futures[rid].result(timeout=1.0) is outputs[rid]
 
 
 class TestShutdownCleansUpFutures:
     """Test that shutdown cancels pending futures."""
+
+    def test_shutdown_joins_result_pump_threads(self):
+        executor = _make_executor()
+        pump = threading.Thread(
+            target=executor._pump_stop.wait,
+            name="test-result-pump",
+        )
+        executor._result_pump_threads = [pump]
+        pump.start()
+
+        executor.shutdown()
+
+        assert not pump.is_alive()
+        assert executor._result_pump_threads == []
 
     def test_shutdown_sets_exception_on_pending_futures(self):
         executor = _make_executor()
@@ -254,3 +418,77 @@ class TestShutdownCleansUpFutures:
 
         assert len(executor._rpc_futures) == 0
         assert len(executor._output_futures) == 0
+
+
+class _RacyFuture(concurrent.futures.Future):
+    # done() always lies and reports False, to deterministically force the
+    # pump's check-then-act race window without needing real thread timing.
+    def done(self) -> bool:
+        return False
+
+
+def _racy_cancelled_future() -> concurrent.futures.Future:
+    fut = _RacyFuture()
+    fut.cancel()
+    assert fut.cancelled()
+    return fut
+
+
+class TestResultPumpCancelledFutureRace:
+    """Regression for #5793: a future cancelled concurrently with the pump's
+    resolve call (e.g. an asyncio.wait_for timeout, or a request abort) must
+    be dropped, not raise InvalidStateError and kill the pump thread.
+    """
+
+    def test_compute_done_racing_cancel_does_not_crash_pump(self):
+        executor = _make_executor()
+        fut = _racy_cancelled_future()
+        with executor._futures_lock:
+            executor._rpc_futures["1"] = fut
+
+        msg = AsyncDiffusionOutput(kind=AsyncOutputKind.COMPUTE_DONE, rpc_id="1", async_output_id="abc")
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.cancelled()
+
+    def test_output_ready_racing_cancel_does_not_crash_pump(self):
+        executor = _make_executor()
+        fut = _racy_cancelled_future()
+        with executor._futures_lock:
+            executor._output_futures["abc123"] = fut
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="abc123",
+            output=DiffusionOutput(output="late"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.cancelled()
+
+    def test_batch_split_racing_cancel_does_not_crash_pump(self):
+        executor = _make_executor()
+        cancelled_fut = _racy_cancelled_future()
+        healthy_fut = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._output_futures["batch-1/r-aborted"] = cancelled_fut
+            executor._output_futures["batch-1/r-healthy"] = healthy_fut
+            executor._batch_split_map["batch-1"] = {
+                "batch-1/r-aborted": "r-aborted",
+                "batch-1/r-healthy": "r-healthy",
+            }
+
+        outputs = {
+            "r-aborted": DiffusionOutput(output="late"),
+            "r-healthy": DiffusionOutput(output="ok"),
+        }
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="batch-1",
+            output=_FakeBatchOutput(outputs),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert cancelled_fut.cancelled()
+        assert healthy_fut.done()
+        assert healthy_fut.result(timeout=1.0) is outputs["r-healthy"]

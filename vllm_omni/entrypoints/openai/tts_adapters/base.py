@@ -7,9 +7,7 @@ model's request normalization, validation, prompt/param building, sampling
 overrides, and output policy, so adding a model means writing one adapter file
 instead of editing the shared serving module in ~10 scattered places.
 
-See the RFC for the full design (issue #4327). This is the foundation landed in
-the first migration PR; Qwen3-TTS is the first model routed through it while the
-remaining models stay on the legacy path until individually migrated.
+See the RFC for the full design (issue #4327).
 """
 
 from abc import ABC, abstractmethod
@@ -37,6 +35,21 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
 
         _conditioning_cache_salt_fn = _conditioning_cache_salt
     return _conditioning_cache_salt_fn(request, tts_params)
+
+
+def apply_max_new_tokens(
+    sampling_params_list: list,
+    request: "OpenAICreateSpeechRequest",
+) -> list:
+    """Apply a request-level ``max_new_tokens`` limit."""
+    if request.max_new_tokens is None:
+        return sampling_params_list
+
+    import copy
+
+    sampling_params_list = copy.deepcopy(sampling_params_list)
+    sampling_params_list[0].max_tokens = request.max_new_tokens
+    return sampling_params_list
 
 
 @dataclass
@@ -99,10 +112,24 @@ class TTSModelAdapter(ABC):
 
     #: Stable discriminator string (the model-type from detection); registry key.
     name: ClassVar[str]
-    #: Engine ``model_stage`` key(s) this model uses, for documentation only.
+    #: Engine ``model_stage`` key(s) this model uses. Load-bearing: the serving
+    #: layer discovers the TTS stage and resolves the model type from these.
     stage_keys: ClassVar[frozenset[str]] = frozenset()
+    #: Engine ``model_arch`` value(s) that identify this model type. Checked
+    #: before ``stage_keys`` in :meth:`matches`. Only needed by models whose
+    #: ``model_stage`` alone is ambiguous or absent.
+    model_archs: ClassVar[frozenset[str]] = frozenset()
+    #: Set when the model has no dedicated ``model_stage`` value and its AR
+    #: entry stage must be discovered by ``model_archs`` instead (Ming dense).
+    arch_identifies_entry_stage: ClassVar[bool] = False
+    #: Detection order; lower runs first. Only set this to break a genuine
+    #: overlap with another adapter — see ``tests/.../test_tts_detection.py``,
+    #: which fails if two same-priority detectors can match the same input.
+    detect_priority: ClassVar[int] = 100
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Whether the model consumes ``request.speed`` in its native parameters.
+    native_speed_control: ClassVar[bool] = False
 
     max_new_tokens_min = 1
 
@@ -110,6 +137,31 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
+
+    @classmethod
+    def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
+        """Whether a deployed stage with this ``model_stage``/``model_arch``
+        is served by this adapter.
+
+        Architecture wins over stage key, so a model that declares both is
+        recognized even when deployed under a stage key it shares with another
+        model. Override only for match rules that are not a set membership
+        test (see ``covo_audio``).
+        """
+        if model_arch is not None and model_arch in cls.model_archs:
+            return True
+        return model_stage is not None and model_stage in cls.stage_keys
+
+    @classmethod
+    def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
+        """Whether a matched stage really accepts ``/v1/audio/speech`` in *this*
+        deployment.
+
+        Lets a model that is speech-capable only in some topologies say so
+        (Audex: its omni thinker is text-final unless the speech decoder is
+        deployed alongside). Default: always.
+        """
+        return True
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """In-place request normalization/mutation (e.g. infer task type,
@@ -145,6 +197,8 @@ class TTSModelAdapter(ABC):
         self,
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         """Apply model-specific sampling mutations.
 

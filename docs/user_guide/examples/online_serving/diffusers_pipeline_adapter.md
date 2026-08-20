@@ -99,7 +99,7 @@ a native vLLM-Omni pipeline for those cases.
 ### Attention Backends
 
 The diffusers backend converts
-[vLLM-Omni standard of attention backend setting](../../../docs/user_guide/diffusion/attention_backends.md)
+[vLLM-Omni standard of attention backend setting](../../diffusion/attention_backends.md)
 to [diffusers standard](https://huggingface.co/docs/diffusers/optimization/attention_backends#available-backends).
 
 Specifically for `FLASH_ATTN`, it will first attempt to use FlashAttention-3 and then FlashAttention-2.

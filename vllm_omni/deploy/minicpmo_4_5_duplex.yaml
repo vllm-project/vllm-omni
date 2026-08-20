@@ -27,12 +27,15 @@ stages:
   - stage_id: 1
     max_num_seqs: 2
     async_scheduling: false
-    # The split Talker exposes a binary continue/stop vocabulary; native
-    # segment and turn boundaries travel as explicit output metadata.
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
+    # Overlay only the knobs duplex changes. Codec temperature / top_k stay
+    # on the base YAML. Native duplex still ends each Talker request after
+    # one generate_chunk (26 samples, last is codec EOS) inside the model;
+    # YAML max_tokens is only the hard ceiling.
     default_sampling_params:
-      max_tokens: 2048
+      max_tokens: 4096
       min_tokens: 0
-      stop_token_ids: [1]
 
   - stage_id: 2
     max_num_seqs: 2

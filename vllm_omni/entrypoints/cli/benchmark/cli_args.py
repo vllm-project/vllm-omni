@@ -96,6 +96,23 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
         "and matches official separate video/audio streams.",
     )
     group.add_argument(
+        "--daily-omni-pack-mode",
+        type=str,
+        choices=["qwen", "minicpm-interleave"],
+        default="qwen",
+        help="How to pack multimodal parts into OpenAI chat messages. "
+        "'qwen' (default): one video_url + one audio_url (Daily-Omni/Qwen protocol). "
+        "'minicpm-interleave': MiniCPM-o official recipe — 1fps frames interleaved with "
+        "matching 1s audio segments as image_url/audio_url pairs (needed to approach "
+        "OpenBMB ~80%% Daily-Omni; requires local Videos extract). By default this mode "
+        "writes JPEG/WAV segments under "
+        "<daily-omni-video-dir>/.minicpm_daily_omni_interleave and sends file:// URLs, "
+        "so start the server with --allowed-local-media-path <daily-omni-video-dir> "
+        "(or a parent). Alternatively pass --daily-omni-inline-local-video to embed "
+        "segments as data URLs. For MiniCPM-o 4.5 string chat templates also start the "
+        "server with --interleave-mm-strings.",
+    )
+    group.add_argument(
         "--daily-omni-save-eval-items",
         action="store_true",
         default=False,
@@ -114,6 +131,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         choices=["en", "zh"],
         default="en",
         help="Which Seed-TTS split to load: en/meta.lst or zh/meta.lst under the dataset root.",
+    )
+    group.add_argument(
+        "--seed-tts-turns-per-session",
+        type=int,
+        default=1,
+        help="Group this many Seed-TTS target texts into one Realtime session. "
+        "The first row's reference audio and transcript are reused for every turn.",
     )
     group.add_argument(
         "--seed-tts-root",

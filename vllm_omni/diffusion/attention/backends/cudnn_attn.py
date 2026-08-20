@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 
 class CuDNNAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_prefix_kv_slicing: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -61,10 +62,47 @@ class CuDNNAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         attention_mask = None
         if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode="broadcast_k")
+            valid_kv_length = attn_metadata.extra.get("valid_kv_length")
+            if attn_metadata.attn_mask is None and isinstance(valid_kv_length, int):
+                if not 0 < valid_kv_length <= key.shape[1]:
+                    raise ValueError(
+                        "valid_kv_length must be within the K/V sequence, "
+                        f"got {valid_kv_length} for length {key.shape[1]}"
+                    )
+                # A contiguous valid prefix is mathematically equivalent to a
+                # broadcast key-padding mask. Slicing K/V keeps Q/output in the
+                # checkpoint's aligned layout while letting cuDNN select its
+                # much faster mask-free FMHA plan.
+                key = key[:, :valid_kv_length]
+                value = value[:, :valid_kv_length]
+            else:
+                attention_mask = _maybe_reshape_attn_mask(
+                    query,
+                    key,
+                    attn_metadata.attn_mask,
+                    mask_mode="broadcast_k",
+                )
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
+        # cuDNN has no kernel for degenerate attention shapes when either
+        # sequence has one token. Route those degenerate shapes before entering the
+        # cuDNN-only context: under torch.compile, FakeTensor evaluation raises
+        # before the eager RuntimeError fallback below can run.
+        if query.shape[-2] == 1 or key.shape[-2] == 1:
+            with sdpa_kernel([SDPBackend.MATH]):
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=self.causal,
+                    scale=self.softmax_scale,
+                    enable_gqa=enable_gqa,
+                )
+            return output.permute(0, 2, 1, 3)
+
         # Pin cuDNN exclusively. A priority list like [CUDNN, FLASH, MATH] hits a
         # PyTorch SDPA dispatch quirk: when FLASH rejects a non-None attn_mask,
         # cuDNN gets runtime-disabled in the same call and the dispatcher falls
@@ -73,7 +111,7 @@ class CuDNNAttentionImpl(AttentionImpl):
         #
         # Fall back to the default SDPA dispatcher if cuDNN rejects the shape,
         # e.g. under torch.compile where Dynamo sees a symbolic head_dim and
-        # cuDNN's kernel selection fails (observed in LTX-2 audio attention).
+        # cuDNN's kernel selection fails for some symbolic attention shapes.
         # The unpinned dispatcher then picks EFFICIENT/MATH instead of raising.
         try:
             with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):

@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -36,12 +37,13 @@
         "num-inference-steps": 8,
         "num-prompts": 10,
         "max-concurrency": 1,
-        "skip-performance-assertion": true,
         "baseline": {
-          "throughput_qps": 0.21,
-          "latency_p99": 4.7469,
-          "peak_memory_mb_max": 101100,
-          "peak_memory_mb_mean": 101100
+          "H200": {
+            "throughput_qps": 0.21,
+            "latency_p99": 4.7469,
+            "peak_memory_mb_max": 101100,
+            "peak_memory_mb_mean": 101100
+          }
         }
       }
     ]

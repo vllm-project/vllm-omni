@@ -250,3 +250,101 @@ def test_completions_rejected_for_thinker_talker(omni_server, openai_client) -> 
         err_code=400,
     )
     assert not responses[0].success
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_batched_completions_text(omni_server, openai_client) -> None:
+    """Ensure that we can make a batch chat completions request (text only)."""
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": [
+                    [{"role": "user", "content": "What color is the sky? Answer in one word."}],
+                    [{"role": "user", "content": "What is 2+2? Answer in one word."}],
+                ],
+                "modalities": ["text"],
+                "max_tokens": 20,
+            },
+        },
+    )
+    assert responses
+    resp = responses[0]
+    assert resp.success
+    body = resp.json_body
+    choices = body["choices"]
+    assert len(choices) == 2
+    for choice in choices:
+        assert choice["message"]["content"]
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_batched_completions_audio_out(omni_server, openai_client) -> None:
+    """Ensure that we can make a batch chat completions request (audio + text)."""
+    messages = [
+        [{"role": "user", "content": "Say hello."}],
+        [{"role": "user", "content": "Say goodbye."}],
+    ]
+    num_messages = len(messages)
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                "modalities": ["text", "audio"],
+                "max_tokens": 200,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert resp.success
+    choices = resp.json_body["choices"]
+
+    assert len(choices) == num_messages
+
+    # Every message in the batch should contain both the audio and text content
+    for choice in choices:
+        assert choice["message"]["audio"]["data"]
+        assert choice["message"]["content"]
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize(
+    "sad_opts",
+    [
+        {"stream": "not-a-bool"},  # Fails validation
+        {"n": 2},  # vLLM Batched endpoints doesn't support n > 1
+    ],
+)
+def test_batched_completions_with_bad_values(omni_server, openai_client, sad_opts) -> None:
+    """Ensure that a bad values are correctly handled as 400s."""
+    messages = [
+        [{"role": "user", "content": "Say hello."}],
+        [{"role": "user", "content": "Say goodbye."}],
+    ]
+    responses = openai_client.send_batched_chat_completions_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "messages": messages,
+                **sad_opts,
+            },
+        },
+    )
+    assert responses and len(responses) == 1
+    resp = responses[0]
+    assert not responses[0].success
+    assert resp.status_code == 400

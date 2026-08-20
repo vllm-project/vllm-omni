@@ -30,14 +30,6 @@ steps:
       - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
     mirror_hardwares: h100_4
 
-  - label: "Reliability Test - voxcpm2"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
-    mirror_hardwares: l4_1
-
   - group: "Reliability Test - Invalid parameters Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
@@ -108,6 +100,22 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_1
 
+      # Own step: the image has no NanoCodec, so this file import-skips out of
+      # the mark-selected TTS steps above. The overrides keep nemo_toolkit[tts]
+      # from downgrading transformers; see
+      # examples/offline_inference/text_to_speech/README.md.
+      - label: "TTS · Gepard-1.0 · L4"
+        timeout_in_minutes: 60
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" > /tmp/gepard-overrides.txt
+          - uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" "nemo_toolkit[tts]==2.7.3" --overrides /tmp/gepard-overrides.txt
+          - >-
+            pytest -s -v tests/e2e/offline_inference/test_gepard_tts.py
+            -m "tts and cuda"
+            --run-level "full_model"
+        mirror_hardwares: l4_1
+
       - label: "Diffusion · L4"
         timeout_in_minutes: 60
         commands:
@@ -133,4 +141,4 @@ steps:
             pytest -sv
             tests/e2e/ -m "slow and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_4

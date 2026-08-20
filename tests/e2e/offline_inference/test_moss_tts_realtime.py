@@ -271,7 +271,6 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: English voice_clone produces non-empty 24 kHz audio."""
@@ -283,7 +282,6 @@ def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: Chinese input produces non-empty audio."""

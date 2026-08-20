@@ -39,14 +39,9 @@ from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import resolve_component_quant_config as _resolve_component_quant_config
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_component_quant_config(quant_config, component: str):
-    if hasattr(quant_config, "resolve"):
-        return quant_config.resolve(component)
-    return quant_config
 
 
 class Flux2ImageProcessor(VaeImageProcessor):

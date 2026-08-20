@@ -10,7 +10,7 @@ Each server instance runs a single model specified at startup with `vllm serve <
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
-    --deploy-config vllm_omni/deploy/qwen3_omni.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe.yaml \
     --omni \
     --port 8000 \
     --trust-remote-code
