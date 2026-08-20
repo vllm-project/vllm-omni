@@ -49,3 +49,22 @@ The validation used the public Qwen bear image:
 ```bash
 wget -O qwen-bear.png \
   https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png
+```
+
+#### Command
+
+Run from the repository root:
+
+```bash
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model "Qwen/Qwen-Image-Layered" \
+  --image qwen-bear.png \
+  --prompt "" \
+  --output "layered_50" \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --layers 4 \
+  --resolution 640 \
+  --color-format RGBA \
+  --enable-layerwise-offload
+```
