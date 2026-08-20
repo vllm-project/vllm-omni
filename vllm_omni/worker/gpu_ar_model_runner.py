@@ -1248,6 +1248,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
                 if callable(flush_pending_metadata):
                     flush_pending_metadata(req_ids[:num_reqs])
+
+                # [Omni] Hand the model the batch's req_ids in logits order, for
+                # models that gate logits per request. Only valid without spec
+                # decode: there logits_indices carries several rows per request,
+                # so row i no longer corresponds to req_ids[i].
+                if spec_decode_metadata is None:
+                    set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                    if callable(set_batch_req_ids):
+                        set_batch_req_ids(req_ids[:num_reqs])
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
