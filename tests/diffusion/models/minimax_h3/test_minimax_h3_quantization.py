@@ -66,6 +66,47 @@ def _small_od_config():
     )
 
 
+class _VideoVAEBlockWithRenamedLinears(nn.Module):
+    def __init__(self, *, include_output: bool = True):
+        super().__init__()
+        self.attention = nn.Module()
+        self.attention.qkv_proj = nn.Linear(4, 12)
+        self.mlp = nn.Module()
+        self.mlp.gate_up_proj = nn.Linear(4, 8)
+        if include_output:
+            self.mlp.down_proj = nn.Linear(8, 4)
+
+
+def test_video_vae_discovers_transformer_linears_without_fixed_names():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _discover_video_vae_transformer_linear_paths,
+    )
+
+    blocks = nn.ModuleList([_VideoVAEBlockWithRenamedLinears() for _ in range(2)])
+
+    assert _discover_video_vae_transformer_linear_paths(blocks) == (
+        "attention.qkv_proj",
+        "mlp.down_proj",
+        "mlp.gate_up_proj",
+    )
+
+
+def test_video_vae_rejects_inconsistent_transformer_linear_schemas():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _discover_video_vae_transformer_linear_paths,
+    )
+
+    blocks = nn.ModuleList(
+        [
+            _VideoVAEBlockWithRenamedLinears(),
+            _VideoVAEBlockWithRenamedLinears(include_output=False),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Linear schemas differ"):
+        _discover_video_vae_transformer_linear_paths(blocks)
+
+
 def test_fp8_scope_and_prefix_propagation(monkeypatch):
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config

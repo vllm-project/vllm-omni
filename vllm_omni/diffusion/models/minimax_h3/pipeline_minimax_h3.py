@@ -715,6 +715,10 @@ class MiniMaxH3Pipeline(
             os.path.join(model_path, "video_vae"),
             device=self.device,
             load_device=component_load_device,
+            quant_config=_resolve_component_quant_config(
+                od_config.quantization_config,
+                "video_vae",
+            ),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             os.path.join(model_path, "audio_vae"),
