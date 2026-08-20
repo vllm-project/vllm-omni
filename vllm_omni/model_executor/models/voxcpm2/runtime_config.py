@@ -42,7 +42,6 @@ class _VoxCPM2RuntimeConfig:
     enable_batched_prefill_tail: bool = False
     enable_unified_decode_graph: bool = True
     unified_decode_graph_max_batch_size: int = 64
-    # Zero keeps decode-first scheduling; positive values prioritize TTFA.
     unified_decode_graph_prefill_interval: int = 0
 
     @classmethod

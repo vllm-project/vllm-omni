@@ -43,7 +43,6 @@ stages:
           enable_loc_dit_reduce_overhead_no_cg: true
           enable_unified_decode_graph: true
           unified_decode_graph_max_batch_size: 8
-          # Positive values prioritize TTFA at a possible throughput cost.
           unified_decode_graph_prefill_interval: 0
     default_sampling_params:
       temperature: 0.0

@@ -472,6 +472,17 @@ vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
 ```
 Deploy config auto-loads from `vllm_omni/deploy/voxcpm2.yaml`. Pass `--deploy-config <path>` to override or `--stage-N-<field> <value>` for per-stage runtime tweaks.
 
+For latency-oriented serving, `unified_decode_graph_prefill_interval=N` admits
+waiting prefills for one scheduler iteration after every `N` decode-only
+iterations. The default `0` keeps decode-first admission. Positive values can
+reduce TTFP under concurrent load at the cost of peak throughput, so tune the
+interval for the target workload:
+
+```bash
+vllm serve openbmb/VoxCPM2 --omni \
+    --hf-overrides '{"voxcpm2_runtime_config":{"unified_decode_graph_prefill_interval":6}}'
+```
+
 ### Sending requests
 ```bash
 # Zero-shot synthesis
