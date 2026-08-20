@@ -502,10 +502,10 @@ class TestDistributedLayerwiseOffloadHook:
         the transformed (transposed) weight through prefetch with its
         physical stride preserved.
 
-        This replaces the former rank-local mmap staging test: the backend no
-        longer retains checkpoint mmap sources in bounded staging slots; it
-        packs rank-local blocks into private Host shards like the AllGather
-        path.
+        This covers the sharded AllGather path (weight_shard_size > 1), which
+        packs blocks into private Host shards.  The rank-local mmap path
+        (weight_shard_size == 1 with a checkpoint_mmap plan) retains sources
+        instead; see test_rank_local_mmap_retains_source_and_uses_staging.
         """
         current_block = nn.Linear(2, 2, bias=False)
         next_block = nn.Linear(2, 2, bias=False)
@@ -551,10 +551,45 @@ class TestDistributedLayerwiseOffloadHook:
         local = next(tensor for name, tensor, _ in specs if name == "weight")
         assert torch.equal(local, torch.tensor([0.0, 1.0, 2.0, 3.0]))
 
-    @pytest.mark.skip(
-        reason="rank-local mmap staging slots were dropped: the backend now packs "
-        "rank-local blocks into private Host shards like the AllGather path"
-    )
+    def test_rank_local_mmap_retains_source_and_uses_staging(self, dist_group, patched_offload_runtime):
+        current_block = nn.Linear(2, 2, bias=False)
+        next_block = nn.Linear(2, 2, bias=False)
+        next_block.weight.data.copy_(torch.arange(4, dtype=torch.float32).view(2, 2))
+        source_storage = next_block.weight.untyped_storage().data_ptr()
+
+        def transform(tensor):
+            return tensor.t()
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            weight_shard_group=None,
+            weight_shard_size=1,
+            weight_shard_rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): transform},
+        )
+        hook.initialize_hook(current_block)
+
+        source = hook.cpu_sources[torch.float32][0]["tensor"]
+        assert source.untyped_storage().data_ptr() == source_storage
+        assert hook.cpu_shards == {}
+        assert next_block.weight.numel() == 0
+
+        hook.cpu_staging_buffers = [
+            {torch.float32: torch.empty(4)},
+            {torch.float32: torch.empty(4)},
+        ]
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.equal(
+            next_block.weight,
+            torch.tensor([[0.0, 2.0], [1.0, 3.0]]),
+        )
+        assert next_block.weight.stride() == (1, 2)
+        assert torch.equal(source, torch.arange(4, dtype=torch.float32).view(2, 2))
+
     def test_rank_local_mmap_staging_is_bounded_by_largest_block(self, patched_offload_runtime):
         hooks = []
         for size in (4, 9):
@@ -564,9 +599,9 @@ class TestDistributedLayerwiseOffloadHook:
             hook = DistributedLayerwiseOffloadHook(
                 next_block=next_block,
                 device=torch.device("cpu"),
-                dp_group=None,
-                dp_size=1,
-                rank=0,
+                weight_shard_group=None,
+                weight_shard_size=1,
+                weight_shard_rank=0,
                 pin_memory=False,
                 shared_buffers=[None, None],
                 rank_local_mmap=True,
@@ -646,10 +681,6 @@ class TestPinnedResidentLayerGroup:
         assert block.weight.stride() == expected_stride
         group.offload()
 
-    @pytest.mark.skip(
-        reason="resident-layer mmap source retention was dropped: resident blocks "
-        "are packed into pinned Host masters via _shard_and_pin in all modes"
-    )
     def test_rank_local_mmap_resident_layers_retain_sources(self, patched_offload_runtime):
         blocks = [nn.Linear(2, 2, bias=False) for _ in range(3)]
         expected = []
@@ -907,11 +938,18 @@ class TestMmapWeightLoading:
         assert backend.weight_shard_group is None
         hooks = [hook for group in backend._all_hook_groups for hook in group]
         assert hooks
-        # Rank-local (weight_shard_size=1): hooks stream backend-packed Host
-        # shards with H2D only — no weight collective is wired up.
+        # Rank-local (weight_shard_size=1) with a checkpoint_mmap plan: hooks
+        # retain the mmap views as the host backing and stream with plain H2D.
+        # No chunked packing runs — no prepared parts and no per-block private
+        # pinned shards — and the mmap file handles stay open until disable().
         assert all(hook.weight_shard_size == 1 for hook in hooks)
         assert all(hook.weight_shard_group is None for hook in hooks)
+        assert not backend._prepared_host_parts
+        assert all(hook.cpu_shards == {} for hook in hooks)
+        assert all(hook.cpu_sources for hook in hooks)
+        assert hasattr(backend, "_mmap_file_cache")
         backend.disable()
+        assert not hasattr(backend, "_mmap_file_cache")
 
 
 class TestGetBlocksFromDit:

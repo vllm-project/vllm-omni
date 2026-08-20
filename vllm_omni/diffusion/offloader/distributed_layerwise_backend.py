@@ -8,8 +8,11 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
   and reconstructs each block with chunked AllGather, or streams a complete
   rank-local block without a collective.
 * Consumes the loader-owned host-weight plan (checkpoint mmap views) when the
-  loader skipped ordinary weight materialization, then packs each block into
-  pinned (or pageable fallback) private Host shards.
+  loader skipped ordinary weight materialization.  The sharded AllGather path
+  (weight_shard_size > 1) packs each block into pinned (or pageable fallback)
+  private Host shards; the rank-local path (weight_shard_size == 1) instead
+  retains the checkpoint mmap views as the node-shared host backing and
+  stages one block at a time through two bounded pinned staging slots.
 * Uses a fixed double-buffer scheme that keeps only two layers' worth of
   weights on each device at any time.
 * Pipelines chunked H2D transfers and, when enabled, AllGather communications
@@ -123,10 +126,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         output_ready_events: list[Any] | None = None,
         last_use_events: list[Any | None] | None = None,
         prefetch_executor: concurrent.futures.Executor | None = None,
+        rank_local_mmap: bool = False,
+        pin_memory: bool = True,
+        tensor_transforms: dict[int, Any] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
-        if prepared_host_part is None:
-            raise RuntimeError("hook requires a backend-prepared Host part")
 
         self.next_block = next_block
         self.device = device
@@ -137,24 +141,62 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
 
-        # Backend-prepared Host storage for the block this hook transports.
-        self.cpu_shards: dict[torch.dtype, torch.Tensor] = prepared_host_part["cpu_shards"]
-        self.metadata: dict[torch.dtype, list[dict[str, Any]]] = prepared_host_part["metadata"]
-        self.manifest: PartManifest = prepared_host_part["manifest"]
-        self.fallback_reason: str | None = prepared_host_part.get("fallback_reason")
+        # Host storage mode.  The sharded AllGather path receives a
+        # backend-prepared Host part (chunk manifest + packed private shard).
+        # The rank-local path (weight_shard_size == 1) collects host storage
+        # itself in initialize_hook: retained checkpoint mmap views when the
+        # loader supplied a checkpoint_mmap plan, otherwise a private pinned
+        # copy via _shard_and_pin (the standard loader path).
+        self.rank_local = prepared_host_part is None
+        self.rank_local_mmap = rank_local_mmap
+        self.pin_memory = pin_memory
+        self.tensor_transforms = tensor_transforms or {}
+        if self.rank_local and weight_shard_size > 1:
+            raise RuntimeError("rank-local host storage requires weight_shard_size == 1")
+        if not self.rank_local and rank_local_mmap:
+            raise RuntimeError("rank_local_mmap is only valid without a prepared Host part")
 
-        # The manifest is the canonical source of the block id.  The backend
-        # always populates it; the block_id and the memory-address fallback
-        # below are unreachable in production and would produce wrong ids.
-        self.block_id: int = self.manifest.block_id
+        if not self.rank_local:
+            # Backend-prepared Host storage for the block this hook transports.
+            self.cpu_shards: dict[torch.dtype, torch.Tensor] = prepared_host_part["cpu_shards"]
+            self.metadata: dict[torch.dtype, list[dict[str, Any]]] = prepared_host_part["metadata"]
+            self.manifest: PartManifest | None = prepared_host_part["manifest"]
+            self.fallback_reason: str | None = prepared_host_part.get("fallback_reason")
+
+            # The manifest is the canonical source of the block id.  The backend
+            # always populates it; the block_id and the memory-address fallback
+            # below are unreachable in production and would produce wrong ids.
+            self.block_id: int = self.manifest.block_id
+            self.transport: ChunkedWeightTransport | None = ChunkedWeightTransport(self.block_id, slot_count=2)
+            self.transport.prepare(self.manifest, self.cpu_shards)
+            self.transport_state = self.transport.state
+        else:
+            # Populated by initialize_hook (mmap sources or a private copy).
+            self.cpu_shards = {}
+            self.metadata = {}
+            self.manifest = None
+            self.fallback_reason = None
+            # The backend overwrites block_id with the ownership id right
+            # after construction; the id() fallback only affects trace
+            # markers in standalone (test) constructions.
+            self.block_id = id(next_block)
+            self.transport = None
+            self.transport_state = None
+
         # Block id used for the 'compute' marker, i.e. the module this hook is
         # attached to rather than the block it transports.  The backend
         # overwrites it right after construction.
         self.compute_block_id = self.block_id
 
-        self.transport = ChunkedWeightTransport(self.block_id, slot_count=2)
-        self.transport.prepare(self.manifest, self.cpu_shards)
-        self.transport_state = self.transport.state
+        # File-backed source tensors for rank-local mmap.  Unlike cpu_shards,
+        # these remain immutable views of the checkpoint and are never pinned
+        # or flattened into a model-sized private allocation.
+        self.cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
+        # Rank-local mmap uses two host staging slots shared by every hook in
+        # this worker.  They are assigned by the backend after all block sizes
+        # are known, mirroring the shared device-buffer allocation.
+        self.cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        self.cpu_staging_events: list[Any | None] = [None, None]
 
         # Double buffers: either shared (from backend) or self-allocated (lazy)
         if shared_buffers is not None:
@@ -259,8 +301,28 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.next_block_parameters = dict(self.next_block.named_parameters())
         self.next_block_buffers = dict(self.next_block.named_buffers())
 
-        # Host storage was packed by the backend (_prepare_host_storage) before
-        # this hook was constructed; nothing to shard here.
+        if self.rank_local:
+            if self.rank_local_mmap:
+                # Retain the checkpoint mmap views as the host backing; the
+                # block is staged through the shared bounded slots at prefetch.
+                self.cpu_sources, self.metadata = self._collect_mmap_sources(
+                    self.next_block_parameters,
+                    self.next_block_buffers,
+                    self.tensor_transforms,
+                )
+            else:
+                # Ordinary loader tensors: private host copy, H2D only.
+                self.cpu_shards, self.metadata = self._shard_and_pin(
+                    self.next_block_parameters,
+                    self.next_block_buffers,
+                    dp_size=1,
+                    rank=0,
+                    pin_memory=self.pin_memory,
+                    tensor_transforms=self.tensor_transforms,
+                )
+        # else: host storage was packed by the backend (_prepare_host_storage)
+        # before this hook was constructed; nothing to shard here.
+        self._transported_names = {meta["name"] for metas in self.metadata.values() for meta in metas}
 
         # Allocate device buffers only if not using shared buffers from backend
         if self._owns_buffers:
@@ -290,6 +352,70 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._cached_repoint.append(repoint)
 
         return module
+
+    @staticmethod
+    def _collect_mmap_sources(
+        params: dict[str, nn.Parameter],
+        bufs: dict[str, torch.Tensor],
+        tensor_transforms: dict[int, Any] | None = None,
+    ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
+        """Retain file-backed tensors and replace module storage with placeholders.
+
+        The returned sources preserve safetensors mmap storage.  Runtime-layout
+        adapters are applied only while packing a bounded staging slot, so no
+        full-model anonymous CPU copy is retained by a worker.
+        """
+        cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
+        metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+        offsets: dict[torch.dtype, int] = {}
+
+        for name, target in chain(params.items(), bufs.items()):
+            source = target.to_local() if hasattr(target, "to_local") else target
+            if source.device.type != "cpu":
+                raise ValueError(
+                    f"Rank-local mmap storage requires CPU checkpoint views, but {name!r} is on {source.device}."
+                )
+
+            dtype = source.dtype
+            offset = offsets.get(dtype, 0)
+            transform = (tensor_transforms or {}).get(id(target))
+            runtime_source = transform(source) if callable(transform) else source
+            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
+                raise ValueError(
+                    "mmap weight transform changed tensor metadata for "
+                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
+                    f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
+                )
+            stride = runtime_source.stride()
+            storage_numel = (
+                0
+                if runtime_source.numel() == 0
+                else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(runtime_source.shape, stride))
+            )
+
+            cpu_sources.setdefault(dtype, []).append(
+                {
+                    "name": name,
+                    "tensor": source.detach(),
+                    "transform": transform,
+                }
+            )
+            metadata.setdefault(dtype, []).append(
+                {
+                    "name": name,
+                    "offset": offset,
+                    "numel": storage_numel,
+                    "shape": runtime_source.shape,
+                    "stride": stride,
+                }
+            )
+            offsets[dtype] = offset + storage_numel
+
+            # The detached source above keeps the mmap storage alive while the
+            # module parameter/buffer is rebound to the rotating device slot.
+            set_tensor_storage(target, make_offload_placeholder(target))
+
+        return cpu_sources, metadata
 
     @staticmethod
     def _shard_and_pin(
@@ -418,18 +544,29 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def _allocate_device_buffers(self) -> None:
         """Pre-allocate exactly two device buffers (one per slot).
 
-        The manifest's ``padded_numel`` is the AllGather output size, i.e. the
-        sum of every chunk's padded extent, so the same buffer serves both the
-        chunk-major and the whole-block fallback layout.
+        In prepared mode the manifest's ``padded_numel`` is the AllGather
+        output size, i.e. the sum of every chunk's padded extent, so the same
+        buffer serves both the chunk-major and the whole-block fallback
+        layout.  In rank-local mode there is no collective, so the buffers
+        are sized to the block's exact flattened extent.
         """
         for slot in range(2):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
-            for dtype_manifest in self.manifest.dtypes:
-                gpu_weights[dtype_manifest.dtype] = torch.empty(
-                    dtype_manifest.padded_numel,
-                    dtype=dtype_manifest.dtype,
-                    device=self.device,
-                )
+            if self.manifest is not None:
+                for dtype_manifest in self.manifest.dtypes:
+                    gpu_weights[dtype_manifest.dtype] = torch.empty(
+                        dtype_manifest.padded_numel,
+                        dtype=dtype_manifest.dtype,
+                        device=self.device,
+                    )
+            else:
+                for dtype, metas in self.metadata.items():
+                    total_numel = sum(m["numel"] for m in metas)
+                    gpu_weights[dtype] = torch.empty(
+                        total_numel,
+                        dtype=dtype,
+                        device=self.device,
+                    )
             self.gpu_buffers[slot] = gpu_weights
 
     @property
@@ -462,6 +599,61 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     # ------------------------------------------------------------------ #
     #  Prefetch: H2D + AllGather (overlapped on dedicated streams)      #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _pack_mmap_sources(
+        cpu_sources: dict[torch.dtype, list[dict[str, Any]]],
+        metadata: dict[torch.dtype, list[dict[str, Any]]],
+        slot_buffers: dict[torch.dtype, torch.Tensor],
+    ) -> dict[torch.dtype, torch.Tensor]:
+        staged: dict[torch.dtype, torch.Tensor] = {}
+        for dtype, metas in metadata.items():
+            total_numel = sum(meta["numel"] for meta in metas)
+            destination = slot_buffers[dtype][:total_numel]
+            sources = cpu_sources[dtype]
+            for source_info, meta in zip(sources, metas, strict=True):
+                source = source_info["tensor"]
+                transform = source_info["transform"]
+                if callable(transform):
+                    source = transform(source)
+                if source.dtype != dtype or source.shape != meta["shape"] or source.stride() != meta["stride"]:
+                    raise ValueError(
+                        "mmap weight transform changed tensor layout for "
+                        f"{source_info['name']!r}: expected dtype={dtype}, "
+                        f"shape={tuple(meta['shape'])}, stride={meta['stride']}; "
+                        f"got dtype={source.dtype}, shape={tuple(source.shape)}, "
+                        f"stride={source.stride()}"
+                    )
+                start = meta["offset"]
+                physical_storage = destination[start : start + meta["numel"]]
+                if source.is_contiguous():
+                    physical_storage.copy_(source.flatten())
+                else:
+                    torch.as_strided(
+                        physical_storage,
+                        size=source.shape,
+                        stride=source.stride(),
+                    ).copy_(source)
+            staged[dtype] = destination
+        return staged
+
+    def _stage_mmap_sources(self, slot: int) -> dict[torch.dtype, torch.Tensor]:
+        """Pack this block's mmap views into one bounded host staging slot."""
+        previous_copy = self.cpu_staging_events[slot]
+        if previous_copy is not None:
+            synchronize = getattr(previous_copy, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+            else:
+                # Platform events normally expose synchronize().  Retain a
+                # correctness fallback for test and non-CUDA platform shims.
+                current_omni_platform.synchronize()
+            self.cpu_staging_events[slot] = None
+
+        slot_buffers = self.cpu_staging_buffers[slot]
+        if slot_buffers is None:
+            raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
+        return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
 
     @torch.compiler.disable
     def _submit_prefetch(
@@ -510,21 +702,43 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 previous_owner.ready_events[slot] = None
 
         evt = self._output_ready_events[slot]
-        ticket = self.transport.begin_submission(
-            output_slot=slot,
-            request_generation=self._request_generation,
-            ready_event=evt,
-            part_id=self.manifest.part_id,
-            last_collective_key=(
-                self._request_generation,
-                self.block_id,
-                slot,
-                self.manifest.digest[:16],
-            ),
-        )
-        self.ready_tickets[slot] = ticket
+        ticket = None
+        if not self.rank_local:
+            ticket = self.transport.begin_submission(
+                output_slot=slot,
+                request_generation=self._request_generation,
+                ready_event=evt,
+                part_id=self.manifest.part_id,
+                last_collective_key=(
+                    self._request_generation,
+                    self.block_id,
+                    slot,
+                    self.manifest.digest[:16],
+                ),
+            )
+            self.ready_tickets[slot] = ticket
 
-        if self.weight_shard_size <= 1 or self.weight_shard_group is None:
+        if self.rank_local:
+            # Rank-local: no collective, one whole-block H2D.  Rank-local mmap
+            # first stages the block through the bounded host slot; the plain
+            # rank-local path copies its private host shard directly.
+            cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
+            last_use = self._output_slot_events[slot]
+            if last_use is not None:
+                self.copy_stream.wait_event(last_use)
+            with current_omni_platform.stream(self.copy_stream):
+                with self._trace_range("h2d"):
+                    for dtype, cpu_shard in cpu_weights.items():
+                        gw = gpu_weights[dtype]
+                        async_copy = non_blocking and cpu_shard.is_pinned()
+                        gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
+                evt.record(self.copy_stream)
+            if self.rank_local_mmap:
+                # The CPU staging slot may be overwritten only after this H2D
+                # copy has finished.  The shared event serializes slot reuse
+                # by the next hook that stages into the same slot.
+                self.cpu_staging_events[slot] = evt
+        elif self.weight_shard_size <= 1 or self.weight_shard_group is None:
             last_use = self._output_slot_events[slot]
             if last_use is not None:
                 self.copy_stream.wait_event(last_use)
@@ -596,9 +810,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
-        self.transport.mark_ready(ticket)
+        if ticket is not None:
+            self.transport.mark_ready(ticket)
         self._prefetched_slot = slot
-        self._shared_slot_owners[slot] = self
+        if not self.rank_local:
+            self._shared_slot_owners[slot] = self
 
         # Stamp the slot with this hook's group ID so that group-first
         # hooks can detect whether another group has overwritten the slot.
@@ -701,6 +917,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             owner = self._prev_hook
             evt = owner.ready_events[slot]
 
+        if self.rank_local:
+            # No ticket state machine in rank-local mode: the ready event
+            # alone proves the whole-block H2D has been enqueued.
+            if evt is not None:
+                current_omni_platform.current_stream().wait_event(evt)
+            return self.gpu_buffers[slot]
+
         if evt is None:
             raise RuntimeError(
                 f"block {self.block_id} has no ready event for output slot {slot}: "
@@ -795,7 +1018,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 set_tensor_storage(target, make_offload_placeholder(target))
 
         self._prefetched_slot = None
-        self.transport.reset()
+        if self.transport is not None:
+            self.transport.reset()
+        else:
+            # Rank-local mode has no tickets; drop the stale ready events so
+            # the next request cannot mistake them for a live transfer.
+            self.ready_events = [None, None]
 
     # ------------------------------------------------------------------ #
     #  ModelHook interface                                                #
@@ -909,6 +1137,9 @@ def apply_distributed_block_hook(
     output_ready_events: list[Any] | None = None,
     last_use_events: list[Any | None] | None = None,
     prefetch_executor: concurrent.futures.Executor | None = None,
+    rank_local_mmap: bool = False,
+    pin_memory: bool = True,
+    tensor_transforms: dict[int, Any] | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -930,6 +1161,9 @@ def apply_distributed_block_hook(
         output_ready_events=output_ready_events,
         last_use_events=last_use_events,
         prefetch_executor=prefetch_executor,
+        rank_local_mmap=rank_local_mmap,
+        pin_memory=pin_memory,
+        tensor_transforms=tensor_transforms,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -951,8 +1185,9 @@ class PinnedResidentLayerGroup:
     distributed shard-and-pin operation becomes a shared storage primitive.
     It currently remains here because it depends on DLO's local-shard layout.
     Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
-    pinned CPU master copy and never copies generated device weights back to
-    host. Entering the denoise stage performs one asynchronous H2D pass;
+    pinned CPU master copy (or mmap source plus bounded staging) and never
+    copies generated device weights back to host. Entering the denoise stage
+    performs one asynchronous H2D pass;
     leaving it only restores zero-sized placeholders and releases the device
     buffers.  This lets the following VAE stage reuse the same HBM.
 
@@ -967,11 +1202,14 @@ class PinnedResidentLayerGroup:
         device: torch.device,
         copy_stream: Any,
         pin_memory: bool,
+        rank_local_mmap: bool = False,
+        defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
         self.loaded = False
+        self.rank_local_mmap = rank_local_mmap
         self.pin_memory = pin_memory
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
@@ -980,21 +1218,48 @@ class PinnedResidentLayerGroup:
             params = dict(block.named_parameters())
             bufs = dict(block.named_buffers())
             targets: dict[str, torch.Tensor] = {**params, **bufs}
-            cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
-                params,
-                bufs,
-                dp_size=1,
-                rank=0,
-                pin_memory=pin_memory,
-                tensor_transforms=tensor_transforms,
-            )
+            if rank_local_mmap:
+                cpu_sources, metadata = DistributedLayerwiseOffloadHook._collect_mmap_sources(
+                    params,
+                    bufs,
+                    tensor_transforms,
+                )
+                cpu_shards = {}
+            else:
+                cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+                    params,
+                    bufs,
+                    dp_size=1,
+                    rank=0,
+                    pin_memory=pin_memory,
+                    tensor_transforms=tensor_transforms,
+                )
+                cpu_sources = {}
             self._states.append(
                 {
                     "targets": targets,
                     "cpu_shards": cpu_shards,
+                    "cpu_sources": cpu_sources,
                     "metadata": metadata,
                 }
             )
+
+        self._cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+        self._cpu_staging_events: list[Any | None] = [None, None]
+        if rank_local_mmap and not defer_staging:
+            max_sizes: dict[torch.dtype, int] = {}
+            for state in self._states:
+                for dtype, metas in state["metadata"].items():
+                    total = sum(meta["numel"] for meta in metas)
+                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
+            for _ in range(2):
+                buffers = {}
+                for dtype, total in max_sizes.items():
+                    buffer = torch.empty(total, dtype=dtype, device="cpu")
+                    if pin_memory:
+                        buffer = buffer.pin_memory()
+                    buffers[dtype] = buffer
+                self._cpu_staging_buffers.append(buffers)
 
     def load(self) -> None:
         if self.loaded:
@@ -1014,12 +1279,33 @@ class PinnedResidentLayerGroup:
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
-            for state, block_buffers in zip(self._states, gpu_buffers):
-                for dtype, cpu_weight in state["cpu_shards"].items():
+            for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
+                if self.rank_local_mmap:
+                    slot = index % 2
+                    previous_copy = self._cpu_staging_events[slot]
+                    if previous_copy is not None:
+                        synchronize = getattr(previous_copy, "synchronize", None)
+                        if callable(synchronize):
+                            synchronize()
+                        else:
+                            current_omni_platform.synchronize()
+                    cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
+                        state["cpu_sources"],
+                        state["metadata"],
+                        self._cpu_staging_buffers[slot],
+                    )
+                else:
+                    cpu_weights = state["cpu_shards"]
+
+                for dtype, cpu_weight in cpu_weights.items():
                     block_buffers[dtype].copy_(
                         cpu_weight,
                         non_blocking=cpu_weight.is_pinned(),
                     )
+                if self.rank_local_mmap:
+                    slot_ready = current_omni_platform.Event()
+                    slot_ready.record(self.copy_stream)
+                    self._cpu_staging_events[slot] = slot_ready
             ready.record(self.copy_stream)
 
         for state, block_buffers in zip(self._states, gpu_buffers):
@@ -1162,10 +1448,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         When the transformer is created on meta device, this method
         replaces meta params with mmap views of the checkpoint files.
-        The views point to OS page cache shared across ranks.  The chunked
-        Host packing in ``_prepare_host_storage`` then copies only each
-        rank's local shard (or the rank-local full block) into private Host
-        storage, after which the views can be released.
+        The views point to OS page cache shared across ranks.  The sharded
+        AllGather path copies only each rank's local shard into private Host
+        storage in ``_prepare_host_storage``, after which the views are
+        released; rank-local mode retains the views as the host master and
+        packs one block at a time into bounded staging storage.
 
         Non-DiT modules (VAE, encoders) are NOT affected — they were
         created on CPU with real weights via from_pretrained.
@@ -1442,6 +1729,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     @property
     def _pin_failure_policy(self) -> PinFailurePolicy:
         return PinFailurePolicy(getattr(self.config, "dlo_pin_failure_policy", "fail"))
+
+    @property
+    def _using_rank_local(self) -> bool:
+        """Rank-local mode streams whole blocks without a weight collective.
+
+        Chunked packing (manifests, private shards, tickets) applies only to
+        the sharded AllGather path; with ``weight_shard_size == 1`` each hook
+        collects its own host storage instead.
+        """
+        return self.weight_shard_size <= 1
 
     @property
     def _alignment_bytes(self) -> int:
@@ -1756,6 +2053,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         releases = 0
         for group in self._all_hook_groups:
             for hook in group:
+                if hook.transport is None:
+                    # Rank-local hooks stream whole blocks without the
+                    # chunked transport state machine.
+                    continue
                 counters = hook.transport.counters
                 submissions += counters.submissions
                 submitted_chunks += counters.submitted_chunks
@@ -1789,7 +2090,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Reset request activity counters at a benchmark boundary."""
         for group in self._all_hook_groups:
             for hook in group:
-                hook.transport.reset_counters()
+                if hook.transport is not None:
+                    hook.transport.reset_counters()
 
     # ------------------------------------------------------------------ #
     #  Ownership, hook construction, shared events                        #
@@ -1913,7 +2215,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None],
     ) -> DistributedLayerwiseOffloadHook:
         """Register one hook that transports *next_block* into a shared slot."""
-        prepared = self._prepared_host_parts[id(next_block)]
+        # Rank-local hooks collect their own host storage in initialize_hook;
+        # the chunked AllGather path consumes the backend-prepared Host part.
+        prepared = None if self._using_rank_local else self._prepared_host_parts[id(next_block)]
         hook = apply_distributed_block_hook(
             module,
             next_block,
@@ -1933,12 +2237,60 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             output_ready_events=self._shared_output_ready_events,
             last_use_events=self._shared_last_use_events,
             prefetch_executor=self._prefetch_executor,
+            rank_local_mmap=self._using_rank_local_mmap,
+            pin_memory=self.config.pin_cpu_memory,
+            tensor_transforms=self._mmap_transforms_by_tensor_id,
         )
+        if self._using_rank_local:
+            # No manifest in rank-local mode; assign the ownership id directly.
+            hook.block_id = self._block_ids[id(next_block)]
         # The 'compute' trace marker names the module being computed, not the
         # block whose weights this hook transports.
         hook.compute_block_id = self._block_ids[id(module)]
         hook.set_request_generation(self._request_generation)
         return hook
+
+    def _create_hook_groups(
+        self,
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None],
+        shared_slot_group: list[int],
+        unified_chunk_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
+    ) -> None:
+        """Create the hooks in a circular sliding window.
+
+        The last block prefetches the first block and block ``i`` prefetches
+        block ``i + 1``.  All hooks share the 2 global device buffers.
+        """
+        for group_idx, (blocks, _group_path) in enumerate(self._pending_block_groups):
+            num_blocks = len(blocks)
+            block_hooks: list[DistributedLayerwiseOffloadHook] = [
+                self._create_block_hook(blocks[-1], blocks[0], shared_buffers)
+            ]
+            for i, block in enumerate(blocks[:-1]):
+                block_hooks.append(self._create_block_hook(block, blocks[(i + 1) % num_blocks], shared_buffers))
+
+            # Wire backward references for cache-dit fallback
+            for i in range(len(block_hooks)):
+                block_hooks[i]._prev_hook = block_hooks[i - 1]
+
+            # Assign slots in list order: block_hooks = [last_hook, block0, ..., blockN-2]
+            # This ensures last_hook.current_slot != block0_hook.current_slot,
+            # so the circular prefetch (last_hook -> block0) writes to a
+            # different slot than block0 reads from.  Correct for ALL N.
+            for i, hook in enumerate(block_hooks):
+                hook.current_slot = i % 2
+                hook._group_id = group_idx
+                hook._shared_slot_group = shared_slot_group
+                if unified_chunk_buffers is not None:
+                    hook.gpu_shard_buffers = unified_chunk_buffers
+
+            # Mark block0_hook (index 1) as group-first
+            if len(block_hooks) > 1:
+                block_hooks[1]._is_group_first = True
+            block_hooks[0]._is_group_tail = True
+
+            self._all_hook_groups.append(block_hooks)
+            self._blocks.append(blocks)
 
     def _bootstrap_first_group(self) -> None:
         """Synchronously materialize block 0 before the first forward."""
@@ -2312,9 +2664,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self._resident_blocks.extend(blocks)
                 continue
 
-            # Hook creation is deferred: the Host plan must enforce the pin cap
-            # and pack every block's Host shard before any hook exists, because
-            # a hook requires a backend-prepared Host part.
+            # Hook creation is deferred: in the chunked AllGather path the
+            # Host plan must enforce the pin cap and pack every block's Host
+            # shard before any hook exists; in the rank-local path hooks
+            # collect their own host storage, but the shared device buffers
+            # are sized after every block's metadata is known.
             self._pending_block_groups.append((list(blocks), dit_name))
 
         if self._resident_blocks:
@@ -2323,15 +2677,20 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                rank_local_mmap=self._using_rank_local_mmap,
+                # When streaming groups exist they share the engine-wide
+                # staging slots assigned below; without them the resident
+                # group allocates its own bounded slots.
+                defer_staging=bool(self._pending_block_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
             )
             pipeline._dlo_residency_controller = self
 
         if not self._pending_block_groups:
             self.enabled = bool(self._resident_blocks)
-            if self._using_mmap:
-                # The resident group already copied every planned tensor out
-                # of the mmap views; nothing else will read them.
+            if self._using_mmap and not self.enabled:
+                # Nothing retains the mmap views: no streaming hooks, and no
+                # resident group holding rank-local mmap sources.
                 self._release_mmap_handles()
             return
 
@@ -2339,61 +2698,65 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         #    analyzer sees contiguous block ranges).
         ownership = self._resolve_chunk_ownership(pipeline)
 
-        # 2. Plan every final layout and enforce the pin cap before allocation.
-        self._plan_chunk_manifests(ownership)
-
-        # 3. Pack Host shards; this replaces the original parameter storage.
-        self._prepare_host_storage(ownership)
-        self._validate_manifest_consistency(ownership)
-
-        # 4. Unified allocation sized from the *prepared* manifests (which may
-        #    have been rebuilt as WHOLE_BLOCK by the fallback path).
-        prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
-        unified_buffers = self._allocate_shared_buffers(prepared_manifests)
-        unified_chunk_buffers = None
-        if self.weight_shard_size > 1:
-            unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
-        self._allocate_shared_events()
-
         # Shared slot-group tracker: _shared_slot_group[slot] = group_id
         # that last wrote to that slot.  Group-first hooks use this to
         # skip sync-prefetch when the slot still contains their own data.
         shared_slot_group = [-1, -1]
         self._shared_slot_group = shared_slot_group
 
-        # 5. Create the hooks in a circular sliding window:
-        #    last block prefetches first block, block i prefetches block (i+1).
-        #    All hooks share 2 global device buffers.
-        for group_idx, (blocks, _group_path) in enumerate(self._pending_block_groups):
-            num_blocks = len(blocks)
-            block_hooks: list[DistributedLayerwiseOffloadHook] = [
-                self._create_block_hook(blocks[-1], blocks[0], unified_buffers)
+        if self._using_rank_local:
+            # Rank-local path: no chunked packing.  Each hook collects its own
+            # host storage (retained checkpoint mmap views, or a private
+            # pinned copy for ordinary loader tensors) when it is created.
+            self._allocate_shared_events()
+            self._create_hook_groups([None, None], shared_slot_group)
+
+            all_hooks: list[DistributedLayerwiseOffloadHook] = [
+                hook for group in self._all_hook_groups for hook in group
             ]
-            for i, block in enumerate(blocks[:-1]):
-                block_hooks.append(self._create_block_hook(block, blocks[(i + 1) % num_blocks], unified_buffers))
+            unified_buffers = self._allocate_shared_rank_local_buffers(all_hooks)
+            unified_cpu_staging = None
+            cpu_staging_events = None
+            if self._using_rank_local_mmap:
+                unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
+                    all_hooks,
+                    self._resident_layer_group,
+                )
+                cpu_staging_events = [None, None]
+                if self._resident_layer_group is not None:
+                    # Resident and streamed layers execute in the same stage and
+                    # reuse the same host slots. Events serialize slot reuse.
+                    self._resident_layer_group._cpu_staging_buffers = [
+                        buffers for buffers in unified_cpu_staging if buffers is not None
+                    ]
+                    self._resident_layer_group._cpu_staging_events = cpu_staging_events
+            for hook in all_hooks:
+                hook.gpu_buffers = unified_buffers
+                hook._owns_buffers = False
+                if unified_cpu_staging is not None and cpu_staging_events is not None:
+                    hook.cpu_staging_buffers = unified_cpu_staging
+                    hook.cpu_staging_events = cpu_staging_events
+        else:
+            # 2. Plan every final layout and enforce the pin cap before allocation.
+            self._plan_chunk_manifests(ownership)
 
-            # Wire backward references for cache-dit fallback
-            for i in range(len(block_hooks)):
-                block_hooks[i]._prev_hook = block_hooks[i - 1]
+            # 3. Pack Host shards; this replaces the original parameter storage.
+            self._prepare_host_storage(ownership)
+            self._validate_manifest_consistency(ownership)
 
-            # Assign slots in list order: block_hooks = [last_hook, block0, ..., blockN-2]
-            # This ensures last_hook.current_slot != block0_hook.current_slot,
-            # so the circular prefetch (last_hook -> block0) writes to a
-            # different slot than block0 reads from.  Correct for ALL N.
-            for i, hook in enumerate(block_hooks):
-                hook.current_slot = i % 2
-                hook._group_id = group_idx
-                hook._shared_slot_group = shared_slot_group
-                if unified_chunk_buffers is not None:
-                    hook.gpu_shard_buffers = unified_chunk_buffers
+            # 4. Unified allocation sized from the *prepared* manifests (which may
+            #    have been rebuilt as WHOLE_BLOCK by the fallback path).
+            prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
+            unified_buffers = self._allocate_shared_buffers(prepared_manifests)
+            unified_chunk_buffers = None
+            if self.weight_shard_size > 1:
+                unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
+            self._allocate_shared_events()
 
-            # Mark block0_hook (index 1) as group-first
-            if len(block_hooks) > 1:
-                block_hooks[1]._is_group_first = True
-            block_hooks[0]._is_group_tail = True
-
-            self._all_hook_groups.append(block_hooks)
-            self._blocks.append(blocks)
+            # 5. Create the hooks in a circular sliding window:
+            #    last block prefetches first block, block i prefetches block (i+1).
+            #    All hooks share 2 global device buffers.
+            self._create_hook_groups(unified_buffers, shared_slot_group, unified_chunk_buffers)
 
         # Prefetch first block of the FIRST module group only.
         # Subsequent groups share the same 2 device buffers; prefetching
@@ -2414,11 +2777,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self.enabled = True
 
-        if self._using_mmap:
+        if self._using_mmap and not self._using_rank_local_mmap:
             # _prepare_host_storage packed every planned tensor into private
             # Host shards and rebound the parameters to placeholders, so the
-            # mmap views (and their file handles) are no longer referenced in
-            # either AllGather or rank-local mode.
+            # mmap views (and their file handles) are no longer needed.
+            # Rank-local mmap mode retains the views as the node-shared host
+            # master until disable().
             self._release_mmap_handles()
 
         # Assign GPU buffers to sharded on-demand modules (VAE/encoders).
@@ -2465,6 +2829,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self.enabled and not hasattr(self, "_mmap_file_cache"):
             return
 
+        if self._using_rank_local_mmap:
+            # Staging-slot H2D copies may still be in flight; join them before
+            # the mmap sources they read from are released.
+            current_omni_platform.synchronize()
+
         # Join outstanding submits and retire every bootstrap/tail ticket
         # before closing the transport state.
         for group in self._all_hook_groups:
@@ -2475,8 +2844,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # the slot state machine is locked against further use.
         for group in self._all_hook_groups:
             for hook in group:
-                hook.transport.close()
+                if hook.transport is not None:
+                    hook.transport.close()
                 hook.cpu_shards = {}  # drop pinned-memory references
+                hook.cpu_sources = {}  # drop retained mmap views
 
         for blocks in self._blocks:
             for block in blocks:
@@ -2536,6 +2907,69 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
         )
         return shared_buffers
+
+    def _allocate_shared_rank_local_buffers(
+        self,
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> list[dict[torch.dtype, torch.Tensor] | None]:
+        """Allocate exactly 2 shared device buffers sized to the largest block.
+
+        Rank-local mode has no AllGather, so the slots hold each block's exact
+        flattened extent with no per-shard padding.
+        """
+        max_sizes: dict[torch.dtype, int] = {}
+        for hook in hooks:
+            for dtype, metas in hook.metadata.items():
+                total = sum(m["numel"] for m in metas)
+                max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
+
+        shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        for slot in range(2):
+            gpu_weights: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, total_numel in max_sizes.items():
+                gpu_weights[dtype] = torch.empty(total_numel, dtype=dtype, device=self.device)
+            shared_buffers[slot] = gpu_weights
+
+        logger.info(
+            "Allocated 2 shared rank-local device buffers (max block size: %s)",
+            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
+        )
+        return shared_buffers
+
+    @staticmethod
+    def _allocate_shared_cpu_staging_buffers(
+        hooks: list[DistributedLayerwiseOffloadHook],
+        resident_group: PinnedResidentLayerGroup | None = None,
+    ) -> list[dict[torch.dtype, torch.Tensor] | None]:
+        """Allocate two bounded host slots for rank-local mmap -> device copies."""
+        max_sizes: dict[torch.dtype, int] = {}
+        for hook in hooks:
+            for dtype, metas in hook.metadata.items():
+                total = sum(meta["numel"] for meta in metas)
+                max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
+        if resident_group is not None:
+            for state in resident_group._states:
+                for dtype, metas in state["metadata"].items():
+                    total = sum(meta["numel"] for meta in metas)
+                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), total)
+
+        pin_memory = hooks[0].pin_memory if hooks else bool(resident_group and resident_group.pin_memory)
+        shared_staging: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        for slot in range(2):
+            buffers: dict[torch.dtype, torch.Tensor] = {}
+            for dtype, total_numel in max_sizes.items():
+                buffer = torch.empty(total_numel, dtype=dtype, device="cpu")
+                if pin_memory:
+                    buffer = buffer.pin_memory()
+                buffers[dtype] = buffer
+            shared_staging[slot] = buffers
+
+        logger.info(
+            "Allocated 2 shared host staging buffers for rank-local mmap (max block size: %s, pinned=%s)",
+            {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
+            pin_memory,
+        )
+        return shared_staging
 
     def _allocate_shared_chunk_buffers(
         self,
