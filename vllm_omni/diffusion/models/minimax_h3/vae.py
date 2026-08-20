@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from PIL import Image
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
@@ -22,6 +23,8 @@ from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 
 from .packed_tokens import minimax_h3_patchify_video_latent
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -190,6 +193,46 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def is_distributed_enabled(self) -> bool:
         return self.parallel_size > 1 and dist.is_initialized()
 
+    @contextmanager
+    def _parallel_tiling_for_canvas(
+        self,
+        *,
+        height: int,
+        width: int,
+        is_decoder: bool,
+    ):
+        """Fall back to replicated tiling when there are fewer tiles than ranks.
+
+        The checkpoint's native tile gather requires every rank to own at least
+        one tile. Small canvases can produce fewer tiles than the configured VAE
+        patch-parallel group, which otherwise leaves ranks with empty task lists
+        and hangs the remaining ranks in a collective.
+        """
+        previous = self.model.parallel_tiling
+        enabled = bool(previous)
+        splitter = getattr(self.model, "split_tiles", None)
+        parallel_size = int(getattr(self, "parallel_size", 1))
+        if enabled and parallel_size > 1 and splitter is not None:
+            y_idx, _, _ = splitter(int(height), is_decoder)
+            x_idx, _, _ = splitter(int(width), is_decoder)
+            num_tiles = len(y_idx) * len(x_idx)
+            if num_tiles < parallel_size:
+                enabled = False
+                logger.warning_once(
+                    "MiniMax H3 VAE canvas %dx%d produces %d tile(s), fewer "
+                    "than vae_patch_parallel_size=%d; falling back to "
+                    "replicated local tiling.",
+                    width,
+                    height,
+                    num_tiles,
+                    parallel_size,
+                )
+        self.model.parallel_tiling = enabled
+        try:
+            yield
+        finally:
+            self.model.parallel_tiling = previous
+
     @torch.inference_mode()
     def encode_image(self, image: Image.Image) -> torch.Tensor:
         previous_parallel = self.model.parallel_tiling
@@ -249,10 +292,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                frame_shape = getattr(frames, "shape", ())
+                height = int(frame_shape[-3]) if len(frame_shape) >= 3 else 1
+                width = int(frame_shape[-2]) if len(frame_shape) >= 2 else 1
+                with self._parallel_tiling_for_canvas(
+                    height=height,
+                    width=width,
+                    is_decoder=False,
+                ):
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
@@ -293,7 +344,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1, 1, 1)
-        decoded = self.model.decode_base(latent * std + mean)
+        vae_ratio = int(getattr(self.model, "vae_ratio", 16))
+        with self._parallel_tiling_for_canvas(
+            height=int(latent.shape[-2]) * vae_ratio,
+            width=int(latent.shape[-1]) * vae_ratio,
+            is_decoder=True,
+        ):
+            decoded = self.model.decode_base(latent * std + mean)
         frames = self.model.processor.revert_tensor(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
