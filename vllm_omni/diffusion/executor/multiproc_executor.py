@@ -1026,6 +1026,28 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             self._output_futures[async_output_id] = fut
         return fut
 
+    def drop_output(self, async_output_id: str) -> None:
+        """Discard an async output that will never be waited on.
+
+        An aborted request never calls :meth:`wait_output_ready`, so a late
+        ``OUTPUT_READY`` would be unpacked and cached in ``_completed_outputs``
+        forever (issue #6413). Draining it here keeps engine-process memory
+        bounded under abort traffic. Handles both arrival orderings:
+
+        * result already arrived -> pop and drop the cached future;
+        * result not yet arrived -> register a placeholder waiter so the pump
+          resolves into it (and lets it be freed) instead of caching.
+
+        A genuine waiter that is already registered is left untouched so it can
+        drain through the normal path.
+        """
+        with self._futures_lock:
+            if self._completed_outputs.pop(async_output_id, None) is not None:
+                return
+            if async_output_id in self._output_futures:
+                return
+            self._output_futures[async_output_id] = concurrent.futures.Future()
+
     def check_health(self) -> None:
         if self._is_failed:
             raise EngineDeadError()
@@ -1067,6 +1089,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
+                # Cached async outputs hold unpacked tensors; drop them so they
+                # do not survive shutdown (issue #6413).
+                self._completed_outputs.clear()
             self._processes = (cleaner.processes or []) if cleaner is not None else []
             if not self._processes:
                 self._shutdown_cleaner = None
