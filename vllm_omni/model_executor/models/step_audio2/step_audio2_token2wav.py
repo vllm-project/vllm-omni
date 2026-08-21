@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import io
 import os
 from collections.abc import Iterable
@@ -13,7 +15,6 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from hyperpyyaml import load_hyperpyyaml
 
 try:
     from torch.nn.utils.parametrizations import weight_norm
@@ -21,6 +22,7 @@ except ImportError:
     from torch.nn.utils import weight_norm
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.sequence import IntermediateTensors
@@ -38,7 +40,58 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STREAM_SOURCE_CACHE_LEN,
 )
 
+from .cosyvoice2.config import load_flow_model
+
 logger = init_logger(__name__)
+
+
+def _load_flow_state_dict_strict(flow: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Strictly load separate Q/K/V state into packed Flow parameters."""
+    params = dict(flow.named_parameters())
+    loaded_params: set[str] = set()
+    loaded_shards: dict[str, set[str]] = {}
+    stacked_params_mapping = (
+        (".attn.to_qkv", ".attn.to_q", "q"),
+        (".attn.to_qkv", ".attn.to_k", "k"),
+        (".attn.to_qkv", ".attn.to_v", "v"),
+        (".linear_qkv", ".linear_q", "q"),
+        (".linear_qkv", ".linear_k", "k"),
+        (".linear_qkv", ".linear_v", "v"),
+    )
+
+    for name, tensor in state_dict.items():
+        target_name = name
+        shard_id: str | None = None
+        for packed_name, source_name, candidate_shard_id in stacked_params_mapping:
+            if source_name in name:
+                target_name = name.replace(source_name, packed_name)
+                shard_id = candidate_shard_id
+                break
+        if target_name not in params:
+            raise RuntimeError(f"Unexpected Flow checkpoint parameter: {name}")
+        param = params[target_name]
+        if shard_id is not None:
+            param.weight_loader(param, tensor, shard_id)
+            loaded_shards.setdefault(target_name, set()).add(shard_id)
+        else:
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, tensor)
+        loaded_params.add(target_name)
+
+    missing = sorted(set(params) - loaded_params)
+    incomplete_shards = {
+        name: sorted({"q", "k", "v"} - shards) for name, shards in loaded_shards.items() if shards != {"q", "k", "v"}
+    }
+    if incomplete_shards:
+        raise RuntimeError(f"Missing Flow checkpoint QKV shards: {incomplete_shards}")
+    if missing:
+        raise RuntimeError(f"Missing Flow checkpoint parameters: {missing}")
+
+
+def _load_flow_weights_strict(flow: nn.Module, checkpoint_path: str) -> None:
+    """Load a legacy Flow checkpoint with strict packed-QKV validation."""
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    _load_flow_state_dict_strict(flow, state_dict)
 
 
 def fade_in_out(
@@ -161,15 +214,11 @@ class StepAudio2Token2WavCore(nn.Module):
         self._spk_model = onnxruntime.InferenceSession(
             f"{self.model_path}/campplus.onnx", sess_options=option, providers=["CPUExecutionProvider"]
         )
+        self._flow = load_flow_model(f"{self.model_path}/flow.yaml")
 
-        with open(f"{self.model_path}/flow.yaml") as f:
-            configs = load_hyperpyyaml(f)
-        self._flow = configs["flow"]
         if self.float16:
             self._flow.half()
-        self._flow.load_state_dict(
-            torch.load(f"{self.model_path}/flow.pt", map_location="cpu", weights_only=True), strict=True
-        )
+        _load_flow_weights_strict(self._flow, f"{self.model_path}/flow.pt")
         self._flow.to(self.device).eval()
         self._hift = _build_hift()
 
