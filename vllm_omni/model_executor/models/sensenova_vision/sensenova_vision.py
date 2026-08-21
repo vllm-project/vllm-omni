@@ -57,6 +57,19 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # Make AutoTokenizer.from_pretrained resolve VLLMSenseNovaVisionTokenizer
+        # (id-preserving) in this process BEFORE the BAGEL core builds its own
+        # tokenizer at OmniBagelForConditionalGeneration.__init__ (bagel.py) and
+        # derives the img2img marker ids. Without registration the checkpoint's
+        # declared tokenizer_class cannot be resolved from remote code (the
+        # tokenization_sensenova_vision.py source file is never written into the
+        # checkpoint dir), so AutoTokenizer would renumber the added tokens past
+        # the 152064 embedding rows and trip the embed gather device-side assert.
+        from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision import (
+            register_vllm_sensenova_vision_tokenizer,
+        )
+
+        register_vllm_sensenova_vision_tokenizer()
         config = vllm_config.model_config.hf_config
         self._apply_sensenova_vision_config_defaults(config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)

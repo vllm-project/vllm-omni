@@ -32,6 +32,14 @@ from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision i
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
+# BAGEL-compatible image-processor recipe lives in the model-executor
+# SenseNova-Vision layer as the single canonical copy shared by the AR stage
+# (vllm_omni/engine/arg_utils.py) and this DiT stage so the two stages stay
+# in lockstep.
+from vllm_omni.model_executor.models.sensenova_vision.configuration_sensenova_vision import (
+    SENSENOVA_VISION_PREPROCESSOR_CONFIG as _SENSENOVA_VISION_PREPROCESSOR_CONFIG,
+)
+
 logger = init_logger(__name__)
 
 
@@ -237,24 +245,6 @@ def build_sensenova_vision_diffusion_output(
         },
         stage_durations=stage_durations,
     )
-
-
-# BAGEL-compatible image-processor defaults used to patch SenseNova-Vision
-# checkpoints that do not ship a preprocessor_config.json.  Transcribed from
-# ByteDance-Seed/BAGEL-7B-MoT's preprocessor_config.json so the patched file
-# drives SiglipImageProcessor exactly like the upstream BAGEL checkpoint.
-_SENSENOVA_VISION_PREPROCESSOR_CONFIG: dict[str, Any] = {
-    "image_processor_type": "SiglipImageProcessor",
-    "size": {"height": 980, "width": 980},
-    "image_mean": [0.5, 0.5, 0.5],
-    "image_std": [0.5, 0.5, 0.5],
-    "do_resize": True,
-    "do_rescale": True,
-    "do_normalize": True,
-    "do_convert_rgb": True,
-    "resample": 3,
-    "rescale_factor": 0.00392156862745098,
-}
 
 
 class SenseNovaVisionPipeline(BagelPipeline):

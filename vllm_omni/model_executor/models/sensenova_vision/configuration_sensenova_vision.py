@@ -15,10 +15,54 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# BAGEL-compatible image-processor defaults used to patch SenseNova-Vision
+# checkpoints that do not ship a preprocessor_config.json.  Transcribed from
+# ByteDance-Seed/BAGEL-7B-MoT's preprocessor_config.json so the patched file
+# drives SiglipImageProcessor exactly like the upstream BAGEL checkpoint.
+# This is the canonical copy shared by the AR stage
+# (vllm_omni/engine/arg_utils.py) and the DiT stage
+# (vllm_omni/diffusion/models/sensenova_vision/pipeline_sensenova_vision.py)
+# so the two stages stay in lockstep.
+SENSENOVA_VISION_PREPROCESSOR_CONFIG: dict[str, Any] = {
+    "image_processor_type": "SiglipImageProcessor",
+    "size": {"height": 980, "width": 980},
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "do_resize": True,
+    "do_rescale": True,
+    "do_normalize": True,
+    "do_convert_rgb": True,
+    "resample": 3,
+    "rescale_factor": 0.00392156862745098,
+}
+
+
+def ensure_sensenova_preprocessor_config(config_dir: str) -> bool:
+    """Write ``preprocessor_config.json`` into ``config_dir`` if it is missing.
+
+    Args:
+        config_dir: A directory that otherwise mirrors the checkpoint (e.g. a
+            temp dir containing symlinks to the checkpoint files).
+
+    Returns:
+        True if the file was written, False if it already existed.
+    """
+    config_path = os.path.join(config_dir, "preprocessor_config.json")
+    if os.path.isfile(config_path):
+        return False
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(SENSENOVA_VISION_PREPROCESSOR_CONFIG, f)
+    logger.info(
+        "SenseNova-Vision: wrote BAGEL-compatible preprocessor_config.json at %s",
+        config_path,
+    )
+    return True
 
 
 def merge_sensenova_split_configs(config_root: str, hf_config_path: str) -> None:
