@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
 Bootstrap mode (``bootstrap-upload-steps.yml``):
@@ -145,7 +146,8 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4 + L2/L3 (--e2e); WEEKLY=1 / NON-CRITICAL=1 still run L5.
+        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON-CRITICAL=1 still run L5.
+        # WEEKLY=1 on main also uploads L2/L3 with --e2e.
         image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
         ready_expr = nightly_main
         merge_expr = nightly_main if platform == "cuda" else disabled
