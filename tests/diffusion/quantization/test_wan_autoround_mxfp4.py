@@ -49,16 +49,23 @@ def test_build_wan_autoround_mxfp4_config():
     assert config.block_name_to_quantize == ["blocks"]
 
 
-def test_wan_autoround_config_maps_runtime_layer_names():
+def test_wan_autoround_config_uses_runtime_layer_names():
     config = build_quant_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
-    assert config.packed_modules_mapping == {"to_qkv": ["to_q", "to_k", "to_v"]}
+    assert config.packed_modules_mapping is WanTransformer3DModel.packed_modules_mapping
     assert config.block_name_to_quantize == ["blocks"]
-    mapper = WanTransformer3DModel.hf_to_vllm_mapper
-    assert mapper._map_name("blocks.0.ffn.net.0.proj") == ("blocks.0.ffn.net_0.proj")
-    assert mapper._map_name("blocks.0.ffn.net.2") == "blocks.0.ffn.net_2"
-    assert mapper._map_name("blocks.0.attn1.to_out.0") == ("blocks.0.attn1.to_out")
+
+    layer = object.__new__(LinearBase)
+    nn.Module.__init__(layer)
+    for prefix in (
+        "blocks.0.ffn.net_0.proj",
+        "blocks.0.ffn.net_2",
+        "blocks.0.attn1.to_out",
+    ):
+        layer_config = config.config_parser.resolve(layer, prefix)
+        assert layer_config.quantized
+        assert layer_config.is_mxfp4
 
 
 def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
