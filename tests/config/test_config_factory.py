@@ -2226,6 +2226,28 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        expected = {"custom_ops": ["+rotary_embedding"]}
+        assert cuda_stages[0].yaml_engine_args["compilation_config"] == expected
+        assert all("compilation_config" not in stage.yaml_engine_args for stage in cuda_stages[1:])
+
+        for platform in ("cpu", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(
+                load_deploy_config(deploy_path),
+                platform=platform,
+            )
+            config = deploy.stages[0].compilation_config or {}
+            assert "+rotary_embedding" not in config.get("custom_ops", [])
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
