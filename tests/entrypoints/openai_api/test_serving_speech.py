@@ -5057,10 +5057,10 @@ class TestTTSAsyncOffloading:
     async def test_generate_audio_chunks_resamples_pcm_to_8khz(self, qwen3_tts_server):
         async def pcm_generator():
             output = create_mock_audio_output_for_test()
-            output.multimodal_output = {
-                "audio": torch.linspace(-0.5, 0.5, 2400, dtype=torch.float32),
-                "sr": 24000,
-            }
+            output.multimodal_output.update(
+                audio=torch.linspace(-0.5, 0.5, 2400, dtype=torch.float32),
+                sr=24000,
+            )
             yield output
 
         chunks = [
@@ -5079,10 +5079,10 @@ class TestTTSAsyncOffloading:
     async def test_generate_audio_chunks_wav_header_uses_target_sample_rate(self, qwen3_tts_server):
         async def pcm_generator():
             output = create_mock_audio_output_for_test()
-            output.multimodal_output = {
-                "audio": torch.zeros(2400, dtype=torch.float32),
-                "sr": 24000,
-            }
+            output.multimodal_output.update(
+                audio=torch.zeros(2400, dtype=torch.float32),
+                sr=24000,
+            )
             yield output
 
         chunks = [
