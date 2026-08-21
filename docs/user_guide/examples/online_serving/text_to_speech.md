@@ -21,7 +21,7 @@ For the full list of supported architectures across all modalities, see
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
-| OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
+| OmniVoice | `k2-fsa/OmniVoice` | ✓ (`ref_audio`+`ref_text`) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
@@ -275,13 +275,13 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+Zero-shot multilingual TTS (600+ languages) with automatic voice, reference voice cloning, and voice design.
 
 ### Prerequisites
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`; auto voice and voice design work with `transformers>=4.57.0`.
 
 ### Launch
 ```bash
@@ -295,12 +295,17 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 cd examples/online_serving/text_to_speech/omnivoice
 python speech_client.py --text "Hello, how are you?"
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+python speech_client.py \
+    --text "Hello, this is a cloned voice." \
+    --ref-audio /path/to/ref.wav \
+    --ref-text "Exact transcript spoken in the reference audio." \
+    --output cloned.wav
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
 
 ### Notes
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#omnivoice).
+- `--ref-audio` accepts a local WAV, MP3, FLAC, or OGG file, an HTTP(S) URL, or a `data:` URI. Pair it with an accurate `--ref-text` transcript for voice cloning.
 
 ---
 
