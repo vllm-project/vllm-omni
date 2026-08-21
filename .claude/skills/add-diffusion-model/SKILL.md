@@ -610,6 +610,24 @@ See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.
 
 ---
 
+## Pre-commit conventions
+
+New library files must pass the local gates in
+[docs/contributing/README.md](../../../docs/contributing/README.md#linting).
+That page is the full hook list (SPDX, forbidden imports including Hugging Face
+Hub / Triton / pickle, `torch.cuda`, mypy, test marks, markdownlint, Buildkite,
+shellcheck). In particular:
+
+- SPDX copyright is `vLLM-Omni project` (stale `vLLM project` is rewritten).
+- Use `import regex as re` and `pybase64` in `vllm_omni/`; do not import stdlib
+  `re` or `base64`. Hugging Face Hub downloads go through
+  `vllm.transformers_utils.repo_utils`.
+- Do not add `torch.cuda.*` call sites; use `current_omni_platform`.
+- New `tests/**/test_*.py` files need a CI level mark and a hardware mark.
+- Do not expand `CHECK_IMPORTS[*].allowed_files` or `ALLOWED_FILES` without review.
+- GitHub Actions skips SPDX/shellcheck/mypy-3.10/test-marks/markdownlint; run
+  `pre-commit` locally.
+
 ## Iterative Development Tips
 
 1. **Start minimal**: Basic generation first, no parallelism/caching

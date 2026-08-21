@@ -770,6 +770,7 @@ class OmniResponse:
     success: bool = False
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
     #: HTTP status + error text for the error-handling path (e.g. validator
     #: rejections); populated when the OpenAI client raises an APIError.
@@ -1089,6 +1090,7 @@ class OpenAIClientHandler:
                     result.prompt_tokens = chunk.usage.prompt_tokens
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
+                        result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
 
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1121,6 +1123,7 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
+                    result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
             result.text_content = text_content
