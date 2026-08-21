@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
+from vllm.model_executor.models.utils import PPMissingLayer
 
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
 from tests.helpers.runtime import get_distributed_init_method
@@ -188,6 +189,31 @@ class _NoAttrsModel(nn.Module):
         self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
 
 
+class _PPSplitBlockModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
+    def __init__(self, num_layers: int, start_layer: int, end_layer: int):
+        super().__init__()
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.blocks = nn.ModuleList(
+            [_DummyBlock() if start_layer <= index < end_layer else PPMissingLayer() for index in range(num_layers)]
+        )
+
+
+class _MultiBlockWithUnrelatedPPSlice(nn.Module):
+    """start_layer/end_layer must not slice every block container."""
+
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+
+    def __init__(self):
+        super().__init__()
+        self.start_layer = 0
+        self.end_layer = 1
+        self.transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(2)])
+        self.single_transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(3)])
+
+
 class TestGetBlocksFromDit:
     def test_get_blocks_from_dit_single_block_attr(self):
         model = _SingleBlockModel(num_blocks=3)
@@ -228,6 +254,38 @@ class TestGetBlocksFromDit:
         attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
         assert attr_names == ["blocks"]
         assert len(blocks) == 2
+
+    def test_get_blocks_from_dit_pp_first_stage_uses_local_slice(self):
+        model = _PPSplitBlockModel(num_layers=8, start_layer=0, end_layer=4)
+        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert attr_names == ["blocks"]
+        assert len(blocks) == 4
+        assert blocks[0] is model.blocks[0]
+        assert blocks[-1] is model.blocks[3]
+        assert all(not isinstance(block, PPMissingLayer) for block in blocks)
+
+    def test_get_blocks_from_dit_pp_last_stage_ring_wraps_local_slice(self):
+        model = _PPSplitBlockModel(num_layers=8, start_layer=4, end_layer=8)
+        _, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert len(blocks) == 4
+        assert blocks[0] is model.blocks[4]
+        assert blocks[-1] is model.blocks[7]
+        assert all(block is model.blocks[4 + index] for index, block in enumerate(blocks))
+
+    def test_get_blocks_from_dit_pp_missing_layers_without_start_end(self):
+        model = _PPSplitBlockModel(num_layers=6, start_layer=2, end_layer=5)
+        del model.start_layer
+        del model.end_layer
+        _, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert len(blocks) == 3
+        assert blocks[0] is model.blocks[2]
+        assert blocks[-1] is model.blocks[4]
+
+    def test_get_blocks_from_dit_unrelated_start_end_does_not_slice_other_attrs(self):
+        model = _MultiBlockWithUnrelatedPPSlice()
+        _, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        assert len(blocks) == 5
+        assert all(isinstance(block, _DummyBlock) for block in blocks)
 
 
 class TestGetBlocksAttrNames:

@@ -14,6 +14,7 @@ import torch.distributed as dist
 from safetensors.torch import save_file
 from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
+from vllm.model_executor.models.utils import PPMissingLayer
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
 from tests.helpers.runtime import get_distributed_init_method
@@ -864,6 +865,24 @@ class TestGetBlocksFromDit:
         attr_names, blocks = get_blocks_from_dit(model)
         assert attr_names == []
         assert blocks == []
+
+    def test_get_blocks_from_dit_pp_last_stage_uses_local_slice(self):
+        class _PPSplitBlockModel(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.start_layer = 4
+                self.end_layer = 8
+                self.blocks = nn.ModuleList(
+                    [_DummyBlock() if 4 <= index < 8 else PPMissingLayer() for index in range(8)]
+                )
+
+        model = _PPSplitBlockModel()
+        _, blocks = get_blocks_from_dit(model)
+        assert len(blocks) == 4
+        assert blocks[0] is model.blocks[4]
+        assert blocks[-1] is model.blocks[7]
 
 
 class TestGetBlocksAttrNames:
