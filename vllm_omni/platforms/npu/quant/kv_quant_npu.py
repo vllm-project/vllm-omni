@@ -32,6 +32,9 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
 def _load_quant_ops():
     try:
         import torch_npu
+        from mindiesd.layers.flash_attn.fused_infer_attention_score import (
+            fused_infer_attention_score_v2,
+        )
         from mindiesd.layers.quant.block_quant import fa_block_quant_preprocess
         from msmodelslim.processor.quarot.common.quarot_utils import QuaRotMode, create_rot
     except ImportError as e:
@@ -39,7 +42,7 @@ def _load_quant_ops():
             "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
             "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
         ) from e
-    return torch_npu, fa_block_quant_preprocess, QuaRotMode, create_rot
+    return torch_npu, fa_block_quant_preprocess, fused_infer_attention_score_v2, QuaRotMode, create_rot
 
 
 def _get_rot_matrix(
@@ -72,13 +75,13 @@ def fp8_rotate_quant_fa(
         query: Query tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
         key: Key tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
         value: Value tensor in ``layout`` order (default BNSD: batch, heads, seq, dim).
-        layout: ``BNSD`` or ``BSND`` for ``npu_fused_infer_attention_score_v2``.
+        layout: Input/output tensor layout, either ``BNSD`` or ``BSND``.
         softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
 
     Returns:
         Attention output in the same layout as inputs.
     """
-    torch_npu, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
+    torch_npu, fa_block_quant_preprocess, fused_infer_attention_score_v2, qua_rot_mode, create_rot = _load_quant_ops()
 
     out_dtype = query.dtype
     device = query.device
@@ -100,11 +103,14 @@ def fp8_rotate_quant_fa(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
 
-    out = torch_npu.npu_fused_infer_attention_score_v2(
+    # fa_block_quant_preprocess normalizes both supported input layouts to
+    # BNSD. Use MindIE-SD's Eagle FIA op because the corresponding CANN FIA
+    # path no longer accepts FP8 per-block full quantization (mode 7).
+    out = fused_infer_attention_score_v2(
         q,
         k,
         v,
-        input_layout=layout,
+        input_layout="BNSD",
         num_query_heads=n,
         softmax_scale=scale,
         pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
@@ -119,9 +125,9 @@ def fp8_rotate_quant_fa(
     )[0]
 
     if out.shape[2] != s:
-        if layout == "BNSD":
-            out = out[:, :, :s, :]
-        elif layout == "BSND":
-            out = out[:, :s, :, :]
+        out = out[:, :, :s, :]
+
+    if layout == "BSND":
+        out = out.transpose(1, 2)
 
     return out
