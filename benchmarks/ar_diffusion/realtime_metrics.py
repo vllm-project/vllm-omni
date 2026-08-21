@@ -112,6 +112,9 @@ class ChunkEvent:
     chunk_index: int
     t_submit: float
     t_ready: float
+    frames: int | None = None
+    generate_s: float | None = None
+    decode_s: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -120,6 +123,14 @@ class ChunkEvent:
             raise ValueError("chunk_index must be a non-negative integer.")
         if self.t_ready < self.t_submit:
             raise ValueError("t_ready must not precede t_submit.")
+        if self.frames is not None and (isinstance(self.frames, bool) or not isinstance(self.frames, int)):
+            raise TypeError("frames must be an integer when provided.")
+        if self.frames is not None and self.frames <= 0:
+            raise ValueError("frames must be positive when provided.")
+        for name in ("generate_s", "decode_s"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative.")
 
     @property
     def latency_s(self) -> float:
@@ -133,6 +144,10 @@ class ChunkEvent:
             "t_ready": self.t_ready,
             "latency_s": self.latency_s,
         }
+        for name in ("frames", "generate_s", "decode_s"):
+            value = getattr(self, name)
+            if value is not None:
+                record[name] = value
         if deadline is not None:
             record["deadline"] = deadline
             record["met_deadline"] = self.t_ready <= deadline
@@ -147,6 +162,7 @@ class SessionRecord:
     t_start: float
     events: tuple[ChunkEvent, ...]
     lost_reason: str | None = None
+    resident_decoder_bytes: int | None = None
 
     def __post_init__(self) -> None:
         indices = [event.chunk_index for event in self.events]
@@ -154,6 +170,12 @@ class SessionRecord:
             raise ValueError("events must be unique and ordered by chunk_index.")
         if any(event.session_id != self.session_id for event in self.events):
             raise ValueError("every event must belong to this session.")
+
+
+def _optional_sum(values: Iterable[float | None]) -> float | None:
+    """Sum values, or ``None`` when nothing reported a value."""
+    collected = [value for value in values if value is not None]
+    return sum(collected) if collected else None
 
 
 def percentile(values: Sequence[float], fraction: float) -> float | None:
@@ -210,6 +232,9 @@ class SessionSummary:
     deadline_misses: int
     continuous_play_ratio: float | None
     lost_reason: str | None
+    generate_s_total: float | None = None
+    decode_s_total: float | None = None
+    decode_share: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -225,10 +250,11 @@ def summarize_session(
     events = record.events
     latencies = [event.latency_s for event in events]
     ttfc = events[0].t_ready - record.t_start if events else None
-    # Sum the per-chunk delivery rather than multiplying by a constant: with a
-    # causal decoder the opening chunk is shorter, so chunks x frames_per_chunk
-    # over-counts every run by that difference.
-    frames = sum(profile.frames_at(event.chunk_index) for event in events)
+    # Prefer what the decoder actually delivered. Falling back on the profile
+    # is an assumption about the decoder's temporal geometry; a measured count
+    # is not, which matters precisely because that geometry is not declared
+    # anywhere the runtime can read.
+    frames = sum(event.frames if event.frames is not None else profile.frames_at(event.chunk_index) for event in events)
 
     rtf: float | None = None
     if events:
@@ -245,6 +271,9 @@ def summarize_session(
     )
     cpr = (len(deadlines) - misses) / len(deadlines) if deadlines else None
 
+    generate_total = _optional_sum(event.generate_s for event in events)
+    decode_total = _optional_sum(event.decode_s for event in events)
+    latency_total = sum(latencies)
     return SessionSummary(
         session_id=record.session_id,
         chunks=len(events),
@@ -259,6 +288,12 @@ def summarize_session(
         deadline_misses=misses,
         continuous_play_ratio=cpr,
         lost_reason=record.lost_reason,
+        generate_s_total=generate_total,
+        decode_s_total=decode_total,
+        # The fraction of chunk wall time spent decoding. With generation and
+        # decode serialized this is the headroom overlapping them can recover;
+        # once they overlap it is what the measurement has to show shrinking.
+        decode_share=(decode_total / latency_total if decode_total is not None and latency_total > 0 else None),
     )
 
 
@@ -279,6 +314,8 @@ class RunSummary:
     mean_chunk_latency_s: float | None
     rtf_spread: float | None
     peak_concurrent_sessions: int
+    decode_share: float | None = None
+    resident_decoder_bytes_per_session: int | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,6 +340,8 @@ class RunSummary:
             "worst_case_chunk_latency_s": self.worst_case_chunk_latency_s,
             "continuous_play_ratio": self.continuous_play_ratio,
             "rtf_spread": self.rtf_spread,
+            "decode_share": self.decode_share,
+            "resident_decoder_bytes_per_session": self.resident_decoder_bytes_per_session,
             "notes": list(self.notes),
             "per_session": [summary.to_dict() for summary in self.sessions],
         }
@@ -316,6 +355,7 @@ def summarize_run(
     wall_s: float,
     num_gpus: int = 1,
     peak_concurrent_sessions: int | None = None,
+    resident_decoder_bytes_per_session: int | None = None,
     notes: Sequence[str] = (),
 ) -> RunSummary:
     """Aggregate session records into the reportable run summary."""
@@ -333,6 +373,7 @@ def summarize_run(
     # neighbour that produced many more chunks.
     per_session_cpr = [s.continuous_play_ratio for s in summaries if s.continuous_play_ratio is not None]
     rtfs = [s.rtf for s in summaries if s.rtf is not None]
+    decode_shares = [s.decode_share for s in summaries if s.decode_share is not None]
 
     return RunSummary(
         mode=mode,
@@ -348,6 +389,8 @@ def summarize_run(
         mean_chunk_latency_s=statistics.fmean(latencies) if latencies else None,
         rtf_spread=max(rtfs) - min(rtfs) if len(rtfs) > 1 else None,
         peak_concurrent_sessions=(peak_concurrent_sessions if peak_concurrent_sessions is not None else len(summaries)),
+        decode_share=statistics.fmean(decode_shares) if decode_shares else None,
+        resident_decoder_bytes_per_session=resident_decoder_bytes_per_session,
         notes=tuple(notes),
     )
 

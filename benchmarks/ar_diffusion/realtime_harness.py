@@ -139,6 +139,7 @@ async def _drive_session(
     t_start = clock()
     session = await factory(session_id)
     events: list[ChunkEvent] = []
+    decoder_bytes: list[int] = []
     lost_reason: str | None = None
     period = config.profile.release_period_s
     gauge.enter()
@@ -159,14 +160,24 @@ async def _drive_session(
             except Exception as exc:  # noqa: BLE001 - a lost session is a result, not a crash
                 lost_reason = f"{type(exc).__name__}: {exc}"
                 break
+            # A session that decodes its own chunks reports the generate/decode
+            # split and the frames it actually delivered; one that returns
+            # latents leaves these None and the profile supplies the geometry.
+            timing = getattr(session, "last", None)
             events.append(
                 ChunkEvent(
                     session_id=session_id,
                     chunk_index=chunk_index,
                     t_submit=t_submit,
                     t_ready=clock(),
+                    frames=getattr(timing, "frames", None),
+                    generate_s=getattr(timing, "generate_s", None),
+                    decode_s=getattr(timing, "decode_s", None),
                 )
             )
+            resident = getattr(timing, "resident_decoder_bytes", None)
+            if resident is not None:
+                decoder_bytes.append(resident)
     finally:
         gauge.exit()
         with contextlib.suppress(Exception):
@@ -177,6 +188,9 @@ async def _drive_session(
         t_start=t_start,
         events=tuple(events),
         lost_reason=lost_reason,
+        # Peak rather than last: the cache is bounded, so these agree in steady
+        # state, and a peak is what admission has to reserve against.
+        resident_decoder_bytes=max(decoder_bytes) if decoder_bytes else None,
     )
 
 
@@ -214,6 +228,8 @@ async def run_benchmark(
     ]
     records = await asyncio.gather(*tasks)
     wall = resolved_clock() - t0
+    reported = [r.resident_decoder_bytes for r in records if r.resident_decoder_bytes is not None]
+    resident_decoder_bytes = max(reported) if reported else None
 
     if config.events_dir is not None:
         write_events(records, config)
@@ -225,6 +241,7 @@ async def run_benchmark(
         wall_s=wall,
         num_gpus=config.num_gpus,
         peak_concurrent_sessions=gauge.peak,
+        resident_decoder_bytes_per_session=resident_decoder_bytes,
         notes=notes,
     )
 

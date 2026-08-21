@@ -52,6 +52,26 @@ which TTFC reports. Walking cumulative frames rather than multiplying a constant
 period is what lets a deeper buffer grant real slack, and what keeps a causal
 decoder's shorter opening chunk from being credited with a full period.
 
+## The vertical path
+
+A session's tick returns latents, which nothing can watch. `DecodingSession`
+wraps a latent-producing session so each tick also decodes its chunk
+incrementally, which puts three things inside the measurement:
+
+- **TTFF rather than time-to-first-chunk.** The gate this RFC proposes is time
+  to first *frame*, so the decode has to be on the measured path.
+- **`decode_share`**, the fraction of chunk wall time spent decoding. With
+  generation and decode serialized this is the headroom overlapping them can
+  recover; once they overlap it is the number that has to shrink. Overlap work
+  without this baseline has nothing to beat.
+- **`resident_decoder_bytes_per_session`**, which admission needs and which no
+  other part of the run reports.
+
+Delivered frames then come from the decoder rather than from the profile, so
+the harness *measures* the temporal geometry instead of assuming it. Sessions
+that only produce latents keep working: the stage split is reported as `None`
+and the profile supplies the frame counts.
+
 ## Model neutrality
 
 The chunk shape comes from the pipeline's declared `ARDiffusionKVCacheSpec`. No

@@ -572,3 +572,163 @@ def test_frames_per_chunk_needs_a_mapping_the_spec_does_not_declare() -> None:
 
     with pytest.raises(ValueError, match="frames_per_block"):
         frames_per_chunk_from_spec(NoSpec())
+
+
+# --------------------------------------------------------------------------
+# Vertical path: latents -> incremental decode -> delivered frames
+# --------------------------------------------------------------------------
+
+
+class FakeDecodeState:
+    """Bounded cache stand-in: grows once, then plateaus."""
+
+    def __init__(self) -> None:
+        self.chunks = 0
+
+    def nbytes(self) -> int:
+        return 0 if self.chunks == 0 else 4096
+
+
+class FakeChunkDecoder:
+    """Applies the causal geometry the real decoder has, without torch."""
+
+    def __init__(self, clock: VirtualClock, *, decode_s: float, factor: int = 4) -> None:
+        self._clock = clock
+        self._decode_s = decode_s
+        self._factor = factor
+        self.released: list[FakeDecodeState] = []
+
+    def new_decode_state(self, session_id: str) -> FakeDecodeState:
+        return FakeDecodeState()
+
+    def decode_chunk(self, latent, state: FakeDecodeState):
+        n = latent["latent_frames"]
+        frames = (n - 1) * self._factor + 1 if state.chunks == 0 else n * self._factor
+        state.chunks += 1
+        # Charge decode time on the same virtual clock the driver reads.
+        self._clock.now += self._decode_s
+        return type("Frames", (), {"shape": (1, 3, frames, 8, 8)})()
+
+    def release(self, state: FakeDecodeState) -> None:
+        self.released.append(state)
+
+
+class FakeLatentSession:
+    def __init__(self, clock: VirtualClock, *, generate_s: float, latent_frames: int = 3) -> None:
+        self._clock = clock
+        self._generate_s = generate_s
+        self._latent_frames = latent_frames
+        self.closed = False
+
+    async def next_chunk(self):
+        self._clock.now += self._generate_s
+        return {"latent_frames": self._latent_frames}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _decoding_factory(clock: VirtualClock, *, generate_s: float, decode_s: float):
+    from benchmarks.ar_diffusion.decoding_session import DecodingSession
+
+    decoder = FakeChunkDecoder(clock, decode_s=decode_s)
+    inner: dict[str, FakeLatentSession] = {}
+
+    async def factory(session_id: str):
+        session = FakeLatentSession(clock, generate_s=generate_s)
+        inner[session_id] = session
+        return DecodingSession(
+            inner=session,
+            decoder=decoder,
+            session_id=session_id,
+            clock=clock.time,
+        )
+
+    return factory, decoder, inner
+
+
+@pytest.mark.asyncio
+async def test_ttfc_covers_decode_because_a_latent_is_not_a_frame() -> None:
+    """The gate is time to first *frame*, so decode is inside the measured path."""
+    clock = VirtualClock()
+    factory, _, _ = _decoding_factory(clock, generate_s=0.4, decode_s=0.1)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=3, arrivals=burst_arrivals(1)
+    )
+    run = await drive(config, factory, clock)
+    assert run.sessions[0].ttfc_s == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_decode_share_is_the_headroom_overlap_can_recover() -> None:
+    clock = VirtualClock()
+    factory, _, _ = _decoding_factory(clock, generate_s=0.4, decode_s=0.1)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=4, arrivals=burst_arrivals(1)
+    )
+    run = await drive(config, factory, clock)
+    summary = run.sessions[0]
+    assert summary.generate_s_total == pytest.approx(4 * 0.4)
+    assert summary.decode_s_total == pytest.approx(4 * 0.1)
+    assert summary.decode_share == pytest.approx(0.2)
+    assert run.decode_share == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
+async def test_delivered_frames_are_measured_not_assumed() -> None:
+    """The decoder's temporal geometry is not declared, so it is measured.
+
+    The profile here is the uniform one, which would report 12 frames for every
+    chunk; the decoder actually delivers 9 then 12, and the summary must follow
+    the decoder.
+    """
+    clock = VirtualClock()
+    factory, _, _ = _decoding_factory(clock, generate_s=0.1, decode_s=0.05)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=3, arrivals=burst_arrivals(1)
+    )
+    run = await drive(config, factory, clock)
+    assert run.sessions[0].frames == 9 + 12 + 12
+    assert PROFILE.cumulative_frames(3) == 36  # what assuming would have given
+
+
+@pytest.mark.asyncio
+async def test_resident_decoder_bytes_reach_the_summary() -> None:
+    """Admission needs this term, and nothing else in the run reports it."""
+    clock = VirtualClock()
+    factory, _, _ = _decoding_factory(clock, generate_s=0.1, decode_s=0.05)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=3, arrivals=burst_arrivals(2)
+    )
+    run = await drive(config, factory, clock)
+    assert run.resident_decoder_bytes_per_session == 4096
+    assert json.loads(json.dumps(run.to_dict()))["resident_decoder_bytes_per_session"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_closing_a_session_releases_decoder_state_with_it() -> None:
+    """The cache has no recompute source, so it must not outlive the session."""
+    clock = VirtualClock()
+    factory, decoder, inner = _decoding_factory(clock, generate_s=0.1, decode_s=0.05)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=2, arrivals=burst_arrivals(2)
+    )
+    await drive(config, factory, clock)
+    assert len(decoder.released) == 2
+    assert all(session.closed for session in inner.values())
+
+
+@pytest.mark.asyncio
+async def test_a_latent_only_session_still_works_and_falls_back_to_the_profile() -> None:
+    """Sessions without decode report no split, and the profile fills in frames."""
+    clock = VirtualClock()
+    factory, _ = make_factory(clock, tick_s=0.25)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=3, arrivals=burst_arrivals(1)
+    )
+    run = await drive(config, factory, clock)
+    summary = run.sessions[0]
+    assert summary.decode_share is None
+    assert summary.generate_s_total is None
+    assert summary.frames == 36
+    assert run.resident_decoder_bytes_per_session is None
