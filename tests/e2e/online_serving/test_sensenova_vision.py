@@ -10,7 +10,7 @@ mixed ``caption_generate`` mode via the OpenAI-compatible chat completions API
 exposed by ``vllm-omni serve``.
 
 Equivalent to running:
-    vllm serve sensenova/SenseNova-Vision-7B-MoT --omni \\
+    vllm serve RzZ/SenseNova-Vision-7B-MoT --omni \\
         --port 8092 --deploy-config <ci/sensenova_vision.yaml>
 
     python examples/online_serving/sensenova_vision/openai_chat_client.py \\
@@ -36,7 +36,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = "sensenova/SenseNova-Vision-7B-MoT"
+MODEL = "RzZ/SenseNova-Vision-7B-MoT"
 STAGE_CONFIG_PATH = get_deploy_config_path("ci/sensenova_vision.yaml")
 
 TEXT2TEXT_PROMPT = "What is the capital of France?"

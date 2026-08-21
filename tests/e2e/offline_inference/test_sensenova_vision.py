@@ -35,7 +35,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
-MODEL_NAME = "sensenova/SenseNova-Vision-7B-MoT"
+MODEL_NAME = "RzZ/SenseNova-Vision-7B-MoT"
 STAGE_CONFIG = get_deploy_config_path("ci/sensenova_vision.yaml")
 
 REFERENCE_TEXT_TEXT2TEXT = "Paris"

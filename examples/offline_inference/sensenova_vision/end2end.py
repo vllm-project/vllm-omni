@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SenseNova-Vision-7B-MoT offline inference (full modality matrix).")
     p.add_argument(
         "--model",
-        default="sensenova/SenseNova-Vision-7B-MoT",
+        default="RzZ/SenseNova-Vision-7B-MoT",
         help="HF repo or local path.",
     )
     p.add_argument(
