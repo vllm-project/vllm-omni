@@ -84,6 +84,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0, help="Seed for the arrival process.")
     parser.add_argument(
+        "--non-causal-decoder",
+        action="store_true",
+        help="The decoder expands every latent frame identically, so the opening chunk is full length.",
+    )
+    parser.add_argument(
         "--vae-temporal-factor",
         type=int,
         default=1,
@@ -113,7 +118,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def build_config(
-    args: argparse.Namespace, *, frames_per_chunk: int, resident_bytes: int | None = None
+    args: argparse.Namespace,
+    *,
+    frames_per_chunk: int,
+    frames_per_first_chunk: int | None = None,
+    resident_bytes: int | None = None,
 ) -> BenchmarkConfig:
     """Turn parsed arguments plus the pipeline's chunk shape into a config.
 
@@ -135,6 +144,7 @@ def build_config(
 
     profile = WorkloadProfile(
         frames_per_chunk=frames_per_chunk,
+        frames_per_first_chunk=frames_per_first_chunk,
         target_fps=target_fps,
         buffer_chunks=args.buffer_chunks,
         resident_bytes_per_session=resident_bytes,
@@ -154,22 +164,28 @@ def build_config(
     )
 
 
-def frames_per_chunk_from_spec(spec: Any, *, vae_temporal_factor: int = 1) -> int:
-    """Raw frames one committed chunk delivers.
+def frames_per_chunk_from_spec(spec: Any, *, vae_temporal_factor: int = 1, causal: bool = True) -> tuple[int, int]:
+    """Raw frames a chunk delivers, as ``(steady_state, first_chunk)``.
 
     ``frames_per_block`` is read from the pipeline capability, which is what
     keeps the chunk shape out of this module. ``vae_temporal_factor`` has to be
     supplied by the caller: the spec expresses every frame count in latent
     frames and declares nothing that converts them to delivered frames, so no
     runtime component can compute the playout grid from the capability alone.
-    A pipeline whose decoder does not compress time uses the default of 1.
+
+    The conversion is not a plain multiplication. A causal video decoder maps
+    ``n`` latent frames to ``(n - 1) * factor + 1`` raw frames, so a session's
+    opening chunk delivers fewer frames than every chunk after it -- which is
+    also why a single declared integer could not express this mapping.
     """
     frames_per_block = getattr(spec, "frames_per_block", None)
     if isinstance(frames_per_block, bool) or not isinstance(frames_per_block, int) or frames_per_block <= 0:
         raise ValueError("The pipeline must declare a positive integer frames_per_block.")
     if isinstance(vae_temporal_factor, bool) or not isinstance(vae_temporal_factor, int) or vae_temporal_factor <= 0:
         raise ValueError("vae_temporal_factor must be a positive integer.")
-    return frames_per_block * vae_temporal_factor
+    steady = frames_per_block * vae_temporal_factor
+    first = (frames_per_block - 1) * vae_temporal_factor + 1 if causal else steady
+    return steady, first
 
 
 async def _main(args: argparse.Namespace) -> int:
@@ -179,10 +195,15 @@ async def _main(args: argparse.Namespace) -> int:
     from vllm_omni.experimental.ar_diffusion import ARDiffusionSessionManager
 
     backend = await build_realtime_backend(args)
-    frames_per_chunk = frames_per_chunk_from_spec(backend.spec, vae_temporal_factor=args.vae_temporal_factor)
+    frames_per_chunk, frames_per_first_chunk = frames_per_chunk_from_spec(
+        backend.spec,
+        vae_temporal_factor=args.vae_temporal_factor,
+        causal=not args.non_causal_decoder,
+    )
     config = build_config(
         args,
         frames_per_chunk=frames_per_chunk,
+        frames_per_first_chunk=frames_per_first_chunk,
         # Only the model-owned term is declared; runner-owned KV bytes are not
         # part of the spec, so this under-reports total residency.
         resident_bytes=getattr(backend.spec, "model_owned_state_bytes_per_session", None),

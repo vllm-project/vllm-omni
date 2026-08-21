@@ -49,6 +49,7 @@ class WorkloadProfile:
     target_fps: float
     buffer_chunks: int = 1
     resident_bytes_per_session: int | None = None
+    frames_per_first_chunk: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.frames_per_chunk, bool) or not isinstance(self.frames_per_chunk, int):
@@ -65,11 +66,42 @@ class WorkloadProfile:
             raise ValueError("buffer_chunks must be at least 1.")
         if self.resident_bytes_per_session is not None and self.resident_bytes_per_session < 0:
             raise ValueError("resident_bytes_per_session must be non-negative.")
+        first = self.frames_per_chunk if self.frames_per_first_chunk is None else self.frames_per_first_chunk
+        if isinstance(first, bool) or not isinstance(first, int) or first <= 0:
+            raise ValueError("frames_per_first_chunk must be a positive integer.")
+        object.__setattr__(self, "frames_per_first_chunk", first)
 
     @property
     def release_period_s(self) -> float:
-        """Wall time one committed chunk is worth at the declared playout rate."""
+        """Wall time one steady-state chunk is worth at the declared playout rate.
+
+        Steady state, not the first chunk: a causal decoder expands its first
+        latent frame to a single raw frame and every later one to the full
+        temporal factor, so the opening chunk delivers less video than those
+        that follow. The playout grid is paced by the steady-state chunk, and
+        the shorter opening is accounted for in the cumulative video time that
+        :func:`chunk_deadlines` walks.
+        """
         return self.frames_per_chunk / self.target_fps
+
+    def frames_at(self, chunk_index: int) -> int:
+        """Raw frames chunk ``chunk_index`` delivers."""
+        if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
+            raise ValueError("chunk_index must be a non-negative integer.")
+        assert self.frames_per_first_chunk is not None  # resolved in __post_init__
+        return self.frames_per_first_chunk if chunk_index == 0 else self.frames_per_chunk
+
+    def cumulative_frames(self, chunk_count: int) -> int:
+        """Raw frames delivered by chunks ``0 .. chunk_count - 1``."""
+        if chunk_count <= 0:
+            return 0
+        assert self.frames_per_first_chunk is not None
+        return self.frames_per_first_chunk + self.frames_per_chunk * (chunk_count - 1)
+
+    @property
+    def is_causal(self) -> bool:
+        """Whether the opening chunk delivers fewer frames than later ones."""
+        return self.frames_per_first_chunk != self.frames_per_chunk
 
 
 @dataclass(frozen=True)
@@ -142,17 +174,23 @@ def percentile(values: Sequence[float], fraction: float) -> float | None:
 def chunk_deadlines(record: SessionRecord, profile: WorkloadProfile) -> dict[int, float]:
     """Playout deadline per chunk, or ``{}`` when playback never starts.
 
-    Playback begins once ``buffer_chunks`` chunks are buffered, so chunk
-    ``buffer_chunks - 1`` fixes the playout grid and every later chunk is due
-    one release period after its predecessor. Chunks inside the prebuffer have
-    no deadline: their cost is start latency, which TTFC already reports.
+    Playback begins once ``buffer_chunks`` chunks are buffered. From that
+    instant the player consumes continuously, so chunk ``i`` starts playing
+    only after chunks ``0 .. i - 1`` have played, and must be ready by then::
+
+        deadline(i) = t_ready(buffer_chunks - 1) + cumulative_frames(i) / target_fps
+
+    Walking cumulative frames rather than multiplying a constant period is what
+    lets a deeper buffer grant real slack, and what keeps a causal decoder's
+    shorter opening chunk from being credited with a full period of video.
+    Chunks inside the prebuffer have no deadline: their cost is start latency,
+    which TTFC already reports.
     """
     if len(record.events) < profile.buffer_chunks:
         return {}
     anchor = record.events[profile.buffer_chunks - 1]
-    period = profile.release_period_s
     return {
-        event.chunk_index: anchor.t_ready + (event.chunk_index - anchor.chunk_index) * period
+        event.chunk_index: anchor.t_ready + profile.cumulative_frames(event.chunk_index) / profile.target_fps
         for event in record.events[profile.buffer_chunks :]
     }
 
@@ -187,6 +225,10 @@ def summarize_session(
     events = record.events
     latencies = [event.latency_s for event in events]
     ttfc = events[0].t_ready - record.t_start if events else None
+    # Sum the per-chunk delivery rather than multiplying by a constant: with a
+    # causal decoder the opening chunk is shorter, so chunks x frames_per_chunk
+    # over-counts every run by that difference.
+    frames = sum(profile.frames_at(event.chunk_index) for event in events)
 
     rtf: float | None = None
     if events:
@@ -194,7 +236,7 @@ def summarize_session(
         # from the first submit so queueing before the session starts ticking is
         # not charged to the model.
         wall = events[-1].t_ready - events[0].t_submit
-        video_seconds = len(events) * profile.release_period_s
+        video_seconds = frames / profile.target_fps
         rtf = wall / video_seconds if video_seconds > 0 else None
 
     deadlines = chunk_deadlines(record, profile) if mode is LoadMode.PACED else {}
@@ -206,7 +248,7 @@ def summarize_session(
     return SessionSummary(
         session_id=record.session_id,
         chunks=len(events),
-        frames=len(events) * profile.frames_per_chunk,
+        frames=frames,
         ttfc_s=ttfc,
         latency_p50_s=percentile(latencies, 0.50),
         latency_p95_s=percentile(latencies, 0.95),
@@ -244,6 +286,7 @@ class RunSummary:
             "mode": self.mode.value,
             "profile": {
                 "frames_per_chunk": self.profile.frames_per_chunk,
+                "frames_per_first_chunk": self.profile.frames_per_first_chunk,
                 "target_fps": self.profile.target_fps,
                 "buffer_chunks": self.profile.buffer_chunks,
                 "release_period_s": self.profile.release_period_s,
@@ -335,11 +378,21 @@ def compare_runs(baseline: RunSummary, candidate: RunSummary) -> dict[str, Any]:
     return delta
 
 
-def load_profile_from_spec(spec: Mapping[str, Any], *, target_fps: float, buffer_chunks: int = 1) -> WorkloadProfile:
+def load_profile_from_spec(
+    spec: Mapping[str, Any],
+    *,
+    target_fps: float,
+    buffer_chunks: int = 1,
+    causal: bool = True,
+) -> WorkloadProfile:
     """Build a profile from a pipeline's declared AR-Diffusion KV spec.
 
-    Reads ``frames_per_block`` and the VAE temporal factor from the spec rather
-    than from a flag, so the harness never encodes a model's chunk shape.
+    ``frames_per_block`` is in latent frames. A causal video decoder expands
+    the very first latent frame of a session to one raw frame and every later
+    one to the full temporal factor, so an opening block of ``n`` latent frames
+    delivers ``(n - 1) * factor + 1`` raw frames while every later block
+    delivers ``n * factor``. Pass ``causal=False`` for a decoder that expands
+    every latent frame identically.
     """
     frames_per_block = spec.get("frames_per_block")
     temporal_factor = spec.get("vae_temporal_factor", 1)
@@ -347,8 +400,11 @@ def load_profile_from_spec(spec: Mapping[str, Any], *, target_fps: float, buffer
         raise ValueError("spec must declare a positive integer frames_per_block.")
     if isinstance(temporal_factor, bool) or not isinstance(temporal_factor, int) or temporal_factor <= 0:
         raise ValueError("spec vae_temporal_factor must be a positive integer.")
+    steady = frames_per_block * temporal_factor
+    first = (frames_per_block - 1) * temporal_factor + 1 if causal else steady
     return WorkloadProfile(
-        frames_per_chunk=frames_per_block * temporal_factor,
+        frames_per_chunk=steady,
+        frames_per_first_chunk=first,
         target_fps=target_fps,
         buffer_chunks=buffer_chunks,
         resident_bytes_per_session=spec.get("resident_bytes_per_session"),
