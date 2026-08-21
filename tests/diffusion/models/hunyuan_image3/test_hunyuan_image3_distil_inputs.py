@@ -6,6 +6,10 @@ distilled model parameters (guidance, timesteps_r) are properly passed."""
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    HunyuanImage3Text2ImagePipeline,
+)
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -250,3 +254,41 @@ class TestPrepareInputsForGenerationDistilled:
         ]
         for key in required_distilled_keys:
             assert key in model_inputs, f"{key} must be in model_inputs dict"
+
+
+def test_ar_kv_reuse_rebases_distilled_scatter_indices():
+    pipeline = object.__new__(HunyuanImage3Text2ImagePipeline)
+    model_kwargs = {
+        "query_lens": [8],
+        "attention_mask": torch.ones(1, 1, 8, 12, dtype=torch.bool),
+        "position_ids": torch.arange(8).unsqueeze(0),
+        "image_mask": torch.ones(1, 8, dtype=torch.bool),
+        "gen_timestep_scatter_index": torch.tensor([[5]]),
+        "guidance_scatter_index": torch.tensor([[6]]),
+        "timesteps_r_scatter_index": torch.tensor([[7]]),
+    }
+
+    truncated = pipeline._truncate_reused_prefix(
+        input_ids=torch.arange(8).unsqueeze(0),
+        model_kwargs=model_kwargs,
+        positive_reuse_len=3,
+    )
+
+    assert truncated.tolist() == [[3, 4, 5, 6, 7]]
+    assert model_kwargs["gen_timestep_scatter_index"].tolist() == [[2]]
+    assert model_kwargs["guidance_scatter_index"].tolist() == [[3]]
+    assert model_kwargs["timesteps_r_scatter_index"].tolist() == [[4]]
+
+
+def test_cfg_parallel_splits_meanflow_scatter_indices():
+    model_kwargs = {
+        "timesteps_r_scatter_index": torch.tensor([[1], [2], [3], [4]]),
+    }
+
+    HunyuanImage3Text2ImagePipeline._split_model_kwargs_for_cfg_parallel(
+        model_kwargs,
+        batch_size=2,
+        cfg_rank=1,
+    )
+
+    assert model_kwargs["timesteps_r_scatter_index"].tolist() == [[3], [4]]

@@ -110,7 +110,7 @@ class TestFusedMoEFactory:
         monkeypatch.setitem(
             sys.modules,
             "vllm.model_executor.layers.fused_moe",
-            SimpleNamespace(FusedMoE=mock_vllm_fused_moe),
+            SimpleNamespace(FusedMoEFactory=mock_vllm_fused_moe),
         )
 
         result = fused_moe.FusedMoE(prefix="test", a=1, reduce_results=True)
@@ -139,7 +139,7 @@ class TestFusedMoEFactory:
         monkeypatch.setitem(
             sys.modules,
             "vllm.model_executor.layers.fused_moe",
-            SimpleNamespace(FusedMoE=mocker.MagicMock(return_value=mock_runner)),
+            SimpleNamespace(FusedMoEFactory=mocker.MagicMock(return_value=mock_runner)),
         )
         mocker.patch.object(fused_moe, "current_omni_platform", mocker.MagicMock())
         mock_set_num_tokens = mocker.patch.object(fused_moe, "_set_forward_context_num_tokens")
@@ -169,7 +169,7 @@ class TestFusedMoEFactory:
         monkeypatch.setitem(
             sys.modules,
             "vllm.model_executor.layers.fused_moe",
-            SimpleNamespace(FusedMoE=mocker.MagicMock(return_value=mock_runner)),
+            SimpleNamespace(FusedMoEFactory=mocker.MagicMock(return_value=mock_runner)),
         )
         mocker.patch.object(fused_moe, "current_omni_platform", mocker.MagicMock())
         mock_set_num_tokens = mocker.patch.object(fused_moe, "_set_forward_context_num_tokens")

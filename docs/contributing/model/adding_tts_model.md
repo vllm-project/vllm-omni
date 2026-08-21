@@ -20,7 +20,7 @@ pattern, refer to MOSS-TTS-Nano.
 4. [Step-by-Step Implementation](#step-by-step-implementation)
 5. [Key Components](#key-components)
 6. [Model Registration](#model-registration)
-7. [Stage Configuration](#stage-configuration)
+7. [Pipeline and Deploy Configuration](#pipeline-and-deploy-configuration)
 8. [Stage Input Processors](#stage-input-processors)
 9. [Online Serving Integration](#online-serving-integration)
 10. [Single-Stage Models](#single-stage-models)
@@ -78,7 +78,7 @@ Profile before optimizing.
 new TTS model must pass all three levels:
 
 | Layer | Catches | Tool |
-|-------|---------|------|
+| ------- | --------- | ------ |
 | Offline RTF / duration | Throughput regressions, missing audio, wrong sample rate | `end2end.py`, pytest e2e |
 | Browser streaming playback | Delta-vs-cumulative bugs, chunk boundary glitches, TTFP regressions | Gradio demo over `/v1/audio/speech?stream=true` |
 | Concurrent requests | Per-request state leaks, codec window round-robin gaps | `max_num_seqs>1` smoke with 4+ parallel prompts |
@@ -94,10 +94,10 @@ the symptom is crosstalk or truncation under load, nothing in single-request tes
 vLLM-Omni supports TTS models as multi-stage pipelines where each stage runs independently
 and can be placed on different devices. Qwen3-TTS has two stages:
 
-| Stage | Name | Input | Output |
-|-------|------|-------|--------|
-| 0 | Code Predictor (AR) | Text tokens | Discrete RVQ codec codes |
-| 1 | Code2Wav (Decoder) | RVQ codec codes | Audio waveform |
+| Stage | Name                | Input           | Output                   |
+| ----- | ------------------- | --------------- | ------------------------ |
+| 0     | Code Predictor (AR) | Text tokens     | Discrete RVQ codec codes |
+| 1     | Code2Wav (Decoder)  | RVQ codec codes | Audio waveform           |
 
 Each stage is a separate model class configured independently via YAML. The two stages
 are connected by the `async_chunk` framework, which enables inter-stage streaming for
@@ -170,7 +170,7 @@ and Qwen3-Omni).
 
 When adding a new TTS model, create the following structure:
 
-```
+```text
 vllm_omni/model_executor/models/
   your_model_name/
     __init__.py
@@ -201,7 +201,7 @@ it would not be picked up — the hub README is the documented surface.
 **Qwen3-TTS reference files:**
 
 | File | Purpose |
-|------|---------|
+| ------ | --------- |
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Stage 0 - optimized AR |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Stage 1 - decoder |
@@ -427,112 +427,92 @@ _OMNI_MODELS = {
 
 The registry uses lazy loading - model classes are only imported when needed.
 
-## Stage Configuration
+## Pipeline and Deploy Configuration
 
-Each stage has a `worker_type` that determines how it is scheduled:
+Define fixed topology in `models/<model>/pipeline.py`. The execution type
+selects the scheduler and worker family:
 
-- `worker_type: ar` - autoregressive stage, uses `OmniARScheduler` with PagedAttention
-- `worker_type: generation` - non-AR stage (e.g. decoder), uses `OmniGenerationScheduler`
+- `StageExecutionType.LLM_AR` uses the autoregressive runtime with PagedAttention.
+- `StageExecutionType.LLM_GENERATION` uses the generation runtime for stages such as audio decoders.
 
-Key configuration fields:
+Key topology fields belong to `StagePipelineConfig`:
 
 | Field | Description |
 |-------|-------------|
-| `model_stage` | Which stage to initialize (`ar_stage`, `decoder`, etc.) |
-| `model_arch` | Architecture name, must match `registry.py` |
-| `engine_input_source` | List of upstream stage IDs that provide input (e.g. `[0]`) |
-| `engine_output_type` | Output type: `latent` for intermediate, `audio` for final |
-| `custom_process_next_stage_input_func` | Async chunk processor function path (streaming only) |
-| `final_output` | Whether this stage produces the final user-facing output |
-| `final_output_type` | Type of final output (`audio`, `text`, etc.) |
+| `model_stage` | Logical stage name (`ar_stage`, `decoder`, etc.). |
+| `execution_type` | Runtime family for this stage. |
+| `input_sources` | Upstream stage IDs that provide input. |
+| `model_arch` | Stage-specific architecture name, when it differs from the pipeline default. |
+| `engine_output_type` | Output representation such as `latent` or `audio`. |
+| `custom_process_next_stage_input_func` | Processor for full-payload stage handoff. |
+| `async_chunk_process_next_stage_input_func` | Processor for streaming chunk handoff. |
+| `final_output` / `final_output_type` | Whether this stage produces user-facing output and its modality. |
+| `owns_tokenizer` | Whether this stage supplies the pipeline tokenizer. |
 
-!!! note
-    New in-tree models should define frozen topology in `models/<model>/pipeline.py`,
-    register it in `vllm_omni/config/pipeline_registry.py`, and put deployment
-    knobs in `vllm_omni/deploy/<model>.yaml`. Legacy `stage_args` YAMLs are still
-    accepted for custom configs via `--stage-configs-path`, but should not be used
-    for new bundled defaults.
+For example, a two-stage TTS topology can be defined as:
 
-### Batch mode
+```python
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
 
-```yaml
-# stage_configs/your_model_name.yaml
+_PROC = "vllm_omni.model_executor.stage_input_processors.your_model_name"
 
-stage_args:
-  - stage_id: 0
-    stage_type: llm
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: ar_stage
-      max_num_seqs: 64
-      model_arch: YourTTSModelForConditionalGeneration
-      worker_type: ar
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      engine_output_type: latent
-    default_sampling_params:
-      temperature: 0.9
-      top_k: 50
-      max_tokens: 2048
-
-  - stage_id: 1
-    stage_type: llm
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: decoder
-      model_arch: YourTTSModelForConditionalGeneration
-      worker_type: generation
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      engine_output_type: audio
-    engine_input_source: [0]
-    final_output: true
-    final_output_type: audio
+YOUR_TTS_PIPELINE = PipelineConfig(
+    model_type="your_model_name",
+    default_deploy_config_name="your_model_name.yaml",
+    model_arch="YourTTSModelForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="ar_stage",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            custom_process_next_stage_input_func=f"{_PROC}.ar2decoder",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.ar2decoder_async_chunk",
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="decoder",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            model_arch="YourTTSDecoder",
+            engine_output_type="audio",
+            final_output=True,
+            final_output_type="audio",
+        ),
+    ),
+)
 ```
 
-### Streaming mode (async_chunk)
-
-Add `async_chunk: true` at the top level and specify `custom_process_next_stage_input_func`
-on Stage 0 to define how intermediate outputs are chunked and forwarded:
+Register the pipeline in `vllm_omni/config/pipeline_registry.py`. Runtime
+placement and sizing belong in `vllm_omni/deploy/your_model_name.yaml`:
 
 ```yaml
-# stage_configs/your_model_name_async_chunk.yaml
-
 async_chunk: true
 
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: llm
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: ar_stage
-      max_num_seqs: 64
-      model_arch: YourTTSModelForConditionalGeneration
-      worker_type: ar
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      engine_output_type: latent
-      custom_process_next_stage_input_func: >
-        vllm_omni.model_executor.stage_input_processors.your_model_name.ar2decoder_async_chunk
+    devices: "0"
+    max_num_seqs: 64
     default_sampling_params:
       temperature: 0.9
       top_k: 50
       max_tokens: 2048
 
   - stage_id: 1
-    stage_type: llm
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: decoder
-      model_arch: YourTTSModelForConditionalGeneration
-      worker_type: generation
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      engine_output_type: audio
-    engine_input_source: [0]
-    final_output: true
-    final_output_type: audio
+    devices: "0"
+    max_num_seqs: 1
 ```
+
+Set `async_chunk: false` for end-to-end handoff. The registered pipeline
+selects the full-payload or async chunk processor; processor paths and topology
+must not be moved into the deploy YAML. Use `--deploy-config` to load a custom
+deployment overlay.
 
 ## Stage Input Processors
 
@@ -548,9 +528,9 @@ Understanding what's available in stage outputs:
 - `stage_list[source_id].engine_outputs` - list of `EngineCoreOutput` objects
 - Each `EngineCoreOutput` has `outputs` - list of `RequestOutput` objects
 - Each `RequestOutput` has:
-  - `token_ids` - generated token IDs
-  - `multimodal_output` - dict with keys matching your model's `OmniOutput.multimodal_outputs`
-  - `prompt_token_ids` - original prompt token IDs
+    - `token_ids` - generated token IDs
+    - `multimodal_output` - dict with keys matching your model's `OmniOutput.multimodal_outputs`
+    - `prompt_token_ids` - original prompt token IDs
 
 ### Batch mode (non-streaming)
 
@@ -630,6 +610,7 @@ def ar2decoder_async_chunk(
 ```
 
 Key points:
+
 - `transfer_manager` is the `OmniChunkTransferAdapter` that owns the chunk lifecycle
 - Each call appends one AR decode step's output; a chunk is emitted every `chunk_size` steps
 - The final (possibly partial) chunk is flushed when `is_finished` is true
@@ -673,99 +654,147 @@ down and spawn a new one mid-module. A few rules that save real CI debugging tim
 
 ## Online Serving Integration
 
-To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, add
-**all five** of the following integration points to
-`vllm_omni/entrypoints/openai/serving_speech.py` in a **single commit**. Adding them
-piecemeal causes partial-integration failures that are hard to debug.
+To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, write
+one adapter under `vllm_omni/entrypoints/openai/tts_adapters/`. The adapter declares
+how your model is recognized and owns its request handling; `serving_speech.py` should
+not need an edit.
 
-### 1. Stage constant
+### 1. Write the adapter
 
-Near the top of the file, alongside the other `_*_TTS_MODEL_STAGES` constants:
-
-```python
-_YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
-```
-
-### 2. Union into `_TTS_MODEL_STAGES`
-
-Add to the `_TTS_MODEL_STAGES` set union:
+Create `vllm_omni/entrypoints/openai/tts_adapters/your_model.py`:
 
 ```python
-_TTS_MODEL_STAGES: set[str] = (
-    ...
-    | _YOUR_MODEL_TTS_MODEL_STAGES
-)
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""YourModel serving adapter."""
+
+from typing import TYPE_CHECKING
+
+from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+
+@register_tts_adapter
+class YourModelAdapter(ARTTSAdapter):
+    # The registry key, and the model-type string used in logs.
+    name = "your_model"
+    # The engine ``model_stage`` value(s) your deployment yaml sets. Detection,
+    # stage discovery and `/v1/audio/speech` routing all derive from this.
+    stage_keys = frozenset({"your_model_stage_key"})
+
+    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Return an error string, or None if the request is valid."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
+
+    async def build(
+        self,
+        request: "OpenAICreateSpeechRequest",
+        sampling_params_list: list,
+        has_inline_ref_audio: bool,
+    ) -> PreparedRequest:
+        """Build the engine prompt and per-model parameters."""
+        params: dict[str, list] = {"text": [request.input]}
+        if request.voice is not None:
+            params["voice"] = [request.voice]
+        return PreparedRequest(
+            prompt={"prompt": request.input},
+            tts_params=params,
+            model_type=self.name,
+        )
 ```
 
-### 3. Model type detection
+Then add it to the import block at the bottom of
+`vllm_omni/entrypoints/openai/tts_adapters/__init__.py` so it registers on import.
+That import line is the only shared file a new model has to touch.
 
-In `_detect_tts_model_type()`, add before the final `return None`:
+> **Pure-diffusion TTS does not go through adapters yet.** When the server is built
+> by `OmniOpenAIServingSpeech.for_diffusion()`, `create_speech()` routes straight to
+> `_create_diffusion_speech()` and never calls `validate()` or `build()`.
+> `DiffusionTTSAdapter` is scaffolding for that migration and has no production
+> subclass today, so validation or prompt construction placed in one would silently
+> never run. If your model is served by the diffusion engine rather than
+> `engine_client`, follow the existing diffusion path and say so on #4855 — wiring
+> that path through the adapter layer is open work, not something to do inside a
+> new-model PR.
+
+### 2. If a stage key alone cannot identify your model
+
+Two escape hatches, in order of preference:
 
 ```python
-if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
-    return "your_model"
+# The architecture is authoritative (e.g. your model has no dedicated
+# model_stage value, or shares one with another model).
+model_archs = frozenset({"YourModelForConditionalGeneration"})
+
+# Set this too if your model owns NO stage key, so stage discovery has to find
+# your AR entry stage by architecture.
+arch_identifies_entry_stage = True
 ```
 
-### 4. Request validation dispatch
-
-In `_validate_tts_request()`, add before the fallback `return`:
+If your rule is not a set-membership test, override `matches()` — see
+`covo_audio.py`, which shares the generic `fused_thinker_talker` stage key with
+non-CoVo deployments and confirms with the architecture:
 
 ```python
-if self._tts_model_type == "your_model":
-    return self._validate_your_model_request(request)
+@classmethod
+def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
+    return super().matches(model_stage, model_arch) and bool(model_arch) and "CovoAudio" in model_arch
 ```
 
-### 5. Validation and parameter-builder methods
+If your model can match the same deployment as another adapter, give one of them an
+explicit `detect_priority` (lower runs first). `tests/entrypoints/openai_api/
+test_tts_detection.py` fails if two same-priority detectors can both match one input,
+so an unordered overlap cannot be merged.
 
-Add two new methods:
+Models that are speech-capable only in some deployment topologies override
+`stage_serves_speech()` — see `audex.py`, whose omni thinker is text-final unless the
+speech decoder is deployed alongside it.
 
-```python
-def _validate_your_model_request(
-    self, request: OpenAICreateSpeechRequest
-) -> str | None:
-    """Validate YourModel request. Returns an error string or None."""
-    if not request.input or not request.input.strip():
-        return "Input text cannot be empty"
-    return None
+### 3. Reuse the shared helpers
 
-def _build_your_model_params(
-    self, request: OpenAICreateSpeechRequest
-) -> dict[str, Any]:
-    """Build additional_information dict for YourModel."""
-    params: dict[str, Any] = {"text": [request.input]}
-    if request.voice is not None:
-        params["voice"] = [request.voice]
-    # Add any other model-specific fields here
-    return params
-```
+Adapters reach shared serving helpers through `self.ctx.server`: reference-audio
+resolution (`_resolve_ref_audio`), uploaded-speaker handling
+(`_apply_uploaded_speaker`), format validation (`_validate_ref_audio_format`), and
+prompt-length limits (`_max_instructions_length`). Read a comparable adapter before
+writing your own — `fish_speech.py` for voice cloning, `higgs_audio_v3.py` for
+parameter-heavy models, `moss_tts.py` for a family sharing one base class.
 
-Then wire `_build_your_model_params` into the request-dispatch block in
-`_create_tts_request()` (search for the equivalent `_build_*_params` call for an
-existing model to find the right location). If the model supports voice cloning
-(`ref_audio` → `prompt_audio_path`, `ref_text` → `prompt_text`), add those mappings
-here too — follow any existing `_build_<model>_params` in `serving_speech.py` (e.g.
-`_build_moss_tts_params` for the voice-cloning variant) for the pattern.
+### 4. Test it
 
-> **Two dispatch patterns coexist:** Fish Speech uses a `self._is_fish_speech` boolean
-> checked *before* `elif self._is_tts`. All newer models use the `_tts_model_type`
-> string pattern shown above. For new models, always use the string pattern — do not
-> add new `_is_*` boolean flags.
+`tests/entrypoints/openai_api/test_tts_adapter.py` covers registry invariants and
+`test_tts_detection.py` covers detection. Add your model to
+`EXPECTED_MODEL_TYPES` in the former, and a case to the latter if you added a
+`model_archs` or `matches()` rule.
 
-> **Note on unused variables:** Only extract parameters in `_build_your_model_params`
-> that you actually pass to the model's generate / `inference_stream` call. Extracting
-> a variable without forwarding it will trigger a `ruff F841` pre-commit failure.
+### Do not add branches to `serving_speech.py`
+
+Older models predate the adapter framework and still have per-model branches in
+`serving_speech.py`; they are being migrated out (RFC #4327, #4855). Do not copy
+that pattern. `tools/pre_commit/check_tts_adapter.py` is a ratchet on the remaining
+`self._tts_model_type == ...` comparisons and fails the commit if the count grows.
+
+If your model genuinely needs behaviour that no adapter hook can express, that is a
+missing hook — propose it on the RFC rather than adding a branch.
 
 ### Merge conflicts
 
-`serving_speech.py` is modified by every new model PR and is the most common source of
-rebase conflicts. When rebasing onto `main` and a conflict appears here, the resolution
-is always to **keep both** the upstream model's additions and your own — never discard
-either side. After resolving:
+Your adapter is a new file, so it cannot conflict. The one shared line is your entry
+in the import block at the bottom of `tts_adapters/__init__.py`, which conflicts only
+when another model lands at the same time. The resolution is always to **keep both**
+imports — never discard either side. After resolving:
 
 ```bash
-git add vllm_omni/entrypoints/openai/serving_speech.py
+git add vllm_omni/entrypoints/openai/tts_adapters/__init__.py
 git rebase --continue
 ```
+
+If you find yourself resolving a conflict inside `serving_speech.py`, something in
+your model is still going through the legacy path; see the note above.
 
 ## Single-Stage Models
 
@@ -775,7 +804,7 @@ directly from the model's own generator.
 
 ### Directory structure
 
-```
+```text
 vllm_omni/model_executor/models/your_model_name/
     __init__.py
     modeling_your_model_name.py    # unified class: load_weights + forward + streaming
@@ -786,32 +815,40 @@ vllm_omni/deploy/your_model_name.yaml
 
 No stage input processor is needed.
 
-### Stage config
+### Pipeline and deploy config
 
-Use a single stage with `worker_type: ar`. The `is_comprehension: true` field and the
-top-level `async_chunk: false` are required — omitting them causes silent
-misclassification in the serving layer. Set `max_num_seqs` to at least 4 for
-concurrent production use.
+Use a single `LLM_AR` stage that owns the tokenizer and produces final audio:
+
+```python
+YOUR_TTS_PIPELINE = PipelineConfig(
+    model_type="your_model_name",
+    default_deploy_config_name="your_model_name.yaml",
+    model_arch="YourModelForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="your_model_stage_key",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="audio",
+            final_output=True,
+            final_output_type="audio",
+        ),
+    ),
+)
+```
+
+The deploy YAML controls runtime behavior. Set `max_num_seqs` to at least 4
+for concurrent production use:
 
 ```yaml
-# stage_configs/your_model_name.yaml
 async_chunk: false
 
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: llm
-    is_comprehension: true          # required for serving_speech.py dispatch
-    runtime:
-      devices: "0"
-    engine_args:
-      model_stage: your_model_stage_key
-      model_arch: YourModelForCausalLM
-      worker_type: ar
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      engine_output_type: audio
-      max_num_seqs: 4               # min 4 for concurrent requests; default 1 causes gaps
-    final_output: true
-    final_output_type: audio
+    devices: "0"
+    max_num_seqs: 4
 ```
 
 ### Generator-based streaming pattern
@@ -915,10 +952,17 @@ is correct. Stage the modified files and commit again — do not revert the chan
 Common failures and fixes:
 
 | Check | Cause | Fix |
-|-------|-------|-----|
+| ------- | ------- | ----- |
 | `ruff F841` | Local variable assigned but never used | Remove the extraction or forward it to the model call |
 | `ruff E402` | Module-level import not at top of file | Move import to the top-level import block |
 | `ruff format` | Line length, spacing, or quote style | Accept the auto-fix, stage, and re-commit |
+| `check-spdx-header` | Missing header, or copyright still says `vLLM project` | Use `Copyright contributors to the vLLM-Omni project`; restage the rewrite |
+| `check-forbidden-imports` | Stdlib `re`/`base64`, pickle, Hugging Face Hub API, or direct Triton/TileLang | `import regex as re` and `pybase64`; do not grow the allowlist without review |
+| `check-torch-cuda-call` | New `torch.cuda.*` call site | Use `current_omni_platform`; do not grow `ALLOWED_FILES` without review |
+| `check-tts-adapter-migration` | New `_tts_model_type` branch in `serving_speech.py` | Put logic in `tts_adapters/`; lower `MAX_MODEL_TYPE_BRANCHES` when removing branches |
+| `check-test-ci-coverage` | Test file missing level or hardware mark | Add `core_model`/… plus `cpu`/`cuda`/`hardware_test(` |
+| `shellcheck` | Native `shellcheck` missing, or script warning | Install via apt/dnf/brew (or `shellcheck.exe` on Windows). See [Linting](../README.md#linting) |
+| `mypy-3.10` / `markdownlint-cli2` / `check-buildkite` | Types, docs markdown, or Buildkite YAML | See [Linting](../README.md#linting) |
 
 ### DCO sign-off
 
@@ -973,7 +1017,7 @@ Adding a TTS model to vLLM-Omni involves:
 ### Qwen3-TTS Reference Files
 
 | File | Purpose |
-|------|---------|
+| ------ | --------- |
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | AR stage with vLLM fused ops |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Decoder stage with `chunked_decode_streaming()` |
@@ -985,4 +1029,4 @@ For more information, see:
 
 - [Architecture Overview](../../design/architecture_overview.md)
 - [Async Chunk Design](../../design/feature/async_chunk.md)
-- [Stage Configuration Guide](../../configuration/stage_configs.md)
+- [Pipeline and Deploy Configuration Guide](../../configuration/stage_configs.md)

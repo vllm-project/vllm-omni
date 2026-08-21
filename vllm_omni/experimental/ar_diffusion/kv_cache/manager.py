@@ -174,6 +174,7 @@ class ARDiffusionKVCache:
         device: torch.device | None = None,
         frames_per_block: int = 1,
         max_scratch_tokens_per_branch: int = 0,
+        model_owned_state_bytes_per_session: int = 0,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -197,13 +198,17 @@ class ARDiffusionKVCache:
 
         self.config = config
         self.kv_branches = kv_branches
-        self.session_capacity = session_capacity
+        self.requested_session_capacity = session_capacity
         self._kv_branch_local_indices = {kv_branch.name: kv_branch.local_index for kv_branch in kv_branches}
         self.num_local_kv_branches = max(local_indices) + 1
         if frames_per_block <= 0:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
         if max_scratch_tokens_per_branch < 0:
             raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
+        if model_owned_state_bytes_per_session < 0:
+            raise ValueError(
+                f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
+            )
         self.frames_per_block = int(frames_per_block)
         self.block_size = block_size
         self.num_layers = num_layers
@@ -217,27 +222,10 @@ class ARDiffusionKVCache:
         self.device = device or torch.device("cpu")
         self._allocate_tensors = device is not None
         self._adapters: dict[str, ARDiffusionRequestAdapter] = {}
-
-        # Named cross-attention K/V is allocated lazily per session and released
-        # with that session. Reserve its worst-case capacity when sizing the
-        # paged self-attention pool so the two stores share one memory budget.
         self._cross_sessions: dict[
             str,
             dict[str, dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]],
         ] = {}
-
-        def _cross_pool_bytes(length: int) -> int:
-            return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
-
-        cross_bytes_per_session = sum(_cross_pool_bytes(length) for length in self.cross_attention_lengths.values())
-        cross_total_bytes = cross_bytes_per_session * session_capacity
-        if cross_total_bytes:
-            _log.info(
-                "AR-Diffusion cross-attn reservation: %.1f MiB/session × %d sessions = %.1f MiB",
-                cross_bytes_per_session / (1024 * 1024),
-                session_capacity,
-                cross_total_bytes / (1024 * 1024),
-            )
 
         self.spec = ChunkWindowSpec(
             block_size=block_size,
@@ -250,41 +238,7 @@ class ARDiffusionKVCache:
             sink_chunks=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
         )
-        # Each pool block spans all layers' K/V, so size against the per-layer
-        # page size times the layer count.
-        # Size the self-attn pool against memory reserved for the maximum number
-        # of lazily allocated cross-attention sessions.
-        num_blocks = compute_num_blocks(
-            max(0, available_bytes - cross_total_bytes),
-            config.gpu_memory_fraction,
-            self.spec.page_size_bytes * num_layers,
-        )
-        # Floor: one forward needs the resident window plus the in-flight chunk
-        # (frames_per_block frame-blocks) for every KV branch THIS rank runs,
-        # with a little eviction-transient headroom. The memory-fraction
-        # heuristic can under-size this once block_size grows — e.g. frame-granular
-        # paging at the true frame_seqlen makes each block larger and the pool
-        # fewer-blocks — so guarantee the minimum the rollout cannot run without,
-        # otherwise allocate_chunk hits an exhausted pool mid-forward.
-        resident_blocks = config.sink_chunks + config.window_chunks
-        min_blocks = self.num_local_kv_branches * (resident_blocks + self.frames_per_block) + 2
-        if num_blocks < min_blocks:
-            _log.warning(
-                "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
-                "floor (%d local KV branch(es) x (sink_chunks=%d + window_chunks=%d "
-                "+ frames_per_block=%d) + 2 headroom)",
-                num_blocks,
-                min_blocks,
-                self.num_local_kv_branches,
-                config.sink_chunks,
-                config.window_chunks,
-                self.frames_per_block,
-            )
-            num_blocks = min_blocks
-        layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
-        self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
-        self.managed_num_blocks = num_blocks
-        self.num_blocks = num_blocks
+
         # Scratch blocks are outside KVCacheManager ownership. A non-committing
         # forward needs one block per current frame plus space for any
         # model-declared action/state tokens that coexist with video KV.
@@ -297,6 +251,101 @@ class ARDiffusionKVCache:
         scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
         self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
         self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
+
+        # The self-attention pool, scratch pool, and lazily materialized
+        # cross-attention caches share one hard memory budget. Select the largest
+        # feasible resident-session count rather than raising a block-count floor
+        # past that budget. All resident sessions need a complete sink + window;
+        # only one request can be in flight, so frames_per_block is counted once.
+        page_size_bytes = self.spec.page_size_bytes * num_layers
+        self.available_memory_bytes = available_bytes
+        self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
+        # Reuse the public helper's validation for the memory fraction/page size.
+        compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
+        self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
+        self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
+
+        def _cross_pool_bytes(length: int) -> int:
+            return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
+
+        self.cross_attention_bytes_per_session = sum(
+            _cross_pool_bytes(length) for length in self.cross_attention_lengths.values()
+        )
+
+        def _required_managed_blocks(capacity: int) -> int:
+            resident_per_session = config.sink_chunks + config.window_chunks
+            return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
+
+        def _required_bytes(capacity: int) -> int:
+            return (
+                self.scratch_reserved_bytes
+                + capacity * self.cross_attention_bytes_per_session
+                + capacity * self.model_owned_state_bytes_per_session
+                + _required_managed_blocks(capacity) * page_size_bytes
+            )
+
+        one_session_bytes = _required_bytes(1)
+        if one_session_bytes > available_bytes:
+            raise ValueError(
+                "AR-Diffusion available device memory cannot fit one session: "
+                f"available={available_bytes} bytes, required={one_session_bytes} bytes "
+                "(managed self-attention + cross-attention + scratch + model-owned state)."
+            )
+        self.memory_budget_bytes = max(self.configured_memory_budget_bytes, one_session_bytes)
+        if self.memory_budget_bytes > self.configured_memory_budget_bytes:
+            _log.warning(
+                "AR-Diffusion raised the configured memory budget from %d to %d bytes "
+                "to admit one session that fits actual free device memory",
+                self.configured_memory_budget_bytes,
+                self.memory_budget_bytes,
+            )
+
+        effective_capacity = 0
+        required_managed_blocks = 0
+        for candidate in range(session_capacity, 0, -1):
+            candidate_managed_blocks = _required_managed_blocks(candidate)
+            if _required_bytes(candidate) <= self.memory_budget_bytes:
+                effective_capacity = candidate
+                required_managed_blocks = candidate_managed_blocks
+                break
+        assert effective_capacity > 0
+
+        self.session_capacity = effective_capacity
+        self.cross_attention_reserved_bytes = self.cross_attention_bytes_per_session * effective_capacity
+        self.model_owned_state_reserved_bytes = self.model_owned_state_bytes_per_session * effective_capacity
+        self_attn_budget_bytes = (
+            self.memory_budget_bytes
+            - self.scratch_reserved_bytes
+            - self.cross_attention_reserved_bytes
+            - self.model_owned_state_reserved_bytes
+        )
+        num_blocks = self_attn_budget_bytes // page_size_bytes
+        assert num_blocks >= required_managed_blocks
+        if effective_capacity < session_capacity:
+            _log.warning(
+                "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",
+                session_capacity,
+                effective_capacity,
+            )
+        if self.cross_attention_reserved_bytes:
+            _log.info(
+                "AR-Diffusion cross-attn reservation: %.1f MiB/session × %d sessions = %.1f MiB",
+                self.cross_attention_bytes_per_session / (1024 * 1024),
+                effective_capacity,
+                self.cross_attention_reserved_bytes / (1024 * 1024),
+            )
+        if self.model_owned_state_reserved_bytes:
+            _log.info(
+                "AR-Diffusion model-owned state reservation: %.1f MiB/session × %d sessions = %.1f MiB",
+                self.model_owned_state_bytes_per_session / (1024 * 1024),
+                effective_capacity,
+                self.model_owned_state_reserved_bytes / (1024 * 1024),
+            )
+
+        layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
+        self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
+        self.managed_num_blocks = num_blocks
+        self.num_blocks = num_blocks
         self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
@@ -561,6 +610,11 @@ class ARDiffusionKVCache:
         """
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
+        self.manager.remove_skipped_blocks(
+            adapter.request_id,
+            adapter.num_computed_tokens,
+            num_prompt_tokens=adapter.num_prompt_tokens,
+        )
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access --------------------------------------------

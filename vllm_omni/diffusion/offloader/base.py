@@ -27,8 +27,10 @@ class OffloadConfig:
     pin_cpu_memory: bool = True
     use_hsdp: bool = False
     dp_size: int = 1  # derived from parallel_config, not user-configurable
-    dlo_use_allgather: bool = True  # if True: shard + AllGather; if False: full weights H2D only
-    model_path: str | None = None  # checkpoint path for mmap weight loading
+    # True: add DP sharding + AllGather. False: stream complete rank-local
+    # blocks from the loader-selected host backing with H2D only.
+    dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0  # leading DiT layers kept on device
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -55,13 +57,12 @@ class OffloadConfig:
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
-
         # Derive dp_size from parallel_config — not user-configurable.
         # The offload adapts to whatever DP/SP is already configured.
         dp_size = 1
         if parallel_config is not None:
             dp_size = getattr(parallel_config, "data_parallel_size", 1)
-            # HSDP's fully_shard_degree also contributes to effective DP
+            # HSDP shard and replica sizes determine the effective group size.
             hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
             hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
             if use_hsdp and hsdp_shard_size > 0:
@@ -94,17 +95,27 @@ class OffloadConfig:
         else:
             strategy = OffloadStrategy.NONE
 
-        # When dlo_use_allgather=False, each rank loads full weights (no sharding,
-        # no AllGather).  This avoids AllGather synchronization requirements
-        # (concurrent requests, dummy run skip) at the cost of N× CPU memory.
+        # With dlo_use_allgather=False, do not add another DP shard. Each rank
+        # streams the tensors produced by the standard loader, which may
+        # already be TP-local shards. This avoids AllGather synchronization
+        # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
+        dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        if dlo_resident_layers < 0:
+            raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
+        if dlo_resident_layers and dlo_use_allgather:
+            raise ValueError(
+                "dlo_resident_layers currently requires --dlo-no-use-allgather so "
+                "resident blocks use weights prepared by the standard TP-aware loader"
+            )
 
         # If dlo_use_allgather=False, force dp_size=1 (each rank independent)
         if enable_distributed_layerwise_offload and not dlo_use_allgather:
             dp_size = 1
             logger.info(
                 "Distributed layerwise offload: dlo_use_allgather=False, "
-                "each rank loads full weights (no shard, no AllGather)"
+                "streaming complete rank-local blocks (no DLO shard or AllGather); "
+                "the backend will select mmap or standard-loader host storage"
             )
 
         # HSDP already shards parameters into DTensors.  Running distributed
@@ -114,8 +125,8 @@ class OffloadConfig:
             raise ValueError(
                 "Distributed layerwise offload with AllGather is incompatible with "
                 "HSDP: HSDP parameters are already sharded DTensors, and the offloader "
-                "would double-shard them. Use --dlo-no-use-allgather (full weights per "
-                "rank) or disable HSDP."
+                "would double-shard them. Use --dlo-no-use-allgather (standard-loader "
+                "rank-local weights) or disable HSDP."
             )
 
         return cls(
@@ -124,7 +135,7 @@ class OffloadConfig:
             use_hsdp=use_hsdp,
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
-            model_path=getattr(od_config, "model", None),
+            dlo_resident_layers=dlo_resident_layers,
         )
 
 

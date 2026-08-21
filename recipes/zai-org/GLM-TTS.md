@@ -44,20 +44,20 @@ conditioned on reference audio and its transcript.
 Start the server from the repository root:
 
 ```bash
-vllm-omni serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
 ```
 
 Async chunking is enabled by default in the bundled deployment config. For
 the sync (non-streaming) path:
 
 ```bash
-vllm-omni serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091 --no-async-chunk
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091 --no-async-chunk
 ```
 
 Use a custom deploy config for advanced cases:
 
 ```bash
-vllm-omni serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091 \
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091 \
   --deploy-config /path/to/your_glm_tts_overrides.yaml
 ```
 

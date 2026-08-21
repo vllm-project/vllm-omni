@@ -79,6 +79,13 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+# ResBlock is platform-dispatched in the layers package __init__: CUDA gets
+# fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
+# PyTorch block. UNetDown and UNetUp below instantiate whichever one this
+# resolves to.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
+from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 from vllm_omni.platforms import current_omni_platform
@@ -169,44 +176,6 @@ def real_batched_index_select(t, dim, idx):
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
     assert len(t) == len(idx), f"{len(t)=} != {len(idx)=}"
     return torch.stack([torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))])
-
-
-def conv_nd(dims, *args, **kwargs):  # noqa: N802
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def normalization(channels, **kwargs):
-    """
-    Make a standard normalization layer.
-    :param channels: number of input channels.
-    :return: a nn.Module for normalization.
-    """
-    return nn.GroupNorm(32, channels, **kwargs)
-
-
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Linear(*args, **kwargs)
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
 
 
 def _to_tuple(x, dim=2):
@@ -915,7 +884,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -934,6 +903,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -955,6 +925,10 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            paged_kv_cache_role="primary",
+            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
+            # bfloat16 autocast, independent of the weight-loading dtype.
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     @staticmethod
@@ -1097,7 +1071,7 @@ class ImageKVCacheManager:
         )
         return key, value
 
-    def __call__(
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -2174,8 +2148,10 @@ class HunyuanImage3Model(nn.Module):
             "timestep_emb",
             "time_embed",
             "time_embed_2",
-            # Note: guidance_emb and timestep_r_emb are removed from skip list
-            # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
+            # These embeddings belong to the outer pipeline model rather than
+            # this transformer core and are loaded by the outer weight loader.
+            "guidance_emb",
+            "timestep_r_emb",
         ]
 
         def contains_unexpected_keyword(name, keywords):
@@ -2732,6 +2708,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "position_ids",
             "image_mask",
             "gen_timestep_scatter_index",
+            "guidance_scatter_index",
+            "timesteps_r_scatter_index",
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
@@ -2902,9 +2880,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
 
-        # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
+        # Shift generated-image placeholder indices to match the truncated sequence.
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        for key in ("guidance_scatter_index", "timesteps_r_scatter_index"):
+            if model_kwargs.get(key) is not None:
+                model_kwargs[key] = model_kwargs[key] - positive_reuse_len
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -3315,99 +3296,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-class ResBlock(nn.Module):
-    r"""
-    A residual block that can optionally change the number of channels.
-
-    Args:
-        in_channels (`int`):
-            The number of input channels.
-        emb_channels (`int`):
-            The number of timestep embedding channels.
-        dropout (`float`):
-            The rate of dropout.
-        out_channels (`int`, *optional*):
-            If specified, the number of output channels.
-        use_conv (`bool`, *optional*):
-            If True and out_channels is specified, use a spatial convolution instead of a
-            smaller 1x1 convolution to change the channels in the skip connection.
-        dims (`int`, *optional*):
-            Determines if the signal is 1D, 2D, or 3D.
-        up (`bool`, *optional*):
-            If True, use this block for upsampling.
-        down (`bool`, *optional*):
-            If True, use this block for downsampling.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        emb_channels,
-        out_channels=None,
-        dropout=0.0,
-        use_conv=False,
-        dims=2,
-        up=False,
-        down=False,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"dtype": dtype, "device": device}
-        super().__init__()
-        self.in_channels = in_channels
-        self.dropout = dropout
-        self.out_channels = out_channels or self.in_channels
-        self.use_conv = use_conv
-
-        self.in_layers = nn.Sequential(
-            normalization(self.in_channels, **factory_kwargs),
-            nn.SiLU(),
-            conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),  # noqa: N802
-        )
-
-        self.updown = up or down
-        self.h_upd = self.x_upd = nn.Identity()
-
-        self.emb_layers = nn.Sequential(nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs))
-
-        self.out_layers = nn.Sequential(
-            normalization(self.out_channels, **factory_kwargs),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)),  # noqa: N802
-        )
-
-        if self.out_channels == self.in_channels:
-            self.skip_connection = nn.Identity()
-        elif use_conv:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs)  # noqa: N802
-        else:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)  # noqa: N802
-
-    def forward(self, x, emb) -> torch.Tensor:
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
-        else:
-            h = self.in_layers(x)
-
-        emb_out = self.emb_layers(emb)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-
-        # Adaptive Group Normalization
-        out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-        scale, shift = torch.chunk(emb_out, 2, dim=1)
-        h = out_norm(h) * (1.0 + scale) + shift
-        h = out_rest(h)
-
-        return self.skip_connection(x) + h
 
 
 class UNetDown(nn.Module):

@@ -30,9 +30,12 @@ def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
+        # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
+        # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
         yield SimpleNamespace(
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
+            total_consumed=torch_peak + non_torch,
         )
 
     return _mp

@@ -2,14 +2,120 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
+import base64
+from io import BytesIO
+
+import httpx
 import numpy as np
 import pytest
 import torch
+from PIL import Image
+from vllm import envs
 
 from vllm_omni.diffusion.postprocess import rife_interpolator
 from vllm_omni.entrypoints.openai import video_api_utils
+from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _png_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (2, 1), color=(12, 34, 56)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _install_http_transport(monkeypatch, handler, client_kwargs):
+    async_client = httpx.AsyncClient
+
+    def _client_factory(*args, **kwargs):
+        client_kwargs.append(kwargs.copy())
+        return async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
+    requested_paths = []
+    client_kwargs = []
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/redirect.png":
+            return httpx.Response(302, headers={"location": "/image.png"})
+        return httpx.Response(200, content=_png_bytes(), headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    image = await video_api_utils.decode_image_url("https://example.com/redirect.png")
+
+    assert image.size == (2, 1)
+    assert image.mode == "RGB"
+    assert requested_paths == ["/redirect.png", "/image.png"]
+    assert client_kwargs == [{"timeout": 60, "follow_redirects": True}]
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
+    requested_paths = []
+    client_kwargs = []
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        return httpx.Response(302, headers={"location": "/image.png"})
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", False)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="redirect.*VLLM_MEDIA_URL_ALLOW_REDIRECTS"):
+        await video_api_utils.decode_image_url("https://example.com/redirect.png")
+
+    assert requested_paths == ["/redirect.png"]
+    assert client_kwargs == [{"timeout": 60, "follow_redirects": False}]
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_reports_http_status(monkeypatch):
+    client_kwargs = []
+
+    def _handler(request):
+        return httpx.Response(404)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="server returned HTTP 404"):
+        await video_api_utils.decode_image_url("https://example.com/missing.png")
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_reports_connection_failure(monkeypatch):
+    client_kwargs = []
+
+    def _handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    _install_http_transport(monkeypatch, _handler, client_kwargs)
+
+    with pytest.raises(InvalidInputReferenceError, match="failed to download image"):
+        await video_api_utils.decode_image_url("https://example.com/unreachable.png")
+
+
+@pytest.mark.asyncio
+async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
+    def _unexpected_http_client(*args, **kwargs):
+        pytest.fail("data URLs must not create an HTTP client")
+
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _unexpected_http_client)
+    encoded_image = base64.b64encode(_png_bytes()).decode()
+
+    image = await video_api_utils.decode_image_url(f"data:image/png;base64,{encoded_image}")
+
+    assert image.size == (2, 1)
+    assert image.mode == "RGB"
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
@@ -46,6 +152,52 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["frames"].dtype == np.uint8
     assert mux_calls[0]["fps"] == 8.0
     assert mux_calls[0]["audio"] is None
+
+
+def test_float_frames_are_converted_without_stacking_full_video(monkeypatch):
+    frame = np.array(
+        [
+            [[0.0, 0.5, 1.0, 0.2], [1.5, -0.5, 0.5, 0.8]],
+        ],
+        dtype=np.float32,
+    )
+    original = frame.copy()
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("float video conversion must not stack all frames")
+
+    monkeypatch.setattr(video_api_utils.np, "stack", fail_stack)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames([frame, frame])
+
+    expected = np.array([[[128, 191, 255], [255, 64, 191]]], dtype=np.uint8)
+    assert frames.flags.c_contiguous
+    np.testing.assert_array_equal(frames, np.array([expected, expected]))
+    np.testing.assert_array_equal(frame, original)
+
+
+def test_two_dimensional_width_four_frames_are_not_treated_as_rgba():
+    frame = np.arange(8, dtype=np.float32).reshape(2, 4) / 8
+
+    frames = video_api_utils._coerce_video_to_uint8_frames([frame, frame])
+
+    expected = np.rint(frame * 255).astype(np.uint8)
+    assert frames.shape == (2, 2, 4)
+    np.testing.assert_array_equal(frames, np.stack([expected, expected]))
+
+
+def test_mixed_float_dtypes_preserve_stacked_rounding_semantics():
+    frames = [
+        np.full((1, 1, 3), 0.1, dtype=np.float16),
+        np.full((1, 1, 3), 0.2, dtype=np.float32),
+    ]
+    stacked = np.stack(frames)
+    expected = np.rint(np.clip(stacked, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    actual = video_api_utils._coerce_video_to_uint8_frames(frames)
+
+    assert expected[0, 0, 0, 0] == 25
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("frame_count", [3, 4])
