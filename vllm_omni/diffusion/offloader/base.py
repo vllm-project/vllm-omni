@@ -4,6 +4,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -12,6 +13,26 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+@runtime_checkable
+class SupportsModelCpuOffload(Protocol):
+    """Pipeline-owned lifecycle for model-level CPU offload.
+
+    Pipelines with non-forward component entry points (for example VAE
+    ``decode_latent`` methods) need to activate those stages explicitly, so
+    generic forward-hook discovery cannot manage their full lifecycle.
+    """
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None: ...
+
+    def disable_omni_model_cpu_offload(self) -> None: ...
 
 
 class OffloadStrategy(Enum):
