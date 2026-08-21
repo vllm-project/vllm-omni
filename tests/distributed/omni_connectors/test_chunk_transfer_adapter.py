@@ -3,8 +3,8 @@
 
 import threading
 from collections import deque
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -13,6 +13,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
@@ -32,9 +33,14 @@ class DummyWaitingQueue(list):
     def add_request(self, request):
         self.append(request)
 
+    def remove_requests(self, requests):
+        remove = set(requests)
+        self[:] = [request for request in self if request not in remove]
+
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
-    return SimpleNamespace(
+    request = Mock(
+        client_index=0,
         request_id=req_id,
         external_req_id=external_req_id or req_id,
         status=status,
@@ -44,8 +50,10 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,
-        is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
+        resumable=False,
     )
+    request.is_finished = lambda: RequestStatus.is_finished(request.status)
+    return request
 
 
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
@@ -198,6 +206,55 @@ def test_load_poll(build_adapter):
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-replace", RequestStatus.RUNNING, external_req_id="external-replace")
+    request.resumable = True
+    request.prompt_token_ids = [0] * 4
+    request._all_token_ids = [0] * 4
+    request._output_token_ids = []
+    request.num_prompt_tokens = 4
+    request.num_computed_tokens = 4
+    request.update_block_hashes = Mock()
+    adapter.get_req_chunk[request.request_id] = 1
+    adapter.requests_num_chunks_sent[request.external_req_id] = 4
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "next_stage_prompt_len": 10,
+                "replace_streaming_prompt": True,
+                "finished": False,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 10
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
+
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    waiting_queue = DummyWaitingQueue()
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert running_queue == []
+    assert waiting_queue == [request]
+    assert request.status == RequestStatus.WAITING
+
+    adapter.requests_num_chunks_sent[request.external_req_id] = 9
+    adapter.postprocess_scheduler_output(
+        SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        )
+    )
+    assert request.request_id not in adapter.replaced_streaming_prompt_ids
+    assert request.external_req_id not in adapter.requests_num_chunks_sent
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
@@ -563,6 +620,92 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
     assert "req-non-ar" in adapter.upstream_exhausted_requests
+
+
+def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-marker", RequestStatus.WAITING, external_req_id="external-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "codes": {
+                "audio": torch.tensor([7, 8], dtype=torch.long),
+                "ref": torch.tensor([0.1, -0.1]),
+            },
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "request_finished": torch.tensor(False, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [7, 8]
+    assert "audio" not in request.additional_information["codes"]
+    torch.testing.assert_close(
+        request.additional_information["codes"]["ref"],
+        torch.tensor([0.1, -0.1]),
+    )
+    assert not {"cache_epoch", "chunk_seq", "last_chunk"}.intersection(request.additional_information["meta"])
+    assert request.request_id in adapter.segment_finished_requests
+
+
+def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-empty-marker", RequestStatus.WAITING, external_req_id="external-empty-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [0]
+    assert "codes" not in request.additional_information
+    assert request.additional_information["meta"]["replace_runtime_additional_information"] is True
+    assert request.request_id in adapter.segment_finished_requests
+    assert request.request_id in adapter._finished_load_reqs
+
+
+def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-incremental", RequestStatus.WAITING, external_req_id="external-incremental")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 2},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "phase": "decode",
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is False
+
+    assert torch.equal(request.additional_information["codes"]["audio"], torch.tensor([1, 2]))
+    assert request.additional_information["meta"]["cache_epoch"] == 3
+    assert request.additional_information["meta"]["chunk_seq"] == 2
+    assert request.additional_information["meta"]["phase"] == "decode"
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
@@ -1006,12 +1149,30 @@ def test_finish_requests_restores_status(build_adapter):
     prior = RequestStatus.RUNNING
     request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
     adapter.requests_origin_status[req_id] = prior
+    adapter.waiting_for_chunk_running_requests.append(request)
     requests_map = {req_id: request}
 
     adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
 
     assert request.status == prior
     assert req_id not in adapter.requests_origin_status
+    assert not adapter.waiting_for_chunk_running_requests
+
+
+def test_finish_requests_does_not_restore_stale_status_without_connector_ownership(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-restored", RequestStatus.WAITING_FOR_STREAMING_REQ)
+    request.resumable = True
+    adapter.requests_origin_status[request.request_id] = RequestStatus.RUNNING
+
+    adapter.finish_requests(
+        [request.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {request.request_id: request},
+    )
+
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.request_id not in adapter.requests_origin_status
 
 
 def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter):
@@ -1059,6 +1220,108 @@ def test_finish_requests_releases_active_stream_slot(build_adapter):
     assert [request.request_id for request in adapter._held_non_active] == []
     assert list(adapter._active_streams) == [waiting.request_id]
     assert waiting.status == RequestStatus.WAITING_FOR_CHUNK
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniGenerationScheduler, OmniARScheduler])
+@pytest.mark.parametrize(
+    ("placement", "origin_status", "initial_status", "streaming_counter_owned"),
+    [
+        ("hidden", RequestStatus.RUNNING, RequestStatus.FINISHED_STOPPED, False),
+        ("running", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, False),
+        ("waiting", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, False),
+        ("skipped", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, True),
+        ("skipped_streaming", RequestStatus.RUNNING, RequestStatus.WAITING_FOR_STREAMING_REQ, True),
+        ("skipped_hidden", RequestStatus.RUNNING, RequestStatus.FINISHED_STOPPED, True),
+        ("skipped_non_streaming", RequestStatus.WAITING, RequestStatus.WAITING, False),
+    ],
+)
+def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
+    build_adapter,
+    scheduler_cls,
+    placement,
+    origin_status,
+    initial_status,
+    streaming_counter_owned,
+):
+    adapter, _ = build_adapter(stage_id=1, active_stream_window=2)
+    request = _req(
+        "req-segment-stop",
+        initial_status,
+        external_req_id="ext-segment-stop",
+    )
+    request.resumable = True
+    adapter.requests_origin_status[request.request_id] = origin_status
+    if placement in {"hidden", "skipped_hidden"}:
+        adapter.waiting_for_chunk_running_requests.append(request)
+    adapter._active_streams[request.request_id] = request
+
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request] if placement == "running" else []
+    scheduler.waiting = DummyWaitingQueue([request] if placement == "waiting" else [])
+    scheduler.skipped_waiting = DummyWaitingQueue([request] if placement.startswith("skipped") else [])
+    scheduler.num_waiting_for_streaming_input = int(streaming_counter_owned)
+
+    freed = []
+
+    def fake_free_request(self, live, delay_free_blocks=False):
+        del delay_free_blocks
+        freed.append(live.request_id)
+        self.requests.pop(live.request_id)
+        return None, None
+
+    scheduler._free_request = MethodType(fake_free_request, scheduler)
+
+    first = scheduler_cls.finish_requests(scheduler, [request.request_id], RequestStatus.FINISHED_ABORTED)
+    second = scheduler_cls.finish_requests(scheduler, [request.request_id], RequestStatus.FINISHED_ABORTED)
+
+    assert len(first) == 1
+    assert second == []
+    assert freed == [request.request_id]
+    assert request.request_id not in scheduler.requests
+    assert request.request_id not in adapter._active_streams
+    assert not adapter.waiting_for_chunk_running_requests
+    assert scheduler.running == []
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.skipped_waiting) == []
+    assert scheduler.num_waiting_for_streaming_input == 0
+
+    fresh_a = _req("req-fresh-a", RequestStatus.WAITING)
+    fresh_b = _req("req-fresh-b", RequestStatus.WAITING)
+    assert adapter._ensure_active_stream(fresh_a)
+    assert adapter._ensure_active_stream(fresh_b)
+    assert set(adapter._active_streams) == {fresh_a.request_id, fresh_b.request_id}
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniGenerationScheduler, OmniARScheduler])
+def test_finish_requests_does_not_reopen_off_queue_resumable_segment(build_adapter, scheduler_cls):
+    adapter, _ = build_adapter(stage_id=1, active_stream_window=2)
+    request = _req("req-off-queue", RequestStatus.FINISHED_STOPPED)
+    request.resumable = True
+    adapter.requests_origin_status[request.request_id] = RequestStatus.RUNNING
+
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = []
+    scheduler.waiting = DummyWaitingQueue()
+    scheduler.skipped_waiting = DummyWaitingQueue()
+    scheduler._free_request = lambda *args, **kwargs: pytest.fail("off-queue request was freed")
+
+    assert (
+        scheduler_cls.finish_requests(
+            scheduler,
+            [request.request_id],
+            RequestStatus.FINISHED_ABORTED,
+        )
+        == []
+    )
+    assert scheduler.requests == {request.request_id: request}
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert request.request_id not in adapter.requests_origin_status
 
 
 def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):

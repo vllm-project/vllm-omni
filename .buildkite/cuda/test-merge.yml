@@ -119,6 +119,8 @@ steps:
         source_file_dependencies:
           - tests/e2e/offline_inference/test_qwen3_omni.py
           - tests/e2e/online_serving/test_qwen3_omni.py
+          - tests/helpers/runtime.py
+          - vllm_omni/entrypoints/openai/serving_chat.py
           - vllm_omni/model_executor/models/qwen3_omni/
           - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
           - vllm_omni/model_executor/models/common/snake_activation.py

@@ -141,6 +141,7 @@ class OmniModelConfig(ModelConfig):
         }
     )
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None

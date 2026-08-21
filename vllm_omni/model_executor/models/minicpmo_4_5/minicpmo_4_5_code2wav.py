@@ -69,6 +69,17 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
 # OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
 # override). A step carrying only these has no producer payload at all.
 _RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+_PRODUCER_META_KEYS = frozenset(
+    {
+        "cache_epoch",
+        "chunk_seq",
+        "code_flat_numel",
+        "last_chunk",
+        "prompt_cache_id",
+        "prompt_wav",
+        "ref_audio_sr",
+    }
+)
 
 
 def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
@@ -77,9 +88,12 @@ def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> 
     Any real async-chunk payload brings producer metadata along, whether the
     transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
     """
+    codes = info.get("codes")
+    if isinstance(codes, Mapping) and any(value is not None for value in codes.values()):
+        return True
     if any(key not in _RUNNER_STAMPED_KEYS for key in info):
         return True
-    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
+    return any(meta.get(key) is not None for key in _PRODUCER_META_KEYS)
 
 
 @dataclass(frozen=True)
@@ -126,6 +140,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     input_modalities = "audio"
     have_multimodal_outputs = True
     enable_update_additional_information = True
+    replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
     has_preprocess = False

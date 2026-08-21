@@ -151,6 +151,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
             "max_sequence_length",
             "use_resolution_template",
             "use_duration_template",
+            "negative_metadata_mode",
             "use_system_prompt",
             "system_prompt",
             "negative_prompt",

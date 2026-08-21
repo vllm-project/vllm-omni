@@ -156,7 +156,7 @@ python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a streaming test." \
     --streaming
 ```
-Streaming requires `async_chunk: true` in the stage config.
+Streaming requires `async_chunk: true` in the deploy config.
 
 ### Notes
 - Output: 44.1 kHz mono WAV.
@@ -371,7 +371,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --streaming \
     --output-dir /tmp/out_stream
 ```
-Streaming requires `async_chunk: true` in the stage config.
+Streaming requires `async_chunk: true` in the deploy config.
 
 ### Word Timestamps
 Word-level timestamps are currently a serving-path feature: launch
@@ -380,13 +380,13 @@ Word-level timestamps are currently a serving-path feature: launch
 example is not provided in this release.
 
 ### Batched decoding
-The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, point `--stage-configs-path` at a stage configs YAML with the desired values (see `vllm_omni/model_executor/stage_configs/` for templates):
+The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, create an overlay based on `vllm_omni/deploy/qwen3_tts.yaml` and pass it with `--deploy-config`:
 ```bash
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --query-type CustomVoice \
     --txt-prompts examples/offline_inference/text_to_speech/qwen3_tts/benchmark_prompts.txt \
     --batch-size 4 \
-    --stage-configs-path /path/to/qwen3_tts_batched.yaml
+    --deploy-config /path/to/qwen3_tts_batched.yaml
 ```
 `--batch-size` must match a CUDA-graph capture size (1, 2, 4, 8, 16…).
 
