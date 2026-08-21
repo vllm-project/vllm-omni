@@ -174,7 +174,7 @@ async def _drive_session(
                     generate_s=getattr(timing, "generate_s", None),
                     decode_s=getattr(timing, "decode_s", None),
                     overlap_s=getattr(timing, "overlap_s", None),
-                    backpressure_s=getattr(timing, "backpressure_s", None),
+                    outstanding_generations=getattr(timing, "outstanding_generations", None),
                 )
             )
             resident = getattr(timing, "resident_decoder_bytes", None)

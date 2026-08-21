@@ -59,22 +59,30 @@ class VirtualClock:
         self._waiters.append((self.now + delay, future))
         await future
 
-    async def run_until_idle(self, task: asyncio.Task) -> None:
-        """Advance to each next wakeup until ``task`` completes."""
-        while not task.done():
-            await asyncio.sleep(0)
+    async def run_until_idle(self, task: asyncio.Task, *, max_steps: int = 100_000) -> None:
+        """Advance to each next wakeup until ``task`` completes.
+
+        Each step pumps the loop several times before deciding it is idle:
+        a sleeper inside a prefetch task is two hops from the driver, so a
+        single yield is not enough to settle the chain.
+        """
+        for _ in range(max_steps):
             if task.done():
-                break
-            if not self._waiters:
+                return
+            for _ in range(8):
                 await asyncio.sleep(0)
-                if not self._waiters:
+                if self._waiters or task.done():
                     break
-                continue
+            if task.done():
+                return
+            if not self._waiters:
+                return
             self._waiters.sort(key=lambda item: item[0])
             when, future = self._waiters.pop(0)
             self.now = max(self.now, when)
             if not future.done():
                 future.set_result(None)
+        raise AssertionError("virtual clock did not settle; the session under test is not making progress")
 
 
 class FakeSession:
@@ -621,7 +629,10 @@ class FakeLatentSession:
         self.closed = False
 
     async def next_chunk(self):
-        self._clock.now += self._generate_s
+        # A real await, not a clock bump: generation is a request to the
+        # worker, so it must be able to interleave with local decode work.
+        # Advancing the clock synchronously would make overlap unobservable.
+        await self._clock.sleep(self._generate_s)
         return {"latent_frames": self._latent_frames}
 
     async def close(self) -> None:
@@ -732,3 +743,139 @@ async def test_a_latent_only_session_still_works_and_falls_back_to_the_profile()
     assert summary.generate_s_total is None
     assert summary.frames == 36
     assert run.resident_decoder_bytes_per_session is None
+
+
+# --------------------------------------------------------------------------
+# Overlap: is the pipelining real, or only claimed?
+# --------------------------------------------------------------------------
+
+
+def _overlapped_factory(clock: VirtualClock, *, generate_s: float, decode_s: float, lookahead: int = 1):
+    from benchmarks.ar_diffusion.decoding_session import OverlappedDecodingSession
+
+    decoder = FakeChunkDecoder(clock, decode_s=decode_s)
+    inner: dict[str, FakeLatentSession] = {}
+
+    async def factory(session_id: str):
+        session = FakeLatentSession(clock, generate_s=generate_s)
+        inner[session_id] = session
+        return OverlappedDecodingSession(
+            inner=session,
+            decoder=decoder,
+            session_id=session_id,
+            clock=clock.time,
+            lookahead=lookahead,
+        )
+
+    return factory, decoder, inner
+
+
+@pytest.mark.asyncio
+async def test_overlapped_ticks_cost_max_not_sum() -> None:
+    """The whole point: a tick must cost max(generate, decode), not the sum.
+
+    Serialized, K chunks cost K * (generate + decode). Pipelined, generation of
+    chunk N+1 runs during decode of chunk N, so the run costs one generate to
+    prime plus K * max(generate, decode).
+    """
+    generate_s, decode_s, chunks = 0.4, 0.1, 5
+    clock = VirtualClock()
+    serial_factory, _, _ = _decoding_factory(clock, generate_s=generate_s, decode_s=decode_s)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=chunks, arrivals=burst_arrivals(1)
+    )
+    serial = await drive(config, serial_factory, clock)
+
+    clock2 = VirtualClock()
+    over_factory, _, _ = _overlapped_factory(clock2, generate_s=generate_s, decode_s=decode_s)
+    overlapped = await drive(config, over_factory, clock2)
+
+    # Assert on chunk latency rather than wall time. A lookahead pipeline holds
+    # one generation the consumer never asks for, cancelled at close; charging
+    # that teardown to the measurement would compare two different things.
+    assert serial.sessions[0].latency_p50_s == pytest.approx(generate_s + decode_s)
+    # Steady state: the next generation is already in flight, so a chunk costs
+    # the slower stage rather than the sum. The first chunk still pays both,
+    # because there was nothing to prime the pipeline with.
+    assert overlapped.sessions[0].latency_p50_s == pytest.approx(max(generate_s, decode_s))
+    assert overlapped.sessions[0].latency_max_s == pytest.approx(generate_s + decode_s)
+    assert overlapped.sessions[0].latency_p50_s < serial.sessions[0].latency_p50_s
+
+
+@pytest.mark.asyncio
+async def test_overlap_efficiency_is_zero_serialized_and_positive_pipelined() -> None:
+    """The metric has to distinguish the two, or it measures nothing."""
+    clock = VirtualClock()
+    serial_factory, _, _ = _decoding_factory(clock, generate_s=0.4, decode_s=0.1)
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=4, arrivals=burst_arrivals(1)
+    )
+    serial = await drive(config, serial_factory, clock)
+    assert serial.overlap_efficiency is None  # serialized sessions report no overlap
+
+    clock2 = VirtualClock()
+    over_factory, _, _ = _overlapped_factory(clock2, generate_s=0.4, decode_s=0.1)
+    overlapped = await drive(config, over_factory, clock2)
+    # Decode covers 0.1s of each 0.4s generation after the first chunk.
+    assert 0.0 < overlapped.overlap_efficiency < 1.0
+    assert overlapped.sessions[0].overlap_s_total == pytest.approx(3 * 0.1)
+
+
+@pytest.mark.asyncio
+async def test_generation_never_runs_further_ahead_than_the_lookahead_bound() -> None:
+    """Backpressure here is a ceiling on lookahead, so assert the ceiling.
+
+    Without it a consumer that stops taking chunks would let generation run
+    ahead into memory nothing reads.
+    """
+    for lookahead in (1, 2, 3):
+        clock = VirtualClock()
+        factory, _, _ = _overlapped_factory(clock, generate_s=0.2, decode_s=0.3, lookahead=lookahead)
+        config = BenchmarkConfig(
+            profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=5, arrivals=burst_arrivals(1)
+        )
+        run = await drive(config, factory, clock)
+        assert run.sessions[0].peak_outstanding_generations == lookahead
+
+
+@pytest.mark.asyncio
+async def test_a_consumer_that_stops_leaves_no_generation_running() -> None:
+    """Closing mid-session must cancel the prefetch, not leak it.
+
+    A lookahead pipeline always holds generations the consumer has not asked
+    for; on close they have to be cancelled rather than left to complete into
+    a session that no longer exists.
+    """
+    clock = VirtualClock()
+    factory, decoder, inner = _overlapped_factory(clock, generate_s=0.2, decode_s=0.1, lookahead=2)
+
+    async def scenario():
+        session = await factory("s")
+        await session.next_chunk()
+        assert session._pending, "the prefetch must be outstanding before close"
+        await session.close()
+        return session
+
+    task = asyncio.ensure_future(scenario())
+    await clock.run_until_idle(task)
+    session = await task
+
+    assert decoder.released, "decoder state must be released with the session"
+    assert inner["s"].closed
+    assert not session._pending
+
+
+@pytest.mark.asyncio
+async def test_overlapping_does_not_change_what_is_delivered() -> None:
+    """Pipelining is a scheduling change; the frames must be identical."""
+    config = BenchmarkConfig(
+        profile=PROFILE, mode=LoadMode.SATURATING, chunks_per_session=4, arrivals=burst_arrivals(1)
+    )
+    clock = VirtualClock()
+    serial = await drive(config, _decoding_factory(clock, generate_s=0.3, decode_s=0.2)[0], clock)
+    clock2 = VirtualClock()
+    overlapped = await drive(config, _overlapped_factory(clock2, generate_s=0.3, decode_s=0.2)[0], clock2)
+
+    assert overlapped.sessions[0].frames == serial.sessions[0].frames
+    assert overlapped.sessions[0].chunks == serial.sessions[0].chunks
+    assert [e for e in overlapped.sessions[0].to_dict() if e] == [e for e in serial.sessions[0].to_dict() if e]

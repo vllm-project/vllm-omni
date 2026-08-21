@@ -116,7 +116,7 @@ class ChunkEvent:
     generate_s: float | None = None
     decode_s: float | None = None
     overlap_s: float | None = None
-    backpressure_s: float | None = None
+    outstanding_generations: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -129,7 +129,7 @@ class ChunkEvent:
             raise TypeError("frames must be an integer when provided.")
         if self.frames is not None and self.frames <= 0:
             raise ValueError("frames must be positive when provided.")
-        for name in ("generate_s", "decode_s", "overlap_s", "backpressure_s"):
+        for name in ("generate_s", "decode_s", "overlap_s"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative.")
@@ -146,7 +146,7 @@ class ChunkEvent:
             "t_ready": self.t_ready,
             "latency_s": self.latency_s,
         }
-        for name in ("frames", "generate_s", "decode_s", "overlap_s", "backpressure_s"):
+        for name in ("frames", "generate_s", "decode_s", "overlap_s", "outstanding_generations"):
             value = getattr(self, name)
             if value is not None:
                 record[name] = value
@@ -239,7 +239,7 @@ class SessionSummary:
     decode_share: float | None = None
     overlap_s_total: float | None = None
     overlap_efficiency: float | None = None
-    backpressure_s_total: float | None = None
+    peak_outstanding_generations: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -279,7 +279,7 @@ def summarize_session(
     generate_total = _optional_sum(event.generate_s for event in events)
     decode_total = _optional_sum(event.decode_s for event in events)
     overlap_total = _optional_sum(event.overlap_s for event in events)
-    backpressure_total = _optional_sum(event.backpressure_s for event in events)
+    outstanding = [e.outstanding_generations for e in events if e.outstanding_generations is not None]
     latency_total = sum(latencies)
     return SessionSummary(
         session_id=record.session_id,
@@ -309,7 +309,7 @@ def summarize_session(
             if overlap_total is not None and generate_total is not None and generate_total > 0
             else None
         ),
-        backpressure_s_total=backpressure_total,
+        peak_outstanding_generations=max(outstanding) if outstanding else None,
     )
 
 

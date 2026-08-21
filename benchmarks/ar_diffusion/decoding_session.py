@@ -22,6 +22,7 @@ geometry is not declared anywhere the runtime can read.
 from __future__ import annotations
 
 import asyncio
+import collections
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ class StageTiming:
     frames: int | None = None
     resident_decoder_bytes: int | None = None
     overlap_s: float | None = None
-    backpressure_s: float | None = None
+    outstanding_generations: int | None = None
 
 
 @dataclass
@@ -115,11 +116,16 @@ class OverlappedDecodingSession:
     costs ``max(generate, decode)`` instead.
 
     The session keeps at most ``lookahead`` generations outstanding. That bound
-    is the backpressure mechanism as well as the memory bound: a consumer that
-    stops taking chunks stops the prefetch with it, rather than letting
-    generation run ahead into memory nothing is reading. Time spent waiting on
-    that bound is reported as ``backpressure_s`` so a slow consumer is visible
-    in the results instead of silently inflating chunk latency.
+    is the backpressure: a consumer that stops taking chunks stops generation
+    with it, rather than letting it run ahead into memory nothing is reading.
+    ``outstanding_generations`` reports how many were in flight, so the bound
+    is observable rather than asserted in a comment.
+
+    Note what this is not. Because the caller drives ``next_chunk``, nothing
+    ever *waits* on the bound from inside this class -- backpressure here is a
+    ceiling on lookahead, not a measured stall. Timing a stall would need
+    generation to run as its own producer task, which is a larger change and
+    is not attempted here.
 
     ``overlap_s`` is how much generate time was hidden behind decode, which is
     what "VAE/DiT overlap efficiency" has to be computed from.
@@ -137,34 +143,39 @@ class OverlappedDecodingSession:
         if self.lookahead < 1:
             raise ValueError("lookahead must be at least 1.")
         self._state = self.decoder.new_decode_state(self.session_id)
-        self._pending: asyncio.Task | None = None
-        self._pending_started: float | None = None
+        self._pending: collections.deque[tuple[asyncio.Task, float]] = collections.deque()
         self._closed = False
 
     @property
     def decode_state(self) -> Any:
         return self._state
 
-    def _start_generation(self) -> None:
-        if self._pending is None and not self._closed:
-            self._pending_started = self.clock()
-            self._pending = asyncio.ensure_future(self.inner.next_chunk())
+    def _fill_lookahead(self) -> None:
+        """Keep the prefetch topped up to the bound, and never past it."""
+        while not self._closed and len(self._pending) < self.lookahead:
+            self._pending.append((asyncio.ensure_future(self.inner.next_chunk()), self.clock()))
 
     async def next_chunk(self) -> Any:
         t0 = self.clock()
         # A prefetch issued during the previous tick has been running while the
         # caller was away, so only the part still outstanding is charged here.
-        self._start_generation()
-        pending, started = self._pending, self._pending_started
-        self._pending, self._pending_started = None, None
-        output = await pending
+        self._fill_lookahead()
+        task, started = self._pending.popleft()
+        output = await task
         t1 = self.clock()
-        generate_s = t1 - (started if started is not None else t0)
-        waited_s = t1 - t0
-        overlap_s = max(0.0, generate_s - waited_s)
+        generate_s = t1 - started
+        overlap_s = max(0.0, generate_s - (t1 - t0))
 
         # Issue the next generation before decoding, so the two overlap.
-        self._start_generation()
+        self._fill_lookahead()
+        outstanding = len(self._pending)
+        # ensure_future only *schedules* the task. Decode is synchronous and
+        # blocks the event loop for its whole duration, so without handing
+        # control back first the prefetch never starts and the overlap is
+        # nominal: the request would not leave until decode had already
+        # finished. One yield is enough -- the task only has to get as far as
+        # issuing its request before it awaits.
+        await asyncio.sleep(0)
 
         frames = self.decoder.decode_chunk(self.latent_of(output), self._state)
         t2 = self.clock()
@@ -176,19 +187,19 @@ class OverlappedDecodingSession:
             frames=int(frames.shape[2]) if hasattr(frames, "shape") and len(frames.shape) >= 3 else None,
             resident_decoder_bytes=nbytes() if callable(nbytes) else None,
             overlap_s=overlap_s,
-            backpressure_s=0.0,
+            outstanding_generations=outstanding,
         )
         return frames
 
     async def close(self) -> None:
         self._closed = True
-        if self._pending is not None:
-            self._pending.cancel()
+        while self._pending:
+            task, _ = self._pending.popleft()
+            task.cancel()
             try:
-                await self._pending
+                await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown must not mask close
                 pass
-            self._pending = None
         try:
             self.decoder.release(self._state)
         finally:
