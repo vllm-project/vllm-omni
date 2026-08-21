@@ -45,26 +45,19 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              96.4061,
-              140.8147,
-              271.9025,
-              362.2916,
-              507.776
-            ],
             "mean_e2el_ms": [
-              18507.4582,
-              28365.4956,
+              11701.3818,
+              27510.3956,
               31907.9613,
-              48161.5829,
-              72630.8601
+              42173.9832,
+              63970.0751
             ],
             "mean_audio_rtf": [
               0.1175,
-              0.18,
-              0.2359,
-              0.3278,
-              0.6296
+              0.1647,
+              0.2003,
+              0.2726,
+              0.4195
             ]
           }
         }
@@ -94,14 +87,11 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              354.0951
-            ],
             "mean_e2el_ms": [
-              3952.5615
+              3646.797
             ],
             "mean_audio_rtf": [
-              0.117
+              0.1098
             ]
           }
         }
@@ -133,14 +123,11 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              259.6317
-            ],
             "mean_e2el_ms": [
-              4253.3009
+              4059.0878
             ],
             "mean_audio_rtf": [
-              0.1448
+              0.1335
             ]
           }
         }
@@ -174,14 +161,11 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              457.4453
-            ],
             "mean_e2el_ms": [
-              5912.5623
+              5639.5769
             ],
             "mean_audio_rtf": [
-              0.1967
+              0.1798
             ]
           }
         }
@@ -215,19 +199,12 @@
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              90.8033,
-              202.1779,
-              326.5864,
-              544.8914,
-              961.3929
-            ],
             "mean_e2el_ms": [
-              4517.3411,
-              7857.9711,
+              4354.8945,
+              7672.4248,
               9861.1687,
-              13283.3363,
-              19541.0736
+              13086.8865,
+              18716.709
             ]
           }
         }
@@ -262,11 +239,8 @@
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              318.048
-            ],
             "mean_e2el_ms": [
-              807.6114
+              756.8415
             ]
           }
         }
@@ -303,11 +277,8 @@
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              186.168
-            ],
             "mean_e2el_ms": [
-              726.1137
+              694.9777
             ]
           }
         }
@@ -346,9 +317,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
           "H100": {
-            "mean_ttft_ms": [
-              375.5282
-            ],
             "mean_e2el_ms": [
               1006.1663
             ]

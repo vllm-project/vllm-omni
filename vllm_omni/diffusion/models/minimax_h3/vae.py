@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from PIL import Image
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
@@ -26,6 +28,9 @@ from .packed_tokens import minimax_h3_patchify_video_latent
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+
+logger = init_logger(__name__)
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -170,9 +175,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.parallel_size = parallel_size
         enabled = parallel_size > 1
 
-        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
-        parallel_module = importlib.import_module(f"{package}.parallel")
-        state = parallel_module.get_parallel_state()
+        state = self._native_parallel_state()
         state.clear()
         state.update(
             group_size=parallel_size,
@@ -186,6 +189,57 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             tp_rank=0,
         )
         self.model.parallel_tiling = enabled
+
+    def _native_parallel_state(self) -> dict[str, Any]:
+        """Return the checkpoint's own mutable parallel-state dict."""
+
+        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
+        parallel_module = importlib.import_module(f"{package}.parallel")
+        return parallel_module.get_parallel_state()
+
+    def _decoder_tile_count(self, latent: torch.Tensor) -> int:
+        """Number of decoder tiles the checkpoint will split ``latent`` into.
+
+        Mirrors the checkpoint's ``decode_tiled``: the grid is computed from the
+        pixel-space dimensions, so it is a pure function of the latent shape and
+        resolves identically on every rank.
+        """
+
+        ratio = int(self.model.vae_ratio)
+        rows, _, _ = self.model.split_tiles(int(latent.shape[-2]) * ratio, True)
+        cols, _, _ = self.model.split_tiles(int(latent.shape[-1]) * ratio, True)
+        return len(rows) * len(cols)
+
+    @contextmanager
+    def _rank_local_tiling(self) -> Iterator[None]:
+        """Run one decode with tiling kept on this rank, then restore the group.
+
+        Used only when there are fewer tiles than ranks. Every rank then decodes
+        every tile, which is slower than sharing the work but is correct and
+        involves no collective.
+        """
+
+        state = self._native_parallel_state()
+        saved_state = dict(state)
+        saved_tiling = self.model.parallel_tiling
+        state.update(
+            group_size=1,
+            group_rank=0,
+            local_process_group=None,
+            sp_size=1,
+            sp_rank=0,
+            sp_enabled=False,
+            sp_process_group=None,
+            tp_size=1,
+            tp_rank=0,
+        )
+        self.model.parallel_tiling = False
+        try:
+            yield
+        finally:
+            state.clear()
+            state.update(saved_state)
+            self.model.parallel_tiling = saved_tiling
 
     def is_distributed_enabled(self) -> bool:
         return self.parallel_size > 1 and dist.is_initialized()
@@ -293,7 +347,27 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1, 1, 1)
-        decoded = self.model.decode_base(latent * std + mean)
+        # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        # and then rejects an empty share inside the gather. A rank with no
+        # tiles raises and leaves the collective while the others block in it
+        # forever, so too few tiles hangs the whole stage rather than failing
+        # it. Tile count depends only on the latent shape, so every rank takes
+        # this branch together.
+        num_tiles = self._decoder_tile_count(latent)
+        if self.parallel_size > 1 and num_tiles < self.parallel_size:
+            logger.warning_once(
+                "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
+                "%d ranks; decoding rank-locally for this shape instead, which is "
+                "slower but avoids ranks without tiles hanging the collective.",
+                num_tiles,
+                self.parallel_size,
+            )
+            tiling_context: AbstractContextManager = self._rank_local_tiling()
+        else:
+            tiling_context = nullcontext()
+
+        with tiling_context:
+            decoded = self.model.decode_base(latent * std + mean)
         frames = self.model.processor.revert_tensor(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)

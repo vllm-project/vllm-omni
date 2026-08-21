@@ -551,6 +551,7 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
+        "silence_ban_frames",
         "has_sampling_extra_args",
         "custom_voice_dir",
         "task_type",
