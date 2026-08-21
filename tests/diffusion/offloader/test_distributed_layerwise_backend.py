@@ -264,25 +264,21 @@ class TestDistributedLayerwiseOffloadHook:
         expected_scale = rank0_block.weight_scale.detach().clone()
         expected_stride = rank0_block.weight.stride()
 
-        rank0_hook = DistributedLayerwiseOffloadHook(
-            next_block=rank0_block,
-            device=torch.device("cpu"),
-            dp_group=object(),
-            dp_size=2,
-            rank=0,
+        rank0_hook = _make_prepared_hook(
+            rank0_block,
+            weight_shard_group=object(),
+            weight_shard_size=2,
+            weight_shard_rank=0,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
-        rank1_hook = DistributedLayerwiseOffloadHook(
-            next_block=rank1_block,
-            device=torch.device("cpu"),
-            dp_group=object(),
-            dp_size=2,
-            rank=1,
+        rank1_hook = _make_prepared_hook(
+            rank1_block,
+            weight_shard_group=object(),
+            weight_shard_size=2,
+            weight_shard_rank=1,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineFp8Block())
