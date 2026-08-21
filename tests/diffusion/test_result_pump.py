@@ -492,3 +492,68 @@ class TestResultPumpCancelledFutureRace:
         assert cancelled_fut.cancelled()
         assert healthy_fut.done()
         assert healthy_fut.result(timeout=1.0) is outputs["r-healthy"]
+
+
+class TestDropOutput:
+    """drop_output drains an aborted request's async output so it cannot leak.
+
+    An aborted request never calls wait_output_ready, so a late OUTPUT_READY is
+    unpacked and cached in _completed_outputs forever (issue #6413). drop_output
+    evicts it, handling both arrival orderings.
+    """
+
+    def test_drops_already_cached_output(self):
+        executor = _make_executor()
+        fut = concurrent.futures.Future()
+        fut.set_result(DiffusionOutput(output="leaked"))
+        with executor._futures_lock:
+            executor._completed_outputs["aid-1"] = fut
+
+        executor.drop_output("aid-1")
+
+        with executor._futures_lock:
+            assert "aid-1" not in executor._completed_outputs
+
+    def test_prevents_caching_when_output_not_yet_arrived(self):
+        executor = _make_executor()
+
+        # Abort finalized before OUTPUT_READY: register a placeholder waiter.
+        executor.drop_output("aid-2")
+
+        # The late result now resolves into the placeholder instead of caching.
+        output = DiffusionOutput(output="late")
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="aid-2",
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        with executor._futures_lock:
+            assert "aid-2" not in executor._completed_outputs
+            assert "aid-2" not in executor._output_futures
+
+    def test_leaves_real_waiter_untouched(self):
+        executor = _make_executor()
+        real = executor.wait_output_ready("aid-3")
+
+        executor.drop_output("aid-3")
+
+        with executor._futures_lock:
+            # A genuine waiter still drains via the normal path.
+            assert executor._output_futures.get("aid-3") is real
+
+
+class TestShutdownClearsCompletedOutputs:
+    """shutdown() must release cached async outputs (issue #6413)."""
+
+    def test_shutdown_clears_completed_outputs(self):
+        executor = _make_executor()
+        fut = concurrent.futures.Future()
+        fut.set_result(DiffusionOutput(output="cached"))
+        with executor._futures_lock:
+            executor._completed_outputs["aid-4"] = fut
+
+        executor.shutdown()
+
+        assert executor._completed_outputs == {}
