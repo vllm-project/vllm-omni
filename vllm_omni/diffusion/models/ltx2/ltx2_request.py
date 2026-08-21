@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -44,6 +45,10 @@ class LTXRequestInputs:
     max_sequence_length: int
     audio_latents_normalized: bool = False
     image_crf: int | None = None
+    tiled_data_parallel: bool = False
+    tiled_data_parallel_overlap: int = 5
+    output_height: int | None = None
+    output_width: int | None = None
 
     @property
     def guidance_scale(self) -> float:
@@ -150,6 +155,12 @@ def validate_pipeline_request(
     first_phase = pipeline_recipe.phases[0]
     if not first_phase.allow_guidance_override and request_inputs.guidance != first_phase.guidance:
         raise ValueError(f"{pipeline_name} uses fixed positive-only guidance and cannot override it.")
+
+    if request_inputs.tiled_data_parallel:
+        if not any(phase.input_transform == "spatial_upsample" for phase in pipeline_recipe.phases):
+            raise ValueError(f"{pipeline_name} requires a two-stage recipe for LTX tiled data parallelism.")
+        if request_inputs.tiled_data_parallel_overlap < 0:
+            raise ValueError("LTX tiled data parallel overlap must be non-negative.")
 
 
 def _unwrap_request_tensor(value: Any) -> Any:
@@ -483,6 +494,24 @@ class LTXRequestMixin:
             raise ValueError("Batched LTX requests must use identical `image_crf` values.")
         image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
 
+        tiled_values = [_get_extra_arg(item, "ltx_tiled_data_parallel") for item in sampling_params_list]
+        first_tiled_value = tiled_values[0] if tiled_values else None
+        if any(item != first_tiled_value for item in tiled_values[1:]):
+            raise ValueError("Batched LTX requests must use identical 'ltx_tiled_data_parallel' values.")
+        if first_tiled_value is not None and not isinstance(first_tiled_value, bool):
+            raise ValueError("'ltx_tiled_data_parallel' must be a boolean.")
+        tiled_data_parallel = bool(first_tiled_value)
+
+        overlap_values = [_get_extra_arg(item, "ltx_tiled_data_parallel_overlap") for item in sampling_params_list]
+        first_overlap = overlap_values[0] if overlap_values else None
+        if any(item != first_overlap for item in overlap_values[1:]):
+            raise ValueError("Batched LTX requests must use identical 'ltx_tiled_data_parallel_overlap' values.")
+        if first_overlap is not None and (isinstance(first_overlap, bool) or not isinstance(first_overlap, int)):
+            raise ValueError("'ltx_tiled_data_parallel_overlap' must be a non-negative integer.")
+        tiled_data_parallel_overlap = 5 if first_overlap is None else first_overlap
+        if tiled_data_parallel_overlap < 0:
+            raise ValueError("'ltx_tiled_data_parallel_overlap' must be a non-negative integer.")
+
         sampling = sampling_params_list[0]
         is_dummy_run = req.is_dummy_run()
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
@@ -493,6 +522,12 @@ class LTXRequestMixin:
 
         height = sampling.height or height or self.pipeline_recipe.height
         width = sampling.width or width or self.pipeline_recipe.width
+        output_height = int(height) if tiled_data_parallel else None
+        output_width = int(width) if tiled_data_parallel else None
+        if tiled_data_parallel:
+            alignment = self.vae_spatial_compression_ratio * self.pipeline_recipe.max_spatial_downscale
+            height = math.ceil(height / alignment) * alignment
+            width = math.ceil(width / alignment) * alignment
         num_frames = sampling.num_frames or num_frames or self.pipeline_recipe.num_frames
         frame_rate = sampling.resolved_frame_rate or frame_rate or self.pipeline_recipe.frame_rate
         num_inference_steps = (
@@ -614,4 +649,8 @@ class LTXRequestMixin:
             output_type=output_type,
             max_sequence_length=int(max_sequence_length),
             image_crf=image_crf,
+            tiled_data_parallel=tiled_data_parallel,
+            tiled_data_parallel_overlap=tiled_data_parallel_overlap,
+            output_height=output_height,
+            output_width=output_width,
         )

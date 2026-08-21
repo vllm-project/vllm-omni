@@ -68,6 +68,59 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 
 Use the T2V or I2V request below after the server is ready.
 
+## Experimental multi-GPU 4K path
+
+The two-stage pipelines can opt into the official LTX multi-GPU topology:
+Stage 1 uses full-frame Ulysses sequence parallelism, while Stage 2 reuses the
+same process group for spatial tiled data parallelism. Stage 2 assigns one
+overlapping tile per rank, evaluates local attention, blends the video tiles,
+and keeps the final audio from Stage 1.
+
+The initial qualification boundary is deliberately narrow:
+
+- LTX-2.5 and a two-stage pipeline;
+- one node, Ulysses-only SP, TP/DP/PP/CFG all equal to 1;
+- no Ring SP, AllGather-KV, HSDP, or diffusion cache backend;
+- eager execution via `--enforce-eager`.
+
+For four GPUs, the Stage 2 latent is split into a 2x2 grid with five latent
+cells of overlap on both spatial axes. A 3840x2160 request is generated
+internally at 3840x2176 to satisfy the two-stage 64-pixel alignment, then
+cropped back to 3840x2160 after VAE decode.
+
+This path is experimental until the distributed GPU accuracy and performance
+matrix is published. Like the upstream LTX implementation, it replicates the
+Transformer weights on every rank; TDP primarily reduces high-resolution
+attention work and latency rather than sharding model weights.
+
+Offline T2V example:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model "${MODEL}" \
+  --model-class-name LTX2DistilledTwoStagePipeline \
+  --prompt "A cinematic aerial shot following a sailboat through a fjord at sunrise." \
+  --width 3840 \
+  --height 2160 \
+  --num-frames 121 \
+  --num-inference-steps 8 \
+  --frame-rate 24 \
+  --fps 24 \
+  --ulysses-degree 4 \
+  --enforce-eager \
+  --extra-body '{"ltx_tiled_data_parallel":true,"ltx_tiled_data_parallel_overlap":5}' \
+  --output ltx25-4k-tiled.mp4
+```
+
+The same two keys can be sent in the online videos API `extra_params`
+object. Keep the server topology fixed for its lifetime and enable
+`--ulysses-degree 4 --enforce-eager` at startup.
+
+Decoded 2K/4K tensors can be several GiB before MP4 encoding. The diffusion
+worker therefore allows 300 seconds by default for background D2H and
+shared-memory output transfer. Deployments can override this positive,
+finite limit with `VLLM_OMNI_DIFFUSION_ASYNC_OUTPUT_TIMEOUT_S`.
+
 ## Offline inference
 
 Choose values from the pipeline table. For example, the distilled two-stage

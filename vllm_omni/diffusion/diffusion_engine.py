@@ -7,6 +7,8 @@ import asyncio
 import concurrent.futures
 import copy
 import inspect
+import math
+import os
 import queue
 import threading
 import time
@@ -61,7 +63,27 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_DIFFUSION_ASYNC_OUTPUT_TIMEOUT_S"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 300.0
+
+
+def _resolve_async_output_timeout(raw_value: str) -> float:
+    """Validate the worker D2H/shared-memory output timeout."""
+    try:
+        timeout = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{_ASYNC_OUTPUT_TIMEOUT_ENV} must be a positive finite number, got {raw_value!r}.") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{_ASYNC_OUTPUT_TIMEOUT_ENV} must be a positive finite number, got {raw_value!r}.")
+    return timeout
+
+
+# Decoded high-resolution videos can be multi-GiB before MP4 encoding. Their
+# background D2H copy and shared-memory packing legitimately exceed the old
+# 30-second guard even when denoising has completed successfully.
+_ASYNC_OUTPUT_TIMEOUT = _resolve_async_output_timeout(
+    os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV, str(_ASYNC_OUTPUT_TIMEOUT_DEFAULT))
+)
 
 __all__ = [
     "DiffusionEngine",

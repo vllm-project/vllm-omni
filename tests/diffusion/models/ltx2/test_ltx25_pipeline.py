@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX25_TWO_STAGE_RECIPE,
     LTX_DISTILLED_SIGMAS,
     LTX_POSITIVE_ONLY_RECIPE,
+    LTX_TILED_STAGE_2_SIGMAS,
     resolve_ltx_pipeline_recipe,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
@@ -757,6 +758,35 @@ def test_ltx25_distilled_two_stage_executes_custom_phase_schedules():
 
 
 class TestLTXRequestParsing:
+    def test_4k_tiled_request_aligns_internal_height_and_preserves_output_size(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="prompt",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=2160,
+                        width=3840,
+                        extra_args={
+                            "ltx_tiled_data_parallel": True,
+                            "ltx_tiled_data_parallel_overlap": 5,
+                        },
+                    ),
+                    request_id="ltx-4k-tiled",
+                )
+            ]
+        )
+
+        resolved = _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX2TwoStagePipeline), req)
+
+        assert (resolved.height, resolved.width) == (2176, 3840)
+        assert (resolved.output_height, resolved.output_width) == (2160, 3840)
+        assert resolved.tiled_data_parallel
+        assert resolved.tiled_data_parallel_overlap == 5
+
     def test_request_resolves_custom_sigmas_from_extra_args(self):
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -815,6 +845,115 @@ class TestLTXRequestParsing:
 
         with pytest.raises(ValueError, match="image_crf"):
             _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX2Pipeline), req)
+
+
+def test_ltx25_tiled_stage_uses_official_schedule_and_stage1_audio():
+    request_inputs = LTXRequestInputs(
+        prompt="prompt",
+        negative_prompt="",
+        height=64,
+        width=64,
+        num_frames=1,
+        frame_rate=24.0,
+        num_inference_steps=8,
+        guidance=LTXGuidanceSpec.positive_only(),
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=16,
+        tiled_data_parallel=True,
+    )
+    phase_calls = []
+    prompt_context = object()
+
+    def run_phase(_req, inputs, **kwargs):
+        phase_calls.append((inputs, kwargs))
+        if len(phase_calls) == 1:
+            return LTXPhaseResult(
+                forward_context=SimpleNamespace(prompt_context=prompt_context),
+                video=torch.ones(1, 128, 1, 1, 1),
+                audio=torch.full((1, 8, 1, 2), 2.0),
+                audio_for_next_phase=torch.full((1, 8, 1, 2), 5.0),
+            )
+        return LTXPhaseResult(
+            forward_context=SimpleNamespace(prompt_context=prompt_context),
+            video=torch.full((1, 128, 1, 2, 2), 3.0),
+            audio=torch.full((1, 8, 1, 2), 4.0),
+        )
+
+    class FakeUpsampler(torch.nn.Module):
+        dtype = torch.float32
+
+        def forward(self, latents):
+            return latents.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
+
+    pipeline = object.__new__(LTX2TwoStagePipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_recipe = LTX25_DISTILLED_TWO_STAGE_RECIPE
+    pipeline.vae_spatial_compression_ratio = 32
+    pipeline.vae_temporal_compression_ratio = 8
+    pipeline.device = torch.device("cpu")
+    pipeline.latent_upsampler = FakeUpsampler()
+    object.__setattr__(pipeline, "run_phase", run_phase)
+    object.__setattr__(
+        pipeline,
+        "decode_phase",
+        lambda phase: DiffusionOutput(output=(phase.video, phase.audio)),
+    )
+
+    output = pipeline._run_recipe(
+        SimpleNamespace(),
+        request_inputs,
+        request_sigmas=None,
+        request_phase_sigmas=None,
+    )
+
+    assert phase_calls[1][1]["sigmas"] == list(LTX_TILED_STAGE_2_SIGMAS)
+    assert phase_calls[1][1]["noise_scale"] == LTX_TILED_STAGE_2_SIGMAS[0]
+    torch.testing.assert_close(output.output[0], torch.full((1, 128, 1, 2, 2), 3.0))
+    torch.testing.assert_close(output.output[1], torch.full((1, 8, 1, 2), 2.0))
+
+
+@pytest.mark.parametrize("cache_backend", [None, "none"])
+def test_ltx25_tiled_runtime_accepts_only_initial_qualified_topology(cache_backend):
+    request = SimpleNamespace(tiled_data_parallel=True)
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        sequence_parallel_size=4,
+        ring_degree=1,
+        allgather_degree=1,
+        cfg_parallel_size=1,
+        use_hsdp=False,
+    )
+    pipeline = SimpleNamespace(
+        model_version="2.5",
+        od_config=SimpleNamespace(
+            parallel_config=parallel,
+            enforce_eager=True,
+            cache_backend=cache_backend,
+        ),
+    )
+
+    LTXRuntime._validate_tiled_data_parallel_request(pipeline, request)
+
+    pipeline.od_config.enforce_eager = False
+    with pytest.raises(ValueError, match="enforce_eager"):
+        LTXRuntime._validate_tiled_data_parallel_request(pipeline, request)
+
+    pipeline.od_config.enforce_eager = True
+    pipeline.od_config.cache_backend = "cache_dit"
+    with pytest.raises(ValueError, match="diffusion cache backend"):
+        LTXRuntime._validate_tiled_data_parallel_request(pipeline, request)
 
 
 class TestLTXForwardStages:

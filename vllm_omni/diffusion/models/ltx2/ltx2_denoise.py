@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
     from .ltx2_recipes import LTXPhaseRecipe
     from .ltx2_request import LTXRequestInputs
+    from .ltx2_tiled_data_parallel import LTXTiledDataParallelPlan
 
 
 @dataclass
@@ -45,6 +46,7 @@ class LTXForwardContext:
     sampler: str
     audio_scheduler: Any
     video_audio_step_adapter: Any
+    tiled_data_parallel_plan: LTXTiledDataParallelPlan | None = None
 
     @property
     def batch_size(self) -> int:
@@ -576,6 +578,14 @@ class LTXPhaseExecutor:
             sampler=phase_recipe.sampler,
             audio_scheduler=audio_scheduler,
             video_audio_step_adapter=video_audio_step_adapter,
+            tiled_data_parallel_plan=pipeline._prepare_tiled_data_parallel_plan(
+                request_inputs,
+                phase_recipe,
+                num_frames=latent_num_frames,
+                height=latent_height,
+                width=latent_width,
+                device=latents.device,
+            ),
         )
         video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
         ring_degree = getattr(pipeline.od_config.parallel_config, "ring_degree", 1) or 1

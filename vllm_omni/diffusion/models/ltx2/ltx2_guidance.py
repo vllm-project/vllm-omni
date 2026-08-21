@@ -24,6 +24,18 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 
 logger = init_logger(__name__)
 
+
+def _forward_transformer(
+    pipeline: Any,
+    forward_ctx: LTXForwardContext,
+    kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward = getattr(pipeline, "_forward_transformer", None)
+    if callable(forward):
+        return forward(forward_ctx, kwargs)
+    return pipeline.transformer(**kwargs)
+
+
 if TYPE_CHECKING:
     from .ltx2_denoise import LTXDenoiseContext, LTXForwardContext
     from .ltx2_latents import LTXAVState
@@ -437,7 +449,7 @@ class LTXGuidanceExecutor:
             attention_kwargs=attention_kwargs,
         )
         with pipeline._transformer_cache_context("guided"):
-            local_video, local_audio = pipeline.transformer(**kwargs)
+            local_video, local_audio = _forward_transformer(pipeline, forward_ctx, kwargs)
         local_video_slots = local_video.chunk(model_pass_count)
         local_audio_slots = local_audio.chunk(model_pass_count)
 
@@ -535,7 +547,7 @@ class LTXGuidanceExecutor:
             attention_kwargs=attention_kwargs,
         )
         with pipeline._transformer_cache_context("guided"):
-            video_velocity, audio_velocity = pipeline.transformer(**kwargs)
+            video_velocity, audio_velocity = _forward_transformer(pipeline, forward_ctx, kwargs)
         video_splits = dict(zip(plan.names, video_velocity.chunk(pass_count), strict=True))
         audio_splits = dict(zip(plan.names, audio_velocity.chunk(pass_count), strict=True))
 

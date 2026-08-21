@@ -693,6 +693,40 @@ class TestSequenceParallelSplitHookInit:
         assert hook.module_forward_metadata is not None
         assert hook.module_forward_metadata._cls is DummyModule
 
+    def test_hook_is_bypassed_when_sequence_parallel_is_disabled(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import (
+            ForwardContext,
+            override_forward_context,
+            set_sequence_parallel_enabled,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        class DummyModule(nn.Module):
+            def forward(self, hidden_states):
+                return hidden_states
+
+        hook = SequenceParallelSplitHook(
+            {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        module = DummyModule()
+        hook.initialize_hook(module)
+        hidden_states = torch.randn(1, 4, 2)
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_shard",
+            lambda *args, **kwargs: pytest.fail("disabled SP must not shard"),
+        )
+
+        with override_forward_context(ForwardContext(sp_plan_hooks_applied=True)):
+            with set_sequence_parallel_enabled(False):
+                args, kwargs = hook.pre_forward(module, hidden_states=hidden_states)
+
+        assert args == ()
+        assert kwargs["hidden_states"] is hidden_states
+
 
 @pytest.mark.cpu
 class TestSequenceParallelGatherHookInit:
@@ -727,6 +761,49 @@ class TestSequenceParallelGatherHookInit:
         assert len(hook.metadata) == 2
         assert hook.metadata[0].gather_dim == 1
         assert hook.metadata[1].gather_dim == 2
+
+    def test_hook_is_bypassed_when_sequence_parallel_is_disabled(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import (
+            ForwardContext,
+            override_forward_context,
+            set_sequence_parallel_enabled,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelGatherHook
+
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(gather_dim=1, expected_dims=3),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        output = torch.randn(1, 2, 3)
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_gather",
+            lambda *args, **kwargs: pytest.fail("disabled SP must not gather"),
+        )
+
+        with override_forward_context(ForwardContext(sp_plan_hooks_applied=True)):
+            with set_sequence_parallel_enabled(False):
+                result = hook.post_forward(nn.Identity(), output)
+
+        assert result is output
+
+
+def test_sequence_parallel_enabled_scope_restores_state():
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        override_forward_context,
+        set_sequence_parallel_enabled,
+    )
+
+    context = ForwardContext(sp_plan_hooks_applied=True)
+    with override_forward_context(context):
+        assert context.sp_active is False
+        with set_sequence_parallel_enabled(False):
+            assert context.sequence_parallel_enabled is False
+            assert context.sp_active is False
+        assert context.sequence_parallel_enabled is True
 
 
 @pytest.mark.cpu

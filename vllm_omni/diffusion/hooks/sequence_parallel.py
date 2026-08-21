@@ -60,6 +60,12 @@ _SP_INPUT_HOOK_TEMPLATE = "sp_input---{}"
 _SP_OUTPUT_HOOK_TEMPLATE = "sp_output---{}"
 
 
+def _sequence_parallel_enabled() -> bool:
+    from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+    return not is_forward_context_available() or get_forward_context().sequence_parallel_enabled
+
+
 @dataclass
 class ModuleForwardMetadata:
     """Metadata for mapping forward() parameter names to args/kwargs positions.
@@ -181,6 +187,9 @@ class SequenceParallelSplitHook(ModelHook):
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         """Shard inputs before forward."""
+        if not _sequence_parallel_enabled():
+            return args, kwargs
+
         args_list = list(args)
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
@@ -235,6 +244,9 @@ class SequenceParallelSplitHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Shard outputs for split_output=True entries."""
+        if not _sequence_parallel_enabled():
+            return output
+
         from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
         is_tensor = isinstance(output, torch.Tensor)
@@ -482,6 +494,9 @@ class SequenceParallelGatherHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Gather outputs after forward and remove padding if applied."""
+        if not _sequence_parallel_enabled():
+            return output
+
         from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
         is_tensor = isinstance(output, torch.Tensor)

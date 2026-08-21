@@ -49,6 +49,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # Some pipelines reuse the SP process group for a different parallel
+    # strategy in selected phases. Disable both _sp_plan hooks and SP
+    # attention while such a phase-local forward is running.
+    sequence_parallel_enabled: bool = True
 
     @property
     def sp_active(self) -> bool:
@@ -58,6 +62,8 @@ class ForwardContext:
         - If _sp_plan hooks are NOT applied: default to True when sequence_parallel_size > 1,
           since _sp_shard_depth is only meaningful within the _sp_plan hook mechanism.
         """
+        if not self.sequence_parallel_enabled:
+            return False
         if self.sp_plan_hooks_applied:
             return self._sp_shard_depth > 0
         # No _sp_plan: assume SP active when configured (manual SP, standalone tests)
@@ -170,6 +176,30 @@ def override_forward_context(forward_context: ForwardContext | None):
         yield
     finally:
         _forward_context = prev_context
+
+
+@contextmanager
+def set_sequence_parallel_enabled(enabled: bool, *, allow_active_shard_depth: bool = False):
+    """Temporarily enable or disable SP for the active forward context.
+
+    ``allow_active_shard_depth`` is reserved for phase-local parallel strategies
+    that receive full, unsharded tensors but reuse an SP process group. Some
+    multi-branch SP plans can leave the activity depth non-zero between complete
+    transformer calls, so those strategies must explicitly opt in.
+    """
+    if _forward_context is None:
+        yield
+        return
+
+    if not enabled and _forward_context._sp_shard_depth and not allow_active_shard_depth:
+        raise RuntimeError("Cannot disable sequence parallelism inside an active SP-sharded region.")
+
+    previous = _forward_context.sequence_parallel_enabled
+    _forward_context.sequence_parallel_enabled = enabled
+    try:
+        yield
+    finally:
+        _forward_context.sequence_parallel_enabled = previous
 
 
 @contextmanager

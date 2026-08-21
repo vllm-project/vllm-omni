@@ -25,6 +25,8 @@ LTX_EXTRA_BODY_PARAMS = frozenset(
         "stage_1_sigmas",
         "stage_2_sigmas",
         "image_crf",
+        "ltx_tiled_data_parallel",
+        "ltx_tiled_data_parallel_overlap",
     }
 )
 

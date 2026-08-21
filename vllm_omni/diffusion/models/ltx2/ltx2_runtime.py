@@ -20,6 +20,11 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size as get_guidance_parallel_world_size,
 )
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -49,6 +54,7 @@ from .ltx2_guidance import (
 )
 from .ltx2_phase_adapter import LTXPhaseAdapterRuntime, build_ltx_phase_adapter
 from .ltx2_recipes import (
+    LTX_TILED_STAGE_2_SIGMAS,
     LTXPhaseRecipe,
     LTXPipelineRecipe,
     resolve_ltx_pipeline_recipe,
@@ -57,6 +63,11 @@ from .ltx2_request import (
     LTXRequestInputs,
     LTXRequestMixin,
     validate_pipeline_request,
+)
+from .ltx2_tiled_data_parallel import (
+    LTXTiledDataParallelPlan,
+    build_spatial_tiling_plan,
+    forward_tiled_data_parallel,
 )
 
 
@@ -235,6 +246,7 @@ class LTXRuntime(
             request_sigmas=request_sigmas,
             request_phase_sigmas=request_phase_sigmas,
         )
+        self._validate_tiled_data_parallel_request(request_inputs)
         phase_adapter = getattr(self, "_phase_adapter", None)
         if phase_adapter is not None and any(
             getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
@@ -264,13 +276,18 @@ class LTXRuntime(
         prompt_context = None
         for phase_index, phase_recipe in enumerate(self.pipeline_recipe.phases):
             override_sigmas = None if request_phase_sigmas is None else request_phase_sigmas[phase_index]
+            tiled_phase = request_inputs.tiled_data_parallel and phase_recipe.input_transform == "spatial_upsample"
             phase_sigmas = (
                 override_sigmas
                 if override_sigmas is not None
                 else (
                     request_sigmas
                     if request_sigmas is not None
-                    else (list(phase_recipe.sigmas) if phase_recipe.sigmas is not None else None)
+                    else (
+                        list(LTX_TILED_STAGE_2_SIGMAS)
+                        if tiled_phase
+                        else (list(phase_recipe.sigmas) if phase_recipe.sigmas is not None else None)
+                    )
                 )
             )
             self._enter_phase(phase_recipe)
@@ -282,8 +299,8 @@ class LTXRuntime(
             if phase_sigmas is not None:
                 phase_inputs = replace(phase_inputs, num_inference_steps=len(phase_sigmas) - 1)
             noise_scale = phase_recipe.noise_scale
-            if override_sigmas is not None and phase_recipe.input_transform == "spatial_upsample":
-                noise_scale = float(override_sigmas[0])
+            if phase_sigmas is not None and phase_recipe.input_transform == "spatial_upsample":
+                noise_scale = float(phase_sigmas[0])
             phase_result = self.run_phase(
                 req,
                 phase_inputs,
@@ -299,10 +316,11 @@ class LTXRuntime(
             prompt_context = phase_result.forward_context.prompt_context
 
         final_context = phase_results[-1].forward_context
+        audio_output_phase = 0 if request_inputs.tiled_data_parallel else self.pipeline_recipe.audio_output_phase
         output_phase = LTXPhaseResult(
             forward_context=final_context,
             video=phase_results[self.pipeline_recipe.video_output_phase].video,
-            audio=phase_results[self.pipeline_recipe.audio_output_phase].audio,
+            audio=phase_results[audio_output_phase].audio,
         )
         return self.decode_phase(output_phase)
 
@@ -398,6 +416,77 @@ class LTXRuntime(
         if callable(cache_context):
             return cache_context(context_name)
         return nullcontext()
+
+    def _validate_tiled_data_parallel_request(self, request_inputs: LTXRequestInputs) -> None:
+        if not request_inputs.tiled_data_parallel:
+            return
+        if self.model_version != "2.5":
+            raise ValueError("LTX tiled data parallelism is currently qualified only for LTX-2.5.")
+
+        parallel = self.od_config.parallel_config
+        unsupported = {
+            "tensor_parallel_size": parallel.tensor_parallel_size,
+            "data_parallel_size": parallel.data_parallel_size,
+            "pipeline_parallel_size": parallel.pipeline_parallel_size,
+            "ring_degree": parallel.ring_degree,
+            "allgather_degree": parallel.allgather_degree,
+            "cfg_parallel_size": parallel.cfg_parallel_size,
+        }
+        expected = {
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "ring_degree": 1,
+            "allgather_degree": 1,
+            "cfg_parallel_size": 1,
+        }
+        invalid = [f"{name}={value}" for name, value in unsupported.items() if value != expected[name]]
+        if invalid:
+            raise ValueError(
+                "LTX tiled data parallelism currently requires TP=DP=PP=CFG=1 and Ulysses-only SP; got "
+                + ", ".join(invalid)
+                + "."
+            )
+        if parallel.use_hsdp:
+            raise ValueError("LTX tiled data parallelism does not currently support HSDP.")
+        if (parallel.sequence_parallel_size or 1) <= 1:
+            raise ValueError("LTX tiled data parallelism requires sequence_parallel_size > 1.")
+        if not self.od_config.enforce_eager:
+            raise ValueError("LTX tiled data parallelism currently requires enforce_eager=True.")
+        if getattr(self.od_config, "cache_backend", None) not in (None, "none"):
+            raise ValueError("LTX tiled data parallelism does not currently support a diffusion cache backend.")
+
+    def _prepare_tiled_data_parallel_plan(
+        self,
+        request_inputs: LTXRequestInputs,
+        phase_recipe: LTXPhaseRecipe,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> LTXTiledDataParallelPlan | None:
+        if not request_inputs.tiled_data_parallel or phase_recipe.input_transform != "spatial_upsample":
+            return None
+        return build_spatial_tiling_plan(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            world_size=get_sequence_parallel_world_size(),
+            rank=get_sequence_parallel_rank(),
+            overlap=request_inputs.tiled_data_parallel_overlap,
+            device=device,
+        )
+
+    def _forward_transformer(
+        self,
+        forward_ctx: LTXForwardContext,
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        plan = forward_ctx.tiled_data_parallel_plan
+        if plan is None:
+            return self.transformer(**kwargs)
+        return forward_tiled_data_parallel(self.transformer, kwargs, plan, get_sp_group())
 
     def predict_noise(self, **kwargs):
         with self._transformer_cache_context("cond_uncond"):
@@ -514,6 +603,8 @@ class LTXRuntime(
         decode_timestep: float | list[float],
         decode_noise_scale: float | list[float] | None,
         prompt_batch_size: int,
+        output_height: int | None = None,
+        output_width: int | None = None,
     ) -> DiffusionOutput:
         if output_type == "latent":
             return self._make_output((latents, audio_latents))
@@ -556,6 +647,10 @@ class LTXRuntime(
             )
 
         if video.numel() > 0:
+            if output_height is not None or output_width is not None:
+                crop_height = video.shape[-2] if output_height is None else output_height
+                crop_width = video.shape[-1] if output_width is None else output_width
+                video = video[..., :crop_height, :crop_width]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
         audio = self.vocoder(generated_mel)
@@ -910,6 +1005,8 @@ class LTXRuntime(
             decode_timestep=request_inputs.decode_timestep,
             decode_noise_scale=request_inputs.decode_noise_scale,
             prompt_batch_size=forward_ctx.batch_size,
+            output_height=getattr(request_inputs, "output_height", None),
+            output_width=getattr(request_inputs, "output_width", None),
         )
         if not self.supports_request_batch:
             return output

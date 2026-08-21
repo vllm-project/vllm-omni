@@ -236,6 +236,8 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
             "stage_1_sigmas",
             "stage_2_sigmas",
             "image_crf",
+            "ltx_tiled_data_parallel",
+            "ltx_tiled_data_parallel_overlap",
         }
     )
 

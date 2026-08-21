@@ -20,6 +20,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
+    _resolve_async_output_timeout,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -33,6 +34,18 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("raw_value", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_async_output_timeout_rejects_non_positive_or_non_finite_values(raw_value: str) -> None:
+    with pytest.raises(ValueError, match="must be a positive finite number"):
+        _resolve_async_output_timeout(raw_value)
+
+
+@pytest.mark.cpu
+def test_async_output_timeout_accepts_large_video_transfer_window() -> None:
+    assert _resolve_async_output_timeout("300") == 300.0
 
 
 @dataclass

@@ -36,6 +36,13 @@ LingBot-Video MoE transformer.
 - **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
 - **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
 
+### [LTX-2.5](ltx2/README.md) — Stage-2 Tiled Data Parallelism
+
+Manual four-GPU A/B generation for a matched-schedule global-SP baseline and
+Stage-2 tiled data parallelism. It reports latency, peak memory, profiler
+events, full-frame and overlap-band SSIM/PSNR, and produces a labeled
+side-by-side review video.
+
 ### [Distributed](distributed/omni_connectors/README.md) — RDMA Connector Testing
 
 RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`, including pytest-based single-node checks and manual cross-node benchmarks.
