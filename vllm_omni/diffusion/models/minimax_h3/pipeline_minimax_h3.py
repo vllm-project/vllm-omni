@@ -1140,12 +1140,25 @@ class MiniMaxH3Pipeline(
             self.od_config, "enable_distributed_layerwise_offload", False
         ):
             # Layerwise DiT offload already provides the low-residency encoder
-            # phase used by the checkpoint reference.
-            self.text_encoder.load_to_device()
+            # phase used by the checkpoint reference. The video VAE is not
+            # needed during text encoding and must not overlap the on-demand
+            # encoder on memory-constrained devices.
+            stage_video_vae = self.od_config.enable_layerwise_offload
+            if stage_video_vae:
+                self.video_vae.to("cpu")
             try:
+                if stage_video_vae:
+                    # Release the VAE's inactive allocations before loading the
+                    # encoder. Keep this out of other offload modes.
+                    torch.accelerator.empty_cache()
+                self.text_encoder.load_to_device()
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
             finally:
-                self.text_encoder.offload_to_cpu()
+                try:
+                    self.text_encoder.offload_to_cpu()
+                finally:
+                    if stage_video_vae:
+                        self.video_vae.to(self.device)
 
         # Keep both Qwen and DiT resident across requests. Moving either model
         # here makes encoder latency include a tens-of-gigabytes PCIe transfer,
