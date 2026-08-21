@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
@@ -33,7 +34,8 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     """
     stages = StageConfigFactory.create_default_diffusion(kwargs)
     engine_args = dict(stages[0]["engine_args"])
-    return OmniDiffusionConfig.from_kwargs(**engine_args)
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine_args, stage_id=0)
+    return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
 class TestParallelConfigPropagation:
@@ -50,9 +52,7 @@ class TestParallelConfigPropagation:
         stages = StageConfigFactory.create_default_diffusion({"parallel_config": pc, "model": "x"})
         assert stages[0]["runtime"]["devices"] == "0,1,2,3"
 
-        # Let __post_init__ reconstruct from dict (real code path)
-        ea = dict(stages[0]["engine_args"])
-        od = OmniDiffusionConfig.from_kwargs(**ea)
+        od = _roundtrip_diffusion_config(parallel_config=pc, model="x")
         assert od.parallel_config.tensor_parallel_size == 4
         assert od.parallel_config.world_size == 4
 
@@ -168,6 +168,17 @@ class TestCreateDefaultDiffusion:
         assert od.gpu_memory_utilization == 0.75
         assert od.max_num_batched_tokens == 2048
         assert od.max_model_len == 4096
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("enable_sleep_mod", None),
+            ("enable_lora", True),
+        ],
+    )
+    def test_unowned_raw_field_is_rejected(self, field_name, value):
+        with pytest.raises(ValueError, match=field_name):
+            StageConfigFactory.create_default_diffusion({"model": "x", field_name: value})
 
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():

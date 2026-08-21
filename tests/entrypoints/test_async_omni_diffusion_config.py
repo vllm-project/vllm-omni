@@ -13,14 +13,17 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_default_stage_config_includes_cache_backend():
-    """Ensure cache knobs survive the default diffusion-stage builder."""
+def test_default_stage_config_routes_diffusion_engine_args():
+    """Ensure default diffusion-stage args stay with their actual owner."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
         {
             "cache_backend": "cache_dit",
             "cache_config": '{"Fn_compute_blocks": 2}',
             "vae_use_slicing": True,
             "ulysses_degree": 2,
+            "seed": 7,
+            "kv_cache_dtype": "fp8",
+            "diffusion_kv_cache_dtype": "fp8_e4m3",
         }
     )[0]
 
@@ -31,6 +34,65 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["vae_use_slicing"] is True
     assert engine_args["parallel_config"].ulysses_degree == 2
     assert engine_args["model_stage"] == "diffusion"
+    assert "seed" not in engine_args
+    assert "kv_cache_dtype" not in engine_args
+    assert engine_args["diffusion_kv_cache_dtype"] == "fp8_e4m3"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("enable_sleep_mod", None),
+        ("enable_lora", True),
+        ("kv_cache_dtype", "fp8"),
+        ("seed", 7),
+    ],
+)
+def test_legacy_diffusion_stage_rejects_unowned_field(field_name, value):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.yaml_util import create_config
+    from vllm_omni.engine.stage_init_utils import build_diffusion_config
+
+    stage_dict = StageConfigFactory.create_default_diffusion({"model": "unused"})[0]
+    stage_dict["engine_args"][field_name] = value
+    stage_cfg = create_config(stage_dict)
+    metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None)
+
+    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
+        build_diffusion_config("unused", stage_cfg, metadata)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("enable_sleep_mod", None),
+        ("enable_lora", True),
+    ],
+)
+def test_default_diffusion_factory_rejects_unowned_field(field_name, value):
+    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
+        AsyncOmniEngine._create_default_diffusion_stage_cfg({field_name: value})
+
+
+def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch):
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.yaml_util import create_config
+    from vllm_omni.engine import stage_init_utils
+
+    stage_dict = StageConfigFactory.create_default_diffusion(
+        {
+            "model": "unused",
+            "api_key": "frontend-owned",
+        }
+    )[0]
+    assert "api_key" not in stage_dict["engine_args"]
+    stage_cfg = create_config(stage_dict)
+    metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+
+    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+
+    assert config.model == "unused"
 
 
 def test_default_cache_config_used_when_missing():
@@ -471,7 +533,7 @@ def test_serve_cli_accepts_additional_config():
         ]
     )
 
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(vars(args))[0]
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(args.get_explicit_kwargs_dict())[0]
 
     engine_args = stage_cfg["engine_args"]
 

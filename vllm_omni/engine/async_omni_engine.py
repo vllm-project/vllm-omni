@@ -29,6 +29,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.omni_config import normalize_and_validate_diffusion_engine_ingress_kwargs
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -933,6 +934,7 @@ class AsyncOmniEngine:
         """Create a default single-stage diffusion config from kwargs."""
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
+        kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         normalized_kwargs = dict(kwargs)
         default_sampling_params = normalized_kwargs.get("default_sampling_params")
         if isinstance(default_sampling_params, str):

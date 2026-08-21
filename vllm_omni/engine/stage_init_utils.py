@@ -1466,9 +1466,16 @@ def build_diffusion_config(
     metadata: StageMetadata,
 ) -> Any:
     """Build diffusion config for a stage."""
+    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    stage_id = engine_args_dict.get("stage_id", metadata.stage_id)
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+        engine_args_dict,
+        stage_id=stage_id,
+        include_engine_adapter_metadata=True,
+    )
+    od_config = OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var

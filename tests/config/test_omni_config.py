@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import fields
 from inspect import Parameter, signature
 from pathlib import Path
@@ -45,6 +46,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -105,6 +107,29 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
     omni_config = _from_pipeline_key("personaplex", deploy_config_path=str(deploy_path))
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
+
+
+def _build_single_diffusion_config(
+    *,
+    cli_overrides: dict | None = None,
+    engine_extras: dict | None = None,
+) -> VllmOmniConfig:
+    pipeline = PipelineConfig(
+        model_type="diffusion-owner-test",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        ),
+    )
+    deploy_stages = [StageDeployConfig(stage_id=0, engine_extras=engine_extras)] if engine_extras is not None else []
+    return VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(async_chunk=False, stages=deploy_stages),
+        cli_overrides=cli_overrides,
+    )
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
@@ -278,7 +303,7 @@ def test_from_pipeline_config_normalizes_nested_parallel_config_aliases(field_na
     assert "data_parallel_master_ip" in stage.parallel_config._omni_explicit_fields
 
 
-def test_from_pipeline_config_accepts_diffusion_only_cli_fields_for_diffusion_stage():
+def test_from_pipeline_config_keeps_global_kv_cache_dtype_outside_diffusion_stage():
     stage = _from_pipeline_key(
         "dreamzero",
         deploy_config_path="dreamzero_tp1_cfg2",
@@ -286,11 +311,15 @@ def test_from_pipeline_config_accepts_diffusion_only_cli_fields_for_diffusion_st
     ).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
-    assert stage.diffusion_config.diffusion_kv_cache_dtype == "fp8"
+    assert stage.diffusion_config.diffusion_kv_cache_dtype is None
 
 
 def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
-    assert omni_config_module._stage_cli_overrides(0, {"enable_lora": True}) == {"enable_lora": True}
+    assert omni_config_module._stage_cli_overrides(
+        0,
+        StageExecutionType.LLM_AR,
+        {"enable_lora": True},
+    ) == {"enable_lora": True}
 
 
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
@@ -1092,17 +1121,18 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
 def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "TEA_CACHE")
 
-    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
-        diffusion_attention_backend="flash_attn",
-        fa_deterministic=True,
-        kv_cache_dtype="fp8",
-        kv_cache_skip_steps="0-1",
-        kv_cache_skip_layers=[2],
-        static_lora_scale=0.25,
-        diffusion_kv_mode="paged_scheduler",
-        diffusers_load_kwargs=None,
-        diffusers_call_kwargs=None,
-    )
+    with pytest.warns(FutureWarning):
+        cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+            diffusion_attention_backend="flash_attn",
+            fa_deterministic=True,
+            kv_cache_dtype="fp8",
+            kv_cache_skip_steps="0-1",
+            kv_cache_skip_layers=[2],
+            static_lora_scale=0.25,
+            diffusion_kv_mode="paged_scheduler",
+            diffusers_load_kwargs=None,
+            diffusers_call_kwargs=None,
+        )
 
     assert cfg.diffusion_attention_config.default.backend == "flash_attn"
     assert cfg.fa_deterministic is True
@@ -1116,7 +1146,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
+def test_from_pipeline_config_normalizes_diffusion_attention_alias_from_engine_args(tmp_path):
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -1132,10 +1162,11 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
         )
     )
 
-    stage = _from_pipeline_key(
-        "dreamzero",
-        deploy_config_path=str(deploy_path),
-    ).stage_by_id(0)
+    with pytest.warns(FutureWarning):
+        stage = _from_pipeline_key(
+            "dreamzero",
+            deploy_config_path=str(deploy_path),
+        ).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_attention_config.default.backend == "flash_attn"
@@ -1219,3 +1250,77 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_diffusion_config_projection_rejects_unknown_none():
+    with pytest.raises(ValueError, match="enable_sleep_mod"):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(enable_sleep_mod=None)
+
+
+def test_runtime_diffusion_config_rejects_unknown_none():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match="enable_sleep_mod"):
+        OmniDiffusionConfig.from_kwargs(enable_sleep_mod=None)
+
+
+def test_direct_diffusion_aliases_promote_none_and_reject_real_conflicts(monkeypatch):
+    from vllm_omni.diffusion import data as diffusion_data
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    monkeypatch.setattr(diffusion_data, "build_quant_config", lambda config: config)
+    with pytest.warns(FutureWarning) as warnings:
+        config = OmniDiffusionConfig.from_kwargs(
+            quantization={"method": "example"},
+            quantization_config=None,
+            kv_cache_dtype="fp8",
+            diffusion_kv_cache_dtype=None,
+            enable_sleep_mode=False,
+            request_batch_max_wait_ms=0.0,
+        )
+
+    warning_messages = [str(warning.message) for warning in warnings]
+    assert any("quantization" in message for message in warning_messages)
+    assert any("kv_cache_dtype" in message for message in warning_messages)
+    assert config.quantization_config == {"method": "example"}
+    assert config.diffusion_kv_cache_dtype == "fp8"
+    assert config.enable_sleep_mode is False
+    assert config.request_batch_max_wait_ms == 0.0
+    with pytest.raises(ValueError, match=r"quantization.*quantization_config"):
+        OmniDiffusionConfig.from_kwargs(quantization="fp8", quantization_config={"method": "example"})
+
+
+def test_structured_diffusion_stage_rejects_unknown_engine_extra():
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        _build_single_diffusion_config(engine_extras={"enable_sleep_mod": None})
+
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        _build_single_diffusion_config(cli_overrides={"enable_sleep_mod": None})
+
+    with pytest.raises(ValueError, match=r"stage 0.*enable_sleep_mod"):
+        _build_single_diffusion_config(cli_overrides={"stage_0_enable_sleep_mod": None})
+
+    with pytest.raises(ValueError, match=r"no structured config owner: parallel_config\.unknown_field"):
+        _build_single_diffusion_config(engine_extras={"parallel_config": {"unknown_field": 1}})
+
+
+def test_structured_diffusion_stage_keeps_shared_globals_outside_diffusion():
+    with warnings.catch_warnings(record=True) as caught:
+        stage = _build_single_diffusion_config(
+            cli_overrides={"kv_cache_dtype": "fp8", "seed": 7},
+        ).stage_by_id(0)
+
+    assert stage.diffusion_config.diffusion_kv_cache_dtype is None
+    assert not any(issubclass(warning.category, FutureWarning) for warning in caught)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "config_kwargs"),
+    [
+        ("seed", {"cli_overrides": {"stage_0_seed": None}}),
+        ("kv_cache_dtype", {"engine_extras": {"kv_cache_dtype": "fp8"}}),
+    ],
+)
+def test_structured_diffusion_stage_rejects_explicit_shared_engine_field(field_name, config_kwargs):
+    with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
+        _build_single_diffusion_config(**config_kwargs)
