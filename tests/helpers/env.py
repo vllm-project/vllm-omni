@@ -18,13 +18,21 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 
-def get_physical_device_indices(devices):
+def get_physical_device_indices(devices: list[int]) -> list[int]:
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices is None:
         return devices
     visible_indices = [int(x) for x in visible_devices.split(",")]
     index_mapping = {i: physical for i, physical in enumerate(visible_indices)}
-    return [index_mapping[i] for i in devices if i in index_mapping]
+    out = []
+    for i in devices:
+        if i not in index_mapping:
+            raise ValueError(
+                f"Device index {i} is not in visible devices {visible_indices} "
+                f"(CUDA_VISIBLE_DEVICES={visible_devices})"
+            )
+        out.append(index_mapping[i])
+    return out
 
 
 def pick_least_used_device_indices(num_devices: int) -> list[int]:
