@@ -47,19 +47,19 @@
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.1594
+              0.3038
             ],
             "mean_ttft_ms": [
-              274.164
+              139.997
             ],
             "mean_e2el_ms": [
-              6250.7696
+              3269.8807
             ],
             "mean_audio_ttfp_ms": [
-              994.422
+              456.073
             ],
             "mean_audio_rtf": [
-              0.46163
+              0.2254
             ]
           },
           "A3": {

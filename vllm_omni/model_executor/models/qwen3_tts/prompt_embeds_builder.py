@@ -85,6 +85,37 @@ def build_instruct_text(instruct: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def resolve_x_vector_only(info_dict: dict) -> bool | None:
+    """Resolve whether a request runs Base voice-clone in x-vector-only mode.
+
+    Mirrors the resolution in :meth:`Qwen3TTSPromptEmbedsBuilder.build_prompt_embeds`
+    for the ``task_type == "Base"`` branch: the ``x_vector_only_mode`` flag, then
+    the ``voice_clone_prompt.icl_mode`` override when present.
+
+    Returns ``None`` when the mode does not apply (any non-Base task), so callers
+    can distinguish "in-context" from "not a voice-clone request at all".
+    """
+    task_type = first_value(info_dict.get("task_type"), "CustomVoice")
+    if task_type != "Base":
+        return None
+
+    xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
+
+    raw = info_dict.get("voice_clone_prompt")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        raw = raw[0]
+    if isinstance(raw, dict) and "icl_mode" in raw:
+        icl_flag = raw.get("icl_mode")
+        if isinstance(icl_flag, list):
+            icl_flag = icl_flag[0] if icl_flag else None
+        if isinstance(icl_flag, bool):
+            xvec_only = not icl_flag
+
+    return xvec_only
+
+
 def first_value(value: object, default: object = None) -> object:
     if isinstance(value, list):
         return value[0] if value else default

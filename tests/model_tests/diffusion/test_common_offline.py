@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
@@ -17,7 +20,7 @@ from tests.model_tests.diffusion.task_runners import (
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
@@ -50,7 +53,7 @@ def test_pipeline_on_supported_tasks(
     )
     try:
         for task_type in supported_tasks:
-            with subtests.test(msg=task_type):
+            with subtests.test(msg=task_type.value):
                 if task_type == DiffusionTasks.TEXT_TO_IMAGE:
                     run_and_validate_text_to_image_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:

@@ -73,6 +73,10 @@ stages:
       # audio (HTTP 400). See #4962.
       min_tokens: 2
       repetition_penalty: 1.05
+    # Suppress codebook-0 silence tokens for the first N decode frames of a
+    # request (#4966). Applies to every request on this stage, so intended
+    # for x-vector-only (Base voice-clone) deploys. 0 = off.
+    silence_ban_frames: 0
     subtalker_sampling_params:
       do_sample: true
       temperature: 0.9
