@@ -41,20 +41,46 @@ CPR is not redundant with RTF. RTF is a ratio of aggregates: a session can hold
 bursts that individually miss their playout instants.
 
 Deadlines assume a declared playout grid. Playback starts once `--buffer-chunks`
-chunks are buffered; chunk `buffer_chunks - 1` anchors the grid and every later
-chunk is due one release period after its predecessor. Chunks inside the
-prebuffer have no deadline — their cost is start latency, which TTFC reports.
+chunks are buffered; from that instant the player consumes continuously, so
+
+```
+deadline(i) = t_ready(buffer_chunks - 1) + cumulative_frames(i) / target_fps
+```
+
+Chunks inside the prebuffer have no deadline — their cost is start latency,
+which TTFC reports. Walking cumulative frames rather than multiplying a constant
+period is what lets a deeper buffer grant real slack, and what keeps a causal
+decoder's shorter opening chunk from being credited with a full period.
 
 ## Model neutrality
 
 The chunk shape comes from the pipeline's declared `ARDiffusionKVCacheSpec`. No
 model name appears in this directory.
 
-One value is not derivable from the capability today: every frame count in the
-spec is in *latent* frames and nothing converts them to delivered frames, so the
-playout grid cannot be computed from the spec alone. Until the spec declares it,
-supply `--vae-temporal-factor` (default `1`, correct for a decoder that does not
+One conversion is not derivable from the capability today: every frame count in
+the spec is in *latent* frames and nothing converts them to delivered frames, so
+the playout grid cannot be computed from the spec alone. Supply
+`--vae-temporal-factor` (default `1`, correct for a decoder that does not
 compress time).
+
+**The conversion is not a multiplication.** A causal video decoder expands a
+session's first latent frame to one raw frame and every later one to the full
+factor, so `n` latent frames become `(n - 1) * factor + 1` raw frames the first
+time and `n * factor` every time after:
+
+| | latent frames | raw frames |
+|---|---|---|
+| chunk 0 | 3 | **9** |
+| chunk k > 0 | 3 | 12 |
+| K chunks | 3K | **12K − 3** |
+
+So `chunks x frames_per_chunk` over-counts every run. The profile carries
+`frames_per_first_chunk` alongside `frames_per_chunk`, and both `generated_fps`
+and `RTF` sum the per-chunk delivery. Pass `--non-causal-decoder` for a decoder
+that expands every latent frame identically.
+
+This is also why a single declared integer could not close the gap: the missing
+piece is a *mapping*, not a factor.
 
 ## Usage
 

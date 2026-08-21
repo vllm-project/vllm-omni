@@ -129,6 +129,7 @@ def test_profile_is_built_from_a_declared_spec() -> None:
     profile = load_profile_from_spec(
         {"frames_per_block": 3, "vae_temporal_factor": 4, "resident_bytes_per_session": 1024},
         target_fps=16.0,
+        causal=False,
     )
     assert profile.frames_per_chunk == 12
     assert profile.resident_bytes_per_session == 1024
@@ -173,12 +174,14 @@ def test_deadlines_anchor_on_the_buffer_and_skip_the_prebuffer() -> None:
     assert deadlines[2] == pytest.approx(2.50)
 
 
-def test_deeper_buffer_moves_the_playout_grid_later() -> None:
+def test_deeper_buffer_grants_real_slack() -> None:
+    """Playback starts at the anchor holding two chunks, so chunk 2 is due
+    after both have played -- not one period after the anchor arrived."""
     profile = WorkloadProfile(frames_per_chunk=12, target_fps=16.0, buffer_chunks=2)
     record = _record("s", [1.0, 1.5, 2.0])
     deadlines = chunk_deadlines(record, profile)
     assert set(deadlines) == {2}
-    assert deadlines[2] == pytest.approx(2.25)
+    assert deadlines[2] == pytest.approx(1.5 + 24 / 16.0)
 
 
 def test_cpr_counts_only_chunks_that_had_a_deadline() -> None:
@@ -203,6 +206,48 @@ def test_rtf_compares_wall_time_against_video_time() -> None:
     record = _record("s", [0.375, 0.75, 1.125, 1.5], submit_gap=0.375)
     summary = summarize_session(record, PROFILE, mode=LoadMode.SATURATING)
     assert summary.rtf == pytest.approx((1.5 - 0.0) / 3.0)
+
+
+CAUSAL = WorkloadProfile(frames_per_chunk=12, frames_per_first_chunk=9, target_fps=16.0)
+
+
+def test_causal_decoder_delivers_a_shorter_opening_chunk() -> None:
+    """(n - 1) * factor + 1 for the opening block, n * factor after it.
+
+    3 latent frames at temporal factor 4 is 9 raw frames the first time and 12
+    every time after, so K chunks deliver 12K - 3 frames, not 12K.
+    """
+    assert CAUSAL.is_causal is True
+    assert CAUSAL.frames_at(0) == 9
+    assert CAUSAL.frames_at(1) == CAUSAL.frames_at(7) == 12
+    assert CAUSAL.cumulative_frames(10) == 117  # matches the pipeline's 117-frame horizon
+    assert CAUSAL.cumulative_frames(0) == 0
+
+    summary = summarize_session(_record("s", [1.0, 2.0, 3.0]), CAUSAL, mode=LoadMode.SATURATING)
+    assert summary.frames == 9 + 12 + 12
+    # The uniform profile over-counts the same three chunks.
+    assert summarize_session(_record("s", [1.0, 2.0, 3.0]), PROFILE, mode=LoadMode.SATURATING).frames == 36
+
+
+def test_non_causal_profile_is_the_default_and_stays_uniform() -> None:
+    assert PROFILE.is_causal is False
+    assert PROFILE.frames_at(0) == PROFILE.frames_at(5) == 12
+    assert PROFILE.cumulative_frames(3) == 36
+
+
+def test_causal_opening_chunk_is_not_credited_with_a_full_period() -> None:
+    """The opening chunk buys 9/16 s of playback, so chunk 1 is due sooner."""
+    record = _record("s", [1.0, 1.5, 2.0])
+    assert chunk_deadlines(record, CAUSAL)[1] == pytest.approx(1.0 + 9 / 16.0)
+    assert chunk_deadlines(record, PROFILE)[1] == pytest.approx(1.0 + 12 / 16.0)
+
+
+def test_causal_profile_from_spec_matches_the_pipeline_geometry() -> None:
+    spec = {"frames_per_block": 3, "vae_temporal_factor": 4}
+    causal = load_profile_from_spec(spec, target_fps=16.0)
+    assert (causal.frames_per_first_chunk, causal.frames_per_chunk) == (9, 12)
+    uniform = load_profile_from_spec(spec, target_fps=16.0, causal=False)
+    assert (uniform.frames_per_first_chunk, uniform.frames_per_chunk) == (12, 12)
 
 
 def test_cpr_is_macro_averaged_so_a_lagging_session_is_not_diluted() -> None:
@@ -504,19 +549,21 @@ def test_arrival_rate_switches_to_poisson() -> None:
     assert any(offset > 0 for offset in config.arrivals.offsets_s)
 
 
-def test_frames_per_chunk_needs_a_factor_the_spec_does_not_declare() -> None:
-    """ARDiffusionKVCacheSpec counts latent frames and declares no VAE factor.
+def test_frames_per_chunk_needs_a_mapping_the_spec_does_not_declare() -> None:
+    """ARDiffusionKVCacheSpec counts latent frames and declares no conversion.
 
-    The harness therefore takes the factor from the caller instead of guessing,
-    and a pipeline whose decoder does not compress time uses the default of 1.
+    The harness takes it from the caller instead of guessing. Note the result
+    is a pair, not a scalar: the conversion is causal, so a single declared
+    integer could not express it.
     """
     from benchmarks.ar_diffusion.run_realtime_benchmark import frames_per_chunk_from_spec
 
     class Spec:
         frames_per_block = 3
 
-    assert frames_per_chunk_from_spec(Spec()) == 3
-    assert frames_per_chunk_from_spec(Spec(), vae_temporal_factor=4) == 12
+    assert frames_per_chunk_from_spec(Spec()) == (3, 3)
+    assert frames_per_chunk_from_spec(Spec(), vae_temporal_factor=4) == (12, 9)
+    assert frames_per_chunk_from_spec(Spec(), vae_temporal_factor=4, causal=False) == (12, 12)
     with pytest.raises(ValueError, match="vae_temporal_factor"):
         frames_per_chunk_from_spec(Spec(), vae_temporal_factor=0)
 
