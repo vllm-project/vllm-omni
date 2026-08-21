@@ -144,7 +144,7 @@ H3_MODEL_PARAMS = MiniMaxH3ModelSpecificParams(
     }
 )
 
-LORA_PARAMS = {"local_path": "test_lora_path", "name": "test_name", "scale": 0.7, "int_id": 10}
+LORA_PARAMS = {"scale": 0.7, "name": "style"}
 
 
 def _build_image_output(size: tuple[int, int] = (IMAGE_WIDTH, IMAGE_HEIGHT), color: str = "red") -> Image.Image:
@@ -258,13 +258,7 @@ def _assert_sampling_param_values(
         )
     if expected_lora:
         assert received.lora_request.lora_name == expected_lora["name"], (
-            f"Expected lora name={(expected_lora['name'])}, got {received.lora_request.lora_name}. The received sampling params: {received}"
-        )
-        assert received.lora_request.lora_int_id == expected_lora["int_id"], (
-            f"Expected lora int_id={expected_lora['int_id']}, got {received.lora_request.lora_int_id}. The received sampling params: {received}"
-        )
-        assert received.lora_request.lora_path == expected_lora["local_path"], (
-            f"Expected lora path={expected_lora['local_path']}, got {received.lora_request.lora_path}. The received sampling params: {received}"
+            f"Expected lora name={expected_lora['name']}, got {received.lora_request.lora_name}. The received sampling params: {received}"
         )
         assert received.lora_scale == expected_lora["scale"], (
             f"Expected lora scale={expected_lora['scale']}, got {received.lora_scale}. The received sampling params: {received}"

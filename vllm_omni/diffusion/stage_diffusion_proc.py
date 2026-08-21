@@ -143,7 +143,11 @@ class StageDiffusionProc:
         if lora_req is not None:
             from vllm.lora.request import LoRARequest
 
-            if not isinstance(lora_req, LoRARequest):
+            if isinstance(lora_req, (list, tuple)):
+                sampling_params_dict["lora_request"] = tuple(
+                    req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_req
+                )
+            elif not isinstance(lora_req, LoRARequest):
                 sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)

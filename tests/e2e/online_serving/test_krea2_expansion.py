@@ -107,9 +107,8 @@ def _basic_lora_payload(lora: dict | None = None) -> dict:
         "num_inference_steps": 8,
         "guidance_scale": 0.0,
         "seed": 42,
+        "lora": [] if lora is None else lora,
     }
-    if lora is not None:
-        payload["lora"] = lora
     return payload
 
 
@@ -127,7 +126,10 @@ def _post_image(server: OmniServer, payload: dict) -> np.ndarray:
     "omni_server",
     [
         pytest.param(
-            OmniServerParams(model=MODEL, server_args=["--enforce-eager"]),
+            OmniServerParams(
+                model=MODEL,
+                server_args=["--enforce-eager", "--dynamic-lora", LORA],
+            ),
             id="single_card_lora",
             marks=SINGLE_CARD_FEATURE_MARKS,
         )
@@ -137,12 +139,15 @@ def _post_image(server: OmniServer, payload: dict) -> np.ndarray:
 def test_krea2_lora(omni_server: OmniServer):
     """Serve Krea 2 and validate per-request LoRA over ``/v1/images/generations``.
 
-    Passes ``LORA`` via the top-level ``lora`` object (``{name, path, scale}``) the diffusion
-    image route parses into a ``LoRARequest`` — no server-side LoRA flag needed. Confirms the
-    adapter has a visible effect and that omitting ``lora`` cleanly restores the base output.
+    Registers ``LORA`` at startup, then selects it through the top-level
+    ``lora`` request object. Confirms the adapter has a visible effect and that
+    an explicit empty composition cleanly restores the base output.
     """
     baseline = _post_image(omni_server, _basic_lora_payload())
-    with_lora = _post_image(omni_server, _basic_lora_payload({"name": "darkbrush", "path": LORA, "scale": 1.0}))
+    with_lora = _post_image(
+        omni_server,
+        _basic_lora_payload({"name": LORA.rsplit("/", 1)[-1], "scale": 1.0}),
+    )
     restored = _post_image(omni_server, _basic_lora_payload())
 
     diff_lora = np.abs(baseline - with_lora).mean()

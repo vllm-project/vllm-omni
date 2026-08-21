@@ -99,6 +99,17 @@ class YourPipeline(nn.Module, ProgressBarMixin):
 
 For custom loop structures, follow `vllm_omni/diffusion/models/progress_bar.py` and existing pipelines using `ProgressBarMixin`.
 
+### A4.2 Describe non-standard LoRA checkpoints (when needed)
+
+Do not add checkpoint conversion or fusion lifecycle code to the common
+backend. If the model publishes non-PEFT keys, custom alpha normalization,
+typed updates, or special component/packed-module routing, implement
+`get_lora_load_plan()` and `get_lora_apply_plan()` on the pipeline or model.
+Follow the [Diffusion LoRA guide](../../../docs/user_guide/diffusion/lora.md)
+and the MiniMax-H3, Qwen-Image, or Wan model-owned plans. The shared manager
+continues to own loading, caching, composition, dynamic execution, and
+prefusion.
+
 ### A5. Register, test, docs → continue at Step 4 below.
 
 ---

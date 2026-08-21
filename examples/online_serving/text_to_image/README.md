@@ -118,72 +118,8 @@ python gradio_demo.py
 
 ## LoRA
 
-This example supports both startup-time distilled LoRAs and request-time
-PEFT-compatible adapters. The LoRA path must be readable on the **server**
-machine (usually a local path or a mounted directory).
-
-### Start Server with a Distilled LoRA
-
-```bash
-vllm serve Qwen/Qwen-Image-2512 \
-  --omni \
-  --port 8091 \
-  --lora-backend distill \
-  --lora-path /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
-```
-
-The distilled LoRA is fused once during server initialization and applies to
-every request. Use the checkpoint's few-step sampling settings, for example
-`num_inference_steps=4` and `true_cfg_scale=1.0`.
-
-### Using Python Client with LoRA
-
-```bash
-python openai_chat_client.py \
-  --prompt "A piece of cheesecake" \
-  --lora-path /path/to/lora_adapter \
-  --lora-name my_lora \
-  --lora-scale 1.0 \
-  --output output.png
-```
-
-### Using curl with LoRA (Images API)
-
-The `/v1/images/generations` endpoint supports a `lora` field in the request body:
-
-```bash
-curl -X POST http://localhost:8091/v1/images/generations \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "A piece of cheesecake",
-    "size": "1024x1024",
-    "seed": 42,
-    "lora": {
-      "name": "my_lora",
-      "local_path": "/path/to/lora_adapter",
-      "scale": 1.0
-    }
-  }' | jq -r '.data[0].b64_json' | base64 -d > output.png
-```
-
-### LoRA Parameters
-
-| Parameter    | Type  | Description                                                               |
-| ------------ | ----- | ------------------------------------------------------------------------- |
-| `name`       | str   | LoRA adapter name (optional, defaults to path stem)                       |
-| `local_path` | str   | Server-local path to LoRA adapter folder (PEFT format, required)          |
-| `scale`      | float | LoRA scale factor (default: 1.0)                                          |
-| `int_id`     | int   | LoRA integer ID for caching (optional, derived from path if not provided) |
-
-### LoRA Adapter Format
-
-LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
-
-```
-lora_adapter/
-├── adapter_config.json
-└── adapter_model.safetensors
-```
+See the [Diffusion LoRA guide](../../../docs/user_guide/diffusion/lora.md)
+for startup fusion, dynamic registration, request selection, and adapter formats.
 
 ## Request Format
 

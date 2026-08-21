@@ -34,6 +34,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.lora.plan import (
+    DiffusionLoRAApplyPlan,
+    DiffusionLoRALoadPlan,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
@@ -74,6 +78,7 @@ from .condition_noise import (
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .lora import MINIMAX_H3_LORA_APPLY_PLAN, minimax_h3_lora_load_plan
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -571,6 +576,22 @@ class MiniMaxH3Pipeline(
         """Return the request-scoped Cache-DiT installation state."""
 
         return self._cache_dit_runtime.is_enabled
+
+    def get_lora_apply_plan(self) -> DiffusionLoRAApplyPlan:
+        """Apply FL2VA LoRAs only to the FL2VA transformer partition."""
+
+        return MINIMAX_H3_LORA_APPLY_PLAN
+
+    def get_lora_load_plan(
+        self,
+        adapter_path: str,
+        tensor_keys: tuple[str, ...],
+    ) -> DiffusionLoRALoadPlan | None:
+        """Describe how the shared backend loads known raw H3 adapters."""
+
+        if self.partition == "ref2va":
+            raise ValueError("MiniMax-H3 FL2VA LoRAs are not supported by a Ref2VA-only service")
+        return minimax_h3_lora_load_plan(adapter_path, tensor_keys)
 
     def __init__(
         self,

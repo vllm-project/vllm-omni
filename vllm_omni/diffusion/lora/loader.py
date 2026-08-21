@@ -1,461 +1,240 @@
-import os
-from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
-from diffusers.loaders.lora_conversion_utils import (
-    _convert_non_diffusers_qwen_lora_to_diffusers,
-    _convert_non_diffusers_wan_lora_to_diffusers,
-)
-from huggingface_hub import hf_hub_download
+import torch.nn as nn
 from safetensors.torch import load_file
 from vllm.logger import init_logger
+from vllm.lora.lora_model import LoRAModel
+from vllm.lora.peft_helper import PEFTHelper
+from vllm.lora.request import LoRARequest
+from vllm.lora.utils import get_adapter_absolute_path
 
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
+from vllm_omni.diffusion.lora.plan import (
+    AdditiveBiasUpdate,
+    ConvertedLoRAState,
+    DiffusionAdapterUpdate,
+    DiffusionLoRALoadPlan,
+)
+from vllm_omni.diffusion.lora.utils import _get_submodule
 
 logger = init_logger(__name__)
 
-lora_convert_mapping: dict[str, Callable] = {
-    "QwenImagePipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
-    "QwenImageEditPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
-    "QwenImageEditPlusPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
-    "Wan22Pipeline": _convert_non_diffusers_wan_lora_to_diffusers,
-    "Wan22I2VPipeline": _convert_non_diffusers_wan_lora_to_diffusers,
-}
+
+@dataclass(frozen=True)
+class LoadedDiffusionLoRA:
+    model: LoRAModel
+    peft_helper: PEFTHelper
+    auxiliary_updates: tuple[DiffusionAdapterUpdate, ...] = ()
 
 
-def get_converter_by_pipeline(pipeline):
-    for pipeline_cls in pipeline.__class__.__mro__:
-        converter = lora_convert_mapping.get(pipeline_cls.__name__)
-        if converter is not None:
-            return converter
-    return None
+class DiffusionLoRAAdapterLoader:
+    """Load diffusion adapters into the canonical vLLM LoRA representation."""
 
-
-def _prepare_lora_delta(
-    lora_state_dict,
-    base_key: str,
-    param_to_weight_names: dict[str, list[str]] | None = None,
-    is_bias: bool = False,
-    lora_a_suffix: str = "lora_A.weight",
-    lora_b_suffix: str = "lora_B.weight",
-    lora_bias_suffix: str = "bias",
-):
-    used_keys = set()
-    # stacked_params_mapping                       param_to_weight_names
-    # [(".to_qkv", ".to_q.", "q")
-    # (".to_qkv", ".to_k.", "k")  ========> {".to_qkv": [".to_q", ".to_k", ".to_v"]}
-    # (".to_qkv", ".to_v.", "v")]
-
-    # stacked_sd is to store packed parameter deltas (format: [str, list[torch.Tensor]])
-    # example: {".to_qkv": [delta_q, delta_k, delta_v]}
-    stacked_deltas = []
-    is_stacked_param = False
-    if param_to_weight_names is None:
-        param_to_weight_names = defaultdict(list)
-    for param_name, weight_names in param_to_weight_names.items():
-        if param_name not in base_key:
-            continue
-        is_stacked_param = True
-        # handle lora_a_key and lora_b_key together
-        if is_bias:
-            for weight_name in weight_names:
-                lora_bias_key = f"{base_key.replace(param_name, weight_name)}.{lora_bias_suffix}"
-                if lora_bias_key not in lora_state_dict:
-                    return None, used_keys
-                delta = lora_state_dict[lora_bias_key]
-                stacked_deltas.append(delta)
-                used_keys.add(lora_bias_key)
-        else:
-            for weight_name in weight_names:
-                lora_a_key = f"{base_key.replace(param_name, weight_name)}.{lora_a_suffix}"
-                lora_b_key = lora_a_key.replace(lora_a_suffix, lora_b_suffix)
-                if lora_a_key not in lora_state_dict or lora_b_key not in lora_state_dict:
-                    return None, used_keys
-                a = lora_state_dict[lora_a_key]
-                b = lora_state_dict[lora_b_key]
-                delta = torch.matmul(b, a)
-                stacked_deltas.append(delta)
-                used_keys.add(lora_a_key)
-                used_keys.add(lora_b_key)
-        continue
-
-    if is_stacked_param:
-        return torch.concat(stacked_deltas), used_keys
-
-    if is_bias:
-        lora_bias_key = f"{base_key}.{lora_bias_suffix}"
-        if lora_bias_key not in lora_state_dict:
-            return None, used_keys
-        used_keys.add(lora_bias_key)
-        return lora_state_dict[lora_bias_key], used_keys
-
-    lora_a_key = f"{base_key}.{lora_a_suffix}"
-    lora_b_key = f"{base_key}.{lora_b_suffix}"
-    if lora_a_key not in lora_state_dict or lora_b_key not in lora_state_dict:
-        return None, used_keys
-    a = lora_state_dict[lora_a_key]
-    b = lora_state_dict[lora_b_key]
-    used_keys.add(lora_a_key)
-    used_keys.add(lora_b_key)
-    return torch.matmul(b, a), used_keys
-
-
-def _load_lora_state_dict(
-    pretrained_model_name_or_path: str,
-    weights_name: str | None = None,
-    use_safetensors: bool = True,
-    subfolder: str | None = None,
-    cache_dir: str | None = None,
-    force_download: bool = False,
-    local_files_only: bool | None = None,
-):
-    # first we try to load it from local disk
-    if use_safetensors and pretrained_model_name_or_path.endswith(".safetensors"):
-        return load_file(pretrained_model_name_or_path)
-
-    if os.path.isdir(pretrained_model_name_or_path):
-        model_file = pretrained_model_name_or_path
-        if subfolder:
-            model_file = os.path.join(model_file, subfolder)
-        if weights_name is None:
-            raise ValueError("weights_name is required when loading from a directory")
-        model_file = os.path.join(model_file, weights_name)
-        return load_file(model_file)
-
-    # finally, we try to load it from the internet
-    try:
-        model_file = hf_hub_download(
-            pretrained_model_name_or_path,
-            filename=weights_name,
-            subfolder=subfolder,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            local_files_only=local_files_only,
-        )
-        return load_file(model_file)
-    except Exception as e:
-        logger.error(f"Failed to download {weights_name} from {pretrained_model_name_or_path}: {e}")
-        raise e
-
-
-def _remap_state_dict_keys(sd, rules):
-    """
-    Remap keys in a state_dict by sequentially applying a list of substring substitution rules.
-
-    This utility function transforms parameter names by applying a sequence of
-    (old_substring, new_substring) pairs. For each key in the input dictionary,
-    **all rules are evaluated in the given order**, and every rule whose
-    `old_substring` is found within the current key triggers a replacement.
-    Substitutions are cumulative: the key is updated after each match, and
-    subsequent rules operate on the result of previous replacements.
-
-    The order of rules matters; users are responsible for arranging them to
-    achieve the desired final key. Keys that do not match any rule are copied
-    unchanged.
-
-    Args:
-        sd (dict[str, Any]): Original state_dict mapping parameter names to tensors.
-        rules (List[Tuple[str, str]]): A list of (old_substring, new_substring) pairs.
-            Rules are applied sequentially, and **all matching rules are executed**.
-
-    Returns:
-        dict[str, Any]: A new state_dict with remapped keys. Values are unchanged.
-    """
-    new_sd = OrderedDict()
-    for k, v in sd.items():
-        new_key = k
-        matched = False
-        for p1, p2 in rules:
-            if p1 not in k:
-                continue
-            new_key = new_key.replace(p1, p2)
-            matched = True
-        if matched:
-            new_sd[new_key] = v
-        else:
-            new_sd[k] = v
-    return new_sd
-
-
-def _apply_diffusers_lora_alpha_scaling(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Fold Diffusers-format LoRA alpha values into their B matrices."""
-    scaled_state_dict = dict(state_dict)
-    for alpha_key in (key for key in state_dict if key.endswith(".alpha")):
-        base_key = alpha_key[: -len(".alpha")]
-        lora_a_key = f"{base_key}.lora_A.weight"
-        lora_b_key = f"{base_key}.lora_B.weight"
-        if lora_a_key not in state_dict or lora_b_key not in state_dict:
-            raise ValueError(f"LoRA alpha key {alpha_key!r} does not have matching lora_A and lora_B weights.")
-
-        rank = state_dict[lora_a_key].shape[0]
-        alpha = state_dict[alpha_key]
-
-        scaled_state_dict[lora_b_key] = state_dict[lora_b_key] * (alpha.item() / rank)
-        scaled_state_dict.pop(alpha_key)
-
-    return scaled_state_dict
-
-
-class LoraLoaderMixin:
-    transformer_name = "transformer"
-
-    # Lazy initialization to avoid MRO issues: __init__ may not be called
-    # when mixin with nn.Module
-    @property
-    def lora_loaded(self):
-        if not hasattr(self, "_lora_loaded"):
-            self._lora_loaded = {}
-        return self._lora_loaded
-
-    @lora_loaded.setter
-    def lora_loaded(self, value):
-        self._lora_loaded = value
-
-    @classmethod
-    def load_lora_into_module(
-        cls,
-        state_dict,
-        module,
-        prefix: str = "transformer",
-        lora_a_suffix: str = "lora_A.weight",
-        lora_b_suffix: str = "lora_B.weight",
-        lora_bias_suffix: str = "bias",
-    ):
-        lora_loaded_keys = set()
-
-        # prepare stacked parameters mapping for later use
-        # stacked_params_mapping                       param_to_weight_names
-        # [(".to_qkv", ".to_q.", "q")
-        # (".to_qkv", ".to_k.", "k")  ========> {".to_qkv": [".to_q", ".to_k", ".to_v"]}
-        # (".to_qkv", ".to_v.", "v")]
-        param_to_weight_names = defaultdict(list)
-        if hasattr(module, "stacked_params_mapping"):
-            for param_name, weight_name, _ in module.stacked_params_mapping:
-                param_to_weight_names[param_name].append(weight_name)
-
-        for name, params in module.named_parameters(prefix):
-            is_bias = False
-            if name.endswith(".bias"):
-                base_key = name[: -len(".bias")]
-                is_bias = True
-            elif name.endswith(".weight"):
-                base_key = name[: -len(".weight")]
-            else:
-                continue
-
-            delta, used_keys = _prepare_lora_delta(
-                state_dict,
-                base_key,
-                param_to_weight_names,
-                is_bias,
-                lora_a_suffix,
-                lora_b_suffix,
-                lora_bias_suffix,
-            )
-            if delta is None:
-                continue
-            lora_loaded_keys.update(used_keys)
-
-            delta = delta.to(device=params.device, dtype=params.dtype)
-            with torch.no_grad():
-                params.add_(delta)
-            del delta
-
-        missing_keys = set(state_dict.keys()) - lora_loaded_keys
-        for k in missing_keys:
-            logger.warning(f"Missing loading lora key: {k}")
-
-        logger.info(f"{len(lora_loaded_keys)} lora keys loaded into {module.__class__.__name__}.")
-        return lora_loaded_keys
-
-    @classmethod
-    def unload_module_lora(
-        cls,
-        state_dict,
-        module,
-        prefix: str = "transformer",
-        lora_a_suffix: str = "lora_A.weight",
-        lora_b_suffix: str = "lora_B.weight",
-        lora_bias_suffix: str = "bias",
-    ):
-        lora_unloaded_keys = set()
-
-        param_to_weight_names = defaultdict(list)
-        if hasattr(module, "stacked_params_mapping"):
-            for param_name, weight_name, _ in module.stacked_params_mapping:
-                param_to_weight_names[param_name].append(weight_name)
-
-        for name, param in module.named_parameters(prefix):
-            is_bias = False
-            if name.endswith(".bias"):
-                base_key = name[: -len(".bias")]
-                is_bias = True
-            elif name.endswith(".weight"):
-                base_key = name[: -len(".weight")]
-            else:
-                continue
-
-            delta, used_keys = _prepare_lora_delta(
-                state_dict,
-                base_key,
-                param_to_weight_names,
-                is_bias,
-                lora_a_suffix,
-                lora_b_suffix,
-                lora_bias_suffix,
-            )
-            if delta is None:
-                continue
-            lora_unloaded_keys.update(used_keys)
-
-            delta = delta.to(device=param.device, dtype=param.dtype)
-            with torch.no_grad():
-                param.sub_(delta)
-            del delta
-
-        missing_keys = set(state_dict.keys()) - lora_unloaded_keys
-        for k in missing_keys:
-            logger.warning(f"Missing unloading lora key: {k}")
-
-        logger.info(f"{len(lora_unloaded_keys)} lora keys unloaded from {module.__class__.__name__}.")
-        return lora_unloaded_keys
-
-
-class QwenImageLoraLoaderMixin(LoraLoaderMixin):
-    def load_lora_weights(
+    def __init__(
         self,
-        pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor],
-        adapter_name: str | None = None,
-    ):
-        if adapter_name in self.lora_loaded:
-            return
+        pipeline: nn.Module,
+        dtype: torch.dtype,
+        expected_lora_modules: set[str],
+        component_names: tuple[str, ...],
+    ) -> None:
+        self.pipeline = pipeline
+        self.dtype = dtype
+        self.expected_lora_modules = expected_lora_modules
+        self.component_names = component_names
 
-        if isinstance(pretrained_model_name_or_path_or_dict, dict):
-            state_dict = pretrained_model_name_or_path_or_dict
-        else:
-            state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
-
-        has_alpha = any(k.endswith(".alpha") for k in state_dict)
-        is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
-        is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
-        if has_alpha and is_diffusers_lora_format:
-            state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
-
-        if has_alpha or is_non_diffusers_format:
-            converter = get_converter_by_pipeline(self)
-            if converter is None:
-                raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
-
-            state_dict = converter(state_dict)
-
-        state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
-
-        self.load_lora_into_module(
-            state_dict,
-            self.transformer,
-            prefix=self.transformer_name,
-        )
-
-        self.lora_loaded[adapter_name] = state_dict
-
-    def unload_lora_weights(self, adapter_name: str):
-        if adapter_name not in self.lora_loaded:
-            return
-
-        state_dict = self.lora_loaded[adapter_name]
-
-        transformer = get_transformer_from_pipeline(self)
-        self.unload_module_lora(state_dict, transformer, prefix=self.transformer_name)
-
-        del self.lora_loaded[adapter_name]
-
-
-class WanLoraLoaderMixin(LoraLoaderMixin):
-    transformer_2_name = "transformer_2"
-
-    def load_lora_weights(
+    def resolve_single_file_plan(
         self,
-        pretrained_model_name_or_path: str | list[str],
-        adapter_name: str | None = None,
-    ):
-        """Load LoRA weights into the pipeline's transformer(s).
-
-        Args:
-            pretrained_model_name_or_path: Path(s) to concrete .safetensors LoRA files.
-                - str: a single .safetensors file. Only valid for Wan2.1
-                  (single-transformer pipelines).
-                - list[str]: one file per transformer, matched **by position** to
-                  [transformer, transformer_2]. Required for Wan2.2 MoE.
-            adapter_name: Name to register the adapter under.
-        """
-        if adapter_name in self.lora_loaded:
-            return
-
-        # Normalize to list[(lora_path, target_module_name)].
-        lora_paths = None
-        if isinstance(pretrained_model_name_or_path, str):
-            lora_paths = [pretrained_model_name_or_path]
-        else:
-            lora_paths = list(pretrained_model_name_or_path)
-
-        target_modules = (
-            [self.transformer_name, self.transformer_2_name] if self.has_transformer_2 else [self.transformer_name]
+        adapter_path: str,
+        tensor_keys: tuple[str, ...],
+    ) -> DiffusionLoRALoadPlan:
+        providers = [self.pipeline]
+        providers.extend(
+            component
+            for component_name in self.component_names
+            if (component := _get_submodule(self.pipeline, component_name)) is not None
         )
-        if len(lora_paths) != len(target_modules):
-            raise ValueError(
-                f"{self.__class__.__name__} expects {len(target_modules)} LoRA file(s) "
-                f"(target_modules={target_modules}, paths={lora_paths}), got {len(lora_paths)}. Pass a list of concrete "  # noqa
-                f".safetensors files, one per transformer."
-            )
-
-        module_to_lora_sd = dict()
-        for lora_path, target_module_name in zip(lora_paths, target_modules):
-            state_dict = _load_lora_state_dict(lora_path)
-            is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
-            if is_non_diffusers_format:
-                converter = get_converter_by_pipeline(self)
-                if converter is None:
-                    raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
-
-                state_dict = converter(state_dict)
-
-            state_dict = _remap_state_dict_keys(
-                state_dict,
-                [
-                    (".ffn.net.0.", ".ffn.net_0."),
-                    (".ffn.net.2.", ".ffn.net_2."),
-                    (
-                        ".to_out.0.",
-                        ".to_out.",
-                    ),
-                    # '.bias_B.bias' is a horrible name in diffuser's.
-                    # So we remap it to '.bias'
-                    (".lora_B.bias", ".bias"),
-                ],
-            )
-
-            module = get_transformer_from_pipeline(self, transformer_name=target_module_name)
-            if module is None:
-                logger.warning(
-                    f"Skip LoRA {lora_path}: target module '{target_module_name}' "
-                    f"is not loaded in pipeline {self.__class__.__name__} "
-                    f"(e.g. disabled by boundary_ratio)."
+        plans: list[DiffusionLoRALoadPlan] = []
+        for provider in providers:
+            resolver = getattr(provider, "get_lora_load_plan", None)
+            if not callable(resolver):
+                continue
+            plan = resolver(adapter_path, tensor_keys)
+            if plan is None:
+                continue
+            if not isinstance(plan, DiffusionLoRALoadPlan):
+                raise TypeError(
+                    f"{type(provider).__name__}.get_lora_load_plan() must return "
+                    f"DiffusionLoRALoadPlan or None, got {type(plan)!r}"
                 )
-                continue
+            plans.append(plan)
 
-            self.load_lora_into_module(state_dict, module, prefix=self.transformer_name, lora_bias_suffix="bias")
-            module_to_lora_sd[target_module_name] = state_dict
+        if not plans:
+            raise ValueError(
+                "Raw single-file LoRA adapters require the diffusion model to "
+                "implement get_lora_load_plan(). Use a PEFT adapter directory "
+                "with adapter_config.json instead."
+            )
+        if any(plan != plans[0] for plan in plans[1:]):
+            raise ValueError("Diffusion components returned conflicting LoRA load plans")
+        return plans[0]
 
-        self.lora_loaded[adapter_name] = module_to_lora_sd
+    @staticmethod
+    def _find_single_lora_file(lora_path: str) -> str | None:
+        path = Path(lora_path)
+        if path.is_file():
+            if path.suffix != ".safetensors":
+                raise ValueError(f"Raw LoRA file must use safetensors, got {path}.")
+            return str(path)
+        if not path.is_dir() or (path / "adapter_config.json").is_file():
+            return None
 
-    def unload_lora_weights(self, adapter_name: str):
-        if adapter_name not in self.lora_loaded:
-            return
+        candidates = sorted(path.glob("*.safetensors"))
+        if len(candidates) == 1:
+            return str(candidates[0])
+        if candidates:
+            raise ValueError(
+                f"LoRA repository {path} contains multiple safetensors files; pass the desired file path explicitly."
+            )
+        return None
 
-        module_to_lora_sd = self.lora_loaded[adapter_name]
-        for module_name, lora_sd in module_to_lora_sd.items():
-            module = get_transformer_from_pipeline(self, transformer_name=module_name)
-            self.unload_module_lora(lora_sd, module, prefix=self.transformer_name)
+    @staticmethod
+    def _infer_single_file_rank(tensors: dict[str, torch.Tensor]) -> int:
+        ranks = {int(tensor.shape[0]) for name, tensor in tensors.items() if ".lora_A" in name and tensor.ndim == 2}
+        if len(ranks) != 1:
+            raise ValueError(f"Raw LoRA must contain one matrix rank, found {sorted(ranks)}.")
+        return ranks.pop()
 
-        del self.lora_loaded[adapter_name]
+    def _load_single_file_adapter(
+        self,
+        lora_file: str,
+        lora_model_id: int,
+    ) -> LoadedDiffusionLoRA:
+        tensors = load_file(lora_file, device="cpu")
+        plan = self.resolve_single_file_plan(lora_file, tuple(tensors))
+        auxiliary_updates: tuple[DiffusionAdapterUpdate, ...] = ()
+        if plan.state_dict_converter is not None:
+            converted = plan.state_dict_converter(tensors)
+            if isinstance(converted, ConvertedLoRAState):
+                tensors = converted.lora_tensors
+                auxiliary_updates = converted.auxiliary_updates
+            elif isinstance(converted, dict):
+                tensors = converted
+            else:
+                raise TypeError(
+                    "Diffusion LoRA state_dict_converter must return dict or "
+                    f"ConvertedLoRAState, got {type(converted)!r}"
+                )
+
+        untyped_biases = [name for name in tensors if name.endswith(".lora_B.bias")]
+        if untyped_biases:
+            raise ValueError(
+                "Model LoRA converter must return bias tensors as typed AdditiveBiasUpdate entries, "
+                f"not state-dict keys: {untyped_biases[:3]}"
+            )
+
+        self._validate_auxiliary_updates(lora_file, auxiliary_updates)
+
+        rank = self._infer_single_file_rank(tensors)
+        config = dict(plan.peft_config)
+        config["r"] = rank
+        # Raw diffusion LoRAs commonly omit alpha. The neutral interpretation
+        # is alpha == rank, so their internal multiplier is one.
+        if config.get("lora_alpha") is None:
+            config["lora_alpha"] = rank
+        peft_helper = PEFTHelper.from_dict(config)
+        lora_model = LoRAModel.from_lora_tensors(
+            lora_model_id=lora_model_id,
+            tensors=tensors,
+            peft_helper=peft_helper,
+            device="cpu",
+            dtype=self.dtype,
+            model_vocab_size=None,
+            weights_mapper=plan.weights_mapper,
+        )
+
+        incomplete = [
+            name for name, weights in lora_model.loras.items() if weights.lora_a is None or weights.lora_b is None
+        ]
+        unexpected = [name for name in lora_model.loras if name.rsplit(".", 1)[-1] not in self.expected_lora_modules]
+        if incomplete or unexpected:
+            raise ValueError(
+                f"Raw LoRA {lora_file} is incompatible with this diffusion model: "
+                f"incomplete={incomplete[:3]}, unexpected={unexpected[:3]}."
+            )
+        return LoadedDiffusionLoRA(lora_model, peft_helper, auxiliary_updates)
+
+    @staticmethod
+    def _validate_auxiliary_updates(
+        lora_file: str,
+        updates: tuple[DiffusionAdapterUpdate, ...],
+    ) -> None:
+        seen: set[tuple[type[DiffusionAdapterUpdate], str]] = set()
+        for update in updates:
+            if not isinstance(update, AdditiveBiasUpdate):
+                raise ValueError(f"Raw LoRA {lora_file} produced unsupported auxiliary update {type(update).__name__}")
+            if not update.module_name:
+                raise ValueError(f"Raw LoRA {lora_file} produced an auxiliary update with no module name")
+            if update.tensor.ndim != 1:
+                raise ValueError(
+                    f"Additive bias update for {update.module_name} must be one-dimensional, "
+                    f"got shape {tuple(update.tensor.shape)}"
+                )
+            key = (type(update), update.module_name)
+            if key in seen:
+                raise ValueError(
+                    f"Raw LoRA {lora_file} produced duplicate {type(update).__name__} for {update.module_name}"
+                )
+            seen.add(key)
+
+    def load_adapter(self, lora_request: LoRARequest) -> LoadedDiffusionLoRA:
+        if not self.expected_lora_modules:
+            raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
+
+        logger.debug("Supported LoRA modules: %s", self.expected_lora_modules)
+        lora_path = get_adapter_absolute_path(lora_request.lora_path)
+        logger.debug("Resolved LoRA path: %s", lora_path)
+
+        lora_file = self._find_single_lora_file(lora_path)
+        if lora_file is not None:
+            logger.info("Loading raw single-file LoRA from %s", lora_file)
+            loaded = self._load_single_file_adapter(lora_file, lora_request.lora_int_id)
+        else:
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
+            logger.info(
+                "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
+                peft_helper.r,
+                peft_helper.lora_alpha,
+                peft_helper.target_modules,
+            )
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self.expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
+            logger.info(
+                "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",
+                lora_model.id,
+                len(lora_model.loras),
+                list(lora_model.loras.keys()),
+            )
+            loaded = LoadedDiffusionLoRA(lora_model, peft_helper)
+
+        for lora in loaded.model.loras.values():
+            lora.optimize()
+        return loaded

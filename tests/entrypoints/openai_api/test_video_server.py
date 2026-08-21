@@ -1532,7 +1532,7 @@ def test_invalid_lora_returns_400(test_client):
         "/v1/videos",
         data={
             "prompt": "lora test",
-            "lora": '{"name": "bad-lora"}',
+            "lora": '{"int_id": 7}',
         },
     )
     assert response.status_code == 200
@@ -1992,6 +1992,33 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
     assert float(response.headers["x-peak-memory-mb"]) == 0.0
     engine = test_client.app.state.openai_serving_video._engine_client
     assert engine.captured_prompt["modalities"] == ["video"]
+
+
+def test_sync_accepts_weighted_lora_list(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker, b"fake-video-bytes")
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "weighted adapters",
+            "lora": json.dumps(
+                [
+                    {"name": "cinematic", "scale": 0.8},
+                    {"name": "style", "scale": 0.2},
+                ]
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    sampling = engine.captured_sampling_params_list[0]
+    assert dict(
+        zip(
+            (request.lora_name for request in sampling.lora_request),
+            sampling.lora_scale,
+            strict=True,
+        )
+    ) == {"cinematic": 0.8, "style": 0.2}
 
 
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):

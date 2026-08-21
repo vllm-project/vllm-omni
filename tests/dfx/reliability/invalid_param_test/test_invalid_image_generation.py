@@ -119,7 +119,9 @@ def _minimal_images_gen_json(omni_server: OmniServer) -> dict[str, object]:
             id="generator_device_wrong_type",
         ),
         pytest.param(
-            {"lora": {"foo": "bar"}}, ("lora", "both name and path", "required"), id="lora_missing_required_fields"
+            {"lora": {"foo": "bar"}},
+            ("lora", "name", "non-empty string"),
+            id="lora_missing_required_fields",
         ),
     ],
 )

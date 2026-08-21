@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
         "guidance_scale_2": 1.25,
         "layers": 6,
         "resolution": 1024,
-        "lora": {"name": "adapter-a", "path": "/tmp/adapter-a", "scale": 0.6},
+        "lora": {"name": "style", "scale": 0.6},
     }
     gen_params = OmniDiffusionSamplingParams(height=768, width=1024, seed=0, num_outputs_per_prompt=2)
 
@@ -79,19 +80,38 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert sampling_params_list[1].guidance_scale == 7.5
     assert sampling_params_list[1].num_outputs_per_prompt == 2
     assert sampling_params_list[1].true_cfg_scale == 5.0
-    assert sampling_params_list[1].lora_request.name == "adapter-a"
+    assert sampling_params_list[1].lora_request.lora_name == "style"
     assert sampling_params_list[1].lora_scale == 0.6
     assert sampling_params_list[2].height == 768
     assert sampling_params_list[2].width == 1024
     assert sampling_params_list[2].seed == 0
     assert sampling_params_list[2].num_inference_steps == 28
-    assert sampling_params_list[2].lora_request.name == "adapter-a"
+    assert sampling_params_list[2].lora_request.lora_name == "style"
     assert sampling_params_list[2].lora_scale == 0.6
     assert gen_params.lora_request is None
     assert engine.default_sampling_params_list[1].height is None
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_build_multistage_generation_inputs_rejects_invalid_lora(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+    from vllm_omni.errors import OmniClientError
+
+    engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
+        default_sampling_params_list=[OmniDiffusionSamplingParams()],
+    )
+    with pytest.raises(OmniClientError, match="lora object"):
+        OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="draw a robot",
+            extra_body={"lora": {"int_id": 7}},
+            reference_images=[],
+            gen_params=OmniDiffusionSamplingParams(),
+        )
 
 
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):

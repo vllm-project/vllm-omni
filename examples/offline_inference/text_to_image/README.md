@@ -110,12 +110,12 @@ python text_to_image.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
 | `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
-| `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
-| `--lora-backend` | str |`"peft"`| LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 | `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
+
+LoRA deployment and request options are documented in the
+[Diffusion LoRA guide](../../../docs/user_guide/diffusion/lora.md).
 
 **NextStep-1.1 specific arguments:**
 
@@ -323,24 +323,7 @@ See more examples in the [cfg_parallel user guide](../../../docs/user_guide/para
 
 #### LoRA
 
-This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default `1.0`); omit it to use the base model only.
-
-```bash
-python text_to_image.py \
-  --model Tongyi-MAI/Z-Image-Turbo \
-  --prompt "A piece of cheesecake" \
-  --lora-path /path/to/lora/ \
-  --lora-scale 1.0 \
-  --output output.png
-```
-
-LoRA adapters must be in PEFT format. A typical adapter directory structure:
-
-```
-lora_adapter/
-├── adapter_config.json
-└── adapter_model.safetensors
-```
+See the [Diffusion LoRA guide](../../../docs/user_guide/diffusion/lora.md).
 
 ## Web UI Demo
 

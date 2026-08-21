@@ -6,6 +6,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -15,15 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# This test is specific to Z-Image LoRA behavior. Keep it focused on a single
-# model to reduce runtime and avoid extra downloads.
-models = ["Tongyi-MAI/Z-Image-Turbo"]
-omni_runner_params = [(model_name, None) for model_name in models]
+MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 
 @pytest.mark.advanced_model
-@pytest.mark.parametrize("omni_runner", omni_runner_params, indirect=True)
-def test_diffusion_model(tmp_path: Path, omni_runner):
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+def test_diffusion_model(tmp_path: Path):
     def _extract_images(outputs: list[OmniRequestOutput]):
         if not outputs:
             raise ValueError("Empty outputs from Omni.generate()")
@@ -72,61 +73,56 @@ def test_diffusion_model(tmp_path: Path, omni_runner):
         )
         return str(adapter_dir)
 
-    runner = omni_runner
-    m = runner.omni
-    # high resolution may cause OOM on L4
-    height = 256
-    width = 256
-    prompt = "a photo of a cat sitting on a laptop keyboard"
-
-    outputs = m.generate(
-        prompt,
-        OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_inference_steps=2,
-            guidance_scale=0.0,
-            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
-            num_outputs_per_prompt=1,
-        ),
-    )
-    images = _extract_images(outputs)
-
-    assert len(images) == 1
-    # check image size
-    assert images[0].width == width
-    assert images[0].height == height
-
-    # Real LoRA E2E: generate again with a real on-disk PEFT adapter and
-    # verify that output changes.
-    from vllm_omni.lora.request import LoRARequest
-    from vllm_omni.lora.utils import stable_lora_int_id
-
     lora_dir = _write_zimage_lora(tmp_path / "zimage_lora")
-    lora_request = LoRARequest(
-        lora_name="test",
-        lora_int_id=stable_lora_int_id(lora_dir),
-        lora_path=lora_dir,
-    )
-    outputs_lora = m.generate(
-        prompt,
-        OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            num_inference_steps=2,
-            guidance_scale=0.0,
-            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
-            num_outputs_per_prompt=1,
-            lora_request=lora_request,
-            lora_scale=2.0,
-        ),
-    )
-    images_lora = _extract_images(outputs_lora)
-    assert len(images_lora) == 1
-    assert images_lora[0].width == width
-    assert images_lora[0].height == height
+    with OmniRunner(MODEL, dynamic_lora=[json.dumps({"path": lora_dir, "name": "test"})]) as runner:
+        m = runner.omni
+        # High resolution may cause OOM on L4.
+        height = 256
+        width = 256
+        prompt = "a photo of a cat sitting on a laptop keyboard"
 
-    import numpy as np
+        outputs = m.generate(
+            prompt,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                num_outputs_per_prompt=1,
+                lora_request=(),
+                lora_scale=(),
+            ),
+        )
+        images = _extract_images(outputs)
 
-    diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
-    assert diff > 0.0
+        assert len(images) == 1
+        # check image size
+        assert images[0].width == width
+        assert images[0].height == height
+
+        # Generate again with the startup-registered adapter and verify that
+        # request activation changes the output.
+        lora_request = registered_lora_request("test")
+        outputs_lora = m.generate(
+            prompt,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                num_outputs_per_prompt=1,
+                lora_request=lora_request,
+                lora_scale=2.0,
+            ),
+        )
+        images_lora = _extract_images(outputs_lora)
+        assert len(images_lora) == 1
+        assert images_lora[0].width == width
+        assert images_lora[0].height == height
+
+        import numpy as np
+
+        diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
+        assert diff > 0.0

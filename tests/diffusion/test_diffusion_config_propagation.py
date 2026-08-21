@@ -143,11 +143,12 @@ class TestCreateDefaultDiffusion:
 
     def test_extra_kwargs_forwarded(self):
         stages = StageConfigFactory.create_default_diffusion(
-            {"model": "x", "enforce_eager": True, "lora_path": "/tmp/lora"}
+            {"model": "x", "enforce_eager": True, "dynamic_lora": ["/tmp/lora"], "max_cpu_loras": 2}
         )
         ea = stages[0]["engine_args"]
         assert ea["enforce_eager"] is True
-        assert ea["lora_path"] == "/tmp/lora"
+        assert ea["dynamic_lora"] == ["/tmp/lora"]
+        assert ea["max_cpu_loras"] == 2
 
     def test_diffusion_kv_mode_roundtrip(self):
         od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")

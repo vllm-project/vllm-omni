@@ -92,7 +92,7 @@ class TestStage1DiTLoRA:
             pipeline=pipeline,
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
-            max_cached_adapters=1,
+            max_registered_adapters=1,
         )
 
         mapping = manager._packed_modules_mapping
@@ -139,7 +139,7 @@ class TestStage1DiTLoRA:
             pipeline=pipeline,
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
-            max_cached_adapters=1,
+            max_registered_adapters=1,
         )
 
         # Treat qkv_proj as 3-slice packed layer
@@ -147,6 +147,7 @@ class TestStage1DiTLoRA:
 
         # Target sublayer "q_proj" -- manager should replace the packed "qkv_proj"
         peft_helper = type("_PH", (), {"r": 1, "target_modules": ["q_proj"]})()
+        manager._frozen = False
         manager._replace_layers_with_lora(peft_helper)
 
         assert "language_model.attn.qkv_proj" in replace_calls
@@ -186,12 +187,13 @@ def _write_synthetic_lora(
 
 
 class TestBagelLoRARoundTrip:
-    """End-to-end: synthetic checkpoint → load → activate → verify weights in fused layer."""
+    """End-to-end: startup registration → activation → verify weights."""
 
-    def test_set_active_adapter_loads_and_activates_bagel_lora(self, tmp_path, monkeypatch):
-        """Full round-trip through set_active_adapter for a bagel component module."""
+    def test_startup_registration_and_request_activation(self, tmp_path, monkeypatch):
+        """Full round-trip for a registered bagel component adapter."""
         import vllm_omni.diffusion.lora.manager as manager_mod
 
+        monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
         monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", DummyBaseLayerWithLoRA)
 
         # Build pipeline with bagel.language_model.foo (simple non-packed layer)
@@ -213,13 +215,6 @@ class TestBagelLoRARoundTrip:
             lambda root, name, sub: fake_replace_submodule(root, name, sub),
         )
 
-        manager = DiffusionLoRAManager(
-            pipeline=pipeline,
-            device=torch.device("cpu"),
-            dtype=torch.bfloat16,
-            max_cached_adapters=1,
-        )
-
         # Write synthetic adapter targeting bagel.language_model.foo
         module_name = "bagel.language_model.foo"
         rank = 2
@@ -233,11 +228,22 @@ class TestBagelLoRARoundTrip:
             lora_path=lora_dir,
         )
 
-        # Full round-trip: load from disk → replace layer → activate weights
+        # Full round-trip: startup registration → replace layer → request activation.
+        manager = DiffusionLoRAManager(
+            pipeline=pipeline,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            max_registered_adapters=1,
+            dynamic_loras=(lora_request,),
+        )
+        assert manager.list_adapters() == [42]
+        assert manager._active_composition == ()
+        assert manager._loader is None
+        replaced_layer = pipeline.bagel.language_model.foo
+        replaced_layer.set_calls.clear()
         manager.set_active_adapter(lora_request, lora_scale=0.5)
 
         # Verify the layer was replaced and weights were set
-        replaced_layer = pipeline.bagel.language_model.foo
         assert isinstance(replaced_layer, DummyBaseLayerWithLoRA), "Layer should be wrapped with LoRA"
         assert len(replaced_layer.set_calls) == 1, "set_lora should have been called once"
 

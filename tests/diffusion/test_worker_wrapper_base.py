@@ -44,8 +44,6 @@ def mock_od_config(mocker: MockerFixture):
     config.diffusion_load_format = "default"
     config.dtype = "float32"
     config.max_cpu_loras = 0
-    config.lora_path = None
-    config.lora_scale = 1.0
     return config
 
 

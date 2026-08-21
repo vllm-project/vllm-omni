@@ -685,9 +685,8 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | list[str] | None = None
-    lora_scale: float = 1.0
-    lora_backend: str = "peft"
+    prefused_lora: list[str] | None = None
+    dynamic_lora: list[str] | None = None
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False
@@ -751,6 +750,7 @@ class _DiffusionConfigProjection:
             DiffusionCacheConfig,
             TransformerConfig,
             build_attention_config,
+            normalize_deployment_lora_config,
             parse_kv_cache_skip_selector,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
@@ -760,6 +760,12 @@ class _DiffusionConfigProjection:
             self.tf_model_config = TransformerConfig()
         elif isinstance(self.tf_model_config, Mapping):
             self.tf_model_config = TransformerConfig.from_dict(dict(self.tf_model_config))
+
+        self.prefused_lora, self.dynamic_lora, self.max_cpu_loras = normalize_deployment_lora_config(
+            self.prefused_lora,
+            self.dynamic_lora,
+            self.max_cpu_loras,
+        )
 
         if self.additional_config is None:
             self.additional_config = {}
@@ -819,10 +825,10 @@ class _DiffusionConfigProjection:
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
-        if self.max_cpu_loras is None:
-            self.max_cpu_loras = 1
-        elif self.max_cpu_loras < 1:
-            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if self.prefused_lora and self.quantization_config is not None:
+            raise ValueError("prefused_lora is not supported with quantized diffusion weights; use dynamic_lora")
+        if self.prefused_lora and self.enable_distributed_layerwise_offload:
+            raise ValueError("prefused_lora is not supported with distributed layerwise offload; use dynamic_lora")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
@@ -953,7 +959,6 @@ _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",
-        "static_lora_scale",
     }
 )
 _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {

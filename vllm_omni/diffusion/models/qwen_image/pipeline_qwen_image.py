@@ -25,7 +25,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -33,6 +32,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
+from vllm_omni.diffusion.models.qwen_image.lora import QwenImageLoRAPlanMixin
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -269,7 +269,7 @@ class QwenImagePipeline(
     QwenImageCFGParallelMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
-    QwenImageLoraLoaderMixin,
+    QwenImageLoRAPlanMixin,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]

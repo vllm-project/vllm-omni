@@ -35,6 +35,7 @@ from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -57,8 +58,8 @@ _LORA_RANK = 4
 
 
 def _build_sampling_params(
-    lora_request: LoRARequest | None = None,
-    lora_scale: float = 1.0,
+    lora_request: LoRARequest | tuple | None = None,
+    lora_scale: float | tuple = 1.0,
 ) -> OmniDiffusionSamplingParams:
     return OmniDiffusionSamplingParams(
         height=SIZE[1],
@@ -86,7 +87,11 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
     return None
 
 
-def _generate(omni: Omni, lora_request: LoRARequest | None = None, lora_scale: float = 1.0) -> Image.Image:
+def _generate(
+    omni: Omni,
+    lora_request: LoRARequest | tuple | None = None,
+    lora_scale: float | tuple = 1.0,
+) -> Image.Image:
     outputs = list(
         omni.generate(
             prompts={"prompt": DEFAULT_PROMPT, "modalities": ["image"]},
@@ -130,13 +135,17 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 def test_sensenova_u1_lora_scale_and_deactivation(tmp_path) -> None:
     """Validate LoRA effect, scale sensitivity, bounded perturbation, and clean deactivation."""
     lora_request = _make_file_lora_request(tmp_path / "sensenova_lora")
+    selector = registered_lora_request(lora_request.lora_name)
 
-    with OmniRunner(MODEL) as runner:
+    with OmniRunner(
+        MODEL,
+        dynamic_lora=[json.dumps({"path": lora_request.lora_path, "name": lora_request.lora_name})],
+    ) as runner:
         omni = runner.omni
-        baseline = _generate(omni)
-        img_1x = _generate(omni, lora_request, lora_scale=1.0)
-        img_2x = _generate(omni, lora_request, lora_scale=2.0)
-        restored = _generate(omni)
+        baseline = _generate(omni, (), ())
+        img_1x = _generate(omni, selector, lora_scale=1.0)
+        img_2x = _generate(omni, selector, lora_scale=2.0)
+        restored = _generate(omni, (), ())
 
     baseline_arr = np.array(baseline, dtype=np.int16)
     diff_1x = np.abs(baseline_arr - np.array(img_1x, dtype=np.int16)).mean()

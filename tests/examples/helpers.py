@@ -144,21 +144,6 @@ class ReadmeSnippet(NamedTuple):
                 )
                 argv[1] = str(resolved_script)
 
-        # Normalize LoRA adapter path and ensure README LoRA assets exist.
-        try:
-            lora_arg_idx = argv.index("--lora-path")  # Raise ValueError if not found
-            assert len(argv) > lora_arg_idx + 1, "README bash snippet uses --lora-path without a following value"
-
-            lora_dir = OUTPUT_DIR / "lora"
-            adapter_model = lora_dir / "adapter_model.safetensors"
-            adapter_config = lora_dir / "adapter_config.json"
-            if not adapter_model.exists() or not adapter_config.exists():
-                write_zimage_lora(lora_dir, v_scale=8.0)
-
-            argv[lora_arg_idx + 1] = str(lora_dir)
-        except ValueError:
-            pass
-
         return argv
 
     @staticmethod

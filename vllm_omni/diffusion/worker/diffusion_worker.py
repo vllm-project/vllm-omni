@@ -51,7 +51,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.types import LoRARequestInput, LoRAScaleInput
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -186,7 +187,7 @@ class DiffusionWorker:
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_lora_state: dict[str, tuple[LoRARequestInput, LoRAScaleInput]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -443,34 +444,8 @@ class DiffusionWorker:
         self.model_runner.set_kv_cache_config(kv_cache_configs[self.rank])
 
     def init_lora_manager(self) -> None:
-        """Initialize the LoRA manager for this worker."""
-        if self.model_runner.pipeline is None:
-            return
-
-        lora_path = self.od_config.lora_path
-        if isinstance(lora_path, list) and len(lora_path) == 1:
-            lora_path = lora_path[0]
-
-        lora_backend = self.od_config.lora_backend
-        if lora_backend == LoRABackend.PEFT:
-            self.lora_manager = DiffusionLoRAManager(
-                pipeline=self.model_runner.pipeline,
-                device=self.device,
-                dtype=self.od_config.dtype,
-                max_cached_adapters=self.od_config.max_cpu_loras,
-                lora_path=lora_path,
-                lora_scale=self.od_config.lora_scale,
-            )
-        elif lora_backend == LoRABackend.DISTILL:
-            pipeline = self.model_runner.pipeline
-            if hasattr(pipeline, "load_lora_weights"):
-                if self.od_config.lora_scale > 1.0:
-                    logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
-                pipeline.load_lora_weights(lora_path)
-            else:
-                logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
-        else:
-            raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
+        """Alias the model runner's pre-offload/pre-compile LoRA manager."""
+        self.lora_manager = self.model_runner.lora_manager
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
@@ -548,12 +523,7 @@ class DiffusionWorker:
             diffusion_kv_metadata = new_req.diffusion_kv_metadata
 
         if self.lora_manager is not None:
-            try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
-            except Exception as exc:
-                if req.sampling_params.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
@@ -581,12 +551,7 @@ class DiffusionWorker:
         # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
-            try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
-            except Exception as exc:
-                if sp.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
         with ctx:
@@ -629,28 +594,29 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return
 
-        lora_request: LoRARequest | None = None
-        lora_scale = 1.0
+        lora_request: LoRARequestInput = None
+        lora_scale: LoRAScaleInput = 1.0
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
                 lora_request, lora_scale = entry
                 break
 
-        try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
-        except Exception as exc:
-            if lora_request is not None:
-                raise
-            logger.warning("LoRA activation skipped: %s", exc)
+        self.lora_manager.set_active_adapter(lora_request, lora_scale)
 
     def remove_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.remove_adapter(adapter_id)
+        del adapter_id
+        raise RuntimeError(
+            "Runtime diffusion LoRA registry mutation is not supported; "
+            "configure adapters with --dynamic-lora before starting the server."
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        # NOTE (Alex): We have not implemented the API routing
-        # for the frontend server yet.
-        return self.lora_manager.add_adapter(lora_request)
+        del lora_request
+        raise RuntimeError(
+            "Runtime diffusion LoRA loading is not supported; "
+            "configure adapters with --dynamic-lora before starting the server."
+        )
 
     def submit_interaction(
         self,
@@ -665,7 +631,8 @@ class DiffusionWorker:
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
-        return self.lora_manager.pin_adapter(adapter_id)
+        del adapter_id
+        raise RuntimeError("Diffusion LoRA registrations are immutable and resident for the server lifetime.")
 
     def sleep(self, level: int = 1) -> int:
         """

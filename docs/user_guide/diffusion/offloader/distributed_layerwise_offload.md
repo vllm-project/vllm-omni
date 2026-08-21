@@ -84,6 +84,13 @@ use their ordinary component loader. A checkpoint source that mixes DiT and
 non-DiT weights falls back completely rather than leaving an unplanned
 component uninitialized.
 
+Startup-preloaded dynamic LoRA is supported through the ordinary loader path.
+After base-weight loading and validation, LoRA A/B runtime slots remain on the
+execution device while DLO streams only the base weights. Request-time
+compositions must remain within the target-module and total-rank capacity
+established at startup. This combination does not use direct mmap. Prefused
+LoRA with DLO is rejected.
+
 With direct checkpoint mmap, the loader:
 
 1. saves non-persistent buffers such as RoPE frequencies;

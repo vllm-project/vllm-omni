@@ -477,6 +477,38 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
         loader.load_model(load_device="cpu")
 
 
+def test_dlo_dynamic_lora_uses_ordinary_loader_before_wrapping(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        quantization_config=None,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        dynamic_lora=["/tmp/turbo.safetensors"],
+        model="unused",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    calls: list[str] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: calls.append("load")  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader_mod,
+        "build_checkpoint_mmap_plan",
+        lambda *_args, **_kwargs: pytest.fail("dynamic DLO must load base weights before wrapping"),
+    )
+
+    assert loader.load_model(load_device="cpu") is model
+    assert calls == ["load", "process"]
+    assert loader.take_host_weight_plan() is None
+
+
 def test_hsdp_processes_quantized_weights_before_sharding(mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules

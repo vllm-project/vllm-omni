@@ -25,12 +25,17 @@ class DummyBaseLayerWithLoRA(torch.nn.Module):
         self.set_calls: list[
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
+        self.bias_calls: list[torch.Tensor | list[torch.Tensor | None] | None] = []
         self.reset_calls: int = 0
         self.create_calls: int = 0
+        self.runtime_device: torch.device | None = None
 
     def set_lora(self, index: int, lora_a, lora_b):
         assert index == 0
         self.set_calls.append((lora_a, lora_b))
+
+    def set_additive_bias(self, bias):
+        self.bias_calls.append(bias)
 
     def reset_lora(self, index: int):
         assert index == 0
@@ -38,6 +43,9 @@ class DummyBaseLayerWithLoRA(torch.nn.Module):
 
     def create_lora_weights(self, max_loras, lora_config, model_config):
         self.create_calls += 1
+
+    def move_lora_runtime_to(self, device):
+        self.runtime_device = torch.device(device)
 
 
 def fake_replace_submodule(

@@ -56,11 +56,10 @@ import numpy as np
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
     build_image_to_video_prompt as build_model_image_to_video_prompt,
 )
@@ -315,28 +314,30 @@ def parse_args() -> argparse.Namespace:
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
-        "--lora-path",
+        "--request-lora-name",
         type=str,
-        nargs="+",
         default=None,
-        help="Path to a LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. "
-        "For Wan2.2 MoE models, pass the high-noise checkpoint first and the low-noise checkpoint second.",
+        help="Name of one --dynamic-lora registration to select for this request.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for PEFT LoRA weights (default: 1.0).",
+        help="Request scale for --request-lora-name (default: 1.0).",
     )
     parser.add_argument(
-        "--lora-backend",
-        type=str,
-        default="peft",
-        choices=["peft", "distill"],
-        help=(
-            "LoRA backend. 'peft' loads a PEFT-format adapter for request-time activation; "
-            "'distill' fuses one or more concrete LoRA checkpoint files at initialization."
-        ),
+        "--prefused-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to merge into dense weights at startup. Repeat to compose adapters.",
+    )
+    parser.add_argument(
+        "--dynamic-lora",
+        action="append",
+        default=None,
+        metavar="PATH|JSON",
+        help="LoRA to register at startup for request selection. Repeat to register adapters.",
     )
     parser.add_argument(
         "--extra-body",
@@ -534,12 +535,10 @@ def main():
         omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
-    if args.lora_path is not None:
-        lora_path = args.lora_path
-        if len(lora_path) == 1:
-            lora_path = lora_path[0]
-        omni_kwargs["lora_path"] = lora_path
-        omni_kwargs["lora_backend"] = args.lora_backend
+    if args.prefused_lora:
+        omni_kwargs["prefused_lora"] = args.prefused_lora
+    if args.dynamic_lora:
+        omni_kwargs["dynamic_lora"] = args.dynamic_lora
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
@@ -570,17 +569,7 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
-    lora_request = None
-    if args.lora_path and args.lora_backend == "peft":
-        if len(args.lora_path) != 1:
-            raise ValueError("Only one LoRA path is expected for PEFT backend.")
-
-        lora_path = args.lora_path[0]
-        lora_request = LoRARequest(
-            lora_name=Path(lora_path).stem,
-            lora_int_id=stable_lora_int_id(lora_path),
-            lora_path=lora_path,
-        )
+    lora_request = registered_lora_request(args.request_lora_name) if args.request_lora_name is not None else None
 
     negative_prompt = args.negative_prompt
     if negative_prompt is None and not is_ltx2:

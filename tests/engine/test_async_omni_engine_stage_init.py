@@ -1201,8 +1201,6 @@ def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(m
         stage_type="diffusion",
         engine_args=types.SimpleNamespace(
             diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
             enable_sleep_mode=None,
             quantization_config=None,
         ),
@@ -1235,8 +1233,6 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
         stage_type="diffusion",
         engine_args=types.SimpleNamespace(
             diffusion_attention_config=existing_attention,
-            lora_path=None,
-            lora_scale=None,
             enable_sleep_mode=None,
             quantization_config=None,
         ),

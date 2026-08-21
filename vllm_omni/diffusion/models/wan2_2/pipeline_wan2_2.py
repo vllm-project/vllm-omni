@@ -25,13 +25,13 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
-from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.lora import WanLoRAPlanMixin
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -290,7 +290,7 @@ class Wan22Pipeline(
     DenoiseProgressMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
-    WanLoraLoaderMixin,
+    WanLoRAPlanMixin,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]

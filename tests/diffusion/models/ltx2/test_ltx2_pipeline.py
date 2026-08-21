@@ -291,7 +291,6 @@ def test_ltx23_checkpoint_selects_version_specific_two_stage_profiles(tmp_path, 
         od_config=SimpleNamespace(
             model=str(tmp_path),
             enable_diffusion_pipeline_profiler=False,
-            lora_path=None,
             model_config={},
         )
     )

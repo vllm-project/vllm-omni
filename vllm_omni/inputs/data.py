@@ -1,5 +1,6 @@
 import copy
 import pprint
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
 
@@ -317,8 +318,8 @@ class OmniDiffusionSamplingParams:
     return_frames: bool = False
 
     # LoRA
-    lora_request: LoRARequest | None = None
-    lora_scale: float = 1.0
+    lora_request: LoRARequest | Sequence[LoRARequest] | None = None
+    lora_scale: float | Sequence[float] = 1.0
 
     # STA parameters
     STA_param: list | None = None

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion Model Runner for vLLM-Omni.
 
@@ -35,6 +35,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.types import parse_lora_adapter_specs, parse_lora_registration_specs
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsPromptUpdate,
@@ -139,6 +141,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.od_config = od_config
         self.device = device
         self.pipeline: Any | None = None
+        self.lora_manager: DiffusionLoRAManager | None = None
         self.cache_backend: Any | None = None
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
@@ -220,6 +223,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_dynamic,
         )
 
+    def init_lora_manager(self) -> DiffusionLoRAManager | None:
+        """Install startup LoRAs before offload, compilation, and caching."""
+
+        if not isinstance(self.pipeline, torch.nn.Module):
+            self.lora_manager = None
+            return None
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=getattr(self.od_config, "dtype", torch.bfloat16),
+            max_registered_adapters=getattr(self.od_config, "max_cpu_loras", None) or 1,
+            prefused_loras=parse_lora_adapter_specs(getattr(self.od_config, "prefused_lora", None)),
+            dynamic_loras=parse_lora_registration_specs(getattr(self.od_config, "dynamic_lora", None)),
+            quantized=getattr(self.od_config, "quantization_config", None) is not None,
+        )
+        return self.lora_manager
+
     def load_model(
         self,
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
@@ -275,6 +295,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+            # LoRA runtime tensors are model weights for sleep/wake purposes.
+            # Allocate them in the same pool as the dense checkpoint: the
+            # allocator deliberately rejects entering a second weights pool
+            # after the first one already owns live allocations.
+            self.init_lora_manager()
         time_after_load = time.perf_counter()
 
         logger.info(

@@ -408,10 +408,18 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
     profile = pipeline.component_profile
     if profile.distilled_lora_filename is None or profile.artifact_repo_id is None:
         raise ValueError(f"{profile.name} does not declare the required distilled adapter artifact.")
-    if getattr(pipeline.od_config, "lora_path", None) is not None:
+    external_lora_fields = (
+        "prefused_lora",
+        "dynamic_lora",
+    )
+    configured_external_loras = [
+        field_name for field_name in external_lora_fields if getattr(pipeline.od_config, field_name, None)
+    ]
+    if configured_external_loras:
         raise ValueError(
             f"{pipeline.__class__.__name__} reserves LoRA execution for its phase adapter; "
-            "request or static LoRA composition is not supported yet."
+            "external LoRA composition is not supported yet "
+            f"(configured: {', '.join(configured_external_loras)})."
         )
 
     quantization_config = getattr(pipeline.od_config, "quantization_config", None)

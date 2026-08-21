@@ -443,7 +443,8 @@ class DiffusersPipelineLoader:
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
-                if _dist_offload:
+                _startup_dynamic_lora = bool(getattr(self.od_config, "dynamic_lora", None))
+                if _dist_offload and not _startup_dynamic_lora:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -455,6 +456,14 @@ class DiffusersPipelineLoader:
                         online_quantization=_has_online_quant,
                     )
                     self.host_weight_plan = plan_result.plan
+                elif _dist_offload:
+                    # Install dynamic wrappers only after ordinary loading and
+                    # post-load validation. DLO execution still shards and
+                    # streams those runtime base weights normally.
+                    logger.info(
+                        "Dynamic LoRA with DLO uses ordinary base-weight materialization; "
+                        "disabling the direct-checkpoint mmap startup optimization"
+                    )
 
                 _skip_load = self.host_weight_plan is not None
 

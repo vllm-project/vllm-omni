@@ -126,7 +126,8 @@ def _pipeline(*, dtype, quantization_config):
         transformer=object(),
         od_config=SimpleNamespace(
             model="unused",
-            lora_path=None,
+            prefused_lora=None,
+            dynamic_lora=None,
             dtype=dtype,
             quantization_config=quantization_config,
         ),
@@ -183,6 +184,21 @@ def test_ltx_phase_adapter_rejects_non_bfloat16_layer_fused(monkeypatch):
     monkeypatch.setattr(ltx2_phase_adapter, "resolve_ltx_artifact", lambda *_args, **_kwargs: "adapter")
 
     with pytest.raises(ValueError, match="bfloat16"):
+        ltx2_phase_adapter.build_ltx_phase_adapter(pipeline)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("prefused_lora", ["/tmp/prefused-lora=1.0"]),
+        ("dynamic_lora", ["/tmp/dynamic-lora"]),
+    ],
+)
+def test_ltx_phase_adapter_rejects_external_lora_composition(field_name, field_value):
+    pipeline = _pipeline(dtype=torch.bfloat16, quantization_config=None)
+    setattr(pipeline.od_config, field_name, field_value)
+
+    with pytest.raises(ValueError, match=rf"external LoRA composition.*{field_name}"):
         ltx2_phase_adapter.build_ltx_phase_adapter(pipeline)
 
 

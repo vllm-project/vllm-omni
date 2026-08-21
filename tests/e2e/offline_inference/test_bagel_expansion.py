@@ -35,6 +35,7 @@ from safetensors.torch import save_file
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -42,10 +43,6 @@ from vllm_omni.lora.utils import stable_lora_int_id
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
-
-# (model, deploy_config_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-_OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG)
-
 
 # ---------------------------------------------------------------------------
 # Helpers (reused from test_bagel_text2img.py patterns)
@@ -72,7 +69,8 @@ def _extract_generated_image(omni_outputs: list[OmniRequestOutput]) -> Image.Ima
 
 def _generate_bagel_image(omni: Omni) -> Image.Image:
     params_list = _configure_sampling_params(omni)
-    params_list[1].lora_request = None
+    params_list[1].lora_request = ()
+    params_list[1].lora_scale = ()
     outputs = list(
         omni.generate(
             prompts=[{"prompt": DEFAULT_PROMPT, "modalities": ["image"]}],
@@ -140,27 +138,33 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) -> None:
+def test_bagel_lora_scale_and_deactivation(tmp_path) -> None:
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
-    omni = omni_runner.omni
     lora_request = _make_file_lora_request(tmp_path / "bagel_lora")
+    selector = registered_lora_request(lora_request.lora_name)
 
-    # 1) Baseline (no LoRA)
-    baseline = _generate_bagel_image(omni)
+    with OmniRunner(
+        MODEL,
+        deploy_config=BAGEL_STAGE_CONFIG,
+        dynamic_lora=[json.dumps({"path": lora_request.lora_path, "name": lora_request.lora_name})],
+    ) as runner:
+        omni = runner.omni
 
-    # 2) LoRA with scale=1.0
-    img_1x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=1.0)
+        # 1) Baseline (no LoRA)
+        baseline = _generate_bagel_image(omni)
 
-    # 3) LoRA with scale=2.0
-    img_2x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=2.0)
+        # 2) LoRA with scale=1.0
+        img_1x = _generate_bagel_image_with_lora(omni, selector, lora_scale=1.0)
 
-    # 4) No LoRA again (deactivation)
-    restored = _generate_bagel_image(omni)
+        # 3) LoRA with scale=2.0
+        img_2x = _generate_bagel_image_with_lora(omni, selector, lora_scale=2.0)
+
+        # 4) No LoRA again (deactivation)
+        restored = _generate_bagel_image(omni)
 
     baseline_arr = np.array(baseline, dtype=np.int16)
     img_1x_arr = np.array(img_1x, dtype=np.int16)

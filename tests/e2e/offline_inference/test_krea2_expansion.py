@@ -9,6 +9,7 @@ directory). They cover a basic functional smoke plus the layerwise-CPU-offload p
 via ``SupportsComponentDiscovery`` / ``_layerwise_offload_blocks_attrs``.
 """
 
+import json
 import os
 
 import numpy as np
@@ -16,9 +17,8 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunnerHandler
+from vllm_omni.diffusion.lora.types import LoRARequestInput, registered_lora_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 
 MODEL = os.environ.get("KREA2_MODEL", "krea/Krea-2-Turbo")
 # vLLM-Omni-compatible PEFT repackaging of krea/Krea-2-LoRA-darkbrush (264 modules, r=alpha=32).
@@ -117,7 +117,7 @@ def test_krea2_vae_patch_parallel(omni_runner_handler: OmniRunnerHandler) -> Non
     omni_runner_handler.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
 
-def _generate(handler: OmniRunnerHandler, lora_request: LoRARequest | None, lora_scale: float = 1.0) -> np.ndarray:
+def _generate(handler: OmniRunnerHandler, lora_request: LoRARequestInput, lora_scale=1.0) -> np.ndarray:
     sp = _sampling()
     sp.lora_request = lora_request
     sp.lora_scale = lora_scale
@@ -126,7 +126,11 @@ def _generate(handler: OmniRunnerHandler, lora_request: LoRARequest | None, lora
 
 
 @hardware_test(res={"cuda": "H100"})
-@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+@pytest.mark.parametrize(
+    "omni_runner",
+    [(MODEL, None, {"dynamic_lora": [json.dumps({"path": LORA, "name": "darkbrush"})]})],
+    indirect=True,
+)
 def test_krea2_lora(omni_runner_handler: OmniRunnerHandler) -> None:
     """Validate diffusion LoRA on Krea 2: visible effect, scale sensitivity, clean deactivation.
 
@@ -135,12 +139,12 @@ def test_krea2_lora(omni_runner_handler: OmniRunnerHandler) -> None:
     ``OmniDiffusionSamplingParams.lora_request`` / ``lora_scale`` — the same fields the
     diffusion LoRA manager reads to activate/deactivate the adapter.
     """
-    lora_request = LoRARequest(lora_name="darkbrush", lora_int_id=stable_lora_int_id(LORA), lora_path=LORA)
+    lora_request = registered_lora_request("darkbrush")
 
-    baseline = _generate(omni_runner_handler, None)
+    baseline = _generate(omni_runner_handler, (), ())
     img_1x = _generate(omni_runner_handler, lora_request, lora_scale=1.0)
     img_2x = _generate(omni_runner_handler, lora_request, lora_scale=2.0)
-    restored = _generate(omni_runner_handler, None)
+    restored = _generate(omni_runner_handler, (), ())
 
     diff_1x = np.abs(baseline - img_1x).mean()
     diff_2x = np.abs(baseline - img_2x).mean()
@@ -151,5 +155,5 @@ def test_krea2_lora(omni_runner_handler: OmniRunnerHandler) -> None:
     assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
     # (b) Scale changes the output (stronger adapter -> larger perturbation).
     assert not np.isclose(diff_1x, diff_2x, atol=1.0), f"LoRA scale had no effect: 1x={diff_1x:.2f}, 2x={diff_2x:.2f}"
-    # (c) Passing lora_request=None cleanly deactivates: same seed -> back to baseline (modulo fp drift).
+    # (c) An explicit empty composition cleanly deactivates the startup default.
     assert diff_restored < 5.0, f"LoRA did not deactivate cleanly: diff_restored={diff_restored:.2f}"

@@ -76,6 +76,29 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_accepts_repeated_startup_loras() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--prefused-lora",
+            "/tmp/base-style=0.25",
+            "--dynamic-lora",
+            "/tmp/turbo",
+            "--dynamic-lora",
+            "/tmp/detail",
+        ]
+    )
+
+    assert args.prefused_lora == ["/tmp/base-style=0.25"]
+    assert args.dynamic_lora == ["/tmp/turbo", "/tmp/detail"]
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

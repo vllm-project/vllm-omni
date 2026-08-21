@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -811,6 +811,14 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+    memory_events = []
+
+    @contextmanager
+    def _memory_context(tag):
+        memory_events.append(("enter", tag))
+        yield
+        memory_events.append(("exit", tag))
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
@@ -848,6 +856,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     runner.pipeline = None
     runner.cache_backend = None
     runner.offload_backend = None
+    runner.init_lora_manager = lambda: memory_events.append(("lora", "weights"))
     runner.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -870,11 +879,12 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
 
-    DiffusionModelRunner.load_model(runner)
+    DiffusionModelRunner.load_model(runner, memory_pool_context_fn=_memory_context)
 
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+    assert memory_events == [("enter", "weights"), ("lora", "weights"), ("exit", "weights")]
 
 
 @pytest.mark.core_model

@@ -25,13 +25,13 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
-from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.wan2_2.lora import WanLoRAPlanMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
     create_transformer_from_config,
@@ -179,7 +179,7 @@ class Wan22I2VPipeline(
     DiffusionPipelineProfilerMixin,
     DenoiseProgressMixin,
     SupportsComponentDiscovery,
-    WanLoraLoaderMixin,
+    WanLoRAPlanMixin,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.

@@ -61,7 +61,7 @@ defines the shared configuration and backend extension points.
 | Compile repeated diffusion regions | [Regional Compilation](../user_guide/diffusion/regional_compilation.md) | User-facing optimization guide |
 | Add generated video frames | [Frame Interpolation](../user_guide/diffusion/frame_interpolation.md) | User-facing extension guide |
 | Reduce diffusion model startup time | [Startup and Loading](../user_guide/diffusion/startup_and_loading.md) | User-facing loading guide |
-| Apply diffusion adapters | [LoRA](../user_guide/diffusion/lora.md) | User-facing extension guide |
+| Apply or extend diffusion adapters | [LoRA](../user_guide/diffusion/lora.md) | Integrated in the user guide |
 
 The [Pipeline Parallelism guide](../user_guide/diffusion/parallelism/pipeline_parallel.md)
 remains available by direct link, but it is not promoted in the primary User

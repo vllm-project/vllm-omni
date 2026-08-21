@@ -518,11 +518,10 @@ class OrchestratorArgs:
     num_gpus: int | None = None
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
-    lora_path: list[str] | None = None
-    lora_backend: str | None = None
-    lora_scale: float | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
+    prefused_lora: list[str] | None = None
+    dynamic_lora: list[str] | None = None
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None

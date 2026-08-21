@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.lora.types import lora_batch_key_fields
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -36,7 +37,8 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
-    "lora_int_id"
+    "lora_int_id",
+    "lora_scale",
 }
 
 
@@ -420,10 +422,13 @@ class BaseScheduler(ABC):
     ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
-        # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
+        lora_int_id, lora_scale = lora_batch_key_fields(
+            getattr(sampling, "lora_request", None),
+            getattr(sampling, "lora_scale", 1.0),
+        )
         return StepBatchSamplingParamsKey(
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_int_id=lora_int_id,
+            lora_scale=lora_scale,
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 

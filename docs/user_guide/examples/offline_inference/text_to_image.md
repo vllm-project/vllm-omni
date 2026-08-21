@@ -88,9 +88,9 @@ python text_to_image.py \
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--lora-path` | str | — | Path to PEFT LoRA adapter folder or checkpoint file |
-| `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
-| `--lora-backend` | str |`"peft"`| LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
+
+LoRA deployment and request options are documented in the
+[Diffusion LoRA guide](../../diffusion/lora.md).
 
 **NextStep-1.1 specific arguments:**
 
@@ -229,24 +229,7 @@ See more examples in the [diffusion acceleration user guide](https://github.com/
 
 #### LoRA
 
-This example supports PEFT-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default `1.0`); omit it to use the base model only.
-
-```bash
-python text_to_image.py \
-  --model Tongyi-MAI/Z-Image-Turbo \
-  --prompt "A piece of cheesecake" \
-  --lora-path /path/to/lora/ \
-  --lora-scale 1.0 \
-  --output output.png
-```
-
-LoRA adapters must be in PEFT format. A typical adapter directory structure:
-
-```
-lora_adapter/
-├── adapter_config.json
-└── adapter_model.safetensors
-```
+See the [Diffusion LoRA guide](../../diffusion/lora.md).
 
 ## Web UI Demo
 

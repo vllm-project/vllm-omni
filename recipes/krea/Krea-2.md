@@ -75,7 +75,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output krea2_raw.png
 ```
 
-LoRA (offline) — pass a PEFT adapter with `--lora-path` / `--lora-scale`.
+LoRA (offline) — register a PEFT adapter, then select it by name for the request.
 `NagaSaiAbhinay/Krea-2-vllm-darkbrush-LoRA` is a vLLM-Omni-compatible repackaging
 of `krea/Krea-2-LoRA-darkbrush`; its trigger word is `monochrome ink wash style`:
 
@@ -84,14 +84,16 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --model krea/Krea-2-Turbo \
   --prompt "a fox in the snow, monochrome ink wash style" \
   --num-inference-steps 8 --guidance-scale 0.0 \
-  --lora-path NagaSaiAbhinay/Krea-2-vllm-darkbrush-LoRA --lora-scale 1.0 \
+  --dynamic-lora '{"path":"NagaSaiAbhinay/Krea-2-vllm-darkbrush-LoRA","name":"darkbrush"}' \
+  --request-lora-name darkbrush --lora-scale 1.0 \
   --output krea2_darkbrush.png
 ```
 
 Online — serve and query the OpenAI-compatible image route:
 
 ```bash
-vllm serve krea/Krea-2-Turbo --omni --enforce-eager --port 8091
+vllm serve krea/Krea-2-Turbo --omni --enforce-eager --port 8091 \
+  --dynamic-lora '{"path":"NagaSaiAbhinay/Krea-2-vllm-darkbrush-LoRA","name":"darkbrush"}'
 ```
 
 ```bash
@@ -103,7 +105,7 @@ curl -s http://localhost:8091/v1/images/generations \
     "num_inference_steps": 8,
     "guidance_scale": 0.0,
     "seed": 42,
-    "lora": {"name": "darkbrush", "path": "NagaSaiAbhinay/Krea-2-vllm-darkbrush-LoRA", "scale": 1.0}
+    "lora": {"name": "darkbrush", "scale": 1.0}
   }' | jq -r '.data[0].b64_json' | base64 -d > krea2_online.png
 ```
 
@@ -133,10 +135,9 @@ confirm a valid 1024×1024 PNG is written.
   Krea 2 convention `velocity = cond + guidance_scale * (cond - uncond)`.
 - LoRA: adapters must be PEFT format (`adapter_config.json` +
   `adapter_model.safetensors`); the projections are `ReplicatedLinear`
-  (264 modules). Offline uses `--lora-path` (which sets
-  `OmniDiffusionSamplingParams.lora_request` / `lora_scale`); online uses the
-  top-level `lora` object. Style LoRAs like darkbrush need their trigger word in
-  the prompt.
+  (264 modules). Register adapters at startup with `--dynamic-lora`; offline
+  requests use `--request-lora-name`, and online requests use the top-level
+  `lora` object. Style LoRAs like darkbrush need their trigger word in the prompt.
 - Cache-DiT is supported; `has_separate_cfg` is checkpoint-aware (False for Turbo
   no-CFG, True for Raw CFG).
 - Known limitations: TP / SP / CFG-Parallel are not yet wired for Krea 2. HSDP,

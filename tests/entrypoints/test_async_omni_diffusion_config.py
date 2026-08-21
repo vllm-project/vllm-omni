@@ -301,8 +301,8 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
 
 
-def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
-    """Ensure startup distilled LoRA options reach the online diffusion stage."""
+def test_serve_cli_forwards_prefused_loras_to_diffusion_stage():
+    """Ensure startup LoRA composition reaches the online diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -312,10 +312,9 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
             "serve",
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             "--omni",
-            "--lora-backend",
-            "distill",
-            "--lora-path",
+            "--prefused-lora",
             "/models/high.safetensors",
+            "--prefused-lora",
             "/models/low.safetensors",
         ]
     )
@@ -324,12 +323,28 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
     engine_args = stage_cfg["engine_args"]
 
-    assert explicit_kwargs["lora_backend"] == "distill"
-    assert engine_args["lora_backend"] == "distill"
-    assert engine_args["lora_path"] == [
+    assert explicit_kwargs["prefused_lora"] == [
         "/models/high.safetensors",
         "/models/low.safetensors",
     ]
+    assert engine_args["prefused_lora"] == explicit_kwargs["prefused_lora"]
+
+
+def test_serve_cli_rejects_single_startup_lora_alias():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "serve",
+                "Qwen/Qwen-Image",
+                "--omni",
+                "--lora-path",
+                "/models/style",
+            ]
+        )
 
 
 def test_serve_cli_forwards_distributed_offload_residency():
@@ -523,6 +538,18 @@ def test_resolve_stage_configs_rejects_legacy_config_arguments(legacy_arg, value
         engine._resolve_stage_configs(
             "dummy-model",
             {legacy_arg: value},
+            trust_remote_code=False,
+        )
+
+
+@pytest.mark.parametrize("legacy_field", ["lora_path", "lora_scale", "static_lora_scale", "lora_backend"])
+def test_resolve_stage_configs_rejects_legacy_lora_fields(legacy_field):
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    with pytest.raises(ValueError, match="Legacy diffusion LoRA argument"):
+        engine._resolve_stage_configs(
+            "dummy-model",
+            {legacy_field: "/tmp/style"},
             trust_remote_code=False,
         )
 

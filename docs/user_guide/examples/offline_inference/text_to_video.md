@@ -145,9 +145,8 @@ python text_to_video.py \
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
-- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
-- `--lora-scale`: scale factor for LoRA weights.
-- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
+- LoRA deployment and request selection: see the
+  [Diffusion LoRA guide](../../diffusion/lora.md).
 
 ### Wan2.2-specific
 

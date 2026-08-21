@@ -13,13 +13,12 @@ import torch
 from diffusers.utils import numpy_to_pil
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
-from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
     build_text_to_image_prompt as build_model_text_to_image_prompt,
 )
@@ -265,26 +264,30 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
-        "--lora-path",
+        "--request-lora-name",
         type=str,
-        nargs="+",
         default=None,
-        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
+        help="Name of one --dynamic-lora registration to select for this request.",
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         default=1.0,
-        help="Scale factor for LoRA weights (default: 1.0).",
+        help="Request scale for --request-lora-name (default: 1.0).",
     )
     parser.add_argument(
-        "--lora-backend",
-        type=str,
-        default="peft",
-        choices=["peft", "distill"],
-        help="LoRA backend for loading LoRA adapters. Default: peft"
-        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
-        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
+        "--prefused-lora",
+        action="append",
+        default=None,
+        metavar="PATH[=SCALE]",
+        help="LoRA to merge into dense weights at startup. Repeat to compose adapters.",
+    )
+    parser.add_argument(
+        "--dynamic-lora",
+        action="append",
+        default=None,
+        metavar="PATH|JSON",
+        help="LoRA to register at startup for request selection. Repeat to register adapters.",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -420,13 +423,12 @@ def main():
 
     # Prepare LoRA kwargs for Omni initialization
     lora_args: dict[str, Any] = {}
-    if args.lora_path:
-        lora_path = args.lora_path
-        if len(lora_path) == 1:
-            lora_path = lora_path[0]
-        lora_args["lora_path"] = lora_path
-        lora_args["lora_backend"] = args.lora_backend
-        print(f"Using LoRA from: {lora_path} with backend: {args.lora_backend}")
+    if args.prefused_lora:
+        lora_args["prefused_lora"] = args.prefused_lora
+        print(f"Prefusing LoRA composition: {args.prefused_lora}")
+    if args.dynamic_lora:
+        lora_args["dynamic_lora"] = args.dynamic_lora
+        print(f"Installing dynamic LoRA composition: {args.dynamic_lora}")
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
@@ -505,25 +507,13 @@ def main():
     )
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
-    if args.lora_path:
+    if args.request_lora_name is not None:
         print(f"  LoRA: scale={args.lora_scale}")
     if args.deploy_config:
         print(f"  deploy-config: {args.deploy_config}")
     print(f"{'=' * 60}\n")
 
-    # Build LoRA request when --lora-path is set
-    lora_request = None
-    if args.lora_path and args.lora_backend == "peft":
-        if len(args.lora_path) != 1:
-            raise ValueError("Only one LoRA path is expected for PEFT backend.")
-
-        lora_path = args.lora_path[0]
-        lora_request_id = stable_lora_int_id(lora_path)
-        lora_request = LoRARequest(
-            lora_name=Path(lora_path).stem,
-            lora_int_id=lora_request_id,
-            lora_path=lora_path,
-        )
+    lora_request = registered_lora_request(args.request_lora_name) if args.request_lora_name is not None else None
 
     generation_start = time.perf_counter()
 

@@ -23,7 +23,7 @@ from PIL import Image
 from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer
 from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -42,27 +42,6 @@ ROCM_SERVER_ARGS = (
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 SIZE = "256x256"
 SEED = 42
-
-
-server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            server_args=[
-                "--num-gpus",
-                "1",
-                *ROCM_SERVER_ARGS,
-            ],
-            # A cold-cache Z-Image load can take slightly more than the
-            # orchestrator's 900s default on CI (weights alone have been
-            # observed at ~690s and full orchestrator readiness at ~906s).
-            # Match the large-model offline runner's startup allowance without
-            # weakening timeout detection for every online-serving test.
-            init_timeout=1800,
-        ),
-        id="zimage_turbo_lora",
-    ),
-]
 
 
 def _write_zimage_lora(adapter_dir: Path, *, q_scale: float = 0.0, k_scale: float = 0.0, v_scale: float = 0.0):
@@ -166,14 +145,15 @@ def _basic_payload() -> dict:
         "num_inference_steps": 2,
         "guidance_scale": 0.0,
         "seed": SEED,
+        "lora": [],
     }
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
-@pytest.mark.parametrize("omni_server", server_params, indirect=True)
-def test_images_generations_per_request_lora_switching(omni_server: OmniServer, tmp_path: Path) -> None:
+def _assert_images_generations_per_request_lora_switching(
+    omni_server: OmniServer,
+    lora_a_dir: Path,
+    lora_b_dir: Path,
+) -> None:
     # Base generation.
     base_img = _post_images(omni_server, _basic_payload())
     base_slice = _image_blue_tail_slice(base_img)
@@ -182,20 +162,16 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
     base_ref_max, base_ref_mean = _slice_diff_stats(base_ref_slice, base_slice)
 
     # Adapter A: apply delta to V slice only.
-    lora_a_dir = tmp_path / "zimage_lora_a"
-    _write_zimage_lora(lora_a_dir, v_scale=8.0)
     payload_a = _basic_payload()
-    payload_a["lora"] = {"name": "a", "path": str(lora_a_dir), "scale": 64.0}
+    payload_a["lora"] = {"name": lora_a_dir.name, "scale": 64.0}
     img_a = _post_images(omni_server, payload_a)
     a_slice = _image_blue_tail_slice(img_a)
     _assert_slice_diff(a_slice, base_slice, label="lora_a_vs_base")
     a_vs_base = float(np.abs(a_slice - base_slice).mean())
 
     # Adapter B: apply delta to K slice only (should differ from adapter A).
-    lora_b_dir = tmp_path / "zimage_lora_b"
-    _write_zimage_lora(lora_b_dir, k_scale=4.0)
     payload_b = _basic_payload()
-    payload_b["lora"] = {"name": "b", "path": str(lora_b_dir), "scale": 64.0}
+    payload_b["lora"] = {"name": lora_b_dir.name, "scale": 64.0}
     img_b = _post_images(omni_server, payload_b)
     b_slice = _image_blue_tail_slice(img_b)
     _assert_slice_diff(b_slice, base_slice, label="lora_b_vs_base")
@@ -220,3 +196,29 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
     assert a_vs_base > min_delta, f"lora_a_vs_base drift too small: {a_vs_base} <= {min_delta}"
     assert b_vs_base > min_delta, f"lora_b_vs_base drift too small: {b_vs_base} <= {min_delta}"
     assert b_vs_a > min_delta, f"lora_b_vs_lora_a drift too small: {b_vs_a} <= {min_delta}"
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+def test_images_generations_per_request_lora_switching(tmp_path: Path) -> None:
+    lora_a_dir = tmp_path / "zimage_lora_a"
+    lora_b_dir = tmp_path / "zimage_lora_b"
+    _write_zimage_lora(lora_a_dir, v_scale=8.0)
+    _write_zimage_lora(lora_b_dir, k_scale=4.0)
+
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--dynamic-lora",
+        str(lora_a_dir),
+        "--dynamic-lora",
+        str(lora_b_dir),
+        "--max-cpu-loras",
+        "2",
+        "--init-timeout",
+        "1800",
+        *ROCM_SERVER_ARGS,
+    ]
+    with OmniServer(MODEL, server_args) as omni_server:
+        _assert_images_generations_per_request_lora_switching(omni_server, lora_a_dir, lora_b_dir)

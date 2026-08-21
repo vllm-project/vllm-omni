@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.lora.request import LoRARequest
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
 )
+from vllm_omni.diffusion.lora.types import registered_lora_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -30,7 +32,9 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.utils import stable_lora_int_id
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -534,6 +538,27 @@ class TestDiffusionCompileConfig:
         with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
             OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
 
+    @pytest.mark.parametrize("legacy_field", ["lora_path", "lora_scale", "static_lora_scale", "lora_backend"])
+    def test_config_rejects_legacy_lora_fields(self, legacy_field) -> None:
+        with pytest.raises(ValueError, match="Legacy diffusion LoRA argument"):
+            OmniDiffusionConfig.from_kwargs(model="test", **{legacy_field: "/tmp/style"})
+
+    def test_config_rejects_scale_on_dynamic_registration(self) -> None:
+        with pytest.raises(ValueError, match="does not accept startup scales"):
+            OmniDiffusionConfig(model="test", dynamic_lora=["/tmp/detail=0.5"])
+
+    def test_config_rejects_dynamic_registry_larger_than_capacity(self) -> None:
+        with pytest.raises(ValueError, match="registrations exceed max_cpu_loras"):
+            OmniDiffusionConfig(model="test", dynamic_lora=["/tmp/one", "/tmp/two"])
+
+    def test_config_rejects_prefused_lora_with_dlo(self) -> None:
+        with pytest.raises(ValueError, match="prefused_lora.*distributed layerwise offload.*dynamic_lora"):
+            OmniDiffusionConfig(
+                model="test",
+                prefused_lora=["/tmp/turbo.safetensors=1.0"],
+                enable_distributed_layerwise_offload=True,
+            )
+
     @pytest.mark.parametrize(
         "kwargs, feature",
         [
@@ -556,6 +581,105 @@ class TestDiffusionCompileConfig:
                 diffusion_compile_granularity="full",
                 **kwargs,
             )
+
+
+class TestDynamicLoRAAdmission:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _engine(**overrides) -> DiffusionEngine:
+        config = {
+            "enforce_eager": False,
+            "enable_cpu_offload": False,
+            "enable_layerwise_offload": False,
+            "enable_distributed_layerwise_offload": False,
+            "cache_backend": "none",
+            "prefused_lora": None,
+            "dynamic_lora": None,
+        }
+        config.update(overrides)
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(**config)
+        engine.pre_process_func = None
+        return engine
+
+    @staticmethod
+    def _request(lora_request, lora_scale=1.0) -> OmniDiffusionRequest:
+        return OmniDiffusionRequest(
+            prompt="test",
+            sampling_params=OmniDiffusionSamplingParams(
+                lora_request=lora_request,
+                lora_scale=lora_scale,
+            ),
+            request_id="request",
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"enforce_eager": True},
+            {"prefused_lora": ["/tmp/template"]},
+            {"dynamic_lora": ["/tmp/template"]},
+        ],
+    )
+    def test_request_rejects_unregistered_dynamic_lora(self, overrides) -> None:
+        engine = self._engine(**overrides)
+        request = self._request(registered_lora_request("missing"))
+
+        with pytest.raises(OmniClientError, match="not registered.*--dynamic-lora"):
+            engine._prepare_request_for_admission(request)
+
+    def test_request_allows_registered_dynamic_lora_with_new_scale(self) -> None:
+        path = "/tmp/style"
+        engine = self._engine(dynamic_lora=[path])
+        request = self._request(registered_lora_request("style"), lora_scale=0.25)
+
+        assert engine._prepare_request_for_admission(request) is request
+        resolved = request.sampling_params.lora_request
+        assert isinstance(resolved, LoRARequest)
+        assert resolved.lora_name == "style"
+        assert resolved.lora_int_id == stable_lora_int_id("style")
+        assert resolved.lora_path == path
+        assert request.sampling_params.lora_scale == 0.25
+
+    def test_dynamic_lora_registry_is_parsed_once(self, monkeypatch) -> None:
+        import vllm_omni.diffusion.diffusion_engine as engine_module
+
+        parse = engine_module.parse_lora_registration_specs
+        calls = 0
+
+        def _counted_parse(values):
+            nonlocal calls
+            calls += 1
+            return parse(values)
+
+        monkeypatch.setattr(engine_module, "parse_lora_registration_specs", _counted_parse)
+        engine = self._engine(dynamic_lora=["/tmp/style"])
+
+        for request_id in ("first", "second"):
+            request = self._request(registered_lora_request("style"))
+            request.request_id = request_id
+            engine._prepare_request_for_admission(request)
+
+        assert calls == 1
+
+    def test_request_rejects_paths_even_when_id_and_path_match(self) -> None:
+        engine = self._engine(dynamic_lora=['{"path":"/tmp/style","name":"style"}'])
+        adapter_request = LoRARequest(
+            lora_name="style",
+            lora_int_id=stable_lora_int_id("style"),
+            lora_path="/tmp/style",
+        )
+
+        with pytest.raises(OmniClientError, match="not registered"):
+            engine._prepare_request_for_admission(self._request(adapter_request))
+
+    def test_request_allows_explicit_empty_lora(self) -> None:
+        engine = self._engine()
+        request = self._request((), ())
+
+        assert engine._prepare_request_for_admission(request) is request
 
 
 class TestRequestBatchAdmission:
@@ -809,7 +933,7 @@ async def test_async_add_req_and_stream_response():
     await engine._check_and_start_background_loop()
 
     async def run_task(rid):
-        req = SimpleNamespace(request_id=rid)
+        req = SimpleNamespace(request_id=rid, sampling_params=OmniDiffusionSamplingParams())
         start = time.time()
         res = await _consume_final_output(engine.async_add_req_and_stream_response(req))
         return rid, res, time.time() - start

@@ -20,6 +20,7 @@ import PIL.Image
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -39,6 +40,13 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.lora.types import (
+    WeightedLoRA,
+    is_registered_lora_request,
+    normalize_lora_composition,
+    parse_lora_registration_specs,
+    split_lora_composition,
+)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -53,7 +61,7 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 if TYPE_CHECKING:
@@ -190,6 +198,7 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        self._get_dynamic_lora_registry()
         # Set after the paged-KV profile request has gone through model-owned
         # preprocessing. Real requests are admitted only within this measured
         # activation envelope: (max execution sequences, max seq_len,
@@ -749,11 +758,54 @@ class DiffusionEngine:
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
+        self._resolve_request_lora_registration(request)
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
         return request
+
+    def _resolve_request_lora_registration(self, request: OmniDiffusionRequest) -> None:
+        """Resolve request names to dynamic adapters registered by deployment."""
+
+        sampling = request.sampling_params
+        composition = normalize_lora_composition(sampling.lora_request, sampling.lora_scale)
+        if not composition:
+            return
+
+        registered = self._get_dynamic_lora_registry()
+        unavailable = [
+            adapter
+            for adapter in composition
+            if adapter.request.lora_name not in registered or not is_registered_lora_request(adapter.request)
+        ]
+        if unavailable:
+            specs = ", ".join(repr(adapter.request.lora_name) for adapter in unavailable)
+            raise OmniClientError(
+                "Request LoRA adapter(s) are not registered by this deployment: "
+                f"{specs}. Configure every request-selectable adapter with --dynamic-lora before serving."
+            )
+
+        resolved = tuple(
+            WeightedLoRA(
+                request=registered[adapter.request.lora_name],
+                scale=adapter.scale,
+            )
+            for adapter in composition
+        )
+        sampling.lora_request, sampling.lora_scale = split_lora_composition(resolved)
+
+    def _get_dynamic_lora_registry(self) -> dict[str, LoRARequest]:
+        """Return the deployment registry, parsing immutable config only once."""
+
+        registry = getattr(self, "_dynamic_lora_registry", None)
+        if registry is None:
+            registry = {
+                request.lora_name: request
+                for request in parse_lora_registration_specs(getattr(self.od_config, "dynamic_lora", None))
+            }
+            self._dynamic_lora_registry = registry
+        return registry
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""

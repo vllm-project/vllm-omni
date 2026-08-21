@@ -2515,13 +2515,13 @@ def _get_lora_from_json_str(lora_body):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid LoRA JSON string")
 
-    if not isinstance(lora_dict, dict):
-        raise HTTPException(status_code=400, detail="LoRA must be a JSON object")
+    if not isinstance(lora_dict, (dict, list)):
+        raise HTTPException(status_code=400, detail="LoRA must be a JSON object or array of objects")
 
     return lora_dict
 
 
-def _parse_lora_request(lora_body: dict[str, Any]):
+def _parse_lora_request(lora_body: dict[str, Any] | list[dict[str, Any]] | None):
     try:
         return parse_lora_request(lora_body)
     except ValueError as e:
@@ -2780,7 +2780,10 @@ def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, li
     return app_model_name, app_stage_configs
 
 
-def _parse_form_json(value: str | None, expected_type: type | None = None) -> Any:
+def _parse_form_json(
+    value: str | None,
+    expected_type: type | tuple[type, ...] | None = None,
+) -> Any:
     if value is None or value == "":
         return None
     try:
@@ -2791,9 +2794,11 @@ def _parse_form_json(value: str | None, expected_type: type | None = None) -> An
             detail="Invalid JSON in form field.",
         ) from exc
     if expected_type is not None and not isinstance(parsed, expected_type):
+        expected_types = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+        expected_name = " or ".join(item.__name__ for item in expected_types)
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=f"Invalid JSON in form field: expected {expected_type.__name__}, got {type(parsed).__name__}.",
+            detail=f"Invalid JSON in form field: expected {expected_name}, got {type(parsed).__name__}.",
         )
     return parsed
 
@@ -3306,7 +3311,7 @@ async def _parse_video_form(
         "frame_interpolation_exp": frame_interpolation_exp,
         "frame_interpolation_scale": frame_interpolation_scale,
         "frame_interpolation_model_path": frame_interpolation_model_path,
-        "lora": _parse_form_json(lora, expected_type=dict),
+        "lora": _parse_form_json(lora, expected_type=(dict, list)),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}

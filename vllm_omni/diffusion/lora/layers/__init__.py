@@ -10,6 +10,7 @@ from .column_parallel_linear import (
 )
 from .replicated_linear import DiffusionReplicatedLinearWithLoRA
 from .row_parallel_linear import DiffusionRowParallelLinearWithLoRA
+from .torch_linear import DiffusionTorchLinearWithLoRA
 
 __all__ = [
     "DiffusionBaseLinearLayerWithLoRA",
@@ -19,4 +20,5 @@ __all__ = [
     "DiffusionRowParallelLinearWithLoRA",
     "DiffusionQKVParallelLinearWithLoRA",
     "DiffusionMergedQKVParallelLinearWithLoRA",
+    "DiffusionTorchLinearWithLoRA",
 ]

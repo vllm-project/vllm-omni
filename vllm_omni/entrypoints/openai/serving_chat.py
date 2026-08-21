@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import json
@@ -3138,15 +3141,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body is not None:
                     try:
                         lora_req, lora_scale = parse_lora_request(lora_body)
                         if lora_req is not None:
                             default_stage_params.lora_request = lora_req
                             if lora_scale is not None:
                                 default_stage_params.lora_scale = lora_scale
-                    except Exception as e:  # pragma: no cover - safeguard
-                        logger.warning("Failed to parse LoRA request: %s", e)
+                    except ValueError as exc:
+                        raise OmniClientError(str(exc)) from exc
 
         return engine_prompt, sampling_params_list
 
@@ -3200,15 +3203,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             strength=extra_body.get("strength"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body is not None:
             try:
                 lora_req, lora_scale = parse_lora_request(lora_body)
                 if lora_req is not None:
                     gen_params.lora_request = lora_req
                     if lora_scale is not None:
                         gen_params.lora_scale = lora_scale
-            except Exception as e:  # pragma: no cover - safeguard
-                logger.warning("Failed to parse LoRA request: %s", e)
+            except ValueError as exc:
+                raise OmniClientError(str(exc)) from exc
 
         gen_prompt: OmniTextPrompt = {
             "prompt": prompt,
@@ -3605,15 +3608,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.resolution = resolution
 
             # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
+            if lora_body is not None:
                 try:
                     lora_req, lora_scale = parse_lora_request(lora_body)
                     if lora_req is not None:
                         gen_params.lora_request = lora_req
                         if lora_scale is not None:
                             gen_params.lora_scale = lora_scale
-                except Exception as exc:  # pragma: no cover - safeguard
-                    logger.warning("Failed to parse LoRA request: %s", exc)
+                except ValueError as exc:
+                    raise OmniClientError(str(exc)) from exc
 
             # Route text modality for single-stage diffusion (img2text / text2text)
             requested_modalities = extra_body.get("modalities") or []
