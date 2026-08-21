@@ -1250,45 +1250,6 @@ class MiniMaxH3Pipeline(
                 shapes.extend(video_shapes)
         return (torch.cat(rows) if rows else None), shapes
 
-    def _encode_audio_condition(
-        self,
-        audio: tuple[torch.Tensor, int],
-    ) -> tuple[torch.Tensor, int]:
-        _, rank, _ = _dit_rank_world()
-        rows = None
-        audio_t = 0
-        if rank == 0:
-            with self._component_on_device(self.audio_vae):
-                rows, audio_t = self.audio_vae.encode_waveform(*audio)
-        audio_t_tensor = torch.tensor(
-            [audio_t],
-            dtype=torch.long,
-            device=self.device,
-        )
-        group, _, world_size = _dit_rank_world()
-        if world_size > 1:
-            dist.broadcast(audio_t_tensor, src=0, group=group)
-        rows = _broadcast_tensor(
-            rows,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        return rows, int(audio_t_tensor.item())
-
-    def _encode_audio_conditions(
-        self,
-        audios: list[tuple[torch.Tensor, int]],
-        *,
-        max_duration_seconds: float | None = None,
-    ) -> tuple[torch.Tensor | None, list[int]]:
-        if not audios:
-            return None, []
-        with self._component_on_device(self.audio_vae):
-            return self._encode_audio_conditions_resident(
-                audios,
-                max_duration_seconds=max_duration_seconds,
-            )
-
     def _encode_audio_conditions_resident(
         self,
         audios: list[tuple[torch.Tensor, int]],
@@ -1325,15 +1286,6 @@ class MiniMaxH3Pipeline(
             _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
             [int(value) for value in lengths.tolist()],
         )
-
-    def _encode_video_conditions(
-        self,
-        prepared_videos: list[dict[str, Any]] | None,
-        *,
-        count: int,
-    ) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
-        with self._component_on_device(self.video_vae):
-            return self._encode_video_conditions_resident(prepared_videos, count=count)
 
     def _encode_video_conditions_resident(
         self,
@@ -1381,15 +1333,6 @@ class MiniMaxH3Pipeline(
             _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
             [tuple(int(value) for value in item) for item in shapes.tolist()],
         )
-
-    def _encode_video_audio_conditions(
-        self,
-        prepared_videos: list[dict[str, Any]] | None,
-        *,
-        has_audio: list[bool],
-    ) -> tuple[torch.Tensor | None, list[int]]:
-        with self._component_on_device(self.audio_vae):
-            return self._encode_video_audio_conditions_resident(prepared_videos, has_audio=has_audio)
 
     def _encode_video_audio_conditions_resident(
         self,
