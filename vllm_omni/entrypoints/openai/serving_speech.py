@@ -7,6 +7,7 @@ import math
 import os
 import re
 import struct
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -72,6 +73,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 )
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.reference_cache_key import locator_content_key
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -124,6 +126,7 @@ _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
 _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_MOSS_GPU_CODEC_BATCH_WAIT_MS = 4
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MAX = 4096
@@ -314,6 +317,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._higgs_audio_v3_ref_code_cache_bytes = 0
         self._higgs_audio_v3_ref_code_inflight: dict[str, asyncio.Task[torch.Tensor]] = {}
         self._speaker_cache = get_speaker_cache()
+        self._moss_reference_encoders: dict[tuple[int, str, int, int], Any] = {}
+        self._moss_reference_encoders_lock = threading.Lock()
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
         self._restore_uploaded_speakers()
@@ -665,6 +670,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
+        # Close each MOSS-TTS reference encoder so its daemon batching
+        # thread exits cleanly. Each ``close()`` is best-effort with a
+        # bounded join, so a stuck encoder can't block server shutdown.
+        with self._moss_reference_encoders_lock:
+            encoders = list(self._moss_reference_encoders.values())
+            self._moss_reference_encoders.clear()
+        for encoder in encoders:
+            try:
+                encoder.close()
+            except Exception:
+                logger.exception("MOSS-TTS reference encoder close() failed")
         for name in list(self.uploaded_speakers.keys()):
             self._speaker_cache.clear(name)
 
@@ -1568,9 +1584,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Lazily load the upstream MOSS-TTS processor once per server.
 
         Cached on ``self._moss_processor_cache``. The processor owns its own
-        audio_tokenizer (~1.6 B params); we keep it on CPU so it doesn't
-        compete with the talker (~8 GiB) and codec (~7 GiB) for our 96 GiB
-        GPU — per-request ref-audio encoding is fast enough on CPU.
+        audio_tokenizer (~1.6 B params). The codec encoder is placed on the
+        GPU by default: a single GPU encode is ~0.25 GPU-s versus several
+        seconds on CPU, which dominates cold voice-clone latency. Placement is
+        resolved by :meth:`_resolve_moss_codec_device` (``MOSS_REF_AUDIO_CODEC_DEVICE``
+        env override; default ``cuda:0`` when CUDA is visible, else CPU) with a
+        graceful CPU fallback if GPU placement fails (e.g. OOM).
         """
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
@@ -1580,9 +1599,98 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         model_id = self.engine_client.model_config.model
         proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         if hasattr(proc, "audio_tokenizer"):
-            proc.audio_tokenizer = proc.audio_tokenizer.to("cpu").eval()
+            device = self._resolve_moss_codec_device()
+            try:
+                proc.audio_tokenizer = proc.audio_tokenizer.to(device).eval()
+            except Exception:
+                logger.exception(
+                    "MOSS audio tokenizer placement on %s failed; "
+                    "falling back to CPU",
+                    device,
+                )
+                proc.audio_tokenizer = proc.audio_tokenizer.to("cpu").eval()
+            logger.info(
+                "MOSS audio tokenizer (reference codec) placed on %s",
+                self._moss_codec_device(proc),
+            )
         self._moss_processor_cache = proc
         return proc
+
+    @staticmethod
+    def _resolve_moss_codec_device() -> str:
+        """Resolve the device for the MOSS reference-encode codec.
+
+        ``MOSS_REF_AUDIO_CODEC_DEVICE`` wins when set (e.g. ``cpu``, ``cuda:1``).
+        Otherwise default to ``cuda:0`` when CUDA is visible and fall back to CPU when no
+        GPU is available.
+        """
+        override = os.environ.get("MOSS_REF_AUDIO_CODEC_DEVICE")
+        if override and override.strip():
+            return override.strip()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda:0"
+        except Exception:
+            pass
+        return "cpu"
+
+    @staticmethod
+    def _moss_codec_device(processor: Any) -> str:
+        """Return the device string of a processor's audio tokenizer."""
+        tokenizer = getattr(processor, "audio_tokenizer", None)
+        if tokenizer is None:
+            return "cpu"
+        try:
+            return str(next(tokenizer.parameters()).device)
+        except StopIteration:
+            return "cpu"
+
+    def _get_moss_reference_encoder(
+        self,
+        processor: Any,
+        variant: str,
+        n_vq: int,
+        sr_target: int,
+    ) -> Any:
+        """Return the MOSS-TTS reference encoder for this variant, creating it on demand.
+
+        One instance is held per ``(id(processor), variant, n_vq, sr_target)``
+        so the daemon worker pool and content-addressed LRU are reused across
+        requests. ``shutdown`` closes each instance cleanly. The factory import
+        is lazy so unrelated model paths never pull the MOSS module.
+
+        Batching is device-aware: when the codec is on GPU we coalesce concurrent
+        encodes behind a short wait window, because one
+        GPU forward amortizes across a batch; on CPU we disable coalescing since
+        a single forward already saturates the cores and batching only adds
+        latency.
+        """
+        key = (id(processor), str(variant), int(n_vq), int(sr_target))
+        encoder = self._moss_reference_encoders.get(key)
+        if encoder is not None:
+            return encoder
+        with self._moss_reference_encoders_lock:
+            encoder = self._moss_reference_encoders.get(key)
+            if encoder is not None:
+                return encoder
+            from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
+                create_reference_encoder,
+            )
+
+            codec_on_gpu = self._moss_codec_device(processor).startswith("cuda")
+            encoder = create_reference_encoder(
+                processor,
+                variant=str(variant),
+                n_vq=int(n_vq),
+                sr_target=int(sr_target),
+                # GPU: coalesce concurrent encodes (single worker + wait window)
+                # to amortize the forward. CPU: no wait window.
+                max_batch_wait_ms=_MOSS_GPU_CODEC_BATCH_WAIT_MS if codec_on_gpu else 0,
+            )
+            self._moss_reference_encoders[key] = encoder
+        return encoder
 
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
@@ -1654,30 +1762,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # offline example's hardcoded encode_audios_from_wav(sampling_rate=24000)
         # for this variant; proc.model_config.sampling_rate there is the
         # output rate (48000), the wrong value to resample the reference into.
-        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
+        sr_target = (
+            24000
+            if v == "local"
+            else int(getattr(proc.model_config, "sampling_rate", 24000))
+        )
 
-        # Reference-audio encoding + speaker caching lives in the model package
+        # Reference-audio encoding + caching lives in the model package
         # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
         # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. Imported lazily so the API-server process
-        # only pulls it on the delay-family path (alongside the upstream proc).
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
-
-        _voice = getattr(request, "voice", None)
-        _voice = _voice.strip() if isinstance(_voice, str) else ""
-        _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
+        # this shared serving file. The serving layer explicitly owns the
+        # encoder instance (one per (processor, variant, n_vq, sr_target)):
+        # the getter constructs it on first request and ``shutdown`` closes it
+        # cleanly, replacing the old module-level weakref singleton.
+        #
+        # The cache key is derived from the ref_audio *locator* up front
+        # (locator_content_key: decoded bytes for data: URIs, a stat+sentinel
+        # hash for local files, the raw string otherwise), so a cache hit
+        # returns the encoded codes without resolving or re-encoding the
+        # reference. Re-uploading a file at the same path invalidates its
+        # entry because the content hash changes.
+        encoder = self._get_moss_reference_encoder(proc, v, n_vq, sr_target)
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
-            return await encode_reference_codes(
+            return await encoder.encode_reference_codes(
                 ref_str,
-                processor=proc,
                 resolve_ref_audio=self._resolve_ref_audio,
-                speaker_cache=self._speaker_cache,
-                variant=v,
-                n_vq=n_vq,
-                sr_target=sr_target,
-                voice_name=_voice or None,
-                voice_created_at=_voice_created,
             )
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
@@ -1937,8 +2047,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
+
+        The resolve cache is keyed by *content* whenever the locator exposes
+        content cheaply: local files use a stat/sentinel/xxh3 chain and
+        ``data:`` URIs use an xxh3 of the decoded payload. Http(s) URLs fall
+        back to hashing the raw locator string, which remains best-effort
+        and assumes URL contents are stable during the server lifetime.
         """
-        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        cache_key = self._ref_audio_source_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
@@ -2003,12 +2119,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return h.hexdigest()
 
     def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
-        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        source_key = self._ref_audio_source_cache_key(ref_audio_str)
         cached = self._ref_audio_resolve_cache.get(source_key)
         if cached is None:
             return None
         self._ref_audio_resolve_cache.move_to_end(source_key)
         return cached[3]
+
+    @staticmethod
+    def _ref_audio_source_cache_key(ref_audio_str: str) -> str:
+        """Return a content-aware cache key for a ``ref_audio`` locator.
+
+        Delegates to :func:`locator_content_key`, which keys ``data:`` URIs by
+        their decoded payload, local/``file://`` paths by a stat + sentinel +
+        full-content hash (detecting overwrites that reuse the same path), and
+        everything else (http(s) URLs, opaque strings) by a hash of the raw
+        locator. The same helper backs the MOSS reference encoder's cache so
+        the resolve cache and the codec cache agree on what "the same audio"
+        means.
+        """
+        return locator_content_key(ref_audio_str)
 
     def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
