@@ -16,8 +16,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
 from vllm_omni.experimental.ar_diffusion.session import (
+    ARDiffusionRolloutLostError,
     ARDiffusionSession,
     ARDiffusionSessionManager,
+    ARDiffusionTickExecutionError,
     ARDiffusionWorkerLifecycle,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
@@ -32,8 +34,10 @@ __all__ = [
     "ARDiffusionCrossAttentionKVSpec",
     "ARDiffusionEngine",
     "ARDiffusionOmniTickConsumer",
+    "ARDiffusionRolloutLostError",
     "ARDiffusionSession",
     "ARDiffusionSessionManager",
+    "ARDiffusionTickExecutionError",
     "ARDiffusionWorkerLifecycle",
     "AR_DIFFUSION_TICK_KEY",
     "ARDiffusionChunkMetadata",

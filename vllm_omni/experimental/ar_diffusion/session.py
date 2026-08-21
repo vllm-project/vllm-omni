@@ -42,6 +42,19 @@ class ARDiffusionChunkMetadataError(ARDiffusionSessionError):
     """Raised when a tick consumer returns metadata for a different chunk."""
 
 
+class ARDiffusionTickExecutionError(ARDiffusionSessionError):
+    """Raised when the engine reports a failed or incomplete tick execution."""
+
+
+class ARDiffusionRolloutLostError(ARDiffusionSessionStateError):
+    """Raised when a tick is attempted against a destroyed rollout.
+
+    A failed tick releases worker-side KV and model-owned state, so the
+    accumulated rollout history is gone. Retrying the tick cannot succeed;
+    ``reset()`` restarts the session from chunk 0 rather than resuming it.
+    """
+
+
 class ARDiffusionEventAcceptanceStatus(str, Enum):
     ACCEPTED = "accepted"
     DUPLICATE = "duplicate"
@@ -257,12 +270,19 @@ class ARDiffusionSession(Generic[TickOutputT]):
         self._prompt: str | None = None
         self._controls: dict[str, ARDiffusionControlInput] = {}
 
+        self._rollout_lost: str | None = None
+
         self._state_lock = asyncio.Lock()
         self._tick_lock = asyncio.Lock()
 
     @property
     def status(self) -> ARDiffusionSessionStatus:
         return self._status
+
+    @property
+    def rollout_lost(self) -> str | None:
+        """Why the rollout was destroyed, or ``None`` while it is intact."""
+        return self._rollout_lost
 
     @property
     def chunk_index(self) -> int:
@@ -273,8 +293,19 @@ class ARDiffusionSession(Generic[TickOutputT]):
         return len(self._pending_events)
 
     def _require_active(self) -> None:
-        if self._status is not ARDiffusionSessionStatus.ACTIVE:
-            raise ARDiffusionSessionStateError(f"AR-Diffusion session {self.session_id!r} is {self._status.value}.")
+        if self._status is ARDiffusionSessionStatus.ACTIVE:
+            return
+        # A failed tick already released worker KV and model-owned state, so
+        # this is not a retryable tick error: distinguish it from the other
+        # non-active states, which merely reject the operation.
+        if self._status is ARDiffusionSessionStatus.FAILED and self._rollout_lost:
+            raise ARDiffusionRolloutLostError(
+                f"AR-Diffusion session {self.session_id!r} lost its rollout "
+                f"({self._rollout_lost}); worker KV and model-owned state were "
+                "released, so this tick cannot be retried. Call reset() to "
+                "restart from chunk 0, or close() and open a new session."
+            )
+        raise ARDiffusionSessionStateError(f"AR-Diffusion session {self.session_id!r} is {self._status.value}.")
 
     def _require_resettable(self) -> None:
         if self._status not in {
@@ -410,6 +441,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
         async with self._state_lock:
             self._inflight_event_floor = None
             self._status = ARDiffusionSessionStatus.FAILED
+            self._rollout_lost = f"{type(tick_error).__name__}: {tick_error}"
         try:
             # A model forward may already have released its state. This
             # idempotent close also covers successful forwards whose metadata
@@ -466,7 +498,11 @@ class ARDiffusionSession(Generic[TickOutputT]):
             return output
 
     async def reset(self) -> None:
-        """Reset worker state and discard queued/current transport state."""
+        """Reset worker state and discard queued/current transport state.
+
+        This restarts the session at chunk 0; it never resumes a rollout whose
+        worker-side state was released.
+        """
         async with self._tick_lock:
             async with self._state_lock:
                 self._require_resettable()
@@ -487,6 +523,7 @@ class ARDiffusionSession(Generic[TickOutputT]):
                     self._control_reducer.reset()
                 self._inflight_event_floor = None
                 self._chunk_index = 0
+                self._rollout_lost = None
                 self._status = ARDiffusionSessionStatus.ACTIVE
 
     async def close(self) -> None:

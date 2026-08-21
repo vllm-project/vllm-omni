@@ -7,6 +7,7 @@ import copy
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Protocol
 
+from vllm_omni.experimental.ar_diffusion.session import ARDiffusionTickExecutionError
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -151,12 +152,12 @@ class ARDiffusionOmniTickConsumer:
                 final_output = output
 
         if final_output is None:
-            raise RuntimeError(
+            raise ARDiffusionTickExecutionError(
                 f"AR-Diffusion tick {tick.request_id!r} completed without a final "
                 f"output from stage {self._diffusion_stage_id}."
             )
         if final_output.error:
-            raise RuntimeError(f"AR-Diffusion tick {tick.request_id!r} failed: {final_output.error}")
+            raise ARDiffusionTickExecutionError(f"AR-Diffusion tick {tick.request_id!r} failed: {final_output.error}")
         if final_output.request_id != tick.request_id:
             raise ValueError("AR-Diffusion output request_id does not match the submitted tick request_id.")
         # Parse here so malformed/missing standard metadata fails at the engine

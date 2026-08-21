@@ -11,6 +11,7 @@ from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickCons
 from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
     ARDiffusionSessionEvent,
+    ARDiffusionTickExecutionError,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
@@ -229,3 +230,23 @@ async def test_session_commits_only_after_standard_engine_output_metadata() -> N
     assert session.chunk_index == 1
     assert session.pending_event_count == 0
     assert client.calls[0]["request_id"] == "world-1-chunk-0"
+
+
+@pytest.mark.asyncio
+async def test_engine_reported_failure_raises_the_typed_tick_error() -> None:
+    """The engine boundary must raise a typed error, not a bare RuntimeError.
+
+    Every other failure in this module is typed; an untyped RuntimeError here
+    forces callers to match on message text to tell an engine failure apart
+    from a bug in their own code.
+    """
+    consumer = ARDiffusionOmniTickConsumer(
+        FakeGenerateClient(include_metadata=False, output_error="model failed"),
+        prompt_provider=lambda tick: tick.prompt or "",
+        sampling_params_list=[OmniDiffusionSamplingParams()],
+        diffusion_stage_id=0,
+    )
+    with pytest.raises(ARDiffusionTickExecutionError, match="model failed"):
+        await consumer.execute_tick(make_tick())
+    # Still a RuntimeError, so existing handlers keep working.
+    assert issubclass(ARDiffusionTickExecutionError, RuntimeError)

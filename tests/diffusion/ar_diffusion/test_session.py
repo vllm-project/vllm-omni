@@ -12,6 +12,7 @@ from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionEventAcceptanceStatus,
     ARDiffusionEventQueueFullError,
     ARDiffusionPreparedControls,
+    ARDiffusionRolloutLostError,
     ARDiffusionSession,
     ARDiffusionSessionError,
     ARDiffusionSessionEvent,
@@ -503,3 +504,49 @@ async def test_worker_lifecycle_rejects_unsupported_stage_result() -> None:
 
     with pytest.raises(ARDiffusionSessionError, match="not an AR stage"):
         await lifecycle.close_session("world-1")
+
+
+@pytest.mark.asyncio
+async def test_lost_rollout_is_reported_distinctly_from_other_inactive_states() -> None:
+    """A retry after a failed tick must say the rollout is gone, not just "failed".
+
+    The worker released KV and model-owned state during the failed forward, so
+    the retried tick can never succeed against the state it assumes. The client
+    has to learn that from the error it gets on retry.
+    """
+    consumer = FakeTickConsumer()
+    consumer.failures_remaining = 1
+    lifecycle = FakeLifecycle()
+    session, _, _ = make_session(consumer=consumer, lifecycle=lifecycle)
+
+    assert session.rollout_lost is None
+    with pytest.raises(RuntimeError, match="fake tick failed"):
+        await session.next_chunk()
+
+    # The reason is retained and names the originating failure.
+    assert session.rollout_lost == "RuntimeError: fake tick failed"
+
+    with pytest.raises(ARDiffusionRolloutLostError, match="cannot be retried") as excinfo:
+        await session.next_chunk()
+    # Still a state error, so existing handlers keep working.
+    assert isinstance(excinfo.value, ARDiffusionSessionStateError)
+    assert "restart from chunk 0" in str(excinfo.value)
+
+    # reset() restarts rather than resumes, and clears the terminal reason.
+    await session.reset()
+    assert session.rollout_lost is None
+    assert session.chunk_index == 0
+    assert session.status is ARDiffusionSessionStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_non_rollout_inactive_states_keep_the_generic_state_error() -> None:
+    """close() did not destroy a rollout mid-tick, so it must not report one."""
+    session, _, lifecycle = make_session()
+    await session.close()
+
+    assert session.rollout_lost is None
+    with pytest.raises(ARDiffusionSessionStateError) as excinfo:
+        await session.next_chunk()
+    assert not isinstance(excinfo.value, ARDiffusionRolloutLostError)
+    assert "is closed" in str(excinfo.value)
