@@ -155,14 +155,52 @@ def test_paged_pool_layout_exposes_flat_slot_views():
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
-    assert kv_pools[0].shape == (2, 4, BLOCK, 4, 64)
+    key_cache, value_cache = kv_pools[0]
+    assert key_cache.shape == value_cache.shape == (4, BLOCK, 4, 64)
     assert k_pools[0].shape == (4 * BLOCK, 4, 64)
     assert v_pools[0].shape == (4 * BLOCK, 4, 64)
 
+    # The flat views must alias their block-shaped cache, so a slot write is
+    # visible through the layout the attention kernel reads.
     k_pools[0][BLOCK + 3].fill_(7)
     v_pools[0][2 * BLOCK + 5].fill_(11)
-    assert torch.equal(kv_pools[0][0, 1, 3], k_pools[0][BLOCK + 3])
-    assert torch.equal(kv_pools[0][1, 2, 5], v_pools[0][2 * BLOCK + 5])
+    assert torch.equal(key_cache[1, 3], k_pools[0][BLOCK + 3])
+    assert torch.equal(value_cache[2, 5], v_pools[0][2 * BLOCK + 5])
+
+
+def test_key_and_value_caches_do_not_share_storage():
+    """K and V must be separate allocations, not halves of one tensor.
+
+    The paged-write custom op declares both as mutated. When they alias one
+    storage, inductor's reinplace pass can re-inplace only the first of the
+    two, and auto_functionalized_v2's clone of the entire second pool survives
+    into the compiled graph -- one full pool copied per compiled region per
+    denoising step.
+    """
+    kv_pools, k_pools, v_pools = allocate_kv_pool_with_views(
+        num_blocks=4,
+        block_size=BLOCK,
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=64,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    seen = set()
+    for layer, (key_cache, value_cache) in enumerate(kv_pools):
+        k_storage = key_cache.untyped_storage().data_ptr()
+        v_storage = value_cache.untyped_storage().data_ptr()
+        assert k_storage != v_storage, f"layer {layer}: K and V share one allocation"
+        assert k_pools[layer].untyped_storage().data_ptr() == k_storage
+        assert v_pools[layer].untyped_storage().data_ptr() == v_storage
+        seen.update((k_storage, v_storage))
+    # Every layer's K and V are distinct allocations as well.
+    assert len(seen) == 2 * len(kv_pools)
+
+    # Negative control: writing V must not disturb K.
+    k_pools[0].fill_(0)
+    v_pools[0].fill_(5)
+    assert torch.equal(k_pools[0], torch.zeros_like(k_pools[0]))
 
 
 def test_build_manager_allocate_free_roundtrip():
