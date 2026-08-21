@@ -105,9 +105,6 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
-        # Scratch buffers for the official single-request evaluator. Reuse is
-        # shape/device/dtype guarded; true batch keeps request-owned buffers.
-        self._cfm_buffer_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -180,12 +177,11 @@ class BatchedToken2Wav(nn.Module):
         )
         return self.flow.encoder_proj(hidden), new_cnn, new_att
 
+    @staticmethod
     def _estimator_buffers(
-        self,
         estimator: nn.Module,
         x: torch.Tensor,
         old_att: torch.Tensor | None,
-        buffer_key: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         blocks = estimator.blocks
         depth = len(blocks)
@@ -199,28 +195,6 @@ class BatchedToken2Wav(nn.Module):
         att_width = int(block0.attn.head_dim * 2)
         cnn = x.new_empty((depth, batch_size, cnn_channels, cnn_width))
         att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
-        if buffer_key is None:
-            return cnn, att
-        cached = self._cfm_buffer_cache.get(buffer_key)
-        if cached is not None:
-            cached_cnn, cached_att = cached
-            same_cnn = (
-                cached_cnn.shape == cnn.shape
-                and cached_cnn.device == cnn.device
-                and cached_cnn.dtype == cnn.dtype
-            )
-            same_att = (
-                cached_att.shape[0] == att.shape[0]
-                and cached_att.shape[1] == att.shape[1]
-                and cached_att.shape[2] == att.shape[2]
-                and cached_att.shape[3] >= att.shape[3]
-                and cached_att.shape[4] == att.shape[4]
-                and cached_att.device == att.device
-                and cached_att.dtype == att.dtype
-            )
-            if same_cnn and same_att:
-                return cached_cnn, cached_att[..., : att.shape[3], :]
-        self._cfm_buffer_cache[buffer_key] = (cnn, att)
         return cnn, att
 
     def _estimator_step(
@@ -234,15 +208,12 @@ class BatchedToken2Wav(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
-        buffer_key: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
-        cnn_out, att_out = self._estimator_buffers(
-            estimator, estimator_input, att_cache, buffer_key=buffer_key
-        )
+        cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         result = estimator.blocks_forward_chunk(
@@ -304,7 +275,6 @@ class BatchedToken2Wav(nn.Module):
                 cond=cond_cfg,
                 cnn_cache=old_cnn,
                 att_cache=old_att,
-                buffer_key=step if batch_size == 1 else None,
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
