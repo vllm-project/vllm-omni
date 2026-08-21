@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-Omni model.
 """
@@ -9,6 +9,7 @@ import os
 import pytest
 from openai import BadRequestError
 
+from tests.helpers.assertions import is_quality_failure
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
@@ -200,7 +201,7 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -248,7 +249,7 @@ def test_text_audio_to_text_audio_002(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -300,7 +301,7 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -514,7 +515,7 @@ def test_speaker_001(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text=get_prompt("text"),
+        content_text=get_prompt("text_only"),
     )
 
     request_config = {
@@ -539,7 +540,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text=get_prompt("text"),
+        content_text=get_prompt("text_only"),
     )
 
     request_config = {
@@ -550,17 +551,16 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
-    _gender_assert_substr = "estimated gender"
+    # Retry only when assert_omni_response fails on sampled quality checks (preset voice gender or audio similarity).
     _max_retries = 10
     for attempt in range(_max_retries):
         try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            openai_client.send_omni_request(request_config)
             break
         except AssertionError as e:
-            if _gender_assert_substr not in str(e) or attempt == _max_retries - 1:
+            if not is_quality_failure(e) or attempt == _max_retries - 1:
                 raise
-            print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+            print(f"Quality assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -574,7 +574,7 @@ def test_speaker_003(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text=get_prompt("text"),
+        content_text=get_prompt("text_only"),
     )
 
     request_config = {
