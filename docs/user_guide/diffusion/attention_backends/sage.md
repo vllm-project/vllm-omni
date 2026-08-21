@@ -54,8 +54,22 @@ python -c "import sageattn3; print(sageattn3.__file__)"
 vllm-omni serve <model> --diffusion-attention-backend SAGE_ATTN_3
 ```
 
-`SAGE_ATTN_3` requires CUDA, an importable `sageattn3`, and a Blackwell-class
-GPU. Its kernel assumes the query-head count equals the key/value-head count.
+`SAGE_ATTN_3` requires CUDA, an importable `sageattn3`, and one of the
+architectures the kernel is built for. `sageattention3_blackwell/setup.py`
+emits one gencode per supported compute capability and rejects anything else:
+
+| Compute capability | Gencode | Example GPUs |
+| --- | --- | --- |
+| 10.0 | `sm_100a` | B200, GB200 |
+| 12.0 | `sm_120a` | RTX PRO 6000, RTX 50-series |
+| 12.1 | `sm_121a` | Consumer Blackwell refresh |
+
+Not every Blackwell GPU qualifies. `sm_103` (B300 / GB300) is absent by
+design: the kernel takes the SM120 warp-level `mma.sync` path, while SM103
+requires the tcgen05 implementation. Selecting `SAGE_ATTN_3` on an
+unsupported GPU logs a warning and falls back to `TORCH_SDPA`.
+
+Its kernel also assumes the query-head count equals the key/value-head count.
 GQA and MQA diffusion calls therefore fall back to PyTorch SDPA for
 correctness.
 

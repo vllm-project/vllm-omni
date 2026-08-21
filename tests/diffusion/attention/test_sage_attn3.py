@@ -115,19 +115,80 @@ def test_cuda_platform_selects_sage_attn3_alias(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")
-def test_cuda_platform_falls_back_when_sage_attn3_gpu_is_unsupported(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "capability",
+    [
+        pytest.param((12, 0), id="sm_120-rtx-pro-6000-and-rtx-50-series"),
+        pytest.param((12, 1), id="sm_121-consumer-blackwell-refresh"),
+    ],
+)
+def test_cuda_platform_selects_sage_attn3_on_supported_blackwell(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+):
+    """Every architecture sageattention3_blackwell builds for must route to the backend."""
     from vllm.platforms.interface import DeviceCapability
 
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
     from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda import platform as cuda_platform_module
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    original_import_module = importlib.import_module
 
     monkeypatch.setattr(
         CudaOmniPlatform,
         "get_device_capability",
-        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
+        classmethod(lambda cls, device_id=0: DeviceCapability(*capability)),
     )
     monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+    monkeypatch.setattr(
+        cuda_platform_module.importlib,
+        "import_module",
+        lambda module_name: object() if module_name == "sageattn3" else original_import_module(module_name),
+    )
+
+    backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
+
+    assert backend_path == DiffusionAttentionBackendEnum.SAGE_ATTN_3.get_path()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")
+@pytest.mark.parametrize(
+    "capability",
+    [
+        pytest.param((9, 0), id="sm_90-hopper"),
+        pytest.param((8, 9), id="sm_89-ada"),
+        # sm_103 is the regression this gate protects: ``major >= 10`` used to
+        # admit B300 / GB300, where the failure only surfaced inside the kernel.
+        pytest.param((10, 3), id="sm_103-b300-not-a-build-target"),
+        pytest.param((11, 0), id="sm_110-unknown-future-variant"),
+    ],
+)
+def test_cuda_platform_falls_back_when_sage_attn3_gpu_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda import platform as cuda_platform_module
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    original_import_module = importlib.import_module
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(*capability)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+    # Importable sageattn3 so the assertion isolates the architecture gate: an
+    # unsupported GPU must fall back even when the package is present.
+    monkeypatch.setattr(
+        cuda_platform_module.importlib,
+        "import_module",
+        lambda module_name: object() if module_name == "sageattn3" else original_import_module(module_name),
+    )
 
     backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
 
