@@ -139,13 +139,14 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(minimum: int = 1, aggregate_chunks: int = 1):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
             stage_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
+                    "code2wav_internal_aggregate_chunks": aggregate_chunks,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -154,10 +155,10 @@ def _config(minimum: int = 1):
     )
 
 
-def _model():
+def _model(*, aggregate_chunks: int = 1):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
-    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    model = MiniCPMO45Code2Wav(vllm_config=_config(aggregate_chunks=aggregate_chunks))
     model.backend = backend
     return model, token2wav
 
@@ -383,6 +384,40 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
 
+
+def test_internal_codec_aggregation_keeps_first_window_latency_and_flushes():
+    model, token2wav = _model(aggregate_chunks=4)
+
+    first = _forward(model, [_info("aggregate", 0, [1, 2])])
+    assert first.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert token2wav.hift.calls == [1]
+
+    for chunk_seq in (1, 2, 3):
+        output = _forward(
+            model,
+            [_info("aggregate", chunk_seq, [chunk_seq + 10, chunk_seq + 20])],
+        )
+        assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert token2wav.hift.calls == [1]
+    assert model._states["aggregate"].pending_tokens.numel() == 6
+
+    flushed = _forward(model, [_info("aggregate", 4, [14, 24])])
+    assert flushed.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert token2wav.hift.calls == [1, 1]
+    assert model._states["aggregate"].pending_tokens is None
+
+
+def test_internal_codec_aggregation_flushes_short_final_remainder():
+    model, token2wav = _model(aggregate_chunks=4)
+    _forward(model, [_info("final", 0, [1, 2])])
+    buffered = _forward(model, [_info("final", 1, [3, 4])])
+    assert buffered.multimodal_outputs["model_outputs"][0].numel() == 0
+
+    final = _info("final", 2, [5], last_chunk=True)
+    output = _forward(model, [final])
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is True
+    assert "final" not in model._states
 
 def test_initial_empty_segment_marker_initializes_stream_without_audio():
     model, token2wav = _model()
