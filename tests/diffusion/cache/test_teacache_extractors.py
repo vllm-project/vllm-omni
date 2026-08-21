@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for TeaCache extractor functions.
@@ -649,6 +649,29 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
 
         torch.testing.assert_close(actual_video, expected_video)
         torch.testing.assert_close(actual_audio, expected_audio)
+
+    def test_extractor_uses_prepared_rope_table(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """TeaCache must consume the denoise-loop RoPE table without rebuilding it."""
+        rope_table = minimax_h3_module.prepare_rope_table(
+            sample_inputs["img_position_ids"],
+            seq_len=sample_inputs["x"].shape[1],
+        )
+
+        def unexpected_rope_build(*args, **kwargs):
+            raise AssertionError("TeaCache extractor rebuilt the prepared RoPE table")
+
+        monkeypatch.setattr(minimax_h3_module, "prepare_rope_table", unexpected_rope_build)
+        monkeypatch.setattr(minimax_h3_module.rope, "forward", unexpected_rope_build)
+        context = extract_minimax_h3_context(
+            minimax_h3_module,
+            **{**sample_inputs, "rope_table": rope_table},
+        )
+        context.run_transformer_blocks()
 
     def test_run_transformer_blocks_forwards_packed_layout(
         self,

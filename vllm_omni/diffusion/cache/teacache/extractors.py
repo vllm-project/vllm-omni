@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model-specific extractors for TeaCache.
@@ -13,6 +13,7 @@ all model-specific information needed for generic caching, including preprocessi
 transformer execution, and postprocessing logic.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -1263,7 +1264,6 @@ def extract_minimax_h3_context(
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
-        _build_rope_table,
         _required_kwarg,
     )
 
@@ -1320,8 +1320,20 @@ def extract_minimax_h3_context(
     if inverse_indices.shape[0] != seq_len:
         raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
     device = x.device
-
-    rope_table = _build_rope_table(module.rope(img_position_ids).to(device))
+    local_span = module._rope_local_span(seq_len)
+    local_start, local_len = local_span
+    rope_table = kwargs.get("rope_table")
+    if rope_table is None:
+        rope_table = module.prepare_rope_table(
+            img_position_ids,
+            seq_len=seq_len,
+        )
+    else:
+        module._validate_prepared_rope_table(
+            rope_table,
+            local_len=local_len,
+            device=device,
+        )
 
     decoder_input, t_emb = module._embed(
         x=x,
@@ -1336,7 +1348,7 @@ def extract_minimax_h3_context(
         num_requests=num_requests,
         seq_len=seq_len,
         device=device,
-        local_span=(0, seq_len),
+        local_span=local_span,
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -1353,11 +1365,18 @@ def extract_minimax_h3_context(
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
-        hidden, block_rope, block_combined = module.sp_prepare(
-            decoder_input,
-            rope_table,
-            combined_indices,
-        )
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = module.sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
+        else:
+            hidden, block_rope, block_combined = module.local_sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
         for block in module.blocks:
             hidden = block(
                 hidden,
@@ -1373,11 +1392,29 @@ def extract_minimax_h3_context(
         return (hidden,)
 
     def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        video_logits, audio_logits = module.final_layer(
-            hidden,
-            t_emb=t_emb,
-            inverse_indices=inverse_indices,
-        )
+        if local_len == seq_len:
+            hidden = module.sp_gather(hidden)
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = module.sp_gather(compact_logits)
+            video_width = module.arch.latents_dim * math.prod(module.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
         if not skip_mask_out_condition:
