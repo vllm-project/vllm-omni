@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
-from typing import Any, Literal, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from fastapi import HTTPException
 from PIL import Image
@@ -45,6 +46,9 @@ from vllm_omni.outputs.output_metadata import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 VideoResponseEncodingMode = Literal["auto", "legacy", "optimized"]
 
@@ -124,7 +128,7 @@ class OmniOpenAIServingVideo:
             self._video_response_encoding_config.optimized,
         )
 
-    def _resolve_diffusion_od_config(self) -> Any:
+    def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
         if callable(get_od_config):
             return get_od_config()

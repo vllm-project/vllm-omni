@@ -250,6 +250,80 @@ def test_channel_first_video_tensor_uses_direct_planar_mux(monkeypatch):
     assert options["fps"] == 12.0
 
 
+@pytest.mark.parametrize("optimized", [False, True])
+def test_audio_sample_rate_defaults_and_logs_for_both_encoders(monkeypatch, optimized):
+    mux_calls = []
+    log_messages = []
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info_once",
+        lambda message, *args, **kwargs: log_messages.append(message % args),
+    )
+
+    if optimized:
+
+        def fake_planar_mux(frames, width, height, audio_waveform, **kwargs):
+            mux_calls.append((list(frames), width, height, audio_waveform, kwargs))
+            return b"planar-video"
+
+        monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", fake_planar_mux)
+        planar = np.zeros((3, 2, 4, 4), dtype=np.uint8)
+        video = np.transpose(planar, (1, 2, 3, 0))
+        encoding_config = video_api_utils.OPTIMIZED_VIDEO_RESPONSE_ENCODING
+    else:
+
+        def fake_compat_mux(frames, audio, **kwargs):
+            mux_calls.append((frames, audio, kwargs))
+            return b"legacy-video"
+
+        monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
+        video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+        encoding_config = video_api_utils.LEGACY_VIDEO_RESPONSE_ENCODING
+
+    encoded = video_api_utils._encode_video_bytes(
+        video,
+        fps=12,
+        audio=np.zeros((1, 8), dtype=np.float32),
+        encoding_config=encoding_config,
+    )
+
+    assert encoded in (b"legacy-video", b"planar-video")
+    assert mux_calls[0][-1]["audio_sample_rate"] == video_api_utils.DEFAULT_AUDIO_SAMPLE_RATE
+    assert len(log_messages) == 1
+    assert "default sample rate" in log_messages[0]
+
+
+def test_explicit_audio_sample_rate_bypasses_default_log(monkeypatch):
+    log_messages = []
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info_once",
+        lambda message, *args, **kwargs: log_messages.append(message % args),
+    )
+
+    audio = [[0.0, 1.0], [1.0, 0.0]]
+    assert video_api_utils._resolve_audio_sample_rate(audio, 32000) == 32000
+    assert log_messages == []
+
+
+def test_video_only_does_not_log_default_audio_sample_rate(monkeypatch):
+    log_messages = []
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info_once",
+        lambda message, *args, **kwargs: log_messages.append(message % args),
+    )
+    monkeypatch.setattr(
+        media_utils,
+        "mux_video_audio_bytes",
+        lambda frames, audio, **kwargs: b"legacy-video",
+    )
+
+    video_api_utils._encode_video_bytes(np.zeros((1, 2, 2, 3), dtype=np.uint8), fps=12)
+
+    assert log_messages == []
+
+
 def test_channel_first_video_tensor_keeps_legacy_path_by_default(monkeypatch):
     calls = []
 
@@ -355,6 +429,18 @@ def test_planar_frame_rejects_undersized_plane(monkeypatch, plane_height, line_s
 
 def test_interleaved_video_uses_compatible_mux(monkeypatch):
     calls = []
+    log_messages = []
+    default_rate_logs = []
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info",
+        lambda message, *args, **kwargs: log_messages.append(message % args),
+    )
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info_once",
+        lambda message, *args, **kwargs: default_rate_logs.append(message % args),
+    )
 
     def fail_planar_mux(*args, **kwargs):
         raise AssertionError("interleaved FHWC frames must use the compatible path")
@@ -370,12 +456,18 @@ def test_interleaved_video_uses_compatible_mux(monkeypatch):
     encoded = video_api_utils._encode_video_bytes(
         video,
         fps=12,
+        audio=np.zeros((1, 8), dtype=np.float32),
         encoding_config=video_api_utils.OPTIMIZED_VIDEO_RESPONSE_ENCODING,
     )
 
     assert encoded == b"compatible-video"
     assert calls[0][0].shape == (2, 4, 6, 3)
     assert calls[0][0].dtype == np.uint8
+    assert calls[0][2]["audio_sample_rate"] == video_api_utils.DEFAULT_AUDIO_SAMPLE_RATE
+    assert len(log_messages) == 1
+    assert "frame_shape=(4, 6, 3)" in log_messages[0]
+    assert "non-contiguous channel layout" in log_messages[0]
+    assert len(default_rate_logs) == 1
 
 
 def test_unequal_frame_shapes_fail_before_output_allocation(monkeypatch):

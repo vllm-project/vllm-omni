@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -39,6 +40,17 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 
 if TYPE_CHECKING:
     import av
+
+
+logger = init_logger(__name__)
+
+
+DEFAULT_AUDIO_SAMPLE_RATE = 24_000
+
+
+VideoInput = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
+AudioSample = int | float
+AudioInput = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
 
 
 @dataclass(frozen=True)
@@ -556,6 +568,15 @@ def _supports_direct_planar_mux(frames: list[np.ndarray], frame_shape: tuple[int
     return all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3))
 
 
+def _resolve_audio_sample_rate(audio: AudioInput | None, audio_sample_rate: int | None) -> int:
+    if audio is not None and audio_sample_rate is None:
+        logger.info_once(
+            "Audio sample rate was not provided; using default sample rate of %s Hz.",
+            DEFAULT_AUDIO_SAMPLE_RATE,
+        )
+    return audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE
+
+
 def _iter_planar_video_frames(
     frames: list[np.ndarray],
     common_dtype: np.dtype,
@@ -605,23 +626,33 @@ def _encode_video_bytes_legacy(
         _coerce_video_to_uint8_frames(video),
         audio_np,
         fps=float(fps),
-        audio_sample_rate=audio_sample_rate or 24000,
+        audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
     )
 
 
 def _encode_video_bytes_optimized(
-    video: Any,
+    video: VideoInput,
     fps: int,
-    audio: Any | None = None,
-    audio_sample_rate: int | None = None,
-    video_codec_options: dict[str, str] | None = None,
+    audio: AudioInput | None,
+    audio_sample_rate: int | None,
+    video_codec_options: dict[str, str] | None,
 ) -> bytes:
     """Use planar PyAV frames when the complete input layout is compatible."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     if not _supports_direct_planar_mux(frames, frame_shape):
+        reason = (
+            "unsupported frame shape"
+            if len(frame_shape) != 3 or frame_shape[-1] not in (3, 4)
+            else "non-contiguous channel layout"
+        )
+        logger.info(
+            "Direct planar video mux unsupported (%s; frame_shape=%s); falling back to legacy mux.",
+            reason,
+            frame_shape,
+        )
         # Fall back before opening a PyAV container. Once encoding starts,
         # errors propagate instead of retrying and potentially duplicating work.
         return _encode_video_bytes_legacy(
@@ -639,7 +670,7 @@ def _encode_video_bytes_optimized(
         height=frame_shape[0],
         audio_waveform=audio_np,
         fps=float(fps),
-        audio_sample_rate=audio_sample_rate or 24000,
+        audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
     )
 
