@@ -3,7 +3,6 @@ from importlib.util import find_spec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm import ir
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
@@ -137,10 +136,16 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
-
         import torch_npu
+
+        if residual is not None:
+            output, _, updated_residual = torch_npu.npu_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
+            return output, updated_residual
 
         output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]
 
@@ -161,7 +166,9 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
-            return ir.ops.fused_add_rms_norm(
+            from vllm.ir.ops import fused_add_rms_norm
+
+            return fused_add_rms_norm(
                 x,
                 residual,
                 self.weight.data,

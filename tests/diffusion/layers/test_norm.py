@@ -365,13 +365,13 @@ def test_rmsnorm_matches_native_residual_contract():
 
 @pytest.mark.parametrize(
     "forward_name",
-    ["forward_native", "forward_cuda", "forward_hip", "forward_musa", "forward_npu", "forward_xpu"],
+    ["forward_native", "forward_cuda", "forward_hip", "forward_musa", "forward_xpu"],
 )
-def test_rmsnorm_residual_uses_vllm_ir_op(
+def test_rmsnorm_non_npu_residual_uses_vllm_ir_op(
     monkeypatch: pytest.MonkeyPatch,
     forward_name: str,
 ):
-    """Every platform delegates the residual path to the common vLLM IR op."""
+    """Non-NPU platforms delegate the residual path to the vLLM IR op."""
     from vllm import ir
 
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -401,6 +401,42 @@ def test_rmsnorm_residual_uses_vllm_ir_op(
     assert captured["x"] is x
     assert captured["residual"] is residual
     assert captured["weight"].data_ptr() == norm.weight.data_ptr()
+    assert captured["epsilon"] == 1e-5
+
+
+def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):
+    """NPU keeps the direct fused AddRMSNorm path instead of IR fallback."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, object] = {}
+    fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
+    fused_residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    def npu_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ):
+        captured.update(x=x, residual=residual, gamma=gamma, epsilon=epsilon)
+        return fused_output, torch.empty(0), fused_residual
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_add_rms_norm=npu_add_rms_norm),
+    )
+    norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, dtype=torch.bfloat16)
+    residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    output, updated_residual = norm.forward_npu(x, residual)
+
+    assert output is fused_output
+    assert updated_residual is fused_residual
+    assert captured["x"] is x
+    assert captured["residual"] is residual
+    assert captured["gamma"] is norm.weight
     assert captured["epsilon"] == 1e-5
 
 
