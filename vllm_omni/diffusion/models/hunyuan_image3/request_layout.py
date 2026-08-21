@@ -206,9 +206,7 @@ def hunyuan_num_special_tokens(image_info: ImageInfo) -> int:
     """Return the generated-image prefix tokens emitted before latent tokens."""
 
     return (
-        int(image_info.add_timestep_token)
-        + int(image_info.add_guidance_token)
-        + int(image_info.add_timestep_r_token)
+        int(image_info.add_timestep_token) + int(image_info.add_guidance_token) + int(image_info.add_timestep_r_token)
     )
 
 
