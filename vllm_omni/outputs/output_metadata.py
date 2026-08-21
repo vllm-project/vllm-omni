@@ -139,6 +139,11 @@ def _validate_actions_metadata(metadata: DiffusionMetadataMapping | None) -> Non
     _check_optional_int(metadata, "raw_action_dim", group="actions", min_value=1)
     _check_optional_non_empty_str(metadata, "action_mode", group="actions")
     _check_optional_int(metadata, "domain_id", group="actions")
+    _check_optional_int(metadata, "horizon", group="actions", min_value=1)
+    _check_optional_int(metadata, "action_horizon", group="actions", min_value=1)
+    _check_optional_int(metadata, "action_dim", group="actions", min_value=1)
+    _check_optional_int(metadata, "valid_steps", group="actions", min_value=0)
+    _check_optional_non_empty_str(metadata, "action_space", group="actions")
 
 
 def _validate_transfer_metadata(metadata: DiffusionMetadataMapping | None) -> None:

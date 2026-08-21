@@ -10,8 +10,15 @@ from fastapi import FastAPI, WebSocket
 from omegaconf import OmegaConf
 from starlette.testclient import TestClient
 
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.output_formatter import (
+    format_diffusion_outputs,
+    normalize_diffusion_postprocess_output,
+)
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,6 +44,18 @@ def _json_pack(obj):
 
 def _json_unpack(data):
     return json.loads(data.decode())
+
+
+def _diffusion_request() -> OmniDiffusionRequest:
+    return OmniDiffusionRequest(
+        prompt="pick up the object",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_outputs_per_prompt=1,
+            num_inference_steps=1,
+            resolution=224,
+        ),
+        request_id="robot-policy-test",
+    )
 
 
 def _engine_with_policy_config(policy_config=None):
@@ -306,6 +325,37 @@ def test_infer_extracts_actions_from_generic_multimodal_output():
     assert engine_client.generate_kwargs["request_id"] == "robot-session-a-0"
 
 
+def test_openpi_validator_accepts_formatter_normalized_robot_policy_envelope():
+    action = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    action_metadata = {
+        "raw_action_dim": 2,
+        "action_mode": "policy",
+        "domain_id": 7,
+        "horizon": 2,
+        "action_dim": 2,
+        "valid_steps": 2,
+        "action_space": "joint_position",
+    }
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"actions": action},
+            "metadata": {"actions": action_metadata},
+        }
+    )
+    [result] = format_diffusion_outputs(
+        request=_diffusion_request(),
+        od_config=SimpleNamespace(model_class_name="synthetic_robot_policy"),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"raw": "output"},
+        postprocess_output=postprocess_output,
+    )
+
+    validated = openpi_serving.validate_robot_policy_action_output(result.multimodal_output)
+
+    np.testing.assert_allclose(validated.actions, action)
+    assert validated.action_metadata == action_metadata
+
+
 def test_infer_preserves_dict_actions_from_multimodal_output():
     class FakeEngineClient:
         def get_diffusion_od_config(self):
@@ -333,6 +383,67 @@ def test_infer_preserves_dict_actions_from_multimodal_output():
     np.testing.assert_allclose(actions["right_arm"], np.array([[3.0, 4.0]], dtype=np.float32))
     assert actions["left_arm"].dtype == np.float32
     assert actions["right_arm"].dtype == np.float32
+
+
+def test_extract_actions_rejects_invalid_action_metadata():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(
+        multimodal_output={
+            "actions": [[1.0, 2.0]],
+            "metadata": {"actions": {"horizon": "2"}},
+        }
+    )
+
+    with pytest.raises(TypeError, match="actions.horizon"):
+        serving._extract_actions(result)
+
+
+def test_extract_actions_accepts_single_step_action_vector_metadata():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(
+        multimodal_output={
+            "actions": [1.0, 2.0, 3.0],
+            "metadata": {"actions": {"horizon": 1, "action_dim": 3, "valid_steps": 1}},
+        }
+    )
+
+    actions = serving._extract_actions(result)
+
+    np.testing.assert_allclose(actions, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+
+
+def test_extract_actions_rejects_action_metadata_shape_mismatch():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(
+        multimodal_output={
+            "actions": [[1.0, 2.0]],
+            "metadata": {"actions": {"horizon": 2, "action_dim": 2}},
+        }
+    )
+
+    with pytest.raises(ValueError, match="metadata horizon"):
+        serving._extract_actions(result)
+
+
+def test_extract_actions_rejects_non_finite_actions():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(multimodal_output={"actions": [[1.0, float("nan")]]})
+
+    with pytest.raises(ValueError, match="finite"):
+        serving._extract_actions(result)
+
+
+def test_extract_actions_rejects_scalar_action_payload():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    result = SimpleNamespace(multimodal_output={"actions": 1.0})
+
+    with pytest.raises(ValueError, match="not a scalar"):
+        serving._extract_actions(result)
 
 
 def test_extract_actions_does_not_iterate_result_object():
