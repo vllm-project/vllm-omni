@@ -5,43 +5,52 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
-
-  - label: "Reliability Test - qwen3-omni"
-    timeout_in_minutes: 180
+  - label: "Simple · CPU Coverage Test"
+    key: weekly-simple-cpu-coverage
     depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    if: build.env("WEEKLY") == "1"
+    timeout_in_minutes: 60
     commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
-    mirror_hardwares: h100_2
+      - |
+        set +e
+        REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
+        pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
+        EXIT=$$?
+        gzip -9 -f "$${REPORT}"
+        buildkite-agent artifact upload "$${REPORT}.gz"
+        exit $$EXIT
+    mirror_hardwares: l4_1
 
-  - label: "Reliability Test - wan22"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
-    mirror_hardwares: h100_2
-
-  - label: "Reliability Test - hunyuan-image"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
-    mirror_hardwares: h100_4
-
-  - group: "Reliability Test - Invalid parameters Test"
+  - group: "Reliability Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
 
-      - label: "Invalid parameters Test · H100"
+      - label: "Reliability Test · qwen3-omni"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
+        mirror_hardwares: h100_2
+
+      - label: "Reliability Test · wan22"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
+        mirror_hardwares: h100_2
+
+      - label: "Reliability Test · hunyuan-image"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
+        mirror_hardwares: h100_4
+
+      - label: "Reliability Test · Invalid parameters · H100"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
         mirror_hardwares: h100_2
 
-      - label: "Invalid parameters Test · L4"
+      - label: "Reliability Test · Invalid parameters · L4"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
@@ -49,7 +58,7 @@ steps:
 
   - group: ":card_index_dividers: E2E Tests"
     depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    if: build.env("NON-CRITICAL") == "1"
     steps:
 
       - label: "Omni · L4"
@@ -75,7 +84,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: "TTS · L4"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 120
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -126,7 +135,7 @@ steps:
         mirror_hardwares: l4_4
 
       - label: "Diffusion · H100 · Single-GPU"
-        timeout_in_minutes: 120
+        timeout_in_minutes: 150
         commands:
           - >-
             pytest -sv

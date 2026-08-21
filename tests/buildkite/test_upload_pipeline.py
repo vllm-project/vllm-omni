@@ -61,7 +61,7 @@ def test_bootstrap_steps_loaded_from_file() -> None:
 
 
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
-    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 still gates scheduled CI."""
+    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON-CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
     assert "key: upload-nightly-pipeline" in rendered
@@ -71,6 +71,7 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     assert "key: upload-merge-pipeline" in rendered
     assert 'build.env("NIGHTLY") == "1"' in rendered
     assert 'build.env("WEEKLY") == "1"' in rendered
+    assert 'build.env("NON-CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
     assert "weekly-test" not in rendered
     assert "merge-test" not in rendered

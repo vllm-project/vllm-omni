@@ -16,8 +16,8 @@
 # At least one of --offline/--online is required, so a job with only one mode runs
 # just that half. Total runtime is bounded by the step's timeout_in_minutes.
 #
-# Coverage + artifact upload run only on scheduled nightly E2E sweeps
-# (NIGHTLY=1 and BUILDKITE_BRANCH=main — same gate as bootstrap --e2e).
+# Coverage + artifact upload run only on scheduled weekly E2E sweeps
+# (WEEKLY=1 and BUILDKITE_BRANCH=main — same gate as bootstrap --e2e).
 # All other invocations (PR merge-test, regular main merge, local) run the
 # same combined pytest as the job used before coverage was added.
 #
@@ -50,7 +50,7 @@ if ((${#OFFLINE[@]} == 0 && ${#ONLINE[@]} == 0)); then
 fi
 
 _should_run_coverage() {
-    [[ "${NIGHTLY:-}" == "1" && "${BUILDKITE_BRANCH:-}" == "main" ]]
+    [[ "${WEEKLY:-}" == "1" && "${BUILDKITE_BRANCH:-}" == "main" ]]
 }
 
 if ! _should_run_coverage; then
