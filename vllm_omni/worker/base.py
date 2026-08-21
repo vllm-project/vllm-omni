@@ -127,11 +127,24 @@ class OmniGPUWorkerBase(GPUWorker):
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
-        process_memory = (
-            get_process_gpu_memory(self.local_rank)
-            if is_process_scoped_memory_available() and detect_pid_host()
-            else None
-        )
+        process_memory = None
+        if is_process_scoped_memory_available() and detect_pid_host():
+            process_memory = get_process_gpu_memory(self.local_rank)
+            # A per-process NVML reading is only trustworthy when it actually
+            # attributed memory to THIS process. ``None`` (NVML unavailable /
+            # PID not matched, e.g. container PID namespace) and ``0`` (no
+            # compute process matched the PID) both mean we cannot measure
+            # real usage — and the model weights are already resident, so a
+            # literal 0 is never legitimate here. Treat both as unmeasurable
+            # and fall back to the profiled usage so the KV-cache budget
+            # subtracts the weights/activations already allocated.
+            if process_memory is not None and process_memory <= 0:
+                logger.debug(
+                    "Process-scoped memory unavailable for PID %d (NVML reported %r); using profiling fallback",
+                    os.getpid(),
+                    process_memory,
+                )
+                process_memory = None
 
         if process_memory is not None:
             # NVML available: use per-process memory

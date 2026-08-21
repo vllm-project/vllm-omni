@@ -107,11 +107,15 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
                     f"Check CUDA_VISIBLE_DEVICES or stage config 'devices' setting."
                 )
             handle = nvmlDeviceGetHandleByIndex(local_rank)
-
         for proc in nvmlDeviceGetComputeRunningProcesses(handle):
             if proc.pid == my_pid:
                 return proc.usedGpuMemory
-        return 0
+        # No NVML entry matched our PID. This usually means the process is
+        # running in a container / PID namespace where NVML reports the host
+        # PID(s) rather than ours, so we cannot attribute GPU memory to this
+        # process via NVML.
+        # HACK: [SenseNova-Vision] workaround for memory usage bug when running in Modal shell.
+        return None
     except RuntimeError:
         raise
     except Exception as e:

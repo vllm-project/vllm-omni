@@ -80,7 +80,7 @@ class TestGetProcessGpuMemory:
         with pytest.raises(RuntimeError, match="Invalid GPU device"):
             get_process_gpu_memory(5)
 
-    def test_returns_zero_when_process_not_found(self, mocker: MockerFixture):
+    def test_returns_none_when_process_not_found(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
@@ -90,7 +90,10 @@ class TestGetProcessGpuMemory:
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
 
         memory = get_process_gpu_memory(0)
-        assert memory == 0
+        # A PID that never appears in NVML's process list means we cannot
+        # attribute GPU memory to this process — return None (not 0) so callers
+        # fall back to profiling instead of assuming zero usage.
+        assert memory is None
 
     def test_uses_uuid_when_provided(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
@@ -105,7 +108,7 @@ class TestGetProcessGpuMemory:
         mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses", return_value=[])
 
         memory = get_process_gpu_memory(0)
-        assert memory == 0
+        assert memory is None
         mock_by_uuid.assert_called_once_with(uuid)
 
     def test_raises_on_invalid_uuid(self, mocker: MockerFixture):

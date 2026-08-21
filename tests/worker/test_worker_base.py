@@ -110,6 +110,27 @@ def test_determine_available_memory_clamps_to_zero(monkeypatch):
     assert out == 0
 
 
+def test_determine_available_memory_zero_process_memory_falls_back_to_profiling(monkeypatch):
+    """A 0/None NVML reading is untrustworthy — route to the profiling fallback.
+
+    Regression test for the Bagel OOM: when NVML cannot attribute memory to the
+    current PID (e.g. container PID namespace), the old code treated the
+    process as using 0 bytes and over-allocated KV cache. The fix routes any
+    0/None reading through the profiling fallback, which subtracts
+    weights + peak activation + non-torch usage.
+    """
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(base, "is_process_scoped_memory_available", lambda: True)
+    monkeypatch.setattr(base, "detect_pid_host", lambda: True)
+    monkeypatch.setattr(base, "get_process_gpu_memory", lambda local_rank: 0)
+
+    out = OmniGPUWorkerBase.determine_available_memory(worker)
+
+    profiled = 10 * GIB + 2 * GIB + 1 * GIB
+    assert out == 30 * GIB - profiled
+
+
 def test_determine_available_memory_kv_cache_short_circuit(monkeypatch):
     """A pre-set kv_cache_memory_bytes short-circuits profiling and is returned."""
     worker = _make_worker(requested_memory=30 * GIB, kv_cache_memory_bytes=7 * GIB)
