@@ -863,10 +863,8 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
 
 
-def test_text_attention_uses_common_attention_with_local_gqa_heads(monkeypatch):
-    import vllm_omni.diffusion.attention.layer as attention_layer
-    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
-    from vllm_omni.diffusion.attention.layer import Attention
+def test_text_attention_uses_sdpa_with_local_gqa_heads(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLTextAttention,
     )
@@ -885,16 +883,8 @@ def test_text_attention_uses_common_attention_with_local_gqa_heads(monkeypatch):
         head_dim=2,
         rms_norm_eps=1e-6,
     )
-    monkeypatch.setattr(attention_layer, "get_current_diffusion_config_or_none", lambda: None)
-    monkeypatch.setattr(
-        attention_layer,
-        "get_attn_backend_for_role",
-        lambda **kwargs: (SDPABackend, None),
-    )
     attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
-    assert isinstance(attention.attn, Attention)
-    assert isinstance(attention.attn.attention, SDPAImpl)
-    assert attention.attn.skip_sequence_parallel is True
+    assert isinstance(attention.attn, SDPAImpl)
     attn_call = {}
 
     def fake_attention(query, key, value, attn_metadata=None):

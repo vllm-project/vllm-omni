@@ -413,31 +413,6 @@ def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_var
     return fake
 
 
-def test_npu_causal_attention_uses_sdpa_and_preserves_gqa(monkeypatch):
-    """MindIE dense attention cannot express causal semantics."""
-    fake = _fake_mindiesd(monkeypatch)
-    impl = FlashAttentionImpl(
-        num_heads=4,
-        num_kv_heads=2,
-        head_size=4,
-        softmax_scale=0.5,
-        causal=True,
-    )
-    query = torch.randn(1, 8, 4, 4)
-    key = torch.randn(1, 8, 2, 4)
-    value = torch.randn(1, 8, 2, 4)
-    metadata = AttentionMetadata()
-    expected = torch.randn_like(query)
-    impl._npu_causal_sdpa.forward_npu = Mock(return_value=expected)
-
-    output = impl.forward_npu(query, key, value, metadata)
-
-    assert output is expected
-    impl._npu_causal_sdpa.forward_npu.assert_called_once_with(query, key, value, metadata)
-    fake.attention_forward.assert_not_called()
-    fake.attention_forward_varlen.assert_not_called()
-
-
 # --- Test group A: boundary resolution (_resolve_packed_seq_npu) -------------
 
 

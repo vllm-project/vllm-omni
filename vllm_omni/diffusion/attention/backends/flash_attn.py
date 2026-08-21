@@ -12,10 +12,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.sdpa import (
-    SDPAImpl,
-    _maybe_reshape_attn_mask,
-)
+from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
@@ -86,18 +83,6 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
-        self._npu_causal_sdpa = (
-            SDPAImpl(
-                num_heads=num_heads,
-                head_size=head_size,
-                softmax_scale=softmax_scale,
-                causal=True,
-                num_kv_heads=num_kv_heads,
-                prefix=prefix,
-            )
-            if causal
-            else None
-        )
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -398,14 +383,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        """NPU attention using SDPA for causal and MindIE-SD otherwise."""
-
-        # mindiesd.attention_forward has no causal argument. Routing a causal
-        # layer through that dense API would silently turn decoder self-attn
-        # into full attention. Keep the SDPA implementation here because its
-        # NPU path preserves both causal semantics and native GQA.
-        if self._npu_causal_sdpa is not None:
-            return self._npu_causal_sdpa.forward_npu(query, key, value, attn_metadata)
+        """NPU attention implementation using mindiesd."""
 
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
         if kv_cache_dtype is not None:

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
+import vllm_omni.diffusion.attention.backends.utils.attn_runtime_selector as attn_runtime_selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -57,17 +58,20 @@ def test_sdpa_keeps_compressed_kv_when_native_gqa_kernel_is_available(monkeypatc
     assert output.shape == (1, 3, 4, 8)
 
 
-def test_sdpa_npu_uses_native_causal_gqa_without_cuda_capability_check(monkeypatch):
+def test_sdpa_npu_uses_native_causal_gqa(monkeypatch):
     calls = []
 
     def fake_sdpa(query, key, value, **kwargs):
         calls.append((query.shape, key.shape, value.shape, kwargs))
         return query
 
-    def unexpected_capability_check(*args):
-        raise AssertionError("NPU native GQA must not use the CUDA capability check")
+    capability_calls = []
 
-    monkeypatch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", unexpected_capability_check)
+    def native_gqa_available(*args):
+        capability_calls.append(args)
+        return True
+
+    monkeypatch.setattr(sdpa_backend, "can_sdpa_use_fused_gqa", native_gqa_available)
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
 
     impl = SDPAImpl(num_heads=4, num_kv_heads=2, head_size=8, softmax_scale=0.5, causal=True)
@@ -84,6 +88,7 @@ def test_sdpa_npu_uses_native_causal_gqa_without_cuda_capability_check(monkeypat
     assert kwargs["is_causal"] is True
     assert kwargs["scale"] == 0.5
     assert output.shape == (1, 3, 4, 8)
+    assert len(capability_calls) == 1
 
 
 def test_sdpa_npu_rejects_invalid_gqa_head_ratio():
@@ -95,3 +100,27 @@ def test_sdpa_npu_rejects_invalid_gqa_head_ratio():
             torch.randn(1, 3, 2, 8),
             torch.randn(1, 3, 2, 8),
         )
+
+
+class _FakePlatform:
+    def __init__(self, name: str):
+        self.name = name
+
+    def is_npu(self):
+        return self.name == "npu"
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "expected"),
+    [("npu", True), ("xpu", False), ("musa", False), ("unspecified", False)],
+)
+def test_sdpa_native_gqa_capability_is_platform_aware(monkeypatch, platform_name, expected):
+    monkeypatch.setattr(
+        attn_runtime_selector,
+        "current_omni_platform",
+        _FakePlatform(platform_name),
+    )
+    query = torch.randn(1, 4, 3, 8)
+    key = value = torch.randn(1, 2, 3, 8)
+
+    assert attn_runtime_selector.can_sdpa_use_fused_gqa(query, key, value, None, True) is expected

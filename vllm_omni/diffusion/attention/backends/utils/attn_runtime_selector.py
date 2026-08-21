@@ -4,6 +4,8 @@
 
 import torch
 
+from vllm_omni.platforms import current_omni_platform
+
 
 def can_sdpa_use_fused_gqa(
     query: torch.Tensor,
@@ -14,9 +16,13 @@ def can_sdpa_use_fused_gqa(
 ) -> bool:
     """Return whether PyTorch SDPA can use a fused kernel for this GQA call.
 
-    This check is specific to the SDPA backend. Native GQA backends such as
-    FlashAttention should keep compressed K/V heads and do not use this helper.
+    NPU's PyTorch SDPA implementation supports native GQA. CUDA-compatible
+    devices use PyTorch's runtime kernel checks; other devices fall back to
+    explicit K/V expansion in ``SDPAImpl``.
     """
+    if current_omni_platform.is_npu():
+        return True
+
     if not query.is_cuda:
         return False
 

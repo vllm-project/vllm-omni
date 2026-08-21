@@ -41,7 +41,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -775,13 +775,13 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        self.attn = Attention(
+        self.attn = SDPAImpl(
             num_heads=self.qkv_proj.local_num_heads,
             head_size=self.head_dim,
             causal=True,
             softmax_scale=self.scaling,
             num_kv_heads=self.qkv_proj.local_num_kv_heads,
-            skip_sequence_parallel=True,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -814,7 +814,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output = self.attn(query_states, key_states, value_states)
+        attn_output = self.attn.forward(query_states, key_states, value_states)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output

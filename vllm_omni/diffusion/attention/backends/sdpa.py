@@ -96,7 +96,6 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
         mask_mode: SDPAMaskMode = "broadcast_k",
-        use_native_gqa: bool = False,
     ) -> torch.Tensor:
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
@@ -106,25 +105,23 @@ class SDPAImpl(AttentionImpl):
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
-        # cannot select a fused GQA kernel for the runtime shape/mask, expand
-        # K/V locally so it can use the better-supported equal-head path.
-        if (
-            enable_gqa
-            and not use_native_gqa
-            and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal)
-        ):
+        if enable_gqa:
             if query.shape[1] % key.shape[1] != 0:
                 raise ValueError(
                     "GQA requires query heads to be a multiple of KV heads, "
                     f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
                 )
+
+        # Keep compressed K/V only when the current platform can dispatch a
+        # native GQA kernel for this SDPA call. Other platforms retain the
+        # existing explicit-expansion behavior.
+        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
             repeat_num = query.shape[1] // key.shape[1]
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
             enable_gqa = False
             logger.debug(
-                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
+                "SDPA cannot use a fused native-GQA kernel for this platform or shape; expanding K/V heads before SDPA."
             )
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
@@ -173,16 +170,4 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if query.shape[2] != key.shape[2] and query.shape[2] % key.shape[2] != 0:
-            raise ValueError(
-                "GQA requires query heads to be a multiple of KV heads, "
-                f"got q_heads={query.shape[2]} and kv_heads={key.shape[2]}."
-            )
-        return self._forward_impl(
-            query,
-            key,
-            value,
-            attn_metadata,
-            mask_mode="full_qk",
-            use_native_gqa=True,
-        )
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")
