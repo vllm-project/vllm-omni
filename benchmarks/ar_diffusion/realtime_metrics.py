@@ -115,6 +115,8 @@ class ChunkEvent:
     frames: int | None = None
     generate_s: float | None = None
     decode_s: float | None = None
+    overlap_s: float | None = None
+    backpressure_s: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -127,7 +129,7 @@ class ChunkEvent:
             raise TypeError("frames must be an integer when provided.")
         if self.frames is not None and self.frames <= 0:
             raise ValueError("frames must be positive when provided.")
-        for name in ("generate_s", "decode_s"):
+        for name in ("generate_s", "decode_s", "overlap_s", "backpressure_s"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative.")
@@ -144,7 +146,7 @@ class ChunkEvent:
             "t_ready": self.t_ready,
             "latency_s": self.latency_s,
         }
-        for name in ("frames", "generate_s", "decode_s"):
+        for name in ("frames", "generate_s", "decode_s", "overlap_s", "backpressure_s"):
             value = getattr(self, name)
             if value is not None:
                 record[name] = value
@@ -235,6 +237,9 @@ class SessionSummary:
     generate_s_total: float | None = None
     decode_s_total: float | None = None
     decode_share: float | None = None
+    overlap_s_total: float | None = None
+    overlap_efficiency: float | None = None
+    backpressure_s_total: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -273,6 +278,8 @@ def summarize_session(
 
     generate_total = _optional_sum(event.generate_s for event in events)
     decode_total = _optional_sum(event.decode_s for event in events)
+    overlap_total = _optional_sum(event.overlap_s for event in events)
+    backpressure_total = _optional_sum(event.backpressure_s for event in events)
     latency_total = sum(latencies)
     return SessionSummary(
         session_id=record.session_id,
@@ -294,6 +301,15 @@ def summarize_session(
         # decode serialized this is the headroom overlapping them can recover;
         # once they overlap it is what the measurement has to show shrinking.
         decode_share=(decode_total / latency_total if decode_total is not None and latency_total > 0 else None),
+        overlap_s_total=overlap_total,
+        # Fraction of generate time hidden behind decode. 0 when the two are
+        # serialized, approaching 1 as generation is fully covered.
+        overlap_efficiency=(
+            overlap_total / generate_total
+            if overlap_total is not None and generate_total is not None and generate_total > 0
+            else None
+        ),
+        backpressure_s_total=backpressure_total,
     )
 
 
@@ -315,6 +331,7 @@ class RunSummary:
     rtf_spread: float | None
     peak_concurrent_sessions: int
     decode_share: float | None = None
+    overlap_efficiency: float | None = None
     resident_decoder_bytes_per_session: int | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -341,6 +358,7 @@ class RunSummary:
             "continuous_play_ratio": self.continuous_play_ratio,
             "rtf_spread": self.rtf_spread,
             "decode_share": self.decode_share,
+            "overlap_efficiency": self.overlap_efficiency,
             "resident_decoder_bytes_per_session": self.resident_decoder_bytes_per_session,
             "notes": list(self.notes),
             "per_session": [summary.to_dict() for summary in self.sessions],
@@ -374,6 +392,7 @@ def summarize_run(
     per_session_cpr = [s.continuous_play_ratio for s in summaries if s.continuous_play_ratio is not None]
     rtfs = [s.rtf for s in summaries if s.rtf is not None]
     decode_shares = [s.decode_share for s in summaries if s.decode_share is not None]
+    overlaps = [s.overlap_efficiency for s in summaries if s.overlap_efficiency is not None]
 
     return RunSummary(
         mode=mode,
@@ -390,6 +409,7 @@ def summarize_run(
         rtf_spread=max(rtfs) - min(rtfs) if len(rtfs) > 1 else None,
         peak_concurrent_sessions=(peak_concurrent_sessions if peak_concurrent_sessions is not None else len(summaries)),
         decode_share=statistics.fmean(decode_shares) if decode_shares else None,
+        overlap_efficiency=statistics.fmean(overlaps) if overlaps else None,
         resident_decoder_bytes_per_session=resident_decoder_bytes_per_session,
         notes=tuple(notes),
     )
