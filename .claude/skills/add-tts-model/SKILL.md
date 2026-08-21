@@ -563,7 +563,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] `pre-commit run --files <changed>` passes before every push
 - [ ] Every commit has `Signed-off-by` matching the author email (`git commit -s`)
 - [ ] `git config user.email` matches the email registered on your GitHub account
-- [ ] Details and failure-recovery commands: [references/precommit-dco.md](references/precommit-dco.md)
+- [ ] Hook list, failure table, and DCO recovery: [references/precommit-dco.md](references/precommit-dco.md)
 
 ## References
 

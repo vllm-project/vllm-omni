@@ -869,13 +869,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         else:
             request_ids = requests.keys()
 
+        connector_owned_ids = {
+            request.request_id
+            for queue in (
+                self.waiting_for_chunk_waiting_requests,
+                self.waiting_for_chunk_running_requests,
+                self._held_non_active,
+            )
+            for request in queue
+        }
+
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
-            if request is None or request.is_finished():
+            if request is None:
                 # Invalid request ID.
                 continue
-            if req_id in self.requests_origin_status:
+            resumable_segment_stop = bool(
+                getattr(request, "resumable", False) and request.status == RequestStatus.FINISHED_STOPPED
+            )
+            if request.is_finished() and not resumable_segment_stop:
+                continue
+            # Once restored to a scheduler queue, the saved origin is stale and
+            # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
+            if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
 
         request_ids = set(request_ids)
@@ -891,11 +908,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
-            self._active_streams.pop(req_id, None)
-            self.requests_with_ready_chunks.discard(req_id)
-            self.upstream_exhausted_requests.discard(req_id)
-            self._finished_load_reqs.discard(req_id)
-            self._cancelled_load_reqs.add(req_id)
-            self._waiting_since.pop(req_id, None)
+            self.cleanup_receiver(req_id)
 
         return []

@@ -242,6 +242,7 @@ data/
 datasets/
 *.csv
 *.json
+!recipes/cosmos3/negative_prompt.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !tests/assets/soulxsinger/*.json
@@ -278,3 +279,6 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
+
+# Linting binaries downloaded by local pre-commit hooks
+shellcheck*/
