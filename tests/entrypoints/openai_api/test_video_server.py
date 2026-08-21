@@ -12,7 +12,6 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,10 +37,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
-from vllm_omni.entrypoints.openai.video_api_utils import (
-    LEGACY_VIDEO_RESPONSE_ENCODING,
-    OPTIMIZED_VIDEO_RESPONSE_ENCODING,
-)
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -65,11 +60,6 @@ class MockVideoResult:
             self.multimodal_output["audio_sample_rate"] = sample_rate
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
-
-
-@dataclass(frozen=True)
-class VideoStageConfigFake:
-    stage_type: str
 
 
 class FakeAsyncOmni:
@@ -99,126 +89,11 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-@pytest.mark.parametrize(
-    ("model_class_name", "mode", "expected_optimized"),
-    [
-        ("MiniMaxH3Pipeline", "auto", True),
-        ("MiniMaxH3ModularPipeline", "auto", True),
-        ("WanPipeline", "auto", False),
-        ("UnknownVideoPipeline", "auto", False),
-        ("MiniMaxH3Pipeline", "legacy", False),
-        ("WanPipeline", "optimized", True),
-    ],
-)
-def test_video_response_encoding_mode_is_resolved_from_server_policy(
-    model_class_name,
-    mode,
-    expected_optimized,
-):
+def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
     engine = FakeAsyncOmni()
-    engine.model_class_name = model_class_name
-
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
-        video_response_encoding_mode=mode,
-    )
-
-    assert handler._video_response_encoding_config.optimized is expected_optimized
-
-
-@pytest.mark.parametrize(
-    ("engine_stage_types", "injected_stage_types", "expected_optimized"),
-    [
-        (["diffusion"], ["diffusion", "diffusion"], False),
-        (["diffusion", "diffusion"], ["diffusion"], True),
-    ],
-)
-def test_video_response_encoding_prefers_injected_stage_configs(
-    engine_stage_types,
-    injected_stage_types,
-    expected_optimized,
-):
-    engine = SimpleNamespace(
-        stage_configs=[VideoStageConfigFake(stage_type=stage_type) for stage_type in engine_stage_types],
-        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
-    )
-
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        stage_configs=[VideoStageConfigFake(stage_type=stage_type) for stage_type in injected_stage_types],
-        video_response_encoding_mode="auto",
-    )
-
-    assert handler._video_response_encoding_config.optimized is expected_optimized
-
-
-def test_video_response_encoding_auto_uses_attribute_od_config_fallback():
-    engine = SimpleNamespace(
-        stage_configs=[VideoStageConfigFake(stage_type="diffusion")],
-        od_config=SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
-    )
-
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        video_response_encoding_mode="auto",
-    )
-
-    assert handler._video_response_encoding_config.optimized
-
-
-def test_video_response_encoding_prefers_od_config_getter():
-    engine = SimpleNamespace(
-        stage_configs=[VideoStageConfigFake(stage_type="diffusion")],
-        od_config=SimpleNamespace(model_class_name="WanPipeline"),
-        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="MiniMaxH3Pipeline"),
-    )
-
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        video_response_encoding_mode="auto",
-    )
-
-    assert handler._video_response_encoding_config.optimized
-
-
-@pytest.mark.parametrize(
-    "stage_types",
-    [
-        ["diffusion", "diffusion"],
-        ["llm", "diffusion"],
-    ],
-)
-def test_video_response_encoding_auto_is_legacy_for_multiple_stages(stage_types):
-    engine = FakeAsyncOmni()
-    engine.model_class_name = "MiniMaxH3Pipeline"
-    engine.stage_configs = [VideoStageConfigFake(stage_type=stage_type) for stage_type in stage_types]
-
-    auto_handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        video_response_encoding_mode="auto",
-    )
-    explicit_handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        video_response_encoding_mode="optimized",
-    )
-
-    assert auto_handler._video_response_encoding_config is LEGACY_VIDEO_RESPONSE_ENCODING
-    assert explicit_handler._video_response_encoding_config is OPTIMIZED_VIDEO_RESPONSE_ENCODING
-
-
-def test_video_response_encoding_config_reaches_raw_and_base64_encoders(mocker: MockerFixture):
-    engine = FakeAsyncOmni()
-    engine.model_class_name = "MiniMaxH3Pipeline"
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-        video_response_encoding_mode="auto",
     )
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -236,8 +111,32 @@ def test_video_response_encoding_config_reaches_raw_and_base64_encoders(mocker: 
 
     asyncio.run(_generate_both_response_types())
 
-    assert raw_encoder.call_args.kwargs["encoding_config"] is OPTIMIZED_VIDEO_RESPONSE_ENCODING
-    assert base64_encoder.call_args.kwargs["encoding_config"] is OPTIMIZED_VIDEO_RESPONSE_ENCODING
+    assert "encoding_config" not in raw_encoder.call_args.kwargs
+    assert "encoding_config" not in base64_encoder.call_args.kwargs
+
+
+def test_resolve_diffusion_od_config_falls_back_to_attribute():
+    od_config = SimpleNamespace(model_class_name="WanPipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=od_config),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is od_config
+
+
+def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
+    attribute_config = SimpleNamespace(model_class_name="WanPipeline")
+    getter_config = SimpleNamespace(model_class_name="MiniMaxH3Pipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(
+            od_config=attribute_config,
+            get_diffusion_od_config=lambda: getter_config,
+        ),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is getter_config
 
 
 class BlockingVideoHandler:
@@ -1314,9 +1213,8 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
-        encoding_config=None,
     ):
-        del video, fps, audio, video_codec_options, encoding_config
+        del video, fps, audio, video_codec_options
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

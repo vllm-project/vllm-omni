@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark legacy and planar MP4 response encoding on synthetic input."""
+"""Benchmark legacy and automatic MP4 response encoding on synthetic input."""
 
 from __future__ import annotations
 
@@ -9,23 +9,22 @@ import hashlib
 import json
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from vllm_omni.entrypoints.openai.video_api_utils import (
-    LEGACY_VIDEO_RESPONSE_ENCODING,
-    OPTIMIZED_VIDEO_RESPONSE_ENCODING,
-    VideoResponseEncodingConfig,
     _encode_video_bytes,
+    _encode_video_bytes_legacy,
 )
 
 
 @dataclass(frozen=True)
 class BenchmarkVariant:
     label: str
-    config: VideoResponseEncodingConfig
+    encoder: Callable[..., bytes]
 
 
 def _positive_int(value: str) -> int:
@@ -67,13 +66,12 @@ def _measure(
 ) -> tuple[bytes, dict[str, object]]:
     cpu_start = time.process_time_ns()
     wall_start = time.perf_counter_ns()
-    output = _encode_video_bytes(
+    output = variant.encoder(
         video,
         fps=fps,
         audio=audio,
         audio_sample_rate=audio_sample_rate,
         video_codec_options={"preset": "ultrafast", "threads": "0"},
-        encoding_config=variant.config,
     )
     wall_ms = (time.perf_counter_ns() - wall_start) / 1_000_000
     process_cpu_ms = (time.process_time_ns() - cpu_start) / 1_000_000
@@ -132,8 +130,8 @@ def main() -> None:
         audio_sample_rate=args.audio_sample_rate,
         seed=args.seed,
     )
-    baseline = BenchmarkVariant("legacy", LEGACY_VIDEO_RESPONSE_ENCODING)
-    candidate = BenchmarkVariant("planar", OPTIMIZED_VIDEO_RESPONSE_ENCODING)
+    baseline = BenchmarkVariant("legacy", _encode_video_bytes_legacy)
+    candidate = BenchmarkVariant("automatic", _encode_video_bytes)
 
     for _ in range(args.warmup):
         for variant in (baseline, candidate):

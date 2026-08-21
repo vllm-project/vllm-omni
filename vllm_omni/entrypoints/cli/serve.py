@@ -823,17 +823,6 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-        omni_config_group.add_argument(
-            "--video-response-encoding-mode",
-            choices=("auto", "legacy", "optimized"),
-            default="legacy",
-            help=(
-                "Select non-streaming MP4 response encoding. 'legacy' preserves the compatibility path; "
-                "'auto' enables the optimized path only for models that declare it in metadata; "
-                "'optimized' explicitly opts in any model, with runtime layout fallback."
-            ),
-        )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",

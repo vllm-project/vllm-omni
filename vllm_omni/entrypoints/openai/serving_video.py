@@ -10,14 +10,14 @@ from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -31,9 +31,6 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
-    LEGACY_VIDEO_RESPONSE_ENCODING,
-    OPTIMIZED_VIDEO_RESPONSE_ENCODING,
-    VideoResponseEncodingConfig,
     _encode_video_bytes,
     encode_video_base64,
 )
@@ -49,23 +46,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-VideoResponseEncodingMode = Literal["auto", "legacy", "optimized"]
-
-
-def resolve_video_response_encoding_config(
-    mode: VideoResponseEncodingMode,
-    *,
-    model_prefers_optimized: bool,
-) -> VideoResponseEncodingConfig:
-    """Resolve a server mode without coupling the encoder to model names."""
-    if mode == "legacy":
-        return LEGACY_VIDEO_RESPONSE_ENCODING
-    if mode == "optimized":
-        return OPTIMIZED_VIDEO_RESPONSE_ENCODING
-    if mode == "auto":
-        return OPTIMIZED_VIDEO_RESPONSE_ENCODING if model_prefers_optimized else LEGACY_VIDEO_RESPONSE_ENCODING
-    raise ValueError(f"Unsupported video response encoding mode: {mode!r}")
 
 
 @dataclass
@@ -112,41 +92,16 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
-        video_response_encoding_mode: VideoResponseEncodingMode = "legacy",
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
-        model_metadata = self._get_diffusion_model_metadata()
-        self._video_response_encoding_config = resolve_video_response_encoding_config(
-            video_response_encoding_mode,
-            model_prefers_optimized=model_metadata.prefers_optimized_video_response_encoding,
-        )
-        logger.info(
-            "Video response encoding mode resolved: requested=%s optimized=%s",
-            video_response_encoding_mode,
-            self._video_response_encoding_config.optimized,
-        )
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
         if callable(get_od_config):
             return get_od_config()
         return getattr(self._engine_client, "od_config", None)
-
-    def _get_diffusion_model_metadata(self) -> DiffusionModelMetadata:
-        stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
-        if stage_configs is None:
-            return DiffusionModelMetadata()
-        if len(stage_configs) != 1 or get_stage_type(stage_configs[0]) != "diffusion":
-            # The lightweight engine view does not identify which diffusion
-            # stage produced the final video. Keep auto mode conservative for
-            # ambiguous multi-stage pipelines; explicit optimized still works.
-            return DiffusionModelMetadata()
-
-        od_config = self._resolve_diffusion_od_config()
-        model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
-        return get_diffusion_model_metadata(model_class_name)
 
     @property
     def model_name(self) -> str | None:
@@ -194,13 +149,11 @@ class OmniOpenAIServingVideo:
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
-        video_response_encoding_mode: VideoResponseEncodingMode = "legacy",
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,
             model_name=model_name,
             stage_configs=stage_configs,
-            video_response_encoding_mode=video_response_encoding_mode,
         )
 
     async def _run_and_extract(
@@ -394,7 +347,6 @@ class OmniOpenAIServingVideo:
                         video,
                         fps=artifacts.output_fps,
                         video_codec_options=video_codec_options,
-                        encoding_config=self._video_response_encoding_config,
                     )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
@@ -403,7 +355,6 @@ class OmniOpenAIServingVideo:
                         audio=artifacts.audios[idx],
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
-                        encoding_config=self._video_response_encoding_config,
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -460,7 +411,6 @@ class OmniOpenAIServingVideo:
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
             video_codec_options=video_codec_options,
-            encoding_config=self._video_response_encoding_config,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)

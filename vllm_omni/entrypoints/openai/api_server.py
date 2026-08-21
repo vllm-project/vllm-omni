@@ -717,10 +717,6 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
-        # Response encoding runs in the API process and is resolved when the
-        # video handler is created. Do not forward this CPU serving policy to
-        # AsyncOmni or any diffusion stage.
-        kwargs.pop("video_response_encoding_mode", None)
         kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
 
@@ -816,7 +812,6 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
-            video_response_encoding_mode=getattr(args, "video_response_encoding_mode", "legacy"),
         )
         state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
             engine_client=engine_client,
@@ -1181,7 +1176,6 @@ async def omni_init_app_state(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
-        video_response_encoding_mode=getattr(args, "video_response_encoding_mode", "legacy"),
     )
     state.openai_serving_realtime_robot = None
 

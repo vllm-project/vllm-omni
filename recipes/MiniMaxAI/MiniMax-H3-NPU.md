@@ -120,14 +120,12 @@ above) or HSDP — see
 
 ### CPU MP4 response encoding (Atlas A2)
 
-Use `--video-response-encoding-mode auto` to select the optimized CPU MP4
-response encoder only for a single diffusion stage whose metadata identifies
-`MiniMaxH3Pipeline` or `MiniMaxH3ModularPipeline`. Unknown model metadata or a
-multi-stage service resolves to the `legacy` path. `legacy` is the compatibility
-fallback; `optimized` may be selected explicitly for other models, but each
-model must be validated independently. If the input layout is incompatible with
-direct planar encoding, the encoder falls back to `legacy` before opening the
-PyAV container.
+Non-streaming MP4 responses use one public automatic encoder. It checks the
+runtime frame shape, common dtype, and RGB channel-plane contiguity for every
+request; compatible inputs use direct planar PyAV frames, while unsupported
+inputs fall back to the legacy muxer before opening the PyAV container. No CLI
+flag, model declaration, or user configuration is required. Streaming fMP4
+output remains on its existing incremental path.
 
 Current performance and correctness validation is limited to one Atlas A2 host
 with 8x Ascend 910B4-1 NPUs, the `FL2VA`/`t2va` partition, one request at a
