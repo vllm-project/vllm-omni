@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -75,11 +75,6 @@ class _RequestState:
     prompt_cache_id: str
     prompt_wav: str
     token2wav: BatchedToken2WavState
-    # Codec payloads after the first streamed window are accumulated before
-    # vocoding. Keeping this in request-owned state prevents cross-request
-    # mixing while allowing the first window to be emitted with low latency.
-    pending_tokens: torch.Tensor | None = None
-    aggregate_target: int = 0
 
 
 @dataclass
@@ -151,13 +146,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 Path(self.model_path) / "assets" / "HT_ref_audio.wav",
             )
         )
-        self._internal_aggregate_chunks = int(
-            extra.get("code2wav_internal_aggregate_chunks", 4)
-        )
-        if self._internal_aggregate_chunks < 1:
-            raise ValueError(
-                "MiniCPM-o Code2Wav code2wav_internal_aggregate_chunks must be >= 1"
-            )
 
     def _resolve_model_root(self) -> Path:
         model_root = Path(self.model_path)
@@ -577,74 +565,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
-
-        pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
-        pending.update(
-            {
-                item.state_id: _RequestState(
-                    cache_epoch=item.cache_epoch,
-                    chunk_seq=item.chunk_seq,
-                    prompt_cache_id=item.prompt_cache_id,
-                    prompt_wav=item.prompt_wav,
-                    token2wav=item.previous.token2wav,
-                    pending_tokens=None,
-                    aggregate_target=item.previous.aggregate_target,
-                )
-                for item in segment_markers
-                if item.previous is not None
-            }
-        )
-        initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
-        # Keep the first codec window on the latency path. Later windows are
-        # accumulated per request and decoded in one larger batch, reducing
-        # repeated encoder/HiFT launch overhead without sharing state.
-        decode_items: list[_WorkItem] = []
-        for item in sentinels:
-            previous = item.previous
-            buffered = None if previous is None else previous.pending_tokens
-            if buffered is not None and buffered.numel() > 0:
-                decode_items.append(
-                    replace(item, tokens=buffered, last_chunk=True)
-                )
-        for item in segment_markers:
-            previous = item.previous
-            buffered = None if previous is None else previous.pending_tokens
-            if buffered is not None and buffered.numel() > 0:
-                decode_items.append(
-                    replace(item, tokens=buffered, last_chunk=False)
-                )
-        for item in compute_items:
-            previous = item.previous
-            if previous is None or previous.aggregate_target < 1:
-                decode_items.append(item)
-                continue
-            prior = previous.pending_tokens
-            if prior is None or prior.numel() == 0:
-                combined = item.tokens
-            else:
-                combined = torch.cat((prior, item.tokens), dim=0)
-            target = previous.aggregate_target
-            if target < 1:
-                target = max(
-                    1,
-                    int(item.tokens.numel()) * self._internal_aggregate_chunks,
-                )
-            boundary = item.last_chunk or item.tts_is_last_chunk
-            if boundary or combined.numel() >= target:
-                decode_items.append(replace(item, tokens=combined))
-                continue
-            pending[item.state_id] = _RequestState(
-                cache_epoch=item.cache_epoch,
-                chunk_seq=item.chunk_seq,
-                prompt_cache_id=item.prompt_cache_id,
-                prompt_wav=item.prompt_wav,
-                token2wav=previous.token2wav,
-                pending_tokens=combined.detach(),
-                aggregate_target=target,
-            )
-
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
-        for item in decode_items:
+        for item in compute_items:
             buckets.setdefault(self._bucket_key(item), []).append(item)
         undersized = [
             {
@@ -662,6 +584,22 @@ class MiniCPMO45Code2Wav(nn.Module):
                 minimum=self._min_batch_size,
                 buckets=undersized,
             )
+
+        pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
+        pending.update(
+            {
+                item.state_id: _RequestState(
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=item.chunk_seq,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    token2wav=item.previous.token2wav,
+                )
+                for item in segment_markers
+                if item.previous is not None
+            }
+        )
+        initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
         for item in segment_markers:
             if item.previous is None:
                 initial_marker_buckets.setdefault(
@@ -699,8 +637,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_cache_id=item.prompt_cache_id,
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
-                    pending_tokens=None,
-                    aggregate_target=0,
                 )
         for bucket in buckets.values():
             batch_size = len(bucket)
@@ -749,12 +685,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                         prompt_cache_id=item.prompt_cache_id,
                         prompt_wav=item.prompt_wav,
                         token2wav=next_state,
-                        pending_tokens=None,
-                        aggregate_target=(
-                            item.previous.aggregate_target
-                            if item.previous is not None and item.previous.aggregate_target > 0
-                            else max(1, int(item.tokens.numel()) * self._internal_aggregate_chunks)
-                        ),
                     )
                 )
 
