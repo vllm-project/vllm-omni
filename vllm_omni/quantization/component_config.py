@@ -117,9 +117,21 @@ class ComponentQuantizationConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         config = self.resolve(prefix)
-        if config is None:
-            return None
-        return config.get_quant_method(layer, prefix)
+        if config is not None:
+            method = config.get_quant_method(layer, prefix)
+            if method is not None:
+                return method
+        # Layer is not covered by any component (e.g. a per-component config that
+        # only targets {"text_encoder": ...} but the layer lives in the DiT
+        # transformer). vLLM's LinearBase treats a None quant method as fatal
+        # ("All linear layers should support quant method."), so hand unmatched
+        # linears an explicit unquantized method instead of None. Non-linear
+        # layers keep returning None (vLLM tolerates that).
+        from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:

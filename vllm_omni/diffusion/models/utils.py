@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -72,12 +73,18 @@ def replace_linear_class(
     )
 
 
-def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
+def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig, prefix: str = ""):
     """Recursively replace modules in the model as needed.
     Currently, this replaces:
     - `nn.Linear` with vLLM's tensor parallel linear classes
+
+    Args:
+        prefix: Component prefix (e.g. "text_encoder") prepended to each layer's
+            qualified name. Per-component quant configs route by longest-prefix
+            match, so a model built standalone (whose internal names start at the
+            module root) must be given its pipeline-level prefix here for routing
+            like ``{"text_encoder": {"method": "fp8"}}`` to resolve.
     """
-    # Prefix the patterns because we always start from `self.model`
     quant_config = build_quant_config(od_config.quantization_config)
 
     def _recursive_replace(module: nn.Module, prefix: str):
@@ -93,7 +100,7 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
             if new_module is not child_module:
                 setattr(module, child_name, new_module)
 
-    _recursive_replace(model, prefix="")
+    _recursive_replace(model, prefix=prefix)
 
 
 def init_parameters(
@@ -122,13 +129,27 @@ def create_transformers_model(
     hf_config: PretrainedConfig,
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
+    *,
+    prune_fn: Callable[[nn.Module], None] | None = None,
+    prefix: str = "",
 ) -> PreTrainedModel:
-    """Create a HuggingFace model using the given auto class and model name."""
+    """Create a HuggingFace model using the given auto class and model name.
+
+    Args:
+        prune_fn: Optional callback invoked on the freshly meta-initialized model
+            before linear replacement and parameter materialization. Use it to
+            drop unused submodules (e.g. the vision tower on a VL text encoder)
+            so their parameters are never quantized nor allocated on any device.
+        prefix: Component prefix (e.g. "text_encoder") used for per-component
+            quant routing. See ``recursive_replace_linear``.
+    """
     dtype = dtype or od_config.dtype
     device = device or torch.get_default_device()
     with init_on_device_without_buffers("meta"):
         model = auto_cls.from_config(hf_config)
-    recursive_replace_linear(model, od_config)
+    if prune_fn is not None:
+        prune_fn(model)
+    recursive_replace_linear(model, od_config, prefix=prefix)
     init_parameters(model, dtype=dtype, device=device)
     return model
 

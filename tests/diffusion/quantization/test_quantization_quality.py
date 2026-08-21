@@ -93,7 +93,7 @@ class QualityTestConfig:
             return self.quantized_model
         return self.model or ""
 
-    def quantization_ref(self) -> str | None:
+    def quantization_ref(self) -> str | dict | None:
         if self.quantized_model is not None:
             return None
         return self.quantization
@@ -202,6 +202,18 @@ QUALITY_CONFIGS = [
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
         max_lpips=0.35,
+        seed=142,
+        num_inference_steps=20,
+    ),
+    # Text-encoder-only FP8: quantizes just the text encoder (DiT stays BF16),
+    # so this gate is independent of the transformer FP8 regression (#2728).
+    QualityTestConfig(
+        id="fp8_qwen_image_text_encoder",
+        model="Qwen/Qwen-Image",
+        quantization={"text_encoder": {"method": "fp8"}},
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.20,
         seed=142,
         num_inference_steps=20,
     ),
