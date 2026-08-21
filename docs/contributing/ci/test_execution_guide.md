@@ -196,7 +196,7 @@ Failed jobs: 1/2
     The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
 
     - **Reliability** (+ invalid-parameter) and **Simple · CPU Coverage Test** → `WEEKLY=1` (CPU coverage also requires `main`)
-    - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON-CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON-CRITICAL`)
+    - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)
 
 You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).
 

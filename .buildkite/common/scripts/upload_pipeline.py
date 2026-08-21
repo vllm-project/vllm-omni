@@ -121,7 +121,7 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
         merge_main = (
             'build.branch == "main" && build.env("NIGHTLY") != "1" && '
-            'build.env("WEEKLY") != "1" && build.env("NON-CRITICAL") != "1"'
+            'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
         )
         merge_pr = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
         nightly_label_if = (
@@ -136,17 +136,17 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         )
         weekly_label_if = (
             '(build.branch == "main" && '
-            '(build.env("WEEKLY") == "1" || build.env("NON-CRITICAL") == "1")) || '
+            '(build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")) || '
             '(build.branch != "main" && build.pull_request.labels includes "weekly-test")'
         )
         merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
 
     ready_base = f"({nightly_main}) || ({ready_pr})"
-    weekly_main = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON-CRITICAL") == "1")'
+    weekly_main = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON-CRITICAL=1 still run L5.
+        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
         # WEEKLY=1 on main also uploads L2/L3 with --e2e.
         image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
         ready_expr = nightly_main

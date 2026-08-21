@@ -567,7 +567,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
     - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`). Weekly CI (`.buildkite/cuda/test-weekly.yml`) runs the **Reliability Test** group on `WEEKLY=1` or PR label `weekly-test`. The weekly **E2E Tests** group (slow Omni/TTS/Diffusion) is separate and requires `NON-CRITICAL=1`.
+    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`). Weekly CI (`.buildkite/cuda/test-weekly.yml`) runs the **Reliability Test** group on `WEEKLY=1` or PR label `weekly-test`. The weekly **E2E Tests** group (slow Omni/TTS/Diffusion) is separate and requires `NON_CRITICAL=1`.
 - ***Script Example***:
 
 <details>

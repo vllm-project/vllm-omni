@@ -81,12 +81,12 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     | L2 | `cuda/test-ready.yml` | `ready` label |
     | L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
     | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
-    | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON-CRITICAL=1` (see step `if`s below) |
+    | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
 
-    On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON-CRITICAL=1`**. Inside that file:
+    On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
     - **Reliability** / **Simple · CPU Coverage Test** → `WEEKLY=1` (coverage also requires `main`)
-    - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON-CRITICAL=1`
+    - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
 
     **`--e2e`:** when uploading ready/merge on `main` with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
@@ -211,15 +211,15 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Diff shape | Path | Default L2/L3 |
 | --- | --- | --- |
 | Product code / non-whitelisted paths | normal CI | all on |
-| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY/`NON-CRITICAL` exceptions below) |
+| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY/`NON_CRITICAL` exceptions below) |
 | Whitelisted CI YAML only | yaml-gated (`skip_l2_l3`) | per platform/level matrix |
 | Docs/skip-mark **+** whitelisted CI YAML | yaml-gated (`skip_l2_l3`) | same as CI-YAML-only (does **not** widen to normal CI) |
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON-CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
+**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
 
-**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON-CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
+**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
 ##### Whitelisted CI YAML → platform
 

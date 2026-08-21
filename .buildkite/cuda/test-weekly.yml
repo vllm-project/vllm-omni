@@ -58,7 +58,7 @@ steps:
 
   - group: ":card_index_dividers: E2E Tests"
     depends_on: upload-weekly-pipeline
-    if: build.env("NON-CRITICAL") == "1"
+    if: build.env("NON_CRITICAL") == "1"
     steps:
 
       - label: "Omni · L4"

@@ -45,7 +45,7 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L5 Test — main+WEEKLY=1 / NON-CRITICAL=1 (scheduled), or PR with weekly-test label
+  # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (scheduled), or PR with weekly-test label
   - label: "Upload Weekly Pipeline"
     depends_on: image-build
     key: upload-weekly-pipeline
