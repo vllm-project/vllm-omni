@@ -142,9 +142,11 @@ def test_restoration_contract_has_a_validation_only_one_shot_commit_boundary() -
     assert "without mutating" in (WeightRestorer.__doc__ or "")
 
 
-def test_post_load_publication_policy_is_explicitly_unsupported() -> None:
-    with pytest.raises(ValueError, match="post-load publication is not implemented"):
-        ProductionPolicy(allow_post_load_publish=True)
+def test_post_load_publication_policy_is_explicitly_enabled() -> None:
+    policy = ProductionPolicy(allow_post_load_publish=True)
+
+    assert policy.allow_local_build
+    assert policy.allow_post_load_publish
 
 
 def test_manifest_and_publication_marker_round_trip_exactly() -> None:

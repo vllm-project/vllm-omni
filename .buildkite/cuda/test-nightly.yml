@@ -255,6 +255,12 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m full_model --run-level full_model
         mirror_hardwares: h100_4
 
+      - label: ":full_moon: HiDream-O1-Image · Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
+        mirror_hardwares: h100_2
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image"
         key: nightly-diffusion-x2iat-performance-qwen-image
         timeout_in_minutes: 180

@@ -55,7 +55,9 @@ flowchart LR
 The contracts have deliberately narrow ownership:
 
 - `HostWeightRuntime` applies resolution and fallback policy and emits one
-  terminal report. It does not own a model or call the canonical loader.
+  terminal resolution report. Explicit post-load publication emits a separate
+  report and may return a lease, but does not revise the completed resolution.
+  The runtime does not own a model or call the canonical loader.
 - `HostWeightStore` owns artifact lookup, coordinated construction,
   publication, validation, quarantine, and lifecycle.
 - `HostWeightLease` owns process-local tensor views, mapped-file resources, and
@@ -135,9 +137,23 @@ producer cancellation requires a future process-isolated producer contract. A
 waiter timing out never cancels another process's valid build.
 
 Remote providers are represented by protocols but are explicitly unsupported
-in the first implementation. V1 also invokes only `PRE_LOAD_SAFE` producers;
-enabling post-load publication is rejected during configuration until a
-separate post-load entry point and model-lifetime contract exist.
+in the first implementation. Pre-load `resolve()` invokes only
+`PRE_LOAD_SAFE` producers. A loader that completed canonical materialization
+may explicitly call `publish_after_load()` with a `POST_LOAD_ONLY` producer
+when `allow_post_load_publish` is enabled.
+
+`allow_local_build` controls producer use during pre-load resolution;
+`allow_post_load_publish` independently controls the explicit post-load entry
+point. This permits lookup-only warm starts that populate a missing artifact
+only after the canonical loader has established the current model.
+
+Post-load publication is synchronous in V1, but its outcome is independent of
+the already completed resolution. A store failure is returned in a separate
+publication report and cannot turn a valid canonical model into a failed
+resolution. On success, the runtime closes the validated store lease before
+returning the report. Post-load publication only warms future startups; it does
+not restore, rebind, or otherwise mutate the canonically loaded model serving
+the current startup.
 
 ## Restoration transaction boundary
 
