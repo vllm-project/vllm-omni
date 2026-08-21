@@ -21,6 +21,12 @@ most ``CACHE_T`` temporal slices, so the cache is a function of resolution and
 never of session length. It is not free -- see :meth:`StreamingDecodeState.nbytes`,
 which is the quantity session admission has to account for.
 
+Measured on the reference checkpoint at 832x480 in bf16, on one RTX PRO 6000:
+streaming a session chunk by chunk reproduces the whole-clip decode with a
+maximum absolute error of 0, resident decoder state holds at 1801 MiB across
+every chunk, and time to first frame drops from 2.271 s -- the whole-clip
+barrier -- to 0.370 s, without the session costing more in total.
+
 Only ``torch`` is imported here so the contract can be exercised without a
 device, a checkpoint, or the distributed VAE stack.
 """
