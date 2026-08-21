@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
