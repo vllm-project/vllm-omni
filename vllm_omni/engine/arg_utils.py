@@ -184,6 +184,7 @@ class OmniEngineArgs(EngineArgs):
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     async_chunk: bool = False
     retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -407,6 +408,7 @@ class OmniEngineArgs(EngineArgs):
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
+            silence_ban_frames=self.silence_ban_frames,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,

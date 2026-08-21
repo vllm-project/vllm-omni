@@ -39,6 +39,7 @@
           8
         ],
         "no_oversample": true,
+        "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "extra_body": {
@@ -55,32 +56,115 @@
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.7803,
-              1.1008,
-              1.2027
+              0.9731,
+              1.1986,
+              1.686
             ],
             "mean_ttft_ms": [
-              166.9764,
-              307.7133,
-              323.584
+              152.5665,
+              270.2559,
+              301.455
             ],
             "mean_e2el_ms": [
-              1361.1682,
-              3800.6332,
-              6961.8636
+              1027.2953,
+              3306.3735,
+              4686.5366
             ],
             "mean_audio_ttfp_ms": [
-              635.8099,
-              1615.6591,
-              2888.9831
+              458.1553,
+              2030.2335,
+              2068.6233
             ],
             "mean_audio_rtf": [
-              0.3151,
-              0.8568,
-              1.5425
+              0.2357,
+              0.791,
+              1.0324
+            ]
+          },
+          "A3": {
+            "request_throughput": [
+              0.5383,
+              0.6042,
+              0.7547
+            ],
+            "mean_ttft_ms": [
+              333.2633,
+              533.8656,
+              547.3388
+            ],
+            "mean_e2el_ms": [
+              1857.2154,
+              6600.5101,
+              10450.6811
+            ],
+            "mean_audio_ttfp_ms": [
+              986.4666,
+              3411.0754,
+              3352.7515
+            ],
+            "mean_audio_rtf": [
+              0.4423,
+              1.5734,
+              2.3024
             ]
           }
         }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_a2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A2"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
       }
     ]
   }

@@ -613,6 +613,10 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+
+    if _looks_like_hidream_o1(model, cfg):
+        return "HiDreamO1ImagePipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1318,7 +1322,17 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
+                    raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
+
+                if is_hidream_o1:
+                    self.model_class_name = "HiDreamO1ImagePipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()

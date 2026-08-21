@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fused MiniMax H3 modulation with FP32 accumulation."""
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit

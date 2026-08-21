@@ -3013,9 +3013,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
                     mm["sr"] = [sr for _ in ready_req_ids]
+                    # Dense mode still yields a strict SUBSET of the batch when
+                    # some requests emit no audio this step (e.g. prefill
+                    # phase). Without the marker the runner indexes these
+                    # per-request lists by batch position and misroutes audio
+                    # across requests; the marker declares meta.req_id
+                    # alignment.
+                    mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
                     mm["sr"] = [sr for _ in audio_by_req]
+                    # Same subset hazard as the coalesce branch above.
+                    mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
                 mm["sr"] = []
