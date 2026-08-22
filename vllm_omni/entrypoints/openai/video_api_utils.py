@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared helper utilities for OpenAI-compatible video generation API.
 """
@@ -613,7 +613,7 @@ def _log_video_encoding_path(
     )
 
 
-def _validate_frame_conversion_workers(value: Any) -> int:
+def _validate_frame_conversion_workers(value: object) -> int:
     """Validate the bounded CPU frame-conversion worker count."""
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_FRAME_CONVERSION_WORKERS:
         raise ValueError(f"frame_conversion_workers must be between 1 and {MAX_FRAME_CONVERSION_WORKERS}.")
@@ -662,7 +662,7 @@ def _build_planar_video_frame(frame: np.ndarray, common_dtype: np.dtype) -> av.V
         if plane.height < height or plane.line_size < width:
             raise ValueError("PyAV video plane is smaller than the requested frame dimensions.")
         plane_view = np.frombuffer(
-            plane,
+            memoryview(plane),
             dtype=np.uint8,
             count=plane.height * plane.line_size,
         ).reshape(plane.height, plane.line_size)
@@ -695,7 +695,7 @@ def _iter_planar_video_frames(
         return
 
     executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="video-planar")
-    pending: deque[Future[Any]] = deque()
+    pending: deque[Future[av.VideoFrame]] = deque()
     max_pending = 2 * worker_count
     frame_iter = iter(frames)
     try:
@@ -705,14 +705,14 @@ def _iter_planar_video_frames(
                 break
 
         while pending:
-            frame = pending.popleft().result()
+            converted_frame = pending.popleft().result()
             try:
                 next_input = next(frame_iter)
             except StopIteration:
                 pass
             else:
                 pending.append(executor.submit(_build_planar_video_frame, next_input, common_dtype))
-            yield frame
+            yield converted_frame
     finally:
         for future in pending:
             future.cancel()
@@ -815,6 +815,9 @@ def _encode_video_bytes(
         effective_frame_conversion_workers=effective_frame_conversion_workers,
     )
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+    audio_sample_rate_for_mux = (
+        effective_audio_sample_rate if effective_audio_sample_rate is not None else DEFAULT_AUDIO_SAMPLE_RATE
+    )
     video_frames = _iter_planar_video_frames(
         frames,
         common_dtype,
@@ -827,7 +830,7 @@ def _encode_video_bytes(
             height=frame_shape[0],
             audio_waveform=audio_np,
             fps=float(fps),
-            audio_sample_rate=effective_audio_sample_rate,
+            audio_sample_rate=audio_sample_rate_for_mux,
             video_codec_options=video_codec_options,
         )
     finally:

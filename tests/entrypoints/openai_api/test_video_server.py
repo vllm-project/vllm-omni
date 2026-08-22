@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
 
+import argparse
 import asyncio
 import base64
 import io
@@ -39,6 +40,7 @@ from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -130,15 +132,21 @@ async def test_frame_conversion_workers_are_removed_before_async_omni_constructi
         return FakeEngine()
 
     monkeypatch.setattr(api_server, "AsyncOmni", fake_async_omni)
-    args = SimpleNamespace(
-        model="fake-model",
-        disable_log_stats=False,
-        trust_remote_code=False,
-        get_explicit_kwargs_dict=lambda: {
-            "model": "fake-model",
-            "video_response_frame_conversion_workers": 8,
-            "some_engine_arg": "kept",
-        },
+    args = TrackingNamespace(
+        unfiltered_ns=argparse.Namespace(
+            model="fake-model",
+            video_response_frame_conversion_workers=8,
+            some_engine_arg="kept",
+            disable_log_stats=False,
+            trust_remote_code=False,
+        ),
+        explicit_keys=frozenset(
+            {
+                "model",
+                "video_response_frame_conversion_workers",
+                "some_engine_arg",
+            }
+        ),
     )
 
     async with api_server.build_async_omni_from_stage_config(args) as engine:
