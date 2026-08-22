@@ -190,8 +190,22 @@ class OmniOpenAIServingVideo:
         ):
             target_size = (vp.width, vp.height)
             image_items = input_image if isinstance(input_image, list) else [input_image]
+            def _letterbox(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+                # Scale to fit and pad instead of stretching: a plain resize to
+                # the output canvas distorts reference aspect ratios (e.g. a
+                # landscape identity reference squeezed into a portrait canvas
+                # yields systematically elongated subjects in Ref2VA).
+                tw, th = size
+                scale = min(tw / image.width, th / image.height)
+                nw = max(1, round(image.width * scale))
+                nh = max(1, round(image.height * scale))
+                resized = image.resize((nw, nh), Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", (tw, th), (255, 255, 255))
+                canvas.paste(resized, ((tw - nw) // 2, (th - nh) // 2))
+                return canvas
+
             resized_images = [
-                image.resize(target_size, Image.Resampling.LANCZOS) if image.size != target_size else image
+                _letterbox(image, target_size) if image.size != target_size else image
                 for image in image_items
             ]
             input_image = resized_images if isinstance(input_image, list) else resized_images[0]
