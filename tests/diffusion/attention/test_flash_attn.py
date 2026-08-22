@@ -398,6 +398,47 @@ def _npu_impl(causal: bool = False) -> FlashAttentionImpl:
     return FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
 
 
+@pytest.mark.parametrize(
+    "qkv_layout,input_shape,expected_layout",
+    [
+        (None, (1, 8, 2, 4), "BSND"),
+        ("BSND", (1, 8, 2, 4), "BSND"),
+        ("BNSD", (1, 2, 8, 4), "BNSD"),
+    ],
+)
+def test_npu_fp8_quant_preserves_declared_qkv_layout(monkeypatch, qkv_layout, input_shape, expected_layout):
+    captured = {}
+
+    def fake_fp8_rotate_quant_fa(query, key, value, **kwargs):
+        captured["args"] = (query, key, value)
+        captured["kwargs"] = kwargs
+        return torch.ones_like(query)
+
+    fake_quant = SimpleNamespace(fp8_rotate_quant_fa=fake_fp8_rotate_quant_fa)
+    monkeypatch.setitem(sys.modules, "vllm_omni.platforms.npu.quant.kv_quant_npu", fake_quant)
+
+    impl = FlashAttentionImpl(
+        num_heads=2,
+        head_size=4,
+        softmax_scale=0.5,
+        causal=False,
+        qkv_layout=qkv_layout,
+    )
+    query = torch.randn(input_shape)
+    key = torch.randn(input_shape)
+    value = torch.randn(input_shape)
+
+    out = impl.forward_fa_quant_npu(query, key, value)
+
+    op_query, op_key, op_value = captured["args"]
+    assert op_query is query
+    assert op_key is key
+    assert op_value is value
+    assert captured["kwargs"]["layout"] == expected_layout
+    assert captured["kwargs"]["softmax_scale"] == 0.5
+    assert out.shape == query.shape
+
+
 def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_varlen=None):
     """Install a stub ``mindiesd`` so local ``from mindiesd import ...`` works.
 

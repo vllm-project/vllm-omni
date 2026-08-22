@@ -399,16 +399,14 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
 
-        layout = self.qkv_layout or "BNSD"
-        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
-        out = fp8_rotate_quant_fa(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
+        layout = self.qkv_layout or "BSND"
+        return fp8_rotate_quant_fa(
+            query,
+            key,
+            value,
             layout=layout,
             softmax_scale=self.softmax_scale,
         )
-        return out.transpose(1, 2)
 
     def forward_fa_npu(
         self,

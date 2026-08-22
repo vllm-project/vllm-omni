@@ -10,7 +10,6 @@ the test module itself does not ``import vllm_omni`` (which would pull
 from __future__ import annotations
 
 import importlib.util
-import math
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -98,36 +97,14 @@ class TestKVQuantNPUUnit:
     @pytest.fixture
     def fake_quant_ops(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured: dict[str, Any] = {
-            "fa_calls": [],
-            "mindiesd_kwargs": None,
-            "out_shape": None,
+            "op_args": None,
+            "op_kwargs": None,
         }
 
-        class FakeTorchNPU:
-            float8_e4m3fn = "fp8_marker"
-
-            @staticmethod
-            def npu_fused_infer_attention_score_v2(*args, **kwargs):
-                del args, kwargs
-                raise AssertionError("the removed CANN FP8 per-block FA path must not be called")
-
-        def fake_mindiesd_fused_infer_attention_score_v2(q, k, v, **kwargs):
-            del q, k, v
-            captured["mindiesd_kwargs"] = kwargs
-            out_shape = captured["out_shape"]
-            return (torch.ones(out_shape, dtype=torch.float32), torch.empty(0))
-
-        def fake_fa_block_quant_preprocess(x, block_size, dst_type, layout):
-            captured["fa_calls"].append(
-                {
-                    "block_size": block_size,
-                    "layout": layout,
-                    "dst_type": dst_type,
-                    "shape": tuple(x.shape),
-                }
-            )
-            scale = torch.full((1,), float(block_size), dtype=torch.float32)
-            return x, scale
+        def fake_fp8_op(q, k, v, **kwargs):
+            captured["op_args"] = (q, k, v)
+            captured["op_kwargs"] = kwargs
+            return torch.ones_like(q)
 
         fake_qua_rot_mode = SimpleNamespace(HADAMARD="hadamard")
 
@@ -138,14 +115,8 @@ class TestKVQuantNPUUnit:
 
         monkeypatch.setattr(
             kv_quant_npu,
-            "_load_quant_ops",
-            lambda: (
-                FakeTorchNPU,
-                fake_fa_block_quant_preprocess,
-                fake_mindiesd_fused_infer_attention_score_v2,
-                fake_qua_rot_mode,
-                fake_create_rot,
-            ),
+            "_load_sd_ops",
+            lambda: (fake_fp8_op, fake_qua_rot_mode, fake_create_rot),
         )
 
         return captured
@@ -158,41 +129,41 @@ class TestKVQuantNPUUnit:
         return query, key, value
 
     @pytest.mark.parametrize(
-        "layout,input_shape,out_shape,softmax_scale,expected_scale",
+        "layout,input_shape,softmax_scale",
         [
-            ("BNSD", (2, 3, 4, 8), (2, 3, 6, 8), None, 1.0 / math.sqrt(8)),
-            # MindIE-SD block preprocessing normalizes BSND input to BNSD.
-            ("BSND", (2, 4, 3, 8), (2, 3, 6, 8), 0.125, 0.125),
+            ("BNSD", (2, 3, 4, 8), None),
+            ("BSND", (2, 4, 3, 8), 0.125),
         ],
     )
-    def test_fp8_rotate_quant_fa_layouts_scale_and_crop(
+    def test_fp8_rotate_quant_fa_forwards_layout_scale_and_rotation(
         self,
         fake_quant_ops: dict[str, Any],
         layout: str,
         input_shape: tuple[int, int, int, int],
-        out_shape: tuple[int, int, int, int],
         softmax_scale: float | None,
-        expected_scale: float,
     ) -> None:
         query, key, value = self._make_qkv(input_shape)
-        fake_quant_ops["out_shape"] = out_shape
 
         out = kv_quant_npu.fp8_rotate_quant_fa(query, key, value, layout=layout, softmax_scale=softmax_scale)
 
         assert out.shape == query.shape
         assert out.dtype == query.dtype
-        assert fake_quant_ops["mindiesd_kwargs"]["input_layout"] == "BNSD"
-        # BNSD: shape[1]==heads, BSND: shape[2]==heads.
-        expected_heads = input_shape[1] if layout == "BNSD" else input_shape[2]
-        assert fake_quant_ops["mindiesd_kwargs"]["num_query_heads"] == expected_heads
-        assert fake_quant_ops["mindiesd_kwargs"]["softmax_scale"] == pytest.approx(expected_scale)
-        assert [call["block_size"] for call in fake_quant_ops["fa_calls"]] == [128, 256, 256]
+        op_query, op_key, op_value = fake_quant_ops["op_args"]
+        assert op_query is query
+        assert op_key is key
+        assert op_value is value
+        assert fake_quant_ops["op_kwargs"]["layout"] == layout
+        assert fake_quant_ops["op_kwargs"]["softmax_scale"] == softmax_scale
+        q_rot = fake_quant_ops["op_kwargs"]["q_rot"]
+        k_rot = fake_quant_ops["op_kwargs"]["k_rot"]
+        assert q_rot is k_rot
+        assert q_rot.shape == (input_shape[-1], input_shape[-1])
+        assert q_rot.dtype == query.dtype
 
     def test_fp8_rotate_quant_fa_invalid_layout_raises(self, fake_quant_ops) -> None:
         query = torch.randn(1, 2, 3, 4, dtype=torch.float32)
         key = torch.randn(1, 2, 3, 4, dtype=torch.float32)
         value = torch.randn(1, 2, 3, 4, dtype=torch.float32)
-        fake_quant_ops["out_shape"] = (1, 2, 3, 4)
 
         with pytest.raises(ValueError, match="unsupported layout"):
             kv_quant_npu.fp8_rotate_quant_fa(query, key, value, layout="INVALID")
@@ -204,8 +175,8 @@ class TestKVQuantNPUSmoke:
 
     def test_fp8_rotate_quant_fa_real_npu_shape_contract(self):
         try:
-            kv_quant_npu._load_quant_ops.cache_clear()
-            kv_quant_npu._load_quant_ops()
+            kv_quant_npu._load_sd_ops.cache_clear()
+            kv_quant_npu._load_sd_ops()
         except ImportError:
             pytest.skip("NPU quant dependencies are not fully installed.")
 
