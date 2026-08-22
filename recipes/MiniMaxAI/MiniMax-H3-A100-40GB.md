@@ -4,9 +4,10 @@ This recipe covers MiniMax-H3 FL2VA/Ref2VA serving on **NVIDIA A100-SXM4-40GB**
 (sm80, 40 GiB per GPU). Two validated paths are provided:
 
 - **TP4 + CPU offload** — the simplest path; the whole checkpoint streams
-  through host memory, so per-GPU HBM stays at ~22 GiB for a synthetic
-  reference and ~37.5 GiB for the official reference (with audio) under the
-  reference-KV cache.
+  through host memory, so per-GPU HBM stays at ~22 GiB with the official
+  reference (with audio) under the reference-KV cache. (A larger synthetic
+  reference was measured at the same ~22 GiB; the worker-aggregated torch
+  peak reported by the API was ~31 GiB for the official-reference run.)
 - **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
   layer; per-GPU HBM drops to ~11-14 GiB at the cost of wall-clock time.
 
@@ -53,8 +54,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
 
 For Ref2VA, stop the server and restart with `/path/to/MiniMax-H3/Ref2VA`.
 With the official reference video (1344x768, includes an audio reference) the
-per-GPU peak rises to ~37.5 GiB when the reference-KV cache is active — still
-within 40 GiB, but leave headroom for longer prompts or more references.
+live per-GPU peak was ~22.3 GiB (nvidia-smi) during the 480x256/96-frame run —
+within 40 GiB with headroom for longer prompts or more references. The
+worker-aggregated torch peak reported by the API (`peak_memory_mb`) was
+~31 GiB for the same run; this is a process-aggregate metric, not a per-GPU
+figure.
 
 ## Four A100-40GB: DLO rank-local (lower HBM)
 
