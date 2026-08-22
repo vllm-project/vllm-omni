@@ -415,6 +415,19 @@ def _disk_marks_serialized(qc_kwargs: dict[str, Any], quant_config: object) -> b
     return False
 
 
+def _rebuild_from_disk(qc_method: str, qc_kwargs: dict[str, Any]) -> QuantizationConfig | None:
+    """Rebuild a config from a checkpoint's ``quantization_config``.
+
+    The dict has to reach :func:`build_quant_config` as a mapping, not as a
+    method name plus keyword arguments. ModelOpt detection -- which reads
+    ``quant_algo`` / ``producer`` to tell NVFP4 from FP8 -- only runs on the
+    mapping branch, so splitting them selects the class by ``quant_method``
+    alone. Every ModelOpt export writes ``quant_method: "modelopt"`` whatever
+    its algorithm, so an NVFP4 checkpoint was being built as FP8.
+    """
+    return build_quant_config({"quant_method": qc_method, **qc_kwargs})
+
+
 def resolve_quant_config_from_disk(
     quant_config: QuantizationConfig | None,
     disk_qc: dict[str, Any] | str | None,
@@ -452,10 +465,16 @@ def resolve_quant_config_from_disk(
             qc_method,
             qc_kwargs,
         )
-        return build_quant_config(qc_method, **qc_kwargs)
+        return _rebuild_from_disk(qc_method, qc_kwargs)
 
     active_method = _normalize_quant_method_alias(quant_config.get_name())
-    disk_method = _normalize_quant_method_alias(qc_method)
+    # Resolve the disk method the same way the builder would. A ModelOpt export
+    # always writes quant_method="modelopt" and names its algorithm in
+    # quant_algo, so comparing quant_method alone reports a config built from
+    # this very checkpoint as a mismatch against it.
+    disk_method = _normalize_quant_method_alias(
+        _detect_modelopt_method({"quant_method": qc_method, **qc_kwargs}) or qc_method
+    )
     if active_method != disk_method:
         raise ValueError(
             f"Checkpoint config.json declares quant_method={qc_method!r} but the "
@@ -468,13 +487,13 @@ def resolve_quant_config_from_disk(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
             qc_method,
         )
-        return build_quant_config(qc_method, **qc_kwargs)
+        return _rebuild_from_disk(qc_method, qc_kwargs)
 
     # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
     # is_checkpoint_*_serialized; rebuild so the offline path is selected.
     if qc_kwargs.get("data_type") == "mx_fp":
         logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
-        return build_quant_config(qc_method, **qc_kwargs)
+        return _rebuild_from_disk(qc_method, qc_kwargs)
 
     if (
         "ignored_layers" in qc_kwargs
@@ -482,6 +501,6 @@ def resolve_quant_config_from_disk(
         and set(qc_kwargs.get("ignored_layers") or []) != set(quant_config.ignored_layers or [])
     ):
         logger.info("config.json ignored_layers differs from active config; rebuilding quant_config.")
-        return build_quant_config(qc_method, **qc_kwargs)
+        return _rebuild_from_disk(qc_method, qc_kwargs)
 
     return quant_config
