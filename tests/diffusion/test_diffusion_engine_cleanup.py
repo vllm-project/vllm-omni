@@ -400,8 +400,6 @@ def test_fail_engine_does_not_reenter_when_executor_shutdown_fails() -> None:
     assert engine._closed is True
     assert engine._shutting_down is True
     assert engine._shutdown_complete is False
-
-
 def test_finalize_aborted_request_drops_pending_async_output() -> None:
     """An aborted request with a pending async output must be drained (#6413).
 
