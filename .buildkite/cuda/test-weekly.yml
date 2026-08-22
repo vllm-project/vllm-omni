@@ -56,6 +56,37 @@ steps:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
         mirror_hardwares: l4_1
 
+  - group: "Perf Test"
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+
+      - label: ":full_moon: Omni · Perf Test · vLLM Text"
+        key: weekly-omni-performance-vllm-text
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_2
+
+      - label: ":full_moon: Omni · Perf Test · Multi-Replica"
+        key: weekly-omni-performance-multi-replicas
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_3
+
   - group: ":card_index_dividers: E2E Tests"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1"

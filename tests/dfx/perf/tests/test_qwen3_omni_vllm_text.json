@@ -10,7 +10,7 @@
           "num_cards": 2
         }
       },
-      "full_model",
+      "slow",
       "omni"
     ],
     "server_params": {

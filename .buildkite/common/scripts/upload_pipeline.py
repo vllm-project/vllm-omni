@@ -134,15 +134,17 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
             'build.pull_request.labels includes "diffusion-x2v-test"'
             "))"
         )
+        # TEMP DEBUG (revert before merge): allow WEEKLY/NON_CRITICAL without
+        # build.branch == "main" so PR rebuilds can upload L5 with env vars.
         weekly_label_if = (
-            '(build.branch == "main" && '
-            '(build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")) || '
+            '(build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1") || '
             '(build.branch != "main" && build.pull_request.labels includes "weekly-test")'
         )
         merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
 
     ready_base = f"({nightly_main}) || ({ready_pr})"
-    weekly_main = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
+    # TEMP DEBUG (revert before merge): drop main-only gate for scheduled weekly env.
+    weekly_main = 'build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1"'
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
