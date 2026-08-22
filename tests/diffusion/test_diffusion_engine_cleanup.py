@@ -380,6 +380,7 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
 
+
 def test_finalize_aborted_request_drops_pending_async_output() -> None:
     """An aborted request with a pending async output must be drained (#6413).
 
