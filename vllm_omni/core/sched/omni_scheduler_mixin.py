@@ -25,7 +25,10 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    OmniSchedulingCoordinator,
+    uses_full_payload_input_coordinator,
+)
 from vllm_omni.core.sched.output import (
     OmniChunkRecvHandle,
     OmniNewRequestData,
@@ -105,14 +108,9 @@ class OmniSchedulerMixin:
         self.chunk_transfer_adapter = (
             OmniChunkTransferAdapter(self.vllm_config) if getattr(model_config, "async_chunk", False) else None
         )
-        uses_full_payload_input = bool(
-            getattr(model_config, "stage_id", 0) > 0
-            and not getattr(model_config, "async_chunk", False)
-            and getattr(model_config, "requires_full_payload_input", False)
-        )
         self.input_coordinator = (
             OmniSchedulingCoordinator(stage_id=getattr(model_config, "stage_id", 0))
-            if uses_full_payload_input
+            if uses_full_payload_input_coordinator(model_config)
             else None
         )
         self._latest_omni_connector_output = None

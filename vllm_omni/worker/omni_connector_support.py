@@ -26,9 +26,7 @@ def validate_worker_omni_connector(
         OmniConnectorModelRunnerMixin,
     ):
         worker_name = getattr(worker_cls, "__name__", str(worker_cls_path))
-        raise ValueError(
-            f"Worker {worker_name!r} does not provide an Omni connector model runner."
-        )
+        raise ValueError(f"Worker {worker_name!r} does not provide an Omni connector model runner.")
 
 
 def _resolve_worker_cls(worker_cls_path: str | type[Any]) -> type[Any]:
@@ -36,13 +34,9 @@ def _resolve_worker_cls(worker_cls_path: str | type[Any]) -> type[Any]:
         return worker_cls_path
     module_path, separator, class_name = worker_cls_path.rpartition(".")
     if not separator:
-        raise ValueError(
-            f"worker_cls must be a fully qualified class path, got {worker_cls_path!r}."
-        )
+        raise ValueError(f"worker_cls must be a fully qualified class path, got {worker_cls_path!r}.")
     try:
         worker_module = importlib.import_module(module_path)
         return getattr(worker_module, class_name)
     except (ImportError, AttributeError) as exc:
-        raise ValueError(
-            f"Unable to resolve worker_cls {worker_cls_path!r} for connector validation."
-        ) from exc
+        raise ValueError(f"Unable to resolve worker_cls {worker_cls_path!r} for connector validation.") from exc

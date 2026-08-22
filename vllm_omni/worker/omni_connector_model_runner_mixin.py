@@ -54,7 +54,6 @@ def needs_omni_connector(model_config: Any) -> bool:
     return (
         bool(getattr(model_config, "requires_full_payload_input", False))
         or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
-        or bool(getattr(model_config, "omni_kv_config", None))
         or get_stage_connector_role(model_config) is not None
     )
 

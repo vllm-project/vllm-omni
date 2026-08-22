@@ -238,20 +238,18 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        connector_extra = self.stage_connector_spec.get("extra")
-        connector_role = connector_extra.get("role") if isinstance(connector_extra, dict) else None
-        needs_connector = bool(
-            self.requires_full_payload_input
-            or self.custom_process_next_stage_input_func
-            or self.omni_kv_config
-            or connector_role is not None
-        )
         if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
+
+        connector_extra = self.stage_connector_spec.get("extra")
+        connector_role = connector_extra.get("role") if isinstance(connector_extra, dict) else None
+        needs_connector = bool(
+            self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
+        )
         validate_worker_omni_connector(self.worker_cls, needs_connector)
         super().__post_init__()
 

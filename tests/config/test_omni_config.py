@@ -244,23 +244,34 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
-def test_from_pipeline_config_pipeline_owns_full_payload_input_capability():
+@pytest.mark.parametrize(
+    ("engine_extras", "cli_overrides"),
+    [
+        ({"requires_full_payload_input": False}, {}),
+        ({}, {"stage_1_requires_full_payload_input": False}),
+    ],
+    ids=["deploy", "stage-cli"],
+)
+def test_from_pipeline_config_rejects_full_payload_input_capability_overrides(
+    engine_extras,
+    cli_overrides,
+):
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     deploy = DeployConfig(
         stages=[
             StageDeployConfig(
                 stage_id=1,
-                engine_extras={"requires_full_payload_input": False},
+                engine_extras=engine_extras,
             )
         ]
     )
 
-    config = VllmOmniConfig.from_pipeline_config(
-        pipeline,
-        user_deploy_config=deploy,
-        cli_overrides={"stage_1_requires_full_payload_input": False},
-    )
-    assert config.stage_by_id(1).model_config.requires_full_payload_input is True
+    with pytest.raises(ValueError, match=r"no structured config owner: requires_full_payload_input"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            cli_overrides=cli_overrides,
+        )
 
 
 @pytest.mark.parametrize(
@@ -588,6 +599,7 @@ def test_sub_config_fields_match_structured_scopes():
         # legacy engine-args path.
         "model_subdir",
         "tokenizer_subdir",
+        "requires_full_payload_input",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

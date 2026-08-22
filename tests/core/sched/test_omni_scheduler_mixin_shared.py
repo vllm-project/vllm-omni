@@ -66,9 +66,7 @@ def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_rec
         (1, False, True, True),
     ],
 )
-def test_full_payload_coordinator_matches_legacy_gate(
-    monkeypatch, stage_id, async_chunk, required, enabled
-):
+def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, async_chunk, required, enabled):
     monkeypatch.setattr(
         omni_scheduler_mixin,
         "OmniChunkTransferAdapter",
@@ -129,7 +127,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         ("process", scheduler.waiting, scheduler.running, scheduler.requests),
         # The chunk deadline runs after chunks are applied, so a chunk that
         # arrived this cycle resets the clock before it is measured (R1.1).
-        ("chunk-timeouts", DEFAULT_INPUT_WAIT_TIMEOUT_S),
+        ("chunk-timeouts", omni_scheduler_mixin.DEFAULT_INPUT_WAIT_TIMEOUT_S),
         ("failed-sends",),
         ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
         ("restore-full", scheduler.waiting),

@@ -141,7 +141,7 @@ def test_full_payload_capability_validates_platform_selected_worker(monkeypatch)
         )
 
 
-def test_multimodal_kwarg_overrides(mocker):
+def test_multimodal_kwarg_overrides(monkeypatch):
     """Ensure that overrides in the multimodal config are preserved."""
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
@@ -155,8 +155,8 @@ def test_multimodal_kwarg_overrides(mocker):
         assert self.mm_processor_cache_gb == override_val
         return fake_model_config
 
-    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
-    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+    monkeypatch.setattr(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    monkeypatch.setattr(OmniModelConfig, "from_vllm_model_config", lambda model_config, **_: model_config)
 
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
