@@ -167,7 +167,7 @@ Failed jobs: 1/2
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
     pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
-    Nightly **Perf Test** jobs in ``test-nightly.yml`` use ``--test-config-file`` only (no ``-m``). E2e L4 function tests still use ``full_model`` + ``--run-level full_model`` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml)). Example:
+    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
 === "L5 level"
 
@@ -195,7 +195,7 @@ Failed jobs: 1/2
 
     The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
 
-    - **Reliability** (+ invalid-parameter) and **Simple · CPU Coverage Test** → `WEEKLY=1` (CPU coverage also requires `main`)
+    - **Reliability** (+ invalid-parameter), **Perf Test** (Omni vLLM Text / Multi-Replica), and **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Scheduled upload of those env-gated steps still requires `main`.
     - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)
 
 You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).

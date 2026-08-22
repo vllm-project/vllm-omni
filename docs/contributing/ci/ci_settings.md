@@ -85,7 +85,7 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 
     On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
-    - **Reliability** / **Simple · CPU Coverage Test** → `WEEKLY=1` (coverage also requires `main`)
+    - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires `main`.
     - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
 
     **`--e2e`:** when uploading ready/merge on `main` with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
@@ -118,6 +118,8 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3 and A3 CI images, then uploads child test pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
+
+    **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -217,7 +219,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
+**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -341,15 +343,9 @@ per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS 
 Test". Coverage + artifact upload run only when bootstrap uploaded that job with
 `--e2e` (`WEEKLY=1` and `BUILDKITE_BRANCH=main`, via `run_cov_split.sh`); otherwise
 the same job runs plain pytest without `--cov`. It runs on a single GPU so the
-pilot is cheap to reproduce. (A second diffusion pilot, "Diffusion · Bagel Test",
-was retired from merge; reintroduce another diffusion coverage job if a second
-pilot is needed again.) This is a pilot, not a rollout: no dashboard/visualization
-lives in this repo, and nothing is gated on coverage.
+pilot is cheap to reproduce.
 
-**L1 package coverage (CPU):** ready/merge Simple Test jobs no longer pass
-`--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage
-Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` +
-Cobertura XML artifact).
+**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under
