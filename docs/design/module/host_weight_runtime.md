@@ -56,7 +56,8 @@ The contracts have deliberately narrow ownership:
 
 - `HostWeightRuntime` applies resolution and fallback policy and emits one
   terminal resolution report. Explicit post-load publication emits a separate
-  report and may return a lease, but does not revise the completed resolution.
+  report and closes its store-returned lease before returning; it does not
+  revise the completed resolution.
   The runtime does not own a model or call the canonical loader.
 - `HostWeightStore` owns artifact lookup, coordinated construction,
   publication, validation, quarantine, and lifecycle.
