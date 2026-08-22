@@ -47,7 +47,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
 
@@ -406,7 +406,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        request_metadata: dict[str, dict[str, Any]] = {}
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
         chunk_ready_req_ids: set[str] = set()
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
@@ -426,7 +426,6 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             input_coordinator.update_request_metadata(
                 self.requests,
                 request_metadata,
-                model_mode=model_mode,
             )
         if input_coordinator._async_chunk:
             input_coordinator.process_pending_chunks(

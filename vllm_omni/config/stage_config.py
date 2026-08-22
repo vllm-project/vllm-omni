@@ -287,6 +287,9 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Optional model-owned adapter for runner payload metadata that affects
+    # scheduling. The scheduler only receives its typed effects.
+    scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1077,6 +1080,7 @@ def _build_engine_args(
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in PIPELINE_WIDE_ENGINE_FIELDS:
