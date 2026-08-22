@@ -166,7 +166,7 @@ steps:
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_WORKER_MULTIPROC_METHOD="spawn"
-          - test -d /opt/Amphion || { echo 'ERROR: /opt/Amphion not found; the Vevo2 lane requires Amphion pre-cloned into the CI image.' >&2; exit 1; }
+          - "test -d /opt/Amphion || { echo 'ERROR: /opt/Amphion not found; the Vevo2 lane requires Amphion pre-cloned into the CI image.' >&2; exit 1; }"
           - export PYTHONPATH="/opt/Amphion:${PYTHONPATH:-}"
           - export VEVO2_MODEL_PATH="${VEVO2_MODEL_PATH:-/fsx/hf_cache/vevo2_ckpt/Vevo2}"
           - |
