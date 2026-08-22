@@ -197,7 +197,7 @@ The resident count changes placement and transfer frequency only; it does not
 quantize or change the BF16/FP32 denoise math. Re-measure peak memory before
 increasing it on a different request shape.
 
-For non-DLO deployments on 40 GB cards (TP4 + CPU offload, or DLO rank-local),
+For A100-SXM4-40GB (sm80) deployments — TP4 + CPU offload or rank-local DLO —
 see [MiniMax-H3-A100-40GB.md](MiniMax-H3-A100-40GB.md).
 
 ### RTX 5090 target-hardware validation

@@ -1,15 +1,18 @@
 # MiniMax-H3 on A100-SXM4-40GB
 
 This recipe covers MiniMax-H3 FL2VA/Ref2VA serving on **NVIDIA A100-SXM4-40GB**
-(sm80, 40 GiB per GPU). Two validated paths are provided:
+(sm80, 40 GiB per GPU). Two paths are provided: the TP4 + CPU offload path is
+the fully validated one, and the DLO path is startup/partial-run validated
+(see the DLO section for its status):
 
 - **TP4 + CPU offload** — the simplest path; the whole checkpoint streams
-  through host memory, so per-GPU HBM stays at ~22 GiB with the official
-  reference (with audio) under the reference-KV cache. (A larger synthetic
-  reference was measured at the same ~22 GiB; the worker-aggregated torch
-  peak reported by the API was ~31 GiB for the official-reference run.)
+  through host memory, so per-GPU HBM stays at ~22 GiB (official reference with
+  audio, reference-KV cache active; a synthetic reference measured the same
+  ~22 GiB). The worker-aggregated torch peak reported by the API was ~31 GiB
+  for the official-reference run.
 - **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
-  layer; per-GPU HBM drops to ~11-14 GiB at the cost of wall-clock time.
+  layer from host memory; per-GPU HBM after loading is ~3.1 GiB, at the cost of
+  wall-clock time.
 
 A100 is sm80: **NVFP4 and hardware FP8 paths are unavailable** (FP8 tensor
 cores require sm89+), so use BF16 throughout. The text encoder (Qwen3-VL) and
@@ -22,20 +25,35 @@ at a time, or use the combined FL2VA + Ref2VA layout from the main recipe.
 | --- | ---: | ---: |
 | GPU HBM | 40 GiB per GPU | 40 GiB per GPU |
 | Checkpoint storage | 135 GiB per partition | 135 GiB per partition |
-| Available system RAM | 150 GiB minimum | 100 GiB minimum |
+| Available system RAM | 150 GiB minimum | 150 GiB minimum |
 | Recommended system RAM | 384 GiB | 384 GiB |
 
 `FL2VA` and `Ref2VA` are separate ~135 GiB checkpoint partitions. Host RAM
 matters most for the CPU-offload path: the entire active partition (weights +
-pinned staging) lives in host memory. DLO keeps rank-local weights in pinned
-host memory as well.
+pinned staging) lives in host memory. The DLO path uses TP1 rank-local mmap
+([#6213](https://github.com/vllm-project/vllm-omni/pull/6213)): the four DP
+replicas share the checkpoint's OS page cache on one node instead of holding
+four private copies, and each worker keeps only two bounded pinned staging
+slots. The 150 GiB minimum for the DLO column is an estimate based on that
+shared-mmap layout (checkpoint pages + staging); it was not stress-measured
+(see the DLO section's validation note) — size for ~135 GiB of checkpoint pages
+plus staging, or measure your own footprint.
 
 ## Four A100-40GB: TP4 + CPU offload (480x256, 4 seconds)
 
-Use TP4 with model-level CPU offload. This is the same mechanism as the
-4xL40S report in [issue #5700][l40s-comment]: per-GPU HBM peaks at ~22 GiB
+Use TP4 with model-level CPU offload (`--enable-cpu-offload`, the same
+sequential-offload mechanism as the 4×L40S report in [issue #5700][l40s-comment],
+minus that report's vLLM-core offload flags, which are no-ops for diffusion —
+see the note below the command): per-GPU HBM peaks at ~22 GiB
 (BF16, synthetic 4s reference) and the request completes in roughly
 300-370 s for 50 denoising steps at 480x256 (machine-load dependent).
+
+`--vae-patch-parallel-size 4` is safe on current main: the 4×L40S report
+warned about `ValueError: Found empty tasks on sp rank 3` when decoder tiles
+are fewer than ranks, but that was fixed by
+[#6345](https://github.com/vllm-project/vllm-omni/pull/6345) (rank-local tiling
+fallback), which is present in the recipe's base. The 480x256 runs below
+exercise exactly this path.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -46,11 +64,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
   --num-gpus 4 --tensor-parallel-size 4 --text-encoder-tp-size 4 \
   --usp 1 --ring 1 --vae-patch-parallel-size 4 \
   --vae-parallel-mode tile --vae-use-tiling \
-  --enable-cpu-offload --cpu-offload-gb 50 \
-  --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 1 \
+  --enable-cpu-offload \
   --enforce-eager \
   --diffusion-attention-backend CUDNN_ATTN
 ```
+
+> The vLLM-core flags `--cpu-offload-gb`, `--offload-group-size`,
+> `--offload-num-in-group`, and `--offload-prefetch-step` are **no-ops for
+> diffusion models** — they configure the autoregressive offloaders in
+> `vllm/config/offload.py`, which `vllm_omni` never reads. MiniMax-H3's CPU
+> offload is driven solely by `--enable-cpu-offload`
+> (`enable_omni_model_cpu_offload` → `apply_sequential_offload`). The 4×L40S
+> report in #5700 attributed its low VRAM to that flag combo, but the memory
+> savings there also came from `--enable-cpu-offload`; the extra flags only
+> emitted a vLLM-core warning (`offload_backend="auto"` with both UVA and
+> prefetch fields set).
 
 For Ref2VA, stop the server and restart with `/path/to/MiniMax-H3/Ref2VA`.
 With the official reference video (1344x768, includes an audio reference) the
@@ -63,8 +91,18 @@ figure.
 ## Four A100-40GB: DLO rank-local (lower HBM)
 
 If HBM headroom is needed (e.g. co-tenant workloads), the rank-local DLO path
-peaks at ~11-14 GiB per GPU. It is slower per step because every denoising
-step streams non-resident DiT blocks over NVLink/PCIe.
+starts at ~3.1 GiB per GPU after model loading (all weights stay in host
+memory / shared page cache) and streams DiT blocks per denoising step. It is
+slower per step because every denoising step streams non-resident DiT blocks
+over NVLink/PCIe.
+
+> **Validation status:** the DLO command below was verified to start, load,
+> and run the first denoising steps without error on this node, but a full
+> 50-step request was **not** completed during validation (an early attempt
+> OOM'd in an activation layer, and the later run was stopped at step 10 of
+> 49). Treat the DLO row in the capacity table as a startup/partial-run
+> measurement and re-validate end-to-end before production use. The TP4 +
+> CPU-offload path above is the fully validated one.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -80,12 +118,27 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve /path/to/MiniMax-H3/FL2VA \
   --diffusion-attention-backend CUDNN_ATTN
 ```
 
-## Eight A100-40GB
+This is the official TP1 rank-local DLO topology
+([docs](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/offloader/distributed_layerwise_offload.md)):
+`--data-parallel-size 4` with `--dlo-no-use-allgather` runs four independent DP
+replicas, each streaming complete rank-local blocks. On current main the
+loader's direct-checkpoint mmap plan (`checkpoint_mmap`) is supported for TP1:
+the four replicas map the same checkpoint file, sharing the OS page cache, so
+this is **not** four private 135 GiB copies. Each worker keeps only two bounded
+pinned staging slots (`distributed_layerwise_backend.py` logs "checkpoint pages
+are node-shared; each worker owns only two bounded host staging slots"). The
+four replicas also give request-level concurrency for independent requests;
+this is the rank-local DP routing shape from
+[#5911](https://github.com/vllm-project/vllm-omni/issues/5911).
 
-TP8 was not measured in this recipe (the validating node had a co-tenant GPU).
-TP8 with the same CPU-offload flags is expected to fit (weights shard across
-eight ranks, so per-GPU weight peak is lower than TP4), but re-measure peak
-HBM before trusting it for production.
+## Eight A100-40GB (not measured)
+
+Both commands above use **4 of the 8 GPUs** on the testing node
+(`CUDA_VISIBLE_DEVICES=0,1,2,3`; the node had a co-tenant GPU, so TP8 was not
+exercised). TP8 with the same offload flags is *expected* to fit — weights
+shard across eight ranks, so per-GPU weight peak is lower than TP4 — but treat
+the 8-GPU row as an estimate and re-measure peak HBM before trusting it for
+production.
 
 ## Notes
 
