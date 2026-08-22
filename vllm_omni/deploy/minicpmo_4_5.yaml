@@ -103,3 +103,10 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      # Execution-efficiency candidate: Code2Wav (CFM + HiFT) previously ran
+      # fully eager while Thinker/Talker used piecewise graphs. Same math,
+      # graph-captured dispatch. Must re-pass accuracy gates before submission.
+      - stage_id: 2
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
