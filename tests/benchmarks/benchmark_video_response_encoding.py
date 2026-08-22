@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark legacy and automatic MP4 response encoding on synthetic input."""
+"""Benchmark legacy and planar MP4 response encoding on synthetic input."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import hashlib
 import json
 import statistics
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from vllm_omni.entrypoints.openai.video_api_utils import (
+    MAX_FRAME_CONVERSION_WORKERS,
     _encode_video_bytes,
     _encode_video_bytes_legacy,
 )
@@ -24,13 +24,20 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
 @dataclass(frozen=True)
 class BenchmarkVariant:
     label: str
-    encoder: Callable[..., bytes]
+    frame_conversion_workers: int | None
 
 
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def _worker_count(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MAX_FRAME_CONVERSION_WORKERS:
+        raise argparse.ArgumentTypeError(f"worker count must not exceed {MAX_FRAME_CONVERSION_WORKERS}")
     return parsed
 
 
@@ -66,12 +73,18 @@ def _measure(
 ) -> tuple[bytes, dict[str, object]]:
     cpu_start = time.process_time_ns()
     wall_start = time.perf_counter_ns()
-    output = variant.encoder(
+    encoder = _encode_video_bytes if variant.frame_conversion_workers is not None else _encode_video_bytes_legacy
+    kwargs = {
+        "fps": fps,
+        "audio": audio,
+        "audio_sample_rate": audio_sample_rate,
+        "video_codec_options": {"preset": "ultrafast", "threads": "0"},
+    }
+    if variant.frame_conversion_workers is not None:
+        kwargs["frame_conversion_workers"] = variant.frame_conversion_workers
+    output = encoder(
         video,
-        fps=fps,
-        audio=audio,
-        audio_sample_rate=audio_sample_rate,
-        video_codec_options={"preset": "ultrafast", "threads": "0"},
+        **kwargs,
     )
     wall_ms = (time.perf_counter_ns() - wall_start) / 1_000_000
     process_cpu_ms = (time.process_time_ns() - cpu_start) / 1_000_000
@@ -105,6 +118,8 @@ def _summarize(records: list[dict[str, object]], label: str) -> dict[str, object
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--comparison", choices=("legacy-vs-direct", "workers"), default="workers")
+    parser.add_argument("--workers", type=_worker_count, default=8)
     parser.add_argument("--frames", type=_positive_int, default=12)
     parser.add_argument("--height", type=_positive_int, default=96)
     parser.add_argument("--width", type=_positive_int, default=160)
@@ -120,6 +135,22 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _variants(comparison: str, workers: int) -> tuple[BenchmarkVariant, BenchmarkVariant]:
+    serial_label = "direct-1-worker" if workers != 1 else "direct-1-worker-baseline"
+    serial = BenchmarkVariant(serial_label, 1)
+    if comparison == "legacy-vs-direct":
+        return BenchmarkVariant("legacy-reference", None), BenchmarkVariant(f"direct-{workers}-workers", workers)
+    return serial, BenchmarkVariant(f"direct-{workers}-workers", workers)
+
+
+def _variant_metadata(variant: BenchmarkVariant) -> dict[str, object]:
+    return {
+        "label": variant.label,
+        "path": "legacy_fallback" if variant.frame_conversion_workers is None else "direct_planar",
+        "frame_conversion_workers": variant.frame_conversion_workers,
+    }
+
+
 def main() -> None:
     args = _parse_args()
     video, audio = _build_inputs(
@@ -130,8 +161,7 @@ def main() -> None:
         audio_sample_rate=args.audio_sample_rate,
         seed=args.seed,
     )
-    baseline = BenchmarkVariant("legacy", _encode_video_bytes_legacy)
-    candidate = BenchmarkVariant("automatic", _encode_video_bytes)
+    baseline, candidate = _variants(args.comparison, args.workers)
 
     for _ in range(args.warmup):
         for variant in (baseline, candidate):
@@ -172,6 +202,11 @@ def main() -> None:
 
     result = {
         "config": {
+            "comparison": args.comparison,
+            "variants": {
+                "baseline": _variant_metadata(baseline),
+                "candidate": _variant_metadata(candidate),
+            },
             "frames": args.frames,
             "height": args.height,
             "width": args.width,

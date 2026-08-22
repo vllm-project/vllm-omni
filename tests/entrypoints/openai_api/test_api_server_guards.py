@@ -710,6 +710,13 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
 
         return _factory
 
+    video_factory_kwargs = []
+
+    @classmethod
+    def _video_for_diffusion(cls, *args, **kwargs):
+        video_factory_kwargs.append(kwargs)
+        return _marker("video")
+
     monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -718,7 +725,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         "for_diffusion",
         _for_diffusion_factory("audio_generate"),
     )
-    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
+    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _video_for_diffusion)
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
     monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _for_diffusion_factory("speech"))
     monkeypatch.setattr(
@@ -728,7 +735,11 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(video_response_frame_conversion_workers=8),
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -737,6 +748,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    assert video_factory_kwargs[0]["video_response_frame_conversion_workers"] == 8
 
 
 @pytest.mark.asyncio
@@ -774,6 +786,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         async def warmup(self):
             return None
 
+    video_constructor_kwargs = {}
+
+    class _FakeVideo(_FakeCtor):
+        def __init__(self, *args, **kwargs):
+            video_constructor_kwargs.update(kwargs)
+
     monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
@@ -796,11 +814,15 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeVideo)
     monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(video_response_frame_conversion_workers=4),
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -808,3 +830,4 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
         must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
         must_be_none=_MULTISTAGE_MUST_BE_NONE,
     )
+    assert video_constructor_kwargs["video_response_frame_conversion_workers"] == 4

@@ -118,20 +118,108 @@ On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
 above) or HSDP — see
 [§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
 
-### CPU MP4 response encoding (Atlas A2)
+### CPU MP4 response encoding: MiniMax-H3 FL2VA/t2va (Atlas A2)
 
-Non-streaming MP4 responses use one public automatic encoder. It checks the
-runtime frame shape, common dtype, and RGB channel-plane contiguity for every
-request; compatible inputs use direct planar PyAV frames, while unsupported
-inputs fall back to the legacy muxer before opening the PyAV container. No CLI
-flag, model declaration, or user configuration is required. Streaming fMP4
-output remains on its existing incremental path.
+This section documents the validated CPU response-encoding behavior for
+MiniMax-H3 `FL2VA`/`t2va` on one Atlas A2 host. The implementation itself is
+capability-based and has no model whitelist; other models and platforms have
+not been tested by this change and have no compatibility or performance claim.
 
-Current performance and correctness validation is limited to one Atlas A2 host
-with 8x Ascend 910B4-1 NPUs, the `FL2VA`/`t2va` partition, one request at a
-time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
-only changes CPU MP4 response encoding; it does not change DiT execution or
-stage 0.
+Non-streaming MP4 responses use an automatic encoder. It checks the runtime
+frame shape, common dtype, and RGB channel-plane contiguity for every request.
+Compatible inputs use direct planar PyAV frames; unsupported inputs use the
+legacy fallback, and the worker setting is ignored on that route. Streaming
+fMP4 output keeps its existing incremental path. The conservative default is
+one CPU frame-conversion worker. The public range is 1 through 8:
+`--video-response-frame-conversion-workers 1..8`.
+
+The route log records `selected_path`, `requested_frame_conversion_workers`,
+and `effective_frame_conversion_workers`. A legacy fallback records
+`effective_frame_conversion_workers=0`. For a direct path with `F` frames and
+requested worker count `W`, the effective count is `min(W, F)`. One worker, or
+one frame, stays serial and does not create a thread pool.
+
+For more than one worker, each request owns a bounded pool. Conversion futures
+are submitted and results are yielded in FIFO order. At most `2 * W_eff`
+frames are pending, where `W_eff = min(W, F)`, and each worker reuses its own
+thread-local single-channel scratch buffer. Generator close, conversion
+failure, and mux failure cancel pending futures and shut down the pool with
+`wait=True` and `cancel_futures=True`. The pool is per request, so concurrent
+requests can multiply worker, pending-frame, and scratch-buffer resources.
+
+There is no algorithmic worker limit at 8 or 32. The pending-frame bound is
+`min(2 * W_eff, F)`. For the validated 1344x768 `gbrp` shape, one PyAV frame
+uses 3,096,576 bytes and one float32 single-channel scratch buffer uses
+4,128,768 bytes. When the bounded queue is full, the capacity/modelled
+maximum of these two known allocation classes is therefore:
+
+`min(2 * W_eff, F) * 3,096,576 + W_eff * 4,128,768` bytes.
+
+This capacity is not guaranteed to be reached at every instant, and it is not
+an upper bound for total process memory. It excludes futures, executor
+objects, libx264 buffers, the original input, audio, allocator overhead, and
+other process state. For the tested worker counts the modelled capacities are:
+
+| Workers | Bounded frame/scratch capacity |
+|---:|---:|
+| 8 | 78.75 MiB |
+| 16 | 157.50 MiB |
+| 32 | 315.00 MiB |
+
+With `N` concurrent requests, this per-request capacity model scales
+approximately by `N`. Actual process RSS and peak memory are workload
+measurements; they cannot be inferred from this model. The public cap is an
+operational resource boundary, not a theoretical or universal optimum.
+
+#### Final CPU validation
+
+The final CPU formal used one fixed 124-frame, 1344x768 float32 payload at
+24 fps with stereo 32 kHz audio. PyAV/libx264 used `preset=ultrafast` and
+`threads=0`. BASE and candidate workers 1, 2, 4, and 8 were each run with one
+warmup followed by five formal rounds, in the order `BASE -> 1 -> 2 -> 4 -> 8`.
+
+| Configuration | Wall median (ms) | Process CPU median (ms) | Absolute sampled peak RSS median (KB) |
+|---|---:|---:|---:|
+| BASE | 6831.562 | 9552.620 | 3168812 |
+| Candidate w1 | 6468.999 | 9396.600 | 3167804 |
+| Candidate w2 | 4726.955 | 10041.123 | 3188784 |
+| Candidate w4 | 3852.694 | 10222.248 | 3223748 |
+| Candidate w8 | 3273.143 | 10677.300 | 3296880 |
+
+All 25 formal outputs were byte-identical and passed complete media
+validation: H.264 1344x768 at 24 fps with 124 frames, plus AAC stereo audio
+at 32 kHz. The CPU results do not measure NPU stage 0 or end-to-end request
+latency. Sampled RSS is an absolute process value, not an increment and not an
+exact unsampled peak.
+
+Relative to candidate w1, candidate w8 has derived wall change `-49.403%`,
+process CPU change `+13.629%`, and RSS change `+4.075%`. The wall percentage is
+reported as `(w8 - w1) / w1`, so a negative value means lower wall time.
+
+#### Independent worker-boundary exploration
+
+The same payload was measured independently for workers 8, 16, and 32. Each
+worker count had one warmup and five formal rounds in both forward and reverse
+order. The forward order was `8 -> 16 -> 32`; the reverse order was
+`32 -> 16 -> 8`.
+
+| Workers | Forward wall median (ms) | Reverse wall median (ms) | Forward RSS median (KB) | Reverse RSS median (KB) |
+|---:|---:|---:|---:|---:|
+| 8 | 2854.683 | 3354.612 | 3293004 | 3297688 |
+| 16 | 2855.986 | 3498.202 | 3462104 | 3454060 |
+| 32 | 3058.166 | 3482.307 | 3750708 | 3746896 |
+
+All 30 exploratory outputs were byte-identical and passed media validation.
+The pooled ten-sample changes were slight and order-sensitive, so they are not
+treated as a performance gain. Workers 16 and 32 showed no stable same-order
+wall improvement over worker 8 while increasing resource use. This PR keeps
+the public range at 1 through 8.
+
+Worker 1 is the conservative default. For the tested single-request
+MiniMax-H3/A2 workload, worker 8 is a latency-oriented recommendation when
+CPU and memory headroom are available; worker 4 is a lower-resource
+intermediate choice. Worker 8 is not a theoretical or general optimum, and
+other workloads require fresh measurement.
 
 ### Optional optimizations
 

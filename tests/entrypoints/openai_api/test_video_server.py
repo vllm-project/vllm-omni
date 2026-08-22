@@ -89,11 +89,12 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
+def test_raw_and_base64_encoders_receive_configured_workers(mocker: MockerFixture):
     engine = FakeAsyncOmni()
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
+        video_response_frame_conversion_workers=8,
     )
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -111,8 +112,41 @@ def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture)
 
     asyncio.run(_generate_both_response_types())
 
-    assert "encoding_config" not in raw_encoder.call_args.kwargs
-    assert "encoding_config" not in base64_encoder.call_args.kwargs
+    assert raw_encoder.call_args.kwargs["frame_conversion_workers"] == 8
+    assert base64_encoder.call_args.kwargs["frame_conversion_workers"] == 8
+
+
+@pytest.mark.asyncio
+async def test_frame_conversion_workers_are_removed_before_async_omni_construction(monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    def fake_async_omni(model, **kwargs):
+        captured["model"] = model
+        captured["kwargs"] = kwargs
+        return FakeEngine()
+
+    monkeypatch.setattr(api_server, "AsyncOmni", fake_async_omni)
+    args = SimpleNamespace(
+        model="fake-model",
+        disable_log_stats=False,
+        trust_remote_code=False,
+        get_explicit_kwargs_dict=lambda: {
+            "model": "fake-model",
+            "video_response_frame_conversion_workers": 8,
+            "some_engine_arg": "kept",
+        },
+    )
+
+    async with api_server.build_async_omni_from_stage_config(args) as engine:
+        assert isinstance(engine, FakeEngine)
+
+    assert captured["model"] == "fake-model"
+    assert captured["kwargs"] == {"some_engine_arg": "kept", "log_stats": True}
+    assert captured["shutdown"] is True
 
 
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
@@ -1213,8 +1247,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
+        frame_conversion_workers=None,
     ):
-        del video, fps, audio, video_codec_options
+        del video, fps, audio, video_codec_options, frame_conversion_workers
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

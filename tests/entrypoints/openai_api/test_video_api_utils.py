@@ -3,6 +3,8 @@
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
+import threading
+from collections import deque
 from io import BytesIO
 
 import av
@@ -314,6 +316,9 @@ def test_audio_sample_rate_defaults_and_path_log(monkeypatch, video, expected_pa
     assert "fps=12" in path_logs[0]
     assert "audio_present=True" in path_logs[0]
     assert "effective_audio_sample_rate=24000" in path_logs[0]
+    assert "requested_frame_conversion_workers=1" in path_logs[0]
+    expected_effective_workers = 1 if expected_mux == "direct" else 0
+    assert f"effective_frame_conversion_workers={expected_effective_workers}" in path_logs[0]
 
 
 def test_explicit_audio_sample_rate_bypasses_default_log(monkeypatch):
@@ -482,6 +487,331 @@ def test_non_contiguous_fallback_is_logged_before_legacy_mux(monkeypatch):
     assert video_api_utils._encode_video_bytes(video, fps=12) == b"legacy-video"
     assert events[0].startswith("Video response encoding route selected: selected_path=legacy_fallback")
     assert events[1] == "legacy"
+
+
+def _make_direct_planar_frame(channel_first: np.ndarray) -> np.ndarray:
+    frame = np.transpose(channel_first, (1, 2, 0))
+    assert all(frame[..., channel].flags.c_contiguous for channel in range(3))
+    return frame
+
+
+def _decode_video_frames(video_bytes: bytes) -> np.ndarray:
+    with av.open(BytesIO(video_bytes), mode="r", format="mp4") as container:
+        video_stream = container.streams.video[0]
+        return np.stack([frame.to_ndarray(format="rgb24") for frame in container.decode(video_stream)])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_common_dtype"),
+    [
+        (np.bool_, np.dtype(np.bool_)),
+        (np.uint8, np.dtype(np.float32)),
+        (np.float32, np.dtype(np.float32)),
+    ],
+    ids=["bool", "uint8-normalized-to-float32", "float32"],
+)
+def test_public_direct_planar_dtypes_normalize_and_encode_consistently(dtype, expected_common_dtype):
+    channel_first = np.arange(3 * 4 * 4, dtype=np.float32).reshape(3, 4, 4) / 48
+    if dtype == np.bool_:
+        channel_first = channel_first > 0.5
+    elif dtype == np.uint8:
+        channel_first = np.rint(channel_first * 255).astype(np.uint8)
+    else:
+        channel_first = channel_first.astype(dtype)
+    video = [_make_direct_planar_frame(channel_first), _make_direct_planar_frame(channel_first)]
+
+    prepared, frame_shape, common_dtype = video_api_utils._prepare_video_frames(video)
+    assert frame_shape == (4, 4, 3)
+    assert common_dtype == expected_common_dtype
+    assert video_api_utils._direct_planar_fallback_reason(prepared, frame_shape, common_dtype) is None
+
+    serial_frames = list(video_api_utils._iter_planar_video_frames(prepared, common_dtype, worker_count=1))
+    parallel_frames = list(video_api_utils._iter_planar_video_frames(prepared, common_dtype, worker_count=4))
+    serial_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in serial_frames])
+    parallel_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in parallel_frames])
+    expected_pixels = video_api_utils._coerce_video_to_uint8_frames(video)
+    np.testing.assert_array_equal(serial_pixels, expected_pixels)
+    np.testing.assert_array_equal(parallel_pixels, expected_pixels)
+
+    outputs = [
+        video_api_utils._encode_video_bytes(
+            video,
+            fps=12,
+            frame_conversion_workers=workers,
+            video_codec_options={"preset": "ultrafast", "threads": "1"},
+        )
+        for workers in (1, 4)
+    ]
+    assert outputs[0] == outputs[1]
+    assert _decode_video_frames(outputs[0]).shape == expected_pixels.shape
+
+
+def test_public_mixed_bool_uint8_direct_planar_is_consistent_across_workers():
+    bool_frame = _make_direct_planar_frame(
+        np.array(
+            [
+                [[False, True, False, True], [True, False, True, False]],
+                [[True, True, False, False], [False, False, True, True]],
+                [[False, False, True, True], [True, True, False, False]],
+            ],
+            dtype=np.bool_,
+        ).repeat(2, axis=1)
+    )
+    uint8_frame = _make_direct_planar_frame(
+        np.array(
+            [
+                [[0, 64, 128, 255], [255, 128, 64, 0]],
+                [[16, 80, 144, 240], [240, 144, 80, 16]],
+                [[32, 96, 160, 224], [224, 160, 96, 32]],
+            ],
+            dtype=np.uint8,
+        ).repeat(2, axis=1)
+    )
+    video = [bool_frame, uint8_frame]
+
+    prepared, frame_shape, common_dtype = video_api_utils._prepare_video_frames(video)
+    assert [frame.dtype for frame in prepared] == [np.dtype(np.bool_), np.dtype(np.float32)]
+    assert common_dtype == np.dtype(np.float32)
+    assert video_api_utils._direct_planar_fallback_reason(prepared, frame_shape, common_dtype) is None
+
+    serial_frames = list(video_api_utils._iter_planar_video_frames(prepared, common_dtype, worker_count=1))
+    parallel_frames = list(video_api_utils._iter_planar_video_frames(prepared, common_dtype, worker_count=4))
+    serial_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in serial_frames])
+    parallel_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in parallel_frames])
+    expected_pixels = video_api_utils._coerce_video_to_uint8_frames(video)
+    np.testing.assert_array_equal(serial_pixels, expected_pixels)
+    np.testing.assert_array_equal(parallel_pixels, expected_pixels)
+
+    outputs = [
+        video_api_utils._encode_video_bytes(
+            video,
+            fps=12,
+            frame_conversion_workers=workers,
+            video_codec_options={"preset": "ultrafast", "threads": "1"},
+        )
+        for workers in (1, 4)
+    ]
+    assert outputs[0] == outputs[1]
+    assert _decode_video_frames(outputs[0]).shape == expected_pixels.shape
+
+
+def test_fallback_ignores_workers_without_creating_pool(monkeypatch):
+    events = []
+
+    class UnexpectedThreadPool:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("fallback must not create a frame conversion pool")
+
+    monkeypatch.setattr(video_api_utils, "ThreadPoolExecutor", UnexpectedThreadPool)
+    monkeypatch.setattr(
+        video_api_utils,
+        "_encode_prepared_video_bytes_legacy",
+        lambda *args, **kwargs: events.append("legacy") or b"legacy-video",
+    )
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info",
+        lambda message, *args, **kwargs: events.append(message % args),
+    )
+
+    video = np.zeros((2, 4, 6, 3), dtype=np.float32)
+    assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=8) == b"legacy-video"
+    assert events[-1] == "legacy"
+    assert "requested_frame_conversion_workers=8" in events[0]
+    assert "effective_frame_conversion_workers=0" in events[0]
+
+
+def test_direct_workers_are_forwarded_and_capped_in_route_log(monkeypatch):
+    calls = []
+    events = []
+    video = np.transpose(np.zeros((3, 3, 4, 4), dtype=np.float32), (1, 2, 3, 0))
+
+    def fake_iter(frames, common_dtype, worker_count=1):
+        calls.append((frames, common_dtype, worker_count))
+        yield from ()
+
+    monkeypatch.setattr(video_api_utils, "_iter_planar_video_frames", fake_iter)
+    monkeypatch.setattr(
+        media_utils,
+        "mux_av_video_audio_bytes",
+        lambda frames, **kwargs: list(frames) and b"direct-video" or b"direct-video",
+    )
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info",
+        lambda message, *args, **kwargs: events.append(message % args),
+    )
+
+    assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=8) == b"direct-video"
+    assert calls and calls[0][2] == 3
+    assert "requested_frame_conversion_workers=8" in events[0]
+    assert "effective_frame_conversion_workers=3" in events[0]
+
+
+@pytest.mark.parametrize("workers", [0, 9, True, False, 1.0, "1"])
+def test_encode_video_bytes_rejects_invalid_programmatic_worker_count(workers):
+    with pytest.raises(ValueError, match="between 1 and 8"):
+        video_api_utils._encode_video_bytes(
+            np.zeros((1, 2, 2, 3), dtype=np.float32), fps=12, frame_conversion_workers=workers
+        )
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32], ids=["uint8", "float32"])
+def test_serial_and_parallel_planar_frames_have_identical_pixels(dtype):
+    if dtype == np.float32:
+        planar = np.linspace(-0.25, 1.25, num=3 * 9 * 2 * 2, dtype=np.float32).reshape(3, 9, 2, 2)
+        frames = list(planar.transpose(1, 2, 3, 0))
+    else:
+        frames = [np.full((2, 2, 3), index, dtype=dtype) for index in range(9)]
+
+    serial = list(video_api_utils._iter_planar_video_frames(frames, np.dtype(dtype), worker_count=1))
+    parallel = list(video_api_utils._iter_planar_video_frames(frames, np.dtype(dtype), worker_count=8))
+
+    serial_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in serial])
+    parallel_pixels = np.stack([frame.to_ndarray(format="rgb24") for frame in parallel])
+    np.testing.assert_array_equal(serial_pixels, parallel_pixels)
+    if dtype == np.float32:
+        expected_pixels = np.rint(np.clip(np.stack(frames), 0.0, 1.0) * 255.0).astype(np.uint8)
+        np.testing.assert_array_equal(serial_pixels, expected_pixels)
+
+
+def test_planar_worker_pool_preserves_fifo_order_and_bounds_pending(monkeypatch):
+    class TrackingDeque(deque):
+        max_size = 0
+
+        def append(self, value):
+            super().append(value)
+            type(self).max_size = max(type(self).max_size, len(self))
+
+    def fake_build(frame, common_dtype):
+        del common_dtype
+        return int(frame[0, 0, 0])
+
+    monkeypatch.setattr(video_api_utils, "deque", TrackingDeque)
+    monkeypatch.setattr(video_api_utils, "_build_planar_video_frame", fake_build)
+    frames = [np.full((1, 1, 3), index, dtype=np.uint8) for index in range(13)]
+
+    output = list(video_api_utils._iter_planar_video_frames(frames, np.dtype(np.uint8), worker_count=3))
+
+    assert output == list(range(13))
+    assert TrackingDeque.max_size <= 6
+
+
+def test_planar_worker_exception_propagates_and_leaves_no_pool_threads(monkeypatch):
+    def failing_build(frame, common_dtype):
+        del common_dtype
+        marker = int(frame[0, 0, 0])
+        if marker == 2:
+            raise RuntimeError("frame conversion failed")
+        return marker
+
+    monkeypatch.setattr(video_api_utils, "_build_planar_video_frame", failing_build)
+    frames = [np.full((1, 1, 3), index, dtype=np.uint8) for index in range(6)]
+
+    with pytest.raises(RuntimeError, match="frame conversion failed"):
+        list(video_api_utils._iter_planar_video_frames(frames, np.dtype(np.uint8), worker_count=3))
+
+    assert not any(thread.name.startswith("video-planar") for thread in threading.enumerate())
+
+
+def test_workers_one_and_single_frame_do_not_create_a_pool(monkeypatch):
+    def fail_pool(*args, **kwargs):
+        raise AssertionError("serial conversion must not create a thread pool")
+
+    monkeypatch.setattr(video_api_utils, "ThreadPoolExecutor", fail_pool)
+    frames = [
+        np.full((1, 2, 3), 0.25, dtype=np.float32),
+        np.full((1, 2, 3), 0.75, dtype=np.float32),
+    ]
+
+    output = list(video_api_utils._iter_planar_video_frames(frames, np.dtype(np.float32), worker_count=1))
+    assert len(output) == len(frames)
+    for actual, source in zip(output, frames):
+        expected = np.rint(np.clip(source, 0.0, 1.0) * 255.0).astype(np.uint8)
+        np.testing.assert_array_equal(actual.to_ndarray(format="rgb24"), expected)
+
+    single_frame_output = list(
+        video_api_utils._iter_planar_video_frames(frames[:1], np.dtype(np.float32), worker_count=8)
+    )
+    assert len(single_frame_output) == 1
+
+
+def test_planar_scratch_is_reused_per_thread_and_not_shared():
+    barrier = threading.Barrier(2)
+
+    def observe_scratch():
+        first = video_api_utils._planar_channel_scratch(3, 4, np.dtype(np.float32))
+        barrier.wait(timeout=2)
+        second = video_api_utils._planar_channel_scratch(3, 4, np.dtype(np.float32))
+        return first, second
+
+    with video_api_utils.ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(lambda _: observe_scratch(), range(2)))
+
+    assert first[0] is first[1]
+    assert second[0] is second[1]
+    assert first[0] is not second[0]
+
+
+def test_planar_generator_close_cancels_pending_and_shuts_down(monkeypatch):
+    cancelled = []
+    shutdown_calls = []
+
+    class RecordingFuture(video_api_utils.Future):
+        def __init__(self, marker):
+            super().__init__()
+            self.marker = marker
+
+        def cancel(self):
+            cancelled.append(self.marker)
+            return super().cancel()
+
+    class RecordingExecutor:
+        def __init__(self, max_workers, thread_name_prefix):
+            del max_workers, thread_name_prefix
+
+        def submit(self, function, frame, common_dtype):
+            del function, common_dtype
+            future = RecordingFuture(int(frame[0, 0, 0]))
+            if future.marker == 0:
+                future.set_result(future.marker)
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            shutdown_calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(video_api_utils, "ThreadPoolExecutor", RecordingExecutor)
+    frames = [np.full((1, 1, 3), index, dtype=np.uint8) for index in range(5)]
+    generator = video_api_utils._iter_planar_video_frames(frames, np.dtype(np.uint8), worker_count=2)
+
+    assert next(generator) == 0
+    generator.close()
+
+    assert cancelled == [1, 2, 3, 4]
+    assert shutdown_calls == [(True, True)]
+
+
+def test_mux_failure_after_first_frame_closes_pool_without_legacy_retry(monkeypatch):
+    legacy_calls = []
+
+    def fail_after_first_frame(frames, **kwargs):
+        del kwargs
+        next(frames)
+        raise RuntimeError("mux failed after first frame")
+
+    monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", fail_after_first_frame)
+    monkeypatch.setattr(
+        video_api_utils,
+        "_encode_prepared_video_bytes_legacy",
+        lambda *args, **kwargs: legacy_calls.append((args, kwargs)) or b"legacy-video",
+    )
+    planar = np.transpose(np.zeros((3, 8, 4, 4), dtype=np.float32), (1, 2, 3, 0))
+
+    with pytest.raises(RuntimeError, match="mux failed after first frame"):
+        video_api_utils._encode_video_bytes(planar, fps=12, frame_conversion_workers=4)
+
+    assert legacy_calls == []
+    assert not any(thread.name.startswith("video-planar") for thread in threading.enumerate())
 
 
 def test_direct_mux_error_is_propagated_without_legacy_retry(monkeypatch):
