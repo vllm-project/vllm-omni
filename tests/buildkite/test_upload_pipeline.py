@@ -67,12 +67,14 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     assert "key: image-build" in rendered
     assert "key: upload-nightly-pipeline" in rendered
     assert "key: upload-weekly-pipeline" in rendered
-    # Scheduled WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
+    # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
     doc = yaml.safe_load(rendered)
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
     assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
