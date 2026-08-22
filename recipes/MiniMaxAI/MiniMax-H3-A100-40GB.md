@@ -1,9 +1,9 @@
 # MiniMax-H3 on A100-SXM4-40GB
 
 This recipe covers MiniMax-H3 FL2VA/Ref2VA serving on **NVIDIA A100-SXM4-40GB**
-(sm80, 40 GiB per GPU). Two paths are provided: the TP4 + CPU offload path is
-the fully validated one, and the DLO path is startup/partial-run validated
-(see the DLO section for its status):
+(sm80, 40 GiB per GPU). Two validated paths are provided; the TP4 + CPU offload
+path is the lower-latency one, and the DLO path trades latency for much lower
+HBM:
 
 - **TP4 + CPU offload** — the simplest path; the whole checkpoint streams
   through host memory, so per-GPU HBM stays at ~22 GiB (official reference with
@@ -11,8 +11,8 @@ the fully validated one, and the DLO path is startup/partial-run validated
   ~22 GiB). The worker-aggregated torch peak reported by the API was ~31 GiB
   for the official-reference run.
 - **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
-  layer from host memory; per-GPU HBM after loading is ~3.1 GiB, at the cost of
-  wall-clock time.
+  layer from host memory; per-GPU HBM peaks at ~12.6 GiB (measured), at the
+  cost of wall-clock time (~5-7× slower per request on this node).
 
 A100 is sm80: **NVFP4 and hardware FP8 paths are unavailable** (FP8 tensor
 cores require sm89+), so use BF16 throughout. The text encoder (Qwen3-VL) and
@@ -34,10 +34,10 @@ pinned staging) lives in host memory. The DLO path uses TP1 rank-local mmap
 ([#6213](https://github.com/vllm-project/vllm-omni/pull/6213)): the four DP
 replicas share the checkpoint's OS page cache on one node instead of holding
 four private copies, and each worker keeps only two bounded pinned staging
-slots. The 150 GiB minimum for the DLO column is an estimate based on that
-shared-mmap layout (checkpoint pages + staging); it was not stress-measured
-(see the DLO section's validation note) — size for ~135 GiB of checkpoint pages
-plus staging, or measure your own footprint.
+slots (2×~1.2 GiB observed). The 150 GiB minimum for the DLO column is sized
+for ~135 GiB of shared checkpoint pages plus staging; the completed DLO run
+below was not instrumented for host-RSS, so keep 150 GiB unless you measure a
+smaller footprint on your node.
 
 ## Four A100-40GB: TP4 + CPU offload (480x256, 4 seconds)
 
@@ -91,18 +91,18 @@ figure.
 ## Four A100-40GB: DLO rank-local (lower HBM)
 
 If HBM headroom is needed (e.g. co-tenant workloads), the rank-local DLO path
-starts at ~3.1 GiB per GPU after model loading (all weights stay in host
-memory / shared page cache) and streams DiT blocks per denoising step. It is
-slower per step because every denoising step streams non-resident DiT blocks
-over NVLink/PCIe.
+keeps weights in host memory / shared page cache (~3.1 GiB per GPU after model
+loading) and streams DiT blocks per denoising step. It is slower per step
+because every denoising step streams non-resident DiT blocks over NVLink/PCIe.
 
-> **Validation status:** the DLO command below was verified to start, load,
-> and run the first denoising steps without error on this node, but a full
-> 50-step request was **not** completed during validation (an early attempt
-> OOM'd in an activation layer, and the later run was stopped at step 10 of
-> 49). Treat the DLO row in the capacity table as a startup/partial-run
-> measurement and re-validate end-to-end before production use. The TP4 +
-> CPU-offload path above is the fully validated one.
+**Validation:** this DLO command was validated end-to-end with the same request
+as the TP4 path (official 1344×768 reference video with audio, 480×256/96
+frames, seed 0): a full 50-step Ref2VA run completed (`status=completed`) with
+a live per-GPU peak of **~12.6 GiB** (nvidia-smi) and total inference time of
+**2013 s** (~5.5× the TP4 path's 364 s). The API worker-aggregated
+`peak_memory_mb` was 19,108 for the same run. An earlier DLO attempt on this
+node OOM'd in an activation layer; the run below is the one that completed —
+re-measure on your own node before trusting the numbers.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
