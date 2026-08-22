@@ -12,7 +12,7 @@ connectors:
       connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      codec_chunk_frames: 50
       codec_left_context_frames: 3
       # Experimental performance candidate: fewer CFM refinement steps.
       # Keep this isolated from the stable accuracy-validated deployment.
