@@ -188,11 +188,6 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
-        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-            logger.warning_once(
-                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
-                "paged-attention adapter yet; model attention remains on the dense path."
-            )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),

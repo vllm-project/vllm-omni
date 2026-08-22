@@ -397,12 +397,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise RuntimeError("Model must be loaded before collecting Diffusion KV cache specs")
 
         cache_layers: dict[str, tuple[Attention, KVCacheSpec]] = {}
-        for layer_name, module in self.pipeline.named_modules():
+        cache_layer_paths: dict[str, str] = {}
+        for module_path, module in self.pipeline.named_modules():
             if not isinstance(module, Attention):
                 continue
             spec = module.get_kv_cache_spec(self.vllm_config)
             if spec is not None:
+                layer_name = module.prefix
+                if not isinstance(layer_name, str) or not layer_name:
+                    raise RuntimeError(
+                        "Paged Diffusion Attention must expose a non-empty canonical prefix; "
+                        f"module_path={module_path!r}"
+                    )
+                if layer_name in cache_layers:
+                    raise RuntimeError(
+                        "Duplicate canonical paged Diffusion Attention prefix "
+                        f"{layer_name!r} for module paths "
+                        f"{cache_layer_paths[layer_name]!r} and {module_path!r}"
+                    )
                 cache_layers[layer_name] = (module, spec)
+                cache_layer_paths[layer_name] = module_path
         if not cache_layers:
             raise RuntimeError(
                 "paged_scheduler Diffusion KV found no cache-enabled Attention modules "
@@ -627,7 +641,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+            kv_backend = getattr(self, "diffusion_kv_backend", None)
+            with set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=od_config,
+                paged_kv_runtime=getattr(kv_backend, "paged_attention_adapter", None),
+            ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
@@ -981,10 +1000,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = {}
 
+            kv_backend = getattr(self, "diffusion_kv_backend", None)
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
+                paged_kv_runtime=getattr(kv_backend, "paged_attention_adapter", None),
             ):
                 clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)

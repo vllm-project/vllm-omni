@@ -26,6 +26,9 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Worker-owned paged runtime available to model integrations while they
+    # describe the current query/write spans.
+    paged_kv_runtime: Any | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -150,6 +153,7 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: Any | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -157,6 +161,7 @@ def create_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -182,6 +187,7 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: Any | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -193,6 +199,7 @@ def set_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
