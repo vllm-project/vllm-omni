@@ -523,6 +523,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    scheduling_metadata_adapter: str | None = None
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -1985,6 +1986,8 @@ def _build_model_config(
         kwargs["model_subdir"] = topology.model_subdir
     if "tokenizer_subdir" not in kwargs and topology.tokenizer_subdir is not None:
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
+    if "scheduling_metadata_adapter" not in kwargs:
+        kwargs["scheduling_metadata_adapter"] = topology.scheduling_metadata_adapter
     return cast(Any, OmniStageModelConfig)(
         default_sampling_params=default_sampling_params,
         session_mode=deploy.session_mode,
