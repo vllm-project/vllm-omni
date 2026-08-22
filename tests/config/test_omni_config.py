@@ -244,6 +244,25 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
+def test_from_pipeline_config_pipeline_owns_full_payload_input_capability():
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=1,
+                engine_extras={"requires_full_payload_input": False},
+            )
+        ]
+    )
+
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"stage_1_requires_full_payload_input": False},
+    )
+    assert config.stage_by_id(1).model_config.requires_full_payload_input is True
+
+
 @pytest.mark.parametrize(
     ("cli_overrides", "stage_id"),
     [
@@ -443,10 +462,12 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     async_config = _from_pipeline_key("qwen3_tts")
     assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert async_config.stage_by_id(1).custom_process_input_func is None
+    assert async_config.stage_by_id(1).model_config.requires_full_payload_input is True
 
     sync_config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": False})
     assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert sync_config.stage_by_id(1).custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert sync_config.stage_by_id(1).model_config.requires_full_payload_input is True
 
     assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None

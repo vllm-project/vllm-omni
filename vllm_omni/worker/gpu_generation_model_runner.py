@@ -35,12 +35,14 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
-from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,27 +58,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        # Mirrors the init allowlist in gpu_ar_model_runner.py.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "AudexCode2Wav",
-            "AudexXCodec1",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2S2MelDecoder",
-            # nemotron_voicechat: code2wav (stage 2) consumes the talker's
-            # full-payload code stacks.
-            "NemotronVoiceChatCode2Wav",
-        }
-        if (
-            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
-            or get_stage_connector_role(self.model_config) is not None
-        ):
+        if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )

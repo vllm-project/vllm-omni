@@ -404,6 +404,7 @@ class OmniStageModelConfig:
     # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    requires_full_payload_input: bool = False
 
 
 @_enforce_keyword_only_init
@@ -1185,6 +1186,7 @@ def _stage_engine_values(
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    engine["requires_full_payload_input"] = topology.requires_full_payload_input
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,

@@ -201,6 +201,9 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Whether the non-async path waits for a complete upstream payload from
+    # the model-runner connector before scheduling this stage.
+    requires_full_payload_input: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -482,7 +485,6 @@ _STAGE_RESERVED_KEYS = frozenset(
 
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
-
 
 def deploy_runtime_override_keys() -> frozenset[str]:
     """Return deploy-schema fields that are valid CLI/runtime overrides.
@@ -850,6 +852,7 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
 
