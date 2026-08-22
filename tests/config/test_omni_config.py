@@ -636,6 +636,7 @@ def test_sub_config_fields_match_structured_scopes():
         "has_sampling_extra_args",
         "custom_voice_dir",
         "task_type",
+        "expected_model_version",
         "codec_frame_rate_hz",
         "enforce_eager",
         "max_cudagraph_capture_size",

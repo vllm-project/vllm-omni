@@ -76,6 +76,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
+    "LTX2TextToAudioPipeline": (
+        "ltx2",
+        "pipeline_ltx2_audio",
+        "LTX2TextToAudioPipeline",
+    ),
     "LTX2TwoStagePipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
@@ -367,6 +372,8 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "AudioXPipeline",
+    "LTX2TextToAudioPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
@@ -553,6 +560,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TextToAudioPipeline": "get_ltx2_audio_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",

@@ -720,6 +720,10 @@ class OmniDiffusionConfig:
     # task-specific components or weights before serving requests.
     task_type: str | None = None
 
+    # Optional assertion for unified model-family pipelines. Metadata remains
+    # authoritative; this never overrides checkpoint detection.
+    expected_model_version: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)

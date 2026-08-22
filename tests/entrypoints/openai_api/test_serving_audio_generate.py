@@ -192,6 +192,19 @@ class TestRequestValidation:
         req = OpenAICreateAudioGenerateRequest(input="test", stream_format="audio")
         assert req.stream_format == "audio"
 
+    def test_ltx_exact_num_frames_and_audio_length_are_mutually_exclusive(self):
+        with pytest.raises(Exception, match="mutually exclusive"):
+            OpenAICreateAudioGenerateRequest(input="test", audio_length=5.0, num_frames=121)
+
+    def test_audio_length_must_be_positive(self):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(input="test", audio_length=0.0)
+
+    def test_ltx_exact_num_frames_and_frame_rate_are_accepted(self):
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
+        assert req.num_frames == 121
+        assert req.frame_rate == 24.0
+
 
 # Constructor & Class Methods
 class TestConstructor:
@@ -271,6 +284,7 @@ class TestParameterWiring:
         sp = call_kwargs["sampling_params_list"][0]
         assert isinstance(sp, OmniDiffusionSamplingParams)
         assert sp.guidance_scale == 12.0
+        assert sp.guidance_scale_provided
 
     @pytest.mark.asyncio
     async def test_num_inference_steps_wiring(self, server_and_engine):
@@ -315,6 +329,17 @@ class TestParameterWiring:
         sp = engine.generate.call_args[1]["sampling_params_list"][0]
         assert sp.extra_args["audio_start_in_s"] == 2.0
         assert sp.extra_args["audio_end_in_s"] == 12.0  # start + length
+        assert sp.extra_args["audio_length"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_ltx_exact_num_frames_wiring(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args["num_frames"] == 121
+        assert sp.frame_rate == 24.0
 
     @pytest.mark.asyncio
     async def test_audio_length_default_start(self, server_and_engine):
@@ -405,6 +430,35 @@ class TestAudioResponseFormat:
 
         audio_obj = mock_create_audio.call_args[0][0]
         assert audio_obj.sample_rate == 44100  # Stable Audio default
+
+    @pytest.mark.asyncio
+    async def test_audio_sample_rate_metadata_takes_precedence_over_legacy_sr(self):
+        engine = MagicMock()
+        engine.errored = False
+        engine.model_type = "LTX2TextToAudioPipeline"
+        engine.default_sampling_params_list = [{}]
+
+        async def generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="ltx-t2a",
+                images=[],
+                prompt=None,
+                metrics={},
+                multimodal_output={
+                    "audio": torch.zeros(16),
+                    "audio_sample_rate": 48000,
+                    "sr": 44100,
+                },
+            )
+
+        engine.generate = MagicMock(side_effect=generate)
+        server = _make_server(engine)
+        response = MagicMock(audio_data=b"audio", media_type="audio/wav")
+        server.create_audio = MagicMock(return_value=response)
+
+        await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="test"))
+
+        assert server.create_audio.call_args[0][0].sample_rate == 48000
 
 
 # Error Handling

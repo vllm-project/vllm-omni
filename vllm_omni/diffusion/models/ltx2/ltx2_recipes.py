@@ -118,6 +118,20 @@ def _official_guidance(stg_block: int) -> LTXGuidanceSpec:
     )
 
 
+def _official_audio_only_guidance(stg_block: int) -> LTXGuidanceSpec:
+    """Official full-model T2A guidance without cross-modal guidance."""
+    return LTXGuidanceSpec(
+        video=LTXModalityGuidance(),
+        audio=LTXModalityGuidance(
+            cfg_scale=7.0,
+            stg_scale=1.0,
+            modality_scale=1.0,
+            rescale_scale=0.7,
+            stg_blocks=(stg_block,),
+        ),
+    )
+
+
 LTX2_ONE_STAGE_RECIPE = LTXPipelineRecipe(
     supports_cache_dit=True,
     phases=(LTXPhaseRecipe(name="generate", guidance=_official_guidance(29)),),
@@ -139,6 +153,18 @@ LTX25_FULL_RECIPE = LTXPipelineRecipe(
             noise_scale=1.0,
         ),
     ),
+)
+LTX2_T2A_RECIPE = LTXPipelineRecipe(
+    phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(29)),),
+)
+LTX23_T2A_RECIPE = LTXPipelineRecipe(
+    num_inference_steps=30,
+    phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(28)),),
+)
+LTX25_T2A_RECIPE = LTXPipelineRecipe(
+    num_inference_steps=30,
+    negative_prompt=LTX25_DEFAULT_NEGATIVE_PROMPT,
+    phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(28), noise_scale=1.0),),
 )
 LTX_POSITIVE_ONLY_RECIPE = LTXPipelineRecipe(
     supports_cache_dit=True,
@@ -300,6 +326,9 @@ LTX25_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX25_FULL_RECIPE)
 
 
 _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
+    ("text_to_audio", "2"): LTX2_T2A_RECIPE,
+    ("text_to_audio", "2.3"): LTX23_T2A_RECIPE,
+    ("text_to_audio", "2.5"): LTX25_T2A_RECIPE,
     ("one_stage", "2"): LTX2_ONE_STAGE_RECIPE,
     ("one_stage", "2.3"): LTX23_ONE_STAGE_RECIPE,
     ("one_stage", "2.5"): LTX25_FULL_RECIPE,

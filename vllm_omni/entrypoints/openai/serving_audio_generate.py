@@ -81,6 +81,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
 
             if request.guidance_scale is not None:
                 sampling_params_list[0].guidance_scale = request.guidance_scale
+                sampling_params_list[0].guidance_scale_provided = True
 
             if request.num_inference_steps is not None:
                 sampling_params_list[0].num_inference_steps = request.num_inference_steps
@@ -91,9 +92,14 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 audio_start = request.audio_start if request.audio_start is not None else 0.0
                 audio_end_in_s = audio_start + audio_length
                 sampling_params_list[0].extra_args = {
+                    "audio_length": audio_length,
                     "audio_start_in_s": audio_start,
                     "audio_end_in_s": audio_end_in_s,
                 }
+            elif request.num_frames is not None:
+                sampling_params_list[0].extra_args = {"num_frames": request.num_frames}
+            if request.frame_rate is not None:
+                sampling_params_list[0].frame_rate = request.frame_rate
 
             logger.info("Audio generation request %s", request_id)
             _rl = getattr(self, "request_logger", None)
@@ -135,7 +141,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 return self.create_error_response("Audio generation model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("sr", default_sr)
+            sample_rate = audio_output.get("audio_sample_rate", audio_output.get("sr", default_sr))
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 

@@ -441,6 +441,7 @@ class StageDeployConfig:
 
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
+    expected_model_version: str | None = None
     diffusion_load_format: str | None = None
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None

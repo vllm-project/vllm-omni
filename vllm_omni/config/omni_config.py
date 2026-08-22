@@ -428,6 +428,7 @@ class OmniStageModelConfig:
     has_sampling_extra_args: bool = False
     custom_voice_dir: str | None = None
     task_type: str | None = None
+    expected_model_version: str | None = None
     codec_frame_rate_hz: float | None = None
     enforce_eager: bool = False
     max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
@@ -698,6 +699,7 @@ class _DiffusionConfigProjection:
     streaming_output: bool = False
     model_arch: str | None = None
     task_type: str | None = None
+    expected_model_version: str | None = None
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
@@ -975,6 +977,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "model",
         "model_arch",
         "task_type",
+        "expected_model_version",
         "dtype",
         "trust_remote_code",
         "revision",

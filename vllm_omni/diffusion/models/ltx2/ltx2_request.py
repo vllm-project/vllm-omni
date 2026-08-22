@@ -54,6 +54,34 @@ class LTXRequestInputs:
 LTXCheckpointKind = Literal["distilled", "regular"]
 
 
+def resolve_ltx_audio_num_frames(
+    *,
+    audio_length: float | None,
+    num_frames: int | None,
+    frame_rate: float,
+    default_num_frames: int,
+    temporal_compression_ratio: int = 8,
+) -> int:
+    """Resolve T2A duration onto LTX's causal ``ratio * k + 1`` clock."""
+    if frame_rate <= 0:
+        raise ValueError("LTX text-to-audio `frame_rate` must be positive.")
+    if audio_length is not None and num_frames is not None:
+        raise ValueError("`audio_length` and `num_frames` are mutually exclusive.")
+    if audio_length is not None:
+        if audio_length <= 0:
+            raise ValueError("LTX text-to-audio `audio_length` must be positive.")
+        target_num_frames = audio_length * frame_rate
+        interval_count = max(1, round((target_num_frames - 1) / temporal_compression_ratio))
+        return interval_count * temporal_compression_ratio + 1
+
+    resolved = default_num_frames if num_frames is None else int(num_frames)
+    if resolved < 1 or (resolved - 1) % temporal_compression_ratio:
+        raise ValueError(
+            f"LTX text-to-audio `num_frames` must be {temporal_compression_ratio} * k + 1, got {resolved}."
+        )
+    return resolved
+
+
 def validate_ltx_checkpoint(
     scheduler_config: Mapping[str, Any],
     *,

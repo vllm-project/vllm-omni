@@ -627,6 +627,44 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diffusion_pytorch_model.safetensors"
+    save_file(
+        {
+            "proj_in.weight": torch.zeros(2, 2),
+            "audio_proj_in.weight": torch.ones(2, 2),
+            "transformer_blocks.0.audio_ff.weight": torch.full((2, 2), 2.0),
+            "transformer_blocks.0.audio_to_video_attn.weight": torch.full((2, 2), 3.0),
+        },
+        checkpoint,
+    )
+    od_config = SimpleNamespace(
+        enable_multithread_weight_load=True,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_args, **_kwargs: (tmp_path, [str(checkpoint)], True),
+    )
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+        weight_name_patterns=("audio_*", "transformer_blocks.*.audio_ff.*"),
+    )
+
+    weights = list(loader._get_weights_iterator(source))
+
+    assert [name for name, _tensor in weights] == [
+        "transformer.audio_proj_in.weight",
+        "transformer.transformer_blocks.0.audio_ff.weight",
+    ]
+
+
 def test_stream_online_quant_weights_offloads_layers_after_processing():
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,

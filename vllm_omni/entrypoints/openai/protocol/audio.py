@@ -363,11 +363,22 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
         default=0.0,
         description="Audio start time in seconds",
+    )
+    num_frames: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact LTX duration clock; must be 8 * k + 1",
+    )
+    frame_rate: float | None = Field(
+        default=None,
+        gt=0,
+        description="LTX duration clock rate used with num_frames",
     )
     negative_prompt: str | None = Field(
         default=None,
@@ -396,6 +407,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         if v == "sse":
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
+
+    @model_validator(mode="after")
+    def validate_ltx_duration_options(self) -> "OpenAICreateAudioGenerateRequest":
+        if self.audio_length is not None and self.num_frames is not None:
+            raise ValueError("`audio_length` and `num_frames` are mutually exclusive.")
+        if self.num_frames is not None and (self.num_frames - 1) % 8:
+            raise ValueError("`num_frames` must be 8 * k + 1 for LTX text-to-audio.")
+        return self
 
 
 class CreateAudio(BaseModel):
