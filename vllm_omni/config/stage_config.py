@@ -890,7 +890,6 @@ def _build_engine_args(
     if ps.model_path_resolver:
         engine_args["model_path_resolver"] = ps.model_path_resolver
     engine_args["inline_diffusion"] = ps.inline_diffusion
-    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -917,6 +916,7 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 

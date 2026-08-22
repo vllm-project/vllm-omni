@@ -6,7 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,7 +37,8 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, OmniEngineArgs, internal_blacklist_keys
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1560,24 +1561,77 @@ stages:
         )
         assert async_stages[1].custom_process_input_func is None
 
-    def test_propagates_scheduling_metadata_adapter(self):
+    @pytest.mark.parametrize(
+        ("adapter_path", "deploy_path", "expected"),
+        [
+            pytest.param(
+                "pipeline.PipelineAdapter",
+                "deploy.IgnoredAdapter",
+                "pipeline.PipelineAdapter",
+                id="deploy_conflict_overridden_by_pipeline",
+            ),
+            pytest.param(None, "deploy.IgnoredAdapter", None, id="deploy_ignored_when_pipeline_unset"),
+            pytest.param("pipeline.PipelineAdapter", None, "pipeline.PipelineAdapter", id="deploy_absent"),
+        ],
+    )
+    def test_scheduling_metadata_adapter_pipeline_is_authoritative(self, adapter_path, deploy_path, expected):
+        """Pipeline config is the only source that sets the adapter; deploy cannot."""
+        deploy_kwargs = {} if deploy_path is None else {"engine_extras": {"scheduling_metadata_adapter": deploy_path}}
+        stage = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="metadata_adapter_test",
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="consumer",
+                        scheduling_metadata_adapter=adapter_path,
+                    ),
+                ),
+            ),
+            DeployConfig(stages=(StageDeployConfig(stage_id=0, **deploy_kwargs),)),
+        )[0]
+
+        assert stage.yaml_engine_args["scheduling_metadata_adapter"] == expected
+
+    def test_scheduling_metadata_adapter_survives_engine_args_filtering(self):
+        adapter_path = "package.CustomSchedulingMetadataAdapter"
         pipeline = PipelineConfig(
             model_type="metadata_adapter_test",
             stages=(
                 StagePipelineConfig(
                     stage_id=0,
                     model_stage="consumer",
-                    scheduling_metadata_adapter="package.CustomSchedulingMetadataAdapter",
+                    scheduling_metadata_adapter=adapter_path,
                 ),
             ),
         )
 
         stage = merge_pipeline_deploy(pipeline, DeployConfig())[0]
 
-        assert (
-            stage.yaml_engine_args["scheduling_metadata_adapter"]
-            == "package.CustomSchedulingMetadataAdapter"
+        assert "scheduling_metadata_adapter" in {f.name for f in fields(OmniEngineArgs)}
+
+        filtered = filter_dataclass_kwargs(OmniEngineArgs, dict(stage.yaml_engine_args))
+        assert filtered["scheduling_metadata_adapter"] == adapter_path
+
+    def test_scheduling_metadata_adapter_is_per_stage(self):
+        """Each stage carries only its own pipeline-defined adapter."""
+        stages = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="metadata_adapter_test",
+                stages=(
+                    StagePipelineConfig(stage_id=0, model_stage="thinker"),
+                    StagePipelineConfig(
+                        stage_id=1,
+                        model_stage="talker",
+                        scheduling_metadata_adapter="pipeline.TalkerAdapter",
+                    ),
+                ),
+            ),
+            DeployConfig(),
         )
+
+        assert stages[0].yaml_engine_args["scheduling_metadata_adapter"] is None
+        assert stages[1].yaml_engine_args["scheduling_metadata_adapter"] == "pipeline.TalkerAdapter"
 
     def test_no_bundled_legacy_stage_config_yamls(self):
         repo_root = Path(__file__).resolve().parents[2]

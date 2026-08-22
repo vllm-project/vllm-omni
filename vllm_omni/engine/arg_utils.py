@@ -165,6 +165,9 @@ class OmniEngineArgs(EngineArgs):
         async_chunk: If set to True, perform async chunk
         session_mode: Request lifecycle mode, either turn-based or duplex
         worker_type: Model Type, e.g., "ar" or "generation"
+        scheduling_metadata_adapter: Optional dotted path of a runner-side
+            adapter that translates incoming payload metadata into typed
+            scheduler-visible updates. If None, the default adapter is used.
         task_type: Model-defined startup task type. Consumers validate the
             supported values and decide whether it selects request behavior,
             task-specific weights, or both.
@@ -206,6 +209,7 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
     task_type: str | None = None
@@ -424,6 +428,7 @@ class OmniEngineArgs(EngineArgs):
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            scheduling_metadata_adapter=self.scheduling_metadata_adapter,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,

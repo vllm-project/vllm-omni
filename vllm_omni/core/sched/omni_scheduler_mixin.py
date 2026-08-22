@@ -242,9 +242,7 @@ class OmniSchedulerMixin:
         if input_coordinator is None:
             return
         if connector_output and connector_output.request_metadata:
-            input_coordinator.update_request_metadata(
-                self.requests, connector_output.request_metadata
-            )
+            input_coordinator.update_request_metadata(self.requests, connector_output.request_metadata)
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
             connector_output.stage_recv_req_ids if connector_output else set(),

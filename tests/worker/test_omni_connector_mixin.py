@@ -8,6 +8,7 @@ GPU or vLLM runtime.
 
 from __future__ import annotations
 
+import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -60,13 +61,14 @@ def _make_model_config(
     async_chunk: bool = False,
     worker_type: str = "ar",
     custom_func: str | None = None,
+    scheduling_metadata_adapter: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         stage_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
-        scheduling_metadata_adapter=None,
+        scheduling_metadata_adapter=scheduling_metadata_adapter,
     )
 
 
@@ -99,6 +101,14 @@ class _FakeTPGroup:
         if self.rank_in_group == src:
             return obj
         return self.follower_result
+
+
+class _EchoSchedulingMetadataAdapter:
+    """Dummy adapter resolved from a dotted path in mixin integration tests."""
+
+    def extract(self, payload: Any, *, model_mode: str) -> SchedulingMetadataUpdate:
+        del payload, model_mode
+        return SchedulingMetadataUpdate(resize_prompt_to=7)
 
 
 # ------------------------------------------------------------------ #
@@ -906,10 +916,77 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
 
         self.assertEqual(results, {"r1": payload})
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertEqual(host.get_local_request_metadata("r1"), SchedulingMetadataUpdate())
+        self.assertIsNone(host.get_local_request_metadata("r1"))
         self.assertEqual(host._stage_recv_req_ids, {"r1"})
         self.assertNotIn("r1", host._pending_load_reqs)
         self.assertEqual(tp_group.broadcast_inputs, [None])
+        host.shutdown_omni_connectors()
+
+
+class TestCustomSchedulingMetadataAdapterResolution(unittest.TestCase):
+    """Runner-side resolution of a configured scheduling metadata adapter."""
+
+    @staticmethod
+    def _dotted_path() -> str:
+        return f"{__name__}._EchoSchedulingMetadataAdapter"
+
+    @staticmethod
+    def _resolve_import_module_patch():
+        """Return a context manager that resolves the local dummy class by path.
+
+        pytest may import this module under different fully qualified names
+        (``tests.worker.test_omni_connector_mixin`` vs ``test_omni_connector_mixin``),
+        so vendor the module lookup through ``sys.modules`` instead of relying
+        on the importable dotted name.
+        """
+        return patch(
+            "vllm_omni.worker.scheduling_metadata_adapter.importlib.import_module",
+            return_value=sys.modules[__name__],
+        )
+
+    def test_recv_full_payload_uses_configured_adapter(self):
+        """A dotted-path adapter is resolved at init and drives extraction.
+
+        Covering init resolution implicitly: the recv path can only return the
+        custom effect if ``init_omni_connectors`` loaded the dummy class.
+        """
+        with self._resolve_import_module_patch():
+            host = MixinHost()
+            host.init_omni_connectors(
+                model_config=_make_model_config(
+                    stage_id=2,
+                    worker_type="generation",
+                    scheduling_metadata_adapter=self._dotted_path(),
+                )
+            )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._local_rank = 1
+        host._full_payload_pending_broadcast_req_ids.add("r1")
+        tp_group = _FakeTPGroup(
+            world_size=2,
+            rank_in_group=1,
+            follower_result={"r1": {"meta": {"next_stage_prompt_len": 9}}},
+        )
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            results = host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertEqual(results, {"r1": {"meta": {"next_stage_prompt_len": 9}}})
+        self.assertEqual(
+            host.get_local_request_metadata("r1"),
+            SchedulingMetadataUpdate(resize_prompt_to=7),
+        )
+        host.shutdown_omni_connectors()
+
+    def test_default_adapter_none_effect_is_not_stored(self):
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config(worker_type="ar"))
+
+        update = host._scheduling_metadata_adapter.extract({"tok": [1]}, model_mode="ar")
+        self.assertIsNone(update)
+        host.put_local_request_metadata("r1", update)
+        self.assertNotIn("r1", host._local_request_metadata)
         host.shutdown_omni_connectors()
 
 
