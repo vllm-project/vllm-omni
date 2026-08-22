@@ -107,6 +107,7 @@ def test_ltx_audio_transformer_exposes_hsdp_blocks(monkeypatch):
 
 def test_ltx_audio_transformer_forward_has_audio_only_signature(monkeypatch):
     calls = []
+    prompt_timesteps = []
 
     class FakeBlock(nn.Module):
         def __init__(self, **_kwargs):
@@ -126,6 +127,10 @@ def test_ltx_audio_transformer_forward_has_audio_only_signature(monkeypatch):
         caption_channels=8,
         num_layers=1,
         use_prompt_embeddings=False,
+        audio_cross_attn_mod=True,
+    )
+    model.audio_prompt_adaln.register_forward_pre_hook(
+        lambda _module, args: prompt_timesteps.append(args[0].detach().clone())
     )
     audio = torch.randn(2, 3, 4)
     context = torch.randn(2, 5, 8)
@@ -142,6 +147,7 @@ def test_ltx_audio_transformer_forward_has_audio_only_signature(monkeypatch):
     assert calls[0][0] == (2, 3, 8)
     assert calls[0][1] == context.shape
     assert "audio_rotary_emb" in calls[0][2]
+    assert torch.equal(prompt_timesteps[0], torch.full((2,), 500.0))
 
 
 def test_ltx_audio_weight_loader_ignores_video_weights_and_loads_audio_weights(monkeypatch):

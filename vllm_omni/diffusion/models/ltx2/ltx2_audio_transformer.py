@@ -342,7 +342,8 @@ class LTX2AudioTransformerModel(nn.Module):
     ) -> torch.Tensor:
         del return_dict
         if audio_sigma is None:
-            audio_sigma = audio_timestep[:, 0] if audio_timestep.ndim > 1 else audio_timestep
+            scaled_sigma = audio_timestep[:, 0] if audio_timestep.ndim > 1 else audio_timestep
+            audio_sigma = scaled_sigma / self.config.timestep_scale_multiplier
         if audio_encoder_attention_mask is not None and audio_encoder_attention_mask.ndim == 2:
             audio_encoder_attention_mask = (1 - audio_encoder_attention_mask.to(audio_hidden_states.dtype)) * -10000
             audio_encoder_attention_mask = audio_encoder_attention_mask.unsqueeze(1)
@@ -371,8 +372,10 @@ class LTX2AudioTransformerModel(nn.Module):
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
 
         if self.prompt_modulation and self.config.use_prompt_adaln_single:
+            # Match the official preprocessor: prompt-side AdaLN consumes the
+            # scheduler sigma on the same 0..1000 scale as token timesteps.
             temb_prompt_audio, _ = self.audio_prompt_adaln(
-                audio_sigma.flatten(),
+                audio_sigma.flatten() * self.config.timestep_scale_multiplier,
                 batch_size=batch_size,
                 hidden_dtype=audio_hidden_states.dtype,
             )

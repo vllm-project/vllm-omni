@@ -59,6 +59,7 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert LTX2TextToAudioPipeline.support_audio_output
     assert not LTX2TextToAudioPipeline.support_image_input
     assert not hasattr(LTX2TextToAudioPipeline, "support_video_output")
+    assert LTX2TextToAudioPipeline.dummy_run_num_frames == 9
 
 
 @pytest.mark.parametrize(
@@ -293,6 +294,61 @@ def test_ltx_t2a_rejects_distilled_scheduler_before_large_components(tmp_path, m
         ltx2_audio_runtime.initialize_audio_pipeline_components(pipe, od_config)
 
     assert not tokenizer_loaded
+
+
+def test_ltx25_t2a_overrides_shared_distilled_scheduler_before_validation(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+
+    tokenizer_loaded = False
+    scheduler_from_config = {}
+
+    class Source:
+        def __init__(self, **_kwargs):
+            pass
+
+    class Scheduler:
+        def __init__(self, config):
+            self.config = config
+
+    def load_tokenizer(*_args, **_kwargs):
+        nonlocal tokenizer_loaded
+        tokenizer_loaded = True
+        return SimpleNamespace(model_max_length=1024)
+
+    def rebuild_scheduler(_config, **kwargs):
+        scheduler_from_config.update(kwargs)
+        return Scheduler({"use_dynamic_shifting": True, "shift_terminal": 0.1})
+
+    monkeypatch.setattr(ltx2_audio_runtime.DiffusersPipelineLoader, "ComponentSource", Source)
+    monkeypatch.setattr(ltx2_audio_runtime, "prefetch_subfolders", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ltx2_audio_runtime.FlowMatchEulerDiscreteScheduler,
+        "from_pretrained",
+        lambda *_args, **_kwargs: Scheduler({"use_dynamic_shifting": False, "shift_terminal": None}),
+    )
+    monkeypatch.setattr(
+        ltx2_audio_runtime.FlowMatchEulerDiscreteScheduler,
+        "from_config",
+        rebuild_scheduler,
+    )
+    monkeypatch.setattr(ltx2_audio_runtime.AutoTokenizer, "from_pretrained", load_tokenizer)
+    monkeypatch.setattr(
+        ltx2_audio_runtime,
+        "_load_component",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop after scheduler validation")),
+    )
+
+    pipe = SimpleNamespace(
+        component_profile=LTX25_T2A_COMPONENT_PROFILE,
+        pipeline_kind="text_to_audio",
+    )
+    od_config = SimpleNamespace(model=str(tmp_path), revision=None, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="stop after scheduler validation"):
+        ltx2_audio_runtime.initialize_audio_pipeline_components(pipe, od_config)
+
+    assert scheduler_from_config == {"use_dynamic_shifting": True, "shift_terminal": 0.1}
+    assert tokenizer_loaded
 
 
 def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypatch):

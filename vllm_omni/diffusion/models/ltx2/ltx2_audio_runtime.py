@@ -111,19 +111,27 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
         local_files_only=local_files_only,
         revision=revision,
     )
-    # Reject merged-distilled checkpoints before allocating the text encoder,
-    # connectors, VAE, vocoder, or Transformer.
-    validate_ltx_checkpoint(
-        pipeline.scheduler.config,
-        expected_kind=resolve_ltx_checkpoint_kind(pipeline.pipeline_kind),
-        pipeline_name=type(pipeline).__name__,
-    )
+
+    # LTX-2.5 publishes the distilled scheduler as the repository default,
+    # while the Full/SFT transformer (used by the regular one-stage and T2A
+    # profiles) requires dynamic shifting.  Apply the profile override before
+    # validating the checkpoint kind; otherwise a valid LTX-2.5 Full/SFT
+    # checkpoint is rejected based on the deliberately shared distilled
+    # scheduler config.
     if profile.scheduler_use_dynamic_shifting:
         pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
             pipeline.scheduler.config,
             use_dynamic_shifting=True,
             shift_terminal=profile.scheduler_shift_terminal,
         )
+
+    # Reject incompatible checkpoints before allocating the text encoder,
+    # connectors, VAE, vocoder, or Transformer.
+    validate_ltx_checkpoint(
+        pipeline.scheduler.config,
+        expected_kind=resolve_ltx_checkpoint_kind(pipeline.pipeline_kind),
+        pipeline_name=type(pipeline).__name__,
+    )
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
         model,
         subfolder="tokenizer",
@@ -230,6 +238,10 @@ class LTXAudioRuntime(
     support_audio_output = True
     support_image_input = False
     supports_request_batch = False
+    # The generic diffusion warmup uses this class-level value when the
+    # pipeline is registered by name.  LTX's causal audio clock requires
+    # ``8 * k + 1`` frames; 9 is the smallest valid warmup shape.
+    dummy_run_num_frames: ClassVar[int] = 9
     connector_batches_cfg = False
     preserve_sp_padded_audio_duration = True
 
