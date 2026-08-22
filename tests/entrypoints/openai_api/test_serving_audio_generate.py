@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 def create_mock_audio_output(
     request_id: str = "audiogen-mock-123",
     sample_rate: int = 44100,
+    sample_rate_key: str = "sr",
     num_samples: int = 44100,
     audio_key: str = "audio",
 ) -> OmniRequestOutput:
@@ -42,11 +43,16 @@ def create_mock_audio_output(
         images=[],
         prompt=None,
         metrics={},
-        multimodal_output={audio_key: audio_tensor, "sr": sample_rate},
+        multimodal_output={audio_key: audio_tensor, sample_rate_key: sample_rate},
     )
 
 
-def _make_engine_client(*, audio_key: str = "audio", sample_rate: int = 44100):
+def _make_engine_client(
+    *,
+    audio_key: str = "audio",
+    sample_rate: int = 44100,
+    sample_rate_key: str = "sr",
+):
     """Build a mock engine client producing audio output."""
     mock_engine_client = MagicMock()
     mock_engine_client.errored = False
@@ -57,6 +63,7 @@ def _make_engine_client(*, audio_key: str = "audio", sample_rate: int = 44100):
         yield create_mock_audio_output(
             request_id=kwargs.get("request_id", "audiogen-mock"),
             sample_rate=sample_rate,
+            sample_rate_key=sample_rate_key,
             audio_key=audio_key,
         )
 
@@ -327,6 +334,23 @@ class TestParameterWiring:
         assert sp.extra_args["audio_end_in_s"] == 5.0
 
     @pytest.mark.asyncio
+    async def test_extra_params_merged_into_extra_args(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            audio_length=5.0,
+            extra_params={"sigma_shift": 3.0},
+        )
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args == {
+            "audio_start_in_s": 0.0,
+            "audio_end_in_s": 5.0,
+            "sigma_shift": 3.0,
+        }
+
+    @pytest.mark.asyncio
     async def test_no_audio_length_skips_extra_args(self, server_and_engine):
         server, engine = server_and_engine
         req = OpenAICreateAudioGenerateRequest(input="test")
@@ -392,19 +416,25 @@ class TestAudioResponseFormat:
         assert isinstance(audio_obj, CreateAudio)
         assert audio_obj.speed == 2.5
 
-    @patch("vllm_omni.entrypoints.openai.serving_audio_generate.OmniOpenAIServingAudioGenerate.create_audio")
-    def test_sample_rate_from_output(self, mock_create_audio, test_app):
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sample_rate_key", "sample_rate"),
+        [("audio_sample_rate", 48000), ("sr", 24000)],
+    )
+    async def test_sample_rate_from_output(self, sample_rate_key, sample_rate):
+        engine = _make_engine_client(
+            sample_rate=sample_rate,
+            sample_rate_key=sample_rate_key,
+        )
+        server = _make_server(engine)
         mock_audio_response = MagicMock()
         mock_audio_response.audio_data = b"dummy"
         mock_audio_response.media_type = "audio/wav"
-        mock_create_audio.return_value = mock_audio_response
+        with patch.object(server, "create_audio", return_value=mock_audio_response) as mock_create_audio:
+            await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="test"))
 
-        c = TestClient(test_app)
-        payload = {"input": "test"}
-        c.post("/v1/audio/generate", json=payload)
-
-        audio_obj = mock_create_audio.call_args[0][0]
-        assert audio_obj.sample_rate == 44100  # Stable Audio default
+        audio_obj = mock_create_audio.call_args.args[0]
+        assert audio_obj.sample_rate == sample_rate
 
 
 # Error Handling

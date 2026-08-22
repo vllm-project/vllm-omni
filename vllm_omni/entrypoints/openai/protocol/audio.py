@@ -371,6 +371,10 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         default=None,
         description="Random seed for reproducibility",
     )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
+    )
 
     @field_validator("stream_format")
     @classmethod

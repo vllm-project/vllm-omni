@@ -1,5 +1,5 @@
 
-# Diffusion Serving Benchmark (Image/Video)
+# Diffusion Serving Benchmark (Image/Video/Audio)
 
 This folder contains an online-serving benchmark script for diffusion models.
 It sends requests to a vLLM OpenAI-compatible endpoint and reports throughput,
@@ -31,9 +31,32 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 **Notes**
 
 - By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
+- Text-to-audio (`t2a`) talks to `/v1/audio/generate` and reports generated-audio throughput and RTF for WAV output.
 - If you run the server on another host or port, pass `--base-url` accordingly.
 
 ## 2. Supported Datasets
+
+### Text-to-audio
+
+Start an audio diffusion server and run a synthetic prompt benchmark:
+
+```bash
+vllm serve stabilityai/stable-audio-open-1.0 --omni --port 8091
+
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://localhost:8091 \
+    --model stabilityai/stable-audio-open-1.0 \
+    --task t2a --dataset random --num-prompts 10 \
+    --audio-length 10 --num-inference-steps 50 \
+    --max-concurrency 2 --response-format wav
+```
+
+WAV responses provide `audio_duration_total`, `audio_throughput_seconds_per_second`,
+and mean/median/P99 `audio_rtf` metrics. Other response formats still report request
+throughput and latency, but their duration and RTF metrics are zero. Use
+`--extra-body` for model-specific fields such as `guidance_scale` or `extra_params`.
+When `--slo` is enabled, audio request cost is estimated from output duration and
+the number of diffusion steps.
 
 The benchmark supports three dataset modes via `--dataset`:
 
@@ -98,7 +121,7 @@ You can point to your own trace using `--dataset-path`.
 - `--base-url`: Server address; `--endpoint` selects the path appended to this base URL.
 - `--model`: The OpenAI-compatible `model` field.
 - `--endpoint`: API endpoint path. Leading `/` is optional, e.g. `/v1/videos` or `v1/videos`.
-- `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`).
+- `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`, `t2a`).
 - `--dataset`: Dataset mode (`vbench` / `trace` / `random`).
 - `--num-prompts`: Number of requests to send.
 

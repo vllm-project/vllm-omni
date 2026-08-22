@@ -5,7 +5,9 @@ import mimetypes
 import os
 import time
 import uuid
+import wave
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Any
 
 import aiohttp
@@ -36,6 +38,8 @@ class RequestFuncInput:
     num_inference_steps: int | None = None
     seed: int | None = None
     fps: int | None = None
+    audio_length: float | None = None
+    response_format: str = "wav"
     timestamp: float | None = None
     slo_ms: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
@@ -55,6 +59,7 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+    audio_duration: float | None = None
 
 
 def _guess_mime_type(path: str) -> str:
@@ -67,6 +72,59 @@ def _encode_image_as_data_url(path: str) -> str:
         encoded = base64.b64encode(f.read()).decode("utf-8")
     mime = _guess_mime_type(path)
     return f"data:{mime};base64,{encoded}"
+
+
+def _wav_duration_seconds(audio_bytes: bytes) -> float | None:
+    """Return WAV duration without decoding samples, or None for other formats."""
+    try:
+        with wave.open(BytesIO(audio_bytes), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            return wav_file.getnframes() / frame_rate if frame_rate > 0 else None
+    except (EOFError, wave.Error):
+        return None
+
+
+async def async_request_audio_generate(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """POST /v1/audio/generate and collect raw audio output."""
+    output = RequestFuncOutput(start_time=time.perf_counter())
+    payload: dict[str, Any] = {
+        "input": input.prompt,
+        "model": input.model,
+        "response_format": input.response_format,
+    }
+    if input.audio_length is not None:
+        payload["audio_length"] = input.audio_length
+    if input.num_inference_steps is not None:
+        payload["num_inference_steps"] = input.num_inference_steps
+    if input.seed is not None:
+        payload["seed"] = input.seed
+    payload.update(input.extra_body)
+
+    try:
+        async with session.post(input.api_url, json=payload) as response:
+            if response.status == 200:
+                audio_bytes = await response.read()
+                if not audio_bytes:
+                    output.error = "Audio generation response was empty."
+                else:
+                    output.response_body = audio_bytes
+                    output.audio_duration = _wav_duration_seconds(audio_bytes)
+                    output.success = True
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+    except Exception as e:
+        output.error = str(e)
+
+    output.latency = time.perf_counter() - output.start_time
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 async def async_request_image_edits(
@@ -509,5 +567,8 @@ backends_function_mapping = {
     },
     "2v": {
         "/v1/videos": (async_request_v1_videos, "/v1/videos"),
+    },
+    "2a": {
+        "/v1/audio/generate": (async_request_audio_generate, "/v1/audio/generate"),
     },
 }

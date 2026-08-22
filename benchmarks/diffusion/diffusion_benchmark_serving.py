@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Benchmark online serving for diffusion models (Image/Video Generation).
+Benchmark online serving for diffusion models (Image/Video/Audio Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple endpoints:
@@ -100,14 +100,15 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import (
+from PIL import Image
+from tqdm.asyncio import tqdm
+
+from .backends import (
     RequestFuncInput,
     RequestFuncOutput,
     backends_function_mapping,
     normalize_endpoint,
 )
-from PIL import Image
-from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +347,8 @@ class VBenchDataset(BaseDataset):
             num_inference_steps=self.args.num_inference_steps,
             seed=self.args.seed,
             fps=self.args.fps,
+            audio_length=self.args.audio_length,
+            response_format=self.args.response_format,
             image_paths=image_paths,
         )
 
@@ -542,6 +545,8 @@ class TraceDataset(BaseDataset):
         fps = self._coerce_int(row.get("fps"))
         timestamp = self._coerce_float(row.get("timestamp"))
         slo_ms = self._coerce_float(row.get("slo_ms"))
+        audio_length = self._coerce_float(row.get("audio_length"))
+        response_format = str(row.get("response_format") or self.args.response_format)
         image_paths = row.get("image_paths")
         if not image_paths:
             single = row.get("image_path")
@@ -579,6 +584,8 @@ class TraceDataset(BaseDataset):
             fps=fps if fps is not None else self.args.fps,
             timestamp=timestamp,
             slo_ms=slo_ms,
+            audio_length=audio_length if audio_length is not None else self.args.audio_length,
+            response_format=response_format,
             image_paths=image_paths,
             video_paths=video_paths,
             request_id=str(row.get("request_id")) if row.get("request_id") is not None else str(uuid.uuid4()),
@@ -721,12 +728,16 @@ class CustomDataset(BaseDataset):
         height = item.get("height", self.args.height)
         num_inference_steps = item.get("num_inference_steps", self.args.num_inference_steps)
         seed = item.get("seed", self.args.seed)
+        audio_length = item.get("audio_length", self.args.audio_length)
+        response_format = item.get("response_format", self.args.response_format)
         reserved_keys = {
             "prompt",
             "width",
             "height",
             "num_inference_steps",
             "seed",
+            "audio_length",
+            "response_format",
             "image_paths",
             "image_urls",
             "video_paths",
@@ -749,6 +760,8 @@ class CustomDataset(BaseDataset):
             width=width,
             height=height,
             num_inference_steps=num_inference_steps,
+            audio_length=audio_length,
+            response_format=response_format,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -817,6 +830,8 @@ class RandomDataset(BaseDataset):
             "num_frames": self.args.num_frames,
             "num_inference_steps": self.args.num_inference_steps,
             "fps": self.args.fps,
+            "audio_length": self.args.audio_length,
+            "response_format": self.args.response_format,
         }
         if self._sampled_requests:
             profile = self._sampled_requests[idx]
@@ -931,16 +946,21 @@ def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_tim
     if base_time_ms is None:
         return None
 
+    steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
+    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
+    if args.task == "t2a":
+        audio_length = req.audio_length if req.audio_length is not None else args.audio_length
+        if audio_length is None or audio_length <= 0:
+            return None
+        return float(base_time_ms) * float(audio_length) * step_scale
+
     width = req.width if req.width is not None else args.width
     height = req.height if req.height is not None else args.height
     if width is None or height is None:
         return None
 
     frames = req.num_frames if req.num_frames is not None else args.num_frames
-    steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
-
     frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
-    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
 
     area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
     return float(base_time_ms) * area_units * frame_scale * step_scale
@@ -962,16 +982,21 @@ def _infer_slo_base_time_ms_from_warmups(
         if not out.success or out.latency <= 0:
             continue
 
+        steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
+        step_scale = int(steps) if isinstance(steps, int) and steps > 0 else 1
+        if args.task == "t2a":
+            audio_length = req.audio_length if req.audio_length is not None else args.audio_length
+            if audio_length is not None and audio_length > 0:
+                candidates_ms.append((out.latency * 1000.0) / (float(audio_length) * step_scale))
+            continue
+
         width = req.width if req.width is not None else args.width
         height = req.height if req.height is not None else args.height
         if width is None or height is None:
             continue
 
         frames = req.num_frames if req.num_frames is not None else args.num_frames
-        steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
-
         frame_scale = int(frames) if isinstance(frames, int) and frames > 0 else 1
-        step_scale = int(steps) if isinstance(steps, int) and steps > 0 else 1
 
         area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
         denom = area_units * float(frame_scale) * float(step_scale)
@@ -1102,6 +1127,10 @@ def calculate_metrics(
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
     peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
+    audio_durations = [o.audio_duration for o in success_outputs if o.audio_duration is not None]
+    audio_rtfs = [
+        o.latency / o.audio_duration for o in success_outputs if o.audio_duration is not None and o.audio_duration > 0
+    ]
 
     # Aggregate per-stage durations across all successful requests that reported them.
     stage_duration_lists: dict[str, list[float]] = {}
@@ -1128,6 +1157,13 @@ def calculate_metrics(
         "stage_durations_mean": stage_durations_mean,
         "stage_durations_p50": stage_durations_p50,
         "stage_durations_p99": stage_durations_p99,
+        "audio_duration_total": float(sum(audio_durations)),
+        "audio_throughput_seconds_per_second": (
+            float(sum(audio_durations)) / total_duration if total_duration > 0 else 0
+        ),
+        "audio_rtf_mean": float(np.mean(audio_rtfs)) if audio_rtfs else 0,
+        "audio_rtf_median": float(np.median(audio_rtfs)) if audio_rtfs else 0,
+        "audio_rtf_p99": float(np.percentile(audio_rtfs, 99)) if audio_rtfs else 0,
     }
 
     if slo_enabled:
@@ -1171,7 +1207,15 @@ def _save_generated_outputs(
             continue
 
         if isinstance(out.response_body, bytes):
-            fname = f"req_{idx:04d}.mp4"
+            if req.api_url.endswith("/v1/audio/generate"):
+                ext = (
+                    req.response_format
+                    if req.response_format in {"wav", "pcm", "flac", "mp3", "aac", "opus"}
+                    else "bin"
+                )
+            else:
+                ext = "mp4"
+            fname = f"req_{idx:04d}.{ext}"
             fpath = os.path.join(save_dir, fname)
             with open(fpath, "wb") as f:
                 f.write(out.response_body)
@@ -1228,7 +1272,7 @@ def _save_generated_outputs(
                 failed += 1
                 logger.warning(f"Failed to save image for request {idx}: {e}", exc_info=True)
 
-    logger.info(f"Saved {saved} generated image(s) to {save_dir}. Failed to save {failed} image(s).")
+    logger.info(f"Saved {saved} generated output(s) to {save_dir}. Failed to save {failed} output(s).")
 
 
 def wait_for_service(base_url: str, timeout: int = 120) -> None:
@@ -1257,6 +1301,8 @@ def _default_endpoint_for_task(task: str) -> str:
         return "/v1/images/edits"
     if task == "t2i":
         return "/v1/chat/completions"
+    if task == "t2a":
+        return "/v1/audio/generate"
     raise ValueError(f"Unsupported task for endpoint resolution: {task}")
 
 
@@ -1267,16 +1313,20 @@ async def benchmark(args):
 
     VIDEO_TASKS = {"t2v", "i2v", "ti2v", "v2v"}
     IMAGE_TASKS = {"t2i", "i2i", "ti2i", "it2i"}
+    AUDIO_TASKS = {"t2a"}
 
     if args.task in VIDEO_TASKS:
         task_type = "2v"
     elif args.task in IMAGE_TASKS:
         task_type = "2i"
+    elif args.task in AUDIO_TASKS:
+        task_type = "2a"
     else:
         raise ValueError(
             f"Unsupported task: '{args.task}'. "
             f"Valid video tasks: {sorted(VIDEO_TASKS)}, "
-            f"Valid image tasks: {sorted(IMAGE_TASKS)}"
+            f"Valid image tasks: {sorted(IMAGE_TASKS)}, "
+            f"valid audio tasks: {sorted(AUDIO_TASKS)}"
         )
 
     raw_endpoint = args.endpoint if args.endpoint is not None else args.backend
@@ -1408,6 +1458,15 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
     print("{:<40} {:<15.4f}".format("Latency P95 (s):", metrics["latency_p95"]))
 
+    if args.task == "t2a":
+        print("{:<40} {:<15.2f}".format("Generated audio duration (s):", metrics["audio_duration_total"]))
+        print(
+            "{:<40} {:<15.4f}".format("Audio throughput (audio s/s):", metrics["audio_throughput_seconds_per_second"])
+        )
+        print("{:<40} {:<15.4f}".format("Audio RTF Mean:", metrics["audio_rtf_mean"]))
+        print("{:<40} {:<15.4f}".format("Audio RTF Median:", metrics["audio_rtf_median"]))
+        print("{:<40} {:<15.4f}".format("Audio RTF P99:", metrics["audio_rtf_p99"]))
+
     if args.slo:
         print(f"{'-' * 50}")
         print("{:<40} {:<15.2%}".format("SLO Attainment Rate (all):", metrics.get("slo_attainment_rate", 0.0)))
@@ -1471,7 +1530,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "v2v", "ti2i", "i2i", "it2i", "t2i"],
+        choices=["t2v", "i2v", "ti2v", "v2v", "ti2i", "i2i", "it2i", "t2i", "t2a"],
         help="Task type.",
     )
     parser.add_argument(
@@ -1543,6 +1602,18 @@ if __name__ == "__main__":
         help="Random seed (for diffusion models).",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
+    parser.add_argument(
+        "--audio-length",
+        type=float,
+        default=10.0,
+        help="Requested output duration in seconds (for audio).",
+    )
+    parser.add_argument(
+        "--response-format",
+        choices=["wav", "pcm", "flac", "mp3", "aac", "opus"],
+        default="wav",
+        help="Audio response format. WAV enables duration and RTF metrics.",
+    )
     parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
     parser.add_argument(
         "--slo",

@@ -19,6 +19,11 @@ Usage:
     python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
     python text_to_audio.py --prompt "A soft synth pad" --cache-backend tea_cache
 
+    # MossSoundEffectV2
+    python text_to_audio.py --model OpenMOSS-Team/MOSS-SoundEffect-v2.0 --prompt "The sound of a dog barking"
+    python text_to_audio.py --model OpenMOSS-Team/MOSS-SoundEffect-v2.0 --prompt "A piano playing a gentle melody" --audio-length 10.0
+    python text_to_audio.py --model OpenMOSS-Team/MOSS-SoundEffect-v2.0 --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+
     # AudioX (text-to-audio / text-to-music)
     python text_to_audio.py --model zhangj1an/AudioX --task t2a \
         --prompt "Fireworks burst twice, then a clock ticking." \

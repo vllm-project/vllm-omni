@@ -5,9 +5,10 @@ A unified script for text/video-to-audio generation. Supported models:
 | Model | Tasks | Notes |
 |-------|-------|-------|
 | `stabilityai/stable-audio-open-1.0` | text-to-audio | gated; uses `--audio-length` |
+| `OpenMOSS-Team/MOSS-SoundEffect-v2.0` | text-to-audio | |
 | `zhangj1an/AudioX` | `t2a` / `t2m` / `v2a` / `v2m` / `tv2a` / `tv2m` | pass `--task`; video tasks need `--video` |
 
-The `stabilityai/stable-audio-open-1.0` pipeline generates audio from text prompts.
+The `stabilityai/stable-audio-open-1.0` and `OpenMOSS-Team/MOSS-SoundEffect-v2.0` pipelines generate audio from text prompts.
 
 ## Prerequisites
 
@@ -76,6 +77,18 @@ python text_to_audio.py \
   --video https://zeyuet.github.io/AudioX/static/samples/V2M/1XeBotOFqHA.mp4 \
   --num-inference-steps 250 --guidance-scale 6.0 --audio-length 10.0 \
   --output tv2a.wav
+```
+
+### Moss-SoundEffect-v2.0
+
+This initial integration supports basic single-request inference. Parallelism and cache-backend acceleration are not yet supported.
+
+```bash
+python text_to_audio.py \
+  --model OpenMOSS-Team/MOSS-SoundEffect-v2.0 \
+  --prompt "The Sound of a dog barking" \
+  --num-inference-steps 50 --guidance-scale 6.0 --audio-length 10.0 \
+  --output moss_sfx_v2.wav
 ```
 
 Key arguments:
