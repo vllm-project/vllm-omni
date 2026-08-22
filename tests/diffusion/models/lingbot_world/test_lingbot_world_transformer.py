@@ -465,30 +465,21 @@ def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None
         module.CausalLingBotWorldTransformer3DModel(**{field: 4})
 
 
-class _RecordingQuantConfig:
-    """Minimal stand-in for a vLLM ``QuantizationConfig``.
+def _quantizable_projections(model) -> dict[str, object]:
+    """Map every projection that reached the quant dispatch to its config.
 
-    ``LinearBase`` only calls ``get_quant_method(layer, prefix=...)``, so the
-    stub records the prefix each parallel linear presents and hands back the
-    unquantized method. That makes the recorded set an exact map of which
-    modules a real checkpoint's exclusion list would be matched against.
+    Keyed by the prefix the projection presented, which is the string a
+    checkpoint's exclusion list is matched against.
     """
-
-    def __init__(self) -> None:
-        self.prefixes: list[str] = []
-
-    def get_quant_method(self, layer, prefix: str = ""):
-        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-        self.prefixes.append(prefix)
-        return UnquantizedLinearMethod()
+    return {module.quant_prefix: module.quant_config for module in model.modules() if hasattr(module, "quant_prefix")}
 
 
 def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefixes() -> None:
     module = attention_tests._load_module()
-    quant_config = _RecordingQuantConfig()
+    quant_config = object()
 
-    _tiny_model(module, num_layers=2, quant_config=quant_config)
+    model = _tiny_model(module, num_layers=2, quant_config=quant_config)
+    presented = _quantizable_projections(model)
 
     per_block = {
         "self_attn.qkv",
@@ -505,22 +496,32 @@ def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefi
     expected = {"c2ws_hidden_states_layer1", "c2ws_hidden_states_layer2"} | {
         f"blocks.{index}.{name}" for index in range(2) for name in per_block
     }
-    assert set(quant_config.prefixes) == expected
-    # Every prefix is presented exactly once; a duplicate would mean two modules
-    # share a name and would silently collide in an exclusion list.
-    assert len(quant_config.prefixes) == len(expected)
+    assert set(presented) == expected
+    # A prefix appearing twice would mean two modules collide in an exclusion
+    # list; the dict would silently hide that, so count the modules too.
+    assert sum(1 for m in model.modules() if hasattr(m, "quant_prefix")) == len(expected)
+    assert all(config is quant_config for config in presented.values())
 
 
 def test_precision_sensitive_projections_stay_out_of_the_quant_dispatch() -> None:
     module = attention_tests._load_module()
-    quant_config = _RecordingQuantConfig()
 
-    _tiny_model(module, num_layers=2, quant_config=quant_config)
+    model = _tiny_model(module, num_layers=2, quant_config=object())
+    presented = set(_quantizable_projections(model))
 
-    # Modulation, embedding and head projections are plain ``nn.Linear`` and must
-    # never be handed to a quantization method, regardless of the checkpoint.
+    # Modulation, embedding and head projections produce precision-sensitive
+    # values, are plain ``nn.Linear``, and must never reach a quant method.
     for name in ("cam_scale_layer", "cam_shift_layer", "head", "text_embedding", "time_embedding", "time_projection"):
-        assert not any(prefix.endswith(name) or f".{name}." in prefix for prefix in quant_config.prefixes), name
+        assert not any(prefix.endswith(name) or f".{name}." in prefix for prefix in presented), name
+
+
+def test_an_unquantized_model_hands_no_projection_a_quant_config() -> None:
+    module = attention_tests._load_module()
+
+    model = _tiny_model(module, num_layers=1)
+
+    assert set(_quantizable_projections(model))
+    assert all(config is None for config in _quantizable_projections(model).values())
 
 
 def test_orphaned_quantization_scale_reports_the_exclusion_mismatch() -> None:
