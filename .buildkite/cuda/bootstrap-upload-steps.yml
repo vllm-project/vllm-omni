@@ -9,7 +9,7 @@ steps:
       queue: "cpu_queue_premerge"
 
   # L2 Test — PR ready label (diff-aware) or WEEKLY=1 (--e2e, full E2E group)
-  # TEMP: drop BUILDKITE_BRANCH=main so WEEKLY=1 on a debug branch also uploads --e2e.
+  # TEMP: drop BUILDKITE_BRANCH=main; restore to main && WEEKLY=1 after debug.
   - label: "Upload Ready Pipeline"
     depends_on: image-build
     key: upload-ready-pipeline
@@ -24,7 +24,7 @@ steps:
       queue: "cpu_queue_premerge"
 
   # L3 Test — PR merge-test label (diff-aware) or WEEKLY=1 (--e2e, full E2E group)
-  # TEMP: drop BUILDKITE_BRANCH=main so WEEKLY=1 on a debug branch also uploads --e2e.
+  # TEMP: drop BUILDKITE_BRANCH=main; restore to main && WEEKLY=1 after debug.
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline

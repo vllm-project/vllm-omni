@@ -106,6 +106,9 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     disabled = "false"
     nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
     nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
+    # TEMP DEBUG (revert before merge): L2/L3 upload on WEEKLY=1, not NIGHTLY.
+    # Restore to: weekly_e2e = 'build.branch == "main" && build.env("WEEKLY") == "1"'
+    weekly_e2e = 'build.env("WEEKLY") == "1"'
 
     if platform == "npu":
         ready_pr = (
@@ -117,6 +120,7 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         nightly_label_if = nightly_only
         weekly_label_if = disabled
         merge_base = disabled
+        ready_base = ready_pr
     else:
         ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
         merge_main = (
@@ -140,19 +144,19 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
             '(build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1") || '
             '(build.branch != "main" && build.pull_request.labels includes "weekly-test")'
         )
-        merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
+        merge_base = f"({weekly_e2e}) || (({merge_main}) || ({merge_pr}))"
+        ready_base = f"({weekly_e2e}) || ({ready_pr})"
 
-    ready_base = f"({nightly_main}) || ({ready_pr})"
     # TEMP DEBUG (revert before merge): drop main-only gate for scheduled weekly env.
     weekly_main = 'build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1"'
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
         # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
-        # WEEKLY=1 on main also uploads L2/L3 with --e2e.
+        # WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
         image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
-        ready_expr = nightly_main
-        merge_expr = nightly_main if platform == "cuda" else disabled
+        ready_expr = weekly_e2e if platform == "cuda" else disabled
+        merge_expr = weekly_e2e if platform == "cuda" else disabled
         nightly_expr = nightly_main
         weekly_expr = weekly_main if platform == "cuda" else disabled
     elif decision.skip_l2_l3:
