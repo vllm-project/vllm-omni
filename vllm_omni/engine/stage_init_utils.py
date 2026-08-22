@@ -540,9 +540,21 @@ def extract_stage_metadata_from_omni_stage_config(
 
 def prepare_engine_environment() -> None:
     """One-time global setup: load plugins, set multiprocessing spawn method."""
+    from vllm_omni.model_executor.layers.fused_moe import (
+        get_fused_moe_configs_dir,
+        maybe_set_vllm_tuned_config_folder,
+    )
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # Prefer omni-shipped fused_moe tile JSONs when the user has not set a
+    # custom folder. Upstream still falls back to vLLM's packaged configs.
+    if maybe_set_vllm_tuned_config_folder():
+        logger.info(
+            "[stage_init] Set VLLM_TUNED_CONFIG_FOLDER=%s (omni fused_moe configs)",
+            get_fused_moe_configs_dir(),
+        )
 
     if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

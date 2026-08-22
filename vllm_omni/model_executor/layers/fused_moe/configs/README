@@ -1,0 +1,24 @@
+This directory contains omni-shipped tuned configurations for the upstream
+vLLM fused_moe Triton kernel (same JSON schema as
+``vllm/model_executor/layers/fused_moe/configs/``).
+
+For different settings of
+- E (number of experts)
+- N (intermediate size; often TP/EP sharded)
+- device_name (from ``torch.cuda.get_device_name()``, spaces → ``_``)
+- optional dtype / block_shape
+the JSON file maps batch size M → tile config
+(``BLOCK_SIZE_*``, ``GROUP_SIZE_M``, ``num_warps``, ``num_stages``).
+
+At runtime, vLLM-Omni sets ``VLLM_TUNED_CONFIG_FOLDER`` to this directory when
+the env is unset. vLLM still falls back to its own packaged configs if a
+filename is missing here.
+
+Generate files with upstream vLLM's script, then copy JSON here:
+
+```bash
+# from a vLLM checkout / editable install
+python benchmarks/kernels/benchmark_moe.py \
+  --model <moe-model> --tune \
+  --save-dir /path/to/vllm_omni/model_executor/layers/fused_moe/configs
+```
