@@ -46,7 +46,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
 
@@ -320,9 +320,9 @@ class OmniSchedulerMixin:
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
 
-        Called at the top of every ``schedule()`` cycle.  Identical between
-        AR and generation schedulers except for the ``model_mode`` argument
-        forwarded to ``update_request_metadata``.
+        Called at the top of every ``schedule()`` cycle. ``model_mode`` is
+        retained for the shared call surface; the runner has already applied
+        model-specific interpretation before publishing the typed updates.
         """
         connector_outputs: list[OmniConnectorOutput] = []
         inbox = getattr(self, "_omni_connector_output_inbox", None)
@@ -339,7 +339,7 @@ class OmniSchedulerMixin:
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        request_metadata: dict[str, dict[str, Any]] = {}
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
         chunk_ready_req_ids: set[str] = set()
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
@@ -359,7 +359,6 @@ class OmniSchedulerMixin:
             input_coordinator.update_request_metadata(
                 self.requests,
                 request_metadata,
-                model_mode=model_mode,
             )
         if input_coordinator._async_chunk:
             input_coordinator.process_pending_chunks(
