@@ -1036,7 +1036,6 @@ def _build_engine_args(
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
-    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -1083,6 +1082,7 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 
