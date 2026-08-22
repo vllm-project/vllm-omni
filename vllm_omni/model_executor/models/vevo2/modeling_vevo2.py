@@ -270,9 +270,11 @@ def _seeded_rng(seed: int | None):
     cpu_state = torch.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     try:
+        # ``torch.manual_seed`` already reseeds every initialised accelerator
+        # (it forwards to the cuda/xpu/mps backends internally), so there is no
+        # device-specific seed call here -- one would be redundant and would
+        # pin this path to CUDA.
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
         yield
     finally:
         torch.set_rng_state(cpu_state)
