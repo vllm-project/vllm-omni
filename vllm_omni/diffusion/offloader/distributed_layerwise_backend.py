@@ -1686,33 +1686,43 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
             return
 
-        from vllm_omni.diffusion.distributed.parallel_state import get_fs_group
-
-        fs_group = get_fs_group()
-        if fs_group.world_size != self.weight_shard_size:
+        # HSDP path. Upstream no longer registers an FS process group in
+        # parallel_state (the HSDP DeviceMesh owns shard groups internally),
+        # so build the FS row ourselves. The HSDP mesh layout is
+        # arange(world).reshape(replicate, shard): each FS row is a
+        # contiguous, replica-major rank range [r//shard*shard, +shard).
+        # Chunk offsets are rank-major within one row, so this layout is
+        # mandatory — a strided row would land rank r's local chunk at the
+        # wrong full-buffer offset.
+        world_size = torch.distributed.get_world_size()
+        global_rank = torch.distributed.get_rank()
+        shard = self.weight_shard_size
+        if world_size % shard != 0:
             raise ValueError(
-                "DLO weight shard degree does not match the FS group: "
-                f"config={self.weight_shard_size}, group={fs_group.world_size}"
+                f"DLO weight shard degree {shard} does not divide the world size {world_size}: "
+                "FS rows must be contiguous replica-major ranges"
             )
 
-        # Chunk offsets are rank-major within one FS row, so a row must be a
-        # contiguous, replica-major rank range.  A strided row would make
-        # rank r's local chunk land at the wrong full-buffer offset.
-        ranks = list(fs_group.ranks)
-        if ranks != list(range(ranks[0], ranks[0] + len(ranks))):
-            raise ValueError(f"DLO requires replica-major, contiguous fully-shard rows; got FS ranks={ranks}")
-
-        self.weight_shard_group = fs_group.device_group
-        self.weight_shard_cpu_group = fs_group.cpu_group
-        self.weight_shard_rank = fs_group.rank_in_group
+        # new_group is collective over the world group: every rank creates
+        # every row's groups in the same order, then keeps only its own row.
+        row_groups: dict[int, tuple[Any, Any]] = {}
+        for start in range(0, world_size, shard):
+            row = list(range(start, start + shard))
+            row_groups[start] = (
+                torch.distributed.new_group(ranks=row),
+                torch.distributed.new_group(ranks=row, backend="gloo"),
+            )
+        row_start = global_rank - global_rank % shard
+        self.weight_shard_group, self.weight_shard_cpu_group = row_groups[row_start]
+        self.weight_shard_rank = global_rank % shard
         self._publish_weight_shard_config()
 
         logger.info(
-            "Distributed layerwise offload: weight_shard_size=%d, rank_in_group=%d, global_rank=%d, group_ranks=%s",
+            "DLO (HSDP): weight_shard_size=%d, rank_in_group=%d, global_rank=%d, row_ranks=%s",
             self.weight_shard_size,
             self.weight_shard_rank,
-            fs_group.rank,
-            ranks,
+            global_rank,
+            list(range(row_start, row_start + shard)),
         )
 
     def _publish_weight_shard_config(self) -> None:

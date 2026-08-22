@@ -1890,6 +1890,48 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="does not match the resolved group"):
             backend._init_weight_shard_group()
 
+    def test_hsdp_fs_row_group_builder(self, monkeypatch):
+        """HSDP path builds FS row groups from the mesh layout (review: #6374).
+
+        Upstream removed the parallel_state FS group; the backend now derives
+        contiguous replica-major rows itself and creates every row's groups in
+        a fixed order (new_group is collective over the world group)."""
+        import torch.distributed as dist
+
+        backend = self._make_weight_shard_backend(weight_shard_size=2, use_hsdp=True)
+        created: list[tuple[tuple[int, ...], str | None]] = []
+
+        def fake_new_group(ranks, backend=None):
+            created.append((tuple(ranks), backend))
+            return (tuple(ranks), backend)
+
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_world_size", lambda: 4)
+        monkeypatch.setattr(dist, "get_rank", lambda: 3)
+        monkeypatch.setattr(dist, "new_group", fake_new_group)
+
+        backend._init_weight_shard_group()
+
+        # Rank 3 sits in row [2, 3] with rank-in-row 1; device + gloo groups.
+        assert backend.weight_shard_group == ((2, 3), None)
+        assert backend.weight_shard_cpu_group == ((2, 3), "gloo")
+        assert backend.weight_shard_rank == 1
+        assert backend.config.weight_shard_size == 2
+        # Every row's groups are created in order on every rank.
+        assert created == [((0, 1), None), ((0, 1), "gloo"), ((2, 3), None), ((2, 3), "gloo")]
+
+    def test_hsdp_fs_row_rejects_indivisible_world(self, monkeypatch):
+        """A shard degree that does not divide the world size fails fast."""
+        import torch.distributed as dist
+
+        backend = self._make_weight_shard_backend(weight_shard_size=2, use_hsdp=True)
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_world_size", lambda: 3)
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+
+        with pytest.raises(ValueError, match="does not divide the world size"):
+            backend._init_weight_shard_group()
+
     def test_resident_layers_with_allgather_rejected(self):
         class FakePC:
             data_parallel_size = 2

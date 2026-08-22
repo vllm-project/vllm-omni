@@ -1019,7 +1019,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
+        # Stepwise requests must go through the same DLO generation lifecycle
+        # as the request-list path; otherwise transport tickets/futures stay
+        # live across scheduler steps (review: #6374).
+        request_context = getattr(self.offload_backend, "request_context", None)
+        offload_context = request_context() if callable(request_context) else nullcontext()
+        with grad_context, offload_context:
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
