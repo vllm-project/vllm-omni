@@ -298,12 +298,19 @@ class TestResultPumpDispatch:
 
 
 class _FakeBatchOutput:
-    """Batch-level output exposing per-request results."""
+    """Batch-level output exposing per-request results.
 
-    def __init__(self, results):
+    *raise_for* names request ids whose extraction blows up, standing in for a
+    corrupt entry in an otherwise healthy batch.
+    """
+
+    def __init__(self, results, raise_for=()):
         self._results = results
+        self._raise_for = set(raise_for)
 
     def get_request_output(self, req_id):
+        if req_id in self._raise_for:
+            raise RuntimeError(f"corrupt batch entry for {req_id}")
         result = self._results.get(req_id)
         if result is None:
             return None
@@ -535,13 +542,9 @@ class TestResultPumpDispatchIsGuarded:
     def test_batch_split_failure_does_not_kill_the_pump(self):
         executor = _make_executor()
 
-        class _ExplodingBatchOutput:
-            def get_request_output(self, req_id):
-                raise RuntimeError("corrupt batch output")
-
         with executor._futures_lock:
             executor._batch_split_map["batch-1"] = {"batch-1/r-0": "r-0"}
-        doomed = executor.wait_output_ready("batch-1/r-0")
+        corrupt = executor.wait_output_ready("batch-1/r-0")
 
         fut = executor.wait_output_ready("abc123")
         output = DiffusionOutput(output="after the bad batch")
@@ -549,7 +552,7 @@ class TestResultPumpDispatchIsGuarded:
             AsyncDiffusionOutput(
                 kind=AsyncOutputKind.OUTPUT_READY,
                 async_output_id="batch-1",
-                output=_ExplodingBatchOutput(),
+                output=_FakeBatchOutput({}, raise_for=["r-0"]),
             ),
             AsyncDiffusionOutput(
                 kind=AsyncOutputKind.OUTPUT_READY,
@@ -560,9 +563,40 @@ class TestResultPumpDispatchIsGuarded:
         pump = _feed_msgs_to_pump(executor, msgs)
 
         assert not pump.is_alive()
-        assert not doomed.done()  # that one message is lost, as expected
+        assert corrupt.done(), "the corrupt request must be failed, not left hanging"
+        assert corrupt.result(timeout=1.0).error
         assert fut.done(), "one corrupt batch must not wedge the queue"
         assert fut.result(timeout=1.0) is output
+
+    def test_one_corrupt_request_does_not_drop_its_batch_siblings(self):
+        """The split map is popped before delivery starts, so an exception
+        escaping mid-loop leaves every later request in the batch with no
+        output and no way to get one. Siblings are unrelated to the corrupt
+        entry and must still complete.
+        """
+        executor = _make_executor()
+
+        req_ids = ["r-0", "r-1", "r-2"]
+        with executor._futures_lock:
+            executor._batch_split_map["batch-1"] = {f"batch-1/{rid}": rid for rid in req_ids}
+        waiters = {rid: executor.wait_output_ready(f"batch-1/{rid}") for rid in req_ids}
+
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="batch-1",
+            output=_FakeBatchOutput(outputs, raise_for=["r-1"]),
+        )
+        pump = _feed_msgs_to_pump(executor, [msg])
+
+        assert not pump.is_alive()
+        for rid in req_ids:
+            assert waiters[rid].done(), f"{rid} was dropped by a sibling's failure"
+        # r-2 is delivered after the corrupt r-1, which is the ordering that used to break.
+        assert waiters["r-0"].result(timeout=1.0) is outputs["r-0"]
+        assert waiters["r-2"].result(timeout=1.0) is outputs["r-2"]
+        failed = waiters["r-1"].result(timeout=1.0)
+        assert "r-1" in failed.error
 
 
 class TestResultPumpDropsOutputForAbandonedWaiter:

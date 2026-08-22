@@ -948,14 +948,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
         for per_req_id, req_id in per_req_map.items():
-            req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
-            if req_output is not None and req_output.result is not None:
-                per_req_result = req_output.result
-            elif error:
-                per_req_result = DiffusionOutput(error=error)
-            else:
-                per_req_result = DiffusionOutput(error="No output result for batch request")
+            try:
+                req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
+                if req_output is not None and req_output.result is not None:
+                    per_req_result = req_output.result
+                elif error:
+                    per_req_result = DiffusionOutput(error=error)
+                else:
+                    per_req_result = DiffusionOutput(error="No output result for batch request")
+            except Exception as e:
+                # The split map has already been popped, so an exception escaping
+                # here would take every request later in this batch with it: they
+                # would never be resolved and would hang until their own timeout.
+                # One corrupt request costs one request.
+                logger.exception("Failed to extract batch output for request %s", req_id)
+                per_req_result = DiffusionOutput(error=f"Failed to extract batch output for request {req_id}: {e}")
             with self._futures_lock:
                 pending = self._output_futures.pop(per_req_id, None)
                 if pending is not None and not pending.done():
