@@ -32,6 +32,7 @@ def _tiny_model(
     num_layers: int = 2,
     num_frames_per_block: int = 1,
     sliding_window_num_frames: int = 3,
+    quant_config=None,
 ):
     return module.CausalLingBotWorldTransformer3DModel(
         patch_size=(1, 2, 2),
@@ -50,6 +51,7 @@ def _tiny_model(
         num_frames_per_block=num_frames_per_block,
         sliding_window_num_frames=sliding_window_num_frames,
         local_attn_size=-1,
+        quant_config=quant_config,
     )
 
 
@@ -463,11 +465,101 @@ def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None
         module.CausalLingBotWorldTransformer3DModel(**{field: 4})
 
 
-def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> None:
+class _RecordingQuantConfig:
+    """Minimal stand-in for a vLLM ``QuantizationConfig``.
+
+    ``LinearBase`` only calls ``get_quant_method(layer, prefix=...)``, so the
+    stub records the prefix each parallel linear presents and hands back the
+    unquantized method. That makes the recorded set an exact map of which
+    modules a real checkpoint's exclusion list would be matched against.
+    """
+
+    def __init__(self) -> None:
+        self.prefixes: list[str] = []
+
+    def get_quant_method(self, layer, prefix: str = ""):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        self.prefixes.append(prefix)
+        return UnquantizedLinearMethod()
+
+
+def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefixes() -> None:
+    module = attention_tests._load_module()
+    quant_config = _RecordingQuantConfig()
+
+    _tiny_model(module, num_layers=2, quant_config=quant_config)
+
+    per_block = {
+        "self_attn.qkv",
+        "self_attn.o",
+        "cross_attn.q",
+        "cross_attn.k",
+        "cross_attn.v",
+        "cross_attn.o",
+        "ffn.0",
+        "ffn.2",
+        "cam_injector_layer1",
+        "cam_injector_layer2",
+    }
+    expected = {"c2ws_hidden_states_layer1", "c2ws_hidden_states_layer2"} | {
+        f"blocks.{index}.{name}" for index in range(2) for name in per_block
+    }
+    assert set(quant_config.prefixes) == expected
+    # Every prefix is presented exactly once; a duplicate would mean two modules
+    # share a name and would silently collide in an exclusion list.
+    assert len(quant_config.prefixes) == len(expected)
+
+
+def test_precision_sensitive_projections_stay_out_of_the_quant_dispatch() -> None:
+    module = attention_tests._load_module()
+    quant_config = _RecordingQuantConfig()
+
+    _tiny_model(module, num_layers=2, quant_config=quant_config)
+
+    # Modulation, embedding and head projections are plain ``nn.Linear`` and must
+    # never be handed to a quantization method, regardless of the checkpoint.
+    for name in ("cam_scale_layer", "cam_shift_layer", "head", "text_embedding", "time_embedding", "time_projection"):
+        assert not any(prefix.endswith(name) or f".{name}." in prefix for prefix in quant_config.prefixes), name
+
+
+def test_orphaned_quantization_scale_reports_the_exclusion_mismatch() -> None:
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+
+    # An unquantized build receiving a scale tensor is the exact symptom of an
+    # exclusion list whose root does not match the module prefixes.
+    with pytest.raises(KeyError, match="without a quantization method"):
+        model.load_weights([("blocks.0.ffn.0.weight_scale", torch.zeros(1))])
+
+    with pytest.raises(KeyError, match="Unexpected LingBot model weight name"):
+        model.load_weights([("blocks.0.nonexistent.weight", torch.zeros(1))])
+
+
+def test_from_config_adopts_the_quantization_config_declared_by_the_checkpoint() -> None:
     module = attention_tests._load_module()
 
-    with pytest.raises(RuntimeError, match="quant_config.*not supported"):
-        module.CausalLingBotWorldTransformer3DModel(quant_config=object())
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
+    disk_quant_config = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    built = object()
+    calls: list[tuple] = []
+
+    import vllm_omni.quantization.factory as factory
+
+    original = factory.resolve_quant_config_from_disk
+    factory.resolve_quant_config_from_disk = lambda active, disk: (calls.append((active, disk)), built)[1]
+    try:
+        probe = ConfigProbe.from_config(
+            {"_class_name": "CausalLingBotWorldTransformer3DModel", "quantization_config": disk_quant_config}
+        )
+    finally:
+        factory.resolve_quant_config_from_disk = original
+
+    assert calls == [(None, disk_quant_config)]
+    assert probe.received_kwargs["quant_config"] is built
 
 
 def test_from_config_accepts_diffusers_metadata_and_normalizes_patch_size() -> None:

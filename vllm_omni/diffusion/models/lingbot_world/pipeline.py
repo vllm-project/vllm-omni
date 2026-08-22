@@ -165,8 +165,6 @@ def _validate_scheduler_config(config: dict[str, Any]) -> None:
 
 
 def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
-    if getattr(od_config, "quantization_config", None) is not None:
-        raise NotImplementedError("LingBot World v1 does not support quantization.")
     parallel_config = getattr(od_config, "parallel_config", None)
     if parallel_config is None:
         return
@@ -450,10 +448,15 @@ class LingBotWorldCausalDMDPipeline(
             self.vae = self.vae.to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        # The quantization prefix is rooted at the transformer's own module tree
+        # (``blocks.N.…``, ``head``, ``patch_embedding``) because that is how
+        # ModelOpt/compressed-tensors checkpoints spell their exclusion lists.
+        # It is unrelated to the ``"transformer."`` prefix the pipeline weight
+        # loader uses, which addresses ``self.transformer`` from the pipeline.
         self.transformer = CausalLingBotWorldTransformer3DModel.from_config(
             transformer_config,
             quant_config=getattr(od_config, "quantization_config", None),
-            prefix="transformer",
+            prefix="",
         )
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
