@@ -667,6 +667,7 @@ class LongCatImageEditPipeline(
                 negative_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep / 1000,
+                    "guidance": guidance,
                     "encoder_hidden_states": negative_prompt_embeds,
                     "txt_ids": negative_text_ids,
                     "img_ids": latent_image_ids,

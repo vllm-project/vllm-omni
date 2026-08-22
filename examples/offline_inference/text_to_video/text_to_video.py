@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -462,17 +461,6 @@ def main():
             "scm_steps_policy": "dynamic",
         }
 
-    # Configure parallel settings
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        pipeline_parallel_size=args.pipeline_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-    )
-
     profiler_enabled = args.profiler_config is not None
 
     omni_kwargs = dict(
@@ -481,7 +469,13 @@ def main():
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,

@@ -829,13 +829,12 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)

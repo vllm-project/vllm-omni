@@ -185,6 +185,79 @@ class TestDistributedLayerwiseOffloadHook:
         assert next_block.weight.stride() == expected_stride
         assert torch.equal(next_block.weight, expected)
 
+    def test_allgather_reconstructs_online_fp8_weight_and_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """DLO must reconstruct finalized online-FP8 tensors byte-for-byte."""
+
+        class OnlineFp8Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical_weight = torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0, 4.0],
+                        [5.0, 6.0, 7.0, 8.0],
+                        [9.0, 10.0, 11.0, 12.0],
+                    ],
+                    dtype=torch.float32,
+                ).to(torch.float8_e4m3fn)
+                self.weight = nn.Parameter(logical_weight.t(), requires_grad=False)
+                self.weight_scale = nn.Parameter(torch.tensor([0.25]), requires_grad=False)
+
+        current_block = OnlineFp8Block()
+        rank0_block = OnlineFp8Block()
+        rank1_block = OnlineFp8Block()
+        expected_weight = rank0_block.weight.detach().clone()
+        expected_scale = rank0_block.weight_scale.detach().clone()
+        expected_stride = rank0_block.weight.stride()
+
+        rank0_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank0_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank1_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank1_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=1,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(OnlineFp8Block())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert rank0_block.weight.stride() == expected_stride
+        torch.testing.assert_close(
+            rank0_block.weight.float(),
+            expected_weight.float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(rank0_block.weight_scale, expected_scale)
+
     def test_dtensor_wrapper_preserved_across_prefetch_and_offload(self, dist_group, patched_offload_runtime):
         """DTensor wrapper should be preserved through prefetch/offload cycle."""
         current_block = TinyBlock(_make_values(1.0))

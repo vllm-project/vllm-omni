@@ -14,7 +14,6 @@ import itertools
 import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters import (
-    LEGACY_TTS_DETECTORS,
     TTS_ADAPTER_REGISTRY,
     all_tts_stage_keys,
     detect_tts_model_type,
@@ -154,6 +153,7 @@ _PIPELINE_STAGES = [
     "indextts2_talker",
     "latent_generator",
     "llm",
+    "minimax_music3_ar",
     "ming_tts",
     "moss_tts",
     "moss_tts_codec",
@@ -282,24 +282,14 @@ def test_entry_stage_archs_is_ming_only():
     assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
 
 
-def test_every_detected_type_is_adapter_backed_or_declared_legacy():
-    """Detection may only name a model that has an adapter or an explicit
-    :data:`LEGACY_TTS_DETECTORS` entry — never an undeclared string."""
-    legacy_names = {d.name for d in LEGACY_TTS_DETECTORS}
+def test_every_detected_type_is_adapter_backed():
+    """Detection may only name a model that has a registered adapter."""
     for stage, arch in itertools.product(_STAGES, _ARCHS):  # full cross product on purpose
         detected = detect_tts_model_type(stage, arch)
         if detected is None:
             continue
-        assert detected in TTS_ADAPTER_REGISTRY or detected in legacy_names, (
+        assert detected in TTS_ADAPTER_REGISTRY, (
             f"detection produced undeclared model type {detected!r} for stage={stage!r} arch={arch!r}"
-        )
-
-
-def test_legacy_detectors_have_no_adapter():
-    """A legacy entry that gained an adapter must be deleted from the list."""
-    for detector in LEGACY_TTS_DETECTORS:
-        assert resolve_adapter(detector.name) is None, (
-            f"{detector.name!r} now has an adapter; remove it from LEGACY_TTS_DETECTORS"
         )
 
 

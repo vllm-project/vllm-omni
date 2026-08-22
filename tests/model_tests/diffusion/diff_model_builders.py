@@ -54,14 +54,18 @@ def _shrink_flux_t5_text_encoder(config: dict) -> dict:
 
 
 def _shrink_qwen_text_encoder_config(config: dict, hidden_size: int = 64) -> dict:
-    text_config = config["text_config"]
+    """Shrink a Qwen2.5-VL text encoder (nested Qwen-Image or flat LongCat layout)."""
+    # Nested: text fields live under text_config, with top-level mirrors.
+    # Flat: text fields live at the top level.
+    text_config = config["text_config"] if "text_config" in config else config
     old_head_dim = text_config["hidden_size"] / text_config["num_attention_heads"]
     text_config["num_hidden_layers"] = 2
     text_config["intermediate_size"] = 64
     text_config["hidden_size"] = hidden_size
     text_config["num_attention_heads"] = 2
     text_config["num_key_value_heads"] = 2
-    text_config["layer_types"] = text_config["layer_types"][:2]
+    if "layer_types" in text_config:
+        text_config["layer_types"] = text_config["layer_types"][:2]
     factor = old_head_dim / (hidden_size / 2)
     mrope_section = text_config["rope_scaling"]["mrope_section"]
     text_config["rope_scaling"]["mrope_section"] = [round(d / factor) for d in mrope_section]
@@ -102,6 +106,22 @@ def tiny_qwen_image_edit_plus_builder() -> str:
         "QwenImageEditPlusPipeline",
         "Qwen/Qwen-Image-Edit-2511",
         transform={"text_encoder": _shrink_qwen_text_encoder_config, "transformer": _shrink_qwen_transformer_config},
+    )
+
+
+def tiny_longcat_image_builder() -> str:
+    return build_tiny_from_configs(
+        "LongCatImagePipeline",
+        "meituan-longcat/LongCat-Image",
+        transform={
+            "text_encoder": _shrink_qwen_text_encoder_config,
+            "transformer": partial(
+                _shrink_dit_rope_config,
+                num_single_layers=2,
+                default_axes_dims_rope=[16, 56, 56],
+                joint_attention_dim=64,
+            ),
+        },
     )
 
 

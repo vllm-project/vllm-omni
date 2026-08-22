@@ -14,7 +14,7 @@ from vllm.inputs import tokens_input
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
     INDEXTTS25_MIN_DURATION_FACTOR,
@@ -240,6 +240,15 @@ class IndexTTS2Adapter(ARTTSAdapter):
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: OpenAICreateSpeechRequest,
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
 
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server

@@ -48,6 +48,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
     stage_sends_async_output,
 )
+from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -106,7 +107,7 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
 
-class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
+class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
     def __init__(self, *args, **kwargs):
@@ -140,7 +141,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._init_duplex_sampling_state()
         #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
+
+    def _update_states(self, scheduler_output: SchedulerOutput):
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+        self._update_duplex_sampling_states(scheduler_output)
+        return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -767,6 +778,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             if callable(flush_pending_metadata):
                 flush_pending_metadata(req_ids[:num_reqs])
 
+            # [Omni] Hand the model the batch's req_ids in logits order, for
+            # models that gate logits per request. Mirrors gpu_ar_model_runner.
+            # Only valid without spec decode: there logits_indices carries several
+            # rows per request, so row i no longer corresponds to req_ids[i].
+            if spec_decode_metadata is None:
+                set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                if callable(set_batch_req_ids):
+                    set_batch_req_ids(req_ids[:num_reqs])
+
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
             if multimodal_outputs is not None:
@@ -899,10 +919,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                sampler_output = model_sample(
-                    logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
-                )
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                self._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(

@@ -23,8 +23,10 @@ import vllm_omni.diffusion.attention.backends.utils.piecewise_attn as piecewise_
 from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     Segment,
+    build_paged_piecewise_plan,
     build_segments,
     piecewise_attn,
+    run_paged_piecewise_plan,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -82,6 +84,72 @@ def test_build_segments_full_span_retains_global_kv_end():
     segments = build_segments([(2, 7)], query_offset=4, query_len=2)
 
     assert segments == [Segment(q_start=4, q_end=6, kv_end=7, mode="full")]
+
+
+def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
+    full_attn_spans = [[(2, 5)], [(4, 7)]]
+    plan = build_paged_piecewise_plan(
+        full_attn_spans,
+        query_offsets=[0, 2],
+        query_lens=[6, 6],
+        seq_lens=[6, 8],
+        device=DEVICE,
+    )
+    query = torch.arange(12 * 2 * 4, dtype=torch.float32).reshape(12, 2, 4)
+    key = query + 100
+    value = query + 200
+    calls = []
+
+    def run_segment(segment_query, segment_key, segment_value, segment_batch):
+        calls.append(
+            (
+                [segment.mode for segment in segment_batch.row_segments],
+                [segment.kv_end for segment in segment_batch.row_segments],
+                segment_batch.query_indices.tolist(),
+            )
+        )
+        torch.testing.assert_close(segment_key, segment_query + 100)
+        torch.testing.assert_close(segment_value, segment_query + 200)
+        return segment_query
+
+    output = run_paged_piecewise_plan(
+        query,
+        key,
+        value,
+        plan,
+        plan.segments,
+        run_segment,
+    )
+
+    torch.testing.assert_close(output, query)
+    assert calls == [
+        (["causal", "causal"], [2, 4], [0, 1, 6, 7]),
+        (["full", "full"], [5, 7], [2, 3, 4, 8, 9, 10]),
+        (["causal", "causal"], [6, 8], [5, 11]),
+    ]
+
+
+def test_paged_piecewise_runner_uses_runner_output_shape():
+    plan = build_paged_piecewise_plan(
+        [[(2, 5)]],
+        query_offsets=[0],
+        query_lens=[6],
+        seq_lens=[6],
+        device=DEVICE,
+    )
+    query = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4)
+
+    output = run_paged_piecewise_plan(
+        query,
+        query,
+        query,
+        plan,
+        plan.segments,
+        lambda segment_query, *_args: segment_query[..., :3],
+    )
+
+    assert output.shape == (6, 2, 3)
+    torch.testing.assert_close(output, query[..., :3])
 
 
 @pytest.mark.parametrize("global_spans", SPAN_CASES)

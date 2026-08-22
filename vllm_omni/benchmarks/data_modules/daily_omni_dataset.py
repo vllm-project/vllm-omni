@@ -7,7 +7,8 @@ Dataset source: https://huggingface.co/datasets/liarliar/Daily-Omni
 
 Supports loading QA metadata from:
 - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
-- HuggingFace datasets (``dataset_path``): legacy online mode
+- HuggingFace Hub id (``dataset_path``): resolved with ``snapshot_download`` to the repo's
+  ``qa.json``, which reads the hub cache and therefore also works under ``HF_HUB_OFFLINE``
 
 Video/audio files normally come from extracted ``Videos.tar``. When ``--daily-omni-video-dir``
 is not set, the first request that needs on-disk media downloads that archive from the Hugging Face
@@ -24,9 +25,9 @@ Why ``BenchmarkDataset`` instead of ``HuggingFaceDataset``?
     This class therefore inherits only ``BenchmarkDataset`` (minimal: ``dataset_path``,
     ``random_seed``, ``self.data``) and implements **two explicit loaders**:
     ``_load_from_local_json`` (default path for air-gapped runs) and ``_load_from_huggingface``
-    (optional legacy path for users who prefer ``datasets`` + Hub cache). The latter is **not**
+    (Hub ids, resolved to the repo's ``qa.json`` through the hub cache). The latter is **not**
     inheritance; it is the same Hub rows as before, factored into a helper so one class can
-    serve both deployment modes without mandatory ``datasets`` when using ``qa_json_path``.
+    serve both deployment modes without mandatory ``datasets``.
 
 Usage:
     from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset
@@ -38,7 +39,7 @@ Usage:
         random_seed=42,
     )
 
-    # HuggingFace mode (legacy, requires network)
+    # Hub id mode (works offline once the repo is in the HF hub cache)
     dataset = DailyOmniDataset(
         dataset_path="liarliar/Daily-Omni",
         dataset_split="train",
@@ -208,6 +209,68 @@ def _resolve_hf_cache_snapshot(path: Path) -> Path:
     if revisions:
         return max(revisions, key=lambda p: p.stat().st_mtime)
     return path
+
+
+#: QA metadata pulled by :func:`ensure_daily_omni_hub_root`. ``Videos.tar`` is deliberately left
+#: out: it is ~60GB and only :func:`ensure_daily_omni_hub_videos_dir` needs it, lazily, once a
+#: request actually asks for media.
+_DAILY_OMNI_QA_ALLOW_PATTERNS = ["qa.json", "QA.json"]
+
+
+def ensure_daily_omni_hub_root(repo_id: str) -> Path:
+    """Resolve a Daily-Omni Hub id to its snapshot directory, downloading QA metadata if needed.
+
+    Mirrors :func:`...seed_tts_dataset.resolve_seed_tts_root`: ``snapshot_download`` resolves the
+    repo through the **hub cache**, so an air-gapped run (``HF_HUB_OFFLINE=1``) keeps working as
+    long as the dataset was pre-staged there. ``datasets.load_dataset`` cannot do this — it only
+    consults the separate *datasets* cache, which a ``hf download`` never populates.
+
+    Raises:
+        ImportError: if ``huggingface_hub`` is not installed.
+        ValueError: if ``repo_id`` is empty.
+    """
+    rid = (repo_id or "").strip()
+    if not rid:
+        raise ValueError("repo_id is required to download Daily-Omni from Hugging Face")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "Install huggingface_hub to load Daily-Omni from the Hub, or pass a local "
+            "--daily-omni-qa-json / --daily-omni-video-dir mirror."
+        ) from e
+
+    cache = snapshot_download(
+        repo_id=rid,
+        repo_type="dataset",
+        allow_patterns=_DAILY_OMNI_QA_ALLOW_PATTERNS,
+    )
+    root = _resolve_hf_cache_snapshot(Path(cache).resolve())
+    logger.info("Daily-Omni Hub snapshot ready at %s (repo=%s)", root, rid)
+    return root
+
+
+def _daily_omni_qa_load_error(
+    repo_id: str | None,
+    snapshot_error: Exception | None,
+    datasets_error: Exception,
+) -> RuntimeError:
+    """Compose an actionable error after both QA-metadata sources failed.
+
+    Offline CI hits this when the dataset is missing from the hub cache *or* staged under a
+    different repo id, so the message names both attempts and the flags that bypass them.
+    """
+    parts = [f"Could not load Daily-Omni QA metadata for {repo_id!r}."]
+    if snapshot_error is not None:
+        parts.append(f"huggingface_hub snapshot_download failed: {type(snapshot_error).__name__}: {snapshot_error}")
+    parts.append(f"datasets.load_dataset failed: {type(datasets_error).__name__}: {datasets_error}")
+    parts.append(
+        "For offline runs, pre-stage the dataset in the HF hub cache "
+        "(`hf download --repo-type dataset <repo>`) and make sure the repo id matches, "
+        "or pass --daily-omni-qa-json / --daily-omni-video-dir pointing at a local mirror."
+    )
+    return RuntimeError(" ".join(parts))
 
 
 def resolve_daily_omni_local_root(dataset_path: str | None) -> Path | None:
@@ -433,7 +496,8 @@ class DailyOmniDataset(BenchmarkDataset):
 
     QA metadata can be loaded from:
     - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
-    - HuggingFace datasets (``dataset_path``): legacy online mode
+    - HuggingFace Hub id (``dataset_path``): the repo's ``qa.json`` via ``snapshot_download``
+      (hub-cache backed, offline-safe); ``datasets.load_dataset`` only as a parquet fallback
 
     Video/audio files normally come from extracted ``Videos.tar``. When ``video_dir`` is not set,
     the first sample that needs on-disk media downloads that archive from the Hugging Face dataset
@@ -444,7 +508,8 @@ class DailyOmniDataset(BenchmarkDataset):
         qa_json_path: Path to local qa.json file (offline mode, preferred). When provided,
             ``dataset_path`` and ``dataset_split`` are ignored.
         dataset_path: HuggingFace dataset path (e.g., "liarliar/Daily-Omni"). Used only if
-            ``qa_json_path`` is not provided (legacy online mode).
+            ``qa_json_path`` is not provided; resolved through the hub cache, so a pre-staged
+            repo also loads with ``HF_HUB_OFFLINE=1``.
         dataset_split: Dataset split to use (default: "train"). Used only in online mode.
         random_seed: Random seed for shuffling
         video_dir: Directory containing extracted video files (default: None; may be filled lazily
@@ -602,21 +667,42 @@ class DailyOmniDataset(BenchmarkDataset):
         self.data = _ListDatasetIterator(data)
 
     def _load_from_huggingface(self) -> None:
-        """Load QA rows via ``datasets.load_dataset`` (legacy / convenience path).
+        """Load QA rows for a Hub id, preferring the repo's ``qa.json`` over ``datasets``.
 
-        Kept for backward compatibility: callers can still pass ``dataset_path=liarliar/Daily-Omni``
-        and get the same parquet-backed rows as the Hub dataset card, with streaming (or
-        non-streaming if ``no_stream=True``) and shuffle.
+        The Hub repo ships ``qa.json`` (1,197 rows) next to ``Videos.tar``, so the primary path is
+        :func:`ensure_daily_omni_hub_root` → :meth:`_load_from_local_json`: ``snapshot_download``
+        reads the hub cache and therefore works under ``HF_HUB_OFFLINE``, the same contract as
+        Seed-TTS. ``datasets.load_dataset`` remains only as a fallback for mirrors
+        that publish parquet rows instead of ``qa.json``; it consults the *datasets* cache rather
+        than the hub cache and streams shards over HTTP, so it cannot serve air-gapped runs.
 
         This is intentionally **not** implemented by subclassing ``HuggingFaceDataset``: that base
         always runs Hub ``load_dataset`` from its constructor and expects a Hub id as the primary
         API; Daily-Omni instead chooses the source in ``load_data()`` (JSON vs Hub) while sharing
         one ``sample()`` / request-building implementation for both.
         """
+        snapshot_error: Exception | None = None
+        try:
+            root = ensure_daily_omni_hub_root(self.dataset_path)
+        except Exception as e:  # noqa: BLE001 - any failure just falls through to `datasets`
+            snapshot_error = e
+        else:
+            qa_json = daily_omni_local_qa_json(root)
+            if qa_json is not None:
+                self.qa_json_path = qa_json
+                logger.info("Loading Daily-Omni QA metadata from Hub snapshot: %s", qa_json)
+                self._load_from_local_json()
+                return
+            logger.info(
+                "Hub snapshot %s ships no qa.json; falling back to `datasets.load_dataset`",
+                root,
+            )
+
         if load_dataset is None:
-            raise ImportError(
-                "datasets library is required for HuggingFace mode. "
-                "Install with: pip install datasets, or use local JSON mode instead."
+            raise _daily_omni_qa_load_error(
+                self.dataset_path,
+                snapshot_error,
+                ImportError("datasets library is not installed (pip install datasets)"),
             )
 
         load_kw: dict[str, Any] = {
@@ -626,7 +712,10 @@ class DailyOmniDataset(BenchmarkDataset):
         }
         if self.dataset_subset is not None:
             load_kw["name"] = self.dataset_subset
-        ds = load_dataset(self.dataset_path, **load_kw)
+        try:
+            ds = load_dataset(self.dataset_path, **load_kw)
+        except Exception as e:
+            raise _daily_omni_qa_load_error(self.dataset_path, snapshot_error, e) from e
         if not getattr(self, "disable_shuffle", False):
             ds = ds.shuffle(seed=self.random_seed)
         self.data = ds

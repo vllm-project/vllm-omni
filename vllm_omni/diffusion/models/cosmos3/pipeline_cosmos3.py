@@ -126,6 +126,7 @@ from .utils import (
     ROBOLAB_DEFAULT_RAW_ACTION_DIM,
     ROBOLAB_DEFAULT_RESOLUTION,
     ROBOLAB_MIDTRAIN_RAW_ACTION_DIM,
+    VIDEO_RES_SIZE_INFO,
     RoboLabActionPostprocessInputs,
     RoboLabPolicyInputs,
     build_abs_pose_from_components,
@@ -163,6 +164,14 @@ COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{widt
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
 COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
+COSMOS3_TRANSFER_SYSTEM_PROMPT = (
+    "You are a helpful assistant that generates images or videos following the user's instructions"
+    " and control signals (edge maps, blur, depth, or segmentation)."
+)
+COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
+    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
+    "visible structure must align with the {hint_names} signal at every frame."
+)
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
 COSMOS3_T2V_DEFAULT_WIDTH = 1280
@@ -191,6 +200,7 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -233,6 +243,50 @@ def _format_json_object_prompt(
 
     prompt_obj.update(metadata)
     return json.dumps(prompt_obj)
+
+
+def _json_object_aspect_ratio(prompt: str) -> Any | None:
+    """Return an aspect-ratio field from a JSON-object prompt, if present."""
+    try:
+        prompt_obj = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(prompt_obj, dict):
+        return None
+    return prompt_obj.get("aspect_ratio")
+
+
+def _normalize_aspect_ratio(value: Any) -> str | None:
+    """Normalize supported ratio spellings for comparison and prompt metadata."""
+    if value is None:
+        return None
+    parts = str(value).strip().replace(":", ",").split(",")
+    if len(parts) != 2:
+        return None
+    try:
+        width, height = (int(part.strip()) for part in parts)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    divisor = math.gcd(width, height)
+    return f"{width // divisor},{height // divisor}"
+
+
+def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
+    """Return the nearest supported Cosmos aspect-ratio label."""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Cosmos3 canvas dimensions must be positive, got {width}x{height}.")
+    canvas_ratio = width / height
+
+    def ratio_value(label: str) -> float:
+        ratio_width, ratio_height = (int(part) for part in label.split(","))
+        return ratio_width / ratio_height
+
+    return min(
+        (label for sizes in VIDEO_RES_SIZE_INFO.values() for label in sizes),
+        key=lambda label: abs(canvas_ratio - ratio_value(label)),
+    )
 
 
 def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransformer]:
@@ -492,6 +546,17 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
         # Resolve missing H/W.
         if transfer_requested:
+            requested_width = request.sampling_params.width
+            requested_height = request.sampling_params.height
+            if (
+                requested_width is not None
+                and requested_height is not None
+                and COSMOS3_TRANSFER_REQUESTED_SIZE_KEY not in extra
+            ):
+                extra[COSMOS3_TRANSFER_REQUESTED_SIZE_KEY] = {
+                    "width": int(requested_width),
+                    "height": int(requested_height),
+                }
             _set_transfer_size_from_image(request, image)
         elif request.sampling_params.height is None or request.sampling_params.width is None:
             if action_mode is not None:
@@ -2068,6 +2133,12 @@ class Cosmos3OmniDiffusersPipeline(
         sp: OmniDiffusionSamplingParams,
         use_system_prompt: bool = False,
         is_t2i: bool = False,
+        system_prompt: str | None = None,
+        prompt_suffix: str | None = None,
+        use_duration_template: bool | None = None,
+        use_resolution_template: bool | None = None,
+        negative_metadata_mode: str | None = None,
+        aspect_ratio_override: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Format prompts with metadata templates and tokenize.
 
@@ -2075,24 +2146,67 @@ class Cosmos3OmniDiffusersPipeline(
 
         For T2I (``is_t2i=True``) the duration template is suppressed (no FPS
         or duration concept for a single image) and the image-flavored
-        resolution template is used.
+        resolution template is used. ``prompt_suffix`` is appended only to the
+        positive prompt, after metadata formatting. ``negative_metadata_mode``
+        controls whether the negative branch receives no metadata, the same
+        metadata as the positive branch, or inverse metadata.
         """
         # Route cosmos3-specific controls through ``_get_sp_param`` so they
         # are picked up from ``extra_args`` (OpenAI endpoint path) as well
         # as from direct attributes.
-        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False)) and not is_t2i
+        if use_duration_template is None:
+            use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False))
+        if use_resolution_template is None:
+            use_resolution_template = bool(self._get_sp_param(sp, "use_resolution_template", False))
+        if negative_metadata_mode is None:
+            negative_metadata_mode = str(self._get_sp_param(sp, "negative_metadata_mode", "inverse"))
+        negative_metadata_mode = negative_metadata_mode.strip().lower()
+        if negative_metadata_mode not in {"none", "same", "inverse"}:
+            raise ValueError(
+                "Cosmos3 negative_metadata_mode must be one of 'none', 'same', or 'inverse'; "
+                f"got {negative_metadata_mode!r}."
+            )
+
+        use_duration_template = use_duration_template and not is_t2i
         dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if bool(self._get_sp_param(sp, "use_resolution_template", False)):
+        if use_resolution_template:
             res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
         else:
             res_tmpl = None
+        requested_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
+        prompt_aspect_ratio = _json_object_aspect_ratio(prompt)
+        metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
+        canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
+        normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
+        has_aspect_ratio_conflict = (
+            aspect_ratio_override is None
+            and metadata_aspect_ratio is not None
+            and normalized_metadata_ratio != canvas_aspect_ratio
+        )
+        if has_aspect_ratio_conflict:
+            aspect_ratio_source = (
+                "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
+            )
+            if _is_rank_zero():
+                logger.warning(
+                    "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
+                    aspect_ratio_source,
+                    metadata_aspect_ratio,
+                    width,
+                    height,
+                    canvas_aspect_ratio,
+                )
+            metadata_aspect_ratio = canvas_aspect_ratio
+        elif aspect_ratio_override is not None:
+            metadata_aspect_ratio = aspect_ratio_override
+
         json_prompt = _format_json_object_prompt(
             prompt,
             num_frames=num_frames,
             frame_rate=frame_rate,
             height=height,
             width=width,
-            aspect_ratio=self._get_sp_param(sp, "aspect_ratio", None),
+            aspect_ratio=metadata_aspect_ratio,
         )
         if json_prompt is not None:
             prompt = json_prompt
@@ -2106,37 +2220,44 @@ class Cosmos3OmniDiffusersPipeline(
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
             )
+        if prompt_suffix:
+            prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
         if _is_rank_zero():
             logger.info("Final prompt: '%s'", prompt)
 
-        # Negative prompt: inverse templates ("not {duration}...", "not {height}x{width}...").
-        # Applied whenever the matching positive template is enabled; an empty
-        # negative_prompt yields output that starts with the template, not a dot.
-        inv_dur = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
-        if res_tmpl is None:
-            inv_res = None
-        elif is_t2i:
-            inv_res = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+        if negative_metadata_mode == "none":
+            negative_dur_tmpl = None
+            negative_res_tmpl = None
+        elif negative_metadata_mode == "same":
+            negative_dur_tmpl = dur_tmpl
+            negative_res_tmpl = res_tmpl
         else:
-            inv_res = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
+            negative_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
+            if res_tmpl is None:
+                negative_res_tmpl = None
+            elif is_t2i:
+                negative_res_tmpl = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+            else:
+                negative_res_tmpl = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
         negative_prompt = self._apply_metadata_templates(
             negative_prompt,
             num_frames,
             frame_rate,
             height,
             width,
-            duration_template=inv_dur,
-            resolution_template=inv_res,
-            force_duration_template=True,
+            duration_template=negative_dur_tmpl,
+            resolution_template=negative_res_tmpl,
+            force_duration_template=negative_metadata_mode == "inverse",
         )
 
-        default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
-        sys_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
+        if system_prompt is None:
+            default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
+            system_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
         cond_ids, cond_mask = self._tokenize_prompt(
-            prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         return cond_ids, cond_mask, uncond_ids, uncond_mask
 
@@ -2857,11 +2978,76 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         sp: OmniDiffusionSamplingParams,
         source_hw: tuple[int, int] | None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, str]:
         resolution = self._get_sp_param(sp, "resolution", self._get_sp_param(sp, "image_size", 720))
         source_h, source_w = source_hw or (COSMOS3_T2V_DEFAULT_HEIGHT, COSMOS3_T2V_DEFAULT_WIDTH)
         target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
-        return int(target_h), int(target_w)
+        aspect_ratio = next(
+            ratio for ratio, size in VIDEO_RES_SIZE_INFO[str(resolution)].items() if size == (target_w, target_h)
+        )
+        return int(target_h), int(target_w), aspect_ratio
+
+    def _warn_transfer_bucket_conflicts(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        prompt: str,
+        *,
+        source_hw: tuple[int, int] | None,
+        height: int,
+        width: int,
+        aspect_ratio: str,
+    ) -> None:
+        """Explain transfer's bucket selection when it overrides request metadata."""
+        if not _is_rank_zero():
+            return
+
+        requested_size_data = self._get_sp_param(sp, COSMOS3_TRANSFER_REQUESTED_SIZE_KEY, None)
+        if isinstance(requested_size_data, Mapping):
+            requested_width = requested_size_data.get("width")
+            requested_height = requested_size_data.get("height")
+        else:
+            requested_width = getattr(sp, "width", None)
+            requested_height = getattr(sp, "height", None)
+        if requested_width is not None and requested_height is not None:
+            try:
+                requested_size = (int(requested_width), int(requested_height))
+            except (TypeError, ValueError):
+                requested_size = None
+            if requested_size is not None and requested_size != (width, height):
+                source_description = (
+                    f"control input {source_hw[1]}x{source_hw[0]} (WxH)"
+                    if source_hw is not None
+                    else "the default transfer geometry"
+                )
+                resolution = self._get_sp_param(sp, "resolution", self._get_sp_param(sp, "image_size", 720))
+                logger.warning(
+                    "Cosmos3 transfer ignores requested size=%dx%d (WxH); %s selected the %s resolution=%s "
+                    "bucket, %dx%d (WxH). Transfer supports canonical Cosmos buckets, not arbitrary output sizes.",
+                    *requested_size,
+                    source_description,
+                    aspect_ratio,
+                    resolution,
+                    width,
+                    height,
+                )
+
+        request_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
+        aspect_ratio_source = "requested aspect_ratio"
+        if request_aspect_ratio is None:
+            request_aspect_ratio = _json_object_aspect_ratio(prompt)
+            aspect_ratio_source = "JSON prompt aspect_ratio"
+        normalized_requested_ratio = _normalize_aspect_ratio(request_aspect_ratio)
+        if normalized_requested_ratio is not None and normalized_requested_ratio != aspect_ratio:
+            logger.warning(
+                "Cosmos3 transfer %s=%r conflicts with the control-selected %s bucket, %dx%d (WxH); "
+                "using %s for prompt metadata.",
+                aspect_ratio_source,
+                request_aspect_ratio,
+                aspect_ratio,
+                width,
+                height,
+                aspect_ratio,
+            )
 
     @staticmethod
     def _first_transfer_control_hw(transfer_config: Cosmos3TransferConfig) -> tuple[int, int] | None:
@@ -2890,6 +3076,7 @@ class Cosmos3OmniDiffusersPipeline(
         control_latents: list[torch.Tensor],
         shared_kwargs: dict[str, Any],
         *,
+        control_weights: list[float] | None = None,
         velocity_mask: torch.Tensor,
         condition_latents: torch.Tensor,
         guidance_interval: tuple[float, float] | None = None,
@@ -2925,6 +3112,7 @@ class Cosmos3OmniDiffusersPipeline(
                     text_ids=cond_ids,
                     text_mask=cond_mask,
                     control_latents=control_latents,
+                    control_weights=control_weights,
                     _cosmos3_cache_key="transfer_cond_full",
                     **shared_kwargs,
                 )
@@ -2946,6 +3134,7 @@ class Cosmos3OmniDiffusersPipeline(
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
                             control_latents=control_latents,
+                            control_weights=control_weights,
                             _cosmos3_cache_key="transfer_uncond_full",
                             **shared_kwargs,
                         ),
@@ -2993,6 +3182,7 @@ class Cosmos3OmniDiffusersPipeline(
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
                             control_latents=control_latents,
+                            control_weights=control_weights,
                             _cosmos3_cache_key="transfer_uncond_full",
                             **shared_kwargs,
                         ),
@@ -3043,7 +3233,15 @@ class Cosmos3OmniDiffusersPipeline(
             source_hw = (int(input_frames.shape[-2]), int(input_frames.shape[-1]))
         else:
             source_hw = self._first_transfer_control_hw(transfer_config)
-        height, width = self._transfer_bucket_size(sp, source_hw)
+        height, width, transfer_aspect_ratio = self._transfer_bucket_size(sp, source_hw)
+        self._warn_transfer_bucket_conflicts(
+            sp,
+            prompt,
+            source_hw=source_hw,
+            height=height,
+            width=width,
+            aspect_ratio=transfer_aspect_ratio,
+        )
 
         if input_frames is not None:
             if tuple(input_frames.shape[-2:]) != (height, width):
@@ -3113,7 +3311,10 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+        transfer_prompt_suffix = None
+        if transfer_config.emphasize_control_in_prompt:
+            hint_names = ", ".join(hint.key for hint in transfer_config.ordered_hints)
+            transfer_prompt_suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint_names)
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
@@ -3124,6 +3325,13 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
+        for ignored_key in ("system_prompt", "use_system_prompt"):
+            if self._get_sp_param(sp, ignored_key, None) is not None:
+                logger.warning_once(
+                    "Cosmos3 transfer ignores the '%s' request parameter and always "
+                    "tokenizes both CFG branches with the transfer-specific system prompt.",
+                    ignored_key,
+                )
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -3133,8 +3341,14 @@ class Cosmos3OmniDiffusersPipeline(
             width,
             max_sequence_length,
             sp,
-            use_system_prompt,
+            use_system_prompt=True,
             is_t2i=False,
+            system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+            prompt_suffix=transfer_prompt_suffix,
+            use_duration_template=bool(self._get_sp_param(sp, "use_duration_template", True)),
+            use_resolution_template=bool(self._get_sp_param(sp, "use_resolution_template", True)),
+            negative_metadata_mode=str(self._get_sp_param(sp, "negative_metadata_mode", "same")),
+            aspect_ratio_override=transfer_aspect_ratio,
         )
 
         output_chunks: list[torch.Tensor] = []
@@ -3227,6 +3441,7 @@ class Cosmos3OmniDiffusersPipeline(
                 control_guidance=transfer_config.control_guidance,
                 control_guidance_interval=transfer_config.control_guidance_interval,
                 control_latents=control_latents,
+                control_weights=transfer_config.normalized_control_weights,
                 shared_kwargs=shared_kwargs,
                 velocity_mask=velocity_mask,
                 condition_latents=condition_latents,

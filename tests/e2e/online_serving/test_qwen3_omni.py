@@ -149,9 +149,18 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
     2. The number of cached tokens is divisible by the block size used in
     test_params, because currently upstream vLLM does not cache partial
     blocks.
+    3. The first request also reports prompt token details; details must be
+    present whenever --enable-prompt-tokens-details is on, even when zero
+    tokens are cached. (An exact cached_tokens == 0 check would be
+    order-dependent here: the module-scoped server may have already cached
+    the shared system-prompt blocks from earlier tests.)
+
+    Returns the (first, second) responses for additional per-test assertions.
     """
-    openai_client.send_omni_request(request_config, request_num=1)[0]
+    first_response = openai_client.send_omni_request(request_config, request_num=1)[0]
     cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+
+    assert first_response.cached_tokens is not None
 
     # Ensure that we have a prefix cache hit on the second request and that only the last
     # partial block is uncached (since currently we don't cache partial blocks).
@@ -162,6 +171,8 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
     assert num_cached_tokens > 0
     assert num_cached_tokens % BLOCK_SIZE == 0
     assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
+
+    return first_response, cached_response
 
 
 @pytest.mark.advanced_model
@@ -195,7 +206,10 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
         "stream": False,
         "modalities": ["text"],
     }
-    _run_prefix_cache_check(openai_client, request_config)
+    first_response, _ = _run_prefix_cache_check(openai_client, request_config)
+
+    assert first_response.multimodal_tokens is not None
+    assert first_response.multimodal_tokens.get("image", 0) > 0
 
 
 @pytest.mark.advanced_model

@@ -65,6 +65,31 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
+## CPU MP4 response encoding
+
+For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
+host CPU through PyAV/libx264 after generation. The response encoder selects the
+path automatically at runtime: inputs with a supported frame shape, common dtype,
+and RGB per-channel contiguous layout use direct planar frames; other inputs
+fall back to the legacy path before the PyAV container is opened. No CLI flag,
+model declaration, or user configuration is required. Streaming fMP4 output is
+unchanged.
+
+A community benchmark on 2x Xeon 8480C reported the following comparison
+between the legacy and direct planar paths
+([full result](https://github.com/vllm-project/vllm-omni/pull/6288#issuecomment-5337546499)):
+
+| Metric | Legacy | Direct planar | Change |
+|---|---:|---:|---:|
+| Median wall time | 1.805 s | 1.394 s | -22.8% |
+| Median process CPU time | 3.613 s | 3.207 s | -11.2% |
+| Peak RSS | 3182 MiB | 2794 MiB | -387 MiB (-12.2%) |
+
+Across the 1.0-8.7 s sweep, wall-time improvement was approximately 21.8-22.6%;
+outputs were byte-identical and full decode passed. This is evidence for host
+CPU response encoding. Actual gains depend on the CPU and runtime, and should
+not be interpreted as GPU, DiT, or stage 0 speedups.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
@@ -416,9 +441,10 @@ For example, keep the first main block's attention projections in BF16 with:
 ```
 
 The structured option replaces `--quantization fp8`. Online FP8 can be used
-with H3 layerwise offload and with distributed layerwise offload's full-weight
-per-rank path (`--dlo-no-use-allgather`). The sharded DLO AllGather path is not
-supported for runtime-created FP8 weights.
+with H3 layerwise offload and with both DLO transfer paths. The default
+AllGather path uses the ordinary loader to finalize FP8 weights and scales
+before sharding them across ranks. `--dlo-no-use-allgather` instead retains
+complete rank-local tensors and avoids the synchronized request-wave contract.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -870,8 +896,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   H3 native `tile` mode only.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
-- Runtime-created FP8 weights do not support the sharded DLO AllGather path;
-  use `--dlo-no-use-allgather` when combining online FP8 with DLO.
+- Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
+  in host memory on every rank during startup before retaining only each rank's
+  shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone

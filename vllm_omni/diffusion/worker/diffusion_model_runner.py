@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import gc
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -21,7 +22,9 @@ from torch.profiler import record_function
 from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -32,6 +35,11 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
+    DiffusionPagedAttentionRow,
+    PreparedDiffusionPagedAttentionBatch,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -45,8 +53,10 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionSchedulerOutput,
     KVPrefetchJob,
+    NewRequestData,
     validate_new_request_data_identity,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
@@ -139,6 +149,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        self.model_memory_usage = 0
+        self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
+            vllm_config=vllm_config,
+            od_config=od_config,
+            device=device,
+        )
+        # Compatibility view for callers that inspect the installed config;
+        # physical ownership remains in ``diffusion_kv_backend``.
+        self.kv_cache_config: KVCacheConfig | None = None
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
@@ -167,8 +186,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         metadata: DiffusionKVMetadata | None,
     ) -> None:
         cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-        # W0 does not wire the Scheduler allocator or Worker installer yet, so
-        # validate an allocation snapshot when present without requiring one.
+        if cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is None:
+            raise ValueError(f"paged_scheduler request {request_id!r} requires Diffusion KV metadata")
         if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is not None:
             raise ValueError(f"{cache_mode.value} request {request_id!r} must not carry Diffusion KV metadata")
 
@@ -273,6 +292,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             m.consumed_memory / GiB_bytes,
             time_after_load - time_before_load,
         )
+        self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
@@ -367,6 +387,64 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         logger.info("Model runner: Initialization complete.")
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """Collect native specs from cache-enabled loaded attention modules."""
+
+        if self.od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return {}
+        if self.pipeline is None:
+            raise RuntimeError("Model must be loaded before collecting Diffusion KV cache specs")
+
+        cache_layers: dict[str, tuple[Attention, KVCacheSpec]] = {}
+        for layer_name, module in self.pipeline.named_modules():
+            if not isinstance(module, Attention):
+                continue
+            spec = module.get_kv_cache_spec(self.vllm_config)
+            if spec is not None:
+                cache_layers[layer_name] = (module, spec)
+        if not cache_layers:
+            raise RuntimeError(
+                "paged_scheduler Diffusion KV found no cache-enabled Attention modules "
+                f"in {type(self.pipeline).__name__}"
+            )
+        return self.diffusion_kv_backend.register_kv_cache_layers(cache_layers)
+
+    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Physically initialize the Engine-generated rank-local config."""
+
+        self.diffusion_kv_backend.initialize_kv_cache(kv_cache_config)
+        self.kv_cache_config = self.diffusion_kv_backend.kv_cache_config
+
+    def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:
+        return self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
+
+    def get_diffusion_kv_row(
+        self,
+        request_id: str,
+        sequence_id: int | None,
+        context_id: str | None = None,
+    ) -> int:
+        return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
+
+    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+        return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
+
+    def refresh_diffusion_kv_block_table_layout(self) -> None:
+        self.diffusion_kv_backend.refresh_block_table_layout()
+
+    def prepare_paged_attention_batch(
+        self,
+        rows: list[DiffusionPagedAttentionRow] | tuple[DiffusionPagedAttentionRow, ...],
+    ) -> PreparedDiffusionPagedAttentionBatch:
+        """Prepare model-specific query/write spans against installed Worker rows."""
+
+        return self.diffusion_kv_backend.prepare_paged_attention_batch(rows)
+
+    def activate_paged_attention(self, batch: PreparedDiffusionPagedAttentionBatch):
+        """Expose a prepared paged batch to Omni Attention for one forward."""
+
+        return self.diffusion_kv_backend.activate_paged_attention(batch)
 
     def clear_prompt_embed_cache(self) -> None:
         """Evict all cached text-encoder outputs (e.g. between training epochs).
@@ -516,6 +594,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         require_request_batch_support: bool,
         kv_prefetch_job: KVPrefetchJob | None = None,
         record_name: str,
+        record_output_peak_memory: bool = True,
     ) -> BatchRunnerOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not reqs:
@@ -545,7 +624,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
+            if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
@@ -558,7 +637,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         pipeline_name=type(self.pipeline).__name__,
                     )
 
-            if is_primary and outputs:
+            if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
                 for output in outputs:
                     output.peak_memory_mb = max(output.peak_memory_mb, batch_peak_memory_mb)
@@ -614,17 +693,78 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             request_id=req.request_id,
             metadata=diffusion_kv_metadata,
         )
-        runner_output = self._execute_request_list(
-            [req],
-            od_config=self.od_config,
-            allow_single_output=True,
-            require_request_batch_support=False,
-            kv_prefetch_job=kv_prefetch_job,
-            record_name="pipeline_forward",
-        )
-        output = runner_output.runner_outputs[0].result
-        assert output is not None
-        return output
+        installed_request = False
+        if diffusion_kv_metadata is not None:
+            self.install_diffusion_kv_metadata(diffusion_kv_metadata)
+            installed_request = True
+        try:
+            runner_output = self._execute_request_list(
+                [req],
+                od_config=self.od_config,
+                allow_single_output=True,
+                require_request_batch_support=False,
+                kv_prefetch_job=kv_prefetch_job,
+                record_name="pipeline_forward",
+            )
+            output = runner_output.runner_outputs[0].result
+            assert output is not None
+            return output
+        finally:
+            if installed_request:
+                self.remove_diffusion_kv_requests([req.request_id])
+
+    def profile_run(self, requests: list[OmniDiffusionRequest]) -> None:
+        """Run the maximum per-rank request batch for memory profiling.
+
+        This deliberately bypasses Scheduler admission and Diffusion KV
+        metadata validation because cache capacity has not been sized yet.
+        It otherwise uses the normal execution-mode path so model inputs,
+        collective communication, backend workspaces, denoising, and decode
+        allocations contribute to the observed peak. Step execution profiles
+        one fused ``InputBatch`` instead of sequential single-request forwards.
+        """
+
+        if not requests:
+            raise ValueError("Diffusion memory profiling requires at least one request.")
+
+        runner_output: BatchRunnerOutput | None = None
+        request_ids = [request.request_id for request in requests]
+        try:
+            if getattr(self.od_config, "step_execution", False):
+                scheduler_output = DiffusionSchedulerOutput(
+                    step_id=0,
+                    scheduled_new_reqs=[
+                        NewRequestData(request_id=request.request_id, req=request) for request in requests
+                    ],
+                    scheduled_cached_reqs=CachedRequestData.make_empty(),
+                    finished_req_ids=set(),
+                    num_running_reqs=len(requests),
+                    num_waiting_reqs=0,
+                )
+                runner_output = self._execute_stepwise(
+                    scheduler_output,
+                    validate_kv_metadata=False,
+                    record_output_peak_memory=False,
+                )
+            else:
+                runner_output = self._execute_request_list(
+                    requests,
+                    od_config=self.od_config,
+                    allow_single_output=len(requests) == 1,
+                    require_request_batch_support=len(requests) > 1,
+                    record_name="pipeline_memory_profile",
+                    # The enclosing native memory_profiling context owns the
+                    # peak counters. Resetting them here would discard request
+                    # preparation allocations and understate the budget.
+                    record_output_peak_memory=False,
+                )
+            current_omni_platform.synchronize()
+        finally:
+            for request_id in request_ids:
+                self.state_cache.pop(request_id, None)
+            self.input_batch = None
+            del runner_output
+            gc.collect()
 
     def execute_model_batch(
         self,
@@ -643,14 +783,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 request_id=new_req.req.request_id,
                 metadata=new_req.diffusion_kv_metadata,
             )
-        reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
-        return self._execute_request_list(
-            reqs,
-            od_config=od_config,
-            allow_single_output=False,
-            require_request_batch_support=True,
-            record_name="pipeline_forward_batch",
-        )
+        installed_request_ids: list[str] = []
+        try:
+            for new_req in scheduler_output.scheduled_new_reqs:
+                if new_req.diffusion_kv_metadata is not None:
+                    self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
+                    installed_request_ids.append(new_req.request_id)
+            reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
+            return self._execute_request_list(
+                reqs,
+                od_config=od_config,
+                allow_single_output=False,
+                require_request_batch_support=True,
+                record_name="pipeline_forward_batch",
+            )
+        finally:
+            if installed_request_ids:
+                self.remove_diffusion_kv_requests(installed_request_ids)
 
     # ------------------------------------------------------------------
     # Step-wise execution
@@ -750,13 +899,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
+        return self._execute_stepwise(
+            scheduler_output,
+            validate_kv_metadata=True,
+            record_output_peak_memory=True,
+        )
+
+    def _execute_stepwise(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        validate_kv_metadata: bool,
+        record_output_peak_memory: bool,
+    ) -> BatchRunnerOutput:
+        """Execute one step with explicit validation and profiling policy."""
+
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
-            self._validate_diffusion_kv_metadata(
-                request_id=new_req.req.request_id,
-                metadata=new_req.diffusion_kv_metadata,
-            )
+            if validate_kv_metadata:
+                self._validate_diffusion_kv_metadata(
+                    request_id=new_req.req.request_id,
+                    metadata=new_req.diffusion_kv_metadata,
+                )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.
@@ -765,13 +930,53 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
 
+        # Scheduler metadata is installed only for newly admitted requests;
+        # cached requests continue to use the row installed on their first
+        # step. Paged rows are retired here for scheduler-finished requests so
+        # a subsequent wave can reuse the native table slots. Dense execution
+        # must not issue Worker KV cleanup side effects.
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and scheduler_output.finished_req_ids
+        ):
+            self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
+        installed_request_ids: list[str] = []
+        try:
+            for new_req in scheduler_output.scheduled_new_reqs:
+                if new_req.diffusion_kv_metadata is not None:
+                    self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
+                    installed_request_ids.append(new_req.request_id)
+            return self._execute_stepwise_core(
+                scheduler_output,
+                record_output_peak_memory=record_output_peak_memory,
+            )
+        except Exception:
+            if installed_request_ids:
+                self.remove_diffusion_kv_requests(installed_request_ids)
+            raise
+
+    def _execute_stepwise_core(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        record_output_peak_memory: bool,
+    ) -> BatchRunnerOutput:
+        """Run the denoise step after metadata admission and row installation."""
+
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
+            if (
+                record_output_peak_memory
+                and new_request_ids
+                and not had_active_states
+                and is_primary
+                and current_omni_platform.is_available()
+            ):
                 current_omni_platform.reset_peak_memory_stats()
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = {}
@@ -864,7 +1069,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."
                         )
 
-                if is_primary:
+                if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
                     states_by_id = {state.request_id: state for state in states}
                     for state in states:
@@ -880,7 +1085,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             state.peak_memory_mb,
                         )
 
+                terminal_request_ids = [
+                    runner_output.request_id for runner_output in runner_output_list if runner_output.finished
+                ]
                 self._update_states_after(states, input_batch, pipeline_interrupted)
+                if (
+                    getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                    is DiffusionKVCacheMode.PAGED_SCHEDULER
+                    and terminal_request_ids
+                ):
+                    self.remove_diffusion_kv_requests(terminal_request_ids)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
 

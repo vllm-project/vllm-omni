@@ -521,7 +521,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
-        description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
+        description="Initial chunk size for reduced TTFA. Overrides the deploy config for this session.",
     )
     non_streaming_mode: bool | None = Field(
         default=None,

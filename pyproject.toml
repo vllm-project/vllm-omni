@@ -41,8 +41,10 @@ dev = [
     "pytest-cov==7.1.0",
     "pytest-mock==3.15.1",
     "pytest-shard==0.1.2",
+    "pytest-xdist==3.8.0",
     "websockets==16.1",
     "pytest-subtests==0.15.0",
+    "filelock>=3.16.1,<4",
     "datasets==3.6.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -190,6 +192,7 @@ select = [
     "N",      # pep8-naming
     "UP",     # pyupgrade
     "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -225,19 +228,14 @@ ignore = [
 "torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
-python_version = "3.12, 3.13"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
+python_version = "3.12"
+# Align with vLLM: silent follow for library code; missing third-party stubs
+# are ignored everywhere (including tests). tests/ still get
+# --follow-imports skip from tools/pre_commit/mypy.py.
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
 check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
+follow_imports = "silent"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -247,7 +245,8 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
-    "--strict-config"
+    "--strict-config",
+    "--dist=loadgroup"
 ]
 markers = [
     # ci/cd required
@@ -296,6 +295,7 @@ markers = [
     "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
+    "xdist: xdist-parallelizable tests",
 ]
 filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
@@ -343,6 +343,8 @@ extend-ignore-identifiers-re = [
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
+    # setuptools-scm / git-describe local versions, e.g. 0.26.1.dev14+gae6577ea
+    "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
@@ -367,3 +369,5 @@ Leary = "Leary"
 fo = "fo"
 ba = "ba"
 SER = "SER"
+# NumPy ndarray.flags.writeable (canonical flag name, not "writable").
+writeable = "writeable"
