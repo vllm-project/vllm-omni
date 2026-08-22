@@ -232,9 +232,9 @@ class OmniSchedulerMixin:
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
 
-        Called at the top of every ``schedule()`` cycle.  Identical between
-        AR and generation schedulers except for the ``model_mode`` argument
-        forwarded to ``update_request_metadata``.
+        Called at the top of every ``schedule()`` cycle. ``model_mode`` is
+        retained for the shared call surface; the runner has already applied
+        model-specific interpretation before publishing the typed updates.
         """
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
@@ -243,7 +243,7 @@ class OmniSchedulerMixin:
             return
         if connector_output and connector_output.request_metadata:
             input_coordinator.update_request_metadata(
-                self.requests, connector_output.request_metadata, model_mode=model_mode
+                self.requests, connector_output.request_metadata
             )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,

@@ -20,7 +20,7 @@ import torch
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
@@ -66,6 +66,7 @@ def _make_model_config(
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
+        scheduling_metadata_adapter=None,
     )
 
 
@@ -311,14 +312,14 @@ class TestOmniConnectorOutput(unittest.TestCase):
 
         host._chunk_ready_req_ids.add("req-1")
         host._chunk_finished_req_ids.add("req-2")
-        host._local_request_metadata["req-1"] = {"next_stage_prompt_len": 10}
+        host._local_request_metadata["req-1"] = SchedulingMetadataUpdate(resize_prompt_to=10)
         host._stage_recv_req_ids.add("req-3")
 
         output = host.get_omni_connector_output()
         self.assertIsInstance(output, OmniConnectorOutput)
         self.assertEqual(output.chunk_ready_req_ids, {"req-1"})
         self.assertEqual(output.chunk_finished_req_ids, {"req-2"})
-        self.assertEqual(output.request_metadata, {"req-1": {"next_stage_prompt_len": 10}})
+        self.assertEqual(output.request_metadata, {"req-1": SchedulingMetadataUpdate(resize_prompt_to=10)})
         self.assertEqual(output.stage_recv_req_ids, {"req-3"})
 
         output2 = host.get_omni_connector_output()
@@ -561,7 +562,7 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
             host._chunk_finished_req_ids.add(req_id)
             host._chunk_stream_completed.add(req_id)
             host._local_stage_payload_cache[req_id] = {"finished": True}
-            host._local_request_metadata[req_id] = {}
+            host._local_request_metadata[req_id] = SchedulingMetadataUpdate()
             host._finished_load_reqs.add(req_id)
             host._pending_load_reqs.pop(req_id, None)
 
@@ -628,7 +629,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._chunk_stream_completed.add(req_id)
         host._stage_recv_req_ids.add(req_id)
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {}}
-        host._local_request_metadata[req_id] = {"prompt_len": 10}
+        host._local_request_metadata[req_id] = SchedulingMetadataUpdate(resize_prompt_to=10)
 
         # Cleanup
         host.cleanup_finished_request(req_id)
@@ -754,7 +755,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._request_ids_mapping[req_id] = ext_id
         host._put_req_chunk[ext_id] = 1
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {"ids": [1, 2, 3]}}
-        host._local_request_metadata[req_id] = {"next_stage_prompt_len": 3}
+        host._local_request_metadata[req_id] = SchedulingMetadataUpdate(resize_prompt_to=3)
         host._stage_recv_req_ids.add(req_id)
 
         pruned = host.prune_inactive_requests(set())
@@ -905,7 +906,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
 
         self.assertEqual(results, {"r1": payload})
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertEqual(host.get_local_request_metadata("r1"), {})
+        self.assertEqual(host.get_local_request_metadata("r1"), SchedulingMetadataUpdate())
         self.assertEqual(host._stage_recv_req_ids, {"r1"})
         self.assertNotIn("r1", host._pending_load_reqs)
         self.assertEqual(tp_group.broadcast_inputs, [None])
@@ -970,7 +971,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         }
         packet = {
             "staged_payloads": {"r1": payload},
-            "request_metadata": {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+            "request_metadata": {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11))},
             "newly_finished": {"r1"},
             "chunk_finished": {"r1"},
         }
@@ -983,7 +984,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertEqual(output.chunk_finished_req_ids, {"r1"})
         self.assertEqual(
             output.request_metadata,
-            {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 11))},
         )
         self.assertEqual(host.get_local_stage_payload("r1"), payload)
         self.assertNotIn("r1", host._pending_load_reqs)
@@ -1140,7 +1141,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {"r1": {"next_stage_prompt_len": 7}})
+        self.assertEqual(output2.request_metadata, {"r1": SchedulingMetadataUpdate(resize_prompt_to=7)})
 
         host.shutdown_omni_connectors()
 
@@ -1180,10 +1181,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._model_mode = "gen"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 1
-        host._local_request_metadata["r1"] = {
-            "code_predictor_codes": [10, 11, 12],
-            "left_context_size": 0,
-        }
+        host._local_request_metadata["r1"] = SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12))
         host._finished_load_reqs.add("r1")
 
         made_progress = host._poll_single_request("r1")
@@ -1193,7 +1191,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertEqual(host._get_req_chunk["r1"], 1)
 
         output = host.get_omni_connector_output()
-        self.assertEqual(output.request_metadata["r1"]["code_predictor_codes"], [10, 11, 12])
+        self.assertEqual(output.request_metadata["r1"], SchedulingMetadataUpdate(prompt_token_ids=(10, 11, 12)))
         self.assertEqual(output.chunk_ready_req_ids, {"r1"})
 
         host._omni_connector.get.return_value = (

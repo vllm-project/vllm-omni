@@ -616,6 +616,8 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "stage_input_transport",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
