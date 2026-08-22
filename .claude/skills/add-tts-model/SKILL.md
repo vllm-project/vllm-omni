@@ -138,9 +138,12 @@ A shared buffer silently corrupts audio across concurrent requests — the sympt
    - Load codec weights (may need lazy loading from separate checkpoint)
    - Implement `forward()`: codec codes -> audio waveform
    - Return `OmniOutput` with `multimodal_outputs`
-5. **Create stage config YAML** defining both stages, memory allocation, and model paths
-6. **Create stage input processor** for prompt building
-7. **Write end2end.py** test script
+5. **Define and register the pipeline topology** in
+   `vllm_omni/model_executor/models/<model>/pipeline.py`
+6. **Create the deploy YAML** under `vllm_omni/deploy/` for placement,
+   memory sizing, connectors, and runtime overrides
+7. **Create stage input processor** for prompt building and inter-stage handoff
+8. **Write end2end.py** test script
 
 ### Critical Parameters to Get Right
 
@@ -174,7 +177,7 @@ These bugs appear in almost every new TTS PR. Check all before the first push. S
 - **All return paths must emit `model_outputs`** — if any early-return branch skips setting `model_outputs`, the serving layer silently drops that step's audio (fish speech: `fix: ensure ALL return paths emit model_outputs`)
 - **Per-request state isolation** — for batched concurrent requests, key all state by request ID; a shared buffer corrupts audio across requests (fish speech: `fix: per-request vocode + delta emission`)
 - **Codec tensor device** — move codec codes to the codec decoder's device before calling decode; mismatches cause silent CPU fallback or crashes (fish speech: `fix: use model device for CUDA stream`)
-- **AR stage `max_num_seqs`** — set to at least 4 in production configs; for single-stage models this is the only stage. For two-stage models, Stage 0 (AR) needs `max_num_seqs ≥ 4` to pipeline concurrent requests; Stage 1 (codec decoder) typically uses `max_num_seqs: 1` intentionally. Default of 1 everywhere causes audio gaps under concurrency because the codec window round-robins across requests (RFC #2568)
+- **AR stage `max_num_seqs`** — set to at least 4 in production deploy configs; for single-stage models this is the only stage. For two-stage models, Stage 0 (AR) needs `max_num_seqs ≥ 4` to pipeline concurrent requests; Stage 1 (codec decoder) is model-specific and may intentionally use `max_num_seqs: 1`. Defaulting the AR stage to 1 causes audio gaps under concurrency because the codec window round-robins across requests (RFC #2568)
 
 ### Optional Dependency Handling
 
@@ -190,18 +193,18 @@ pattern, signature constraints, and MOSS-TTS-Nano reference.
 When the upstream model cannot be cleanly split into an AR stage and a
 separate decoder, run the full pipeline inside a single AR worker and
 stream audio through a per-request `inference_stream()` generator keyed by
-`_omni_req_id`. Stage config must set `worker_type: ar`,
-`engine_output_type: audio`, `final_output: true`, `is_comprehension: true`,
-and `async_chunk: false` at the top level. Only extract params from
+`_omni_req_id`. Define one `StagePipelineConfig` with
+`execution_type=StageExecutionType.LLM_AR`, `engine_output_type="audio"`,
+`final_output=True`, and `owns_tokenizer=True`. Set `async_chunk: false` in
+the deploy YAML. Only extract params from
 `additional_information` that you actually forward, or pre-commit fails
 `ruff F841`.
 
 Full walkthrough with the complete `forward()` / `_create_stream_gen()`
-skeleton and stage-config fields:
+skeleton plus pipeline/deploy definitions:
 [references/single-stage-ar.md](references/single-stage-ar.md). For an
 in-tree reference, look for any single-stage AR model under
-`vllm_omni/model_executor/models/` — e.g. the MOSS-TTS-Nano integration when
-it lands.
+`vllm_omni/model_executor/models/`, such as MOSS-TTS-Nano.
 
 **VoxCPM2 is a different pattern** and should not reuse this skeleton — it
 runs the base LM under vLLM PagedAttention with external side-computation.
@@ -210,7 +213,8 @@ See `plan/voxcpm2_native_ar_design.md`.
 ### Deliverables
 
 - Model files in `vllm_omni/model_executor/models/<model_name>/`
-- Stage config YAML
+- Registered `pipeline.py` topology
+- Deploy YAML under `vllm_omni/deploy/`
 - Working `end2end.py` at `examples/offline_inference/text_to_speech/<model>/end2end.py`
 - New section in `examples/offline_inference/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/offline_inference/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/` — the hub README is the documented surface and the mkdocs `generate_examples` hook only descends one level into `examples/<category>/`.
 
@@ -400,21 +404,29 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 
 ### Steps
 
-1. **Update stage config YAML**:
+1. **Update the pipeline topology** so the producing stage declares its async
+   handoff processor with `async_chunk_process_next_stage_input_func`.
+2. **Update the deploy YAML** to enable async chunk and configure the connector:
    ```yaml
    async_chunk: true
-   codec_chunk_frames: 25      # frames per chunk
-   codec_left_context_frames: 25  # overlap for smooth boundaries
+
+   connectors:
+     connector_of_shared_memory:
+       name: SharedMemoryConnector
+       extra:
+         codec_streaming: true
+         codec_chunk_frames: 25
+         codec_left_context_frames: 25
    ```
-2. **Implement chunk handling in Stage 1**:
+3. **Implement chunk handling in Stage 1**:
    - Accept partial input (chunk of codec codes)
    - Handle left context for smooth audio boundaries
    - Return partial audio in `OmniOutput`
-3. **Test streaming**:
+4. **Test streaming**:
    - Verify audio quality matches non-streaming output
    - Check for artifacts at chunk boundaries
    - Measure TTFA (time to first audio)
-4. **Update online serving** to support `stream=true` with PCM output
+5. **Update online serving** to support `stream=true` with PCM output
 
 ### Streaming Architecture
 
@@ -435,7 +447,8 @@ Stage 0 (AR)                    Stage 1 (Decoder)
 
 ### Deliverables
 
-- Updated stage config with async_chunk enabled
+- Updated pipeline async handoff processor and deploy config with
+  `async_chunk: true`
 - Smooth streaming audio without boundary artifacts
 - TTFA metrics
 
@@ -507,14 +520,15 @@ Use this checklist when integrating a new TTS model:
 - [ ] Config classes created with `model_type` registration
 - [ ] Stage 0 (AR) implemented and generates correct tokens
 - [ ] Stage 1 (Decoder) produces correct audio from tokens — dtype float32 for codec decoder
-- [ ] Stage 1 `max_num_seqs` ≥ 4 in production config (default 1 causes gaps under concurrency)
+- [ ] AR stage `max_num_seqs` ≥ 4 in the production deploy config unless the model has a tested lower limit
 - [ ] Optional dependency fallbacks handled at `load_weights()` time (torchaudio/soundfile/etc.)
 - [ ] Streaming: codec codes accumulated across AR steps (not reset per step)
 - [ ] Streaming: delta audio emitted per chunk, not full re-decoded waveform
 - [ ] Streaming: all `forward()` return paths emit `model_outputs`
 - [ ] Streaming: per-request state keyed by request ID (not shared across requests)
 - [ ] Streaming: codec tensors moved to codec decoder device before decode
-- [ ] Stage config YAML created
+- [ ] Pipeline topology defined in `pipeline.py` and registered in `OMNI_PIPELINES`
+- [ ] Deploy YAML created under `vllm_omni/deploy/`
 - [ ] `end2end.py` produces audio matching reference quality
 - [ ] README.md written
 
@@ -531,7 +545,8 @@ Use this checklist when integrating a new TTS model:
 - [ ] Documentation added (offline + online docs, nav, supported models)
 
 ### Phase 4: Async Chunk
-- [ ] Stage config updated with `async_chunk: true`
+- [ ] Pipeline declares the async handoff processor
+- [ ] Deploy config sets `async_chunk: true` and connector chunk parameters
 - [ ] Stage 1 handles partial chunks correctly
 - [ ] No audio artifacts at chunk boundaries
 - [ ] Streaming via API (`stream=true`) works
@@ -548,7 +563,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] `pre-commit run --files <changed>` passes before every push
 - [ ] Every commit has `Signed-off-by` matching the author email (`git commit -s`)
 - [ ] `git config user.email` matches the email registered on your GitHub account
-- [ ] Details and failure-recovery commands: [references/precommit-dco.md](references/precommit-dco.md)
+- [ ] Hook list, failure table, and DCO recovery: [references/precommit-dco.md](references/precommit-dco.md)
 
 ## References
 

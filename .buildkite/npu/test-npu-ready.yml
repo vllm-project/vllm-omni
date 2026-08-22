@@ -43,7 +43,7 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
-        mirror_hardwares: a2b3_npu_1
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"

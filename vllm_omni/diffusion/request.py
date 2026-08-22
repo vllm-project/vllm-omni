@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
+_DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
 
 
 @dataclass
@@ -90,4 +91,6 @@ class OmniDiffusionRequest:
 
     @classmethod
     def is_dummy_run_request_id(cls, request_id: str | None) -> bool:
-        return request_id == DUMMY_DIFFUSION_REQUEST_ID
+        return request_id == DUMMY_DIFFUSION_REQUEST_ID or (
+            isinstance(request_id, str) and request_id.startswith(_DUMMY_DIFFUSION_REQUEST_ID_PREFIX)
+        )

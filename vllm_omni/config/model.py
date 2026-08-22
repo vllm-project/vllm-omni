@@ -141,11 +141,17 @@ class OmniModelConfig(ModelConfig):
         }
     )
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    # Key names (not values) of the stage's default sampling ``extra_args``.
+    # Engine-core code runs before any request arrives, so this is the only
+    # place it can learn which request-shaping conventions a stage uses (e.g.
+    # ``cfg_role`` for classifier-free-guidance request pairs).
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     @property
     def registry(self):

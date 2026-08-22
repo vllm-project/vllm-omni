@@ -23,8 +23,8 @@ logger = init_logger(__name__)
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU Worker for Generation model (non-autoregressive waveform generation).
 
-    Usage in stage config:
-        worker_cls: "vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner"
+    Selected for stages whose pipeline topology uses
+    ``execution_type=StageExecutionType.LLM_GENERATION``.
     """
 
     @instrument(span_name="Init device")
