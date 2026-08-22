@@ -192,6 +192,7 @@ select = [
     "N",      # pep8-naming
     "UP",     # pyupgrade
     "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)

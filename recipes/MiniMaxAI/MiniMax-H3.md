@@ -65,6 +65,31 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
+## CPU MP4 response encoding
+
+For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
+host CPU through PyAV/libx264 after generation. The response encoder selects the
+path automatically at runtime: inputs with a supported frame shape, common dtype,
+and RGB per-channel contiguous layout use direct planar frames; other inputs
+fall back to the legacy path before the PyAV container is opened. No CLI flag,
+model declaration, or user configuration is required. Streaming fMP4 output is
+unchanged.
+
+A community benchmark on 2x Xeon 8480C reported the following comparison
+between the legacy and direct planar paths
+([full result](https://github.com/vllm-project/vllm-omni/pull/6288#issuecomment-5337546499)):
+
+| Metric | Legacy | Direct planar | Change |
+|---|---:|---:|---:|
+| Median wall time | 1.805 s | 1.394 s | -22.8% |
+| Median process CPU time | 3.613 s | 3.207 s | -11.2% |
+| Peak RSS | 3182 MiB | 2794 MiB | -387 MiB (-12.2%) |
+
+Across the 1.0-8.7 s sweep, wall-time improvement was approximately 21.8-22.6%;
+outputs were byte-identical and full decode passed. This is evidence for host
+CPU response encoding. Actual gains depend on the CPU and runtime, and should
+not be interpreted as GPU, DiT, or stage 0 speedups.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery

@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVING_SPEECH = Path("vllm_omni/entrypoints/openai/serving_speech.py")
 
 # Budgets. These may only go DOWN. See the module docstring.
-MAX_MODEL_TYPE_BRANCHES = 20
+MAX_MODEL_TYPE_BRANCHES = 9
 
 _GUIDANCE = """
 Move the per-model behaviour into its adapter under

@@ -423,6 +423,12 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
         request,
         True,
     )
+    duplicate_boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(turn_id=7, turn_end=True),
+        request,
+        True,
+    )
     next_turn = tts2code2wav_async_chunk(
         manager,
         _duplex_delta(20, turn_id=8),
@@ -435,6 +441,10 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     assert turn_end.meta.last_chunk is True
     assert turn_end.meta.turn_end is True
     assert turn_end.meta.is_segment_finished.item() is True
+    assert turn_end.meta.replace_runtime_additional_information is True
+    assert duplicate_boundary is not None
+    assert duplicate_boundary.meta.is_segment_finished.item() is True
+    assert duplicate_boundary.meta.replace_runtime_additional_information is True
     assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
     assert next_turn.meta.last_chunk is False

@@ -101,6 +101,7 @@ If docs and live code disagree, verify the code/tests and report the drift.
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
 | [verification.md](references/checks/verification.md) | Hardware, a server, or a runnable affected path is available for active verification. |
 | [examples-policy.md](../precheck-pr/references/examples-policy.md) | The PR adds, copies, or renames Python under `examples/`; apply the canonical policy shared with `precheck-pr`. |
+| [find-simplifications](../find-simplifications/SKILL.md) | Every review; run a diff-scoped subtraction and simplification pass after correctness blockers. |
 
 ### Delivery and reviewer coordination
 
@@ -183,9 +184,13 @@ promotion gate. Candidate or draft rules are questions, not blockers, unless
 current code, tests, or policy enforce them. Inspect both sides of any config,
 registry, serialization, connector, cache, or stage boundary.
 
-When a diff adds or expands a helper, class, fallback, compatibility branch, or
-public behavior, run a subtraction pass: remove out-of-scope behavior and check
-whether each new abstraction can be deleted, merged, moved, or inlined.
+Read and apply [find-simplifications](../find-simplifications/SKILL.md) on every
+review. Constrain it to the diff and the adjacent ownership, callers, or
+consumers needed to prove a candidate. Check whether added or expanded helpers,
+classes, state, fallback and compatibility branches, data movement, or public
+behavior can be deleted, merged, moved, or inlined. Zero candidates is a valid
+result. Do not widen the review into repository backlog or report speculative
+style preferences as simplification findings.
 
 ### 6. Verify the changed path
 

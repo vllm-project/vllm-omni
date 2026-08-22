@@ -66,11 +66,16 @@ stages:
       to_stage_2: connector_of_shared_memory
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
     # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).
+    # Values track upstream utils.TTSSamplingParams (min_p/win_size/tau_r are
+    # declared there but never read, so they stay out). repetition_penalty is
+    # consumed by the Talker, which rescores it over upstream's 16-frame window
+    # instead of the Sampler's whole-stream presence penalty.
+    # min_tokens is upstream's min_new_token.
     default_sampling_params:
       temperature: 0.8
-      top_p: 0.8
-      top_k: 100
-      repetition_penalty: 1.02
+      top_p: 0.85
+      top_k: 25
+      repetition_penalty: 1.05
       min_tokens: 50
       max_tokens: 4096
       seed: 42

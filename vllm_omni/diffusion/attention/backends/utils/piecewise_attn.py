@@ -15,6 +15,8 @@ Per segment:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import torch
@@ -123,3 +125,109 @@ def piecewise_attn(
     if len(outputs) == 1:
         return outputs[0]
     return torch.cat(outputs, dim=1)
+
+
+@dataclass(frozen=True, slots=True)
+class PagedPiecewiseSegment:
+    """One aligned segment across rows in a packed paged batch."""
+
+    row_segments: tuple[Segment, ...]
+    query_indices: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class PagedPiecewisePlan:
+    """Piecewise segment batches for one packed paged-attention batch."""
+
+    spans: tuple[tuple[tuple[int, int], ...], ...]
+    segments: tuple[PagedPiecewiseSegment, ...]
+    num_query_tokens: int
+
+
+PagedPiecewiseRunner = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, object],
+    torch.Tensor,
+]
+
+
+def build_paged_piecewise_plan(
+    full_attn_spans: Sequence[Sequence[tuple[int, int]]],
+    query_offsets: Sequence[int],
+    query_lens: Sequence[int],
+    seq_lens: Sequence[int],
+    *,
+    device: torch.device | str | None = None,
+) -> PagedPiecewisePlan:
+    """Build packed indices for corresponding piecewise segments in each row."""
+
+    row_count = len(full_attn_spans)
+    if row_count == 0 or not (row_count == len(query_offsets) == len(query_lens) == len(seq_lens)):
+        raise ValueError("Paged piecewise inputs must have one entry per row")
+
+    spans = tuple(tuple(tuple(span) for span in row_spans) for row_spans in full_attn_spans)
+
+    packed_offsets = [0]
+    for row_spans, query_offset, query_len, seq_len in zip(spans, query_offsets, query_lens, seq_lens, strict=True):
+        previous_end = 0
+        for start, end in row_spans:
+            if start < previous_end or not 0 <= start < end <= seq_len:
+                raise ValueError("Paged piecewise spans must be sorted, non-overlapping, and within the sequence")
+            previous_end = end
+        if query_offset < 0 or query_len <= 0 or query_offset + query_len > seq_len:
+            raise ValueError("Paged piecewise query range must be within the sequence")
+        packed_offsets.append(packed_offsets[-1] + query_len)
+
+    segments_by_row = tuple(
+        tuple(build_segments(row_spans, query_offset, query_len))
+        for row_spans, query_offset, query_len in zip(spans, query_offsets, query_lens, strict=True)
+    )
+    if len({len(row_segments) for row_segments in segments_by_row}) != 1:
+        raise ValueError("Paged piecewise rows must produce aligned segments")
+
+    packed_segments = []
+    for row_segments in zip(*segments_by_row, strict=True):
+        if len({segment.mode for segment in row_segments}) != 1:
+            raise ValueError("Paged piecewise rows must use the same attention mode per segment")
+        query_indices = []
+        for row_index, (segment, query_offset) in enumerate(zip(row_segments, query_offsets, strict=True)):
+            local_start = segment.q_start - query_offset
+            local_end = segment.q_end - query_offset
+            query_indices.extend(range(packed_offsets[row_index] + local_start, packed_offsets[row_index] + local_end))
+        packed_segments.append(
+            PagedPiecewiseSegment(
+                row_segments=tuple(row_segments),
+                query_indices=torch.tensor(query_indices, dtype=torch.long, device=device),
+            )
+        )
+
+    return PagedPiecewisePlan(spans, tuple(packed_segments), packed_offsets[-1])
+
+
+def run_paged_piecewise_plan(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: PagedPiecewisePlan,
+    segment_metadata: Sequence[object],
+    segment_runner: PagedPiecewiseRunner,
+) -> torch.Tensor:
+    """Run and scatter piecewise attention over packed Q/K/V write tensors."""
+
+    if query.shape[0] != plan.num_query_tokens:
+        raise ValueError(f"Paged piecewise plan has {plan.num_query_tokens} query tokens, got {query.shape[0]}")
+
+    output = None
+    for segment, metadata in zip(plan.segments, segment_metadata, strict=True):
+        indices = segment.query_indices
+        segment_output = segment_runner(
+            query.index_select(0, indices),
+            key.index_select(0, indices),
+            value.index_select(0, indices),
+            metadata,
+        )
+        if output is None:
+            output = segment_output.new_empty((query.shape[0], *segment_output.shape[1:]))
+        output.index_copy_(0, indices, segment_output)
+
+    assert output is not None
+    return output

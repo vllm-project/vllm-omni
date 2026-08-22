@@ -1494,14 +1494,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.inputs_embeds.gpu[start_offset : start_offset + overlay_len].copy_(src)
 
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
+        replace = getattr(self.model, "replace_runtime_additional_information", False)
+        update_buffer = self._replace_intermediate_buffer if replace else self._update_intermediate_buffer
         for new_req in scheduler_output.scheduled_new_reqs:
             model_buffer = getattr(new_req, "model_intermediate_buffer", None)
             if isinstance(model_buffer, dict) and model_buffer:
-                self._update_intermediate_buffer(new_req.req_id, model_buffer)
+                update_buffer(new_req.req_id, model_buffer)
+                if replace:
+                    continue
             payload_info = getattr(new_req, "additional_information", None)
             decoded_info = deserialize_additional_information(payload_info)
             if decoded_info:
-                self._update_intermediate_buffer(new_req.req_id, decoded_info)
+                update_buffer(new_req.req_id, decoded_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
@@ -1509,7 +1513,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     decoded_info = deserialize_additional_information(req_infos)
                     if decoded_info:
-                        self._update_intermediate_buffer(req_id, decoded_info)
+                        update_buffer(req_id, decoded_info)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -2039,6 +2043,27 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 
+    def _replace_intermediate_buffer(self, req_id: str, upd: dict) -> None:
+        """Replace one request's runtime payload with the current chunk."""
+        if not isinstance(upd, dict):
+            return
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        snapshot = dict(upd)
+        previous = self.model_intermediate_buffer.get(req_id)
+        previous_meta = previous.get("meta") if isinstance(previous, dict) else None
+        incoming_meta = snapshot.get("meta")
+        meta = dict(incoming_meta) if isinstance(incoming_meta, dict) else {}
+        if isinstance(previous_meta, dict):
+            for key in ("num_processed_tokens", "resumable"):
+                if key not in meta and key in previous_meta:
+                    meta[key] = previous_meta[key]
+        if meta or "meta" in snapshot:
+            snapshot["meta"] = meta
+        self.model_intermediate_buffer[req_id] = snapshot
+        setattr(req_state, "additional_information_cpu", snapshot)
+
     def _update_streaming_input_additional_info(self, new_req_data, req_id):
         # For streaming input prefill case only. Update buffer from last segment input.
         cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
@@ -2046,6 +2071,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not isinstance(inc_info, dict) or not inc_info:
             payload_info = getattr(new_req_data, "additional_information", None)
             inc_info = deserialize_additional_information(payload_info)
+        if getattr(self.model, "replace_runtime_additional_information", False):
+            snapshot = dict(inc_info) if isinstance(inc_info, dict) else {}
+            meta = snapshot.get("meta")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            meta["num_processed_tokens"] = 0
+            meta["resumable"] = True
+            snapshot["meta"] = meta
+            self._replace_intermediate_buffer(req_id, snapshot)
+            return
         if not isinstance(inc_info, dict) or not inc_info:
             return
         merged_info = dict(cached_additional_info) if isinstance(cached_additional_info, dict) else {}

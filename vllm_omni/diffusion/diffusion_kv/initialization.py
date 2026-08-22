@@ -73,7 +73,13 @@ def initialize_diffusion_kv_control_plane(
         scheduler_kv_cache_config,
         vllm_config,
     )
-    executor.set_kv_cache_configs(worker_configs)
+    # Native sizing may auto-fit ``max_model_len=-1`` against the profiled
+    # memory budget.  Forward that final value so every Worker sizes its
+    # physical BlockTables from the same bound as the Scheduler.
+    resolved_max_model_len = vllm_config.model_config.max_model_len
+    if type(resolved_max_model_len) is not int or resolved_max_model_len <= 0:
+        raise ValueError("native Diffusion KV sizing must resolve a positive max_model_len")
+    executor.set_kv_cache_configs(worker_configs, resolved_max_model_len)
     return (
         scheduler_kv_cache_config,
         scheduler_block_size,

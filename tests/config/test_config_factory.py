@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for StageConfigFactory and related classes.
 """
@@ -1661,6 +1661,7 @@ stages:
             ]
         }
         original_foo = fake_config["stages"][0]["foo"]
+        assert isinstance(original_foo, dict)
         original_b = original_foo["b"]
 
         with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
@@ -2128,7 +2129,12 @@ class TestBaseConfigInheritance:
             sampling = deploy.stages[1].default_sampling_params
             assert sampling is not None, f"{filename} stage 1 lost default_sampling_params"
             assert sampling["temperature"] == 0.8, filename
-            assert sampling["top_k"] == 100, filename
+            # Upstream utils.TTSSamplingParams. min_tokens is not checked here:
+            # the duplex overlay drops it to 0 because the model budgets each
+            # generate_chunk itself.
+            assert sampling["top_k"] == 25, filename
+            assert sampling["top_p"] == 0.85, filename
+            assert sampling["repetition_penalty"] == 1.05, filename
 
     def test_ci_inherits_from_main(self):
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
@@ -2828,13 +2834,14 @@ class TestObjectStorageConfigResolution:
         monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
 
         class Recorder:
+            def __init__(self) -> None:
+                self.pulls = pulls
+
             def set_files(self, files: list[tuple[str, str]]) -> None:
                 materialized_files.clear()
                 materialized_files.extend(files)
 
-        recorder = Recorder()
-        recorder.pulls = pulls
-        return recorder
+        return Recorder()
 
     def test_passthrough_for_non_uri(self, fake_object_storage):
         assert _materialize_object_storage_configs("org/model") == "org/model"
