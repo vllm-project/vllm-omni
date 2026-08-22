@@ -110,8 +110,9 @@ Do not add `--enforce-eager`. The first request includes regional
 compilation; warm the server once before measuring steady-state latency.
 H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 
-The same endpoint accepts `task=t2va`, `task=fl2va`, and `task=ref2va`; no
-partition restart is required. Layerwise offload applies to both DiTs.
+The FL2VA endpoint accepts `task=t2va` and `task=fl2va`. Serve `task=ref2va`
+from a separate Ref2VA server invocation; one process cannot load both
+checkpoint partitions. Layerwise offload applies to both FL2VA DiTs.
 
 On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
 768P without offloading or sharding: use distributed layerwise offload (as
@@ -141,35 +142,44 @@ one frame, stays serial and does not create a thread pool.
 
 For more than one worker, each request owns a bounded pool. Conversion futures
 are submitted and results are yielded in FIFO order. At most `2 * W_eff`
-frames are pending, where `W_eff = min(W, F)`, and each worker reuses its own
-thread-local single-channel scratch buffer. Generator close, conversion
-failure, and mux failure cancel pending futures and shut down the pool with
-`wait=True` and `cancel_futures=True`. The pool is per request, so concurrent
-requests can multiply worker, pending-frame, and scratch-buffer resources.
+submitted or pending futures represent frames, where `W_eff = min(W, F)`. A
+converted PyAV frame yielded to the muxer can coexist with those pending
+futures. Each worker also reuses its own thread-local single-channel scratch
+buffer, so the model adds `W_eff` such scratch buffers. Generator close,
+conversion failure, and mux failure cancel pending futures and shut down the
+pool with `wait=True` and `cancel_futures=True`. The pool is per request, so
+concurrent requests can multiply worker, pending-frame, and scratch-buffer
+resources.
 
-There is no algorithmic worker limit at 8 or 32. The pending-frame bound is
-`min(2 * W_eff, F)`. For the validated 1344x768 `gbrp` shape, one PyAV frame
-uses 3,096,576 bytes and one float32 single-channel scratch buffer uses
-4,128,768 bytes. When the bounded queue is full, the capacity/modelled
-maximum of these two known allocation classes is therefore:
+For `W_eff > 1`, the conservative known frame-storage count is
+`min(F, 2 * W_eff + 1)`: the extra one is the yielded frame and is distinct
+from the `2 * W_eff` pending-future bound. For the validated 124-frame,
+1344x768 `gbrp` shape, one PyAV frame uses 3,096,576 bytes and one float32
+single-channel scratch buffer uses 4,128,768 bytes. The known-capacity model
+is therefore:
 
-`min(2 * W_eff, F) * 3,096,576 + W_eff * 4,128,768` bytes.
+`min(F, 2 * W_eff + 1) * 3,096,576 + W_eff * 4,128,768` bytes.
 
-This capacity is not guaranteed to be reached at every instant, and it is not
-an upper bound for total process memory. It excludes futures, executor
+For `W_eff = 1`, conversion is serial, no pool is created, and one converted
+frame plus one thread-local scratch buffer is used at a time. For the pooled
+worker counts below, the pending-future column excludes the yielded frame, and
+the capacity includes both frame classes:
+
+| Workers | Pending-future bound | Known frame slots | Known capacity |
+| ---: | ---: | ---: | ---: |
+| 8 | 16 | 17 | 81.703125 MiB |
+| 16 | 32 | 33 | 160.453125 MiB |
+| 32 | 64 | 65 | 317.953125 MiB |
+
+This is a conservative known-capacity model, not total process memory. It is
+not guaranteed to be reached at every instant and excludes futures, executor
 objects, libx264 buffers, the original input, audio, allocator overhead, and
-other process state. For the tested worker counts the modelled capacities are:
+other process state. With `N` concurrent requests, this per-request model
+scales approximately by `N`; actual process RSS and peak memory require
+workload measurement.
 
-| Workers | Bounded frame/scratch capacity |
-|---:|---:|
-| 8 | 78.75 MiB |
-| 16 | 157.50 MiB |
-| 32 | 315.00 MiB |
-
-With `N` concurrent requests, this per-request capacity model scales
-approximately by `N`. Actual process RSS and peak memory are workload
-measurements; they cannot be inferred from this model. The public cap is an
-operational resource boundary, not a theoretical or universal optimum.
+The public cap is an operational resource boundary, not a theoretical or
+universal optimum.
 
 #### Final CPU validation
 
@@ -198,10 +208,14 @@ reported as `(w8 - w1) / w1`, so a negative value means lower wall time.
 
 #### Independent worker-boundary exploration
 
-The same payload was measured independently for workers 8, 16, and 32. Each
-worker count had one warmup and five formal rounds in both forward and reverse
-order. The forward order was `8 -> 16 -> 32`; the reverse order was
-`32 -> 16 -> 8`.
+The same payload was measured for workers 8, 16, and 32. Each worker count had
+one warmup and five formal rounds in both forward and reverse order. The
+forward order was `8 -> 16 -> 32`; the reverse order was `32 -> 16 -> 8`.
+
+Workers 16 and 32 were measured in an independent cap-unlocked experimental
+worktree using the same bounded algorithm. The public CLI and programmatic
+validator reject values above 8, so the public operational range is 1 through
+8. The bounded queue imposes no algorithmic or theoretical limit at 8.
 
 | Workers | Forward wall median (ms) | Reverse wall median (ms) | Forward RSS median (KB) | Reverse RSS median (KB) |
 |---:|---:|---:|---:|---:|
@@ -212,8 +226,125 @@ order. The forward order was `8 -> 16 -> 32`; the reverse order was
 All 30 exploratory outputs were byte-identical and passed media validation.
 The pooled ten-sample changes were slight and order-sensitive, so they are not
 treated as a performance gain. Workers 16 and 32 showed no stable same-order
-wall improvement over worker 8 while increasing resource use. This PR keeps
-the public range at 1 through 8.
+wall improvement over worker 8 while increasing resource use. The public range
+remains 1 through 8.
+
+#### Final A2 E2E validation (measured)
+
+This final measured E2E run was scoped strictly to MiniMax-H3 `FL2VA`/`t2va`:
+one request at `1344x768@24fps`, fixed Laser configuration, on one host with
+8x Atlas A2 910B4-1. BASE was `bd4f9acfd30456cb8fa98af53d32f7adc34e03a0`
+without PR2; the candidate runtime was
+`81804c86f51bb8ab31827bbf3dbd2a62ef03bee3`; the run date was
+`2026-08-22`. The model partition path is represented as
+`$MODEL_ROOT/FL2VA`.
+
+BASE and candidate were run serially. Each side had one warmup and three
+formal requests for each 5, 8.7, and 15 second duration. The fixed prompt was:
+
+> In a snowy blue-purple forest, Ori carefully walks past a sleeping giant;
+> footsteps crunch in the snow while the creature breathes and softly snorts.
+
+The seed was 1101. Each request requested 50 steps and executed 49 DiT
+forwards. BASE and candidate both used the known-good eight-NPU command above
+with `MODEL=$MODEL_ROOT/FL2VA`,
+`MINDIE_SD_FA_TYPE=ascend_laser_attention`, and
+`--diffusion-attention-backend FLASH_ATTN`. Candidate alone additionally used
+`--video-response-frame-conversion-workers 8`; BASE did not use the PR2 flag.
+No Laser operator trace was captured, so Laser activation is not
+trace-confirmed.
+
+The measured environment was:
+
+| Component | Version / provenance |
+| --- | --- |
+| Driver / firmware | `25.5.2` / `7.8.0.7.220` |
+| CANN | `9.0.1 V100R001C10SPC002B220` |
+| Python | `3.12.13` |
+| PyTorch / `torch_npu` | `2.10.0+cpu` / `2.10.0.post2` |
+| vLLM | `0.26.0+empty` |
+| vLLM-Ascend | `0.19.1rc2.dev1251+g905bbf372` |
+| vLLM-Omni metadata | `0.26.1.dev138+g596c16a55.npu` |
+| Import origins | Exact BASE/CANDIDATE source worktrees verified |
+| MindIE-SD | `3.0.0` |
+| PyAV | `18.0.0` |
+| ffmpeg / ffprobe | `4.4.2` / `4.4.2` |
+
+The provenance checks verified that `vllm_omni` imports resolved from the exact
+BASE and CANDIDATE source worktrees. The checks accounted for shared editable
+distribution metadata and recorded vLLM and vLLM-Ascend provenance separately.
+
+The tables below report measured medians with observed ranges. MP4 reduction is
+derived as `(BASE - candidate) / BASE`; the MP4 timer is the direct metric for
+this CPU response-conversion change.
+
+| Duration | BASE MP4 (ms) | Candidate MP4 (ms) | Derived reduction |
+| ---: | ---: | ---: | ---: |
+| 5 s | 4943.92 [4809.49, 5113.98] | 3547.37 [2033.84, 3658.29] | 28.248% |
+| 8.7 s | 11456.80 [7834.04, 11647.05] | 3158.92 [3086.81, 5996.05] | 72.428% |
+| 15 s | 14367.83 [13426.50, 14546.93] | 5806.33 [5690.51, 10227.57] | 59.588% |
+
+| Duration | BASE stage 0 (s) | Candidate stage 0 (s) |
+| ---: | ---: | ---: |
+| 5 s | 161.755 [161.057, 162.508] | 157.684 [157.018, 158.686] |
+| 8.7 s | 379.430 [353.087, 390.267] | 352.310 [351.838, 359.633] |
+| 15 s | 933.645 [902.745, 938.495] | 943.822 [940.118, 960.199] |
+
+| Duration | BASE server E2E (s) | Candidate server E2E (s) |
+| ---: | ---: | ---: |
+| 5 s | 166.571 [166.007, 167.629] | 160.725 [160.572, 161.349] |
+| 8.7 s | 391.083 [364.551, 398.107] | 355.403 [355.003, 365.634] |
+| 15 s | 947.077 [917.298, 952.869] | 954.055 [945.930, 965.896] |
+
+Externally observed client-wall E2E was measured outside the server process:
+
+| Duration | BASE externally observed client-wall E2E (s) | Candidate externally observed client-wall E2E (s) |
+| ---: | ---: | ---: |
+| 5 s | 167.870 [167.322, 168.933] | 162.042 [161.892, 162.664] |
+| 8.7 s | 392.409 [365.875, 399.420] | 356.708 [356.317, 366.954] |
+| 15 s | 948.404 [918.628, 954.196] | 955.393 [947.237, 967.225] |
+
+Stage 0, server E2E, and externally observed client-wall E2E differences are
+not causally attributed to PR2. Only CPU response conversion changed; three
+samples show substantial accelerator-side variation. The MP4 timer is the
+direct metric.
+
+| Duration | BASE true denoise (s) | Candidate true denoise (s) |
+| ---: | ---: | ---: |
+| 5 s | 148 [147, 148] | 145 [144, 147] |
+| 8.7 s | 332 [331, 369] | 336 [332, 340] |
+| 15 s | 894 [869, 900] | 910 [893, 913] |
+
+True denoise elapsed values above are measured with 49 DiT forwards per
+request. All-device sampled peak HBM was measured at a 1-second interval; the
+peaks are lower bounds:
+
+| Duration | BASE peak HBM (MB) | Candidate peak HBM (MB) |
+| ---: | ---: | ---: |
+| 5 s | 29794 [29792, 29805] | 31513 [29804, 33220] |
+| 8.7 s | 31892 [31771, 31905] | 31770 [31672, 31892] |
+| 15 s | 35433 [35433, 35447] | 35433 [35433, 35443] |
+
+All 18 formal MP4s were byte-identical across repeats and between BASE and
+candidate for each fixed duration. All 24 total requests (6 warmups plus 18
+formal) passed the HTTP, media, and request contracts, including H.264
+1344x768 at 24 fps, AAC stereo at 32 kHz, and full timestamp/decode checks.
+There was no request-window fatal error, OOM, collective timeout, NaN/Inf,
+fallback, or rank failure. The stop gate was clean: the port and processes were
+free, and all eight cards were healthy and idle.
+
+The frozen raw-regex audit returned exactly `FINAL_AUDIT=FAIL failures=2`. A
+later contextual review classified the two full-log gates as false positives:
+each side had 9 startup INFO `NaN-clamp` lines and 32 post-SIGTERM cleanup
+`Traceback` markers. The markers occurred after the explicit SIGTERM shutdown
+trigger from CANN repository-manager cleanup and were not request failures.
+
+This evidence is limited to fixed Laser configuration, one host, and one
+request at a time. It covers no concurrency or sustained recovery, no
+`fl2va`/`Ref2VA` or other models/platforms, and supports no general
+recommendation beyond this tested H3/A2 setup. The run has no trace-confirmed
+Laser operator. The CPU benchmark and worker-boundary scan above are separate
+from this E2E evidence.
 
 Worker 1 is the conservative default. For the tested single-request
 MiniMax-H3/A2 workload, worker 8 is a latency-oriented recommendation when
