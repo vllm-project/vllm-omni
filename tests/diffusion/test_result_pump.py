@@ -465,6 +465,7 @@ class TestResultPumpCancelledFutureRace:
         _feed_one_msg_to_pump(executor, msg)
 
         assert fut.cancelled()
+        assert executor._completed_outputs == {}
 
     def test_batch_split_racing_cancel_does_not_crash_pump(self):
         executor = _make_executor()
@@ -492,6 +493,67 @@ class TestResultPumpCancelledFutureRace:
         assert cancelled_fut.cancelled()
         assert healthy_fut.done()
         assert healthy_fut.result(timeout=1.0) is outputs["r-healthy"]
+        assert executor._completed_outputs == {}
+
+
+class TestResultPumpDiscardsDoneFuture:
+    """A registered future that is already cancelled/done must have its late
+    OUTPUT_READY result discarded, not re-cached into _completed_outputs.
+
+    rahul-steiger-nv (#6439 review): the old `else` branch cached the result
+    whenever `pending.done()` was true, so a genuinely cancelled waiter (the
+    common abort case) leaked the late result back into the cache. The pump
+    must distinguish "no waiter registered" (cache) from "waiter registered
+    but done/cancelled" (discard).
+    """
+
+    def test_single_output_discards_for_cancelled_future(self):
+        executor = _make_executor()
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        fut.cancel()
+        assert fut.cancelled() and fut.done()
+        with executor._futures_lock:
+            executor._output_futures["aid-x"] = fut
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="aid-x",
+            output=DiffusionOutput(output="late"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert executor._completed_outputs == {}
+        assert "aid-x" not in executor._output_futures
+
+    def test_batch_split_discards_for_cancelled_member(self):
+        executor = _make_executor()
+        cancelled_fut: concurrent.futures.Future = concurrent.futures.Future()
+        cancelled_fut.cancel()
+        assert cancelled_fut.cancelled() and cancelled_fut.done()
+        healthy_fut: concurrent.futures.Future = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._output_futures["batch-9/r-aborted"] = cancelled_fut
+            executor._output_futures["batch-9/r-healthy"] = healthy_fut
+            executor._batch_split_map["batch-9"] = {
+                "batch-9/r-aborted": "r-aborted",
+                "batch-9/r-healthy": "r-healthy",
+            }
+
+        outputs = {
+            "r-aborted": DiffusionOutput(output="late"),
+            "r-healthy": DiffusionOutput(output="ok"),
+        }
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="batch-9",
+            output=_FakeBatchOutput(outputs),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        # Aborted member's result is discarded, healthy member still delivered.
+        assert healthy_fut.done()
+        assert healthy_fut.result(timeout=1.0) is outputs["r-healthy"]
+        assert executor._completed_outputs == {}
 
 
 class TestDropOutput:

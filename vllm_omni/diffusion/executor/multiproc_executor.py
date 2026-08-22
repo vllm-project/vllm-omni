@@ -958,18 +958,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     if batch_id:
                         with self._futures_lock:
                             pending = self._output_futures.pop(batch_id, None)
-                            if pending is not None and not pending.done():
-                                if exc is not None:
-                                    try_set_exception(pending, exc)
-                                else:
-                                    try_set_result(pending, output_result)
-                            else:
+                            if pending is None:
+                                # No waiter registered yet: cache for a later
+                                # wait_output_ready().
                                 fut = concurrent.futures.Future()
                                 if exc is not None:
                                     fut.set_exception(exc)
                                 else:
                                     fut.set_result(output_result)
                                 self._completed_outputs[batch_id] = fut
+                            elif not pending.done():
+                                if exc is not None:
+                                    try_set_exception(pending, exc)
+                                else:
+                                    try_set_result(pending, output_result)
+                            # else: waiter registered but already cancelled/done
+                            # (e.g. aborted request) -> discard, do not re-cache.
 
     def _deliver_batch_split(
         self,
@@ -989,12 +993,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
                 pending = self._output_futures.pop(per_req_id, None)
-                if pending is not None and not pending.done():
-                    try_set_result(pending, per_req_result)
-                else:
+                if pending is None:
+                    # No waiter registered yet: cache for a later
+                    # wait_output_ready().
                     fut: concurrent.futures.Future = concurrent.futures.Future()
                     fut.set_result(per_req_result)
                     self._completed_outputs[per_req_id] = fut
+                elif not pending.done():
+                    try_set_result(pending, per_req_result)
+                # else: waiter registered but already cancelled/done -> discard,
+                # do not re-cache.
 
     def describe_pending_state(self, async_output_id: str | None = None) -> str:
         """Summarize async-output bookkeeping for diagnosing stuck waits."""
