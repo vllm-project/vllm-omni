@@ -987,7 +987,6 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
-        "stage_input_transport",
         "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
