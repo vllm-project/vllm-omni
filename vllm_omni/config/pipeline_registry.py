@@ -51,6 +51,9 @@ from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPEL
 from vllm_omni.model_executor.models.dots_tts.pipeline import DOTS_TTS_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.dynin_omni.pipeline import DYNIN_OMNI_PIPELINE
+from vllm_omni.model_executor.models.falcon_perception.pipeline import (
+    FALCON_PERCEPTION_PIPELINE,
+)
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
@@ -184,6 +187,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
+    "falcon_perception": FALCON_PERCEPTION_PIPELINE,
     "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
     "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }

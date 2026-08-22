@@ -216,6 +216,10 @@ ignore = [
 # legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
 # F-correctness rules still apply.
 "vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
+# AnyUp upsampler vendored from the Falcon Perception reference implementation
+# (itself a copy of github.com/wimmerth/anyup). Kept diffable against upstream,
+# so its H/W/BLOCK_SIZE argument names stay as-is.
+"vllm_omni/model_executor/models/falcon_perception/anyup.py" = ["N803"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]

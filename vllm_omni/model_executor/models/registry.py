@@ -468,6 +468,25 @@ _OMNI_MODELS = {
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
+    ## Falcon Perception
+    # Alias: the HF repo ships this architecture name in config.json, so this
+    # entry is what lets a bare `tiiuae/Falcon-Perception` resolve for offline
+    # loading. Online serving is not supported -- see the model docs.
+    "FalconPerceptionForSegmentation": (
+        "falcon_perception",
+        "falcon_perception_thinker",
+        "FalconPerceptionThinker",
+    ),
+    "FalconPerceptionThinker": (
+        "falcon_perception",
+        "falcon_perception_thinker",
+        "FalconPerceptionThinker",
+    ),
+    "FalconPerceptionSegmentation": (
+        "falcon_perception",
+        "falcon_perception_segmentation",
+        "FalconPerceptionSegmentation",
+    ),
 }
 
 
