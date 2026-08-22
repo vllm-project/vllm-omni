@@ -1038,6 +1038,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     )
     expected = torch.ones(2, 3)
     pipeline.text_encoder = Mock(return_value=expected)
+    pipeline._model_cpu_offload_modules = [pipeline.text_encoder]
     input_ids = torch.tensor([1, 2])
     vision_kwargs = {"pixel_values": torch.ones(1, 4)}
 
@@ -1401,7 +1402,7 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         lambda path: f"frames:{path}",
     )
 
-    rows, shapes = pipeline._encode_video_conditions(None, count=2)
+    rows, shapes = pipeline._encode_video_conditions_resident(None, count=2)
 
     assert pipeline.video_vae.calls == [
         "frames:video-1.mp4",
@@ -1964,7 +1965,7 @@ def test_ref2va_audio_duration_validation_precedes_rank_branch(monkeypatch):
 
     waveform = torch.zeros(1, 10)
     with pytest.raises(ValueError, match="max_duration_seconds must be positive"):
-        pipeline._encode_audio_conditions(
+        pipeline._encode_audio_conditions_resident(
             [(waveform, 10)],
             max_duration_seconds=0,
         )
@@ -1985,7 +1986,7 @@ def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
     pipeline.audio_vae = FakeAudioVAE()
     waveform = torch.arange(40, dtype=torch.float32).reshape(1, 40)
 
-    encoded, lengths = pipeline._encode_audio_conditions(
+    encoded, lengths = pipeline._encode_audio_conditions_resident(
         [(waveform, 10)],
         max_duration_seconds=2.5,
     )

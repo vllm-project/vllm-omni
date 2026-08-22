@@ -537,6 +537,15 @@ def test_empty_final_ignores_generation_scheduler_placeholder_token():
         # The runner injects the engine request id on every step (GPU
         # _preprocess, NPU _gather_runtime_additional_information)...
         {"request_id": "a", "meta": {"request_id": "a"}},
+        # Runtime snapshot bookkeeping alone is not a Talker payload.
+        {
+            "request_id": "a",
+            "meta": {
+                "request_id": "a",
+                "num_processed_tokens": 0,
+                "resumable": True,
+            },
+        },
         # ...but a pre-warm step can also reach the model with nothing at all.
         {},
     ],

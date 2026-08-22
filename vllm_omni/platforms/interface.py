@@ -185,6 +185,28 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        """Return the platform's native paged-KV BlockTables implementation."""
+        from vllm.v1.worker.gpu.block_table import BlockTables
+
+        return BlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build native attention metadata for the diffusion paged path.
+
+        The common CUDA/ROCm/XPU path uses vLLM's builder. Platforms with a
+        backend-specific metadata contract can override this hook without
+        making the diffusion adapter import their optional runtime package.
+        ``seq_lens_cpu`` is an adapter-only convenience value and is removed
+        before calling the upstream builder.
+        """
+        from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+
+        kwargs.pop("seq_lens_cpu", None)
+        return build_attn_metadata(**kwargs)
+
+    @classmethod
     def init_diffusion_worker_vllm_config(
         cls,
         vllm_config: Any,

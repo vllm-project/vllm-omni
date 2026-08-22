@@ -679,6 +679,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for info in update_infos
         )
         if replace_streaming_prompt:
+            self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)

@@ -75,6 +75,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     num_processed_tokens: int
     next_stage_prompt_len: int
     replace_streaming_prompt: bool
+    replace_runtime_additional_information: bool
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -175,6 +176,7 @@ class MetaStruct(_StructBase):
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
     replace_streaming_prompt: bool | None = None
+    replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None

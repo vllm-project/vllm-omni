@@ -149,6 +149,9 @@ class OmniSchedulerMixin:
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(session.external_req_id, None)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
@@ -159,7 +162,10 @@ class OmniSchedulerMixin:
         # pre-replacement frame will drain, so the counter reaches exactly
         # zero; a placeholder-based seed swallowed valid new-segment frames
         # whenever placeholder counts diverged from scheduled counts.
-        session.num_stale_output_tokens += int(getattr(session, "num_in_flight_tokens", 0) or 0)
+        # num_in_flight_tokens already includes any undrained stale share.
+        # Assign instead of accumulating so callers that fenced the same
+        # rollover before entering this helper do not count it twice.
+        session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
         new_prompt = update.prompt_token_ids or ()
@@ -184,6 +190,44 @@ class OmniSchedulerMixin:
             self._enqueue_waiting_request(session)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
+        """Discard cache state that belongs to a replaced prompt."""
+        # A prompt replacement is not a normal streaming extension: none of
+        # the old KV blocks or encoder state is valid for the new prompt. Use
+        # the scheduler's block-free path so an in-flight GPU step is fenced
+        # correctly before the blocks return to the pool.
+        self._free_request_blocks(session)
+        self.encoder_cache_manager.free(session)
+        getattr(self, "_inflight_prefills", set()).discard(session)
+
+    def _reset_ready_async_chunk_replacements(self) -> None:
+        """Release stale cache state after an async-chunk prompt rollover."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        replaced_ids = getattr(adapter, "replaced_streaming_prompt_ids", None)
+        ready_ids = getattr(adapter, "requests_with_ready_chunks", None)
+        if not replaced_ids or not ready_ids:
+            return
+
+        for request_id in tuple(replaced_ids & ready_ids):
+            request = self.requests.get(request_id)
+            if request is None:
+                replaced_ids.discard(request_id)
+                continue
+            # The streaming update may already have fenced this same in-flight
+            # frame. Seed idempotently so the replacement does not count it twice.
+            request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+            request.num_output_placeholders = 0
+            request.spec_token_ids = []
+            self._release_replaced_streaming_prompt_cache(request)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(request.external_req_id, None)
+            # Consume this marker after the one-time cache reset. The separate
+            # ready-chunk marker remains until scheduler admission succeeds.
+            replaced_ids.discard(request_id)
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
@@ -216,6 +260,7 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
+            self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()
 

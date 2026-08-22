@@ -188,6 +188,11 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
+        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
+            logger.warning_once(
+                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
+                "paged-attention adapter yet; model attention remains on the dense path."
+            )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -431,16 +436,38 @@ class DiffusionWorker:
             )
         ]
 
-    def set_kv_cache_configs(self, kv_cache_configs: list[KVCacheConfig]) -> None:
-        """Install this rank's native config without allocating tensors yet."""
+    def set_kv_cache_configs(
+        self,
+        kv_cache_configs: list[KVCacheConfig],
+        resolved_max_model_len: int,
+    ) -> None:
+        """Select this rank's config and initialize its physical KV pages."""
 
         assert self.model_runner is not None
+        assert self.vllm_config is not None
         if len(kv_cache_configs) != self.od_config.num_gpus:
             raise ValueError(
                 "Diffusion KVCacheConfig rank count mismatch: "
                 f"expected={self.od_config.num_gpus}, got={len(kv_cache_configs)}"
             )
-        self.model_runner.set_kv_cache_config(kv_cache_configs[self.rank])
+        if not 0 <= self.rank < len(kv_cache_configs):
+            raise ValueError(f"Diffusion Worker rank {self.rank} has no rank-local KVCacheConfig")
+        if type(resolved_max_model_len) is not int or resolved_max_model_len <= 0:
+            raise ValueError("resolved Diffusion KV max_model_len must be a positive integer")
+
+        # Native cache sizing may resolve an explicit ``-1`` model-length
+        # sentinel to the capacity that actually fits the profiled pool.
+        self.vllm_config.model_config.max_model_len = resolved_max_model_len
+        kv_cache_config = kv_cache_configs[self.rank]
+        self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        with self._maybe_get_memory_pool_context("kv_cache"):
+            self.model_runner.set_kv_cache_config(kv_cache_config)
+
+    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+        """Clear Worker-local rows without freeing Scheduler-owned blocks."""
+
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.remove_diffusion_kv_requests(request_ids)
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -730,6 +757,8 @@ class DiffusionWorker:
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
+        if self.model_runner is not None and (tags is None or "kv_cache" in tags):
+            self.model_runner.refresh_diffusion_kv_block_table_layout()
         if len(self._sleep_saved_buffers) and self.model_runner is not None:
             model = self.model_runner.pipeline
             for name, buffer in model.named_buffers():

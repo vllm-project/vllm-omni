@@ -663,7 +663,7 @@ class _DiffusionConfigProjection:
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
@@ -678,6 +678,7 @@ class _DiffusionConfigProjection:
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
@@ -816,6 +817,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if (
+            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and self.diffusion_kv_max_rows_per_request is None
+        ):
+            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 

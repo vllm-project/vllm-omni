@@ -49,6 +49,9 @@ class GlmTTSAdapter(ARTTSAdapter):
         prompt = await self.ctx.server._build_glm_tts_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="glm_tts")
 
+    def _load_supported_speakers(self) -> set[str]:
+        return set()
+
     def apply_sampling_overrides(
         self,
         sampling_params_list: list,
