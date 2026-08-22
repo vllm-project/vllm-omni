@@ -109,4 +109,4 @@ platforms:
       - stage_id: 2
         enforce_eager: false
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: NONE
