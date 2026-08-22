@@ -1,0 +1,7 @@
+# FL2V vLLM-Omni client dependencies.
+# The GPU work happens in the vLLM-Omni server, so this client needs no torch.
+numpy>=2.0
+pillow>=11.0
+imageio>=2.35
+imageio-ffmpeg>=0.5
+requests>=2.32

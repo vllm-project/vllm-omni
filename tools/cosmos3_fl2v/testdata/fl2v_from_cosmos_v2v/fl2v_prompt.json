@@ -1,0 +1,220 @@
+{
+  "subjects": [
+    {
+      "description": "A white articulated robot arm (Franka-style) entering from the upper left, holding the handle of a pale mint-green electric kettle",
+      "appearance_details": "White forearm links with black cabling zip-tied along the arm, small status LEDs near the wrist, black gripper fingers clutching the kettle handle",
+      "relationship": "Primary actor performing the pouring task",
+      "location": "Upper-left to center of frame, extending over the white tabletop",
+      "relative_size": "Large within frame",
+      "orientation": "Reaching toward the glass in the center of the table",
+      "pose": "Arm extended; wrist rotates the kettle from a pouring tilt toward a more upright end pose",
+      "action": "Continues pouring from the start-frame pose into the right-hand drinking glass, then moves the kettle spout left so the single coffee stream enters the open instant-coffee jar beside it, then moves the spout back over the right-hand glass and finishes in the end-frame pose",
+      "state_changes": "Spout aim moves right glass -> left jar -> right glass. Exactly one continuous stream; kettle tilt decreases toward the end frame",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 1,
+      "number_of_legs": 0
+    },
+    {
+      "description": "A pale mint-green / off-white electric kettle held by the white robot arm, pouring hot coffee-colored liquid",
+      "appearance_details": "Rounded modern kettle body, spout aimed near the glass, handle gripped by the robot",
+      "relationship": "Pouring vessel controlled by the white robot arm",
+      "location": "Center-left above the table, spout near the glass rim",
+      "relative_size": "Medium within frame",
+      "orientation": "Tilted to pour, becoming more upright by the end",
+      "pose": "",
+      "action": "Releases one continuous, unbranched stream of hot brewed coffee. The spout shifts left from the drinking glass into the open coffee jar, then shifts back over the drinking glass",
+      "state_changes": "Lateral aim changes smoothly while pour tilt continues; never a second stream",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 0,
+      "number_of_legs": 0
+    },
+    {
+      "description": "A clear cylindrical drinking glass on the white table to the right of the coffee jar, holding dark reddish-brown coffee with a long metal spoon",
+      "appearance_details": "Transparent glass showing dark reddish-brown coffee liquid throughout the clip, instant-coffee granules dissolving at the bottom, metal spoon leaning inside against the rim; the coffee level rises and the color stays a rich dark brown",
+      "relationship": "Primary pour target at the start and end; skipped during the mid-clip jar diversion",
+      "location": "Center-right of the tabletop, to the right of the coffee jar",
+      "relative_size": "Small to medium within frame",
+      "orientation": "Upright",
+      "pose": "",
+      "action": "Receives dark brown coffee before and after the diversion. During the jar interval, it receives zero new coffee because the complete stream is diverted into the left jar; the coffee already inside remains visible and still",
+      "state_changes": "Coffee level rises before the diversion, pauses while the stream enters the left jar, then rises again after the spout returns. Existing coffee stays in the glass",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 0,
+      "number_of_legs": 0
+    },
+    {
+      "description": "An open glass jar of instant coffee granules with a white label, sitting to the left of the drinking glass; becomes the temporary pour target during the mid-clip diversion",
+      "appearance_details": "Clear jar filled with dark brown granules, white label with green accents",
+      "relationship": "Secondary vessel: receives the diverted coffee stream mid-clip, then is left alone again",
+      "location": "Left of the glass on the table",
+      "relative_size": "Small within frame",
+      "orientation": "Upright",
+      "pose": "",
+      "action": "Starts dry of poured liquid besides its granules. Mid-clip it receives the full coffee stream from the kettle for several seconds, wetting the granules. After the spout returns to the drinking glass, no more coffee enters the jar",
+      "state_changes": "Granules become wet and a small pool of dark brown coffee appears among them during the diversion; jar stays upright and in place",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 0,
+      "number_of_legs": 0
+    },
+    {
+      "description": "A black three-finger robotic gripper visible in the bottom-right foreground",
+      "appearance_details": "Matte black articulated fingers, partially cropped by the frame edge",
+      "relationship": "Secondary idle manipulator; does not perform the pour",
+      "location": "Bottom-right foreground",
+      "relative_size": "Medium, partially out of frame",
+      "orientation": "Facing toward the workspace center",
+      "pose": "Open / idle",
+      "action": "Stays essentially static throughout",
+      "state_changes": "None",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 0,
+      "number_of_legs": 0
+    },
+    {
+      "description": "A stream of hot dark-brown coffee leaving the kettle spout",
+      "appearance_details": "Thin continuous stream of hot brewed coffee, amber-to-dark-brown where it catches the light, with light steam",
+      "relationship": "Shows pour aiming accuracy",
+      "location": "A single connected path from the kettle spout to exactly one vessel at a time: first the right drinking glass, then the left coffee jar, then the right drinking glass again",
+      "relative_size": "Thin linear element",
+      "orientation": "Downward from spout",
+      "pose": "",
+      "action": "The single unbroken coffee stream moves from the right drinking glass across to the open left coffee jar and pours into the jar among the granules, then moves back across into the right drinking glass. Never two streams; never table spill as the main event",
+      "state_changes": "Exactly one stream and one impact point move continuously: right glass -> left jar -> right glass",
+      "clothing": "",
+      "expression": "",
+      "gender": "",
+      "age": "",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 1,
+      "number_of_arms": 0,
+      "number_of_legs": 0
+    }
+  ],
+  "background_setting": "Bright indoor tabletop robotics / kitchen workspace matching the provided start and end frames: glossy white reflective table, blurred faucet and cabinetry in the background, soft indoor lighting. Camera viewpoint, framing, and object identities must remain consistent with the seed images.",
+  "lighting": {
+    "conditions": "Bright even indoor illumination consistent with the seed frames",
+    "direction": "Mostly top / overhead lighting with soft reflections on the white table",
+    "shadows": "Soft contact shadows under the glass, jar, and robot links; stable across the clip",
+    "illumination_effect": "Specular highlights on glass, kettle, and the dark coffee stream; no sudden lighting changes"
+  },
+  "aesthetics": {
+    "composition": "Same high-angle close framing as the start and end images, with the pour action centered",
+    "color_scheme": "White table and robot, pale kettle, dark reddish-brown coffee in the glass and in the pouring stream, brown coffee granules, black foreground gripper",
+    "mood_atmosphere": "Controlled robotics demo interrupted by a brief diversion of the pour into the wrong vessel (the coffee jar), then recovery into the drinking glass",
+    "patterns": "Reflections of overhead lights on the glossy table"
+  },
+  "cinematography": {
+    "camera_motion": "Fully static camera identical to the seed frames; no pan, tilt, zoom, or cut",
+    "framing": "High-angle close shot of the tabletop pour workspace",
+    "camera_angle": "Same elevated angle as seed_start.png and seed_end.png",
+    "depth_of_field": "Foreground and mid-ground sharp; background softly blurred",
+    "focus": "Kettle spout, glass, and the dark brown coffee stream in sharp focus",
+    "lens_focal_length": "Same as seed frames"
+  },
+  "style_medium": "Live-action video",
+  "artistic_style": "Realistic robotics demonstration footage",
+  "context": "First-last-frame conditioned generation for SIL-style anomaly insertion: lock the clip to the given start and end images while inserting a wrong-vessel pour diversion in the middle (coffee briefly poured into the left jar instead of the right glass), then recover so the final frame matches the end seed.",
+  "actions": [
+    {
+      "time": "0:00-0:02",
+      "description": "From the start-frame pose, the white arm pours hot dark-brown coffee from the kettle spout into the right-hand drinking glass; the black gripper stays idle"
+    },
+    {
+      "time": "0:02-0:05",
+      "description": "Wrong-vessel diversion: the wrist moves the kettle spout left until the entire single coffee stream enters the open instant-coffee jar to the left of the drinking glass. For about three seconds the stream lands only inside the jar, wetting the granules. Zero new coffee enters the right glass during this interval; its existing coffee remains inside and its fill level pauses"
+    },
+    {
+      "time": "0:05-0:07.875",
+      "description": "Correction: the arm moves the spout back over the right drinking glass, resumes filling it with dark reddish-brown coffee, and settles into the end-frame pose with the kettle more upright and the glass fuller, matching seed_end.png"
+    }
+  ],
+  "text_and_signage_elements": [
+    {
+      "text": "Coffee jar label text",
+      "category": "product_label",
+      "appearance": "White label with green accents on the jar",
+      "spatial_temporal": "Visible on the jar throughout; remains readable and stable",
+      "context": "Static prop labeling; do not alter or animate the label content"
+    }
+  ],
+  "segments": [
+    {
+      "segment_index": 0,
+      "time_range": "0:00-0:02",
+      "description": "On-target pour from the start seed into the right drinking glass",
+      "key_changes": "Dark brown coffee enters the right glass; granules in the left jar stay dry of new pour; arm motion is smooth",
+      "camera": "Static, identical to seeds"
+    },
+    {
+      "segment_index": 1,
+      "time_range": "0:02-0:05",
+      "description": "Diversion: the one stream moves fully into the left coffee jar instead of the right glass",
+      "key_changes": "Stream impact is inside the left jar only; right-glass level stops rising; jar granules become wet with dark coffee",
+      "camera": "Static, identical to seeds"
+    },
+    {
+      "segment_index": 2,
+      "time_range": "0:05-0:07.875",
+      "description": "Recover pour into the right drinking glass and settle to the end seed",
+      "key_changes": "Coffee stream returns into the right glass; dark reddish-brown level rises to match the end frame; kettle pose matches the end frame",
+      "camera": "Static, identical to seeds"
+    }
+  ],
+  "transitions": [],
+  "temporal_caption": "The video is anchored to provided start and end frames of a tabletop robot pouring hot dark-brown coffee from a pale kettle into a clear drinking glass on a glossy white table, with an open instant-coffee jar to the left of the glass and a black three-finger gripper idle in the foreground. The liquid is brewed coffee: rich reddish-brown in the glass and amber-brown in the falling stream. It begins matching the start image with one continuous stream landing inside the right-hand drinking glass. Midway, the white arm moves the kettle spout left, and that same single, unbranched stream enters the open left coffee jar among the granules for about three seconds. During this interval zero new coffee enters the right glass: the coffee already inside remains visible and its level does not rise. The arm then moves the same stream back over the right glass and finishes matching the end image with fuller coffee and a more upright kettle. There is never a second stream, never simultaneous pouring into both vessels, and never a table spill as the main event. Camera and objects remain fixed and consistent; there are no cuts.",
+  "audio_description": "",
+  "resolution": {
+    "W": 1280,
+    "H": 720
+  },
+  "aspect_ratio": "16,9",
+  "duration": "7.875ss",
+  "fps": 24,
+  "conditioning": {
+    "mode": "first_last_image_to_video",
+    "image_start": "assets/seed_start.png",
+    "image_end": "assets/seed_end.png",
+    "num_frames": 189,
+    "fps": 24.0,
+    "duration": "7.875s",
+    "size": "1280x720",
+    "condition_frame_indexes_vision": [
+      0,
+      47
+    ],
+    "event": "wrong_vessel_pour_into_left_jar",
+    "aligned_with": "Diffusers/vLLM-Omni Cosmos3 V2V example defaults (robot_pouring): num_frames=189, fps=24, 1280x720",
+    "note": "Required: start/end images + prompt. num_frames/fps/size are optional controls (default to official V2V 189@24 / 1280x720). Stock V2V uses condition_frame_indexes_vision=[0,1]; FL2V uses [0, T_lat-1]."
+  }
+}
