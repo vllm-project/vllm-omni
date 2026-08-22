@@ -182,15 +182,44 @@ class LingBotSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=self.head_dim,
-            total_num_heads=num_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=_projection_prefix(prefix, "qkv"),
-        )
-        self.num_local_heads = self.qkv.num_heads
+
+        # Q/K/V are fused into one GEMM only when the weights are not
+        # quantized. A ModelOpt NVFP4 checkpoint stores one global weight
+        # scale per projection, and vLLM's fused path keeps a single scalar
+        # ``alpha`` for the merged layer, resolving the three by taking their
+        # maximum. Because each projection's FP8 block scales were normalised
+        # by *its own* global scale -- every one of them saturates at 448.0 --
+        # substituting another projection's scale rescales that projection's
+        # whole output. On the public LingBot NVFP4 export the three differ by
+        # up to 3.5x, so fusing would not degrade the model, it would break it.
+        # Keeping them separate also matches how the checkpoint is stored.
+        self.fused_qkv = quant_config is None
+        if self.fused_qkv:
+            self.qkv = QKVParallelLinear(
+                hidden_size=dim,
+                head_size=self.head_dim,
+                total_num_heads=num_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=_projection_prefix(prefix, "qkv"),
+            )
+            self.num_local_heads = self.qkv.num_heads
+        else:
+            for name in ("q", "k", "v"):
+                setattr(
+                    self,
+                    name,
+                    ColumnParallelLinear(
+                        dim,
+                        dim,
+                        bias=True,
+                        gather_output=False,
+                        return_bias=False,
+                        quant_config=quant_config,
+                        prefix=_projection_prefix(prefix, name),
+                    ),
+                )
+            self.num_local_heads = num_heads // tp_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
         self.o = RowParallelLinear(
             dim,
@@ -309,8 +338,11 @@ class LingBotSelfAttention(nn.Module):
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
-        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        if self.fused_qkv:
+            qkv, _ = self.qkv(hidden_states)
+            query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        else:
+            query, key, value = self.q(hidden_states), self.k(hidden_states), self.v(hidden_states)
         query = self.norm_q(query)
         key = self.norm_k(key)
 
@@ -1228,7 +1260,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
 
         params = dict(self.named_parameters())
         loaded: set[str] = set()
-        qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v"))
+        # Only rewrite Q/K/V into a fused parameter when one was actually
+        # built; a quantized model keeps the checkpoint's own three.
+        qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v")) if self.blocks[0].self_attn.fused_qkv else ()
         for checkpoint_name, loaded_weight in weights:
             name = checkpoint_name
             shard_id = None

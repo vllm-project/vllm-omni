@@ -482,7 +482,10 @@ def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefi
     presented = _quantizable_projections(model)
 
     per_block = {
-        "self_attn.qkv",
+        # Q/K/V stay separate under quantization; see the fused_qkv comment.
+        "self_attn.q",
+        "self_attn.k",
+        "self_attn.v",
         "self_attn.o",
         "cross_attn.q",
         "cross_attn.k",
@@ -501,6 +504,45 @@ def test_quant_config_reaches_every_parallel_linear_with_checkpoint_rooted_prefi
     # list; the dict would silently hide that, so count the modules too.
     assert sum(1 for m in model.modules() if hasattr(m, "quant_prefix")) == len(expected)
     assert all(config is quant_config for config in presented.values())
+
+
+def test_quantized_self_attention_keeps_q_k_and_v_separate() -> None:
+    """Fusing them would break a ModelOpt NVFP4 checkpoint, not just degrade it.
+
+    Each projection's FP8 block scales are normalised by its own global weight
+    scale -- all three saturate at 448.0 in the public export -- while vLLM's
+    fused path carries one scalar alpha and resolves the three globals by
+    taking their maximum. On that checkpoint they differ by up to 3.5x, so two
+    of the three projections would dequantize to the wrong magnitude.
+    """
+    module = attention_tests._load_module()
+
+    quantized = _tiny_model(module, num_layers=1, quant_config=object())
+    unquantized = _tiny_model(module, num_layers=1)
+
+    assert quantized.blocks[0].self_attn.fused_qkv is False
+    assert not hasattr(quantized.blocks[0].self_attn, "qkv")
+    for name in ("q", "k", "v"):
+        assert hasattr(quantized.blocks[0].self_attn, name)
+
+    # The unquantized path is unchanged: fusion is still the default.
+    assert unquantized.blocks[0].self_attn.fused_qkv is True
+    assert hasattr(unquantized.blocks[0].self_attn, "qkv")
+
+
+def test_a_quantized_model_loads_q_k_v_under_their_checkpoint_names() -> None:
+    """The fused rename must not fire when there is no fused parameter."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, quant_config=object())
+
+    names = dict(model.named_parameters())
+    assert "blocks.0.self_attn.q.weight" in names
+    assert "blocks.0.self_attn.qkv.weight" not in names
+
+    loaded = model.load_weights(
+        [("blocks.0.self_attn.q.weight", torch.zeros_like(names["blocks.0.self_attn.q.weight"]))]
+    )
+    assert "blocks.0.self_attn.q.weight" in loaded
 
 
 def test_precision_sensitive_projections_stay_out_of_the_quant_dispatch() -> None:
