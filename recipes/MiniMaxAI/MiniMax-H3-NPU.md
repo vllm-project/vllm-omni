@@ -272,14 +272,25 @@ one warmup and five formal rounds in both forward and reverse order. The
 forward order was `8 -> 16 -> 32`; the reverse order was `32 -> 16 -> 8`.
 
 Workers 16 and 32 were measured in an independent experimental worktree using
-the same bounded algorithm. They are exploratory measurements, not a
-recommendation or a claim that larger worker counts improve every workload.
+the same bounded algorithm. The measured experimental scan used BASE commit
+`f09bdcbc7dc94827e76d4e9479674639be6ac442`, candidate patch SHA256
+`f2ea3bdd12ac51355920144df2ce10440140fe9410b32ab0cfdfb8e4a4ccc3e2`, and
+experiment diff SHA256
+`620a28904f3178acacc67640186cc49dc4bc4a77350e54283af0e7e4a760daab`; the
+experimental diff temporarily extended validation through 32 workers while
+leaving the scheduling algorithm unchanged.
 
 | Workers | Forward wall median (ms) | Reverse wall median (ms) | Forward RSS median (KB) | Reverse RSS median (KB) |
 |---:|---:|---:|---:|---:|
 | 8 | 2854.683 | 3354.612 | 3293004 | 3297688 |
 | 16 | 2855.986 | 3498.202 | 3462104 | 3454060 |
 | 32 | 3058.166 | 3482.307 | 3750708 | 3746896 |
+
+| Workers | Forward process CPU median (ms) | Reverse process CPU median (ms) |
+|---:|---:|---:|
+| 8 | 10033.490 | 10934.985 |
+| 16 | 10294.702 | 10904.763 |
+| 32 | 11362.199 | 11637.329 |
 
 All 30 exploratory outputs were byte-identical and passed media validation.
 The pooled ten-sample changes were slight and order-sensitive, so they are not
