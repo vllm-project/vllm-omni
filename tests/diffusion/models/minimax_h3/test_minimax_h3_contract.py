@@ -5,7 +5,7 @@ import json
 import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import pytest
@@ -1006,7 +1006,7 @@ def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     quant_config.get_quant_method.assert_called_once_with(linear, prefix=prefix)
 
 
-def test_no_offload_keeps_text_encoder_resident():
+def test_no_offload_keeps_text_encoder_resident(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1019,12 +1019,15 @@ def test_no_offload_keeps_text_encoder_resident():
     expected = torch.ones(2, 3)
     pipeline.text_encoder.encode_ids.return_value = expected
     input_ids = torch.tensor([1, 2])
+    empty_cache = Mock()
+    monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
 
     actual = pipeline._encode_text_hidden(input_ids, {})
 
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.offload_to_cpu.assert_not_called()
+    empty_cache.assert_not_called()
 
 
 def test_model_offload_uses_hooked_text_encoder_call():
@@ -1053,7 +1056,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     "offload_flag",
     ["enable_layerwise_offload", "enable_distributed_layerwise_offload"],
 )
-def test_layerwise_offload_releases_text_encoder(offload_flag):
+def test_layerwise_offload_releases_text_encoder(monkeypatch, offload_flag):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1064,15 +1067,73 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
         enable_distributed_layerwise_offload=False,
     )
     setattr(pipeline.od_config, offload_flag, True)
+    pipeline.device = torch.device("cpu")
+    pipeline.video_vae = Mock()
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
-    pipeline.text_encoder.encode_ids.return_value = expected
+    calls = []
+    pipeline.video_vae.to.side_effect = lambda device: calls.append(("video_vae.to", device))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "empty_cache",
+        lambda: calls.append(("empty_cache", None)),
+    )
+    pipeline.text_encoder.load_to_device.side_effect = lambda: calls.append(("text_encoder.load", None))
+    pipeline.text_encoder.encode_ids.side_effect = lambda *_args, **_kwargs: (
+        calls.append(("text_encoder.encode", None)) or expected
+    )
+    pipeline.text_encoder.offload_to_cpu.side_effect = lambda: calls.append(("text_encoder.offload", None))
 
     actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
 
     assert actual is expected
+    expected_calls = [
+        ("text_encoder.load", None),
+        ("text_encoder.encode", None),
+        ("text_encoder.offload", None),
+    ]
+    if offload_flag == "enable_layerwise_offload":
+        expected_calls = [
+            ("video_vae.to", "cpu"),
+            ("empty_cache", None),
+            *expected_calls,
+            ("video_vae.to", pipeline.device),
+        ]
+    assert calls == expected_calls
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_stage", ["load", "encode", "offload"])
+def test_layerwise_offload_restores_video_vae_on_failure(monkeypatch, failure_stage):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = Mock(spec=OmniDiffusionConfig)
+    pipeline.od_config.enable_cpu_offload = False
+    pipeline.od_config.enable_layerwise_offload = True
+    pipeline.od_config.enable_distributed_layerwise_offload = False
+    pipeline.device = torch.device("cpu")
+    pipeline.video_vae = Mock()
+    pipeline.text_encoder = Mock()
+    monkeypatch.setattr(torch.accelerator, "empty_cache", Mock())
+
+    if failure_stage == "load":
+        pipeline.text_encoder.load_to_device.side_effect = RuntimeError("load failed")
+    elif failure_stage == "encode":
+        pipeline.text_encoder.encode_ids.side_effect = RuntimeError("encode failed")
+    else:
+        pipeline.text_encoder.offload_to_cpu.side_effect = RuntimeError("offload failed")
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert pipeline.video_vae.to.call_args_list == [
+        call("cpu"),
+        call(pipeline.device),
+    ]
 
 
 def test_distributed_layerwise_offload_releases_text_encoder():
