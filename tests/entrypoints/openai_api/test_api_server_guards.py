@@ -380,8 +380,8 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
 def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, expected: bool) -> None:
     """Lock the gate that decides whether /start_profile is registered.
 
-    vLLM-Omni enables the profiler endpoints from the stage config, not from
-    ``VLLM_TORCH_PROFILER_DIR``. Fails if the gate starts accepting a stage that
+    vLLM-Omni enables the profiler endpoints from the stage config, matching
+    upstream vLLM v0.16.0+. Fails if the gate starts accepting a stage that
     only half-declares ``profiler_config`` (present but with no ``profiler``),
     stops supporting attribute-style configs, or stops scanning every stage.
     """
@@ -499,11 +499,12 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monkeypatch, caplog) -> None:
     """Lock the not-silent behavior when only ``VLLM_TORCH_PROFILER_DIR`` is set.
 
-    vLLM registers /start_profile from that environment variable; vLLM-Omni
-    registers it from the stage config. Without the warning the mismatch looks
-    identical to a working setup: server starts, nothing logged, /start_profile
-    404s. Fails if the routes get mounted from the env var alone, or if the
-    startup warning stops being emitted.
+    That variable was removed in vLLM v0.16.0 when profiling moved to
+    ``ProfilerConfig``, so nothing reads it any more. A stale value left in an
+    environment or script is inert, and without this warning it looks identical
+    to a working setup: server starts, nothing logged, /start_profile 404s.
+    Fails if the routes get mounted from the env var alone, or if the migration
+    warning stops being emitted.
     """
 
     def fake_build_openai_app(args, supported_tasks):
