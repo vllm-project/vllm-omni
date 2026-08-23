@@ -12,7 +12,7 @@ HBM:
   for the official-reference run.
 - **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
   layer from host memory; per-GPU HBM peaks at ~12.6 GiB (measured), at the
-  cost of wall-clock time (~5-7× slower per request on this node).
+  cost of wall-clock time (~5.5× slower per request on this node).
 
 A100 is sm80: **NVFP4 and hardware FP8 paths are unavailable** (FP8 tensor
 cores require sm89+), so use BF16 throughout. The text encoder (Qwen3-VL) and
@@ -93,13 +93,14 @@ figure.
 If HBM headroom is needed (e.g. co-tenant workloads), the rank-local DLO path
 keeps weights in host memory / shared page cache (~3.1 GiB per GPU after model
 loading) and streams DiT blocks per denoising step. It is slower per step
-because every denoising step streams non-resident DiT blocks over NVLink/PCIe.
+because every denoising step streams non-resident DiT blocks over PCIe (H2D
+copies; no-AllGather mode does not use NVLink collectives).
 
 **Validation:** this DLO command was validated end-to-end with the same request
 as the TP4 path (official 1344×768 reference video with audio, 480×256/96
 frames, seed 0): a full 50-step Ref2VA run completed (`status=completed`) with
 a live per-GPU peak of **~12.6 GiB** (nvidia-smi) and total inference time of
-**2013 s** (~5.5× the TP4 path's 364 s). The API worker-aggregated
+**2012.8 s** (~5.5× the TP4 path's 364.5 s). The API worker-aggregated
 `peak_memory_mb` was 19,108 for the same run. An earlier DLO attempt on this
 node OOM'd in an activation layer; the run below is the one that completed —
 re-measure on your own node before trusting the numbers.
@@ -126,10 +127,41 @@ loader's direct-checkpoint mmap plan (`checkpoint_mmap`) is supported for TP1:
 the four replicas map the same checkpoint file, sharing the OS page cache, so
 this is **not** four private 135 GiB copies. Each worker keeps only two bounded
 pinned staging slots (`distributed_layerwise_backend.py` logs "checkpoint pages
-are node-shared; each worker owns only two bounded host staging slots"). The
-four replicas also give request-level concurrency for independent requests;
-this is the rank-local DP routing shape from
-[#5911](https://github.com/vllm-project/vllm-omni/issues/5911).
+are node-shared; each worker owns only two bounded host staging slots").
+
+> Note: DP-level request concurrency (one request per rank per denoising wave)
+> is currently gated on the AllGather path; for rank-local no-AllGather it is
+> the subject of [PR #5911](https://github.com/vllm-project/vllm-omni/pull/5911),
+> which is not yet merged. Until then, treat this DP4 command as four replicas
+> that each serve their own sequential requests (or a single request fanned
+> out), not as one batch of four concurrent requests.
+
+**Why not AllGather?** The AllGather variant
+(`--dlo-use-allgather`, the default) shards host weights across the DP group
+(≈1/4 of each block per rank) and reconstructs each layer with
+`all_gather_into_tensor` on a communication stream. It is the throughput-
+oriented path: NVLink gathers are cheap on this node (all eight A100s are
+NV12-connected through the NVSwitch), and DP>1 allows one request per rank per
+denoising wave. This recipe validates the rank-local path (`--dlo-no-use-allgather`)
+instead, for two reasons:
+
+1. **Single-request validation** — AllGather's payoff is DP concurrency (one
+   request per rank per wave), which only shows up with concurrent requests;
+   for one 480×256 request, AllGather adds a synchronized collective per
+   streamed block (every rank must enter each wave) without reducing HBM or
+   latency.
+2. **Host-memory footprint** — rank-local TP1 shared-mmap keeps *one* OS-page-
+   cache copy of the checkpoint on the node, shared by all four replicas and
+   reclaimable under pressure. AllGather pins ≈1/4 of the model in *each* rank
+   (private pinned shards totaling ≈1 full model across the group), which is
+   not shareable or reclaimable. For the "fit on a shared node" goal, the
+   rank-local layout is the more memory-friendly choice.
+
+On a node where concurrent requests are the workload, `--dlo-use-allgather`
+(drop `--dlo-no-use-allgather`) is the recommended variant for throughput;
+re-measure HBM and latency there before adopting it. HSDP + AllGather is
+rejected by the offloader (double-sharding), so keep TP1+DP (or TP-only) when
+switching to AllGather.
 
 ## Eight A100-40GB (not measured)
 
