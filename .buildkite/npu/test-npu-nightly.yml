@@ -244,7 +244,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · Perf Test"
         key: nightly-diffusion-x2v-performance
         timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
