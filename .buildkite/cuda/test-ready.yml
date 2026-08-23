@@ -9,23 +9,27 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: "Simple · Model Executor Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/diffusion -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Engine&Entrypoints Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"

@@ -84,6 +84,16 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
+def _cleanup_after_execution_error(exc: Exception) -> None:
+    """Release device tensors retained by a failed execution traceback."""
+    exc.__traceback__ = None
+    try:
+        gc.collect()
+        current_omni_platform.empty_cache()
+    except Exception:
+        logger.warning("Failed to release device memory after an execution error", exc_info=True)
+
+
 def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
@@ -1187,7 +1197,6 @@ class WorkerProc:
             return None, False
 
         result = None
-        rpc_exception: Exception | None = None
         status: dict[str, Any] = {
             "rank": self.gpu_id,
             "ok": True,
@@ -1204,7 +1213,6 @@ class WorkerProc:
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            rpc_exception = e
             status.update(
                 {
                     "ok": False,
@@ -1213,6 +1221,9 @@ class WorkerProc:
                     "traceback": traceback.format_exc(),
                 }
             )
+            if not collect_rank_status:
+                raise
+            _cleanup_after_execution_error(e)
 
         if isinstance(result, bool):
             status["bool_result"] = result
@@ -1232,8 +1243,6 @@ class WorkerProc:
                 )
             return None, False
 
-        if rpc_exception is not None:
-            raise rpc_exception
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
         return result, should_reply
@@ -1282,6 +1291,8 @@ class WorkerProc:
                         self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    error = str(e)
+                    _cleanup_after_execution_error(e)
                     # Apply the same reply gate as the success path so
                     # non-output ranks don't enqueue stale error replies
                     # that compete with the expected responder's message.
@@ -1296,7 +1307,7 @@ class WorkerProc:
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
-                                    error=str(e),
+                                    error=error,
                                 )
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -1324,11 +1335,11 @@ class WorkerProc:
                                 except Exception:
                                     dp_rank = self.gpu_id
                                 self._return_result(
-                                    {"status": "error", "error": str(e), "dp_rank": dp_rank, "wave_id": wave_id}
+                                    {"status": "error", "error": error, "dp_rank": dp_rank, "wave_id": wave_id}
                                 )
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": str(e), "wave_id": wave_id})
+                            self._return_result({"status": "error", "error": error, "wave_id": wave_id})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -1345,6 +1356,7 @@ class WorkerProc:
                         exc_info=True,
                     )
                     output = DiffusionOutput.from_exception(e)
+                    _cleanup_after_execution_error(e)
 
                 try:
                     self._return_result(output)

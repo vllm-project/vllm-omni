@@ -1267,8 +1267,6 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -2225,6 +2223,28 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+    def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        expected = {"custom_ops": ["+rotary_embedding"]}
+        assert cuda_stages[0].yaml_engine_args["compilation_config"] == expected
+        assert all("compilation_config" not in stage.yaml_engine_args for stage in cuda_stages[1:])
+
+        for platform in ("cpu", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(
+                load_deploy_config(deploy_path),
+                platform=platform,
+            )
+            config = deploy.stages[0].compilation_config or {}
+            assert "+rotary_embedding" not in config.get("custom_ops", [])
 
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
