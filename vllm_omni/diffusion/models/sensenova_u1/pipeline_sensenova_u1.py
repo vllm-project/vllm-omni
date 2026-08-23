@@ -39,6 +39,7 @@ from vllm_omni.diffusion.lora.loader import (
     LoraLoaderMixin,
     _apply_diffusers_lora_alpha_scaling,
     _load_lora_state_dict,
+    _prepare_lora_delta,
     _remap_state_dict_keys,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -1467,10 +1468,71 @@ class SenseNovaU1Pipeline(
         state_dict = {k: v.to(torch.float32) for k, v in state_dict.items()}
         state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
 
-        loaded_keys = self.load_lora_into_module(state_dict, self, prefix="")
-        if not loaded_keys:
+        applied = self._add_lora_deltas(state_dict)
+        if not applied:
             raise ValueError(f"Distilled LoRA {paths[0]} matched no parameter of this pipeline.")
-        self.lora_loaded[adapter_name] = state_dict
+        logger.info("Fused distilled LoRA %s into %d parameters", paths[0], applied)
+        # Fusion is one-way and there is no unload path, so keep only a sentinel;
+        # the fp32 state dict is ~1.5 GiB and would stay resident for the process.
+        self.lora_loaded[adapter_name] = paths[0]
+
+    def _fused_shards(self, base_key: str) -> list[tuple[str, str | int]] | None:
+        """Unfused source names and shard ids for a fused parameter, else None."""
+        for param_name, weight_name, shard_id in self.stacked_params_mapping:
+            if base_key.endswith(param_name):
+                return [
+                    (base_key[: -len(param_name)] + w, sid)
+                    for p, w, sid in self.stacked_params_mapping
+                    if p == param_name
+                ]
+        return None
+
+    def _add_lora_deltas(self, state_dict: dict[str, torch.Tensor]) -> int:
+        """Add every matching delta into its parameter, sharding through vLLM.
+
+        The delta read from the checkpoint spans the whole layer. A parameter of
+        a parallel layer only holds this rank's slice of it, so the delta goes
+        through the layer's own weight loader -- into a zeroed copy of the
+        parameter, which is then added -- instead of being added directly.
+        """
+        applied = 0
+        for name, param in self.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            base_key = name[: -len(".weight")]
+            shards = self._fused_shards(base_key)
+
+            deltas: list[tuple[torch.Tensor, str | int | None]] = []
+            for src, shard_id in shards or [(base_key, None)]:
+                delta, _ = _prepare_lora_delta(state_dict, src, None)
+                if delta is None:
+                    deltas = []
+                    break
+                deltas.append((delta, shard_id))
+            if not deltas:
+                continue
+
+            weight_loader = getattr(param, "weight_loader", None)
+            buffer = torch.zeros_like(param.data)
+            if weight_loader is None:
+                # Not a parallel layer: the delta is already rank-local.
+                buffer = torch.cat([d for d, _ in deltas]).to(device=param.device, dtype=param.dtype)
+            else:
+                saved = param.data
+                try:
+                    param.data = buffer
+                    for delta, shard_id in deltas:
+                        delta = delta.to(device=param.device, dtype=param.dtype)
+                        if shard_id is None:
+                            weight_loader(param, delta)
+                        else:
+                            weight_loader(param, delta, shard_id)
+                finally:
+                    param.data = saved
+            with torch.no_grad():
+                param.data.add_(buffer)
+            applied += 1
+        return applied
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = self.stacked_params_mapping

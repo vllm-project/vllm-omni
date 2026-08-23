@@ -42,6 +42,34 @@ def test_rmsnorm_matches_float64_reference(hidden: int, dtype: torch.dtype, atol
     torch.testing.assert_close(got.to(torch.float32), want.to(torch.float32), atol=atol, rtol=atol)
 
 
+def _cast_chain(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """The implementation this PR replaced, kept so its accuracy can be compared."""
+    var = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    return weight * (x.to(torch.float32) * torch.rsqrt(var + eps)).to(weight.dtype)
+
+
+@pytest.mark.parametrize("hidden", [512, 4096])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rmsnorm_is_closer_to_float64_than_the_cast_chain(hidden: int, dtype: torch.dtype):
+    """The cast chain rounds to ``dtype`` before the weight multiply and so rounds
+    twice, while ``F.rms_norm`` rounds once. Restoring the cast chain fails here."""
+    torch.manual_seed(0)
+    norm = Qwen3RMSNorm(hidden, eps=1e-6).to(dtype)
+    with torch.no_grad():
+        norm.weight.copy_(torch.rand(hidden, dtype=dtype) + 0.5)
+    x = torch.randn(64, hidden, dtype=dtype)
+
+    reference = _reference(x, norm.weight, norm.variance_epsilon).to(torch.float64)
+    scale = reference.abs().mean()
+
+    def relative_error(out: torch.Tensor) -> float:
+        return ((out.to(torch.float64) - reference).abs().mean() / scale).item()
+
+    fused = relative_error(norm(x))
+    legacy = relative_error(_cast_chain(x, norm.weight, norm.variance_epsilon))
+    assert fused < legacy, f"{dtype} hidden={hidden}: fused {fused:.3e} not better than {legacy:.3e}"
+
+
 def test_rmsnorm_is_scale_equivariant():
     """RMSNorm divides by the RMS, so scaling the input must not change the output."""
     torch.manual_seed(0)

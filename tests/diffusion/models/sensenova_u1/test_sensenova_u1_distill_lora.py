@@ -122,3 +122,75 @@ def test_multiple_files_rejected(tmp_path):
     path = _write(tmp_path, {f"{_prefix()}.self_attn.o_proj_mot_gen": _triple(HIDDEN, HIDDEN, 1.0)})
     with pytest.raises(ValueError, match="exactly one"):
         pipe.load_lora_weights([path, path])
+
+
+class _ShardedLayer(nn.Module):
+    """One rank of a two-way sharded fused QKV, with a vLLM-style weight loader.
+
+    The parameter holds half of each of q, k and v. The loader is handed the whole
+    layer's tensor and keeps only this rank's slice, which is what vLLM does.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(HIDDEN // 2 + KV, HIDDEN))
+        self.seen: list[tuple[str, tuple[int, ...]]] = []
+        self.weight.weight_loader = self._weight_loader
+
+    def _weight_loader(self, param, loaded_weight, shard_id):
+        self.seen.append((shard_id, tuple(loaded_weight.shape)))
+        sizes = {"q": HIDDEN // 2, "k": KV // 2, "v": KV // 2}
+        offsets = {"q": 0, "k": HIDDEN // 2, "v": HIDDEN // 2 + KV // 2}
+        rows = sizes[shard_id]
+        param.data[offsets[shard_id] : offsets[shard_id] + rows] = loaded_weight[:rows]
+
+
+class _ShardedStub(SenseNovaU1Pipeline):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        layer = nn.Module()
+        layer.self_attn = nn.Module()
+        layer.self_attn.qkv_proj_mot_gen = _ShardedLayer()
+        self.language_model.model.layers = nn.ModuleList([layer])
+
+
+def test_fused_delta_is_sharded_through_the_weight_loader(tmp_path):
+    """Under tensor parallelism the parameter is a rank-local shard while the
+    checkpoint delta spans the whole layer, so the delta has to go through the
+    layer's weight loader. Adding it directly raises a shape error."""
+    pipe = _ShardedStub()
+    layer = pipe.language_model.model.layers[0].self_attn.qkv_proj_mot_gen
+    entries = {
+        f"{_prefix()}.self_attn.q_proj_mot_gen": _triple(HIDDEN, HIDDEN, 1.0),
+        f"{_prefix()}.self_attn.k_proj_mot_gen": _triple(KV, HIDDEN, 2.0),
+        f"{_prefix()}.self_attn.v_proj_mot_gen": _triple(KV, HIDDEN, 3.0),
+    }
+    pipe.load_lora_weights(_write(tmp_path, entries))
+
+    # the loader saw the whole layer's tensors, not a pre-sharded slice
+    assert layer.seen == [("q", (HIDDEN, HIDDEN)), ("k", (KV, HIDDEN)), ("v", (KV, HIDDEN))]
+
+    scale = ALPHA / RANK * RANK
+    got = layer.weight
+    assert torch.allclose(got[: HIDDEN // 2], torch.full((HIDDEN // 2, HIDDEN), scale * 1.0))
+    assert torch.allclose(got[HIDDEN // 2 : HIDDEN // 2 + KV // 2], torch.full((KV // 2, HIDDEN), scale * 2.0))
+    assert torch.allclose(got[HIDDEN // 2 + KV // 2 :], torch.full((KV // 2, HIDDEN), scale * 3.0))
+
+
+def test_fusion_does_not_retain_the_adapter_tensors(tmp_path):
+    """Fusion is one-way and this pipeline has no unload path, so holding the
+    fp32 state dict would keep about 1.5 GiB alive for the shipped checkpoint."""
+    pipe = _Stub()
+    path = _write(tmp_path, {f"{_prefix()}.self_attn.o_proj_mot_gen": _triple(HIDDEN, HIDDEN, 1.0)})
+    pipe.load_lora_weights(path, adapter_name="distill")
+
+    kept = pipe.lora_loaded["distill"]
+    assert not isinstance(kept, dict)
+    assert not isinstance(kept, torch.Tensor)
+
+    # the sentinel still makes a second load a no-op
+    before = pipe.language_model.model.layers[0].self_attn.o_proj_mot_gen.weight.detach().clone()
+    pipe.load_lora_weights(path, adapter_name="distill")
+    torch.testing.assert_close(pipe.language_model.model.layers[0].self_attn.o_proj_mot_gen.weight, before)
