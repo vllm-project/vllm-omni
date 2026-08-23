@@ -16,6 +16,7 @@ import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -51,6 +52,16 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
+
+
+def _resolve_component_quant_config(
+    quant_config: QuantizationConfig | None,
+    component: str,
+) -> QuantizationConfig | None:
+    component_configs = getattr(quant_config, "component_configs", None)
+    if component_configs is not None:
+        return component_configs.get(component, quant_config.default_config)
+    return quant_config
 
 
 def get_wan22_i2v_post_process_func(
@@ -302,24 +313,23 @@ class Wan22I2VPipeline(
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformer",
+        )
         self.transformer = create_transformer_from_config(
             transformer_config,
-            quant_config=od_config.quantization_config,
+            quant_config=transformer_quant_config,
         )
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            t2_quant = transformer_2_config.get("quantization_config")
-            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-                from vllm_omni.quantization.factory import build_quant_config
-
-                method = t2_quant["quant_method"]
-                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-                t2_quant = build_quant_config(method, **kwargs)
-            else:
-                t2_quant = None
+            transformer_2_quant_config = _resolve_component_quant_config(
+                od_config.quantization_config,
+                "transformer_2",
+            )
             self.transformer_2 = create_transformer_from_config(
                 transformer_2_config,
-                quant_config=t2_quant,
+                quant_config=transformer_2_quant_config,
             )
         else:
             self.transformer_2 = None

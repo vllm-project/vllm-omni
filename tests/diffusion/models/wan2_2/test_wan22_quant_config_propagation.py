@@ -7,7 +7,7 @@ Tests cover:
 - create_vace_transformer_from_config passes quant_config and prefix
 - set_tf_model_config propagates quant_config to OmniDiffusionConfig
 - patch_wan_rms_norm safely iterates sys.modules with concurrent modifications
-- I2V transformer_2 quant_config is built from config dict
+- I2V per-component quantization routing
 """
 
 import sys
@@ -21,9 +21,13 @@ import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace as wan22_vace_modu
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
 )
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
+    _resolve_component_quant_config,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace import (
     create_vace_transformer_from_config,
 )
+from vllm_omni.quantization import build_quant_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -232,70 +236,61 @@ class TestPatchWanRmsNorm:
 
 
 # ---------------------------------------------------------------------------
-# I2V transformer_2 quant_config extraction
+# I2V per-component quantization routing
 # ---------------------------------------------------------------------------
 
 
-class TestI2VTransformer2QuantConfig:
-    """Test the transformer_2 quant_config build logic from pipeline_wan2_2_i2v."""
+class TestI2VTransformerQuantConfig:
+    """Test I2V per-component quantization routing."""
 
-    def test_transformer_2_quant_config_built_from_dict(self):
-        """When transformer_2 config has quantization_config dict, build_quant_config is called."""
-        from vllm_omni.quantization.factory import build_quant_config
+    @pytest.mark.parametrize(
+        ("spec", "expected"),
+        [
+            (None, (None, None)),
+            (
+                {"method": "fp8", "activation_scheme": "dynamic"},
+                ("fp8", "fp8"),
+            ),
+            (
+                {"transformer": {"method": "fp8"}},
+                ("fp8", None),
+            ),
+            (
+                {"transformer_2": {"method": "fp8"}},
+                (None, "fp8"),
+            ),
+            (
+                {
+                    "default": {"method": "fp8"},
+                    "transformer_2": None,
+                },
+                ("fp8", None),
+            ),
+            (
+                {
+                    "transformer": {"method": "fp8"},
+                    "transformer_2": {"method": "int8"},
+                },
+                ("fp8", "int8"),
+            ),
+        ],
+        ids=[
+            "none",
+            "flat",
+            "transformer-only",
+            "transformer-2-only",
+            "default-with-transformer-2-disabled",
+            "mixed",
+        ],
+    )
+    def test_component_quantization_routing(self, spec, expected):
+        config = build_quant_config(spec)
 
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "num_layers": 2,
-            "quantization_config": {
-                "quant_method": "auto-round",
-                "bits": 4,
-                "group_size": 128,
-                "sym": True,
-                "packing_format": "auto_round:auto_gptq",
-            },
-        }
+        transformer = _resolve_component_quant_config(config, "transformer")
+        transformer_2 = _resolve_component_quant_config(config, "transformer_2")
 
-        # Replicate the logic from pipeline_wan2_2_i2v.py
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            method = t2_quant["quant_method"]
-            kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-            t2_quant = build_quant_config(method, **kwargs)
-        else:
-            t2_quant = None
-
-        from vllm.model_executor.layers.quantization.inc import INCConfig
-
-        assert isinstance(t2_quant, INCConfig)
-        assert t2_quant.weight_bits == 4
-        assert t2_quant.group_size == 128
-
-    def test_transformer_2_quant_config_none_when_missing(self):
-        """When transformer_2 config has no quantization_config, result is None."""
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "num_layers": 2,
-        }
-
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            pass  # won't enter
-        else:
-            t2_quant = None
-
-        assert t2_quant is None
-
-    def test_transformer_2_quant_config_none_when_dict_lacks_method(self):
-        """When quantization_config is a dict but missing quant_method, result is None."""
-        t2_config = {
-            "patch_size": [1, 2, 2],
-            "quantization_config": {"bits": 4},  # no quant_method key
-        }
-
-        t2_quant = t2_config.get("quantization_config")
-        if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-            pass
-        else:
-            t2_quant = None
-
-        assert t2_quant is None
+        actual = (
+            transformer.get_name() if transformer else None,
+            transformer_2.get_name() if transformer_2 else None,
+        )
+        assert actual == expected
