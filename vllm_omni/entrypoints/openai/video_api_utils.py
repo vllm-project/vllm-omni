@@ -48,7 +48,6 @@ logger = init_logger(__name__)
 
 
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
-MAX_FRAME_CONVERSION_WORKERS = 8
 
 _planar_scratch_local = threading.local()
 
@@ -614,9 +613,9 @@ def _log_video_encoding_path(
 
 
 def _validate_frame_conversion_workers(value: object) -> int:
-    """Validate the bounded CPU frame-conversion worker count."""
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_FRAME_CONVERSION_WORKERS:
-        raise ValueError(f"frame_conversion_workers must be between 1 and {MAX_FRAME_CONVERSION_WORKERS}.")
+    """Validate a positive CPU frame-conversion worker count."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("frame_conversion_workers must be a positive integer.")
     return value
 
 

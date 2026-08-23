@@ -125,25 +125,35 @@ This section documents the validated CPU response-encoding behavior for
 MiniMax-H3 `FL2VA`/`t2va` on one Atlas A2 host. The implementation itself is
 capability-based and has no model whitelist; other models and platforms have
 not been tested by this change and have no compatibility or performance claim.
+Other models, hardware, tasks, shapes, durations, and concurrency
+configurations retain the default of one worker until measured.
 
 Non-streaming MP4 responses use an automatic encoder. It checks the runtime
 frame shape, common dtype, and RGB channel-plane contiguity for every request.
 Compatible inputs use direct planar PyAV frames; unsupported inputs use the
 legacy fallback, and the worker setting is ignored on that route. Streaming
 fMP4 output keeps its existing incremental path. The conservative default is
-one CPU frame-conversion worker. The public range is 1 through 8:
-`--video-response-frame-conversion-workers 1..8`.
+one CPU frame-conversion worker. Configure the service with
+`--video-response-frame-conversion-workers N`, where `N` is any positive
+integer and the default is `1`. For a direct-planar request with `F` frames,
+the effective worker count is `min(N, F)`; CPU count is not a validation cap.
 
 PR2 parallelizes only direct-planar frame conversion. The caller still
 synchronously waits for the complete MP4 mux/encode, so PR2 does not move
 complete non-streaming encoding off the asyncio event loop; that is a separate
 follow-up.
 
-The route log records `selected_path`, `requested_frame_conversion_workers`,
-and `effective_frame_conversion_workers`. A legacy fallback records
-`effective_frame_conversion_workers=0`. For a direct path with `F` frames and
-requested worker count `W`, the effective count is `min(W, F)`. One worker, or
-one frame, stays serial and does not create a thread pool.
+At service startup, an INFO log reports the configured worker count, whether
+conversion is `serial` or `parallel`, the `non-streaming direct_planar MP4
+response encoding` scope, and the rule
+`per_request_effective_workers=min(configured_workers, frame_count)`. Each
+non-streaming request also logs `selected_path`,
+`requested_frame_conversion_workers`, and `effective_frame_conversion_workers`.
+The latter is `0` for the legacy fallback and otherwise is the request-level
+worker count after clamping to the frame count.
+For a direct path with `F` frames and requested worker count `W`, the effective
+count is `min(W, F)`. One worker, or one frame, stays serial and does not create
+a thread pool.
 
 For more than one worker, each request owns a bounded pool. Conversion futures
 are submitted and results are yielded in FIFO order. At most `2 * W_eff`
@@ -183,8 +193,9 @@ other process state. With `N` concurrent requests, this per-request model
 scales approximately by `N`; actual process RSS and peak memory require
 workload measurement.
 
-The public cap is an operational resource boundary, not a theoretical or
-universal optimum.
+There is no fixed public maximum. CPU capacity, memory, frame count, and
+concurrent requests remain practical resource constraints, so larger values
+must be validated against the target workload.
 
 #### Final CPU validation
 
@@ -228,10 +239,9 @@ The same payload was measured for workers 8, 16, and 32. Each worker count had
 one warmup and five formal rounds in both forward and reverse order. The
 forward order was `8 -> 16 -> 32`; the reverse order was `32 -> 16 -> 8`.
 
-Workers 16 and 32 were measured in an independent cap-unlocked experimental
-worktree using the same bounded algorithm. The public CLI and programmatic
-validator reject values above 8, so the public operational range is 1 through
-8. The bounded queue imposes no algorithmic or theoretical limit at 8.
+Workers 16 and 32 were measured in an independent experimental worktree using
+the same bounded algorithm. They are exploratory measurements, not a
+recommendation or a claim that larger worker counts improve every workload.
 
 | Workers | Forward wall median (ms) | Reverse wall median (ms) | Forward RSS median (KB) | Reverse RSS median (KB) |
 |---:|---:|---:|---:|---:|
@@ -242,8 +252,8 @@ validator reject values above 8, so the public operational range is 1 through
 All 30 exploratory outputs were byte-identical and passed media validation.
 The pooled ten-sample changes were slight and order-sensitive, so they are not
 treated as a performance gain. Workers 16 and 32 showed no stable same-order
-wall improvement over worker 8 while increasing resource use. The public range
-remains 1 through 8.
+wall improvement over worker 8 while increasing resource use. These results do
+not imply a recommendation for workers 16 or 32.
 
 #### Final A2 E2E validation (measured)
 
@@ -362,11 +372,17 @@ recommendation beyond this tested H3/A2 setup. The run has no trace-confirmed
 Laser operator. The CPU benchmark and worker-boundary scan above are separate
 from this E2E evidence.
 
-Worker 1 is the conservative default. For the tested single-request
-MiniMax-H3/A2 workload, worker 8 is a latency-oriented recommendation when
-CPU and memory headroom are available; worker 4 is a lower-resource
-intermediate choice. Worker 8 is not a theoretical or general optimum, and
-other workloads require fresh measurement.
+Worker 1 is the conservative default. For the exact measured E2E scope only —
+MiniMax-H3 `FL2VA`/`t2va`, one request, fixed Laser, `1344x768@24fps`, tested
+5, 8.7, and 15 second cases, on the Atlas A2 host with a 192-CPU Kunpeng-920
+and 8 x Ascend 910B4-1, using the recorded software stack in the measured
+environment table above — worker 8 is a latency-oriented recommendation when
+CPU and memory headroom are available. This recommendation does not extend to
+other models, hardware, tasks, shapes, durations, or concurrency; those
+configurations retain the default of one worker until measured. Worker 4 is a
+lower-resource intermediate choice in the CPU scan, not a general
+recommendation. Worker 8 is not a theoretical optimum, and the exploratory
+16/32 results do not imply a recommendation for those values.
 
 ### Optional optimizations
 

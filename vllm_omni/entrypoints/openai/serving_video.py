@@ -101,9 +101,13 @@ class OmniOpenAIServingVideo:
         self._video_response_frame_conversion_workers = _validate_frame_conversion_workers(
             video_response_frame_conversion_workers
         )
+        worker_mode = "parallel" if self._video_response_frame_conversion_workers > 1 else "serial"
         logger.info(
-            "Video response frame conversion workers configured: requested=%s",
+            "Video response frame conversion configured: configured_workers=%s mode=%s "
+            "scope=non-streaming direct_planar MP4 response encoding "
+            "per_request_effective_workers=min(configured_workers, frame_count)",
             self._video_response_frame_conversion_workers,
+            worker_mode,
         )
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:

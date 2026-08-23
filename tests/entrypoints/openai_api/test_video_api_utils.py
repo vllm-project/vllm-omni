@@ -621,7 +621,7 @@ def test_fallback_ignores_workers_without_creating_pool(monkeypatch):
     assert "effective_frame_conversion_workers=0" in events[0]
 
 
-def test_direct_workers_are_forwarded_and_capped_in_route_log(monkeypatch):
+def test_direct_workers_are_forwarded_and_clamped_to_frame_count_in_route_log(monkeypatch):
     calls = []
     events = []
     video = np.transpose(np.zeros((3, 3, 4, 4), dtype=np.float32), (1, 2, 3, 0))
@@ -642,15 +642,15 @@ def test_direct_workers_are_forwarded_and_capped_in_route_log(monkeypatch):
         lambda message, *args, **kwargs: events.append(message % args),
     )
 
-    assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=8) == b"direct-video"
+    assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=32) == b"direct-video"
     assert calls and calls[0][2] == 3
-    assert "requested_frame_conversion_workers=8" in events[0]
+    assert "requested_frame_conversion_workers=32" in events[0]
     assert "effective_frame_conversion_workers=3" in events[0]
 
 
-@pytest.mark.parametrize("workers", [0, 9, True, False, 1.0, "1"])
+@pytest.mark.parametrize("workers", [0, -1, True, False, 1.0, "1"])
 def test_encode_video_bytes_rejects_invalid_programmatic_worker_count(workers):
-    with pytest.raises(ValueError, match="between 1 and 8"):
+    with pytest.raises(ValueError, match="positive integer"):
         video_api_utils._encode_video_bytes(
             np.zeros((1, 2, 2, 3), dtype=np.float32), fps=12, frame_conversion_workers=workers
         )

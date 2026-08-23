@@ -23,7 +23,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
-from vllm_omni.entrypoints.openai.video_api_utils import MAX_FRAME_CONVERSION_WORKERS
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -60,13 +59,13 @@ def _nonneg_finite_float(value: str) -> float:
 
 
 def _video_response_frame_conversion_workers(value: str) -> int:
-    """Argparse type for the bounded CPU frame-conversion worker count."""
+    """Argparse type for a positive CPU frame-conversion worker count."""
     try:
         parsed = int(value)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(f"invalid worker count: {value!r}") from exc
-    if not 1 <= parsed <= MAX_FRAME_CONVERSION_WORKERS:
-        raise argparse.ArgumentTypeError(f"worker count must be between 1 and {MAX_FRAME_CONVERSION_WORKERS}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("worker count must be a positive integer")
     return parsed
 
 
@@ -844,7 +843,7 @@ class OmniServeCommand(CLISubcommand):
             default=1,
             help=(
                 "Number of CPU workers used to convert planar video frames for non-streaming MP4 responses "
-                f"(1-{MAX_FRAME_CONVERSION_WORKERS}, default: 1)."
+                "(positive integer; default: 1; each request clamps this value to its frame count)."
             ),
         )
         # TTS-specific parameters

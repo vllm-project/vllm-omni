@@ -14,11 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vllm_omni.entrypoints.openai.video_api_utils import (
-    MAX_FRAME_CONVERSION_WORKERS,
-    _encode_video_bytes,
-    _encode_video_bytes_legacy,
-)
+from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, _encode_video_bytes_legacy
 
 
 @dataclass(frozen=True)
@@ -28,16 +24,12 @@ class BenchmarkVariant:
 
 
 def _positive_int(value: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {value!r}") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be at least 1")
-    return parsed
-
-
-def _worker_count(value: str) -> int:
-    parsed = _positive_int(value)
-    if parsed > MAX_FRAME_CONVERSION_WORKERS:
-        raise argparse.ArgumentTypeError(f"worker count must not exceed {MAX_FRAME_CONVERSION_WORKERS}")
     return parsed
 
 
@@ -119,7 +111,7 @@ def _summarize(records: list[dict[str, object]], label: str) -> dict[str, object
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comparison", choices=("legacy-vs-direct", "workers"), default="workers")
-    parser.add_argument("--workers", type=_worker_count, default=8)
+    parser.add_argument("--workers", type=_positive_int, default=8)
     parser.add_argument("--frames", type=_positive_int, default=12)
     parser.add_argument("--height", type=_positive_int, default=96)
     parser.add_argument("--width", type=_positive_int, default=160)

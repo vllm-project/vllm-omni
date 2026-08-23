@@ -89,7 +89,7 @@ def test_serve_parser_defaults_to_one_video_response_frame_conversion_worker() -
     assert args.video_response_frame_conversion_workers == 1
 
 
-@pytest.mark.parametrize("workers", [1, 2, 4, 8])
+@pytest.mark.parametrize("workers", [1, 2, 4, 8, 9, 32])
 def test_serve_parser_accepts_video_response_frame_conversion_workers(workers: int) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
@@ -109,7 +109,7 @@ def test_serve_parser_accepts_video_response_frame_conversion_workers(workers: i
     assert args.get_explicit_kwargs_dict()["video_response_frame_conversion_workers"] == workers
 
 
-@pytest.mark.parametrize("workers", ["0", "9", "-1", "not-an-int"])
+@pytest.mark.parametrize("workers", ["0", "-1", "1.0", "not-an-int"])
 def test_serve_parser_rejects_invalid_video_response_frame_conversion_workers(workers: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")

@@ -118,6 +118,27 @@ def test_raw_and_base64_encoders_receive_configured_workers(mocker: MockerFixtur
     assert base64_encoder.call_args.kwargs["frame_conversion_workers"] == 8
 
 
+@pytest.mark.parametrize(
+    ("workers", "mode"),
+    [(1, "serial"), (32, "parallel")],
+)
+def test_startup_log_describes_frame_conversion_configuration(mocker: MockerFixture, workers: int, mode: str) -> None:
+    startup_log = mocker.patch("vllm_omni.entrypoints.openai.serving_video.logger.info")
+
+    OmniOpenAIServingVideo.for_diffusion(
+        FakeAsyncOmni(),
+        model_name="test-model",
+        video_response_frame_conversion_workers=workers,
+    )
+
+    message, *args = startup_log.call_args.args
+    rendered_message = message % tuple(args)
+    assert f"configured_workers={workers}" in rendered_message
+    assert f"mode={mode}" in rendered_message
+    assert "scope=non-streaming direct_planar MP4 response encoding" in rendered_message
+    assert "per_request_effective_workers=min(configured_workers, frame_count)" in rendered_message
+
+
 @pytest.mark.asyncio
 async def test_frame_conversion_workers_are_removed_before_async_omni_construction(monkeypatch):
     captured = {}
