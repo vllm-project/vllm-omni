@@ -1212,6 +1212,7 @@ class StagePool:
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
         kwargs = dict(kwargs or {})
@@ -1227,6 +1228,7 @@ class StagePool:
                 timeout=timeout,
                 args=args,
                 kwargs=kwargs,
+                unique_reply_rank=unique_reply_rank,
             )
         except Exception as exc:
             logger.exception(

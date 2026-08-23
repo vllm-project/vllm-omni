@@ -185,6 +185,51 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     assert replace_calls == ["to_qkv"]
 
 
+def test_lora_manager_uses_declared_mapping_and_component_relative_target(monkeypatch):
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    replace_calls: list[str] = []
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, module: fake_replace_submodule(root, name, module, replace_calls),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.packed_modules_mapping = {"qkv_proj": ["to_q", "to_k", "to_v"]}
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.blocks = torch.nn.ModuleList([torch.nn.Module()])
+    pipeline.transformer.blocks[0].attn = torch.nn.Module()
+    pipeline.transformer.blocks[0].attn.qkv_proj = _FakeLinearBase()
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    monkeypatch.setattr(manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"])
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {
+            "r": 1,
+            "target_modules": r"^blocks\.(?:.*\.)?attn\.to_q$",
+        },
+    )()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert manager._packed_modules_mapping["qkv_proj"] == ["to_q", "to_k", "to_v"]
+    assert replace_calls == ["blocks.0.attn.qkv_proj"]
+
+
 def test_lora_manager_activates_fused_lora_on_packed_layer():
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),

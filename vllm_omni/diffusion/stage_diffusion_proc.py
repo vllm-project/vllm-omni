@@ -209,6 +209,7 @@ class StageDiffusionProc:
         timeout: float | None,
         args: tuple,
         kwargs: dict,
+        unique_reply_rank: int | None,
     ) -> Any:
         """Dispatch collective RPC calls to DiffusionEngine.
 
@@ -216,6 +217,7 @@ class StageDiffusionProc:
         the contract that ``AsyncOmni`` provides.
         """
         loop = asyncio.get_running_loop()
+        exec_all_ranks = unique_reply_rank is not None
 
         if method == "profile":
             is_start = args[0] if args else True
@@ -242,7 +244,8 @@ class StageDiffusionProc:
                 timeout,
                 (),
                 {"lora_request": lora_request},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -254,7 +257,8 @@ class StageDiffusionProc:
                 timeout,
                 args,
                 kwargs or {},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -266,7 +270,8 @@ class StageDiffusionProc:
                 timeout,
                 (),
                 {},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             if not isinstance(results, list):
                 return results or []
@@ -284,7 +289,8 @@ class StageDiffusionProc:
                 timeout,
                 (),
                 {"adapter_id": lora_id},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -297,7 +303,8 @@ class StageDiffusionProc:
             timeout,
             args,
             kwargs or {},
-            None,
+            unique_reply_rank,
+            exec_all_ranks,
         )
 
     # ------------------------------------------------------------------
@@ -439,6 +446,7 @@ class StageDiffusionProc:
                             msg.get("timeout"),
                             tuple(msg.get("args", ())),
                             msg.get("kwargs", {}),
+                            msg.get("unique_reply_rank"),
                         )
                         await response_socket.send(
                             encoder.encode(

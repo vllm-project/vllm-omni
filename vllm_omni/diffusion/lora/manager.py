@@ -177,6 +177,13 @@ class DiffusionLoRAManager:
 
         mapping: dict[str, list[str]] = {}
         for module in self.pipeline.modules():
+            declared = getattr(module, "packed_modules_mapping", None)
+            if isinstance(declared, dict):
+                for packed_name, sub_names in declared.items():
+                    if isinstance(packed_name, str) and isinstance(sub_names, (list, tuple)):
+                        values = [str(name) for name in sub_names]
+                        if values:
+                            mapping.setdefault(packed_name, values)
             derived = _derive_from_stacked_params_mapping(getattr(module, "stacked_params_mapping", None))
             for packed_name, sub_names in derived.items():
                 if not isinstance(packed_name, str) or not packed_name:
@@ -412,14 +419,22 @@ class DiffusionLoRAManager:
 
                 packed_modules_list = self._get_packed_modules_list(module)
                 if target_modules_pattern is not None or target_modules_list is not None:
-                    should_replace = _matches_target(full_module_name)
+                    # PEFT targets are relative to the denoiser component
+                    # (e.g. ``^transformer_blocks...``), while manager keys
+                    # include the pipeline component prefix
+                    # (``transformer.transformer_blocks...``). Accept either
+                    # spelling so an anchored target does not silently wrap
+                    # zero layers.
+                    should_replace = _matches_target(module_name) or _matches_target(full_module_name)
                     if not should_replace and len(packed_modules_list) > 1:
                         prefix, _, packed_suffix = full_module_name.rpartition(".")
+                        relative_prefix, _, _ = module_name.rpartition(".")
                         sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, len(packed_modules_list))
                         if sub_suffixes is not None:
                             for sub_suffix in sub_suffixes:
                                 sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
-                                if _matches_target(sub_full_name):
+                                sub_relative_name = f"{relative_prefix}.{sub_suffix}" if relative_prefix else sub_suffix
+                                if _matches_target(sub_relative_name) or _matches_target(sub_full_name):
                                     should_replace = True
                                     break
 

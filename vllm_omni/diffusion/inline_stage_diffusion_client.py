@@ -211,6 +211,7 @@ class InlineStageDiffusionClient(StageClientBase):
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
     ) -> Any:
         loop = asyncio.get_running_loop()
 
@@ -226,7 +227,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 profile_prefix,
             )
 
-        kwargs = kwargs or {}
+        kwargs = dict(kwargs or {})
+        exec_all_ranks = unique_reply_rank is not None
 
         # LoRA methods
         if method == "add_lora":
@@ -238,7 +240,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 timeout,
                 (),
                 {"lora_request": lora_request},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -250,7 +253,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 timeout,
                 args,
                 kwargs,
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -262,7 +266,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 timeout,
                 (),
                 {},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             if not isinstance(results, list):
                 return results or []
@@ -280,7 +285,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 timeout,
                 (),
                 {"adapter_id": lora_id},
-                None,
+                unique_reply_rank,
+                exec_all_ranks,
             )
             return all(results) if isinstance(results, list) else results
 
@@ -291,7 +297,8 @@ class InlineStageDiffusionClient(StageClientBase):
             timeout,
             args,
             kwargs,
-            None,
+            unique_reply_rank,
+            exec_all_ranks,
         )
 
     def check_health(self) -> None:

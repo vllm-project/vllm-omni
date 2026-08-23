@@ -80,6 +80,7 @@ class _ConcurrencyTrackingExecutor:
                     "args": args,
                     "kwargs": kwargs,
                     "unique_reply_rank": unique_reply_rank,
+                    "exec_all_ranks": exec_all_ranks,
                     "thread": threading.get_ident(),
                 }
             )
@@ -225,6 +226,27 @@ async def test_executor_only_called_from_busy_loop_thread():
         f"executor.collective_rpc must run only on the busy-loop thread "
         f"(expected {{{busy_tid}}}, got {engine.executor.thread_ids})"
     )
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_forwards_worker_rank_policy():
+    """Queued RPCs preserve all-rank execution and unique-reply routing."""
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        result = await engine.async_collective_rpc(
+            "mutate_workers",
+            args=("payload",),
+            unique_reply_rank=2,
+            exec_all_ranks=True,
+        )
+        assert result.error == "rpc_result_for_payload"
+    finally:
+        _stop_engine(engine)
+
+    call = next(call for call in engine.executor.calls if call["method"] == "mutate_workers")
+    assert call["unique_reply_rank"] == 2
+    assert call["exec_all_ranks"] is True
 
 
 @pytest.mark.asyncio

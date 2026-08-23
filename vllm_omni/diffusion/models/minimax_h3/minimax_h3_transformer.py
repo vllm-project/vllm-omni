@@ -949,11 +949,13 @@ class MiniMaxH3DiTModel(nn.Module):
         },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
-    # The checkpoint already stores qkv and the MLP gate/up as single tensors
-    # (see the reordering in load_weights), so there are no unfused names for
-    # quantization or LoRA to map onto. Address the fused layers directly, e.g.
-    # ignored_layers=["blocks.0.attn.qkv_proj"].
-    packed_modules_mapping = {}
+    # Online trainer LoRA uses the unfused Diffusers names. The serving port
+    # keeps qkv and SwiGLU gate/up fused, so expose their logical sublayers to
+    # vLLM's packed-LoRA loader.
+    packed_modules_mapping = {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+        "fc1": ["gate_proj", "up_proj"],
+    }
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
         if tp_size < 1:

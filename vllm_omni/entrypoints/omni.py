@@ -4,7 +4,7 @@ import copy
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterable, Sequence
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
@@ -24,6 +24,26 @@ logger = init_logger(__name__)
 
 class Omni(OmniBase):
     """Synchronous entrypoint for offline generation."""
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        stage_ids: list[int] | None = None,
+        *,
+        unique_reply_rank: int | None = None,
+    ) -> list[Any]:
+        """Execute a stage-scoped control RPC through the public sync entrypoint."""
+        return self.engine.collective_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=stage_ids,
+            unique_reply_rank=unique_reply_rank,
+        )
 
     def _maybe_force_final_only_for_llm_stages(
         self,

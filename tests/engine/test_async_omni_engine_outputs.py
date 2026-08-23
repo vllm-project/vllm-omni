@@ -462,6 +462,13 @@ def test_collective_and_duplex_results_share_router_without_swapping(mocker: Moc
     engine._correlated_rpc_client.close()
 
 
+@pytest.mark.parametrize("rank", [True, -1, 1.5])
+def test_collective_rpc_rejects_invalid_unique_reply_rank(rank):
+    engine = object.__new__(AsyncOmniEngine)
+    with pytest.raises(ValueError, match="unique_reply_rank"):
+        engine.collective_rpc("health", unique_reply_rank=rank)
+
+
 def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixture):
     class SignallingQueue(queue.Queue):
         def __init__(self) -> None:

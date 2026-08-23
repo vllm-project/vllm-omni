@@ -562,8 +562,8 @@ class TestPromptUpdateIntegration:
                 )
             ]
 
-        def collective_rpc(self, method, timeout, args, kwargs, unique_reply_rank):
-            del timeout, kwargs, unique_reply_rank
+        def collective_rpc(self, method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks=False):
+            del timeout, kwargs, unique_reply_rank, exec_all_ranks
             if method == "submit_interaction":
                 request_id, interaction = args
                 self._runner.submit_interaction(request_id, interaction)

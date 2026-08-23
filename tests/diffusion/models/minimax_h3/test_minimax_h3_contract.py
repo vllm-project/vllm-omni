@@ -15,6 +15,15 @@ import torch.nn as nn
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def test_h3_declares_logical_sublayers_for_packed_lora():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+
+    assert MiniMaxH3DiTModel.packed_modules_mapping == {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+        "fc1": ["gate_proj", "up_proj"],
+    }
+
+
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -1689,8 +1698,10 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs))
-        or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe)),
+        lambda command, **kwargs: (
+            calls.append((command, kwargs))
+            or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe))
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")
