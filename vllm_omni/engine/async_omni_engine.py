@@ -15,9 +15,9 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 import janus
 import torch
@@ -25,6 +25,8 @@ from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.model_executor.models import ModelRegistry
+from vllm.tasks import SupportedTask
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -75,12 +77,78 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
+    from vllm_omni.engine.stage_pool import StagePool
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
     from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+
+
+# vLLM's closed task set plus ``speech``, the composition-level task an
+# audio-output stage adds; this is the task universe an omni pipeline serves.
+OmniSupportedTask: TypeAlias = Literal[SupportedTask, "speech"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _CapabilityTask:
+    """A logical check for whether a ``StagePool`` supports a task."""
+
+    task: OmniSupportedTask
+    probe: Callable[[str | list[str], ModelConfig], bool]
+    eligible: Callable[[StageClient], bool]
+
+    def check(self, pool: StagePool) -> bool:
+        """Whether this pool's stage serves the task: an eligible stage running a capable model."""
+        client = pool.stage_client
+        if client is None or not self.eligible(client):
+            return False
+
+        # Diffusion-stage pools carry no vLLM config; nothing to probe.
+        if (model_config := getattr(pool.stage_vllm_config, "model_config", None)) is None:
+            return False
+
+        try:
+            return bool(self.probe(model_config.architectures, model_config))
+        except Exception:
+            logger.debug(
+                "Could not probe %s for %s",
+                getattr(self.probe, "__name__", self.probe),
+                getattr(model_config, "model", "<unknown>"),
+                exc_info=True,
+            )
+            return False
+
+
+_MODEL_CAPABILITY_TASKS: tuple[_CapabilityTask, ...] = (
+    # SupportsTranscription -> /v1/audio/transcriptions, /v1/audio/translations.
+    _CapabilityTask(
+        task="transcription",
+        probe=ModelRegistry.is_transcription_model,
+        eligible=lambda client: getattr(client, "is_comprehension", False),
+    ),
+)
+
+
+def _derive_supported_tasks(stage_pools: Sequence[StagePool]) -> tuple[OmniSupportedTask, ...]:
+    """Derive the served task set from the stage topology and model capabilities."""
+    clients = [pool.stage_client for pool in stage_pools if pool.stage_client is not None]
+    supported: set[OmniSupportedTask] = set()
+
+    if any(getattr(client, "is_comprehension", False) for client in clients):
+        supported.add("generate")
+
+    if any(getattr(client, "final_output_type", None) == "audio" for client in clients):
+        supported.add("speech")
+
+    for rule in _MODEL_CAPABILITY_TASKS:
+        if any(rule.check(pool) for pool in stage_pools):
+            supported.add(rule.task)
+
+    return tuple(supported) if supported else ("generate",)
 
 
 class AsyncOmniEngine:
@@ -216,7 +284,7 @@ class AsyncOmniEngine:
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
         self.prompt_expand_func: Any | None = None
-        self.supported_tasks: tuple[str, ...] = ("generate",)
+        self.supported_tasks: tuple[OmniSupportedTask, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
         # Janus queues are constructed eagerly here (not deferred to the
@@ -341,12 +409,7 @@ class AsyncOmniEngine:
             )
             for client in self.stage_clients
         ]
-        supported_tasks: set[str] = set()
-        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
-            supported_tasks.add("generate")
-        if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
-            supported_tasks.add("speech")
-        self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
+        self.supported_tasks = _derive_supported_tasks(self.stage_pools)
 
     def _bootstrap_orchestrator(
         self,
