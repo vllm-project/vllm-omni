@@ -138,10 +138,43 @@ one CPU frame-conversion worker. Configure the service with
 integer and the default is `1`. For a direct-planar request with `F` frames,
 the effective worker count is `min(N, F)`; CPU count is not a validation cap.
 
-PR2 parallelizes only direct-planar frame conversion. The caller still
-synchronously waits for the complete MP4 mux/encode, so PR2 does not move
+The direct-planar parallel frame conversion change parallelizes only
+direct-planar frame conversion. The caller still synchronously waits for the
+complete MP4 mux/encode, so this CPU response-conversion change does not move
 complete non-streaming encoding off the asyncio event loop; that is a separate
 follow-up.
+
+For the measured candidate setting in this section, start the Atlas A2 FL2VA
+server as follows. The `--video-response-frame-conversion-workers 8` line is
+the candidate setting used for the measurements; omit it for BASE/default
+worker 1.
+
+```bash
+export MODEL_ROOT=/path/to/MiniMax-H3
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=9098
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
+export PYTHONDONTWRITEBYTECODE=1
+export MINDIE_SD_FA_TYPE=ascend_laser_attention
+
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 8 \
+  --usp 8 \
+  --ring 1 \
+  --text-encoder-tp-size 8 \
+  --enable-distributed-layerwise-offload \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --vae-patch-parallel-size 8 \
+  --diffusion-attention-backend FLASH_ATTN \
+  --video-response-frame-conversion-workers 8
+```
 
 At service startup, an INFO log reports the configured worker count, whether
 conversion is `serial` or `parallel`, the `non-streaming direct_planar MP4
@@ -260,7 +293,7 @@ not imply a recommendation for workers 16 or 32.
 This final measured E2E run was scoped strictly to MiniMax-H3 `FL2VA`/`t2va`:
 one request at `1344x768@24fps`, fixed Laser configuration, on one host with
 8x Atlas A2 910B4-1. BASE was `bd4f9acfd30456cb8fa98af53d32f7adc34e03a0`
-without PR2; the candidate runtime was
+without the worker option; the candidate runtime was
 `81804c86f51bb8ab31827bbf3dbd2a62ef03bee3`; the run date was
 `2026-08-22`. The model partition path is represented as
 `$MODEL_ROOT/FL2VA`.
@@ -272,11 +305,12 @@ formal requests for each 5, 8.7, and 15 second duration. The fixed prompt was:
 > footsteps crunch in the snow while the creature breathes and softly snorts.
 
 The seed was 1101. Each request requested 50 steps and executed 49 DiT
-forwards. BASE and candidate both used the known-good eight-NPU command above
-with `MODEL=$MODEL_ROOT/FL2VA`,
+forwards. BASE and candidate both used the self-contained Atlas A2 FL2VA
+command in this section with `MODEL=$MODEL_ROOT/FL2VA`,
 `MINDIE_SD_FA_TYPE=ascend_laser_attention`, and
-`--diffusion-attention-backend FLASH_ATTN`. Candidate alone additionally used
-`--video-response-frame-conversion-workers 8`; BASE did not use the PR2 flag.
+`--diffusion-attention-backend FLASH_ATTN`. Candidate used
+`--video-response-frame-conversion-workers 8`; BASE omitted that line and used
+the default worker count of 1.
 No Laser operator trace was captured, so Laser activation is not
 trace-confirmed.
 
@@ -331,9 +365,9 @@ Externally observed client-wall E2E was measured outside the server process:
 | 15 s | 948.404 [918.628, 954.196] | 955.393 [947.237, 967.225] |
 
 Stage 0, server E2E, and externally observed client-wall E2E differences are
-not causally attributed to PR2. Only CPU response conversion changed; three
-samples show substantial accelerator-side variation. The MP4 timer is the
-direct metric.
+not causally attributed to this CPU response-conversion change. Only CPU
+response conversion changed; three samples show substantial accelerator-side
+variation. The MP4 timer is the direct metric.
 
 | Duration | BASE true denoise (s) | Candidate true denoise (s) |
 | ---: | ---: | ---: |
