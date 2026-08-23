@@ -138,11 +138,10 @@ one CPU frame-conversion worker. Configure the service with
 integer and the default is `1`. For a direct-planar request with `F` frames,
 the effective worker count is `min(N, F)`; CPU count is not a validation cap.
 
-The direct-planar parallel frame conversion change parallelizes only
-direct-planar frame conversion. The caller still synchronously waits for the
-complete MP4 mux/encode, so this CPU response-conversion change does not move
-complete non-streaming encoding off the asyncio event loop; that is a separate
-follow-up.
+Parallel frame conversion applies only to the direct-planar path. The caller
+still synchronously waits for the complete MP4 mux/encode, so this CPU
+response-conversion change does not move complete non-streaming encoding off the
+asyncio event loop; that is a separate follow-up.
 
 For the measured candidate setting in this section, start the Atlas A2 FL2VA
 server as follows. The `--video-response-frame-conversion-workers 8` line is
