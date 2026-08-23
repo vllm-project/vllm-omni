@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Root pytest entrypoint for the vLLM-Omni test suite.
 
@@ -19,12 +22,11 @@ bootstrap_vllm_layer_custom_op_modules()
 
 pytest_plugins = (
     "tests.helpers.fixtures.config",
-    "tests.helpers.fixtures.env",
+    "tests.helpers.fixtures.clean",
     "tests.helpers.fixtures.log",
     "tests.helpers.fixtures.media",
     "tests.helpers.fixtures.run_args",
     "tests.helpers.fixtures.runtime",
-    "tests.helpers.fixtures.speaker_cache",
     "tests.helpers.fixtures.xdist",
 )
 
@@ -51,7 +53,6 @@ _MEDIA_EXPORT_NAMES = (
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",
-    "decode_b64_image",
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
@@ -62,10 +63,12 @@ _RUNTIME_EXPORT_NAMES = (
     "HttpResponse",
     "OmniResponse",
     "OmniRunner",
+    "OfflineOmniClient",
     "OmniRunnerHandler",
     "OmniServer",
     "OmniServerParams",
     "OmniServerStageCli",
+    "OnlineOmniClient",
     "OpenAIClientHandler",
     "dummy_messages_from_mix_data",
 )

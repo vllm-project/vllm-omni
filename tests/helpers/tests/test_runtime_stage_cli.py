@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for OmniServerStageCli process planning helpers."""
 
 from __future__ import annotations
@@ -38,23 +41,8 @@ def test_stage_cli_builds_headless_replica_cmd(tmp_path: Path) -> None:
     assert cmd[cmd.index("--deploy-config") + 1] == server.stage_config_path
 
 
-def test_stage_cli_splits_devices_per_replica(tmp_path: Path) -> None:
+def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
 
-    assert server._devices_for_replica(1, "1,2,3", 0) == "1"
-    assert server._devices_for_replica(1, "1,2,3", 1) == "2"
-    assert server._devices_for_replica(1, "1,2,3", 2) == "3"
-
-
-def test_stage_cli_maps_visible_devices_after_replica_split(tmp_path: Path) -> None:
-    server = OmniServerStageCli(
-        "fake-model",
-        _write_stage_config(tmp_path),
-        [],
-        env_dict={"CUDA_VISIBLE_DEVICES": "4,5,6,7"},
-    )
-    env: dict[str, str] = {}
-
-    server._set_stage_device_env(1, env, "1,2,3", replica_id=1)
-
-    assert env["CUDA_VISIBLE_DEVICES"] == "6"
+    assert server.stage_ids == [0, 1]
+    assert server.stage_replica_counts == {0: 1, 1: 3}
