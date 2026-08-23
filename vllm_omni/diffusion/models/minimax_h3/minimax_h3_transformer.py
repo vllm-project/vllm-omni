@@ -954,6 +954,14 @@ class MiniMaxH3DiTModel(nn.Module):
     # quantization or LoRA to map onto. Address the fused layers directly, e.g.
     # ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
+    # Turbo LoRA checkpoints publish separate Q/K/V adapters. This declaration
+    # lets the legacy diffusion LoRA manager bind them to the packed QKV layer;
+    # it does not change the fused base-checkpoint loading path above.
+    stacked_params_mapping = (
+        (".attn.qkv_proj", ".attn.to_q", "q"),
+        (".attn.qkv_proj", ".attn.to_k", "k"),
+        (".attn.qkv_proj", ".attn.to_v", "v"),
+    )
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
         if tp_size < 1:
