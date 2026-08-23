@@ -1582,6 +1582,9 @@ class SkipSoftmaxSpec:
 class AttnQuantSpec:
     dtype_qk: str | None = None
     dtype_vo: str | None = None
+    q_scale: float | None = None
+    k_scale: float | None = None
+    v_scale: float | None = None
     q_block_size: int = 1
     k_block_size: int = 16
     flashinfer_backend: str | None = None
@@ -1598,6 +1601,14 @@ class AttnQuantSpec:
                 raise ValueError(
                     f"quant.{name}={v!r} unsupported; kernels exist only for {sorted(self._VALID_BLOCK_SIZES)}."
                 )
+        for name in ("q_scale", "k_scale", "v_scale"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            validated = _in_range(value, f"quant.{name}", 0.0, None)
+            if validated == 0:
+                raise ValueError(f"quant.{name} must be > 0")
+            setattr(self, name, validated)
 
     @property
     def enabled(self) -> bool:
@@ -1652,9 +1663,15 @@ class AttentionSpec:
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
                 "Remove skip_softmax or set backend to TRTLLM_ATTN."
             )
-        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+        quant_backends = {
+            "TRTLLM_ATTN",
+            "FLASHINFER_ATTN",
+            "FLASHINFER_SM120_ATTN",
+        }
+        if self.quant is not None and self.backend.upper() not in quant_backends:
             raise ValueError(
-                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                "quant is only supported by the TRTLLM_ATTN, FLASHINFER_ATTN, "
+                "and FLASHINFER_SM120_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
@@ -1697,6 +1714,10 @@ class AttentionSpec:
                 quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
+            for name in ("q_scale", "k_scale", "v_scale"):
+                value = getattr(q, name)
+                if value is not None:
+                    quant_kw[name] = value
             kw["quant"] = quant_kw
         if self.block_sparse is not None:
             bs = self.block_sparse

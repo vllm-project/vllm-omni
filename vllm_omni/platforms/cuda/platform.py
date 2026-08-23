@@ -198,6 +198,14 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     raise ValueError(
                         "TRTLLM_ATTN diffusion attention backend requires flashinfer, which is not installed."
                     )
+            if backend_upper == "FLASHINFER_SM120_ATTN":
+                sm120_supported = (
+                    compute_capability is not None and compute_capability.major == 12 and compute_capability.minor == 0
+                )
+                if not sm120_supported:
+                    raise ValueError("FLASHINFER_SM120_ATTN requires an SM120 GPU (compute capability 12.0).")
+                if not flashinfer_available:
+                    raise ValueError("FLASHINFER_SM120_ATTN requires flashinfer, which is not installed.")
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()

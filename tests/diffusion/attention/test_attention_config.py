@@ -72,6 +72,21 @@ class TestAttentionSpec:
         assert bk["dtype_vo"] == "fp8_e4m3"
         assert bk["flashinfer_backend"] == "trtllm-gen"
 
+    def test_sm120_fp8_static_scales_passed_through(self):
+        bk = AttentionSpec(
+            backend="FLASHINFER_SM120_ATTN",
+            quant={
+                "dtype_qk": "fp8_e4m3",
+                "flashinfer_backend": "cute-dsl-prims",
+                "q_scale": 0.5,
+                "k_scale": 0.25,
+                "v_scale": 0.125,
+            },
+        ).backend_kwargs()["quant"]
+        assert bk["q_scale"] == 0.5
+        assert bk["k_scale"] == 0.25
+        assert bk["v_scale"] == 0.125
+
     def test_quant_and_skip_softmax_coexist(self):
         bk = AttentionSpec(
             backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
