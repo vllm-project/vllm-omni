@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -347,6 +348,46 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
         assert method.lower() in paths[path], f"missing OpenAPI method {method} {path}"
 
 
+@pytest.mark.parametrize(
+    ("stage_configs", "expected"),
+    [
+        (None, False),
+        ([], False),
+        ([{}], False),
+        ([{"engine_args": None}], False),
+        ([{"engine_args": {}}], False),
+        ([{"engine_args": {"profiler_config": None}}], False),
+        ([{"engine_args": {"profiler_config": {}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": None}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": "torch"}}}], True),
+        ([{"engine_args": {"profiler_config": {"profiler": "cuda"}}}], True),
+        # Attribute-style stage/engine_args/profiler_config, not just dicts.
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch")))],
+            True,
+        ),
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=None))],
+            False,
+        ),
+        # Any stage enabling the profiler is enough.
+        (
+            [{"engine_args": {}}, {"engine_args": {"profiler_config": {"profiler": "torch"}}}],
+            True,
+        ),
+    ],
+)
+def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, expected: bool) -> None:
+    """Lock the gate that decides whether /start_profile is registered.
+
+    vLLM-Omni enables the profiler endpoints from the stage config, not from
+    ``VLLM_TORCH_PROFILER_DIR``. Fails if the gate starts accepting a stage that
+    only half-declares ``profiler_config`` (present but with no ``profiler``),
+    stops supporting attribute-style configs, or stops scanning every stage.
+    """
+    assert api_server._should_enable_profiler_endpoints(stage_configs) is expected
+
+
 @pytest.mark.asyncio
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
@@ -452,6 +493,62 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert "/v1/chat/completions" in openapi_paths
     assert "/v1/models" in openapi_paths
     assert "/health" in openapi_paths
+
+
+@pytest.mark.asyncio
+async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monkeypatch, caplog) -> None:
+    """Lock the not-silent behavior when only ``VLLM_TORCH_PROFILER_DIR`` is set.
+
+    vLLM registers /start_profile from that environment variable; vLLM-Omni
+    registers it from the stage config. Without the warning the mismatch looks
+    identical to a working setup: server starts, nothing logged, /start_profile
+    404s. Fails if the routes get mounted from the env var alone, or if the
+    startup warning stops being emitted.
+    """
+
+    def fake_build_openai_app(args, supported_tasks):
+        return FastAPI()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        # No stage declares profiler_config, so the gate must stay closed.
+        yield _FakeEngineClient(
+            stage_configs=[{"engine_args": {}}],
+            vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(_api_process_rank=0)),
+        )
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    captured: dict[str, object] = {}
+
+    async def fake_serve_http(app, **_kwargs):
+        captured["served_app"] = app
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/omni-profiler-traces")
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
+
+    async def fake_storage_start():
+        captured["storage_started"] = True
+
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    with caplog.at_level(logging.WARNING):
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    served_app = captured["served_app"]._inner  # type: ignore[attr-defined]
+    manifest = _route_manifest(served_app.routes)
+    assert ("POST", "/start_profile") not in manifest
+    assert ("POST", "/stop_profile") not in manifest
+    assert "VLLM_TORCH_PROFILER_DIR" in caplog.text
+    assert "profiler_config" in caplog.text
 
 
 @pytest.mark.asyncio

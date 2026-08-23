@@ -541,6 +541,19 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
+        elif os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+            # vLLM enables /start_profile from this environment variable, but
+            # vLLM-Omni gates the endpoints on the stage config instead. Without
+            # this warning the mismatch is silent and looks like a working setup.
+            logger.warning(
+                "VLLM_TORCH_PROFILER_DIR is set, but no stage declares "
+                "engine_args.profiler_config.profiler, so /start_profile and "
+                "/stop_profile were NOT registered. vLLM-Omni enables profiling "
+                "through profiler_config, not this environment variable: pass "
+                '--profiler-config \'{"profiler": "torch", "torch_profiler_dir": "..."}\' '
+                "to `vllm serve`, or add a profiler_config block to a stage in "
+                "your deploy YAML. See docs/contributing/profiling.md."
+            )
 
         vllm_config = await _get_vllm_config(engine_client)
 
