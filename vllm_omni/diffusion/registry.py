@@ -271,11 +271,6 @@ _DIFFUSION_MODELS = {
         "pipeline_sensenova_u1",
         "SenseNovaU1Pipeline",
     ),
-    "AudioXPipeline": (
-        "audiox",
-        "pipeline_audiox",
-        "AudioXPipeline",
-    ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5",
@@ -316,16 +311,6 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
-    "SoulXSingerPipeline": (
-        "soulx_singer",
-        "pipeline_soulx_singer_svs",
-        "PipelineSoulXSingerSVS",
-    ),
-    "SoulXSingerSVCPipeline": (
-        "soulx_singer",
-        "pipeline_soulx_singer_svc",
-        "PipelineSoulXSingerSVC",
-    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -335,6 +320,11 @@ _DIFFUSION_MODELS = {
         "hidream_image",
         "pipeline_hidream_image",
         "HiDreamImagePipeline",
+    ),
+    "HiDreamO1ImagePipeline": (
+        "hidream_o1_image",
+        "pipeline_hidream_o1_image",
+        "HiDreamO1ImagePipeline",
     ),
     "DreamZeroPipeline": (
         "dreamzero",
@@ -367,7 +357,6 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
-    "AudioXPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
@@ -561,9 +550,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
-    "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
-    "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
-    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
@@ -600,6 +586,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
@@ -641,8 +628,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
-    "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
-    "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
 
 

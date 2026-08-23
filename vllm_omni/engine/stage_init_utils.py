@@ -567,8 +567,13 @@ def split_devices_for_replicas(
     num_replicas: int,
     tp_size: int,
     stage_id: int,
-) -> list[str]:
+) -> list[str | None]:
     """Split a devices string into per-replica subsets.
+
+    The result always has one entry per replica, because callers index it by
+    replica id. When ``devices_str`` is ``None`` the stage declares no explicit
+    placement, so every replica gets ``None`` and inherits the launcher's
+    ``CUDA_VISIBLE_DEVICES``.
 
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
     Otherwise, two YAML shapes are accepted:
@@ -597,8 +602,14 @@ def split_devices_for_replicas(
     Any other length raises ``ValueError`` (the two modes are
     length-disjoint for ``num_replicas > 1``).
     """
-    if num_replicas <= 1 or devices_str is None:
-        return [devices_str] if devices_str is not None else [devices_str]
+    if devices_str is None:
+        # No explicit placement: hand back one empty slot per replica, matching
+        # ``get_headless_replica_devices``. Returning a single-element list here
+        # made callers index past the end for every replica after the first.
+        return [None] * max(1, num_replicas)
+
+    if num_replicas <= 1:
+        return [devices_str]
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
@@ -688,7 +699,7 @@ def compute_replica_layout(
             raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
         replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
 
-    replica_devices_map: dict[int, list[str]] = {}
+    replica_devices_map: dict[int, list[str | None]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
         num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:

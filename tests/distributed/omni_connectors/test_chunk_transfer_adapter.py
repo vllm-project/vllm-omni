@@ -208,6 +208,55 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
+def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-replace", RequestStatus.RUNNING, external_req_id="external-replace")
+    request.resumable = True
+    request.prompt_token_ids = [0] * 4
+    request._all_token_ids = [0] * 4
+    request._output_token_ids = []
+    request.num_prompt_tokens = 4
+    request.num_computed_tokens = 4
+    request.update_block_hashes = Mock()
+    adapter.get_req_chunk[request.request_id] = 1
+    adapter.requests_num_chunks_sent[request.external_req_id] = 4
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "next_stage_prompt_len": 10,
+                "replace_streaming_prompt": True,
+                "finished": False,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 10
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
+
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    waiting_queue = DummyWaitingQueue()
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert running_queue == []
+    assert waiting_queue == [request]
+    assert request.status == RequestStatus.WAITING
+
+    adapter.requests_num_chunks_sent[request.external_req_id] = 9
+    adapter.postprocess_scheduler_output(
+        SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        )
+    )
+    assert request.request_id not in adapter.replaced_streaming_prompt_ids
+    assert request.external_req_id not in adapter.requests_num_chunks_sent
+
+
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-tensor", RequestStatus.WAITING, external_req_id="external-tensor")
@@ -571,6 +620,92 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert request.additional_information["kv_metadata"] == {"foo": "bar"}
     assert "req-non-ar" in adapter._finished_load_reqs
     assert "req-non-ar" in adapter.upstream_exhausted_requests
+
+
+def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-marker", RequestStatus.WAITING, external_req_id="external-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "codes": {
+                "audio": torch.tensor([7, 8], dtype=torch.long),
+                "ref": torch.tensor([0.1, -0.1]),
+            },
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "request_finished": torch.tensor(False, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [7, 8]
+    assert "audio" not in request.additional_information["codes"]
+    torch.testing.assert_close(
+        request.additional_information["codes"]["ref"],
+        torch.tensor([0.1, -0.1]),
+    )
+    assert not {"cache_epoch", "chunk_seq", "last_chunk"}.intersection(request.additional_information["meta"])
+    assert request.request_id in adapter.segment_finished_requests
+
+
+def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-empty-marker", RequestStatus.WAITING, external_req_id="external-empty-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [0]
+    assert "codes" not in request.additional_information
+    assert request.additional_information["meta"]["replace_runtime_additional_information"] is True
+    assert request.request_id in adapter.segment_finished_requests
+    assert request.request_id in adapter._finished_load_reqs
+
+
+def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-incremental", RequestStatus.WAITING, external_req_id="external-incremental")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 2},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "phase": "decode",
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is False
+
+    assert torch.equal(request.additional_information["codes"]["audio"], torch.tensor([1, 2]))
+    assert request.additional_information["meta"]["cache_epoch"] == 3
+    assert request.additional_information["meta"]["chunk_seq"] == 2
+    assert request.additional_information["meta"]["phase"] == "decode"
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):

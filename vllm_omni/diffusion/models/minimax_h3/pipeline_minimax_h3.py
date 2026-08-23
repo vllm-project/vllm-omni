@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """vLLM-Omni pipeline for MiniMax H3 FL2VA and Ref2VA partitions."""
 
 from __future__ import annotations
@@ -8,10 +9,10 @@ import math
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import groupby
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -44,7 +45,13 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader import (
+    OffloadPlan,
+    apply_sequential_offload,
+    remove_sequential_offload,
+    sequential_offload_component,
+)
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -68,6 +75,7 @@ from .condition_noise import (
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -104,6 +112,12 @@ from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from vllm_omni.lora.request import LoRARequest
+
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -124,6 +138,9 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_TURBO_SIGMA_POINTS = 5
+MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
+MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -543,9 +560,8 @@ class MiniMaxH3Pipeline(
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
         "encode_prompt",
-        "_encode_video_conditions",
-        "_encode_video_audio_conditions",
-        "_encode_audio_conditions",
+        "_encode_visual_conditions",
+        "_encode_reference_audio_conditions",
         "diffuse",
         "decode",
     ]
@@ -553,6 +569,80 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+
+    def _load_diffusion_lora_adapter(
+        self,
+        *,
+        lora_request: LoRARequest,
+        lora_path: str | Path,
+        dtype: torch.dtype,
+    ) -> tuple[LoRAModel, PEFTHelper] | None:
+        # A cache eviction may be followed by a different adapter reusing the
+        # same client-supplied ID. Every real load replaces the classification.
+        self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        od_config = getattr(self, "od_config", None)
+        offload_modes = []
+        if getattr(od_config, "enable_cpu_offload", False):
+            offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
+        if getattr(od_config, "enable_layerwise_offload", False):
+            offload_modes.append("layerwise offload (--enable-layerwise-offload)")
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            offload_modes.append("distributed layerwise offload (--enable-distributed-layerwise-offload)")
+        loaded = load_minimax_h3_turbo_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if loaded is not None:
+            self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
+        return loaded
+
+    def _validate_diffusion_lora_binding(
+        self,
+        *,
+        lora_model: LoRAModel,
+        bound_lora_names: frozenset[str],
+    ) -> None:
+        if lora_model.id not in self._turbo_lora_adapter_ids:
+            return
+        missing = sorted(set(lora_model.loras) - bound_lora_names)
+        if missing:
+            raise ValueError(
+                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+            )
+
+    def _has_active_turbo_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._turbo_lora_adapter_ids
+        )
+
+    def _validate_turbo_sampling(self, sampling: Any) -> None:
+        extra = sampling.extra_args or {}
+        sigma_points = sampling.num_inference_steps
+        if sigma_points != MINIMAX_H3_TURBO_SIGMA_POINTS:
+            raise OmniClientError(
+                "MiniMax-H3 Turbo requires num_inference_steps=5 (five sigma points produce four denoiser evaluations)"
+            )
+        try:
+            video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}") from exc
+        if not math.isclose(video_shift, MINIMAX_H3_TURBO_VIDEO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}")
+        try:
+            audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(
+                f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}"
+            ) from exc
+        if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -584,6 +674,7 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        self._turbo_lora_adapter_ids: set[int] = set()
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -776,6 +867,8 @@ class MiniMaxH3Pipeline(
         self,
         requested: str | None,
         multi_modal_data: dict[str, Any],
+        *,
+        has_turbo_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -793,6 +886,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"checkpoint partition {self.partition!r} supports {sorted(self.supported_tasks)}, got task={task!r}"
             )
+        if task == "ref2va" and has_turbo_lora:
+            raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
         return task
 
     def _resolve_shape(
@@ -1129,9 +1224,7 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.od_config.enable_cpu_offload and not getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
+        if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
@@ -1160,8 +1253,48 @@ class MiniMaxH3Pipeline(
             or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
 
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None:
+        if getattr(self, "_model_cpu_offload_modules", None):
+            return
+
+        components = ModuleDiscovery.discover(self)
+        dits = components.dits
+        stages = [*components.encoders, *components.vaes]
+        modules = [*dits, *stages]
+        apply_sequential_offload(
+            dit_modules=dits,
+            encoder_modules=stages,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+            offload_initial_dits=True,
+        )
+
+        self._model_cpu_offload_modules = modules
+        logger.info(
+            "MiniMax-H3 model-level CPU offload enabled for %d DiT(s), text encoder, video VAE, and audio VAE",
+            len(dits),
+        )
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        modules = getattr(self, "_model_cpu_offload_modules", None)
+        if not modules:
+            return
+        remove_sequential_offload(modules)
+        self._model_cpu_offload_modules = []
+
     @contextmanager
     def _component_on_device(self, component: nn.Module):
+        if getattr(self, "_model_cpu_offload_modules", None):
+            with sequential_offload_component(component):
+                yield
+            return
         staged = self._uses_manual_component_offload()
         if staged:
             component.load_to_device()
@@ -1170,21 +1303,6 @@ class MiniMaxH3Pipeline(
         finally:
             if staged:
                 component.offload_to_cpu()
-
-    def _encode_visual_condition(
-        self,
-        image: Image.Image,
-    ) -> torch.Tensor:
-        _, rank, _ = _dit_rank_world()
-        rows = None
-        if rank == 0:
-            with self._component_on_device(self.video_vae):
-                rows = self.video_vae.encode_image(image)
-        return _broadcast_tensor(
-            rows,
-            dtype=torch.float32,
-            device=self.device,
-        )
 
     def _encode_visual_conditions(
         self,
@@ -1195,44 +1313,34 @@ class MiniMaxH3Pipeline(
     ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
-        for image in images:
-            rows.append(self._encode_visual_condition(image))
-            shapes.append((1, image.height // 16, image.width // 16))
-        if video_count:
-            video_rows, video_shapes = self._encode_video_conditions(
-                prepared_videos,
-                count=video_count,
-            )
-            rows.append(video_rows)
-            shapes.extend(video_shapes)
+        _, rank, _ = _dit_rank_world()
+        # Keep image and video references in one residency window when both
+        # appear in a request; otherwise the video branch would reload the VAE.
+        needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
+        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
+        with video_vae_context:
+            if images:
+                image_rows = None
+                if rank == 0:
+                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
+                rows.append(
+                    _broadcast_tensor(
+                        image_rows,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                )
+                shapes.extend((1, image.height // 16, image.width // 16) for image in images)
+            if video_count:
+                video_rows, video_shapes = self._encode_video_conditions_resident(
+                    prepared_videos,
+                    count=video_count,
+                )
+                rows.append(video_rows)
+                shapes.extend(video_shapes)
         return (torch.cat(rows) if rows else None), shapes
 
-    def _encode_audio_condition(
-        self,
-        audio: tuple[torch.Tensor, int],
-    ) -> tuple[torch.Tensor, int]:
-        _, rank, _ = _dit_rank_world()
-        rows = None
-        audio_t = 0
-        if rank == 0:
-            with self._component_on_device(self.audio_vae):
-                rows, audio_t = self.audio_vae.encode_waveform(*audio)
-        audio_t_tensor = torch.tensor(
-            [audio_t],
-            dtype=torch.long,
-            device=self.device,
-        )
-        group, _, world_size = _dit_rank_world()
-        if world_size > 1:
-            dist.broadcast(audio_t_tensor, src=0, group=group)
-        rows = _broadcast_tensor(
-            rows,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        return rows, int(audio_t_tensor.item())
-
-    def _encode_audio_conditions(
+    def _encode_audio_conditions_resident(
         self,
         audios: list[tuple[torch.Tensor, int]],
         *,
@@ -1268,15 +1376,6 @@ class MiniMaxH3Pipeline(
             _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
             [int(value) for value in lengths.tolist()],
         )
-
-    def _encode_video_conditions(
-        self,
-        prepared_videos: list[dict[str, Any]] | None,
-        *,
-        count: int,
-    ) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
-        with self._component_on_device(self.video_vae):
-            return self._encode_video_conditions_resident(prepared_videos, count=count)
 
     def _encode_video_conditions_resident(
         self,
@@ -1325,15 +1424,6 @@ class MiniMaxH3Pipeline(
             [tuple(int(value) for value in item) for item in shapes.tolist()],
         )
 
-    def _encode_video_audio_conditions(
-        self,
-        prepared_videos: list[dict[str, Any]] | None,
-        *,
-        has_audio: list[bool],
-    ) -> tuple[torch.Tensor | None, list[int]]:
-        with self._component_on_device(self.audio_vae):
-            return self._encode_video_audio_conditions_resident(prepared_videos, has_audio=has_audio)
-
     def _encode_video_audio_conditions_resident(
         self,
         prepared_videos: list[dict[str, Any]] | None,
@@ -1375,6 +1465,34 @@ class MiniMaxH3Pipeline(
         return (
             _broadcast_tensor(rows, dtype=torch.float32, device=self.device),
             [int(value) for value in lengths.tolist()],
+        )
+
+    def _encode_reference_audio_conditions(
+        self,
+        prepared_videos: list[dict[str, Any]] | None,
+        *,
+        has_audio: list[bool],
+        standalone_audios: list[tuple[torch.Tensor, int]],
+        max_duration_seconds: float,
+    ) -> tuple[torch.Tensor | None, list[int], torch.Tensor | None, list[int]]:
+        # Embedded and standalone audio are consecutive direct Audio-VAE
+        # calls. Keep the component resident across both paths.
+        needs_audio_vae = any(has_audio) or bool(standalone_audios)
+        audio_vae_context = self._component_on_device(self.audio_vae) if needs_audio_vae else nullcontext()
+        with audio_vae_context:
+            embedded_condition, embedded_lengths = self._encode_video_audio_conditions_resident(
+                prepared_videos,
+                has_audio=has_audio,
+            )
+            external_condition, external_lengths = self._encode_audio_conditions_resident(
+                standalone_audios,
+                max_duration_seconds=max_duration_seconds,
+            )
+        return (
+            embedded_condition,
+            embedded_lengths,
+            external_condition,
+            external_lengths,
         )
 
     def _initial_noise(
@@ -1627,7 +1745,14 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
-        task = self._resolve_task(extra.get("task"), multi_modal_data)
+        has_turbo_lora = self._has_active_turbo_lora(sampling)
+        task = self._resolve_task(
+            extra.get("task"),
+            multi_modal_data,
+            has_turbo_lora=has_turbo_lora,
+        )
+        if has_turbo_lora:
+            self._validate_turbo_sampling(sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -1755,12 +1880,15 @@ class MiniMaxH3Pipeline(
                     prepared_videos,
                     video_count=video_count,
                 )
-                embedded_audio_condition, embedded_audio_lengths = self._encode_video_audio_conditions(
+                (
+                    embedded_audio_condition,
+                    embedded_audio_lengths,
+                    external_audio_condition,
+                    external_audio_lengths,
+                ) = self._encode_reference_audio_conditions(
                     prepared_videos,
                     has_audio=has_audio,
-                )
-                external_audio_condition, external_audio_lengths = self._encode_audio_conditions(
-                    standalone_audios,
+                    standalone_audios=standalone_audios,
                     max_duration_seconds=float(num_frames) / float(sampling.fps or MINIMAX_H3_FPS),
                 )
                 audio_parts = [

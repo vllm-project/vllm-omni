@@ -65,6 +65,31 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
+## CPU MP4 response encoding
+
+For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
+host CPU through PyAV/libx264 after generation. The response encoder selects the
+path automatically at runtime: inputs with a supported frame shape, common dtype,
+and RGB per-channel contiguous layout use direct planar frames; other inputs
+fall back to the legacy path before the PyAV container is opened. No CLI flag,
+model declaration, or user configuration is required. Streaming fMP4 output is
+unchanged.
+
+A community benchmark on 2x Xeon 8480C reported the following comparison
+between the legacy and direct planar paths
+([full result](https://github.com/vllm-project/vllm-omni/pull/6288#issuecomment-5337546499)):
+
+| Metric | Legacy | Direct planar | Change |
+| --- | ---: | ---: | ---: |
+| Median wall time | 1.805 s | 1.394 s | -22.8% |
+| Median process CPU time | 3.613 s | 3.207 s | -11.2% |
+| Peak RSS | 3182 MiB | 2794 MiB | -387 MiB (-12.2%) |
+
+Across the 1.0-8.7 s sweep, wall-time improvement was approximately 21.8-22.6%;
+outputs were byte-identical and full decode passed. This is evidence for host
+CPU response encoding. Actual gains depend on the CPU and runtime, and should
+not be interpreted as GPU, DiT, or stage 0 speedups.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
@@ -158,7 +183,7 @@ vllm serve "${MODEL}" \
 Use the profile that matches the per-GPU memory capacity:
 
 | Profile | GPUs | Starting shape | Resident DiT blocks | Attention | Execution | Status |
-|---|---:|---:|---:|---|---|---|
+| --- | ---: | ---: | ---: | --- | --- | --- |
 | `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Target-hardware validated |
 | `rtx4090` | 2 x 24 GB | 1024x576 | 12 | cuDNN attention | eager | Capacity-proxy starting point |
 
@@ -177,8 +202,8 @@ increasing it on a different request shape.
 At vLLM-Omni commit `ae6577ea`, one full 50-step T2VA request completed on
 2 x RTX 5090 without OOM:
 
-| Shape | Frames | Client E2E | Sampled peak/GPU | Output validation |
-|---:|---:|---:|---:|---|
+| Shape    | Frames        | Client E2E | Sampled peak/GPU       | Output validation                                            |
+| -------: | ------------: | ---------: | ---------------------: | -----------------------------------------------------------: |
 | 1344x768 | 124 at 24 FPS | 8 min 38 s | approximately 22.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
 
 This is a single end-to-end validation run, not a warmed multi-run latency
@@ -247,7 +272,7 @@ vllm serve "${MODEL}" \
 Do not add `--enforce-eager` to this performance configuration. The first
 request includes regional compilation; warm the server once before measuring
 steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
-1. The H3 VAE supports its native `tile` mode, not
+`1`. The H3 VAE supports its native `tile` mode, not
 `spatial_shard_height` or `spatial_shard_width`.
 
 ### Attention Backends
@@ -505,7 +530,7 @@ vLLM-Omni with MiniMax H3 support, BF16. gfx942 rows measured with the
 `0.26.0+rocm723` wheel (HIP 7.2).
 
 | Workload | Configuration | Observed result |
-|----------|---------------|-----------------|
+| ---------- | --------------- | ----------------- |
 | T2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 0.09 s, denoise 244.04 s, decode 4.15 s, 267.42 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
 | FL2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 13.98 s, denoise 257.58 s, decode 4.11 s, 287.07 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
 | T2VA, 832x480, ~4 s, 40 steps | 1x gfx950 (MI350), FLASH_ATTN, CPU offload | valid MP4 (H.264 + synced audio); ~0.73 s/denoise-step (~1.37 it/s), ~55 s client E2E incl. warmup |
@@ -687,7 +712,7 @@ at most 15 seconds combined.
 ## Official input matrix and limits
 
 | Task | Supported references | Limits |
-|------|----------------------|--------|
+| ------ | ---------------------- | -------- |
 | T2VA | text only | prompt must be non-empty |
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
@@ -718,13 +743,17 @@ Omitting `quality` preserves the startup default: it uses the reference path
 normally, or the server-configured profile when the server was started with
 `--cache-backend cache_dit`.
 
+Turbo is independent of this quality switch: `quality` selects a Cache-DiT
+policy, while Turbo changes the active LoRA weights and sampling schedule. See
+[LoRA](#lora) below.
+
 The following result was measured on 4× NVIDIA H200 with SP4, text-encoder
 TP4, 1344×768, 124 frames, 24 FPS, and 50 inference steps. One full
 `lossless` warmup was excluded, followed by three fixed prompt/seed pairs in
 balanced switch order.
 
 | `quality` | Median inference latency | Speedup | SSIM vs `lossless` | PSNR vs `lossless` | Expected trade-off |
-|---|---:|---:|---:|---:|---|
+| --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 85.49 s | 1.00× | 1.0000 | exact | Native reference path |
 | `high` | 63.36 s | 1.35× | 0.9709 | 34.98 dB | Faster with measured same-seed deviation |
 
@@ -734,10 +763,49 @@ balanced switch order.
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
 
+## LoRA
+
+### Turbo LoRA
+
+Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+
+```text
+lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+export TURBO_DIR=/path/to/minimax-h3-turbo
+export TURBO_FILE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
+export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
+```
+
+Start from a non-offloaded FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
+`--lora-path` preloads the adapter; each request still activates it and uses
+the published sampling settings:
+
+```bash
+-F 'num_inference_steps=5' \
+-F 'flow_shift=6' \
+-F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+-F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
+```
+
+For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
+ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
+dynamic-only and does not support prefusion, DLO, or LoRA composition.
+It also rejects model-level, layerwise, and distributed layerwise offload;
+the legacy dynamic LoRA tensors do not participate in those weight lifecycles.
+The five requested sigma points produce the four denoiser evaluations expected
+by the Turbo artifact.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
-|-----------|-------------------|-------|
+| ----------- | ------------------- | ------- |
 | `quality` | omitted or `lossless` | Request-level quality intent; `high` dynamically installs H3's conservative Cache-DiT profile |
 | `extra_params.force_refresh_step_hint` | omitted | Optional positive 1-based denoising-step hint for an active Cache-DiT request; pair with `extra_params.force_refresh_step_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
@@ -762,9 +830,9 @@ Users can also use a ComfyUI frontend to interact with a hosted MiniMax-H3 servi
 The four-GPU recommendation was measured on four NVIDIA B300 GPUs with one
 excluded warmup followed by three requests.
 
-| Workload | Configuration | Observed result |
-|----------|---------------|-----------------|
-| FL2VA, 209 frames, 1248x768 | no offload, U4, VPP4 tile, regional compile | 86.964 s mean HTTP client latency |
+| Workload                               | Configuration                               | Observed result                      |
+| -------------------------------------- | ------------------------------------------- | ------------------------------------ |
+| FL2VA, 209 frames, 1248x768            | no offload, U4, VPP4 tile, regional compile | 86.964 s mean HTTP client latency    |
 | Two-video Ref2VA, 362 frames, 1344x768 | no offload, U4, VPP4 tile, regional compile | 784.394 s accounted model-stage mean |
 
 These measurements describe the validated shapes rather than a general

@@ -20,7 +20,6 @@ from tests.helpers.stage_config import (
     get_deploy_config_stage,
     modify_stage_config,
 )
-from vllm_omni.platforms import current_omni_platform
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
@@ -92,10 +91,6 @@ def test_default_cuda_graph_startup(omni_server) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@pytest.mark.skipif(
-    current_omni_platform.is_npu(),
-    reason="#issue 5479",
-)
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
@@ -122,10 +117,6 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@pytest.mark.skipif(
-    current_omni_platform.is_npu(),
-    reason="#issue 5479",
-)
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, openai_client) -> None:

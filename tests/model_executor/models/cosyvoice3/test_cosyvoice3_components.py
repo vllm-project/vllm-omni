@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
 from types import SimpleNamespace
@@ -9,8 +9,39 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
+    CausalHiFTGenerator,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def causal_hift():
+    return CausalHiFTGenerator(
+        base_channels=32,
+        upsample_rates=[2, 2],
+        upsample_kernel_sizes=[4, 4],
+        source_resblock_kernel_sizes=[3, 3],
+        source_resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5]],
+    )
+
+
+def test_causal_hift_moves_stft_window_with_model(causal_hift):
+    assert causal_hift.get_buffer("stft_window") is causal_hift.stft_window
+    assert "stft_window" not in causal_hift.state_dict()
+    causal_hift.to(dtype=torch.float64)
+    assert causal_hift.stft_window.dtype == torch.float64
+
+
+def test_causal_hift_stft_moves_window_to_input_device(causal_hift):
+    waveform = torch.empty((1, 64), device="meta")
+
+    real, imag = causal_hift._stft(waveform)
+
+    assert real.device == waveform.device
+    assert imag.device == waveform.device
+    assert causal_hift.stft_window.device == waveform.device
 
 
 class TestPreLookaheadLayer:

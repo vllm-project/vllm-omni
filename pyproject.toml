@@ -41,8 +41,10 @@ dev = [
     "pytest-cov==7.1.0",
     "pytest-mock==3.15.1",
     "pytest-shard==0.1.2",
+    "pytest-xdist==3.8.0",
     "websockets==16.1",
     "pytest-subtests==0.15.0",
+    "filelock>=3.16.1,<4",
     "datasets==3.6.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -133,13 +135,6 @@ docs = [
     "pydantic",
 ]
 
-soulx-svs = [
-    "funasr>=1.0.0",
-    "g2pM>=0.1.2.5",
-    "g2p-en>=2.1.0",
-    "ToJyutping>=3.2.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
 Repository = "https://github.com/vllm-project/vllm-omni"
@@ -190,6 +185,7 @@ select = [
     "N",      # pep8-naming
     "UP",     # pyupgrade
     "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -242,7 +238,8 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
-    "--strict-config"
+    "--strict-config",
+    "--dist=loadgroup"
 ]
 markers = [
     # ci/cd required
@@ -291,6 +288,7 @@ markers = [
     "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
+    "xdist: xdist-parallelizable tests",
 ]
 filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
