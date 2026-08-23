@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion Model Runner for vLLM-Omni.
 
@@ -145,6 +145,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.od_config = od_config
         self.device = device
         self.pipeline: Any | None = None
+        self.diffusion_lora_runtime: Any | None = None
         self.cache_backend: Any | None = None
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
@@ -230,6 +231,37 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             compile_dynamic,
         )
 
+    def _init_diffusion_lora_runtime(self) -> None:
+        if not getattr(self.od_config, "enable_diffusion_lora", False):
+            self.diffusion_lora_runtime = None
+            return
+        if not isinstance(self.pipeline, torch.nn.Module):
+            raise ValueError("Diffusion LoRA Runtime requires an nn.Module pipeline")
+        incompatible = [
+            name
+            for name in (
+                "enable_cpu_offload",
+                "enable_layerwise_offload",
+                "enable_distributed_layerwise_offload",
+            )
+            if getattr(self.od_config, name, False)
+        ]
+        if incompatible:
+            raise ValueError(f"Diffusion LoRA Runtime first release does not support offload; disable {incompatible}")
+
+        from vllm_omni.diffusion.lora_runtime import (
+            DiffusionLoRARuntime,
+            parse_diffusion_lora_deployments,
+        )
+
+        deployments = parse_diffusion_lora_deployments(self.od_config.diffusion_lora)
+        self.diffusion_lora_runtime = DiffusionLoRARuntime(
+            self.pipeline,
+            deployments,
+            device=self.device,
+            dtype=getattr(self.od_config, "dtype", torch.bfloat16),
+        )
+
     def load_model(
         self,
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
@@ -285,6 +317,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                # Install immutable LoRA banks before offload, compile, and
+                # cache wrappers so those systems see the final module graph.
+                self._init_diffusion_lora_runtime()
         time_after_load = time.perf_counter()
 
         logger.info(

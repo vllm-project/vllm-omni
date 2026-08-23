@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """vLLM-Omni pipeline for MiniMax H3 FL2VA and Ref2VA partitions."""
 
 from __future__ import annotations
@@ -74,6 +75,7 @@ from .condition_noise import (
 )
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .lora_runtime import MINIMAX_H3_DIFFUSION_LORA_SUPPORT
 from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -558,6 +560,14 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+
+    @property
+    def diffusion_lora_support(self):
+        """Expose FL2VA LoRA semantics without enabling Ref2VA adapters."""
+
+        if self.partition == "ref2va":
+            return None
+        return MINIMAX_H3_DIFFUSION_LORA_SUPPORT
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""

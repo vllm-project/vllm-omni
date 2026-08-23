@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.lora_runtime.types import normalize_diffusion_lora_composition
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
@@ -286,6 +287,7 @@ class OmniOpenAIServingVideo:
             logger.info("Applied extra_params: %s", loggable)
 
         self._apply_lora(request.lora, gen_params)
+        self._apply_diffusion_loras(request.loras, gen_params)
 
         logger.info(
             "Video sampling params: steps=%s guidance=%s guidance_2=%s seed=%s",
@@ -463,6 +465,23 @@ class OmniOpenAIServingVideo:
         gen_params.lora_request = lora_request
         if lora_scale is not None:
             gen_params.lora_scale = lora_scale
+
+    @staticmethod
+    def _apply_diffusion_loras(loras_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
+        if loras_body is None:
+            return
+        if gen_params.lora_request is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Request cannot combine legacy lora with name-only loras.",
+            )
+        try:
+            gen_params.diffusion_loras = normalize_diffusion_lora_composition(loras_body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=str(exc),
+            ) from exc
 
     async def _run_generation(
         self,

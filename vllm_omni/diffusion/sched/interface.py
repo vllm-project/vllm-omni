@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -81,6 +81,7 @@ class StepBatchSamplingParamsKey:
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
+    diffusion_lora_composition: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, eq=True)
@@ -145,6 +146,7 @@ class RequestBatchSamplingParamsKey:
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
+    diffusion_lora_composition: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass

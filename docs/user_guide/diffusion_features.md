@@ -214,7 +214,7 @@ The following tables show which models support each feature:
 | **💾CPU Offloading (Module-wise)** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❓ | ❓ | ❌ | | | | | |
 | **💾VAE Patch Parallel** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | | | | |
 | **💾FP8 Quant** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❓ | ❓ | ✅ | ✅ | ✅ | | | |
-| **🔧LoRA Inference** | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | | |
+| **🔧LoRA Inference** | ❓ | ❓ | ✅ | ❓ | ❓ | ✅ | ❓ | ❓ | ❌ | ❌ | ✅ | ❓ | | |
 | **🔄Step Execution** | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ❓ | ❓ | ✅ | ❓ | ✅ | ✅ | ✅ | |
 
 !!! info
@@ -228,7 +228,14 @@ The following tables show which models support each feature:
        Multi-device Distributed Layerwise Offload has a separate topology and
        compatibility matrix in the [Distributed Layerwise Offloading guide](diffusion/offloader/distributed_layerwise_offload.md).
     5. The compatibility matrix uses FP8 as the representative quantization method.
-    6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
+    6. Step Execution is not compatible with any diffusion cache backend. LoRA
+       is supported, but a scheduled batch must use one LoRA state. The legacy
+       backend separates requests by `lora_request` and `lora_scale`; the
+       model-declared Diffusion LoRA Runtime separates them by the canonical
+       `loras` composition. The legacy and new request fields cannot be mixed.
+    7. LoRA support is model- and backend-specific. The verified combinations
+       in this matrix include the model-declared Diffusion LoRA Runtime; consult
+       the model recipe before enabling it.
 
 
 ## Multi-Thread Weight Loading

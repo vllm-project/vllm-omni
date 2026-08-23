@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage configuration system for vLLM-Omni."""
 
 from __future__ import annotations
@@ -352,6 +352,8 @@ class StageDeployConfig:
     lora_path: str | list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None
+    enable_diffusion_lora: bool | None = None
+    diffusion_lora: list[str] | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None

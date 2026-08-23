@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible protocol definitions for video generation.
 
@@ -260,6 +260,13 @@ class VideoGenerationRequest(BaseModel):
             "{name/path/scale/int_id}. Field names are flexible "
             "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
             "scale|lora_scale, int_id|lora_int_id)."
+        ),
+    )
+    loras: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Optional name-only Diffusion LoRA Runtime composition. Each item accepts "
+            "only {name, scale}; adapters must be registered when the service starts."
         ),
     )
 

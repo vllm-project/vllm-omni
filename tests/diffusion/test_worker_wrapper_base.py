@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for WorkerWrapperBase class.
@@ -13,6 +13,7 @@ This module tests the WorkerWrapperBase implementation:
 """
 
 from typing import Any
+from weakref import ref
 
 import pytest
 from pytest_mock import MockerFixture
@@ -405,6 +406,43 @@ class TestCustomPipelineWorkerExtension:
         # Verify cleanup was performed
         mock_gc_collect.assert_called_once()
         mock_empty_cache.assert_called_once()
+
+    def test_re_init_pipeline_releases_lora_pipeline_references(self, mocker: MockerFixture, mock_od_config):
+        """LoRA runtime references must not retain the replaced pipeline."""
+        mocker.patch("torch.accelerator.empty_cache")
+        mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+
+        wrapper = WorkerWrapperBase(
+            gpu_id=0,
+            od_config=mock_od_config,
+            base_worker_class=DiffusionWorker,
+            worker_extension_cls=CustomPipelineWorkerExtension,
+        )
+
+        class PipelineHolder:
+            def __init__(self, pipeline):
+                self.pipeline = pipeline
+
+        old_pipeline = MockCustomPipeline()
+        old_pipeline_ref = ref(old_pipeline)
+        runtime = PipelineHolder(old_pipeline)
+        manager = PipelineHolder(old_pipeline)
+        mock_model_runner = mocker.Mock()
+        mock_model_runner.pipeline = old_pipeline
+        mock_model_runner.diffusion_lora_runtime = runtime
+        wrapper.worker.model_runner = mock_model_runner
+        wrapper.worker.diffusion_lora_runtime = runtime
+        wrapper.worker.lora_manager = manager
+        wrapper.worker.init_lora_manager = mocker.Mock()
+        wrapper.worker.load_model = mocker.Mock()
+
+        del old_pipeline, runtime, manager
+        wrapper.worker.re_init_pipeline({"pipeline_class": "MockCustomPipeline"})
+
+        assert old_pipeline_ref() is None
+        assert wrapper.worker.diffusion_lora_runtime is None
+        assert wrapper.worker.lora_manager is None
+        assert mock_model_runner.diffusion_lora_runtime is None
 
     def test_re_init_pipeline_none_pipeline(self, mocker: MockerFixture, mock_od_config):
         """Test re_init_pipeline when pipeline is None."""

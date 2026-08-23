@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Async Omni Engine for vLLM-Omni multi-stage runtime.
 
@@ -1062,6 +1065,8 @@ class AsyncOmniEngine:
             "lora_path": kwargs.get("lora_path", None),
             "lora_scale": kwargs.get("lora_scale", 1.0),
             "lora_backend": kwargs.get("lora_backend", "peft"),
+            "enable_diffusion_lora": kwargs.get("enable_diffusion_lora", False),
+            "diffusion_lora": kwargs.get("diffusion_lora", None),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
@@ -1220,6 +1225,15 @@ class AsyncOmniEngine:
                 if kwargs.get("lora_backend") is not None:
                     if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
                         cfg.engine_args.lora_backend = kwargs["lora_backend"]
+                if kwargs.get("enable_diffusion_lora"):
+                    if (
+                        not hasattr(cfg.engine_args, "enable_diffusion_lora")
+                        or cfg.engine_args.enable_diffusion_lora is None
+                    ):
+                        cfg.engine_args.enable_diffusion_lora = True
+                if kwargs.get("diffusion_lora") is not None:
+                    if not hasattr(cfg.engine_args, "diffusion_lora") or cfg.engine_args.diffusion_lora is None:
+                        cfg.engine_args.diffusion_lora = kwargs["diffusion_lora"]
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None

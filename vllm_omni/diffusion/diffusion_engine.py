@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -40,6 +40,10 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.lora_runtime.types import (
+    normalize_diffusion_lora_composition,
+    parse_diffusion_lora_deployments,
+)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -54,7 +58,7 @@ from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusio
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 if TYPE_CHECKING:
@@ -234,6 +238,12 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        deployments = (
+            parse_diffusion_lora_deployments(getattr(od_config, "diffusion_lora", None))
+            if getattr(od_config, "enable_diffusion_lora", False)
+            else ()
+        )
+        self._registered_diffusion_lora_names = frozenset(deployment.name for deployment in deployments)
         # Set after the paged-KV profile request has gone through model-owned
         # preprocessing. Real requests are admitted only within this measured
         # activation envelope: (max execution sequences, max seq_len,
@@ -811,11 +821,25 @@ class DiffusionEngine:
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
+        self._validate_diffusion_lora_request(request)
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
         return request
+
+    def _validate_diffusion_lora_request(self, request: OmniDiffusionRequest) -> None:
+        composition = normalize_diffusion_lora_composition(getattr(request.sampling_params, "diffusion_loras", ()))
+        if not composition:
+            return
+        if not getattr(self.od_config, "enable_diffusion_lora", False):
+            raise OmniClientError(
+                "Request selected diffusion LoRAs, but the service did not enable Diffusion LoRA Runtime"
+            )
+        registered = getattr(self, "_registered_diffusion_lora_names", frozenset())
+        unknown = sorted({selection.name for selection in composition} - registered)
+        if unknown:
+            raise OmniClientError(f"Unknown diffusion LoRA selection(s) {unknown}; deployed={sorted(registered)}")
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""

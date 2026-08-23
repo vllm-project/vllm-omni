@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.lora_runtime.types import diffusion_lora_composition_key
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {"condition_key", "diffusion_lora_composition", "flow_shift", "lora_int_id", "sample_solver"}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -53,6 +54,7 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["diffusion_lora_composition"] = diffusion_lora_composition_key(getattr(sampling, "diffusion_loras", ()))
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 

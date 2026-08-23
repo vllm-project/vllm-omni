@@ -541,6 +541,48 @@ functional-correctness validations, not tuned throughput; the first request
 includes lazy regional compilation. MI325X (gfx942) and other MI355X SKUs are not
 listed until their own evidence is added.
 
+## FL2VA LoRA runtime
+
+MiniMax-H3 supports the model-declared Diffusion LoRA Runtime for its FL2VA
+transformer. Register immutable adapters when a no-offload FL2VA service starts;
+requests then select registered names and scales without supplying paths. For
+example, append these flags to the four-GPU service command above and change it
+to an FL2VA-only service:
+
+```bash
+--task-type fl2va \
+--enable-diffusion-lora \
+--diffusion-lora '{"name":"turbo","path":"lightx2v/Minimax-h3-Turbo"}'
+```
+
+Select Turbo explicitly in a T2VA or FL2VA request:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:${PORT}/v1/videos/sync" \
+  -F 'prompt=A singer performs on an open-air stage with synchronized vocals.' \
+  -F 'width=1344' \
+  -F 'height=768' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=5' \
+  -F 'flow_shift=6' \
+  -F 'seed=42' \
+  -F 'loras=[{"name":"turbo","scale":1.0}]' \
+  -F 'extra_params={"task":"t2va","duration":4.5,"audio_flow_shift":3.0}' \
+  -o h3_turbo.mp4
+```
+
+Five sigma points produce the four Transformer evaluations expected by this
+Turbo checkpoint. LoRA selection does not change steps, flow shifts, or other
+sampling parameters. Omitting `loras` (or sending `[]`) uses the base model. To
+compose adapters, repeat `--diffusion-lora` at startup and list their registered
+names in `loras`; all selected checkpoints must use an H3-supported publication
+format.
+
+This runtime uses `--enable-diffusion-lora`, repeatable `--diffusion-lora`, and
+the request field `loras`. Do not combine them with legacy `--lora-path` or the
+legacy request field `lora`. CPU, layerwise, and distributed layerwise offload
+are not supported in the initial runtime.
+
 ## HTTP API examples
 
 The following requests use the synchronous endpoint so the returned body can

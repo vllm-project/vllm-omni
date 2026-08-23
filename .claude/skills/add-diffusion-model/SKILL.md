@@ -260,6 +260,8 @@ Preprocessing for custom models is typically done **inside `forward()`** rather 
 
 ## Common Steps (Both Paths)
 
+If the model supports LoRA, follow the [Diffusion LoRA Runtime design](../../../docs/design/feature/diffusion_lora_runtime.md) for its model-declared loading and application hooks.
+
 ### Step 4: Register Model in registry.py
 
 Edit `vllm_omni/diffusion/registry.py`:

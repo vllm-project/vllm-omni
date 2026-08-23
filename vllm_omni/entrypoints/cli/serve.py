@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -465,6 +468,23 @@ class OmniServeCommand(CLISubcommand):
             type=float,
             default=None,
             help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+        )
+        omni_config_group.add_argument(
+            "--enable-diffusion-lora",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Enable the model-declared Diffusion LoRA Runtime.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-lora",
+            action="append",
+            default=None,
+            metavar="JSON",
+            help=(
+                "Register one immutable startup LoRA as JSON, for example "
+                '\'{"name":"turbo","path":"lightx2v/Minimax-h3-Turbo"}\'. '
+                "May be repeated."
+            ),
         )
         omni_config_group.add_argument(
             "--diffusion-compile-granularity",

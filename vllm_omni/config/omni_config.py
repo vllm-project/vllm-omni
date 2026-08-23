@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured vLLM-Omni configuration classes.
 
 This module is additive for Phase 2 of RFC #4021.
@@ -690,6 +690,8 @@ class _DiffusionConfigProjection:
     lora_scale: float = 1.0
     lora_backend: str = "peft"
     max_cpu_loras: int | None = None
+    enable_diffusion_lora: bool = False
+    diffusion_lora: list[str] | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
@@ -829,6 +831,13 @@ class _DiffusionConfigProjection:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        if self.diffusion_lora and not self.enable_diffusion_lora:
+            raise ValueError("--diffusion-lora requires --enable-diffusion-lora")
+        if self.enable_diffusion_lora and not self.diffusion_lora:
+            raise ValueError("--enable-diffusion-lora requires at least one --diffusion-lora")
+        if self.enable_diffusion_lora and self.lora_path:
+            raise ValueError("The new Diffusion LoRA Runtime cannot be combined with legacy --lora-path")
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

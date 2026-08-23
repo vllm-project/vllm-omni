@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
@@ -521,6 +524,8 @@ class OrchestratorArgs:
     lora_path: list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None
+    enable_diffusion_lora: bool = False
+    diffusion_lora: list[str] | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None

@@ -147,6 +147,7 @@ nav:
           - Distributed Layerwise: design/feature/offloader/distributed_layerwise_offload.md
         - Cache-DiT: design/feature/cache_dit.md
         - TeaCache: design/feature/teacache.md
+        - Diffusion LoRA Runtime: design/feature/diffusion_lora_runtime.md
         - Diffusion Continuous Batching: design/feature/diffusion_continuous_batching.md
     - Infrastructure and Performance:
       - Prometheus Metrics: design/metrics.md

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
@@ -9,6 +12,10 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.lora_runtime.types import (
+    DiffusionLoRAComposition,
+    normalize_diffusion_lora_composition,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -319,6 +326,7 @@ class OmniDiffusionSamplingParams:
     # LoRA
     lora_request: LoRARequest | None = None
     lora_scale: float = 1.0
+    diffusion_loras: DiffusionLoRAComposition = ()
 
     # STA parameters
     STA_param: list | None = None
@@ -346,6 +354,9 @@ class OmniDiffusionSamplingParams:
     def __post_init__(self) -> None:
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+        self.diffusion_loras = normalize_diffusion_lora_composition(self.diffusion_loras)
+        if self.diffusion_loras and self.lora_request is not None:
+            raise ValueError("Legacy lora_request cannot be combined with diffusion_loras")
 
     @property
     def batch_size(self):

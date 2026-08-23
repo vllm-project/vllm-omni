@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import base64
 import dataclasses
@@ -3238,6 +3238,7 @@ async def _parse_video_form(
     frame_interpolation_scale: float | None = Form(default=None, gt=0.0),
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
+    loras: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
 ) -> tuple[
     VideoGenerationRequest,
@@ -3307,6 +3308,7 @@ async def _parse_video_form(
         "frame_interpolation_scale": frame_interpolation_scale,
         "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
+        "loras": _parse_form_json(loras, expected_type=list),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
