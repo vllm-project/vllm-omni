@@ -11,8 +11,9 @@ HBM:
   ~22 GiB). The worker-aggregated torch peak reported by the API was ~31 GiB
   for the official-reference run.
 - **DLO (rank-local distributed layerwise offload)** — DiT blocks stream per
-  layer from host memory; per-GPU HBM peaks at ~12.6 GiB (measured), at the
-  cost of wall-clock time (~5.5× slower per request on this node).
+  layer from host memory; per-GPU HBM peaks at ~12.4 GiB (measured,
+  12,583–12,685 MiB), at the cost of wall-clock time (~5.5× slower per request
+  on this node).
 
 A100 is sm80: **NVFP4 and hardware FP8 paths are unavailable** (FP8 tensor
 cores require sm89+), so use BF16 throughout. The text encoder (Qwen3-VL) and
@@ -99,11 +100,11 @@ copies; no-AllGather mode does not use NVLink collectives).
 **Validation:** this DLO command was validated end-to-end with the same request
 as the TP4 path (official 1344×768 reference video with audio, 480×256/96
 frames, seed 0): a full 50-step Ref2VA run completed (`status=completed`) with
-a live per-GPU peak of **~12.6 GiB** (nvidia-smi) and total inference time of
-**2012.8 s** (~5.5× the TP4 path's 364.5 s). The API worker-aggregated
-`peak_memory_mb` was 19,108 for the same run. An earlier DLO attempt on this
-node OOM'd in an activation layer; the run below is the one that completed —
-re-measure on your own node before trusting the numbers.
+a live per-GPU peak of **~12.4 GiB** (nvidia-smi, 12,583–12,685 MiB) and total
+inference time of **2012.8 s** (~5.5× the TP4 path's 364.5 s). The API
+worker-aggregated `peak_memory_mb` was 19,108 for the same run. An earlier DLO
+attempt on this node OOM'd in an activation layer; the run below is the one
+that completed — re-measure on your own node before trusting the numbers.
 
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
