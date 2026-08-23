@@ -134,6 +134,11 @@ fMP4 output keeps its existing incremental path. The conservative default is
 one CPU frame-conversion worker. The public range is 1 through 8:
 `--video-response-frame-conversion-workers 1..8`.
 
+PR2 parallelizes only direct-planar frame conversion. The caller still
+synchronously waits for the complete MP4 mux/encode, so PR2 does not move
+complete non-streaming encoding off the asyncio event loop; that is a separate
+follow-up.
+
 The route log records `selected_path`, `requested_frame_conversion_workers`,
 and `effective_frame_conversion_workers`. A legacy fallback records
 `effective_frame_conversion_workers=0`. For a direct path with `F` frames and
@@ -183,18 +188,20 @@ universal optimum.
 
 #### Final CPU validation
 
-The final CPU formal used one fixed 124-frame, 1344x768 float32 payload at
-24 fps with stereo 32 kHz audio. PyAV/libx264 used `preset=ultrafast` and
-`threads=0`. BASE and candidate workers 1, 2, 4, and 8 were each run with one
-warmup followed by five formal rounds, in the order `BASE -> 1 -> 2 -> 4 -> 8`.
+The final CPU validation was measured on 2026-08-23 against latest main. BASE
+was `2e096788a6337b0bf7ac22c30bb9afa2afb8f3d4`; the candidate production/test
+tree was `3838afe512a6a812d1a7f2b6691cecc6033119f8`. The fixed protocol used
+one 124-frame, 1344x768 float32 payload at 24 fps with stereo 32 kHz audio,
+PyAV/libx264 `preset=ultrafast` and `threads=0`, and one warmup followed by
+five formal rounds in the order `BASE -> w1 -> w2 -> w4 -> w8`.
 
-| Configuration | Wall median (ms) | Process CPU median (ms) | Absolute sampled peak RSS median (KB) |
+| Configuration | Wall median [min,max] (ms) | Process CPU median [min,max] (ms) | Absolute sampled peak RSS median [min,max] (KB) |
 |---|---:|---:|---:|
-| BASE | 6831.562 | 9552.620 | 3168812 |
-| Candidate w1 | 6468.999 | 9396.600 | 3167804 |
-| Candidate w2 | 4726.955 | 10041.123 | 3188784 |
-| Candidate w4 | 3852.694 | 10222.248 | 3223748 |
-| Candidate w8 | 3273.143 | 10677.300 | 3296880 |
+| BASE | 5158.247 [5068.985,5168.578] | 7663.306 [7562.436,7672.253] | 3169604 [3167404,3171576] |
+| Candidate w1 | 6910.579 [5144.031,7115.236] | 9766.698 [7651.154,10322.423] | 3165848 [3152328,3170524] |
+| Candidate w2 | 4188.708 [3030.930,4487.111] | 9232.779 [7808.872,9673.858] | 3186092 [3184036,3187804] |
+| Candidate w4 | 4036.660 [2463.785,4073.655] | 10471.039 [8727.684,10617.781] | 3222528 [3213836,3224960] |
+| Candidate w8 | 3479.733 [3431.188,3630.253] | 11027.355 [10950.923,11162.379] | 3294456 [3283124,3312444] |
 
 All 25 formal outputs were byte-identical and passed complete media
 validation: H.264 1344x768 at 24 fps with 124 frames, plus AAC stereo audio
@@ -202,9 +209,18 @@ at 32 kHz. The CPU results do not measure NPU stage 0 or end-to-end request
 latency. Sampled RSS is an absolute process value, not an increment and not an
 exact unsampled peak.
 
-Relative to candidate w1, candidate w8 has derived wall change `-49.403%`,
-process CPU change `+13.629%`, and RSS change `+4.075%`. The wall percentage is
-reported as `(w8 - w1) / w1`, so a negative value means lower wall time.
+Using the change definition `(candidate - reference) / reference`, w8 versus
+w1 changed wall time by `-49.646%`, process CPU by `+12.908%`, and RSS by
+`+4.062%`. Relative to BASE, the corresponding wall/CPU/RSS changes were
+`(+33.971%, +27.448%, -0.119%)` for w1,
+`(-18.796%, +20.480%, +0.520%)` for w2,
+`(-21.744%, +36.639%, +1.670%)` for w4, and
+`(-32.540%, +43.898%, +3.939%)` for w8.
+
+BASE and w1 show substantial order and host variation. This is a single
+forward sequence, so the BASE comparison is descriptive rather than a stable
+estimate. The recommendation is based primarily on the candidate-internal
+w1-to-w8 comparison and the independent 8/16/32 forward/reverse scan below.
 
 #### Independent worker-boundary exploration
 
