@@ -31,6 +31,7 @@ from vllm_omni.diffusion.offloader.block_discovery import (
     set_blocks_attr_names,
 )
 from vllm_omni.diffusion.offloader.chunked_transport import (
+    PinBudget,
     build_part_manifest,
     pack_local_shard,
 )
@@ -366,6 +367,38 @@ class TestDistributedLayerwiseOffloadHook:
 
         assert hook.current_slot == 0
 
+    def test_offload_layer_retires_prev_ticket_and_event_together(self, dist_group, patched_offload_runtime):
+        """offload_layer must retire the previous hook's ready ticket and ready
+        event as a pair, so the next ring reuse does not fail fast on a leftover
+        event whose ticket is gone (review: #6374)."""
+        block_a = TinyBlock(_make_values(1.0))
+        block_b = TinyBlock(_make_values(10.0))
+
+        hook_a = _make_prepared_hook(
+            block_b,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+        )
+        hook_a.initialize_hook(block_a)
+        hook_b = _make_prepared_hook(
+            block_a,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+        )
+        hook_b.initialize_hook(block_b)
+        hook_b._prev_hook = hook_a
+
+        # hook_a produced slot 0 for hook_b's compute.
+        hook_a.prefetch_layer(slot=0, non_blocking=False)
+        assert hook_a.ready_tickets[0] is not None
+        assert hook_a.ready_events[0] is not None
+
+        hook_b.current_slot = 0
+        hook_b.offload_layer()
+
+        assert hook_a.ready_tickets[0] is None
+        assert hook_a.ready_events[0] is None
+
     def test_device_buffers_allocated(self, dist_group, patched_offload_runtime):
         """Verify exactly two device buffers are allocated."""
         current_block = TinyBlock(_make_values(1.0))
@@ -639,6 +672,29 @@ class TestDistributedLayerwiseOffloadHook:
                 backend._prepare_host_storage(ownership)
         assert backend._prepared_host_parts == {}
         assert released == [True]
+
+    def test_disable_releases_prepared_host_storage(self, dist_group, patched_offload_runtime):
+        """disable() must drop the backend-level prepared Host parts together
+        with the pin-budget accounting, not only the hooks' cpu_shards, so the
+        pinned Host memory is actually released and no stale metrics survive an
+        enable/disable cycle (review: #6374)."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=True,
+            ),
+            torch.device("cpu"),
+        )
+        backend.enabled = True
+        backend._prepared_host_parts = {0: {"cpu_shards": {torch.float32: torch.empty(4)}}}
+        backend._planned_manifests = {0: object()}
+        backend.pin_budget = PinBudget(limit_bytes=1 << 20)
+
+        backend.disable()
+
+        assert backend._prepared_host_parts == {}
+        assert backend._planned_manifests == {}
+        assert backend.pin_budget is None
 
     def test_rank_local_mmap_retains_source_and_uses_staging(self, dist_group, patched_offload_runtime):
         current_block = nn.Linear(2, 2, bias=False)

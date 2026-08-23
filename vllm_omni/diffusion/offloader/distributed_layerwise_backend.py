@@ -968,7 +968,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             ticket = prev.ready_tickets[slot]
             if ticket is not None and prev.transport_state.is_current(ticket):
                 prev.transport.record_last_use(ticket, evt)
+                # Retire the ticket and its ready event as a pair: get_weights
+                # falls back to this hook's ready event and then validates the
+                # ticket, so a leftover event without a ticket would trip the
+                # fail-fast check on the next ring reuse (review: #6374).
                 prev.ready_tickets[slot] = None
+                prev.ready_events[slot] = None
                 if self._shared_slot_owners[slot] is prev:
                     self._shared_slot_owners[slot] = None
 
@@ -2932,6 +2937,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._resident_blocks.clear()
         self._resident_layer_group = None
         self._release_mmap_handles()
+        # The backend-level prepared Host parts alias the same pinned shards
+        # as the hooks' cpu_shards dropped above; clear them together with
+        # the pin-budget accounting so disable actually releases the pinned
+        # Host memory and leaves no stale metrics behind (review: #6374).
+        self._prepared_host_parts.clear()
+        self._planned_manifests = {}
+        self.pin_budget = None
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self.enabled = False
