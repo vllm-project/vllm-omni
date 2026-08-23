@@ -730,6 +730,8 @@ class _DiffusionConfigProjection:
     override_transformer_cls_name: str | None = None
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
+    scheduler: str | None = None
+    scheduler_kwargs: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
@@ -956,6 +958,8 @@ _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
     {
         "diffusion_attention_backend",
+        "diffusion_scheduler",
+        "diffusion_scheduler_kwargs",
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",

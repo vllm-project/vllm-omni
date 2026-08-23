@@ -31,8 +31,10 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    apply_wan_runtime_scheduler,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -326,7 +328,11 @@ class Wan22I2VPipeline(
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+            local_files_only=os.path.exists(od_config.model),
+        )
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -622,9 +628,7 @@ class Wan22I2VPipeline(
         sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
         flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+            apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)

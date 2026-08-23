@@ -27,6 +27,7 @@ from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from msgspec import field
 
+from tests.e2e.features.helpers.custom_scheduler import mark_scheduler_event
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
@@ -69,7 +70,17 @@ class FlowMatchSDEDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
     """SDE version of the FlowMatchEulerDiscreteScheduler.
     The implementation is based on FlowGRPO paper (https://arxiv.org/abs/2505.05470)
     and diffusers v0.37 branch.
+
+    When ``VLLM_OMNI_CUSTOM_SCHEDULER_MARKER`` is set, construction and
+    ``step`` append marker lines so scheduler-injection tests can observe
+    this class from the pytest process. ``set_timesteps`` is inherited
+    unchanged so Qwen-Image's ``retrieve_timesteps`` still sees ``sigmas``.
     """
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        mark_scheduler_event("constructed")
+        return super().from_pretrained(*args, **kwargs)
 
     def step(
         self,
@@ -122,6 +133,7 @@ class FlowMatchSDEDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
             return_logprobs (`bool`, *optional*, defaults to True):
                 Whether to return log probabilities of the previous sample.
         """
+        mark_scheduler_event("stepped")
 
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(

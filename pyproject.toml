@@ -151,6 +151,11 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 [project.entry-points."vllm.general_plugins"]
 vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
 
+# External packages (e.g. verl-omni) advertise diffusion scheduler classes
+# under this group; vllm_omni.diffusion.models.schedulers.resolve_scheduler_cls
+# picks them up by name. Declared empty here so the group is owned by vllm-omni.
+[project.entry-points."vllm_omni.schedulers"]
+
 
 [tool.setuptools.packages.find]
 where = ["."]

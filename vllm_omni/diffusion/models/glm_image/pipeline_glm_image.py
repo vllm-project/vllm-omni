@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -277,8 +278,12 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
             model_path = download_weights_from_hf_specific(model, od_config.revision, ["*"])
 
         # Load scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model_path, subfolder="scheduler", local_files_only=True
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_path, subfolder="scheduler", local_files_only=True
+            ),
+            local_files_only=True,
         )
 
         # Load text encoder (T5 for glyph embeddings)

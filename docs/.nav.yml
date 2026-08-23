@@ -92,6 +92,7 @@ nav:
       - Session State Manager: features/session_state_manager.md
   - Integrations:
     - Custom Diffusion Pipeline: features/custom_pipeline.md
+    - Diffusion Scheduler Injection: features/scheduler_injection.md
     - ComfyUI: features/comfyui.md
   - Fault Tolerance:
     - Failure Modes: user_guide/fault_injection_reliability_matrix.md

@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_prompt_update,
     supports_step_execution,
 )
+from vllm_omni.diffusion.models.schedulers import ensure_scheduler_consumed
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -285,6 +286,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                ensure_scheduler_consumed(self.od_config, self.pipeline)
         time_after_load = time.perf_counter()
 
         logger.info(
