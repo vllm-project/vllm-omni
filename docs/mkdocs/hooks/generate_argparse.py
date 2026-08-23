@@ -124,6 +124,8 @@ def extract_omni_serve_subparser_init():
                         "make_arg_parser": lambda parser: parser,  # no-op for doc
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
                         "_nonneg_finite_float": float,
+                        "_video_response_frame_conversion_workers": int,
+                        "MAX_FRAME_CONVERSION_WORKERS": 8,
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,
