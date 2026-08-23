@@ -149,7 +149,8 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
 ```
 
-See also [Markers for Tests](../test_writing_guide.md#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
+<!-- markdownlint-disable-next-line MD051 -->
+See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
 
 #### `server_params` Configuration
 
