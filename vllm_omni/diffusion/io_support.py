@@ -6,6 +6,7 @@ from __future__ import annotations
 import inspect
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 
@@ -49,29 +50,7 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
 
 
-def get_extra_body_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of extra_body keys accepted by a pipeline.
+def get_dummy_run_num_image_inputs(model_class_name: str) -> int:
+    """Return the maximum advertised image-input count for profiling."""
 
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
-
-
-def get_extra_output_params(model_class_name: str) -> frozenset[str]:
-    """Return the set of custom_output keys to expose in API response metrics.
-
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
-    """
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return frozenset()
-    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
+    return get_diffusion_model_metadata(model_class_name).max_multimodal_image_inputs or 1

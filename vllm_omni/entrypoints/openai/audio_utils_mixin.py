@@ -5,7 +5,7 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
 
 try:
     import soundfile
@@ -24,12 +24,8 @@ class AudioMixin:
         audio_tensor = audio_obj.audio_tensor
         sample_rate = audio_obj.sample_rate
         response_format = audio_obj.response_format.lower()
-        stream_format = audio_obj.stream_format
         base64_encode = audio_obj.base64_encode
         speed = audio_obj.speed
-
-        if stream_format != "audio":
-            raise ValueError(f"Unsupported stream format: {stream_format}")
 
         if soundfile is None:
             raise ImportError(
@@ -53,13 +49,12 @@ class AudioMixin:
             "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),
             "flac": ("FLAC", "audio/flac", {}),
             "mp3": ("MP3", "audio/mpeg", {}),
-            "aac": ("AAC", "audio/aac", {}),
             "opus": ("OGG", "audio/ogg", {"subtype": "OPUS"}),
         }
 
         if response_format not in supported_formats:
-            logger.warning(f"Unsupported response format '{response_format}', defaulting to 'wav'.")
-            response_format = "wav"
+            logger.warning(f"Unsupported response format '{response_format}', defaulting to '{DEFAULT_AUDIO_FORMAT}'.")
+            response_format = DEFAULT_AUDIO_FORMAT
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import torch
 import vllm.ir
 from vllm.config import VllmConfig
 
@@ -25,8 +26,14 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Active Worker-side paged KV adapter.  The adapter is installed only for
+    # the duration of a paged forward; dense forwards leave this as ``None``.
+    # Keep the field opaque here to avoid coupling the common context module to
+    # the diffusion_kv implementation.
+    paged_kv_adapter: Any | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    denoise_timestep: float | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -86,6 +93,40 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def build_local_sp_padding_mask(
+    batch_size: int,
+    local_seq_len: int,
+    device,
+):
+    """Build a per-rank SP padding mask that matches the local shard shape.
+
+    Auto-padding is applied before sequence-parallel sharding, so attention on each
+    rank must receive a mask for its local shard, not for the global padded sequence.
+    """
+    if not is_forward_context_available():
+        return None
+
+    ctx = get_forward_context()
+    if ctx.sp_original_seq_len is None or ctx.sp_padding_size <= 0:
+        return None
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_sequence_parallel_rank,
+    )
+    from vllm_omni.diffusion.distributed.utils import (
+        build_local_sp_padding_mask as build_local_sp_padding_mask_for_rank,
+    )
+
+    return build_local_sp_padding_mask_for_rank(
+        batch_size=batch_size,
+        local_seq_len=local_seq_len,
+        sp_original_seq_len=ctx.sp_original_seq_len,
+        sp_padding_size=ctx.sp_padding_size,
+        sequence_parallel_rank=get_sequence_parallel_rank(),
+        device=device,
+    )
 
 
 def get_ulysses_mode(*, default: str = "strict") -> str:
@@ -173,10 +214,55 @@ def set_forward_context(
                 yield
 
 
+@contextmanager
+def override_paged_kv_adapter(adapter: Any | None):
+    """Temporarily expose a Worker paged-KV adapter to Omni Attention.
+
+    This is deliberately a small context override instead of a second global
+    forward context.  The model runner owns the outer context and the adapter
+    only replaces one opaque field while its prepared native metadata is live.
+    """
+
+    if _forward_context is None:
+        # Unit-level adapter users can prepare/activate metadata without an
+        # Omni model forward context.  In that case there is nothing to
+        # override and the adapter's explicit ``forward`` API remains usable.
+        yield
+        return
+
+    previous = _forward_context.paged_kv_adapter
+    _forward_context.paged_kv_adapter = adapter
+    try:
+        yield
+    finally:
+        _forward_context.paged_kv_adapter = previous
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+class DenoiseProgressMixin:
+    def record_denoise_step(
+        self,
+        step_idx: int | None,
+        timestep=None,
+        scheduler=None,
+        normalized_timestep: float | None = None,
+    ) -> None:
+        set_forward_context_denoise_step_idx(step_idx)
+        if _forward_context is None:
+            return
+        if normalized_timestep is not None:
+            _forward_context.denoise_timestep = float(normalized_timestep)
+            return
+        if timestep is None:
+            return
+        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
+        ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
+        _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:

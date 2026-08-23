@@ -13,7 +13,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
-import librosa  # noqa: TID251
 import numpy as np
 import torch
 import torch.nn as nn
@@ -52,6 +51,7 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_TOKEN_CONFIG,
     STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID,
 )
+from vllm_omni.utils.audio import mel_filter_bank
 
 if TYPE_CHECKING:
     pass
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 def _mel_filters(n_mels: int) -> torch.Tensor:
     """Generate mel filter banks"""
     assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-    return torch.from_numpy(librosa.filters.mel(sr=16000, n_fft=400, n_mels=n_mels))
+    return mel_filter_bank(sr=16000, n_fft=400, n_mels=n_mels)
 
 
 def _normalize_audio(audio: Any) -> torch.Tensor:
@@ -609,7 +609,7 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     Architecture:
         AudioEncoder (6 layers, 512 hidden) →
         Adaptor (512 → LLM dim) →
-        Qwen2 LLM (vocab=64012)
+        Qwen2 LLM (vocab=158720)
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -758,7 +758,11 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         audio_feature_lens = (audio_lens - 1) // 2 + 1
 
-        audio_feature_list = [audio_features[i, : audio_feature_lens[i]] for i in range(audio_features.size(0))]
+        # Single host sync; slicing with per-item 0-d cuda tensors syncs once per item.
+        # Safe: _process_audio_input runs in the eager multimodal-encoder prefill path,
+        # never inside a decode CUDA-graph capture, so this .tolist() host sync is fine.
+        audio_feature_lens_cpu = audio_feature_lens.tolist()
+        audio_feature_list = [audio_features[i, : audio_feature_lens_cpu[i]] for i in range(audio_features.size(0))]
 
         return audio_feature_list
 
@@ -868,31 +872,3 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def has_audio_output(token_ids: list[int], audio_start: int = DEFAULT_TOKEN_CONFIG.audio_start) -> bool:
         """Check if generated tokens contain audio tokens"""
         return any(tid >= audio_start for tid in token_ids)
-
-
-class StepAudio2OutputProcessor:
-    """Helper class to process Step-Audio2 outputs"""
-
-    @staticmethod
-    def process_output(output_ids: torch.Tensor, tokenizer, remove_audio_padding: bool = True) -> dict:
-        """Process model output and separate text/audio tokens"""
-        if isinstance(output_ids, torch.Tensor):
-            output_ids = output_ids.squeeze().tolist()
-
-        # Separate tokens
-        text_tokens, audio_tokens = StepAudio2ThinkerForConditionalGeneration.separate_tokens(output_ids)
-
-        # Remove audio padding if requested
-        if remove_audio_padding and audio_tokens:
-            audio_tokens = [t for t in audio_tokens if t < DEFAULT_TOKEN_CONFIG.audio_eos]
-
-        # Decode text
-        text = tokenizer.decode(text_tokens, skip_special_tokens=False)
-
-        return {
-            "text": text,
-            "text_tokens": text_tokens,
-            "audio_tokens": audio_tokens,
-            "has_audio": len(audio_tokens) > 0,
-            "all_tokens": output_ids,
-        }

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
@@ -16,12 +15,11 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
 logger = init_logger(__name__)
-
-_COSYVOICE3_SPEECH_TOKEN_SIZE = 6561
 
 
 def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStruct | None:
@@ -85,20 +83,6 @@ def _prompt_speech_token_ids(multi_modal_data: dict[str, Any]) -> list[int]:
     return _to_token_id_list(speech_token)
 
 
-def _has_speech_stop_token(output_ids: list[Any]) -> bool:
-    return any(token_id >= _COSYVOICE3_SPEECH_TOKEN_SIZE for token_id in _to_token_id_list(output_ids))
-
-
-def _set_non_stream_prompt_trim(additional_info: dict[str, Any], prompt_speech_len: int) -> None:
-    if prompt_speech_len <= 0:
-        return
-    meta = additional_info.get("meta")
-    if not isinstance(meta, dict):
-        meta = {}
-        additional_info["meta"] = meta
-    meta["talker_prefill_offset"] = prompt_speech_len
-
-
 def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     if isinstance(x, list):
         if not x:
@@ -107,58 +91,6 @@ def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     if isinstance(x, torch.Tensor):
         return x.detach().cpu()
     return None
-
-
-def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
-    if raw_info is None:
-        return {}
-    if isinstance(raw_info, dict):
-        return raw_info
-
-    entries = getattr(raw_info, "entries", None)
-    if not isinstance(entries, dict):
-        return {}
-
-    decoded: dict[str, Any] = {}
-    for key, entry in entries.items():
-        tensor_data = getattr(entry, "tensor_data", None)
-        if tensor_data is not None:
-            dtype_name = getattr(entry, "tensor_dtype", "float32")
-            tensor_shape = getattr(entry, "tensor_shape", None)
-            if tensor_shape is None:
-                continue
-            dt = np.dtype(dtype_name)
-            arr = np.frombuffer(tensor_data, dtype=dt).reshape(tensor_shape)
-            decoded[key] = torch.from_numpy(arr.copy())
-        else:
-            decoded[key] = getattr(entry, "list_data", None)
-    return decoded
-
-
-def text2flow(
-    source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    _requires_multimodal_data: bool = True,
-):
-    """Build stage-1 inputs by prefixing stage-0 prompt ids to its outputs."""
-    engine_inputs: list[OmniTokensPrompt] = []
-    for source_output in source_outputs:
-        output = source_output.outputs[0]
-        multi_modal_data = output.multimodal_output
-        if multi_modal_data is None:
-            raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
-
-        prefix_ids = _ensure_list(source_output.prompt_token_ids)
-        raw_output_ids = _ensure_list(output.cumulative_token_ids)
-        prompt_speech_ids = _prompt_speech_token_ids(multi_modal_data)
-        output_ids = _strip_prompt_prefix(raw_output_ids, prefix_ids)
-        output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
-        additional_info = dict(multi_modal_data)
-        if _has_speech_stop_token(raw_output_ids):
-            _set_non_stream_prompt_trim(additional_info, len(prompt_speech_ids))
-        additional_info.setdefault("ids", {})["prompt"] = prefix_ids
-        engine_inputs.append(OmniTokensPrompt(prompt_token_ids=output_ids, additional_information=additional_info))
-    return engine_inputs
 
 
 def talker2code2wav_async_chunk(
@@ -191,7 +123,7 @@ def talker2code2wav_async_chunk(
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
             with nullcontext():
-                info = _decode_additional_information(getattr(request, "additional_information", None))
+                info = deserialize_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
                 cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
@@ -389,8 +321,6 @@ def text2flow_token_only(
         prompt_speech_ids = _prompt_speech_token_ids(multi_modal_data)
         output_ids = _strip_prompt_prefix(output_ids, prompt_speech_ids)
         additional_info: dict[str, Any] = dict(multi_modal_data)
-        if _has_speech_stop_token(raw_output_ids):
-            _set_non_stream_prompt_trim(additional_info, len(prompt_speech_ids))
         additional_info.setdefault("ids", {})["prompt"] = prefix_ids
         engine_inputs.append(
             OmniTokensPrompt(

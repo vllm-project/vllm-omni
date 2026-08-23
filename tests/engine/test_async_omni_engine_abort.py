@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 from contextlib import ExitStack
 
 import pytest
@@ -9,13 +8,13 @@ from vllm.inputs import PromptType
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.config.stage_config import _PIPELINE_REGISTRY
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 SEED = 42
-pipeline = _PIPELINE_REGISTRY["qwen2_5_omni_thinker_only"]
+pipeline = OMNI_PIPELINES["qwen2_5_omni_thinker_only"]
 
 # Single-stage thinker-only deploy, materialized from tests.helpers.stage_config._CI_OVERLAYS.
 stage_config = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
@@ -51,7 +50,7 @@ async def generate(
         output_modalities=["text"],
     ):
         stage_id = omni_output.stage_id
-        out = omni_output.request_output
+        out = omni_output
         if stage_id == 0:
             num_tokens = sum(len(output.token_ids) for output in out.outputs)
             count = num_tokens
@@ -67,11 +66,9 @@ async def generate(
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
-        # Avoid SHM IPC in tests to prevent /dev/shm exhaustion and SIGBUS.
         engine = AsyncOmni(
             model=model,
-            stage_configs_path=stage_config,
-            shm_threshold_bytes=sys.maxsize,
+            deploy_config=stage_config,
         )
         after.callback(engine.shutdown)
 

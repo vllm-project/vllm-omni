@@ -1,6 +1,9 @@
 # Image-To-Video
 
-This example demonstrates how to deploy the Wan2.2 image-to-video model for online video generation using vLLM-Omni.
+This example demonstrates online image-to-video generation with vLLM-Omni.
+The startup script defaults to Wan2.2, but `MODEL` can select any supported
+image-to-video model. The existing curl helper remains a concrete Wan2.2
+request through the standard Videos API.
 
 ## Start Server
 
@@ -20,9 +23,7 @@ bash run_server.sh
 
 The script allows overriding:
 - `MODEL` (default: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
-- `PORT` (default: `8091`)
-- `BOUNDARY_RATIO` (default: `0.875`)
-- `FLOW_SHIFT` (default: `12.0`)
+- `PORT` (default: `8099`)
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
@@ -120,14 +121,17 @@ Use `/v1/videos/sync` if you want to write the MP4 directly to a file. `POST /v1
 Generated video files are stored on local disk by the async video API.
 Local file storage behavior can be controlled via the following environment variables:
 
-- `VLLM_OMNI_STORAGE_PATH`: directory used for generated files (default: `/tmp/storage`)
-- `VLLM_OMNI_STORAGE_MAX_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+- `VLLM_OMNI_SERVER_STORAGE__PATH`: directory used for generated files (default: `/tmp/storage`)
+- `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY`: max concurrent save/delete operations (default: `4`)
+
+`VLLM_OMNI_STORAGE_PATH` and `VLLM_OMNI_STORAGE_MAX_CONCURRENCY` are deprecated and will be
+removed in a future release; use the names above instead.
 
 Example:
 
 ```bash
-export VLLM_OMNI_STORAGE_PATH=/var/tmp/vllm-omni-videos
-export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
+export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos
+export VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY=8
 ```
 
 ## API Calls

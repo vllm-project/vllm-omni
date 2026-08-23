@@ -22,7 +22,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sdxl.sdxl_unet import SDXLUNet2DConditionModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class StableDiffusionXLPipeline(
             prefetch_list=sdxl_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
         self.text_encoder_2 = from_pretrained_with_prefetch(
             CLIPTextModelWithProjection.from_pretrained,
             model,
@@ -106,7 +106,7 @@ class StableDiffusionXLPipeline(
             prefetch_list=sdxl_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        )
+        ).to(self.device)
         self.unet = SDXLUNet2DConditionModel(od_config=od_config)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKL.from_pretrained,
@@ -146,7 +146,7 @@ class StableDiffusionXLPipeline(
         )
         text_input_ids = text_inputs.input_ids
 
-        text_encoder_device = next(text_encoder.parameters()).device
+        text_encoder_device = self.device
         outputs = text_encoder(text_input_ids.to(text_encoder_device), output_hidden_states=True)
         prompt_embeds = outputs.hidden_states[-2].to(dtype=self.od_config.dtype, device=self.device)
 
@@ -297,7 +297,7 @@ class StableDiffusionXLPipeline(
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] = "",
         negative_prompt: str | list[str] = "",
         height: int | None = None,

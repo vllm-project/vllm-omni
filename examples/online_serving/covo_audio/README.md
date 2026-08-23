@@ -1,4 +1,4 @@
-# Covo-Audio-Chat
+# Covo-Audio-Chat: Online serving
 
 ## Installation
 

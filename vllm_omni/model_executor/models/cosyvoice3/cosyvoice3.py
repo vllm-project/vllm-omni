@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
@@ -35,6 +35,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -49,6 +50,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -70,6 +72,19 @@ def _cosyvoice3_trt_enabled() -> bool:
     them — export ``COSYVOICE3_TRT=0`` in the launching shell to disable.
     """
     return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+
+
+def _campplus_onnx_providers() -> list[str]:
+    """ONNX-Runtime providers for the campplus speaker-embedding session.
+
+    Prefer ``MUSAExecutionProvider`` (from the onnxruntime-musa build) with a
+    CPU fallback when it is available; otherwise CPU only. The MUSA kernels
+    differ from the CPU reference by a few percent on the embedding, which
+    conditions voice cloning -- verify voice similarity if that matters.
+    """
+    if "MUSAExecutionProvider" in onnxruntime.get_available_providers():
+        return ["MUSAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
 
 
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
@@ -162,7 +177,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             campplus_session = onnxruntime.InferenceSession(
                 campplus_onnx_path,
                 sess_options=option,
-                providers=["CPUExecutionProvider"],
+                providers=_campplus_onnx_providers(),
             )
 
         return {
@@ -198,7 +213,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             ) from e
 
         model = _s3.load_model("speech_tokenizer_v3_25hz")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
         cls._s3_model = (model, _s3, device)
         return cls._s3_model
@@ -479,14 +494,6 @@ class CosyVoice3Model(
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
 
-            # Expose streaming parameters
-            self.token_overlap_len = self.code2wav.token_overlap_len
-            self.mel_overlap_len = self.code2wav.mel_overlap_len
-            self.mel_window = self.code2wav.mel_window
-            self.mel_cache_len = self.code2wav.mel_cache_len
-            self.source_cache_len = self.code2wav.source_cache_len
-            self.speech_window = self.code2wav.speech_window
-            self._stream_audio_cache_by_req: dict[str, torch.Tensor] = {}
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
         else:
@@ -511,27 +518,6 @@ class CosyVoice3Model(
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
 
-    @staticmethod
-    def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
-        """Blend previous chunk tail into current chunk head using a Hamming window.
-
-        This mirrors upstream CosyVoice's `fade_in_out(...)` semantics:
-        update the current head in-place using a 2*overlap window, then
-        concatenate the unchanged remainder.
-        """
-        if audio.numel() == 0 or prev_tail.numel() == 0:
-            return audio
-        overlap = min(int(audio.numel()), int(prev_tail.numel()))
-        if overlap <= 0:
-            return audio
-        window = torch.hamming_window(2 * overlap, periodic=False, dtype=audio.dtype, device=audio.device)
-        fade_in = window[:overlap]
-        fade_out = window[overlap:]
-        blended = audio[:overlap] * fade_in + prev_tail[-overlap:].to(device=audio.device, dtype=audio.dtype) * fade_out
-        if overlap == int(audio.numel()):
-            return blended
-        return torch.cat([blended, audio[overlap:]], dim=0)
-
     def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
         """Pass-through stitching for async_chunk.
 
@@ -539,11 +525,9 @@ class CosyVoice3Model(
         Applying an additional waveform-domain fade/cache step introduces either
         duplicated overlap (if no tail trim) or duration shrink (if tail trim).
         """
-        if req_id is not None and stream_finished and hasattr(self, "_stream_audio_cache_by_req"):
+        if req_id is not None and stream_finished and hasattr(self, "_stream_vocoder_cache_by_req"):
             with self._stream_audio_cache_lock:
-                self._stream_audio_cache_by_req.pop(req_id, None)
-                if hasattr(self, "_stream_vocoder_cache_by_req"):
-                    self._stream_vocoder_cache_by_req.pop(req_id, None)
+                self._stream_vocoder_cache_by_req.pop(req_id, None)
         return audio
 
     @staticmethod
@@ -583,8 +567,8 @@ class CosyVoice3Model(
         return float(value)
 
     @staticmethod
-    def _multinomial_sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        return torch.multinomial(probs, 1, replacement=True, generator=generator).reshape(())
+    def _random_sample_one(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        return random_sample(probs.unsqueeze(0), {} if generator is None else {0: generator}).reshape(())
 
     @classmethod
     def _nucleus_sample_one(
@@ -619,7 +603,7 @@ class CosyVoice3Model(
         # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
         # so ``weights`` is guaranteed to have at least one nonzero entry. The
         # final ``.item()`` is the ONLY D2H sync per call.
-        sample_idx = torch.multinomial(weights, 1, replacement=True, generator=generator)
+        sample_idx = cls._random_sample_one(weights, generator=generator)
         return int(sorted_idx[sample_idx].item())
 
     @classmethod
@@ -649,9 +633,14 @@ class CosyVoice3Model(
             rep_num = int((recent == top_id).sum().item())
             if rep_num >= win_size * tau_r:
                 weighted_scores = weighted_scores.clone()
+                original_score = weighted_scores[top_id].clone()
                 weighted_scores[top_id] = float("-inf")
-                fallback_probs = weighted_scores.softmax(dim=0)
-                top_id = int(cls._multinomial_sample(fallback_probs, generator=generator).item())
+                weighted_scores[top_id] = torch.where(
+                    torch.isfinite(weighted_scores).any(),
+                    weighted_scores[top_id],
+                    original_score,
+                )
+                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
@@ -694,6 +683,10 @@ class CosyVoice3Model(
             logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
+        finite_logits = torch.isfinite(logits)
+        if not finite_logits.any(dim=-1).all().item():
+            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        logits.masked_fill_(~finite_logits, float("-inf"))
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))
@@ -952,6 +945,7 @@ class CosyVoice3Model(
         if getattr(self, "_code2wav_trt_done", False):
             return
         self._code2wav_trt_done = True
+
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
         onnx_path = self._resolve_flow_estimator_onnx()

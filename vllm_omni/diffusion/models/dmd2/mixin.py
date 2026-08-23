@@ -10,7 +10,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.dmd2.config import DMD2Config
 from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 
@@ -35,55 +35,54 @@ class DMD2PipelineMixin:
             stochastic_sampling=(self.dmd2_config.solver == "sde"),
         )
 
-    def _sanitize_dmd2_request(self, req: OmniDiffusionRequest) -> None:
-        """Sanitize CFG-related fields in-place. Mutates req.sampling_params and req.prompts."""
-        sp = req.sampling_params
+    def _sanitize_dmd2_request(self, req) -> None:
+        """Sanitize CFG-related fields in-place. Works with both OmniDiffusionRequest and DiffusionRequestBatch."""
+        sampling_params = req.sampling_params_list if isinstance(req, DiffusionRequestBatch) else [req.sampling_params]
+        for sp in sampling_params:
+            if sp.num_inference_steps and sp.num_inference_steps != self.dmd2_config.num_inference_steps:
+                logger.warning(
+                    "DMD2: ignoring num_inference_steps=%d, forcing %d.",
+                    sp.num_inference_steps,
+                    self.dmd2_config.num_inference_steps,
+                )
+            sp.num_inference_steps = self.dmd2_config.num_inference_steps
 
-        if sp.num_inference_steps and sp.num_inference_steps != self.dmd2_config.num_inference_steps:
-            logger.warning(
-                "DMD2: ignoring num_inference_steps=%d, forcing %d.",
-                sp.num_inference_steps,
-                self.dmd2_config.num_inference_steps,
-            )
-        sp.num_inference_steps = self.dmd2_config.num_inference_steps
+            if sp.guidance_scale_provided and sp.guidance_scale != self.dmd2_config.guidance_scale:
+                logger.warning(
+                    "DMD2: ignoring guidance_scale=%.2f, forcing %.2f.",
+                    sp.guidance_scale,
+                    self.dmd2_config.guidance_scale,
+                )
+            sp.guidance_scale = self.dmd2_config.guidance_scale
+            sp.guidance_scale_provided = False
 
-        if sp.guidance_scale_provided and sp.guidance_scale != self.dmd2_config.guidance_scale:
-            logger.warning(
-                "DMD2: ignoring guidance_scale=%.2f, forcing %.2f.",
-                sp.guidance_scale,
-                self.dmd2_config.guidance_scale,
-            )
-        sp.guidance_scale = self.dmd2_config.guidance_scale
-        sp.guidance_scale_provided = False
+            if sp.guidance_scale_2 is not None:
+                logger.warning("DMD2: ignoring guidance_scale_2.")
+                sp.guidance_scale_2 = None
 
-        if sp.guidance_scale_2 is not None:
-            logger.warning("DMD2: ignoring guidance_scale_2.")
-            sp.guidance_scale_2 = None
+            if sp.true_cfg_scale is not None:
+                logger.warning("DMD2: ignoring true_cfg_scale.")
+                sp.true_cfg_scale = None
 
-        if sp.true_cfg_scale is not None:
-            logger.warning("DMD2: ignoring true_cfg_scale.")
-            sp.true_cfg_scale = None
+            sp.do_classifier_free_guidance = False
+            sp.is_cfg_negative = False
 
-        sp.do_classifier_free_guidance = False
-        sp.is_cfg_negative = False
+            # Prevent base pipelines from replacing the DMD2 scheduler.
+            extra_args = getattr(sp, "extra_args", None) or {}
+            for key in ("sample_solver", "flow_shift"):
+                if key in extra_args:
+                    logger.warning("DMD2: ignoring extra_args.%s.", key)
+                    extra_args.pop(key)
 
-        # defense: strip scheduler-override extra_args that would let the base pipeline
-        # (e.g. Wan22Pipeline.forward) rebuild self.scheduler mid-forward and clobber DMD2EulerScheduler.
-        extra_args = getattr(sp, "extra_args", None) or {}
-        for key in ("sample_solver", "flow_shift"):
-            if key in extra_args:
-                logger.warning("DMD2: ignoring extra_args.%s.", key)
-                extra_args.pop(key)
-
-        fixed = []
-        for p in req.prompts:
+        # Strip negative_prompt from each request's prompt in-place.
+        requests = req.requests if hasattr(req, "requests") else [req]
+        for request in requests:
+            p = request.prompt
             if isinstance(p, dict) and "negative_prompt" in p:
                 logger.warning("DMD2: ignoring negative_prompt.")
-                p = {k: v for k, v in p.items() if k != "negative_prompt"}
-            fixed.append(p)
-        req.prompts = fixed
+                request.prompt = {k: v for k, v in p.items() if k != "negative_prompt"}
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
         self._sanitize_dmd2_request(req)
         kwargs.pop("guidance_scale", None)
         kwargs.pop("num_inference_steps", None)

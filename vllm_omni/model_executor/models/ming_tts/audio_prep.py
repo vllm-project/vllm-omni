@@ -14,9 +14,9 @@ from .config_ming_tts import (
     PATCH_SIZE,
     SAMPLE_RATE,
     VAE_PATCH_SIZE,
-    VISION_START_TOKEN_ID,
     MingTTSConfig,
 )
+from .constants import SPEAKER_EMBEDDING_DIM
 
 
 def pad_prompt_waveform(
@@ -57,7 +57,7 @@ def coerce_prompt_waveform(value: Any) -> torch.Tensor:
 
 def coerce_speaker_embeddings(value: Any, *, use_zero_spk_emb: bool = False) -> list[torch.Tensor] | None:
     if value is None:
-        return [torch.zeros((192,), dtype=torch.float32)] if use_zero_spk_emb else None
+        return [torch.zeros((SPEAKER_EMBEDDING_DIM,), dtype=torch.float32)] if use_zero_spk_emb else None
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
         if tensor.ndim == 1:
@@ -79,10 +79,10 @@ def coerce_speaker_embeddings(value: Any, *, use_zero_spk_emb: bool = False) -> 
     else:
         return coerce_speaker_embeddings(torch.as_tensor(value), use_zero_spk_emb=use_zero_spk_emb)
     if not items:
-        return [torch.zeros((192,), dtype=torch.float32)] if use_zero_spk_emb else None
+        return [torch.zeros((SPEAKER_EMBEDDING_DIM,), dtype=torch.float32)] if use_zero_spk_emb else None
     for item in items:
-        if int(item.numel()) != 192:
-            raise ValueError(f"Ming speaker embedding must have 192 dims, got {int(item.numel())}")
+        if int(item.numel()) != SPEAKER_EMBEDDING_DIM:
+            raise ValueError(f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {int(item.numel())}")
     return items
 
 
@@ -232,14 +232,17 @@ def _find_audio_placeholder_positions(input_ids: torch.Tensor, cfg: MingTTSConfi
     return filtered if filtered.numel() > 0 else dummy_pos
 
 
-def _find_speaker_placeholder_positions(input_ids: torch.Tensor, hf_config: Any) -> list[int]:
-    vision_start_token_id = getattr(hf_config, "vision_start_token_id", VISION_START_TOKEN_ID)
-    vision_start_pos = (input_ids == int(vision_start_token_id)).nonzero(as_tuple=True)[0]
-    if vision_start_pos.numel() == 0:
+def _find_speaker_placeholder_positions(input_ids: torch.Tensor, cfg: MingTTSConfig) -> list[int]:
+    # The speaker embedding is written at the slot AFTER the placeholder marker:
+    # dense ``<|vision_start|>``+1 (the ``<|vision_pad|>`` slot), moe ``<spk>``+1
+    # (the ``<audioPatch>`` slot). See upstream prepare_input_embed.
+    placeholder_token_id = int(cfg.speaker_placeholder_token_id)
+    placeholder_pos = (input_ids == placeholder_token_id).nonzero(as_tuple=True)[0]
+    if placeholder_pos.numel() == 0:
         return []
 
     slots = []
-    for pos in vision_start_pos:
+    for pos in placeholder_pos:
         slot = int(pos.item()) + 1
         if slot < int(input_ids.shape[0]):
             slots.append(slot)

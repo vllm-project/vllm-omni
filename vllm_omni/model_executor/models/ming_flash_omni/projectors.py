@@ -108,20 +108,6 @@ class AudioProjector(nn.Module):
             layers.append(nn.Linear(llm_dim, llm_dim))
         self.proj = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project audio features with temporal downsampling.
-
-        Args:
-            x: [B, T, audio_dim] audio encoder output (channel-last).
-
-        Returns:
-            [B, T', llm_dim] projected features (channel-last),
-            where T' = (T - ds_kernel_size + 2*(ds_kernel_size//2)) // ds_stride + 1.
-        """
-        # Conv1d expects [B, C, T], so transpose input
-        x = x.transpose(-1, -2)  # [B, audio_dim, T]
-        return self.proj(x)
-
     def forward_packed(
         self,
         packed: torch.Tensor,
@@ -154,19 +140,6 @@ class AudioProjector(nn.Module):
         packed_proj = torch.cat(conv_segments, dim=0)  # [total_T'', llm_dim]
         packed_proj = mlp(packed_proj)
         return packed_proj, proj_lens
-
-    def compute_output_length(self, input_length: torch.Tensor) -> torch.Tensor:
-        """Compute output sequence length after Conv1d downsampling.
-
-        Args:
-            input_length: Original mel spectrogram lengths.
-
-        Returns:
-            Output lengths after both convolutions.
-        """
-        length = (input_length - 3 + 2 * 1) // 2 + 1
-        length = (length - self.ds_kernel_size + 2 * (self.ds_kernel_size // 2)) // self.ds_stride + 1
-        return length
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())

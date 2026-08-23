@@ -30,15 +30,21 @@ class OmniRequest(Request):
 
     def __init__(
         self,
+        *args,
         prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
-        *args,
+        model_intermediate_buffer: dict | None = None,
         **kwargs,
     ):
-        prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
-        super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+        if prompt_embeds is not None:
+            kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(*args, **kwargs)
+        # vLLM 0.27 owns this counter; accelerator images still based on 0.26
+        # do not. Keep the Omni scheduler's stale-output drain compatible with
+        # both request layouts until those images move to 0.27.
+        self.num_stale_output_tokens = int(getattr(self, "num_stale_output_tokens", 0) or 0)
         # Preserve serialized prompt embeddings payload (optional)
         self.prompt_embeds_payload: PromptEmbedsPayload | None = (
             prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None
@@ -47,6 +53,8 @@ class OmniRequest(Request):
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+        # Runner-owned runtime payload.
+        self.model_intermediate_buffer: dict | None = model_intermediate_buffer
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -93,6 +101,7 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
@@ -116,6 +125,7 @@ class OmniStreamingUpdate:
     arrival_time: float
     sampling_params: SamplingParams | None
     additional_information: AdditionalInformationPayload | None = None
+    model_intermediate_buffer: dict | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -128,4 +138,5 @@ class OmniStreamingUpdate:
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
             additional_information=request.additional_information,
+            model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
         )

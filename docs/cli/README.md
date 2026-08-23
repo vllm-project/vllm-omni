@@ -18,11 +18,11 @@ Specify the port:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
-If you have custom stage configs file, launch the server with command below
-```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --stage-configs-path /path/to/stage_configs_file
-```
+Load a custom deploy configuration with `--deploy-config`:
 
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --deploy-config /path/to/deploy_config.yaml
+```
 
 ## bench
 

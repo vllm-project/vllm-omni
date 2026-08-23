@@ -25,12 +25,10 @@ def test_qwen_image_edit_plus_rejects_too_many_input_images(tmp_path: Path):
     pre_process = get_qwen_image_edit_plus_pre_process_func(SimpleNamespace(model=str(tmp_path)))
     image = Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8))
     request = SimpleNamespace(
-        prompts=[
-            {
-                "prompt": "combine",
-                "multi_modal_data": {"image": [image, image, image, image, image]},
-            }
-        ],
+        prompt={
+            "prompt": "combine",
+            "multi_modal_data": {"image": [image, image, image, image, image]},
+        },
         sampling_params=SimpleNamespace(height=None, width=None),
     )
 

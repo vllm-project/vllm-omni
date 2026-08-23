@@ -29,12 +29,12 @@ _DEFAULT_STAGE_CONFIG_PATH = Path(get_deploy_config_path("dynin_omni_ci.yaml"))
 
 models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [(model, stage_config, {"trust_remote_code": True}) for model in models for stage_config in stage_configs]
 
 DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.omni,
     pytest.mark.parametrize("omni_runner", test_params, indirect=True),
 ]
@@ -175,7 +175,7 @@ def _find_stage_output(outputs: list[Any], output_type: str) -> Any | None:
 
     # Prefer the latest finished chunk to avoid picking an intermediate stream output.
     for stage_output in reversed(matched):
-        if _is_finished_request_output(getattr(stage_output, "request_output", None)):
+        if _is_finished_request_output(stage_output):
             return stage_output
     return matched[-1]
 
@@ -205,7 +205,7 @@ def _to_token_list(value: Any) -> list[int]:
 
 
 def _extract_text(stage_output: Any, tokenizer: Any | None = None) -> str:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return ""
     req_list = request_output if isinstance(request_output, list) else [request_output]
@@ -240,7 +240,7 @@ def _extract_text(stage_output: Any, tokenizer: Any | None = None) -> str:
 
 
 def _extract_audio(stage_output: Any) -> Any | None:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return None
     req_list = request_output if isinstance(request_output, list) else [request_output]
@@ -256,7 +256,7 @@ def _extract_audio(stage_output: Any) -> Any | None:
 
 
 def _extract_image(stage_output: Any) -> Any | None:
-    request_output = getattr(stage_output, "request_output", None)
+    request_output = stage_output
     if request_output is None:
         return None
     req_list = request_output if isinstance(request_output, list) else [request_output]
@@ -290,7 +290,7 @@ def _numel(value: Any) -> int:
     return 0
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_t2i_decode_to_image(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2i_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)
@@ -304,7 +304,7 @@ def test_dynin_t2i_decode_to_image(omni_runner) -> None:
     assert _numel(image_value) > 0
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_mmu_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -322,7 +322,7 @@ def test_dynin_mmu_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_image_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -341,7 +341,7 @@ def test_dynin_image_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_speech_to_text(omni_runner) -> None:
     _configure_dynin_config_env()
     tokenizer = AutoTokenizer.from_pretrained(omni_runner.model_name, trust_remote_code=True)
@@ -360,7 +360,7 @@ def test_dynin_speech_to_text(omni_runner) -> None:
     assert text_content
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_dynin_t2s_decode_to_audio(omni_runner) -> None:
     _configure_dynin_config_env()
     prompt = _build_t2s_decode_prompt(dynin_config_path=DYNIN_CONFIG_PATH)

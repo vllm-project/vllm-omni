@@ -24,6 +24,8 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging
 
+from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+
 try:
     from transformers import AutoVideoProcessor
 except ImportError:
@@ -143,7 +145,6 @@ class MingWhisperFeatureExtractor(FeatureExtractionMixin):
         #      (conv1 has stride=1 and does not change T)
         #   2. AudioProjector Conv1d: kernel=3, stride=2, padding=1
         # Combined: T → ((T-1)//2 + 1 - 1)//2 + 1
-        # See also: AudioProjector.compute_output_length()
         encoder_feats_lengths = ((audio_feats_lengths - 3 + 2 * 1) // 2 + 1 - 3 + 2 * 1) // 2 + 1
         audio_feats = torch.cat(audio_feat_list, dim=0).unsqueeze(0)  # [1, T_total, n_mels]
 
@@ -480,5 +481,10 @@ class MingFlashOmniProcessor(ProcessorMixin):
         return list(dict.fromkeys(names))
 
 
-AutoFeatureExtractor.register("MingWhisperFeatureExtractor", MingWhisperFeatureExtractor)
-AutoProcessor.register("MingFlashOmniProcessor", MingFlashOmniProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the first
+# arg to AutoFeatureExtractor/AutoProcessor.register — it does `key.__module__`
+# internally. Passing "MingWhisperFeatureExtractor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# Same API change as minicpmo_4_5_omni_llm.py / processing_gr00t_n1d7.py.
+AutoFeatureExtractor.register(BailingMM2Config, MingWhisperFeatureExtractor, exist_ok=True)
+AutoProcessor.register(BailingMM2Config, MingFlashOmniProcessor, exist_ok=True)

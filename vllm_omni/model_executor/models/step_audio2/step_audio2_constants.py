@@ -43,39 +43,6 @@ class StepAudio2TokenConfig:
 
 
 @dataclass(frozen=True)
-class StepAudio2EncoderConfig:
-    """
-    Step-Audio2 audio encoder architecture configuration.
-
-    These values define the encoder structure and should match your model weights.
-    """
-
-    # Mel spectrogram parameters
-    n_mels: int = 128
-    """Number of mel frequency bins"""
-
-    # Encoder architecture
-    n_audio_ctx: int = 1500
-    """Audio context length (max sequence length)"""
-
-    n_audio_state: int = 512
-    """Audio encoder hidden state dimension"""
-
-    n_audio_head: int = 8
-    """Number of attention heads in encoder"""
-
-    n_audio_layer: int = 6
-    """Number of encoder layers"""
-
-    # Adapter parameters
-    kernel_size: int = 3
-    """Convolution kernel size for adapter"""
-
-    adapter_stride: int = 2
-    """Stride for adapter convolution (downsampling factor)"""
-
-
-@dataclass(frozen=True)
 class StepAudio2Token2WavConfig:
     """Token2Wav synthesis configuration."""
 
@@ -141,7 +108,6 @@ class StepAudio2ModelConfig:
 
 # Default configuration instances
 DEFAULT_TOKEN_CONFIG = StepAudio2TokenConfig()
-DEFAULT_ENCODER_CONFIG = StepAudio2EncoderConfig()
 DEFAULT_TOKEN2WAV_CONFIG = StepAudio2Token2WavConfig()
 DEFAULT_STREAM_CONFIG = StepAudio2StreamConfig()
 DEFAULT_MODEL_CONFIG = StepAudio2ModelConfig()
@@ -162,12 +128,10 @@ STEP_AUDIO2_DEFAULT_PROMPT_WAV = "default_female.wav"
 
 __all__ = [
     "StepAudio2TokenConfig",
-    "StepAudio2EncoderConfig",
     "StepAudio2Token2WavConfig",
     "StepAudio2StreamConfig",
     "StepAudio2ModelConfig",
     "DEFAULT_TOKEN_CONFIG",
-    "DEFAULT_ENCODER_CONFIG",
     "DEFAULT_TOKEN2WAV_CONFIG",
     "DEFAULT_STREAM_CONFIG",
     "DEFAULT_MODEL_CONFIG",

@@ -3,6 +3,7 @@ Root pytest entrypoint for the vLLM-Omni test suite.
 
 - `tests/conftest.py` stays thin: plugin registration + compatibility re-exports.
 - Importable utilities live under `tests/helpers/`.
+- Helper unit tests live under `tests/helpers/tests/`.
 - Fixtures live under `tests/helpers/fixtures/` and are loaded via `pytest_plugins`.
 """
 
@@ -17,11 +18,14 @@ from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
 bootstrap_vllm_layer_custom_op_modules()
 
 pytest_plugins = (
+    "tests.helpers.fixtures.config",
     "tests.helpers.fixtures.env",
     "tests.helpers.fixtures.log",
+    "tests.helpers.fixtures.media",
     "tests.helpers.fixtures.run_args",
     "tests.helpers.fixtures.runtime",
     "tests.helpers.fixtures.speaker_cache",
+    "tests.helpers.fixtures.xdist",
 )
 
 

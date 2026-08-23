@@ -20,78 +20,6 @@ TALKER_CODEC_START_TOKEN_ID = 8293
 TALKER_CODEC_END_TOKEN_ID = 8294
 
 
-def thinker2talker(
-    source_outputs,
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = False,
-):
-    thinker_outputs = source_outputs
-    talker_inputs = []
-    if not isinstance(prompt, list):
-        prompt = [prompt]
-    multi_modal_data = {
-        thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)
-    }
-
-    for i, thinker_output in enumerate(thinker_outputs):
-        output = thinker_output.outputs[0]
-        prompt_token_ids = thinker_output.prompt_token_ids
-        thinker_output_ids = output.cumulative_token_ids
-        prompt_token_ids_len = len(prompt_token_ids)
-        mm: OmniPayload = output.multimodal_output
-        latent = mm["latent"]
-        thinker_hidden_states = latent.clone().detach().to(latent.device)
-        decode_hidden = thinker_hidden_states[prompt_token_ids_len:].to(torch.float32)
-        prefill_hidden = thinker_hidden_states[:prompt_token_ids_len].to(torch.float32)
-        additional_information = to_dict(
-            OmniPayloadStruct(
-                hidden_states=HiddenStatesStruct(output=decode_hidden, output_shape=list(decode_hidden.shape)),
-                embed=EmbeddingsStruct(prefill=prefill_hidden, prefill_shape=list(prefill_hidden.shape)),
-                ids=IdsStruct(prompt=list(prompt_token_ids), output=list(thinker_output_ids)),
-            )
-        )
-        talker_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
-                + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids))
-                + [TALKER_CODEC_END_TOKEN_ID],
-                additional_information=additional_information,
-                multi_modal_data=(
-                    multi_modal_data[thinker_output.request_id]
-                    if requires_multimodal_data and multi_modal_data is not None
-                    else None
-                ),
-                mm_processor_kwargs=None,
-            )
-        )
-    return talker_inputs
-
-
-def talker2code2wav(
-    source_outputs,
-    _prompt: OmniTokensPrompt | TextPrompt = None,
-    _requires_multimodal_data: bool = False,
-):
-    code2wav_inputs = []
-    for talker_output in source_outputs:
-        output = talker_output.outputs[0]
-        token_ids = list(output.cumulative_token_ids)
-        if token_ids and token_ids[0] == TALKER_CODEC_START_TOKEN_ID:
-            token_ids = token_ids[1:]
-        if token_ids and token_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
-            token_ids = token_ids[:-1]
-        if not token_ids:
-            continue
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=token_ids,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-            )
-        )
-    return code2wav_inputs
-
-
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # Both transitions ship payloads via the worker connector
@@ -101,9 +29,7 @@ def talker2code2wav(
 #   packs an OmniPayload-shaped dict (embed.prefill /
 #   hidden_states.output / ids.prompt / ids.output) for the talker, which
 #   the talker's ``talker_preprocess`` reads from
-#   ``model_intermediate_buffer``.  The shape matches what legacy
-#   ``thinker2talker`` writes into ``additional_information`` as a debug
-#   fallback; ``thinker2talker_token_only`` only allocates prompt slots.
+#   ``model_intermediate_buffer``.
 # - talker->code2wav strips TALKER_CODEC_{START,END} boundary tokens
 #   and ships the codec token ids.
 # ============================================================================
@@ -212,9 +138,7 @@ def talker2code2wav_full_payload(
 # prefill+decode trajectory and packs an OmniPayload-shaped dict that
 # the talker's ``talker_preprocess`` reads from
 # ``model_intermediate_buffer``.  ``thinker2talker_token_only`` only
-# allocates the talker's codec prompt slots; legacy
-# ``thinker2talker`` above remains as a debug fallback that bundles the
-# same shape into ``additional_information``.
+# allocates the talker's codec prompt slots.
 # ============================================================================
 
 

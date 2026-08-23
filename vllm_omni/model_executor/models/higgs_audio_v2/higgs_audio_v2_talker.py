@@ -821,12 +821,12 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         except Exception:
             self._last_step_query_start_loc = None
 
-        # Voice-clone ref-audio substitution: at the prompt-side audio
-        # placeholder span we overwrite the text-embed lookups with the
-        # multi-codebook embedding of the encoded reference clip carried in
-        # ``model_intermediate_buffer``. No-op for plain-text requests and
-        # for decode steps (which fall through to the audio-feedback path).
         if input_ids is not None and inputs_embeds is None:
+            # Voice-clone ref-audio substitution: at the prompt-side audio
+            # placeholder span we overwrite the text-embed lookups with the
+            # multi-codebook embedding of the encoded reference clip carried in
+            # ``model_intermediate_buffer``. No-op for plain-text requests and
+            # for decode steps (which fall through to the audio-feedback path).
             info_dicts = kwargs.get("model_intermediate_buffer")
             if info_dicts is None:
                 info_dicts = kwargs.get("runtime_additional_information")
@@ -836,15 +836,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 info_dicts,
             )
 
-        # Audio-feedback substitution: vLLM's AR runner calls forward()
-        # with ``inputs_embeds=None`` and lets the model embed its own
-        # input_ids inline. ``embed_input_ids`` is only invoked via the
-        # supports_mm_inputs/prompt_embeds branches, neither of which fires
-        # for the talker. So we apply the substitution directly here: at
-        # decode positions where input_ids == audio_token_id, swap the text
-        # embedding with embed_audio_codes(last audio frame stashed in
-        # ``self._audio_state[req_id]`` by :meth:`sample`).
-        if input_ids is not None and inputs_embeds is None:
+            # Audio-feedback substitution: vLLM's AR runner calls forward()
+            # with ``inputs_embeds=None`` and lets the model embed its own
+            # input_ids inline. ``embed_input_ids`` is only invoked via the
+            # supports_mm_inputs/prompt_embeds branches, neither of which fires
+            # for the talker. So we apply the substitution directly here: at
+            # decode positions where input_ids == audio_token_id, swap the text
+            # embedding with embed_audio_codes(last audio frame stashed in
+            # ``self._audio_state[req_id]`` by :meth:`sample`).
             hidden_states = self._maybe_apply_audio_feedback(hidden_states, input_ids)
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
@@ -1506,7 +1505,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             sampled[~valid] = torch.argmax(logits[~valid].float(), dim=-1)
         return sampled
 
-    def _apply_audio_mode_bias(self, logits: torch.Tensor, sampling_metadata: Any) -> int:
+    def _apply_audio_mode_bias(self, logits: torch.Tensor, sampling_metadata: Any) -> None:
         """Mask non-audio tokens at audio-mode positions, in-place on ``logits``.
 
         Heuristic: per-request, find the last token seen so far (last of
@@ -1524,7 +1523,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         the stock sampler.
         """
         if logits is None or logits.ndim != 2:
-            return 0
+            return
         audio_bos = int(self.config.audio_bos_token_id)
         audio_id = int(self.config.audio_token_id)
         # (PyTorch align, corrected): upstream NEVER lets the model
@@ -1542,7 +1541,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
         output_ids = getattr(sampling_metadata, "output_token_ids", None)
         num_rows = int(logits.shape[0])
-        biased = 0
         # Fallback "previous token" source: read each request's LAST input
         # position from ``self._last_step_input_ids`` using ``query_start_loc``
         # from the forward context. The previous version of this code took
@@ -1619,7 +1617,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 mask[audio_eos_vocab] = row[audio_eos_vocab]
                 logits[i].copy_(mask)
                 slot_state["should_terminate"] = False
-                biased += 1
                 continue
             # Always force ``audio_token_id`` — upstream mirror.
             allowed: set[int] = {audio_id, *allowed_extra}
@@ -1629,9 +1626,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 if 0 <= tok < row.shape[-1]:
                     mask[tok] = row[tok]
             logits[i].copy_(mask)
-            biased += 1
         self._last_first_audio_after_bos = first_after_bos
-        return biased
 
     has_postprocess: bool = True
 

@@ -2,18 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from diffusers.utils import numpy_to_pil
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.model_extras import (
+    build_text_to_image_prompt as build_model_text_to_image_prompt,
+)
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    get_model_class_name,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -30,14 +44,40 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
+def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared T2I example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["image"],
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
+def _normalize_images_for_save(images: list[Any]) -> list[Any]:
+    """Convert NumPy diffusion outputs to PIL images before saving."""
+    normalized = []
+    for image in images:
+        if isinstance(image, np.ndarray):
+            normalized.extend(numpy_to_pil(image))
+        else:
+            normalized.append(image)
+    return normalized
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,14 +89,17 @@ def parse_args() -> argparse.Namespace:
         "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1, "
         "black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.2-klein-9B, "
         "black-forest-labs/FLUX.2-dev, tencent/HunyuanImage-3.0-Instruct, "
-        "meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
+        "HiDream-ai/HiDream-O1-Image, meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
         "stabilityai/stable-diffusion-3.5-medium, Tongyi-MAI/Z-Image-Turbo and etc.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a YAML file containing stage configurations for Omni.",
+        help=(
+            "Path to a deploy YAML (new pipeline/stages format). Required for multi-stage "
+            "text-to-image pipelines whose deploy config is not auto-loaded."
+        ),
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -142,7 +185,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -175,16 +223,11 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "int8", "gguf"],
+        choices=["fp8", "int8", "bitsandbytes"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), "
+        "'int8' (Int8 W8A8), 'bitsandbytes' (NF4 4-bit weight-only, CUDA SM 75+). "
         "Default: None (no quantization, uses BF16).",
-    )
-    parser.add_argument(
-        "--gguf-model",
-        type=str,
-        default=None,
-        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -208,8 +251,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help=(
+            "Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default of 1) wins. "
+            "Passing it always overrides the deploy YAML."
+        ),
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -219,6 +267,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-path",
         type=str,
+        nargs="+",
         default=None,
         help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
     )
@@ -227,6 +276,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help="LoRA backend for loading LoRA adapters. Default: peft"
+        "'peft' loads a PEFT-format adapter folder, used e.g. for RL"
+        "'distill' fuses one or more concrete LoRA checkpoint files, used e.g. for distilled few-step LoRAs",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -258,6 +316,19 @@ def parse_args() -> argparse.Namespace:
         "--use-norm",
         action="store_true",
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
+        default=None,
+        help=(
+            "Model-specific generation params as a JSON object, e.g. "
+            '\'{"timestep_shift": 3.0, "cfg_text_scale": 4.0, "cfg_interval": [0.4, 1.0]}\'. '
+            "Each key is filtered against the model's declared extra_body_params "
+            "(see vllm_omni/model_extras), so unknown keys for the chosen model are "
+            "silently dropped. Values here take precedence over the equivalent "
+            "model-specific flags above."
+        ),
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
@@ -350,21 +421,18 @@ def main():
     # Prepare LoRA kwargs for Omni initialization
     lora_args: dict[str, Any] = {}
     if args.lora_path:
-        lora_args["lora_path"] = args.lora_path
-        print(f"Using LoRA from: {args.lora_path}")
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        lora_args["lora_path"] = lora_path
+        lora_args["lora_backend"] = args.lora_backend
+        print(f"Using LoRA from: {lora_path} with backend: {args.lora_backend}")
 
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization == "gguf":
-        if not args.gguf_model:
-            raise ValueError("--gguf-model is required when --quantization gguf is set.")
-        quant_kwargs["quantization_config"] = {
-            "method": "gguf",
-            "gguf_model": args.gguf_model,
-        }
-    elif args.quantization and ignored_layers:
+    if args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -384,10 +452,8 @@ def main():
         "ring_degree": args.ring_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
-        "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
@@ -399,12 +465,22 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
+    model_class_name = get_model_class_name(omni)
+    declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -419,8 +495,9 @@ def main():
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
+    tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
     print(
-        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
@@ -430,49 +507,102 @@ def main():
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
-    if args.stage_configs_path:
-        print(f"  stage-configs-path: {args.stage_configs_path}")
+    if args.deploy_config:
+        print(f"  deploy-config: {args.deploy_config}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
     lora_request = None
-    if args.lora_path:
-        lora_request_id = stable_lora_int_id(args.lora_path)
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request_id = stable_lora_int_id(lora_path)
         lora_request = LoRARequest(
-            lora_name=Path(args.lora_path).stem,
+            lora_name=Path(lora_path).stem,
             lora_int_id=lora_request_id,
-            lora_path=args.lora_path,
+            lora_path=lora_path,
         )
 
     generation_start = time.perf_counter()
-    extra_args = {
+
+    prompt_dict = build_text_to_image_prompt(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+    )
+    prompt_dict = build_model_text_to_image_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
+        height=args.height,
+        width=args.width,
+    )
+
+    diffusion_params = OmniDiffusionSamplingParams(
+        height=args.height,
+        width=args.width,
+        seed=args.seed,
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
+        guidance_scale_2=args.guidance_scale_2,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_images_per_prompt,
+    )
+
+    # Base layer: backward-compatible model-specific flags. New model params should
+    # instead be declared in vllm_omni/model_extras and passed via --extra-body, so
+    # this dict does not need to grow per-model.
+    user_extra = {
+        "cfg_scale": args.cfg_scale,
+        "cfg_text_scale": args.cfg_scale,
+        "negative_prompt": args.negative_prompt,
+        "timestep_shift": args.timesteps_shift,
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
         "use_system_prompt": args.use_system_prompt,
         "system_prompt": args.system_prompt,
     }
-    if lora_request:
-        extra_args["lora_request"] = lora_request
-        extra_args["lora_scale"] = args.lora_scale
+    # Override layer: generic JSON passthrough wins over the flags above. Keys are
+    # still filtered against the model's declared extra_body_params downstream.
+    if args.extra_body:
+        user_extra.update(args.extra_body)
+    if declared_extra_body_params:
+        apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
+    else:
+        diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
 
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-            extra_args=extra_args,
-        ),
+    if lora_request:
+        diffusion_params.lora_request = lora_request
+        diffusion_params.lora_scale = args.lora_scale
+
+    # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
+    # or wrap single diffusion params for single-stage models.
+    init_non_diffusion = should_init_extra_args_for_non_diffusion_stages(
+        model_class_name,
     )
+    defaults = list(omni.default_sampling_params_list or [])
+    sampling_params_list = [clone_sampling_params(p) for p in defaults]
+    if not sampling_params_list:
+        sampling_params_list = [diffusion_params]
+
+    diffusion_replaced = False
+    for idx, params in enumerate(sampling_params_list):
+        if isinstance(params, OmniDiffusionSamplingParams):
+            sampling_params_list[idx] = diffusion_params
+            diffusion_replaced = True
+        elif init_non_diffusion and hasattr(params, "extra_args"):
+            if params.extra_args is None:
+                params.extra_args = {}
+            params.extra_args.update(diffusion_params.extra_args or {})
+            if args.seed is not None and hasattr(params, "seed"):
+                params.seed = args.seed
+
+    if not diffusion_replaced and len(sampling_params_list) == 1:
+        sampling_params_list = [diffusion_params]
+
+    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -502,17 +632,22 @@ def main():
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    first_output = outputs[0]
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
+    images = None
+    for output in outputs:
+        images = getattr(output, "images", None)
+        if images:
+            break
+        req_out = output
+        images = getattr(req_out, "images", None) if req_out is not None else None
+        if images:
+            break
 
-    req_out = first_output.request_output
-    if not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images'.")
+    if not images:
+        images = extract_images_from_outputs(outputs)
 
-    images = req_out.images
     if not images:
         raise ValueError("No images found in request_output")
+    images = _normalize_images_for_save(images)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

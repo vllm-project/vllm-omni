@@ -598,7 +598,7 @@ class Token2latentFlowMatching(nn.Module):
         latent_cond = torch.zeros(b, tgt_lens, self.target_dim).to(device)
         if prefix_target is not None:
             latent_cond[:, : prefix_target.size(1), :] = prefix_target
-        sample, trajectory = self.sample(
+        sample, _ = self.sample(
             tokens=token, audio=latent_cond, steps=s_steps, alpha=cfg_alpha, g_cond=ge, rescale_logits=rescale_logits
         )
         return sample
@@ -612,9 +612,8 @@ class Token2latentFlowMatching(nn.Module):
                 output = torch.cat([tokens, audio, z], dim=-1)
                 return self.vectorfield_forward(inputs=output, times=t.unsqueeze(0), self_attn_mask=None, g_cond=g_cond)
             tokens_empty = torch.zeros(*audio.shape[:2], self.model_dim, device=tokens.device, dtype=tokens.dtype)
-            audio_empty = audio
             tokens_t = torch.cat([tokens_empty, tokens], dim=0)
-            audio_t = torch.cat([audio_empty, audio], dim=0)
+            audio_t = torch.cat([audio, audio], dim=0)
             audio_noizy_t = torch.cat([z, z], dim=0)
             t_t = torch.stack([t, t], dim=0)
             c = g_cond

@@ -219,13 +219,14 @@ def load_weights(self, weights):
 
 ### Class-Level Attributes for Features
 
+
 ```python
 class MyTransformer(nn.Module):
     # torch.compile: list block class names that repeat and can be compiled
     _repeated_blocks = ["MyTransformerBlock"]
 
     # CPU offload: attribute name of the nn.ModuleList containing blocks
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
 
     # LoRA: mapping of fused param names to original param names
     packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}

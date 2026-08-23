@@ -46,7 +46,7 @@ class Omni:
 
     Args:
         model: Model name or path
-        stage_configs: Optional stage configurations
+        deploy_config: Optional path to a deploy configuration
         **kwargs: Additional arguments passed to the engine
 
     Example:
@@ -66,6 +66,21 @@ docs/
 ├── examples/            # Code examples
 └── stylesheets/         # Custom CSS
 ```
+
+## Naming Model Examples
+
+Offline inference and online serving examples for the same model use the same
+directory name and the shared display name in
+`examples/model_display_names.yml`. Use these title forms:
+
+- `# <Model>: Offline inference`
+- `# <Model>: Online serving`
+
+The documentation generator uses the full title for the page H1 and the shared
+display name alone for navigation, and fails the build if a mapped README uses
+a different H1. Keep checkpoint identifiers in commands and prose rather than
+in the display name, and do not rename an existing example directory solely to
+adjust its title because the directory defines its public documentation URL.
 
 ## Publishing Documentation
 

@@ -20,12 +20,22 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsQuant,
+    SupportsRealtime,
+)
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
 )
-from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -39,6 +49,9 @@ from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    apply_outer_quant_config_mapping,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerDummyInputsBuilder,
     Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -46,6 +59,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -85,6 +99,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     CustomProcessMixin,
     SupportsMRoPE,
     SupportsRealtime,
+    SupportsQuant,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -98,6 +113,24 @@ class Qwen3OmniMoeForConditionalGeneration(
         Set `model_stage` in vllm_config to one of: "thinker", "talker", "code2wav"
     """
 
+    # vLLM applies quantization-config name mapping before constructing this
+    # outer stage wrapper.  Expose the final module paths here so checkpoint
+    # ignore lists (for example, the BF16 MoE routers in compressed-tensors
+    # checkpoints) match the nested thinker/talker modules at construction
+    # time.  The keys intentionally omit a trailing dot so exact module names
+    # such as ``thinker.lm_head`` are mapped along with their parameters.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "thinker.lm_head": "thinker.language_model.lm_head",
+            "thinker.model": "thinker.language_model.model",
+            "talker.model": "talker.language_model.model",
+        }
+    )
+    packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
+
+    def _maybe_apply_model_mapping(self) -> None:
+        apply_outer_quant_config_mapping(self)
+
     realtime_max_tokens = 64
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -105,6 +138,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self.use_async_omni_output = False
         config: Qwen3OmniMoeConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -125,10 +159,28 @@ class Qwen3OmniMoeForConditionalGeneration(
         code2wav_config: Qwen3OmniMoeCode2WavConfig = config.code2wav_config
         self.code2wav_config = code2wav_config
 
-        # Determine model stage
-        self.model_stage = vllm_config.model_config.model_stage
+        # Determine model stage. model_stage is injected by omni's staged
+        # startup (engine/stage_init_utils.py); a plain, non-staged vLLM run
+        # never sets it, and reading it directly raised
+        #   AttributeError: 'ModelConfig' object has no attribute 'model_stage'
+        # killing the engine core before it became ready. That path became
+        # reachable once omni archs began overriding upstream's in the global
+        # registry, so this class is now also constructed for non-staged runs
+        # such as the vLLM-text perf benchmark.
+        #
+        # Default to the thinker: it is the text-generation stage, which is what
+        # a non-staged run of this model is asking for. Same shape as
+        # dynin_omni ("token2text") and glm_tts ("glm_tts"). An explicitly wrong
+        # value still reaches the ValueError below rather than being silently
+        # accepted.
+        self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
+        # Staged startup always injects model_stage; its absence means a plain
+        # vLLM run with no talker stage downstream, so no one consumes captured
+        # thinker layers and the forward must return what stock vLLM expects.
+        self.is_staged_run = getattr(vllm_config.model_config, "model_stage", None) is not None
 
         if self.model_stage == "thinker":
+            self.use_async_omni_output = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -149,9 +201,19 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            # The outer wrapper exposes talker_mtp for every stage, but only
+            # the talker stage owns the module that the method invokes.
+            self.talker_mtp_graph_safe = current_omni_platform.supports_talker_mtp_graph_capture()
             multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
+            # Talker only ships codec codes to code2wav; skip latent hidden D2H.
+            # Build Omni output asynchronously like thinker, but run lightweight
+            # postprocess eagerly so hidden_states.last stays on GPU before the
+            # next decode step.
+            self.use_async_omni_output = True
+            self.eager_omni_postprocess_before_async_output = True
+            self.omni_pooler_payload_include_hidden = False
             self.set_custom_preprocess(self.talker_preprocess)
             self.set_custom_postprocess(self.talker_postprocess)
             self.thinker = None
@@ -373,17 +435,21 @@ class Qwen3OmniMoeForConditionalGeneration(
                 inputs_embeds = inputs_embeds.to(thinker_dev)
 
             # Run thinker forward
-            # If talker expects a specific intermediate layer, capture it here
+            # If talker expects a specific intermediate layer, capture it here.
+            # Only staged runs have a talker stage to consume the capture; in a
+            # plain vLLM run capturing would waste a clone per layer per step
+            # and make the thinker return a tuple stock vLLM cannot handle.
             accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
             capture_kwargs = {}
-            if accept_layer is not None:
+            if accept_layer is not None and self.is_staged_run:
                 capture_kwargs = {
                     "capture_layer_indices": [0, int(accept_layer)],
                     "return_hidden_states": True,
                 }
 
-            # Run thinker
-            text_hidden_states, captured_layer_dict = self.thinker(
+            # Run thinker. Returns (text_hidden_states, captured_layer_dict)
+            # when capturing, a bare tensor otherwise.
+            return self.thinker(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -391,7 +457,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 **capture_kwargs,
                 **kwargs,
             )
-            return text_hidden_states, captured_layer_dict
 
         # ========== Stage 2.1: Talker ==========
         elif self.model_stage == "talker":
@@ -481,7 +546,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
-            text_hidden_states, captured_layer_dict = model_outputs
+            if isinstance(model_outputs, tuple):
+                text_hidden_states, captured_layer_dict = model_outputs
+            else:
+                # Bare tensor: capture was not requested (no accept_hidden_layer).
+                text_hidden_states, captured_layer_dict = model_outputs, None
             # Compute thinker-side TTS token embeddings for BOS/EOS/PAD and expose via multimodal outputs.
             # These will later be projected into talker text space by the talker stage.
             multimodal_outputs: OmniPayload = captured_layer_dict if captured_layer_dict is not None else {}
@@ -1213,7 +1282,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             else (
                 talker_hidden_states.device
                 if isinstance(talker_hidden_states, torch.Tensor)
-                else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                else current_omni_platform.get_torch_device()
             )
         )
 

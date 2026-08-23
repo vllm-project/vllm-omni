@@ -28,11 +28,14 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 
 logger = init_logger(__name__)
 
 
-class Qwen3OmniMoeCode2Wav(nn.Module):
+class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
     """
     Qwen3 Omni MoE Code2Wav - Converts num_quantizers-layer RVQ codec codes to audio waveform.
 
@@ -314,10 +317,20 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         for idx, code_seq_len in enumerate(code_seq_lens):
-            # Remove context from output (left_context_size * total_upsample samples)
-            wav_chunk = batch_wav[
-                idx, :, left_context_size[idx] * self.total_upsample : code_seq_len * self.total_upsample
-            ]
+            # The eager decoder (self(codes)) emits a fixed `tail` fewer samples than
+            # code_seq_len*total_upsample: the causal conv stack trims the sequence end
+            # because it lacks right context. The original slice assumed full length, so
+            # under async_chunk every streaming chunk silently dropped its last `tail`
+            # samples -> a ~23ms gap at every chunk boundary + cumulative ~1.2% time
+            # compression. Shift the start back by `tail` so this chunk refills the gap the
+            # previous chunk left (those frames are re-decoded here with proper context).
+            # `tail` is measured per call, so this is a no-op only when the decoder returns
+            # the nominal full length (tail==0, e.g. a C==0 decoder like Qwen3-TTS); for
+            # Qwen3-Omni Code2Wav both the eager forward AND the CUDA-graph wrapper
+            # (_trim_replay_output -> actual*upsample - 555) are short, so it applies to both.
+            tail = max(0, int(code_seq_len * self.total_upsample) - batch_wav.shape[-1])
+            start = max(0, left_context_size[idx] * self.total_upsample - tail)
+            wav_chunk = batch_wav[idx, :, start : code_seq_len * self.total_upsample]
             wavs.append(wav_chunk)
         return wavs
 

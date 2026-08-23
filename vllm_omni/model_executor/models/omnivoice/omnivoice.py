@@ -38,6 +38,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
@@ -379,13 +380,12 @@ class OmniVoiceModel(
         target_ids = torch.full((num_codebooks, target_len), mask_id, dtype=torch.long, device=device)
 
         # Conditional: [text] [ref_audio?] [target_mask]
+        cond_audio_start = text_ids.shape[1]
         if ref_audio_tokens is not None:
             ref_tokens = ref_audio_tokens.to(device)  # [8, T_ref]
             cond_ids = torch.cat([text_ids, ref_tokens, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
-            cond_audio_start = text_ids.shape[1]
 
         cond_len = cond_ids.shape[1]
 
@@ -495,7 +495,7 @@ class OmniVoiceModel(
         try:
             device = next(self.parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = current_omni_platform.get_torch_device()
 
         model_dir = self._resolve_model_dir()
 

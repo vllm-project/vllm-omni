@@ -93,6 +93,8 @@ def build_payload(
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
     }
+    if stream:
+        payload["stream_format"] = "audio"
     if not stream:
         payload["speed"] = speed
 

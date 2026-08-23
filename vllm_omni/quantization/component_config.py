@@ -21,12 +21,30 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizeMethodBase,
     )
+    from vllm.model_executor.models.utils import (
+        WeightsMapper,
+    )
 
 
 # Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8/mixed) only quantize the
 # Thinker LM.  Vision and audio encoder weights remain in BF16 with no
 # corresponding scale tensors in the checkpoint.
 PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
+
+
+def resolve_component_quant_config(
+    quant_config: QuantizationConfig | None,
+    component: str,
+) -> QuantizationConfig | None:
+    """Resolve one pipeline component from a global or component config.
+
+    A plain config is global and therefore applies unchanged to every
+    quantization-aware component. Only ``ComponentQuantizationConfig`` narrows
+    the scope through its explicit prefix map.
+    """
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        return quant_config.resolve(component)
+    return quant_config
 
 
 def resolve_encoder_quant_config(
@@ -48,6 +66,30 @@ def resolve_encoder_quant_config(
     return quant_config
 
 
+def safe_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Return *quant_config* only if it is safe for norm/modulation layers.
+
+    Norm and modulation layers (LayerNorm, RMSNorm, AdaLayerNorm, img_mod,
+    txt_mod, etc.) produce precision-sensitive shift/scale/gate values and
+    should not receive FP8 quant configs (see #2728).  Pre-quantized methods
+    like INC/AutoRound W4A16 need the config propagated so packed weights
+    load correctly.
+
+    This is the inverse of :func:`resolve_encoder_quant_config`: that function
+    strips pre-quantized configs from encoders, while this one strips
+    *every config except* pre-quantized configs from norm/mod layers.
+    """
+    if quant_config is None:
+        return None
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    if isinstance(quant_config, INCConfig):
+        return quant_config
+    return None
+
+
 class ComponentQuantizationConfig(QuantizationConfig):
     """Routes quantization to different configs by layer prefix."""
 
@@ -56,6 +98,7 @@ class ComponentQuantizationConfig(QuantizationConfig):
         component_configs: dict[str, QuantizationConfig | None],
         default_config: QuantizationConfig | None = None,
     ) -> None:
+        super().__init__()
         self._components = component_configs
         self._default = default_config
         self._sorted_prefixes = sorted(self._components.keys(), key=len, reverse=True)
@@ -71,6 +114,14 @@ class ComponentQuantizationConfig(QuantizationConfig):
             if prefix.startswith(comp_prefix):
                 return self._components[comp_prefix]
         return self._default
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        """Apply a weight mapper to every routed quantization config."""
+        for quant_config in self._components.values():
+            if quant_config is not None:
+                quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
+        if self._default is not None:
+            self._default.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_name(self) -> str:
         return "component"

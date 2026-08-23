@@ -85,6 +85,37 @@ def build_instruct_text(instruct: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def resolve_x_vector_only(info_dict: dict) -> bool | None:
+    """Resolve whether a request runs Base voice-clone in x-vector-only mode.
+
+    Mirrors the resolution in :meth:`Qwen3TTSPromptEmbedsBuilder.build_prompt_embeds`
+    for the ``task_type == "Base"`` branch: the ``x_vector_only_mode`` flag, then
+    the ``voice_clone_prompt.icl_mode`` override when present.
+
+    Returns ``None`` when the mode does not apply (any non-Base task), so callers
+    can distinguish "in-context" from "not a voice-clone request at all".
+    """
+    task_type = first_value(info_dict.get("task_type"), "CustomVoice")
+    if task_type != "Base":
+        return None
+
+    xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
+
+    raw = info_dict.get("voice_clone_prompt")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        raw = raw[0]
+    if isinstance(raw, dict) and "icl_mode" in raw:
+        icl_flag = raw.get("icl_mode")
+        if isinstance(icl_flag, list):
+            icl_flag = icl_flag[0] if icl_flag else None
+        if isinstance(icl_flag, bool):
+            xvec_only = not icl_flag
+
+    return xvec_only
+
+
 def first_value(value: object, default: object = None) -> object:
     if isinstance(value, list):
         return value[0] if value else default
@@ -1320,9 +1351,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = codec_embed(spk_tensor)
-            if spk_embed.ndim == 1:
-                spk_embed = spk_embed.view(1, 1, -1)
-            elif spk_embed.ndim == 2:
+            if spk_embed.ndim in (1, 2):
                 spk_embed = spk_embed.view(1, 1, -1)
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
@@ -1523,9 +1552,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                 ref_code_len: int | None = None
                 if isinstance(ref_code, list):
-                    if ref_code and isinstance(ref_code[0], list):
-                        ref_code_len = len(ref_code)
-                    elif ref_code:
+                    if ref_code:
                         ref_code_len = len(ref_code)
                 elif hasattr(ref_code, "shape"):
                     try:
