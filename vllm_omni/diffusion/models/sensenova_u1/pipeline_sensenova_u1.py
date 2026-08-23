@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
@@ -35,6 +35,12 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.lora.loader import (
+    LoraLoaderMixin,
+    _apply_diffusers_lora_alpha_scaling,
+    _load_lora_state_dict,
+    _remap_state_dict_keys,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -446,7 +452,13 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin, CFGParallelMixin):
+class SenseNovaU1Pipeline(
+    nn.Module,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+    CFGParallelMixin,
+    LoraLoaderMixin,
+):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -1408,21 +1420,60 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     # Weight loading
     # -----------------------------------------------------------------------
 
+    # Shard name -> fused parameter, used by weight loading and LoRA loading.
+    # More specific _mot_gen patterns FIRST to avoid substring ambiguity
+    # (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
+    stacked_params_mapping: ClassVar[list[tuple[str, str, str | int]]] = [
+        (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
+        (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
+        (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        # MLP gate/up fused into MergedColumnParallelLinear
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+
+    def load_lora_weights(
+        self,
+        pretrained_model_name_or_path: str | list[str],
+        adapter_name: str | None = None,
+    ) -> None:
+        """Fuse a distilled few-step LoRA into the weights.
+
+        The checkpoints ship kohya `lora_down`/`lora_up`/`alpha` names, renamed
+        here to the Diffusers names before `load_lora_into_module` routes each
+        delta into its slice of the fused projections.
+        """
+        if adapter_name in self.lora_loaded:
+            return
+
+        paths = (
+            [pretrained_model_name_or_path]
+            if isinstance(pretrained_model_name_or_path, str)
+            else list(pretrained_model_name_or_path)
+        )
+        if len(paths) != 1:
+            raise ValueError(f"Expected exactly one distilled LoRA file, got {len(paths)}: {paths}")
+
+        state_dict = _load_lora_state_dict(paths[0])
+        state_dict = _remap_state_dict_keys(
+            state_dict,
+            [(".lora_down.weight", ".lora_A.weight"), (".lora_up.weight", ".lora_B.weight")],
+        )
+        # Fold alpha and the low-rank product in fp32; scaling B in bf16 would
+        # round once before the matmul and once after.
+        state_dict = {k: v.to(torch.float32) for k, v in state_dict.items()}
+        state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
+
+        loaded_keys = self.load_lora_into_module(state_dict, self, prefix="")
+        if not loaded_keys:
+            raise ValueError(f"Distilled LoRA {paths[0]} matched no parameter of this pipeline.")
+        self.lora_loaded[adapter_name] = state_dict
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # More specific _mot_gen patterns FIRST to avoid substring
-            # ambiguity (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
-            (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
-            (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
-            (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            # MLP gate/up fused into MergedColumnParallelLinear
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        self.stacked_params_mapping = stacked_params_mapping
+        stacked_params_mapping = self.stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
