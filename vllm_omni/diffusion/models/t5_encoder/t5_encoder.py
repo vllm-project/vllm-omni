@@ -34,7 +34,8 @@ class T5SelfAttention(nn.Module):
         self.d_kv = config.d_kv
         self.n_heads = config.num_heads
         self.inner_dim = self.n_heads * self.d_kv
-        self.has_relative_attention_bias = has_relative_attention_bias
+        self.reuse_position_bias = config.model_type == "t5"
+        self.has_relative_attention_bias = has_relative_attention_bias or not self.reuse_position_bias
         self.relative_attention_num_buckets = config.relative_attention_num_buckets
         self.relative_attention_max_distance = config.relative_attention_max_distance
 
@@ -63,7 +64,7 @@ class T5SelfAttention(nn.Module):
             return_bias=False,
         )
 
-        if has_relative_attention_bias:
+        if self.has_relative_attention_bias:
             # Store full embedding; slice heads per rank in forward
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
 
@@ -139,7 +140,7 @@ class T5SelfAttention(nn.Module):
         # Attention scores: (batch, local_heads, seq, seq)
         scores = torch.matmul(query_states, key_states.transpose(3, 2))
 
-        if position_bias is None:
+        if position_bias is None or not self.reuse_position_bias:
             if self.has_relative_attention_bias:
                 position_bias = self.compute_bias(seq_length, seq_length, device=scores.device)
             else:

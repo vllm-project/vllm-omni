@@ -15,7 +15,7 @@ import torch
 import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, CLIPImageProcessor, CLIPVisionModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -31,6 +31,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
@@ -217,6 +218,13 @@ class Wan22I2VPipeline(
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
         ]
 
         # Load model_index.json to detect available components
@@ -260,14 +268,16 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
-        self.text_encoder = from_pretrained_with_prefetch(
-            UMT5EncoderModel.from_pretrained,
+        text_encoder_config = from_pretrained_with_prefetch(
+            AutoConfig.from_pretrained,
             model,
             subfolder="text_encoder",
             prefetch_list=subfolders,
             local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+        )
+        self.text_encoder = T5EncoderModel(text_encoder_config, prefix="text_encoder").to(
+            device=self.device, dtype=dtype
+        )
 
         if self.has_image_encoder:
             self.image_processor = from_pretrained_with_prefetch(
@@ -828,7 +838,7 @@ class Wan22I2VPipeline(
         ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.text_encoder(ids.to(device), mask.to(device))[0]
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
@@ -854,7 +864,7 @@ class Wan22I2VPipeline(
             )
             ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
             seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
-            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
+            negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device))[0]
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
             negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
             negative_prompt_embeds = torch.stack(
