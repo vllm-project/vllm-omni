@@ -1170,7 +1170,7 @@ class OpenAIClientHandler:
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
 
-                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                # OpenAI audio responses populate `message.audio`.
                 audio_obj = getattr(choice.message, "audio", None)
                 audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
                 if audio_b64:
