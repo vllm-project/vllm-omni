@@ -816,7 +816,7 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
-            video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", 1),
+            video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", None),
         )
         state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
             engine_client=engine_client,
@@ -1181,7 +1181,7 @@ async def omni_init_app_state(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
-        video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", 1),
+        video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", None),
     )
     state.openai_serving_realtime_robot = None
 

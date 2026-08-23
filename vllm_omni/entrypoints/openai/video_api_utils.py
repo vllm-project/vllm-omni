@@ -12,7 +12,7 @@ import os
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -590,15 +590,16 @@ def _log_video_encoding_path(
     fps: int,
     audio: AudioInput | None,
     audio_sample_rate: int | None,
-    requested_frame_conversion_workers: int,
+    frame_conversion_mode: str,
+    requested_frame_conversion_workers: int | None,
     effective_frame_conversion_workers: int,
     reason: str | None = None,
 ) -> None:
     reason_field = "" if reason is None else f" reason={reason}"
     logger.info(
         "Video response encoding route selected: selected_path=%s%s frames=%d frame_shape=%s dtype=%s fps=%s "
-        "audio_present=%s effective_audio_sample_rate=%s requested_frame_conversion_workers=%s "
-        "effective_frame_conversion_workers=%s",
+        "audio_present=%s effective_audio_sample_rate=%s frame_conversion_mode=%s "
+        "requested_frame_conversion_workers=%s effective_frame_conversion_workers=%s",
         selected_path,
         reason_field,
         len(frames),
@@ -607,7 +608,8 @@ def _log_video_encoding_path(
         fps,
         audio is not None,
         audio_sample_rate,
-        requested_frame_conversion_workers,
+        frame_conversion_mode,
+        "unset" if requested_frame_conversion_workers is None else requested_frame_conversion_workers,
         effective_frame_conversion_workers,
     )
 
@@ -676,6 +678,40 @@ def _build_planar_video_frame(frame: np.ndarray, common_dtype: np.dtype) -> av.V
             np.rint(scratch_buffer, out=scratch_buffer)
             plane_view[:height, :width] = scratch_buffer
     return av_frame
+
+
+def _iter_baseline_planar_video_frames(
+    frames: list[np.ndarray],
+    common_dtype: np.dtype,
+) -> Iterator[av.VideoFrame]:
+    """Yield planar PyAV frames while retaining only one channel scratch buffer."""
+    import av
+
+    height, width = frames[0].shape[:2]
+    scratch_dtype = np.float64 if np.issubdtype(common_dtype, np.bool_) else common_dtype
+    scratch = None if common_dtype == np.uint8 else np.empty((height, width), dtype=scratch_dtype)
+
+    for frame in frames:
+        av_frame = av.VideoFrame(width, height, format="gbrp")
+        for plane, channel in zip(av_frame.planes, (1, 2, 0)):
+            if plane.height < height or plane.line_size < width:
+                raise ValueError("PyAV video plane is smaller than the requested frame dimensions.")
+            plane_view = np.frombuffer(
+                plane,
+                dtype=np.uint8,
+                count=plane.height * plane.line_size,
+            ).reshape(plane.height, plane.line_size)
+            plane_view.fill(0)
+            if frame.dtype == np.uint8:
+                plane_view[:height, :width] = frame[..., channel]
+            else:
+                scratch_buffer = cast(np.ndarray, scratch)
+                np.copyto(scratch_buffer, frame[..., channel], casting="unsafe")
+                np.clip(scratch_buffer, 0.0, 1.0, out=scratch_buffer)
+                scratch_buffer *= 255.0
+                np.rint(scratch_buffer, out=scratch_buffer)
+                plane_view[:height, :width] = scratch_buffer
+        yield av_frame
 
 
 def _iter_planar_video_frames(
@@ -766,12 +802,20 @@ def _encode_video_bytes(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
-    frame_conversion_workers: int = 1,
+    frame_conversion_workers: int | None = None,
 ) -> bytes:
     """Encode a video payload through the automatic capability dispatcher."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
-    requested_frame_conversion_workers = _validate_frame_conversion_workers(frame_conversion_workers)
+    requested_frame_conversion_workers = (
+        None if frame_conversion_workers is None else _validate_frame_conversion_workers(frame_conversion_workers)
+    )
+    if requested_frame_conversion_workers is None:
+        frame_conversion_mode = "baseline_unconfigured"
+    elif requested_frame_conversion_workers == 1:
+        frame_conversion_mode = "configured_serial"
+    else:
+        frame_conversion_mode = "configured_parallel"
 
     # Prepare once so validation is shared by both paths and malformed common
     # input is reported before any muxer is opened.
@@ -788,6 +832,7 @@ def _encode_video_bytes(
             fps=fps,
             audio=audio,
             audio_sample_rate=effective_audio_sample_rate,
+            frame_conversion_mode=frame_conversion_mode,
             requested_frame_conversion_workers=requested_frame_conversion_workers,
             effective_frame_conversion_workers=0,
         )
@@ -801,7 +846,9 @@ def _encode_video_bytes(
             video_codec_options=video_codec_options,
         )
 
-    effective_frame_conversion_workers = min(len(frames), requested_frame_conversion_workers)
+    effective_frame_conversion_workers = (
+        1 if requested_frame_conversion_workers is None else min(len(frames), requested_frame_conversion_workers)
+    )
     _log_video_encoding_path(
         selected_path="direct_planar",
         frames=frames,
@@ -810,10 +857,22 @@ def _encode_video_bytes(
         fps=fps,
         audio=audio,
         audio_sample_rate=effective_audio_sample_rate,
+        frame_conversion_mode=frame_conversion_mode,
         requested_frame_conversion_workers=requested_frame_conversion_workers,
         effective_frame_conversion_workers=effective_frame_conversion_workers,
     )
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+    if requested_frame_conversion_workers is None:
+        return mux_av_video_audio_bytes(
+            _iter_baseline_planar_video_frames(frames, common_dtype),
+            width=frame_shape[1],
+            height=frame_shape[0],
+            audio_waveform=audio_np,
+            fps=float(fps),
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
+
     audio_sample_rate_for_mux = (
         effective_audio_sample_rate if effective_audio_sample_rate is not None else DEFAULT_AUDIO_SAMPLE_RATE
     )
@@ -891,7 +950,7 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
-    frame_conversion_workers: int = 1,
+    frame_conversion_workers: int | None = None,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(

@@ -93,21 +93,34 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
-        video_response_frame_conversion_workers: int = 1,
+        video_response_frame_conversion_workers: int | None = None,
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
-        self._video_response_frame_conversion_workers = _validate_frame_conversion_workers(
-            video_response_frame_conversion_workers
+        self._video_response_frame_conversion_workers = (
+            None
+            if video_response_frame_conversion_workers is None
+            else _validate_frame_conversion_workers(video_response_frame_conversion_workers)
         )
-        worker_mode = "parallel" if self._video_response_frame_conversion_workers > 1 else "serial"
+        if self._video_response_frame_conversion_workers is None:
+            worker_mode = "baseline_unconfigured"
+            requested_workers: int | str = "unset"
+            effective_workers = "1"
+        elif self._video_response_frame_conversion_workers == 1:
+            worker_mode = "configured_serial"
+            requested_workers = 1
+            effective_workers = "1"
+        else:
+            worker_mode = "configured_parallel"
+            requested_workers = self._video_response_frame_conversion_workers
+            effective_workers = "min(requested_workers, frame_count)"
         logger.info(
-            "Video response frame conversion configured: configured_workers=%s mode=%s "
-            "scope=non-streaming direct_planar MP4 response encoding "
-            "per_request_effective_workers=min(configured_workers, frame_count)",
-            self._video_response_frame_conversion_workers,
+            "Video response frame conversion: mode=%s requested_workers=%s "
+            "scope=non-streaming direct_planar MP4 response encoding effective_workers=%s",
             worker_mode,
+            requested_workers,
+            effective_workers,
         )
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
@@ -162,7 +175,7 @@ class OmniOpenAIServingVideo:
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
-        video_response_frame_conversion_workers: int = 1,
+        video_response_frame_conversion_workers: int | None = None,
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,

@@ -738,7 +738,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     await api_server.omni_init_app_state(
         engine,
         state,
-        _minimal_args(video_response_frame_conversion_workers=8),
+        _minimal_args(),
     )
 
     _assert_app_state_snapshot(
@@ -748,7 +748,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
-    assert video_factory_kwargs[0]["video_response_frame_conversion_workers"] == 8
+    assert video_factory_kwargs[0]["video_response_frame_conversion_workers"] is None
 
 
 @pytest.mark.asyncio

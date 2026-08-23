@@ -316,7 +316,8 @@ def test_audio_sample_rate_defaults_and_path_log(monkeypatch, video, expected_pa
     assert "fps=12" in path_logs[0]
     assert "audio_present=True" in path_logs[0]
     assert "effective_audio_sample_rate=24000" in path_logs[0]
-    assert "requested_frame_conversion_workers=1" in path_logs[0]
+    assert "frame_conversion_mode=baseline_unconfigured" in path_logs[0]
+    assert "requested_frame_conversion_workers=unset" in path_logs[0]
     expected_effective_workers = 1 if expected_mux == "direct" else 0
     assert f"effective_frame_conversion_workers={expected_effective_workers}" in path_logs[0]
 
@@ -540,9 +541,9 @@ def test_public_direct_planar_dtypes_normalize_and_encode_consistently(dtype, ex
             frame_conversion_workers=workers,
             video_codec_options={"preset": "ultrafast", "threads": "1"},
         )
-        for workers in (1, 4)
+        for workers in (None, 1, 4)
     ]
-    assert outputs[0] == outputs[1]
+    assert outputs[0] == outputs[1] == outputs[2]
     assert _decode_video_frames(outputs[0]).shape == expected_pixels.shape
 
 
@@ -589,9 +590,9 @@ def test_public_mixed_bool_uint8_direct_planar_is_consistent_across_workers():
             frame_conversion_workers=workers,
             video_codec_options={"preset": "ultrafast", "threads": "1"},
         )
-        for workers in (1, 4)
+        for workers in (None, 1, 4)
     ]
-    assert outputs[0] == outputs[1]
+    assert outputs[0] == outputs[1] == outputs[2]
     assert _decode_video_frames(outputs[0]).shape == expected_pixels.shape
 
 
@@ -617,8 +618,79 @@ def test_fallback_ignores_workers_without_creating_pool(monkeypatch):
     video = np.zeros((2, 4, 6, 3), dtype=np.float32)
     assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=8) == b"legacy-video"
     assert events[-1] == "legacy"
+    assert "frame_conversion_mode=configured_parallel" in events[0]
     assert "requested_frame_conversion_workers=8" in events[0]
     assert "effective_frame_conversion_workers=0" in events[0]
+
+
+def test_default_direct_path_uses_baseline_iterator_and_pr1_mux_arguments(monkeypatch):
+    calls = []
+    events = []
+    video = np.transpose(np.zeros((3, 2, 4, 4), dtype=np.float32), (1, 2, 3, 0))
+
+    def fake_baseline_iter(frames, common_dtype):
+        calls.append(("baseline", len(frames), common_dtype))
+        yield "baseline-frame"
+
+    def fail_configured_iter(*args, **kwargs):
+        raise AssertionError("an omitted option must not use the configured iterator")
+
+    def fake_mux(frames, **kwargs):
+        calls.append(("mux", list(frames), kwargs))
+        return b"baseline-video"
+
+    monkeypatch.setattr(video_api_utils, "_iter_baseline_planar_video_frames", fake_baseline_iter)
+    monkeypatch.setattr(video_api_utils, "_iter_planar_video_frames", fail_configured_iter)
+    monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", fake_mux)
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info",
+        lambda message, *args, **kwargs: events.append(message % args),
+    )
+
+    assert video_api_utils._encode_video_bytes(video, fps=12) == b"baseline-video"
+    assert calls[0][0] == "baseline"
+    assert calls[1][0:2] == ("mux", ["baseline-frame"])
+    assert calls[1][2]["audio_sample_rate"] is None
+    assert "frame_conversion_mode=baseline_unconfigured" in events[0]
+    assert "requested_frame_conversion_workers=unset" in events[0]
+    assert "effective_frame_conversion_workers=1" in events[0]
+
+
+def test_explicit_one_uses_configured_serial_iterator_without_pool(monkeypatch):
+    converted = []
+    events = []
+    video = np.transpose(np.zeros((3, 3, 4, 4), dtype=np.float32), (1, 2, 3, 0))
+
+    def fail_baseline_iter(*args, **kwargs):
+        raise AssertionError("an explicit worker count must not use the baseline iterator")
+
+    def fail_pool(*args, **kwargs):
+        raise AssertionError("one configured worker must not create a thread pool")
+
+    def fake_build(frame, common_dtype):
+        converted.append((frame, common_dtype))
+        return object()
+
+    monkeypatch.setattr(video_api_utils, "_iter_baseline_planar_video_frames", fail_baseline_iter)
+    monkeypatch.setattr(video_api_utils, "ThreadPoolExecutor", fail_pool)
+    monkeypatch.setattr(video_api_utils, "_build_planar_video_frame", fake_build)
+    monkeypatch.setattr(
+        media_utils,
+        "mux_av_video_audio_bytes",
+        lambda frames, **kwargs: list(frames) and b"configured-video",
+    )
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "info",
+        lambda message, *args, **kwargs: events.append(message % args),
+    )
+
+    assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=1) == b"configured-video"
+    assert len(converted) == 3
+    assert "frame_conversion_mode=configured_serial" in events[0]
+    assert "requested_frame_conversion_workers=1" in events[0]
+    assert "effective_frame_conversion_workers=1" in events[0]
 
 
 def test_direct_workers_are_forwarded_and_clamped_to_frame_count_in_route_log(monkeypatch):
@@ -644,6 +716,7 @@ def test_direct_workers_are_forwarded_and_clamped_to_frame_count_in_route_log(mo
 
     assert video_api_utils._encode_video_bytes(video, fps=12, frame_conversion_workers=32) == b"direct-video"
     assert calls and calls[0][2] == 3
+    assert "frame_conversion_mode=configured_parallel" in events[0]
     assert "requested_frame_conversion_workers=32" in events[0]
     assert "effective_frame_conversion_workers=3" in events[0]
 

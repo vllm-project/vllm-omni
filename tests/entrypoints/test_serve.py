@@ -79,14 +79,15 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
-def test_serve_parser_defaults_to_one_video_response_frame_conversion_worker() -> None:
+def test_serve_parser_defaults_to_unconfigured_video_response_frame_conversion() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(["serve", "fake-model", "--omni"])
 
-    assert args.video_response_frame_conversion_workers == 1
+    assert args.video_response_frame_conversion_workers is None
+    assert "video_response_frame_conversion_workers" not in args.get_explicit_kwargs_dict()
 
 
 @pytest.mark.parametrize("workers", [1, 2, 4, 8, 9, 32])

@@ -126,17 +126,19 @@ MiniMax-H3 `FL2VA`/`t2va` on one Atlas A2 host. The implementation itself is
 capability-based and has no model whitelist; other models and platforms have
 not been tested by this change and have no compatibility or performance claim.
 Other models, hardware, tasks, shapes, durations, and concurrency
-configurations retain the default of one worker until measured.
+configurations should keep the option unset until measured.
 
 Non-streaming MP4 responses use an automatic encoder. It checks the runtime
 frame shape, common dtype, and RGB channel-plane contiguity for every request.
 Compatible inputs use direct planar PyAV frames; unsupported inputs use the
 legacy fallback, and the worker setting is ignored on that route. Streaming
-fMP4 output keeps its existing incremental path. The conservative default is
-one CPU frame-conversion worker. Configure the service with
-`--video-response-frame-conversion-workers N`, where `N` is any positive
-integer and the default is `1`. For a direct-planar request with `F` frames,
-the effective worker count is `min(N, F)`; CPU count is not a validation cap.
+fMP4 output keeps its existing incremental path. Omitting
+`--video-response-frame-conversion-workers` preserves the baseline direct-planar
+serial iterator. An explicit positive `N` opts into the configurable path:
+`N=1` uses its optimized serial iterator without a pool, while `N>=2` enables
+bounded parallel conversion. For a direct-planar request with `F` frames, the
+effective configured worker count is `min(N, F)`; CPU count is not a validation
+cap.
 
 Parallel frame conversion applies only to the direct-planar path. The caller
 still synchronously waits for the complete MP4 mux/encode, so this CPU
@@ -145,8 +147,8 @@ asyncio event loop; that is a separate follow-up.
 
 For the measured candidate setting in this section, start the Atlas A2 FL2VA
 server as follows. The `--video-response-frame-conversion-workers 8` line is
-the candidate setting used for the measurements; omit it for BASE/default
-worker 1.
+the candidate setting used for the measurements; omit it for the BASE baseline
+serial path.
 
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
@@ -175,14 +177,15 @@ vllm serve "${MODEL}" \
   --video-response-frame-conversion-workers 8
 ```
 
-At service startup, an INFO log reports the configured worker count, whether
-conversion is `serial` or `parallel`, the `non-streaming direct_planar MP4
-response encoding` scope, and the rule
-`per_request_effective_workers=min(configured_workers, frame_count)`. Each
-non-streaming request also logs `selected_path`,
+At service startup, an INFO log reports `baseline_unconfigured`,
+`configured_serial`, or `configured_parallel`, the requested worker value, the
+`non-streaming direct_planar MP4 response encoding` scope, and its effective
+worker rule. Each non-streaming request also logs `selected_path`,
+`frame_conversion_mode`,
 `requested_frame_conversion_workers`, and `effective_frame_conversion_workers`.
-The latter is `0` for the legacy fallback and otherwise is the request-level
-worker count after clamping to the frame count.
+An unset requested value is logged as `unset`. The effective value is `0` for
+the legacy fallback, `1` for the baseline path, and otherwise is the
+request-level configured worker count after clamping to the frame count.
 For a direct path with `F` frames and requested worker count `W`, the effective
 count is `min(W, F)`. One worker, or one frame, stays serial and does not create
 a thread pool.
@@ -207,10 +210,10 @@ is therefore:
 
 `min(F, 2 * W_eff + 1) * 3,096,576 + W_eff * 4,128,768` bytes.
 
-For `W_eff = 1`, conversion is serial, no pool is created, and one converted
-frame plus one thread-local scratch buffer is used at a time. For the pooled
-worker counts below, the pending-future column excludes the yielded frame, and
-the capacity includes both frame classes:
+For explicitly configured `W_eff = 1`, conversion is serial, no pool is
+created, and one converted frame plus one thread-local scratch buffer is used
+at a time. For the pooled worker counts below, the pending-future column
+excludes the yielded frame, and the capacity includes both frame classes:
 
 | Workers | Pending-future bound | Known frame slots | Known capacity |
 | ---: | ---: | ---: | ---: |
@@ -320,7 +323,7 @@ command in this section with `MODEL=$MODEL_ROOT/FL2VA`,
 `MINDIE_SD_FA_TYPE=ascend_laser_attention`, and
 `--diffusion-attention-backend FLASH_ATTN`. Candidate used
 `--video-response-frame-conversion-workers 8`; BASE omitted that line and used
-the default worker count of 1.
+the baseline serial iterator.
 No Laser operator trace was captured, so Laser activation is not
 trace-confirmed.
 
@@ -416,17 +419,17 @@ recommendation beyond this tested H3/A2 setup. The run has no trace-confirmed
 Laser operator. The CPU benchmark and worker-boundary scan above are separate
 from this E2E evidence.
 
-Worker 1 is the conservative default. For the exact measured E2E scope only —
-MiniMax-H3 `FL2VA`/`t2va`, one request, fixed Laser, `1344x768@24fps`, tested
-5, 8.7, and 15 second cases, on the Atlas A2 host with a 192-CPU Kunpeng-920
-and 8 x Ascend 910B4-1, using the recorded software stack in the measured
-environment table above — worker 8 is a latency-oriented recommendation when
-CPU and memory headroom are available. This recommendation does not extend to
-other models, hardware, tasks, shapes, durations, or concurrency; those
-configurations retain the default of one worker until measured. Worker 4 is a
-lower-resource intermediate choice in the CPU scan, not a general
-recommendation. Worker 8 is not a theoretical optimum, and the exploratory
-16/32 results do not imply a recommendation for those values.
+Keeping the option unset preserves the conservative baseline path. For the
+exact measured E2E scope only — MiniMax-H3 `FL2VA`/`t2va`, one request, fixed
+Laser, `1344x768@24fps`, tested 5, 8.7, and 15 second cases, on the Atlas A2
+host with a 192-CPU Kunpeng-920 and 8 x Ascend 910B4-1, using the recorded
+software stack in the measured environment table above — worker 8 is a
+latency-oriented recommendation when CPU and memory headroom are available.
+This recommendation does not extend to other models, hardware, tasks, shapes,
+durations, or concurrency; those configurations should keep the option unset
+until measured. Worker 4 is a lower-resource intermediate choice in the CPU
+scan, not a general recommendation. Worker 8 is not a theoretical optimum, and
+the exploratory 16/32 results do not imply a recommendation for those values.
 
 ### Optional optimizations
 

@@ -840,10 +840,11 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--video-response-frame-conversion-workers",
             type=_video_response_frame_conversion_workers,
-            default=1,
+            default=None,
             help=(
-                "Number of CPU workers used to convert planar video frames for non-streaming MP4 responses "
-                "(positive integer; default: 1; each request clamps this value to its frame count)."
+                "Opt into configurable CPU planar-frame conversion for non-streaming MP4 responses with a "
+                "positive worker count. Omitting this option preserves baseline serial conversion; configured "
+                "worker counts are clamped to each request's frame count."
             ),
         )
         # TTS-specific parameters

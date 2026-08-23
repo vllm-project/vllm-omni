@@ -91,12 +91,14 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-def test_raw_and_base64_encoders_receive_configured_workers(mocker: MockerFixture):
+@pytest.mark.parametrize("workers", [None, 8], ids=["omitted", "configured"])
+def test_raw_and_base64_encoders_receive_worker_configuration(mocker: MockerFixture, workers: int | None):
     engine = FakeAsyncOmni()
+    handler_kwargs = {} if workers is None else {"video_response_frame_conversion_workers": workers}
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
-        video_response_frame_conversion_workers=8,
+        **handler_kwargs,
     )
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -114,29 +116,36 @@ def test_raw_and_base64_encoders_receive_configured_workers(mocker: MockerFixtur
 
     asyncio.run(_generate_both_response_types())
 
-    assert raw_encoder.call_args.kwargs["frame_conversion_workers"] == 8
-    assert base64_encoder.call_args.kwargs["frame_conversion_workers"] == 8
+    assert raw_encoder.call_args.kwargs["frame_conversion_workers"] == workers
+    assert base64_encoder.call_args.kwargs["frame_conversion_workers"] == workers
 
 
 @pytest.mark.parametrize(
-    ("workers", "mode"),
-    [(1, "serial"), (32, "parallel")],
+    ("workers", "mode", "requested_workers", "effective_workers"),
+    [
+        (None, "baseline_unconfigured", "unset", "1"),
+        (1, "configured_serial", "1", "1"),
+        (32, "configured_parallel", "32", "min(requested_workers, frame_count)"),
+    ],
 )
-def test_startup_log_describes_frame_conversion_configuration(mocker: MockerFixture, workers: int, mode: str) -> None:
+def test_startup_log_describes_frame_conversion_configuration(
+    mocker: MockerFixture,
+    workers: int | None,
+    mode: str,
+    requested_workers: str,
+    effective_workers: str,
+) -> None:
     startup_log = mocker.patch("vllm_omni.entrypoints.openai.serving_video.logger.info")
 
-    OmniOpenAIServingVideo.for_diffusion(
-        FakeAsyncOmni(),
-        model_name="test-model",
-        video_response_frame_conversion_workers=workers,
-    )
+    handler_kwargs = {} if workers is None else {"video_response_frame_conversion_workers": workers}
+    OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model", **handler_kwargs)
 
     message, *args = startup_log.call_args.args
     rendered_message = message % tuple(args)
-    assert f"configured_workers={workers}" in rendered_message
     assert f"mode={mode}" in rendered_message
+    assert f"requested_workers={requested_workers}" in rendered_message
     assert "scope=non-streaming direct_planar MP4 response encoding" in rendered_message
-    assert "per_request_effective_workers=min(configured_workers, frame_count)" in rendered_message
+    assert f"effective_workers={effective_workers}" in rendered_message
 
 
 @pytest.mark.asyncio
