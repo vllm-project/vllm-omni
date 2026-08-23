@@ -249,9 +249,7 @@ class LTXAudioRuntime(
         del prefix
         parallel_config = getattr(od_config, "parallel_config", None)
         if getattr(parallel_config, "ulysses_mode", "strict") == "advanced_uaa":
-            raise ValueError(
-                f"{type(self).__name__} does not support ulysses_mode='advanced_uaa'; use 'strict'."
-            )
+            raise ValueError(f"{type(self).__name__} does not support ulysses_mode='advanced_uaa'; use 'strict'.")
 
         self.model_version = detect_ltx_model_version(
             od_config.model,
@@ -487,9 +485,7 @@ class LTXAudioRuntime(
                     assignments = LTX_GUIDANCE_EXECUTOR._parallel_assignments(len(plan.passes), guidance_world_size)
                     local_indices = assignments[get_guidance_parallel_rank()]
                     model_pass_count = max(len(indices) for indices in assignments)
-                    padded_indices: list[int | None] = local_indices + [None] * (
-                        model_pass_count - len(local_indices)
-                    )
+                    padded_indices: list[int | None] = local_indices + [None] * (model_pass_count - len(local_indices))
                     local_passes = tuple(
                         plan.passes[0] if pass_index is None else plan.passes[pass_index]
                         for pass_index in padded_indices
@@ -526,9 +522,7 @@ class LTXAudioRuntime(
                     audio_num_frames=padded_num_frames,
                     audio_coords=_repeat_batch(audio_coords, model_pass_count),
                     audio_attention_mask=(
-                        None
-                        if audio_attention_mask is None
-                        else _repeat_batch(audio_attention_mask, model_pass_count)
+                        None if audio_attention_mask is None else _repeat_batch(audio_attention_mask, model_pass_count)
                     ),
                     attention_kwargs=attention_kwargs,
                 )

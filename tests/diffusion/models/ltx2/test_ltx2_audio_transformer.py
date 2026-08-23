@@ -65,7 +65,9 @@ def test_ltx_audio_transformer_parameter_tree_has_no_video_branch(monkeypatch):
     assert "audio_proj_in.weight" in parameter_names
     assert "audio_proj_out.weight" in parameter_names
     assert "audio_scale_shift_table" in parameter_names
-    assert not any(name.startswith(("proj_in", "proj_out", "caption_projection", "time_embed", "rope")) for name in parameter_names)
+    assert not any(
+        name.startswith(("proj_in", "proj_out", "caption_projection", "time_embed", "rope")) for name in parameter_names
+    )
     assert not any("audio_to_video" in name or "video_to_audio" in name for name in parameter_names)
 
 

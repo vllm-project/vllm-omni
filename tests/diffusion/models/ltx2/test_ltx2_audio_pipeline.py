@@ -40,9 +40,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
         ("2.5", LTX25_T2A_COMPONENT_PROFILE, LTX25_T2A_RECIPE, "transformer_full"),
     ],
 )
-def test_ltx_t2a_uses_one_pipeline_with_version_specific_full_profiles(
-    version, profile, recipe, transformer_subfolder
-):
+def test_ltx_t2a_uses_one_pipeline_with_version_specific_full_profiles(version, profile, recipe, transformer_subfolder):
     assert resolve_ltx_component_profile("text_to_audio", version) is profile
     assert resolve_ltx_pipeline_recipe("text_to_audio", version) is recipe
     assert profile.transformer_subfolder == transformer_subfolder
@@ -74,22 +72,28 @@ def test_ltx_t2a_public_contract_is_audio_only():
     ],
 )
 def test_ltx_t2a_duration_quantizes_to_nearest_legal_video_clock(seconds, frame_rate, expected):
-    assert resolve_ltx_audio_num_frames(
-        audio_length=seconds,
-        num_frames=None,
-        frame_rate=frame_rate,
-        default_num_frames=121,
-    ) == expected
+    assert (
+        resolve_ltx_audio_num_frames(
+            audio_length=seconds,
+            num_frames=None,
+            frame_rate=frame_rate,
+            default_num_frames=121,
+        )
+        == expected
+    )
     assert (expected - 1) % 8 == 0
 
 
 def test_ltx_t2a_exact_num_frames_overrides_default_duration():
-    assert resolve_ltx_audio_num_frames(
-        audio_length=None,
-        num_frames=81,
-        frame_rate=24.0,
-        default_num_frames=121,
-    ) == 81
+    assert (
+        resolve_ltx_audio_num_frames(
+            audio_length=None,
+            num_frames=81,
+            frame_rate=24.0,
+            default_num_frames=121,
+        )
+        == 81
+    )
 
 
 @pytest.mark.parametrize(
@@ -248,7 +252,9 @@ def test_ltx_t2a_weight_source_filters_video_tensors_before_materialization(tmp_
 
     monkeypatch.setattr(ltx2_audio_runtime.DiffusersPipelineLoader, "ComponentSource", Source)
     monkeypatch.setattr(ltx2_audio_runtime, "prefetch_subfolders", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ltx2_audio_runtime.AutoTokenizer, "from_pretrained", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        ltx2_audio_runtime.AutoTokenizer, "from_pretrained", lambda *_args, **_kwargs: SimpleNamespace()
+    )
 
     pipe = SimpleNamespace(component_profile=LTX2_T2A_COMPONENT_PROFILE)
     od_config = SimpleNamespace(model=str(tmp_path), revision=None, dtype=torch.float32)
