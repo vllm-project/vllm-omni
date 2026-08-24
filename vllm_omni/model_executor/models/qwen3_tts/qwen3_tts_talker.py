@@ -443,7 +443,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
             persistent=False,
         )
-        self._embedding_dtype = torch.bfloat16
+        # Talker embeddings are handed straight to the engine, which allocates
+        # ``inputs_embeds`` from the configured model dtype. Hardcoding
+        # bfloat16 here makes every embedding disagree with the engine on any
+        # GPU where bfloat16 is unavailable and ``--dtype float16`` is forced
+        # (Turing / sm75 and older), producing
+        # ``RuntimeError: index_copy_(): self and source expected to have the
+        # same dtype, but got (self) Half and (source) BFloat16`` in
+        # ``OmniGPUModelRunner.flush_decode_batch``. Follow the engine dtype.
+        self._embedding_dtype = model_dtype
 
         tokenizer_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
@@ -489,6 +497,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tts_pad_embed=self._tts_pad_embed,
             encode_ref_audio_batch=self._encode_ref_audio_batch,
             speaker_cache=self._speaker_cache,
+            embedding_dtype=model_dtype,
         )
         self._load_custom_voice_profiles()
 
