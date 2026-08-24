@@ -23,6 +23,8 @@ Coverage:
     - Cache-DiT + HSDP = 2 + VAE-Patch-Parallel = 2
 """
 
+import re
+
 import pytest
 
 from tests.helpers.mark import hardware_marks
@@ -63,23 +65,6 @@ def _get_vace_feature_cases():
                 ],
             ),
             id="single_card_001",
-            marks=SINGLE_CARD_FEATURE_MARKS,
-        ),
-        # Single GPU: reference-hint cache with explicit lossy opt-in
-        pytest.param(
-            OmniServerParams(
-                model=MODEL,
-                server_args=[
-                    "--cache-backend",
-                    "ref_hint",
-                    "--cache-config",
-                    '{"ref_hint_refresh_interval":2,'
-                    '"ref_hint_strategy":"forecast50",'
-                    '"ref_hint_acknowledge_lossy":true}',
-                    "--vae-use-tiling",
-                ],
-            ),
-            id="single_card_ref_hint",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
         # 2 GPUs: Cache-DiT + Ulysses-SP = 2
@@ -186,3 +171,53 @@ def test_wan_2_1_vace(omni_server: OmniServer, openai_client: OpenAIClientHandle
             },
         }
     )
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--cache-backend",
+                    "ref_hint",
+                    "--cache-config",
+                    '{"ref_hint_refresh_interval":2,'
+                    '"ref_hint_strategy":"forecast50",'
+                    '"ref_hint_acknowledge_lossy":true}',
+                    "--vae-use-tiling",
+                ],
+                capture_output=True,
+            ),
+            id="single_card_ref_hint",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        )
+    ],
+    indirect=True,
+)
+def test_wan_2_1_vace_ref_hint_cache_hits(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    """Exercise forecast50 past calibration and prove the model-region handler ran."""
+    openai_client.send_video_diffusion_request(
+        {
+            "model": MODEL,
+            "form_data": {
+                "prompt": PROMPT,
+                "height": 480,
+                "width": 320,
+                "num_frames": 5,
+                "fps": 8,
+                "num_inference_steps": 3,
+                "guidance_scale": 5.0,
+                "seed": 42,
+            },
+        }
+    )
+
+    server_log = omni_server.read_log()
+    match = re.search(r"Reference-hint cache request summary:.*hits=(\d+)", server_log)
+    assert match is not None, server_log[-8000:]
+    assert int(match.group(1)) > 0, match.group(0)

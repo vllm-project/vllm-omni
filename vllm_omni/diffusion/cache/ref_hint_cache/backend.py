@@ -163,9 +163,23 @@ class RefHintCacheBackend(CacheBackend):
             )
 
     def finish_request(self, pipeline: object) -> None:
-        """Release retained hint tensors as soon as a request finishes."""
-        for transformer in self._get_transformers(pipeline):
-            self._state_for(transformer).reset()
+        """Report cache activity, then release retained request tensors."""
+        states = [self._state_for(transformer) for transformer in self._get_transformers(pipeline)]
+        hits = sum(state.hits for state in states)
+        misses = sum(state.misses for state in states)
+        refreshes = sum(state.refreshes for state in states)
+        logger.info(
+            "Reference-hint cache request summary: strategy=%s "
+            "refresh_interval=%d hits=%d misses=%d refreshes=%d owners=%d",
+            self._strategy(),
+            self._refresh_interval(),
+            hits,
+            misses,
+            refreshes,
+            len(states),
+        )
+        for state in states:
+            state.reset()
 
     def get_model_region_handler(self) -> ModelRegionHandler:
         """Install this backend only in the active request's ForwardContext."""

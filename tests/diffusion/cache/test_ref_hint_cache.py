@@ -20,6 +20,7 @@ def test_refresh_schedule_k2():
     b, r = st.begin_call(3)
     assert r is False and st.history(b)[-1][1] == "h2"  # step 3: reuse the fresher h2
     assert st.hits == 2 and st.misses == 2
+    assert st.refreshes == 1
 
 
 def test_branch_keying_two_forwards_per_step():
@@ -86,6 +87,7 @@ def test_reset_clears_state():
     st.reset()
     assert st._history == {} and st._last_step is None and st._call_idx == 0
     assert st.hits == 0 and st.misses == 0
+    assert st.refreshes == 0
 
 
 def test_refresh_interval_clamped_to_at_least_one():

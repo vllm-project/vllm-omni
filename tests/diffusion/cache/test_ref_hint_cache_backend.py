@@ -12,6 +12,7 @@ import torch.nn as nn
 pytest.importorskip("vllm")
 
 from vllm_omni.diffusion.cache.ref_hint_cache import RefHintCacheBackend  # noqa: E402
+from vllm_omni.diffusion.cache.ref_hint_cache import backend as backend_module  # noqa: E402
 from vllm_omni.diffusion.data import DiffusionCacheConfig  # noqa: E402
 from vllm_omni.diffusion.forward_context import (  # noqa: E402
     ForwardContext,
@@ -161,7 +162,7 @@ def test_forecast50_uses_two_fresh_values_and_damped_prediction():
     assert torch.equal(forecast[0], torch.tensor([2.5]))
 
 
-def test_finish_request_releases_retained_hints():
+def test_finish_request_reports_activity_and_releases_retained_hints(monkeypatch):
     owner = _VaceLikeTransformer()
     pipeline = _FakePipeline(owner)
     backend = RefHintCacheBackend(
@@ -181,10 +182,30 @@ def test_finish_request_releases_retained_hints():
             owner,
             lambda: [torch.tensor([1.0])],
         )
+        context.denoise_step_idx = 1
+        backend.execute(
+            ModelRegion.REFERENCE_HINTS,
+            owner,
+            lambda: [torch.tensor([2.0])],
+        )
 
     state = backend._states[id(owner)]
     assert state._history
+    info_calls = []
+    monkeypatch.setattr(backend_module.logger, "info", lambda *args: info_calls.append(args))
     backend.finish_request(pipeline)
+    assert info_calls == [
+        (
+            "Reference-hint cache request summary: strategy=%s "
+            "refresh_interval=%d hits=%d misses=%d refreshes=%d owners=%d",
+            "reuse",
+            2,
+            1,
+            1,
+            0,
+            1,
+        )
+    ]
     assert state._history == {}
     assert state.misses == 0
 

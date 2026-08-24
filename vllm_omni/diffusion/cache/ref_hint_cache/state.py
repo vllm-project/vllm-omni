@@ -43,6 +43,7 @@ class RefHintCacheState(Generic[ValueT]):
         self._call_idx: int = 0
         self.hits: int = 0
         self.misses: int = 0
+        self.refreshes: int = 0
 
     def reset(self) -> None:
         """Clear retained values and counters for a new generation."""
@@ -51,6 +52,7 @@ class RefHintCacheState(Generic[ValueT]):
         self._call_idx = 0
         self.hits = 0
         self.misses = 0
+        self.refreshes = 0
 
     def begin_call(self, step: int | None) -> tuple[int | None, bool]:
         """Return ``(branch, should_refresh)`` for this region invocation."""
@@ -85,6 +87,8 @@ class RefHintCacheState(Generic[ValueT]):
             return
         self.misses += 1
         history = self._history.setdefault(branch, [])
+        required_values = 2 if self.strategy == _FORECAST50 else 1
+        if len(history) >= required_values:
+            self.refreshes += 1
         history.append((step, value))
-        retained_values = 2 if self.strategy == _FORECAST50 else 1
-        del history[:-retained_values]
+        del history[:-required_values]
