@@ -101,7 +101,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
 )
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
-from vllm_omni.model_executor.models.sensenova_vision.pipeline import SENSENOVA_VISION_PIPELINE
+from vllm_omni.model_executor.models.sensenova_vision.pipeline import (
+    SENSENOVA_VISION_PIPELINE,
+    SENSENOVA_VISION_THINK_PIPELINE,
+)
 from vllm_omni.model_executor.models.soulx_singer.pipeline import (
     SOULXSINGER_SVC_PIPELINE,
     SOULXSINGER_SVS_PIPELINE,
@@ -136,6 +139,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "covo_audio": COVO_AUDIO_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "sensenova_vision": SENSENOVA_VISION_PIPELINE,
+    "sensenova_vision_think": SENSENOVA_VISION_THINK_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "lance": LANCE_PIPELINE,
