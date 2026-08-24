@@ -21,6 +21,23 @@ most ``CACHE_T`` temporal slices, so the cache is a function of resolution and
 never of session length. It is not free -- see :meth:`StreamingDecodeState.nbytes`,
 which is the quantity session admission has to account for.
 
+Measured on the reference checkpoint at 832x480 in bf16, on one RTX PRO 6000
+with torch 2.11: chunking is neutral -- a session decoded in four chunks is
+bit-identical to the same session decoded in one call -- resident decoder
+state holds at 1801 MiB across every chunk, and time to first frame drops
+from 1.9 s, the whole-clip barrier, to 0.31 s without the session costing more
+in total.
+
+Note what "neutral" is measured against. ``AutoencoderKLWan._decode`` applies
+``post_quant_conv`` to the whole latent at once, while the tiled path in this
+repo -- and this decoder -- apply it per frame. It is a 1x1x1 convolution, so
+the two are mathematically identical, but they can select different kernels;
+on bf16 CUDA that seeds a 0.004 difference which the causal convolutions
+downstream amplify to 0.047. Comparing against ``_decode`` therefore measures
+where ``post_quant_conv`` runs, not anything about streaming, and the result
+moves with the torch version. The control that isolates chunking is the same
+session decoded in a single call through this same path.
+
 Only ``torch`` is imported here so the contract can be exercised without a
 device, a checkpoint, or the distributed VAE stack.
 """
