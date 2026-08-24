@@ -26,6 +26,7 @@ EXCLUDED_MODELS = [
     "ZImagePipeline",
     "OvisImagePipeline",
     "WanPipeline",
+    "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
     "LTX2DistilledOneStagePipeline",
