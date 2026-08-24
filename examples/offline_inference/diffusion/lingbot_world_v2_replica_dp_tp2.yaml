@@ -1,0 +1,29 @@
+# LingBot-World 2.0 realtime AR-Diffusion: two replicas, TP=2 each.
+#
+# Device layout:
+#   replica 0 -> GPUs 0,1
+#   replica 1 -> GPUs 2,3
+#
+# Every session is placed on one replica by its first tick and remains there
+# until reset/close. This file is an H200 validation recipe, not a claim that
+# the topology has already been measured on H200.
+
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    num_replicas: 2
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    model_config:
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: true
