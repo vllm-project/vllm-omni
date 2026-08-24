@@ -610,6 +610,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            await VIDEO_TASKS.cancel_all()
             serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
             if serving_video is not None:
                 serving_video.shutdown()
