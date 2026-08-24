@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import (
     TTS_ADAPTER_REGISTRY,
     ARTTSAdapter,
@@ -17,16 +18,19 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS2Adapter,
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.irodori_tts import IrodoriTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
@@ -54,6 +58,7 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
+    "irodori_tts",
 }
 
 
@@ -232,6 +237,56 @@ def test_diffusion_adapter_extra_body_params_fallback():
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+def test_irodori_is_a_diffusion_adapter():
+    adapter_cls = resolve_adapter("irodori_tts")
+    assert adapter_cls is IrodoriTTSAdapter
+    assert issubclass(adapter_cls, DiffusionTTSAdapter)
+
+
+class _IrodoriServer:
+    def __init__(self):
+        self.calls = []
+
+    def _validate_ref_audio_format(self, value):
+        return None if value.startswith("data:") else "bad reference URI"
+
+    async def _resolve_ref_audio_many(self, values, *, min_duration, max_duration):
+        self.calls.append((values, min_duration, max_duration))
+        return [([float(index)] * 48000, 48000) for index, _ in enumerate(values)]
+
+
+@pytest.mark.asyncio
+async def test_irodori_adapter_preserves_reference_order_and_sampling_isolation():
+    server = _IrodoriServer()
+    adapter = IrodoriTTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input="こんにちは",
+        instructions="やさしく",
+        ref_audio=["data:audio/wav;base64,AA==", "data:audio/wav;base64,BB=="],
+        seed=1234,
+        extra_params={"num_steps": 8, "duration_scale": 1.5},
+    )
+    assert adapter.validate(request) is None
+    defaults = [OmniDiffusionSamplingParams(extra_args={"keep": "default"})]
+    prepared = await adapter.build(request, defaults, has_inline_ref_audio=True)
+    overridden = adapter.apply_sampling_overrides(defaults, request)
+
+    assert server.calls == [(["data:audio/wav;base64,AA==", "data:audio/wav;base64,BB=="], 1.0, 120.0)]
+    assert [item[0][0] for item in prepared.prompt["ref_audio"]] == [0.0, 1.0]
+    assert prepared.prompt["caption"] == "やさしく"
+    assert overridden[0].seed == 1234
+    assert overridden[0].num_inference_steps == 8
+    assert overridden[0].extra_args == {"duration_scale": 1.5}
+    assert defaults[0].extra_args == {"keep": "default"}
+
+
+def test_irodori_adapter_rejects_streaming_unknown_options_and_speed():
+    adapter = IrodoriTTSAdapter(SpeechServingContext(server=_IrodoriServer()))
+    assert "final-only" in adapter.validate(OpenAICreateSpeechRequest(input="こんにちは", stream=True))
+    assert "Unsupported" in adapter.validate(OpenAICreateSpeechRequest(input="こんにちは", extra_params={"sway": 1}))
+    assert "speed adjustment" in adapter.validate(OpenAICreateSpeechRequest(input="こんにちは", speed=1.1))
 
 
 if __name__ == "__main__":

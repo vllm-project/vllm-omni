@@ -123,6 +123,104 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
+class _BatchedPreparePipeline:
+    """Step pipeline that advertises the optional batched-prepare hook."""
+
+    device = torch.device("cpu")
+    supports_step_execution = True
+    supports_batched_prepare_encode = True
+
+    def __init__(self, *, advertise: bool = True):
+        self.supports_batched_prepare_encode = advertise
+        self.single_prepare_ids = []
+        self.batch_prepare_ids = []
+
+    @staticmethod
+    def _initialize(state):
+        state.latents = torch.zeros(1, 1)
+        state.timesteps = torch.tensor([1.0])
+        state.step_index = 0
+        return state
+
+    def prepare_encode(self, state):
+        self.single_prepare_ids.append(state.request_id)
+        return self._initialize(state)
+
+    def prepare_encode_batch(self, states):
+        self.batch_prepare_ids.append([state.request_id for state in states])
+        for state in states:
+            self._initialize(state)
+        return states
+
+
+def _make_step_state(request_id: str):
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
+    return StepRequestState(
+        request_id=request_id,
+        sampling=SimpleNamespace(generator=None, seed=None, generator_device=None),
+        prompt="text",
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_prepare_batch_inputs_batches_new_requests_when_pipeline_supports_it() -> None:
+    """A whole admission group goes to the pipeline in one call."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _BatchedPreparePipeline()
+    states = [_make_step_state(f"req-{index}") for index in range(3)]
+
+    runner._prepare_batch_inputs(states, [state.request_id for state in states], build_batch=False)
+
+    assert runner.pipeline.batch_prepare_ids == [["req-0", "req-1", "req-2"]]
+    assert runner.pipeline.single_prepare_ids == []
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_prepare_batch_inputs_only_batches_newly_admitted_requests() -> None:
+    """Requests already running must not be re-prepared alongside new ones."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _BatchedPreparePipeline()
+    states = [_make_step_state(f"req-{index}") for index in range(3)]
+    for state in states[:1]:
+        _BatchedPreparePipeline._initialize(state)
+
+    runner._prepare_batch_inputs(states, ["req-1", "req-2"], build_batch=False)
+
+    assert runner.pipeline.batch_prepare_ids == [["req-1", "req-2"]]
+    assert runner.pipeline.single_prepare_ids == []
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_prepare_batch_inputs_keeps_per_request_path_without_the_capability() -> None:
+    """Pipelines that do not advertise the hook keep the original loop."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _BatchedPreparePipeline(advertise=False)
+    states = [_make_step_state(f"req-{index}") for index in range(3)]
+
+    runner._prepare_batch_inputs(states, [state.request_id for state in states], build_batch=False)
+
+    assert runner.pipeline.batch_prepare_ids == []
+    assert runner.pipeline.single_prepare_ids == ["req-0", "req-1", "req-2"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_prepare_batch_inputs_sends_a_lone_request_through_prepare_encode() -> None:
+    """One new request is not worth a batched call and must not need one."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _BatchedPreparePipeline()
+    states = [_make_step_state("req-0")]
+
+    runner._prepare_batch_inputs(states, ["req-0"], build_batch=False)
+
+    assert runner.pipeline.batch_prepare_ids == []
+    assert runner.pipeline.single_prepare_ids == ["req-0"]
+
+
 class _CompileTrackingModel:
     def __init__(self):
         self.compile_calls = []

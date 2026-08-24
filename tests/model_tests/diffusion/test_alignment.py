@@ -69,6 +69,9 @@ EXCLUDED_MODELS = [
     "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
+    # Irodori is text-to-audio; the common harness has no matching task enum.
+    # Dedicated Irodori contract tests cover the native pipeline instead.
+    "IrodoriTTSPipeline",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",

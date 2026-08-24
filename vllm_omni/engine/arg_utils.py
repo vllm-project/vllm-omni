@@ -201,6 +201,10 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    # Pipeline-specific diffusion options.  This must be a declared engine
+    # field so the structured stage-config projection does not filter it out
+    # before constructing ``OmniDiffusionConfig``.
+    extras: dict[str, Any] = field(default_factory=dict)
     worker_type: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None

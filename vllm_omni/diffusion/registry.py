@@ -306,6 +306,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "IrodoriTTSPipeline": (
+        "irodori_tts",
+        "pipeline_irodori_tts",
+        "IrodoriTTSPipeline",
+    ),
     "Cosmos3OmniDiffusersPipeline": (
         "cosmos3",
         "pipeline_cosmos3",
@@ -368,6 +373,7 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    "IrodoriTTSPipeline",
 }
 
 
@@ -588,6 +594,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "IrodoriTTSPipeline": "get_irodori_tts_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",

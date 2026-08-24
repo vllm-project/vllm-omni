@@ -389,13 +389,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
-        instance._tts_model_type = "omnivoice"
+        model_class_name = None
+        for stage in stage_configs or []:
+            engine_args = getattr(stage, "engine_args", stage)
+            model_class_name = getattr(engine_args, "model_class_name", None)
+            if model_class_name:
+                break
+        if model_class_name is None:
+            from vllm_omni.diffusion.data import resolve_model_class_name
+
+            model_class_name = resolve_model_class_name(model_name)
+        # Keep OmniVoice as the compatibility fallback for its existing pure
+        # diffusion route; only architecture-backed adapters claim their own
+        # models here.
+        instance._tts_model_type = detect_tts_model_type(None, model_class_name) or "omnivoice"
         instance._is_tts = False
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
         instance._adapter = None
         instance._init_speaker_storage()
+        instance._adapter = None
+        adapter_cls = resolve_adapter(instance._tts_model_type)
+        if adapter_cls is not None:
+            instance._adapter = adapter_cls(SpeechServingContext(server=instance, diffusion_engine=diffusion_engine))
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -481,14 +498,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
         if self._diffusion_mode:
-            return None
+            return self._adapter
 
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
             self._adapter = None
             return None
         if self._adapter is None or type(self._adapter) is not adapter_cls:
-            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+            ctx = SpeechServingContext(
+                server=self,
+                engine_client=getattr(self, "engine_client", None),
+                diffusion_engine=getattr(self, "_diffusion_engine", None),
+            )
             self._adapter = adapter_cls(ctx)
             self._adapter.load_capabilities()
         return self._adapter
@@ -1690,18 +1711,45 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._higgs_audio_v3_adapter = adapter
         return adapter
 
-    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
+    async def _resolve_ref_audio(
+        self,
+        ref_audio_str: str,
+        *,
+        min_duration: float = _REF_AUDIO_MIN_DURATION,
+        max_duration: float = _REF_AUDIO_MAX_DURATION,
+    ) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
+        if min_duration < 0 or max_duration <= 0 or min_duration > max_duration:
+            raise ValueError(f"Invalid reference duration bounds: {min_duration=} {max_duration=}.")
+
+        def validate_duration(wav: list[float], sample_rate: int) -> None:
+            if sample_rate <= 0:
+                raise ValueError(f"Reference audio has invalid sample rate {sample_rate}.")
+            duration = len(wav) / sample_rate
+            if duration < min_duration:
+                raise ValueError(
+                    f"Reference audio too short ({duration:.1f}s). "
+                    f"At least {min_duration:g}s of clear speech is required."
+                )
+            if duration > max_duration:
+                raise ValueError(
+                    f"Reference audio too long ({duration:.1f}s). "
+                    f"Maximum {max_duration:g}s supported — use a shorter clip."
+                )
+
         cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
         cached = self._ref_audio_resolve_cache.get(cache_key)
         if cached is not None:
             self._ref_audio_resolve_cache.move_to_end(cache_key)
             wav_list, sr, _, _ = cached
+            # Bounds intentionally remain outside the cache key, so enforce
+            # them on cache hits as well as new fetches.
+            validate_duration(wav_list, sr)
             logger.debug(
                 "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
                 len(wav_list),
@@ -1728,18 +1776,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sr = int(sr)
         artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < _REF_AUDIO_MIN_DURATION:
-            raise ValueError(
-                f"Reference audio too short ({duration:.1f}s). "
-                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-            )
-        if duration > _REF_AUDIO_MAX_DURATION:
-            raise ValueError(
-                f"Reference audio too long ({duration:.1f}s). "
-                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-            )
+        # Convert once so cache and fetch validation run through the identical
+        # calculation and error path.
         tolist_start_s = time.perf_counter()
         wav_list = wav_np.tolist()
+        validate_duration(wav_list, sr)
         tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
         logger.debug(
             "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
@@ -1828,10 +1869,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _discard_ref_audio_artifact_warmup(self, request_id: str) -> None:
         self._request_ref_audio_artifact_keys.pop(request_id, None)
 
-    async def _resolve_ref_audio_many(self, ref_audio_list: list[str]) -> list[tuple[list[float], int]]:
+    async def _resolve_ref_audio_many(
+        self,
+        ref_audio_list: list[str],
+        *,
+        min_duration: float = _REF_AUDIO_MIN_DURATION,
+        max_duration: float = _REF_AUDIO_MAX_DURATION,
+    ) -> list[tuple[list[float], int]]:
         resolved = []
         for ref_audio in ref_audio_list:
-            resolved.append(await self._resolve_ref_audio(ref_audio))
+            resolved.append(
+                await self._resolve_ref_audio(ref_audio, min_duration=min_duration, max_duration=max_duration)
+            )
         return resolved
 
     # ---- Ming TTS helpers ----
@@ -3121,6 +3170,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
     ) -> Response:
         """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice)."""
+        adapter = self._get_tts_adapter()
+        if adapter is not None and getattr(adapter, "backend", None) == "diffusion" and adapter.name != "omnivoice":
+            return await self._create_adapter_diffusion_speech(request, adapter)
+
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
@@ -3233,6 +3286,86 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
             return self._diffusion_error_response(f"Speech generation failed: {e}")
+
+    async def _create_adapter_diffusion_speech(self, request: OpenAICreateSpeechRequest, adapter: Any) -> Response:
+        """Serve an architecture-selected pure-diffusion TTS adapter.
+
+        This route intentionally has no model-name conditionals: the adapter
+        normalizes/validates/builds request data, while this method owns the
+        common diffusion-engine invocation and shared audio encoding.
+        """
+        try:
+            adapter.normalize(request)
+            if error := adapter.validate(request):
+                return self._diffusion_error_response(error, status_code=400)
+            import copy
+
+            request_id = f"speech-{random_uuid()}"
+            has_inline_ref_audio = request.ref_audio is not None
+            sampling_params_list = copy.deepcopy(self._diffusion_engine.default_sampling_params_list)
+            prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            sampling_params_list = adapter.apply_sampling_overrides(
+                sampling_params_list, request, prepared.prompt, request_id
+            )
+            if (
+                request.seed is not None
+                and sampling_params_list
+                and getattr(sampling_params_list[0], "seed", None) is None
+            ):
+                sampling_params_list[0].seed = request.seed
+
+            logger.info(
+                "Diffusion TTS speech request %s: text=%r, model=%s",
+                request_id,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
+                prepared.model_type,
+            )
+            generator = self._diffusion_engine.generate(
+                prompt=prepared.prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=["audio"],
+            )
+            final_output: OmniRequestOutput | None = None
+            async for result in generator:
+                final_output = result
+            if final_output is None:
+                raise ValueError("No output generated from the model.")
+            audio_output, audio_key = self._extract_audio_output(final_output)
+            if audio_output is None or audio_key is None:
+                raise ValueError("TTS model did not produce audio output.")
+            audio_tensor = audio_output[audio_key]
+            sample_rate_raw = audio_output.get("audio_sample_rate", audio_output.get("sr", 48000))
+            if isinstance(sample_rate_raw, list) and sample_rate_raw:
+                sample_rate_raw = sample_rate_raw[-1]
+            sample_rate = int(sample_rate_raw.item()) if hasattr(sample_rate_raw, "item") else int(sample_rate_raw)
+            if isinstance(audio_tensor, list):
+                chunks = [chunk for chunk in audio_tensor if hasattr(chunk, "numel") and chunk.numel() > 0]
+                audio_tensor = torch.cat(chunks, dim=-1) if chunks else np.zeros((0,), dtype=np.float32)
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
+            audio_tensor = np.asarray(audio_tensor, dtype=np.float32).squeeze()
+            if not audio_tensor.size or not np.isfinite(audio_tensor).all():
+                raise ValueError("TTS model produced empty or non-finite audio.")
+            audio_response: AudioResponse = self.create_audio(
+                CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=sample_rate,
+                    response_format=request.response_format or "wav",
+                    speed=1.0,
+                    base64_encode=False,
+                )
+            )
+            return Response(content=audio_response.audio_data, media_type=audio_response.media_type)
+        except asyncio.CancelledError:
+            return self._diffusion_error_response("Client disconnected")
+        except (EngineGenerateError, EngineDeadError):
+            raise
+        except ValueError as exc:
+            return self._diffusion_error_response(str(exc), status_code=400)
+        except Exception as exc:
+            logger.exception("Adapter diffusion speech generation failed: %s", exc)
+            return self._diffusion_error_response(f"Speech generation failed: {exc}")
 
     @staticmethod
     def _diffusion_error_response(message: str, status_code: int = 500) -> Response:

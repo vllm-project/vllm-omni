@@ -255,6 +255,10 @@ def test_arch_matching_is_a_fallback_not_an_override():
     assert detect_tts_model_type("ming_tts", "MingTTSForConditionalGeneration") == "ming_flash_omni_tts"
 
 
+def test_irodori_architecture_is_detected_without_a_stage_key():
+    assert detect_tts_model_type(None, "IrodoriTTSPipeline") == "irodori_tts"
+
+
 def test_stage_keys_cover_legacy_stage_set():
     """No stage key was dropped when the module constants were deleted."""
     assert _LEGACY_TTS_MODEL_STAGES <= all_tts_stage_keys()

@@ -53,6 +53,19 @@ class SupportsStepExecution(Protocol):
     ``prepare_encode()`` (one-time request setup), ``denoise_step()``
     (one denoise forward), ``step_scheduler()`` (one scheduler update),
     and ``post_decode()`` (final decode).
+
+    Two optional capabilities are discovered by attribute rather than declared
+    here, because this Protocol is ``runtime_checkable`` and adding a member
+    would make ``isinstance`` reject every pipeline that lacks it:
+
+    * ``supports_fused_step_execution`` / ``denoise_and_step(states=...)`` --
+      advance a whole microbatch in one call instead of
+      ``denoise_step`` + ``step_scheduler``.
+    * ``supports_batched_prepare_encode`` /
+      ``prepare_encode_batch(states)`` -- prepare every request admitted in one
+      scheduler step together, for pipelines whose request setup runs encoders
+      that batch across requests. Must match ``prepare_encode`` per request up
+      to batching numerics.
     """
 
     supports_step_execution: ClassVar[bool] = True

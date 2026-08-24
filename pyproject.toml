@@ -94,6 +94,13 @@ indextts2 = [
     "WeTextProcessing; sys_platform == 'linux'",
 ]
 
+# Native Irodori v4-Small codec bridge. Keep Torch/TorchAudio platform selection
+# owned by vLLM-Omni; this extra intentionally does not pin either package.
+irodori-tts = [
+    "dacvae @ git+https://github.com/facebookresearch/dacvae.git@414c20785fc3a28373073ea8ef7a1316eeeaca6e",
+    "descript-audiotools==0.7.2",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",
