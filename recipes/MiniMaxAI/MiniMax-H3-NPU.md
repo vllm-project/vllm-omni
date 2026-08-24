@@ -121,38 +121,75 @@ above) or HSDP — see
 
 ### CPU MP4 response encoding: MiniMax-H3 FL2VA/t2va (Atlas A2)
 
-This section documents the validated CPU response-encoding behavior for
-MiniMax-H3 `FL2VA`/`t2va` on one Atlas A2 host. The implementation itself is
-capability-based and has no model whitelist; other models and platforms have
-not been tested by this change and have no compatibility or performance claim.
-Other models, hardware, tasks, shapes, durations, and concurrency
-configurations should keep the option unset until measured.
+This section records measured CPU response-encoding behavior for MiniMax-H3
+FL2VA/t2va on one Atlas A2 host. The implementation is capability-based and
+has no model whitelist; other models, platforms, tasks, shapes, durations, and
+concurrency levels require separate validation.
 
-Non-streaming MP4 responses use an automatic encoder. It checks the runtime
-frame shape, common dtype, and RGB channel-plane contiguity for every request.
-Compatible inputs use direct planar PyAV frames; unsupported inputs use the
-legacy fallback, and the worker setting is ignored on that route. Streaming
-fMP4 output keeps its existing incremental path. Omitting
-`--video-response-frame-conversion-workers` preserves the baseline direct-planar
-serial iterator. An explicit positive `N` opts into the configurable path:
-`N=1` uses its optimized serial iterator without a pool, while `N>=2` enables
-bounded parallel conversion. For a direct-planar request with `F` frames, the
-effective configured worker count is `min(N, F)`; CPU count is not a validation
-cap.
+Non-streaming MP4 responses use direct-planar conversion only when frame shape,
+dtype, and RGB channel-plane contiguity are compatible. The worker option applies
+only to that compatible direct-planar conversion; it does not change the legacy
+fallback or streaming fMP4 path.
 
-Parallel frame conversion applies only to the direct-planar path. The caller
-still synchronously waits for the complete MP4 mux/encode, so this CPU
-response-conversion change does not move complete non-streaming encoding off the
-asyncio event loop; that is a separate follow-up.
+#### Service option and logs
 
-For the measured candidate setting in this section, start the Atlas A2 FL2VA
-server as follows. The `--video-response-frame-conversion-workers 8` line is
-the candidate setting used for the measurements; omit it for the BASE baseline
-serial path.
+Configure the direct-planar path at `vllm serve` startup with:
+
+```text
+--video-response-frame-conversion-workers N
+```
+
+The service states are exact: omitted is the default exact PR1 direct-planar
+serial iterator, not numeric `1`; explicit `1` is PR2 configured serial
+without a pool; explicit `N >= 2` is a bounded FIFO pool.
+When supplied, `--video-response-frame-conversion-workers N` requires an
+explicit positive integer; there is no fixed public maximum. For F frames,
+`W_eff = min(N, F)` and F is the structural upper bound for useful workers;
+scheduling, CPU, memory bandwidth, codec, per-worker memory, and concurrency
+can impose lower practical limits.
+
+Pooled conversion submits at most `2 * W_eff` frame futures and yields
+results in FIFO order. Startup INFO logs `baseline_unconfigured`,
+`configured_serial`, or `configured_parallel`, the requested value,
+`direct_planar` scope, and the effective-worker rule. Each request logs
+`selected_path`, `frame_conversion_mode`, `requested_frame_conversion_workers`,
+and `effective_frame_conversion_workers`; omitted is logged as `unset`.
+The legacy fallback reports effective workers `0`.
+
+#### Memory model
+
+Each pooled worker reuses one thread-local single-channel scratch buffer; one
+converted frame may coexist with the `2 * W_eff` pending futures. The
+derived conservative per-request capacity is:
+
+```text
+min(F, 2 * W_eff + 1) * PyAV_frame_bytes
+  + W_eff * single_channel_scratch_bytes
+```
+
+For explicitly configured `W_eff = 1`, conversion is serial, no pool is
+created, and at most one converted frame and one scratch buffer are used. For
+the validated 124-frame, 1344x768 `gbrp` input, one PyAV frame is 3,096,576
+bytes and one float32 single-channel scratch buffer is 4,128,768 bytes:
+
+| Configured workers | Pending futures | Known frame slots | Derived capacity |
+| ---: | ---: | ---: | ---: |
+| `8` | `16` | `17` | `81.703125 MiB` |
+| `16` | `32` | `33` | `160.453125 MiB` |
+| `32` | `64` | `65` | `317.953125 MiB` |
+
+These are conservative known capacities, not total RSS; they exclude input,
+audio, futures, executor objects, libx264 buffers, allocator overhead, and
+other process state. Concurrent requests multiply these per-request resources.
+
+#### Atlas A2 service placement
+
+For the measured scope, `8 workers` is the candidate setting. Launch normally
+and unbound with this foreground service command:
 
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
-export MODEL="${MODEL_ROOT}/FL2VA"
+export MODEL="$MODEL_ROOT/FL2VA"
 export PORT=9098
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -160,276 +197,133 @@ export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 export PYTHONDONTWRITEBYTECODE=1
 export MINDIE_SD_FA_TYPE=ascend_laser_attention
 
-vllm serve "${MODEL}" \
-  --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
-  --trust-remote-code \
-  --num-gpus 8 \
-  --usp 8 \
-  --ring 1 \
-  --text-encoder-tp-size 8 \
-  --enable-distributed-layerwise-offload \
-  --vae-parallel-mode tile \
-  --vae-use-tiling \
-  --vae-patch-parallel-size 8 \
+vllm serve "$MODEL" \
+  --omni --host 0.0.0.0 --port "$PORT" --trust-remote-code \
+  --num-gpus 8 --usp 8 --ring 1 --text-encoder-tp-size 8 \
+  --enable-distributed-layerwise-offload --vae-parallel-mode tile \
+  --vae-use-tiling --vae-patch-parallel-size 8 \
   --diffusion-attention-backend FLASH_ATTN \
   --video-response-frame-conversion-workers 8
 ```
 
-At service startup, an INFO log reports `baseline_unconfigured`,
-`configured_serial`, or `configured_parallel`, the requested worker value, the
-`non-streaming direct_planar MP4 response encoding` scope, and its effective
-worker rule. Each non-streaming request also logs `selected_path`,
-`frame_conversion_mode`,
-`requested_frame_conversion_workers`, and `effective_frame_conversion_workers`.
-An unset requested value is logged as `unset`. The effective value is `0` for
-the legacy fallback, `1` for the baseline path, and otherwise is the
-request-level configured worker count after clamping to the frame count.
-For a direct path with `F` frames and requested worker count `W`, the effective
-count is `min(W, F)`. One worker, or one frame, stays serial and does not create
-a thread pool.
+From another shell, after `/health` returns `200` and all `8` diffusion
+workers are ready, identify the API PID and run this separate block:
 
-For more than one worker, each request owns a bounded pool. Conversion futures
-are submitted and results are yielded in FIFO order. At most `2 * W_eff`
-submitted or pending futures represent frames, where `W_eff = min(W, F)`. A
-converted PyAV frame yielded to the muxer can coexist with those pending
-futures. Each worker also reuses its own thread-local single-channel scratch
-buffer, so the model adds `W_eff` such scratch buffers. Generator close,
-conversion failure, and mux failure cancel pending futures and shut down the
-pool with `wait=True` and `cancel_futures=True`. The pool is per request, so
-concurrent requests can multiply worker, pending-frame, and scratch-buffer
-resources.
+```bash
+read -r -p "API PID: " API_PID
+taskset -apc 72-95 "$API_PID"
+```
 
-For `W_eff > 1`, the conservative known frame-storage count is
-`min(F, 2 * W_eff + 1)`: the extra one is the yielded frame and is distinct
-from the `2 * W_eff` pending-future bound. For the validated 124-frame,
-1344x768 `gbrp` shape, one PyAV frame uses 3,096,576 bytes and one float32
-single-channel scratch buffer uses 4,128,768 bytes. The known-capacity model
-is therefore:
+Apply this only to the API PID and its existing threads. Keep the eight
+diffusion workers unbound with their PID set and full affinities unchanged.
+Retain the default memory policy; do not add `numactl` or `membind`.
 
-`min(F, 2 * W_eff + 1) * 3,096,576 + W_eff * 4,128,768` bytes.
+#### CPU validation
 
-For explicitly configured `W_eff = 1`, conversion is serial, no pool is
-created, and one converted frame plus one thread-local scratch buffer is used
-at a time. For the pooled worker counts below, the pending-future column
-excludes the yielded frame, and the capacity includes both frame classes:
+The three-state compatibility matrix used `taskset` CPU set `72-95` plus
+`numactl --cpunodebind=3 --membind=3`. It ran one warmup and `n=10`
+pooled formal samples per configuration. This is diagnostic compatibility
+evidence, not CPU-only/default-memory evidence and not accepted production
+placement.
 
-| Workers | Pending-future bound | Known frame slots | Known capacity |
+| Configuration | MP4 wall median (ms) | Process CPU median (ms) | Peak RSS median (KiB) |
+| --- | ---: | ---: | ---: |
+| `PR1 serial` | `4786.615` | `7961.443` | `3152122` |
+| `PR2 option omitted` | `4756.864` | `7962.162` | `3151614` |
+| `PR2 explicit 1` | `4822.763` | `8001.731` | `3151610` |
+
+The omitted PR2 state changed wall time by `-0.622%` versus PR1; all three
+states produced valid byte-identical media. The later accepted production
+placement matrix used only CPU-only `taskset` CPU set `72-95`, default
+memory, and no `numactl`/`membind`. It measured `n=10` formal samples:
+
+| Configured workers | MP4 wall median [min, max] (ms) | Process CPU median (ms) | Peak RSS median (KiB) |
 | ---: | ---: | ---: | ---: |
-| 8 | 16 | 17 | 81.703125 MiB |
-| 16 | 32 | 33 | 160.453125 MiB |
-| 32 | 64 | 65 | 317.953125 MiB |
+| `1 worker` | `4820.797` [4745.619, 4835.065] | `8011.603` | `3153678` |
+| `8 workers` | `1865.855` [1836.359, 1953.360] | `9456.770` | `3278242` |
 
-This is a conservative known-capacity model, not total process memory. It is
-not guaranteed to be reached at every instant and excludes futures, executor
-objects, libx264 buffers, the original input, audio, allocator overhead, and
-other process state. With `N` concurrent requests, this per-request model
-scales approximately by `N`; actual process RSS and peak memory require
-workload measurement.
+`8 workers` reduced median MP4 encoding wall time by `61.296%` versus
+`1 worker`. An independent `8/16/32` scan found no stable wall gain above
+`8 workers` while resources rose: forward/reverse medians were
+`2854.683/3354.612 ms`, `2855.986/3498.202 ms`, and
+`3058.166/3482.307 ms`; corresponding forward/reverse RSS medians were
+`3293004/3297688 KiB`, `3462104/3454060 KiB`, and
+`3750708/3746896 KiB`. The codec decision retains libx264 `threads=0`;
+explicit codec threads `8`, `16`, and `24` showed no stable wall gain of
+at least `5%`, and `threads=8` changed the bitstream hash.
 
-There is no fixed public maximum. CPU capacity, memory, frame count, and
-concurrent requests remain practical resource constraints, so larger values
-must be validated against the target workload.
+#### Final Atlas A2 service comparison
 
-#### Final CPU validation
+The final comparison used `BASE 3d035bfa190e303f53d72e3baa10885f60abe682`
+and tested `CANDIDATE 3e24ea5ba0a498f2f9feab573104b66ddf8dbf55`. It used
+`/v1/videos/sync`, MiniMax-H3 `FL2VA/t2va`, one request at a time,
+`seed 1101`, `1344x768@24 FPS`, and this exact prompt:
 
-The final CPU validation was measured on 2026-08-23 against latest main. BASE
-was `2e096788a6337b0bf7ac22c30bb9afa2afb8f3d4`; the candidate production/test
-tree was `3838afe512a6a812d1a7f2b6691cecc6033119f8`. The fixed protocol used
-one 124-frame, 1344x768 float32 payload at 24 fps with stereo 32 kHz audio,
-PyAV/libx264 `preset=ultrafast` and `threads=0`, and one warmup followed by
-five formal rounds in the order `BASE -> w1 -> w2 -> w4 -> w8`.
+> In a snowy blue-purple forest, Ori carefully walks past a sleeping giant; footsteps crunch
+> in the snow while the creature breathes and softly snorts.
 
-| Configuration | Wall median [min,max] (ms) | Process CPU median [min,max] (ms) | Absolute sampled peak RSS median [min,max] (KB) |
-|---|---:|---:|---:|
-| BASE | 5158.247 [5068.985,5168.578] | 7663.306 [7562.436,7672.253] | 3169604 [3167404,3171576] |
-| Candidate w1 | 6910.579 [5144.031,7115.236] | 9766.698 [7651.154,10322.423] | 3165848 [3152328,3170524] |
-| Candidate w2 | 4188.708 [3030.930,4487.111] | 9232.779 [7808.872,9673.858] | 3186092 [3184036,3187804] |
-| Candidate w4 | 4036.660 [2463.785,4073.655] | 10471.039 [8727.684,10617.781] | 3222528 [3213836,3224960] |
-| Candidate w8 | 3479.733 [3431.188,3630.253] | 11027.355 [10950.923,11162.379] | 3294456 [3283124,3312444] |
+The protocol used `50 requested scheduler points / 49 DiT forwards`,
+Laser-configured attention, libx264 `preset=ultrafast, threads=0`, one
+discarded 5-second warmup per service, then `5/8.7/15`-second formal
+requests in order, three per duration. BASE omitted the worker flag; CANDIDATE
+used `8 workers`. No request was retried.
 
-All 25 formal outputs were byte-identical and passed complete media
-validation: H.264 1344x768 at 24 fps with 124 frames, plus AAC stereo audio
-at 32 kHz. The CPU results do not measure NPU stage 0 or end-to-end request
-latency. Sampled RSS is an absolute process value, not an increment and not an
-exact unsampled peak.
+Recorded hardware/software: `192-CPU Kunpeng 920`, `8x910B4-1`, driver
+`25.5.2`, firmware `7.8.0.7.220`, CANN
+`9.0.1 (V100R001C10SPC002B220)`, Python `3.12.13`, PyTorch
+`2.10.0+cpu`, `torch_npu 2.10.0.post2`, vLLM `0.26.0+empty`,
+vLLM-Ascend `0.19.1rc2.dev1251+g905bbf372`, and installed vLLM-Omni
+distribution metadata `0.26.1.dev138+g596c16a55.npu`. Separate import
+provenance resolved the tested source trees to the exact BASE/CANDIDATE
+commits above. MindIE-SD `3.0.0`, PyAV `18.0.0`, and ffmpeg/ffprobe
+`4.4.2`.
 
-Using the change definition `(candidate - reference) / reference`, w8 versus
-w1 changed wall time by `-49.646%`, process CPU by `+12.908%`, and RSS by
-`+4.062%`. Relative to BASE, the corresponding wall/CPU/RSS changes were
-`(+33.971%, +27.448%, -0.119%)` for w1,
-`(-18.796%, +20.480%, +0.520%)` for w2,
-`(-21.744%, +36.639%, +1.670%)` for w4, and
-`(-32.540%, +43.898%, +3.939%)` for w8.
+Response evidence records `x-request-id`, `x-model`,
+`x-inference-time-s`, `x-stage-durations`, `x-peak-memory-mb`,
+`content-type`, and `content-length`. Startup/request logs record service
+state, selected path, conversion mode, requested/effective workers, frame
+count, dtype, shape, FPS, audio state, and sample rate. `ffprobe` and full
+`ffmpeg` decode verify H.264, AAC stereo at 32 kHz, 24 FPS, dimensions,
+timestamps, and frame counts.
 
-BASE and w1 show substantial order and host variation. This is a single
-forward sequence, so the BASE comparison is descriptive rather than a stable
-estimate. The recommendation is based primarily on the candidate-internal
-w1-to-w8 comparison and the independent 8/16/32 forward/reverse scan below.
+Only the MP4 timer is reported as the optimization benefit:
 
-#### Independent worker-boundary exploration
-
-The same payload was measured for workers 8, 16, and 32. Each worker count had
-one warmup and five formal rounds in both forward and reverse order. The
-forward order was `8 -> 16 -> 32`; the reverse order was `32 -> 16 -> 8`.
-
-Workers 16 and 32 were measured in an independent experimental worktree using
-the same bounded algorithm. The measured experimental scan used BASE commit
-`f09bdcbc7dc94827e76d4e9479674639be6ac442`, candidate patch SHA256
-`f2ea3bdd12ac51355920144df2ce10440140fe9410b32ab0cfdfb8e4a4ccc3e2`, and
-experiment diff SHA256
-`620a28904f3178acacc67640186cc49dc4bc4a77350e54283af0e7e4a760daab`; the
-experimental diff temporarily extended validation through 32 workers while
-leaving the scheduling algorithm unchanged.
-
-| Workers | Forward wall median (ms) | Reverse wall median (ms) | Forward RSS median (KB) | Reverse RSS median (KB) |
-|---:|---:|---:|---:|---:|
-| 8 | 2854.683 | 3354.612 | 3293004 | 3297688 |
-| 16 | 2855.986 | 3498.202 | 3462104 | 3454060 |
-| 32 | 3058.166 | 3482.307 | 3750708 | 3746896 |
-
-| Workers | Forward process CPU median (ms) | Reverse process CPU median (ms) |
-|---:|---:|---:|
-| 8 | 10033.490 | 10934.985 |
-| 16 | 10294.702 | 10904.763 |
-| 32 | 11362.199 | 11637.329 |
-
-All 30 exploratory outputs were byte-identical and passed media validation.
-The pooled ten-sample changes were slight and order-sensitive, so they are not
-treated as a performance gain. Workers 16 and 32 showed no stable same-order
-wall improvement over worker 8 while increasing resource use. These results do
-not imply a recommendation for workers 16 or 32.
-
-#### Final A2 E2E validation (measured)
-
-This final measured E2E run was scoped strictly to MiniMax-H3 `FL2VA`/`t2va`:
-one request at `1344x768@24fps`, fixed Laser configuration, on one host with
-8x Atlas A2 910B4-1. BASE was `bd4f9acfd30456cb8fa98af53d32f7adc34e03a0`
-without the worker option; the candidate runtime was
-`81804c86f51bb8ab31827bbf3dbd2a62ef03bee3`; the run date was
-`2026-08-22`. The model partition path is represented as
-`$MODEL_ROOT/FL2VA`.
-
-BASE and candidate were run serially. Each side had one warmup and three
-formal requests for each 5, 8.7, and 15 second duration. The fixed prompt was:
-
-> In a snowy blue-purple forest, Ori carefully walks past a sleeping giant;
-> footsteps crunch in the snow while the creature breathes and softly snorts.
-
-The seed was 1101. Each request requested 50 steps and executed 49 DiT
-forwards. BASE and candidate both used the self-contained Atlas A2 FL2VA
-command in this section with `MODEL=$MODEL_ROOT/FL2VA`,
-`MINDIE_SD_FA_TYPE=ascend_laser_attention`, and
-`--diffusion-attention-backend FLASH_ATTN`. Candidate used
-`--video-response-frame-conversion-workers 8`; BASE omitted that line and used
-the baseline serial iterator.
-No Laser operator trace was captured, so Laser activation is not
-trace-confirmed.
-
-The measured environment was:
-
-| Component | Version / provenance |
-| --- | --- |
-| Driver / firmware | `25.5.2` / `7.8.0.7.220` |
-| CANN | `9.0.1 V100R001C10SPC002B220` |
-| Python | `3.12.13` |
-| PyTorch / `torch_npu` | `2.10.0+cpu` / `2.10.0.post2` |
-| vLLM | `0.26.0+empty` |
-| vLLM-Ascend | `0.19.1rc2.dev1251+g905bbf372` |
-| vLLM-Omni metadata | `0.26.1.dev138+g596c16a55.npu` |
-| Import origins | Exact BASE/CANDIDATE source worktrees verified |
-| MindIE-SD | `3.0.0` |
-| PyAV | `18.0.0` |
-| ffmpeg / ffprobe | `4.4.2` / `4.4.2` |
-
-The provenance checks verified that `vllm_omni` imports resolved from the exact
-BASE and CANDIDATE source worktrees. The checks accounted for shared editable
-distribution metadata and recorded vLLM and vLLM-Ascend provenance separately.
-
-The tables below report measured medians with observed ranges. MP4 reduction is
-derived as `(BASE - candidate) / BASE`; the MP4 timer is the direct metric for
-this CPU response-conversion change.
-
-| Duration | BASE MP4 (ms) | Candidate MP4 (ms) | Derived reduction |
+| Requested duration | BASE MP4 median [range] (ms) | CANDIDATE MP4 median [range] (ms) | Derived reduction |
 | ---: | ---: | ---: | ---: |
-| 5 s | 4943.92 [4809.49, 5113.98] | 3547.37 [2033.84, 3658.29] | 28.248% |
-| 8.7 s | 11456.80 [7834.04, 11647.05] | 3158.92 [3086.81, 5996.05] | 72.428% |
-| 15 s | 14367.83 [13426.50, 14546.93] | 5806.33 [5690.51, 10227.57] | 59.588% |
+| `5 s` | `4826.50` [4696.01, 4831.13] | `1916.88` [1914.95, 1919.35] | `60.284%` |
+| `8.7 s` | `7869.04` [7797.74, 7939.64] | `3184.63` [3167.23, 3190.22] | `59.530%` |
+| `15 s` | `13463.56` [13445.20, 13648.02] | `5443.59` [5436.20, 5444.34] | `59.568%` |
 
-| Duration | BASE stage 0 (s) | Candidate stage 0 (s) |
-| ---: | ---: | ---: |
-| 5 s | 161.755 [161.057, 162.508] | 157.684 [157.018, 158.686] |
-| 8.7 s | 379.430 [353.087, 390.267] | 352.310 [351.838, 359.633] |
-| 15 s | 933.645 [902.745, 938.495] | 943.822 [940.118, 960.199] |
+| Side | NPU0 | NPU1 | NPU2 | NPU3 | NPU4 | NPU5 | NPU6 | NPU7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `BASE` | `31744` | `35817` | `35816` | `37468` | `39977` | `43920` | `40320` | `39545` |
+| `CANDIDATE` | `31529` | `35351` | `35352` | `35352` | `35418` | `35416` | `35412` | `35457` |
 
-| Duration | BASE server E2E (s) | Candidate server E2E (s) |
-| ---: | ---: | ---: |
-| 5 s | 166.571 [166.007, 167.629] | 160.725 [160.572, 161.349] |
-| 8.7 s | 391.083 [364.551, 398.107] | 355.403 [355.003, 365.634] |
-| 15 s | 947.077 [917.298, 952.869] | 954.055 [945.930, 965.896] |
+The HBM values are maxima from unchanged `hbm-peak-by-device.txt` files,
+sampled at 1-second intervals across each side's nine formal requests; they
+are lower bounds. Video frame counts are:
 
-Externally observed client-wall E2E was measured outside the server process:
+| Duration | Video frames |
+| --- | ---: |
+| `5 s` | `124` |
+| `8.7 s` | `209` |
+| `15 s` | `362` |
 
-| Duration | BASE externally observed client-wall E2E (s) | Candidate externally observed client-wall E2E (s) |
-| ---: | ---: | ---: |
-| 5 s | 167.870 [167.322, 168.933] | 162.042 [161.892, 162.664] |
-| 8.7 s | 392.409 [365.875, 399.420] | 356.708 [356.317, 366.954] |
-| 15 s | 948.404 [918.628, 954.196] | 955.393 [947.237, 967.225] |
+Hashes matched within repeats and across BASE/CANDIDATE for each duration.
+All `20` total requests (two warmups and `18` formal) passed
+HTTP/media/full-decode/timestamp checks; CANDIDATE logged
+`direct_planar configured_parallel 8/8`, all request-level placement and
+worker gates passed, and cleanup left `port 9098` free, no service
+processes, and all eight NPUs healthy and idle.
+No OOM, collective timeout, NaN/Inf, fallback, rank failure, or request
+retry occurred.
 
-Stage 0, server E2E, and externally observed client-wall E2E differences are
-not causally attributed to this CPU response-conversion change. Only CPU
-response conversion changed; three samples show substantial accelerator-side
-variation. The MP4 timer is the direct metric.
+#### Recommendation
 
-| Duration | BASE true denoise (s) | Candidate true denoise (s) |
-| ---: | ---: | ---: |
-| 5 s | 148 [147, 148] | 145 [144, 147] |
-| 8.7 s | 332 [331, 369] | 336 [332, 340] |
-| 15 s | 894 [869, 900] | 910 [893, 913] |
-
-True denoise elapsed values above are measured with 49 DiT forwards per
-request. All-device sampled peak HBM was measured at a 1-second interval; the
-peaks are lower bounds:
-
-| Duration | BASE peak HBM (MB) | Candidate peak HBM (MB) |
-| ---: | ---: | ---: |
-| 5 s | 29794 [29792, 29805] | 31513 [29804, 33220] |
-| 8.7 s | 31892 [31771, 31905] | 31770 [31672, 31892] |
-| 15 s | 35433 [35433, 35447] | 35433 [35433, 35443] |
-
-All 18 formal MP4s were byte-identical across repeats and between BASE and
-candidate for each fixed duration. All 24 total requests (6 warmups plus 18
-formal) passed the HTTP, media, and request contracts, including H.264
-1344x768 at 24 fps, AAC stereo at 32 kHz, and full timestamp/decode checks.
-There was no request-window fatal error, OOM, collective timeout, NaN/Inf,
-fallback, or rank failure. The stop gate was clean: the port and processes were
-free, and all eight cards were healthy and idle.
-
-The frozen raw-regex audit returned exactly `FINAL_AUDIT=FAIL failures=2`. A
-later contextual review classified the two full-log gates as false positives:
-each side had 9 startup INFO `NaN-clamp` lines and 32 post-SIGTERM cleanup
-`Traceback` markers. The markers occurred after the explicit SIGTERM shutdown
-trigger from CANN repository-manager cleanup and were not request failures.
-
-This evidence is limited to fixed Laser configuration, one host, and one
-request at a time. It covers no concurrency or sustained recovery, no
-`fl2va`/`Ref2VA` or other models/platforms, and supports no general
-recommendation beyond this tested H3/A2 setup. The run has no trace-confirmed
-Laser operator. The CPU benchmark and worker-boundary scan above are separate
-from this E2E evidence.
-
-Keeping the option unset preserves the conservative baseline path. For the
-exact measured E2E scope only — MiniMax-H3 `FL2VA`/`t2va`, one request, fixed
-Laser, `1344x768@24fps`, tested 5, 8.7, and 15 second cases, on the Atlas A2
-host with a 192-CPU Kunpeng-920 and 8 x Ascend 910B4-1, using the recorded
-software stack in the measured environment table above — worker 8 is a
-latency-oriented recommendation when CPU and memory headroom are available.
-This recommendation does not extend to other models, hardware, tasks, shapes,
-durations, or concurrency; those configurations should keep the option unset
-until measured. Worker 4 is a lower-resource intermediate choice in the CPU
-scan, not a general recommendation. Worker 8 is not a theoretical optimum, and
-the exploratory 16/32 results do not imply a recommendation for those values.
+Use `8 workers` only for the validated MiniMax-H3 `FL2VA/t2va` on Atlas
+A2 with `192-CPU Kunpeng 920`, `8x910B4-1`, Laser-configured attention,
+`1344x768@24 FPS`, and one request at a time. The capability is generic but
+untested elsewhere; the default remains omitted.
 
 ### Optional optimizations
 
