@@ -11,9 +11,14 @@ Coverage:
 - MXFP8_QUANT_CONFIG structure as the auto-detection contract
 """
 
+import sys
+import types
+from typing import Any
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
@@ -22,6 +27,27 @@ from vllm_omni.quantization import build_quant_config
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available")
+
+
+def _install_ascend_fused_moe_fake(monkeypatch: pytest.MonkeyPatch):
+    """Stub vllm_ascend.ops.fused_moe.fused_moe.AscendUnquantizedFusedMoEMethod
+    so get_quant_method's FusedMoE branch can be exercised without the real
+    vllm-ascend package. Returns the fake class so tests can inspect calls."""
+    calls: list[tuple[Any, dict]] = []
+
+    class _FakeAscendUnquantizedFusedMoEMethod:
+        def __init__(self, moe_config, *, tid2eid=None):
+            self.moe_config = moe_config
+            self.tid2eid = tid2eid
+            calls.append((moe_config, {"tid2eid": tid2eid}))
+
+    for name in ("vllm_ascend", "vllm_ascend.ops", "vllm_ascend.ops.fused_moe"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    fused_moe_module = types.ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
+    fused_moe_module.AscendUnquantizedFusedMoEMethod = _FakeAscendUnquantizedFusedMoEMethod
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.fused_moe.fused_moe", fused_moe_module)
+
+    return _FakeAscendUnquantizedFusedMoEMethod, calls
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +361,137 @@ def test_supported_methods_include_mxfp8():
     from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
 
     assert "mxfp8" in SUPPORTED_QUANTIZATION_METHODS
+
+
+# ---------------------------------------------------------------------------
+# OmniNPUMxfp8Config — NPU AR-stage identity, distinct from vLLM's own "mxfp8"
+# ---------------------------------------------------------------------------
+
+
+def test_omni_npu_mxfp8_config_get_name():
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    assert OmniNPUMxfp8Config.get_name() == "omni_npu_mxfp8"
+
+
+def test_build_quant_config_omni_npu_mxfp8_registered():
+    """omni_npu_mxfp8 must resolve through vLLM's quantization registry,
+    the same lifecycle vLLM's own ModelConfig uses for "mxfp8"."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    cfg = build_quant_config("omni_npu_mxfp8")
+    assert isinstance(cfg, OmniNPUMxfp8Config)
+    assert cfg.is_checkpoint_mxfp8_serialized is False
+
+
+def test_build_quant_config_omni_npu_mxfp8_local_serialized_checkpoint():
+    """A local pre-quantized checkpoint's config.json (quant_method="omni_npu_mxfp8",
+    is_checkpoint_mxfp8_serialized=True) must build the offline variant."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    cfg = build_quant_config(
+        {"method": "omni_npu_mxfp8", "is_checkpoint_mxfp8_serialized": True, "ignored_layers": ["proj_out"]}
+    )
+    assert isinstance(cfg, OmniNPUMxfp8Config)
+    assert cfg.is_checkpoint_mxfp8_serialized is True
+    assert cfg.ignored_layers == ["proj_out"]
+
+
+@pytest.mark.parametrize("quant_method", ["mxfp8", "omni_npu_mxfp8"])
+def test_omni_npu_mxfp8_override_quantization_method_on_npu(quant_method: str, monkeypatch: pytest.MonkeyPatch):
+    """On NPU, a checkpoint declaring either the vLLM-reserved "mxfp8" name (e.g. a
+    Hugging Face checkpoint uploaded before the remap existed) or the already-remapped
+    "omni_npu_mxfp8" (a checkpoint saved locally by this integration) must both resolve
+    to "omni_npu_mxfp8" so vLLM's ModelConfig loads the Omni-specific config class."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    result = OmniNPUMxfp8Config.override_quantization_method(
+        hf_quant_cfg={"quant_method": quant_method},
+        user_quant=None,
+    )
+    assert result == "omni_npu_mxfp8"
+
+
+def test_omni_npu_mxfp8_override_quantization_method_off_npu_returns_none(monkeypatch: pytest.MonkeyPatch):
+    """The remap must not apply on non-NPU platforms, even with a matching config."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+
+    result = OmniNPUMxfp8Config.override_quantization_method(
+        hf_quant_cfg={"quant_method": "mxfp8"},
+        user_quant=None,
+    )
+    assert result is None
+
+
+def test_omni_npu_mxfp8_override_quantization_method_mismatched_method_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An unrelated quant_method in the checkpoint config must not be hijacked."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    result = OmniNPUMxfp8Config.override_quantization_method(
+        hf_quant_cfg={"quant_method": "int8"},
+        user_quant=None,
+    )
+    assert result is None
+
+
+def test_omni_npu_mxfp8_override_quantization_method_non_dict_returns_none(monkeypatch: pytest.MonkeyPatch):
+    """hf_quant_cfg may be None (unquantized model) or a non-dict; must not raise."""
+    from vllm_omni.quantization.mxfp8_config import OmniNPUMxfp8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    assert OmniNPUMxfp8Config.override_quantization_method(hf_quant_cfg=None, user_quant=None) is None
+    assert OmniNPUMxfp8Config.override_quantization_method(hf_quant_cfg="mxfp8", user_quant=None) is None
+
+
+# ---------------------------------------------------------------------------
+# get_quant_method — FusedMoE / tid2eid forwarding (NPU AR-stage MoE routing)
+# ---------------------------------------------------------------------------
+
+
+def test_get_quant_method_fused_moe_forwards_tid2eid(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
+    """tid2eid (logical-to-physical expert id mapping) must be forwarded explicitly
+    to AscendUnquantizedFusedMoEMethod, not silently dropped via **kwargs."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    fake_cls, calls = _install_ascend_fused_moe_fake(monkeypatch)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    config = DiffusionMXFP8Config()
+    layer = mocker.Mock(spec=FusedMoE)
+    layer.moe_config = mocker.sentinel.moe_config
+    sentinel_tid2eid = mocker.sentinel.tid2eid
+
+    method = config.get_quant_method(layer, "blocks.0.ffn.experts", tid2eid=sentinel_tid2eid)
+
+    assert isinstance(method, fake_cls)
+    assert len(calls) == 1
+    moe_config_arg, kwargs = calls[0]
+    assert moe_config_arg is mocker.sentinel.moe_config
+    assert kwargs["tid2eid"] is sentinel_tid2eid
+
+
+def test_get_quant_method_fused_moe_without_tid2eid_passes_none(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
+    """When no logical-to-physical mapping is active, tid2eid must default to None
+    rather than being omitted or raising."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    fake_cls, calls = _install_ascend_fused_moe_fake(monkeypatch)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+
+    config = DiffusionMXFP8Config()
+    layer = mocker.Mock(spec=FusedMoE)
+    layer.moe_config = mocker.sentinel.moe_config
+
+    method = config.get_quant_method(layer, "blocks.0.ffn.experts")
+
+    assert isinstance(method, fake_cls)
+    assert calls[0][1]["tid2eid"] is None

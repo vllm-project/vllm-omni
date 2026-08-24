@@ -1164,6 +1164,7 @@ def build_vllm_config(
         usage_context=UsageContext.LLM_CLASS,
         headless=headless,
     )
+
     executor_class = Executor.get_class(vllm_config)
 
     # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.

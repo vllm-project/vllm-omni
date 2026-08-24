@@ -61,7 +61,10 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -109,6 +112,7 @@ class DiffusionMXFP4Config(QuantizationConfig):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
+        self.quant_description = []
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -145,7 +149,33 @@ class DiffusionMXFP4Config(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
+        **kwargs,
     ) -> QuantizeMethodBase | None:
+        fused_moe_type: type[torch.nn.Module] | None = None
+        try:
+            from vllm.model_executor.layers.fused_moe import FusedMoE
+
+            if isinstance(FusedMoE, type):
+                fused_moe_type = FusedMoE
+        except Exception:
+            fused_moe_type = None
+
+        is_fused_moe_layer = False
+        if fused_moe_type is not None:
+            is_fused_moe_layer = isinstance(layer, fused_moe_type)
+        elif hasattr(layer, "moe_config"):
+            layer_cls = layer.__class__
+            layer_cls_name = getattr(layer_cls, "__name__", "")
+            layer_cls_mod = getattr(layer_cls, "__module__", "")
+            is_fused_moe_layer = layer_cls_name == "FusedMoE" or "fused_moe" in layer_cls_mod
+
+        if current_omni_platform.is_npu():
+            if is_fused_moe_layer:
+                from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+                tid2eid = kwargs.get("tid2eid")
+                return AscendUnquantizedFusedMoEMethod(layer.moe_config, tid2eid=tid2eid)
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,
@@ -168,6 +198,28 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
                 "on NPU (Ascend) and ROCm (AMD, gfx950) platforms."
             )
+        return None
+
+
+@register_quantization_config("omni_npu_mxfp4")
+class OmniNPUMxfp4Config(DiffusionMXFP4Config):
+    """NPU AR-stage identity for online/offline MXFP4, distinct from vLLM's
+    own built-in "mxfp4" quantization method (native Triton MXFP4, e.g. for
+    GPT-OSS). See OmniNPUMxfp8Config in mxfp8_config.py for the rationale.
+    """
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return "omni_npu_mxfp4"
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg: Any, user_quant: Any, hf_config: Any = None) -> Any:
+        if (
+            current_omni_platform.is_npu()
+            and isinstance(hf_quant_cfg, dict)
+            and hf_quant_cfg.get("quant_method") in ("mxfp4", "omni_npu_mxfp4")
+        ):
+            return "omni_npu_mxfp4"
         return None
 
 
