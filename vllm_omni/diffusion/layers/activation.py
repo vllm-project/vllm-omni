@@ -32,6 +32,3 @@ class SiluAndMul(CustomOp):
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
-
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)

@@ -83,17 +83,6 @@ class MoTRMSNorm(CustomOp):
         )
 
     # ------------------------------------------------------------------
-    # XPU fast-path (no XPU RMSNorm kernel; use the pure-PyTorch path)
-    # ------------------------------------------------------------------
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-        text_indices: torch.Tensor | None = None,
-        vae_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.forward_native(x, text_indices, vae_indices)
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _rms_norm_native(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

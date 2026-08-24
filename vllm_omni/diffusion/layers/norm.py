@@ -36,9 +36,6 @@ class LayerNorm(nn.LayerNorm, CustomOp):
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
 
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         if _HAS_MINDIESD:
             try:
@@ -132,12 +129,6 @@ class RMSNorm(CustomOp):
 
         return output
 
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
-
     def forward_native(
         self,
         x: torch.Tensor,
@@ -203,12 +194,6 @@ class RMSNormVAE(CustomOp):
         if self.bias is not None:
             out = out + self.bias
         return out
-
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x)
 
     def forward_native(
         self,
