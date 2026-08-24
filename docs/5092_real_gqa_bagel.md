@@ -35,15 +35,23 @@ parallel_config:
     num_heads: 32
     num_kv_heads: 4
     head_dim: 128
+    batch_size: 1
+    dtype_bytes: 2
     interconnect: nvlink
 ```
 
 The calibration file contains one row per measured strategy and shape, using
-`strategy`, `interconnect`, `sp_degree`, `kv_ratio`, `seq_len`, and
-`latency_ms`. The earlier #5092 names (`sp`, `f`, `seq`, and `p50_ms`) are also
-accepted. The selector first rejects unsupported strategies, then chooses the
-lowest predicted latency and writes the corresponding degree before group
-initialization. Manual degree configuration remains the default.
+`strategy`, `interconnect`, `sp_degree`, `kv_ratio`, `seq_len`, `batch_size`,
+`head_dim`, `dtype_bytes`, and `latency_ms`. All shape fields participate in
+calibration matching; missing or mismatched dimensions are rejected instead of
+silently selecting from a different tensor shape. The earlier #5092 names
+(`sp`, `f`, `seq`, `batch`, `dim`, `dtype`, and `p50_ms`) are also accepted;
+known dtype names such as `bf16` are normalized to their byte width. The
+selector first rejects unsupported strategies, then chooses the lowest
+predicted latency and writes the corresponding degree before group
+initialization. Manual degree configuration remains the default. AllGather-KV
+is considered feasible only when the global sequence length is divisible by
+the SP degree because its collective requires equal local shard sizes.
 
 Ring is excluded from auto selection unless `sp_selector_allow_ring: true` is
 set, because the BAGEL result above shows that latency alone is not a sufficient

@@ -43,8 +43,8 @@ class SPWorkload:
     num_kv_heads: int
     head_dim: int
     interconnect: Interconnect | str
-    batch_size: int = 1
-    dtype_bytes: int = 2
+    batch_size: int
+    dtype_bytes: int
     causal: bool = False
     has_attention_mask: bool = False
     ulysses_mode: str = "strict"
@@ -100,6 +100,9 @@ class CalibrationPoint:
     sp_degree: int
     kv_ratio: float
     seq_len: int
+    batch_size: int
+    head_dim: int
+    dtype_bytes: int
     latency_ms: float
 
     def __post_init__(self) -> None:
@@ -107,8 +110,16 @@ class CalibrationPoint:
             raise ValueError("calibration sp_degree must be > 1")
         if not 0 < self.kv_ratio <= 1:
             raise ValueError("calibration kv_ratio must be in (0, 1]")
-        if self.seq_len <= 0 or self.latency_ms <= 0:
-            raise ValueError("calibration seq_len and latency_ms must be positive")
+        positive = {
+            "seq_len": self.seq_len,
+            "batch_size": self.batch_size,
+            "head_dim": self.head_dim,
+            "dtype_bytes": self.dtype_bytes,
+            "latency_ms": self.latency_ms,
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"calibration dimensions must be positive: {', '.join(invalid)}")
 
 
 class StrategyCostModel(Protocol):
@@ -128,6 +139,27 @@ class EmpiricalCostModel:
         self._points = tuple(points)
         if not self._points:
             raise ValueError("at least one calibration point is required")
+
+    @staticmethod
+    def _dtype_bytes(row: dict[str, Any]) -> int:
+        if "dtype_bytes" in row:
+            return int(row["dtype_bytes"])
+        dtype = str(row["dtype"]).lower().removeprefix("torch.")
+        sizes = {
+            "bf16": 2,
+            "bfloat16": 2,
+            "fp16": 2,
+            "float16": 2,
+            "half": 2,
+            "fp32": 4,
+            "float32": 4,
+            "fp64": 8,
+            "float64": 8,
+        }
+        try:
+            return sizes[dtype]
+        except KeyError as exc:
+            raise ValueError(f"unsupported calibration dtype {row['dtype']!r}; provide dtype_bytes explicitly") from exc
 
     @classmethod
     def from_jsonl(cls, path: str | Path) -> EmpiricalCostModel:
@@ -149,6 +181,9 @@ class EmpiricalCostModel:
                             sp_degree=int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
                             kv_ratio=float(row["kv_ratio"] if "kv_ratio" in row else row["f"]),
                             seq_len=int(row["seq_len"] if "seq_len" in row else row["seq"]),
+                            batch_size=int(row["batch_size"] if "batch_size" in row else row["batch"]),
+                            head_dim=int(row["head_dim"] if "head_dim" in row else row["dim"]),
+                            dtype_bytes=cls._dtype_bytes(row),
                             latency_ms=float(row["latency_ms"] if "latency_ms" in row else row["p50_ms"]),
                         )
                     )
@@ -160,13 +195,19 @@ class EmpiricalCostModel:
         matching = [
             p
             for p in self._points
-            if p.strategy == strategy and p.interconnect == workload.interconnect and p.sp_degree == workload.sp_degree
+            if p.strategy == strategy
+            and p.interconnect == workload.interconnect
+            and p.sp_degree == workload.sp_degree
+            and p.batch_size == workload.batch_size
+            and p.head_dim == workload.head_dim
+            and p.dtype_bytes == workload.dtype_bytes
         ]
         if not matching:
             raise LookupError(
                 "no calibration for "
                 f"strategy={strategy}, interconnect={workload.interconnect}, "
-                f"sp_degree={workload.sp_degree}"
+                f"sp_degree={workload.sp_degree}, batch_size={workload.batch_size}, "
+                f"head_dim={workload.head_dim}, dtype_bytes={workload.dtype_bytes}"
             )
 
         ratios = sorted({p.kv_ratio for p in matching})
@@ -259,6 +300,8 @@ class SPCostSelector:
         if strategy == SPStrategy.ALLGATHER_KV:
             if workload.causal and not caps.allgather_kv_causal:
                 return "AllGather-KV does not support causal attention"
+            if workload.seq_len % workload.sp_degree:
+                return "AllGather-KV requires global sequence length divisible by SP degree"
             return None
         if workload.seq_len % workload.sp_degree:
             return "Ring requires global sequence length divisible by SP degree"
@@ -289,6 +332,12 @@ def resolve_auto_sp_strategy(parallel_config: Any) -> StrategyDecision | None:
     workload_args = dict(raw_workload)
     workload_args.setdefault("sp_degree", int(getattr(parallel_config, "sequence_parallel_size", 1)))
     workload_args.setdefault("ulysses_mode", str(getattr(parallel_config, "ulysses_mode", "strict")))
+    required_shape = ("seq_len", "num_heads", "num_kv_heads", "head_dim", "batch_size", "dtype_bytes")
+    missing = [name for name in required_shape if name not in workload_args]
+    if missing:
+        raise ValueError(
+            f"sp_selector_workload must explicitly declare the full calibration identity; missing: {', '.join(missing)}"
+        )
     workload = SPWorkload(**workload_args)
     selector = SPCostSelector(
         EmpiricalCostModel.from_jsonl(profile),

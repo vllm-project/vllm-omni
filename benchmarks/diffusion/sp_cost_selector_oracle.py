@@ -41,6 +41,9 @@ def _point(row: dict) -> CalibrationPoint:
         sp_degree=int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
         kv_ratio=float(row["kv_ratio"] if "kv_ratio" in row else row["f"]),
         seq_len=int(row["seq_len"] if "seq_len" in row else row["seq"]),
+        batch_size=int(row["batch_size"] if "batch_size" in row else row["batch"]),
+        head_dim=int(row["head_dim"] if "head_dim" in row else row["dim"]),
+        dtype_bytes=EmpiricalCostModel._dtype_bytes(row),
         latency_ms=float(row["latency_ms"] if "latency_ms" in row else row["p50_ms"]),
     )
 
@@ -51,20 +54,24 @@ def _cell_key(row: dict) -> tuple:
         int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
         float(row["kv_ratio"] if "kv_ratio" in row else row["f"]),
         int(row["seq_len"] if "seq_len" in row else row["seq"]),
+        int(row["batch_size"] if "batch_size" in row else row["batch"]),
+        int(row["head_dim"] if "head_dim" in row else row["dim"]),
+        EmpiricalCostModel._dtype_bytes(row),
     )
 
 
 def _workload(row: dict) -> SPWorkload:
-    num_heads = int(row.get("hq", 32))
+    num_heads = int(row["num_heads"] if "num_heads" in row else row["hq"])
     kv_ratio = float(row["kv_ratio"] if "kv_ratio" in row else row["f"])
     return SPWorkload(
         seq_len=int(row["seq_len"] if "seq_len" in row else row["seq"]),
         sp_degree=int(row["sp_degree"] if "sp_degree" in row else row["sp"]),
         num_heads=num_heads,
         num_kv_heads=int(row.get("hkv", round(num_heads * kv_ratio))),
-        head_dim=int(row.get("dim", row.get("head_dim", 128))),
+        head_dim=int(row["head_dim"] if "head_dim" in row else row["dim"]),
         interconnect=row["interconnect"],
-        batch_size=int(row.get("batch", row.get("batch_size", 1))),
+        batch_size=int(row["batch_size"] if "batch_size" in row else row["batch"]),
+        dtype_bytes=EmpiricalCostModel._dtype_bytes(row),
     )
 
 
