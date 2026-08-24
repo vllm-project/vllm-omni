@@ -32,9 +32,9 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
-    _validate_frame_conversion_workers,
     encode_video_base64,
 )
+from vllm_omni.entrypoints.openai.video_frame_conversion import _validate_frame_conversion_workers
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.model_extras import should_preserve_reference_image_size
 from vllm_omni.outputs.output_metadata import (
