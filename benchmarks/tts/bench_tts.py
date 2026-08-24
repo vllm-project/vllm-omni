@@ -63,9 +63,7 @@ _TASK_TO_DATASET: dict[str, str] = {
 _DEFAULT_METRIC_PERCENTILES = "50,99"
 
 # Default design dataset path (bundled with the repo)
-_DEFAULT_DESIGN_DATASET_PATH = str(
-    _REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design"
-)
+_DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
 
 
 def load_model_configs(path: Path) -> dict[str, Any]:
@@ -100,9 +98,7 @@ def build_bench_args(
     dataset_name = _TASK_TO_DATASET[task]
     backend: str = model_cfg["backend"]
     endpoint: str = model_cfg["endpoint"]
-    task_extra_body: dict[str, Any] = dict(
-        (model_cfg.get("task_extra_body") or {}).get(task) or {}
-    )
+    task_extra_body: dict[str, Any] = dict((model_cfg.get("task_extra_body") or {}).get(task) or {})
     if request_seed is not None:
         task_extra_body["seed"] = request_seed
 
@@ -192,9 +188,7 @@ def run_one_benchmark(cmd: list[str]) -> dict[str, Any] | None:
             result_file = result_dir / cmd[fname_idx + 1]
         else:
             # find most recently modified json
-            jsons = sorted(
-                result_dir.glob("result_*.json"), key=lambda p: p.stat().st_mtime
-            )
+            jsons = sorted(result_dir.glob("result_*.json"), key=lambda p: p.stat().st_mtime)
             result_file = jsons[-1] if jsons else None
         if result_file and result_file.is_file():
             return json.loads(result_file.read_text(encoding="utf-8"))
@@ -203,9 +197,7 @@ def run_one_benchmark(cmd: list[str]) -> dict[str, Any] | None:
     return None
 
 
-def _percentile_value(
-    percentiles_rows: Any, target: float, default: float = float("nan")
-) -> float:
+def _percentile_value(percentiles_rows: Any, target: float, default: float = float("nan")) -> float:
     """Extract the value for ``target`` from a ``[[p, value], ...]`` row list."""
     if not isinstance(percentiles_rows, list):
         return default
@@ -296,9 +288,7 @@ def main() -> None:
         help="Task type: voice_clone | default_voice | voice_design | all",
     )
     parser.add_argument("--locale", default="en", choices=["en", "zh"])
-    parser.add_argument(
-        "--concurrency", type=int, nargs="+", default=[1, 4], metavar="N"
-    )
+    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4], metavar="N")
     parser.add_argument(
         "--num-prompts",
         type=int,
@@ -324,12 +314,8 @@ def main() -> None:
         default=None,
         help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)",
     )
-    parser.add_argument(
-        "--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval"
-    )
-    parser.add_argument(
-        "--output-dir", default=None, help="Directory to save result JSON files"
-    )
+    parser.add_argument("--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval")
+    parser.add_argument("--output-dir", default=None, help="Directory to save result JSON files")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -368,9 +354,7 @@ def main() -> None:
     model_configs = load_model_configs(Path(args.model_configs))
     if args.model not in model_configs:
         known = "\n  ".join(model_configs.keys())
-        print(
-            f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\nKnown models:\n  {known}"
-        )
+        print(f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\nKnown models:\n  {known}")
         sys.exit(1)
 
     model_cfg = model_configs[args.model]
@@ -433,9 +417,7 @@ def main() -> None:
                 if args.output_dir and result_filename:
                     result_path = Path(args.output_dir) / result_filename
                     if result_path.is_file():
-                        result_path.write_text(
-                            json.dumps(result, indent=2), encoding="utf-8"
-                        )
+                        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
     print_summary_table(all_results)
 

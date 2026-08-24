@@ -295,9 +295,7 @@ def test_first_audio_latency_rows_falls_back_to_row_list() -> None:
     assert math.isnan(p50) and math.isnan(p99)
 
 
-def test_unsupported_task_exits(
-    model_configs_path: Path, capsys: pytest.CaptureFixture, mocker
-) -> None:
+def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture, mocker) -> None:
     # ModelB does not support voice_design
     mocker.patch.object(
         sys,
