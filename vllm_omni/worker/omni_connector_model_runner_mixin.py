@@ -1828,12 +1828,11 @@ class OmniConnectorModelRunnerMixin:
                     existing.update(payload_data)
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
-                staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
-                self.put_local_request_metadata(
-                    req_id,
-                    self._scheduling_metadata_adapter.extract(staged_payload, model_mode=self._model_mode),
-                )
+                # Runner-owned async receive is not wired into the current
+                # scheduler. Add typed metadata extraction only when async
+                # registration, consumption, and failure propagation migrate
+                # together from OmniChunkTransferAdapter.
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new

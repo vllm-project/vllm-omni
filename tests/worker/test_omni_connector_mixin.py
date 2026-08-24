@@ -1183,11 +1183,12 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertTrue(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
 
-    def test_ar_metadata_only_followup_chunk_does_not_rewake_request(self):
+    def test_ar_metadata_only_followup_chunk_does_not_publish_scheduler_metadata(self):
         host = MixinHost()
         host.init_omni_connectors(
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
+        host._scheduling_metadata_adapter = MagicMock()
         host._omni_connector = MagicMock()
         host._stage_id = 1
         host._async_chunk = True
@@ -1218,7 +1219,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {"r1": SchedulingMetadataUpdate(resize_prompt_to=7)})
+        self.assertEqual(output2.request_metadata, {})
+        host._scheduling_metadata_adapter.extract.assert_not_called()
 
         host.shutdown_omni_connectors()
 

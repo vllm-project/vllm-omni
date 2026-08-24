@@ -17,7 +17,11 @@ logger = init_logger(__name__)
 
 @runtime_checkable
 class SchedulingMetadataAdapter(Protocol):
-    """Translate a runner payload into generic scheduler-visible effects."""
+    """Translate runner payloads into generic scheduler-visible effects.
+
+    The current production consumer is the runner-owned full-payload receive
+    path. Async-chunk scheduling remains owned by OmniChunkTransferAdapter.
+    """
 
     def extract(
         self,
