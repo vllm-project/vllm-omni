@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Synthetic media generation and media/text utilities for tests."""
 
 import atexit
@@ -393,7 +396,7 @@ def generate_synthetic_video(
     import imageio
 
     num_balls = random.randint(3, 8)
-    balls = []
+    balls: list[dict[str, Any]] = []
     for _ in range(num_balls):
         radius = min(width, height) // 8
         if radius < 1:
@@ -569,8 +572,6 @@ def concat_audio(audio_val) -> np.ndarray:
 
 
 def preprocess_text(text):
-    import opencc
-
     word_to_num = {
         "zero": "0",
         "one": "1",
@@ -590,8 +591,13 @@ def preprocess_text(text):
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
-    cc = opencc.OpenCC("t2s")
-    text = cc.convert(text)
+    try:
+        import opencc
+
+        cc = opencc.OpenCC("t2s")
+        text = cc.convert(text)
+    except ImportError:
+        pass
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     return text.lower().strip()
 
