@@ -28,6 +28,7 @@ However, as we strive to ensure output similarity between vLLM-Omni's diffuser b
 - Qwen/Qwen-Image
 - Tongyi-MAI/Z-Image-Turbo
 - Wan2.2-I2V-A14B-Diffusers
+- Lightricks/LTX-2.5-Diffusers (source-preview dependencies)
 
 If you find that a model not listed above also produces different outputs from running diffusers model directly.
 Please consider file an issue.
@@ -115,6 +116,36 @@ The loaded attention backend and the failed attempts (if any) are logged to cons
 The model loading and inference strictly follows the diffusers library, and they may be different from vLLM-Omni's native interface for some specific models.
 Users are encouraged to double-check the model pipeline's interface in [diffusers' official documentation](https://huggingface.co/docs/diffusers/api/pipelines/overview).
 Some particular examples are below.
+
+#### LTX-2.5 (source preview)
+
+Use the gated Diffusers checkpoint
+[`Lightricks/LTX-2.5-Diffusers`](https://huggingface.co/Lightricks/LTX-2.5-Diffusers);
+[`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5) contains
+component weights and is not directly loadable by this backend. Accept the
+model terms, authenticate, and install the source-preview dependencies:
+
+```bash
+hf auth login
+python -m pip install --upgrade 'transformers>=5.10.1' \
+  'diffusers @ git+https://github.com/huggingface/diffusers.git@7564fb016dabda0c943416190fc92398c50b1b20'
+```
+
+```bash
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --diffusion-load-format diffusers \
+  --dtype bfloat16 \
+  --enable-cpu-offload \
+  --vae-use-tiling
+```
+
+The converted repository loads the distilled transformer. When no `sigmas`,
+`timesteps`, or `num_inference_steps` is supplied, the adapter applies the
+official eight-sigma unguided schedule and returns synchronized 48 kHz audio.
+Support is limited to one-stage distilled T2V; `transformer_full`, two-stage
+upsampling, image/video conditioning, and the diffusion video decoder are not
+supported. The general Diffusers backend [limitations](#limitations) apply.
 
 #### Wan Series
 

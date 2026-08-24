@@ -23,7 +23,11 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
+    BasePipelineUtils,
+    get_pipeline_utils,
+    validate_model_compatibility,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
     apply_diffusers_quantization_config,
     convert_diffusers_quantization_config,
@@ -110,6 +114,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         model_id = self.od_config.model
         dtype = self.od_config.dtype
+        validate_model_compatibility(self.od_config)
 
         load_kwargs = {
             "torch_dtype": dtype,
@@ -130,6 +135,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
         self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
+        if pipeline_class_name is None:
+            self._pipeline_utils = get_pipeline_utils(self._pipeline.__class__.__name__)
         self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
 
         self._pipeline.to(self.device)
@@ -146,14 +153,14 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # VAE slicing and tiling: try-catch because not all models have VAE
         if self.od_config.vae_use_slicing:
             try:
-                self._pipeline.enable_vae_slicing()
+                self._pipeline_utils.enable_vae_optimization(self._pipeline, "slicing")
             except Exception as e:
                 logger.warning(
                     f"Failed to enable VAE slicing for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
                 )
         if self.od_config.vae_use_tiling:
             try:
-                self._pipeline.enable_vae_tiling()
+                self._pipeline_utils.enable_vae_optimization(self._pipeline, "tiling")
             except Exception as e:
                 logger.warning(
                     f"Failed to enable VAE tiling for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
@@ -393,6 +400,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         else:
             kwargs["generator"] = torch.Generator(device=sampling.generator_device)
 
+        self._pipeline_utils.update_call_kwargs(self.od_config, kwargs)
+
         logger.info(
             "Calling diffusers pipeline with kwargs: %s", DiffusersAdapterPipeline._summarize_call_kwargs_value(kwargs)
         )
@@ -496,6 +505,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         - ``VideoPipelineOutput(frames=...)`` — text2vid, img2vid
         """
         from vllm_omni.diffusion.data import DiffusionOutput
+
+        output = self._pipeline_utils.normalize_output(self._pipeline, self.od_config, output)
 
         if hasattr(output, "images"):
             # Preserve diffusers image format (`output_type`)

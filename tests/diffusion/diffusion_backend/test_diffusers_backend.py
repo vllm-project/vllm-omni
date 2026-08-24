@@ -17,6 +17,10 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.models.diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
+    LTX25_DISTILLED_SIGMAS,
+    get_pipeline_utils,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -179,6 +183,32 @@ class TestPipelineArgumentsHandling:
 
         with pytest.raises(NotImplementedError):
             DiffusersAdapterPipeline(od_config=od_config)
+
+    def test_ltx25_original_repo_rejected_before_loading(self, mocker):
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained"
+        )
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config(model="Lightricks/LTX-2.5"))
+
+        with pytest.raises(ValueError, match="Lightricks/LTX-2.5-Diffusers"):
+            adapter.load_weights()
+
+        mock_from_pretrained.assert_not_called()
+
+    def test_ltx25_requires_upstream_diffusers_feature(self, mocker):
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils._supports_ltx25_diffusers",
+            return_value=False,
+        )
+        mock_from_pretrained = mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained"
+        )
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config(model="Lightricks/LTX-2.5-Diffusers"))
+
+        with pytest.raises(ImportError, match="7564fb016dabda0c943416190fc92398c50b1b20"):
+            adapter.load_weights()
+
+        mock_from_pretrained.assert_not_called()
 
     def test_adapter_load_weights_injects_supported_quantization_config(self, mocker):
         (
@@ -373,6 +403,28 @@ class TestPipelineArgumentsHandling:
 
         assert isinstance(output, DiffusionOutput)
         assert output.output == raw_output
+
+    def test_ltx25_preserves_video_and_singular_audio_output(self, tmp_path):
+        frames = torch.zeros(1, 2, 3, 4, 3)
+        audio = torch.zeros(1, 48000)
+        (tmp_path / "model_index.json").write_text(
+            '{"_class_name":"LTX2Pipeline","duration_head":["diffusers","LTX2DurationHead"]}',
+            encoding="utf-8",
+        )
+        od_config = _make_od_config(model=str(tmp_path))
+        adapter = DiffusersAdapterPipeline(od_config=od_config)
+        adapter._pipeline = SimpleNamespace(vocoder=SimpleNamespace(config=SimpleNamespace(output_sampling_rate=48000)))
+        adapter._pipeline_utils = get_pipeline_utils("LTX2Pipeline")
+
+        output = adapter._wrap_output(SimpleNamespace(frames=frames, audio=audio))
+
+        assert isinstance(output.output, dict)
+        assert output.output["payload"]["video"] is frames
+        assert output.output["payload"]["audio"] is audio
+        assert output.output["metadata"] == {"audio": {"sample_rate": 48000}}
+
+        frames_only = adapter._wrap_output(SimpleNamespace(frames=frames, audio=None))
+        assert frames_only.output is frames
 
     def test_adapter_build_call_kwargs(self, mocker):
         class MockPipeline:
@@ -628,6 +680,97 @@ class TestPipelineArgumentsHandling:
         )
         with pytest.raises(ValueError):
             pipeline.forward(DiffusionRequestBatch(requests=[problematic_request]))
+
+    def test_ltx25_uses_distilled_sampling_defaults_from_renamed_local_directory(self, mocker, tmp_path):
+        class LTX2Pipeline:
+            def __call__(
+                self,
+                prompt=None,
+                num_inference_steps=None,
+                sigmas=None,
+                timesteps=None,
+                guidance_scale=None,
+                audio_guidance_scale=None,
+                stg_scale=None,
+                audio_stg_scale=None,
+                modality_scale=None,
+                audio_modality_scale=None,
+                guidance_rescale=None,
+                audio_guidance_rescale=None,
+                num_frames=None,
+                frame_rate=None,
+                output_type=None,
+                generator=None,
+            ):
+                return None
+
+            def to(self, device):
+                return self
+
+        # Local model directories do not retain their Hub repository name.
+        # Detect 2.5 from its pipeline component metadata instead.
+        (tmp_path / "model_index.json").write_text(
+            '{"_class_name":"LTX2Pipeline","duration_head":["diffusers","LTX2DurationHead"]}',
+            encoding="utf-8",
+        )
+        enable_tiling = mocker.Mock()
+        loaded_pipeline = LTX2Pipeline()
+        loaded_pipeline.vae = SimpleNamespace(enable_tiling=enable_tiling)
+
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils._supports_ltx25_diffusers",
+            return_value=True,
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter.DiffusionPipeline.from_pretrained",
+            return_value=loaded_pipeline,
+        )
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                model=str(tmp_path),
+                vae_use_tiling=True,
+            )
+        )
+        adapter.load_weights()
+        enable_tiling.assert_called_once_with()
+
+        sampling = OmniDiffusionSamplingParams(
+            num_frames=121,
+            frame_rate=24.0,
+            seed=42,
+            generator_device="cpu",
+        )
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[_make_request(sampling_params=sampling)]))
+
+        assert kwargs["sigmas"] == LTX25_DISTILLED_SIGMAS
+        assert kwargs["num_inference_steps"] == 8
+        assert kwargs["guidance_scale"] == 1.0
+        assert kwargs["audio_guidance_scale"] == 1.0
+        assert kwargs["stg_scale"] == 0.0
+        assert kwargs["audio_stg_scale"] == 0.0
+        assert kwargs["modality_scale"] == 1.0
+        assert kwargs["audio_modality_scale"] == 1.0
+        assert kwargs["guidance_rescale"] == 0.0
+        assert kwargs["audio_guidance_rescale"] == 0.0
+
+        explicit_steps = OmniDiffusionSamplingParams(num_inference_steps=12, generator_device="cpu")
+        step_kwargs = adapter._build_call_kwargs(
+            DiffusionRequestBatch(requests=[_make_request(sampling_params=explicit_steps)])
+        )
+        assert step_kwargs["num_inference_steps"] == 12
+        assert "sigmas" not in step_kwargs
+
+        custom_sigmas = [1.0, 0.5]
+        explicit_schedule = OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            sigmas=custom_sigmas,
+            generator_device="cpu",
+        )
+        schedule_kwargs = adapter._build_call_kwargs(
+            DiffusionRequestBatch(requests=[_make_request(sampling_params=explicit_schedule)])
+        )
+        assert schedule_kwargs["num_inference_steps"] == 2
+        assert schedule_kwargs["sigmas"] is custom_sigmas
 
 
 @pytest.mark.advanced_model
