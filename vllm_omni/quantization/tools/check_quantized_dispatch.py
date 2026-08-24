@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import regex as re
 
 # Suffixes ModelOpt / compressed-tensors ship alongside a packed weight. A
 # module carrying any of them was quantized by whoever produced the checkpoint.
