@@ -6,7 +6,6 @@
 # built against upstream PyTorch and is not ABI-compatible with ROCm builds.
 
 set -euo pipefail
-
 TORCHCODEC_REPO="${TORCHCODEC_REPO:-https://github.com/pytorch/torchcodec.git}"
 # Keep this pinned for ROCm/PyTorch ABI compatibility. When rebasing the ROCm
 # base image or vLLM, revalidate this version against the active torch build.
