@@ -371,6 +371,8 @@ class TestOmniDiffusionSleepMode:
             # --- wake + VRAM restore to initial (±3 GiB) ---
             logger.info("Waking up (Reloading Weights)...")
             await diffusion_engine.wake_up(stage_ids=[0])
+            # AR stages keep the frontend admission gate held after wake.
+            await diffusion_engine.resume_generation(stage_ids=[0])
             await asyncio.sleep(2.0)
             gc.collect()
             get_vram_info(device_id)
