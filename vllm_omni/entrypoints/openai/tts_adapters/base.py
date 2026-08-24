@@ -7,9 +7,7 @@ model's request normalization, validation, prompt/param building, sampling
 overrides, and output policy, so adding a model means writing one adapter file
 instead of editing the shared serving module in ~10 scattered places.
 
-See the RFC for the full design (issue #4327). This is the foundation landed in
-the first migration PR; Qwen3-TTS is the first model routed through it while the
-remaining models stay on the legacy path until individually migrated.
+See the RFC for the full design (issue #4327).
 """
 
 from abc import ABC, abstractmethod
@@ -17,9 +15,26 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+DEFAULT_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
 
 _conditioning_cache_salt_fn: "Callable[..., str] | None" = None
 
@@ -37,6 +52,21 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
 
         _conditioning_cache_salt_fn = _conditioning_cache_salt
     return _conditioning_cache_salt_fn(request, tts_params)
+
+
+def apply_max_new_tokens(
+    sampling_params_list: list,
+    request: "OpenAICreateSpeechRequest",
+) -> list:
+    """Apply a request-level ``max_new_tokens`` limit."""
+    if request.max_new_tokens is None:
+        return sampling_params_list
+
+    import copy
+
+    sampling_params_list = copy.deepcopy(sampling_params_list)
+    sampling_params_list[0].max_tokens = request.max_new_tokens
+    return sampling_params_list
 
 
 @dataclass
@@ -88,6 +118,14 @@ class SpeechServingContext:
     diffusion_engine: Any | None = None
 
 
+@dataclass(frozen=True)
+class TTSCapabilities:
+    precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    supported_speakers: frozenset[str] = frozenset()
+    supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
+    codec_frame_rate: float | None = None
+
+
 class TTSModelAdapter(ABC):
     """Mandatory base class for a TTS model served via ``/v1/audio/speech``.
 
@@ -124,6 +162,7 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
+        self.capabilities = TTSCapabilities()
 
     @classmethod
     def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
@@ -184,6 +223,8 @@ class TTSModelAdapter(ABC):
         self,
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         """Apply model-specific sampling mutations.
 
@@ -191,6 +232,34 @@ class TTSModelAdapter(ABC):
         stream-coercion -> extra_params -> THIS -> seed. Default: identity.
         """
         return sampling_params_list
+
+    async def warmup(self) -> None:
+        return
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        return None
+
+    def load_capabilities(self) -> TTSCapabilities:
+        self.capabilities = TTSCapabilities(
+            precomputed_speakers=self._load_precomputed_speakers(),
+            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_languages=self._load_supported_languages(),
+            codec_frame_rate=self._load_codec_frame_rate(),
+        )
+        return self.capabilities
+
+    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def _load_supported_speakers(self) -> set[str]:
+        # Preserve the legacy default path, which reads talker_config.
+        return load_supported_speakers(self.ctx.engine_client)
+
+    def _load_supported_languages(self) -> frozenset[str]:
+        return DEFAULT_TTS_LANGUAGES
+
+    def _load_codec_frame_rate(self) -> float | None:
+        return load_codec_frame_rate(self.ctx.engine_client)
 
 
 class ARTTSAdapter(TTSModelAdapter):
@@ -228,37 +297,10 @@ class DiffusionTTSAdapter(TTSModelAdapter):
         return frozenset(params) if params is not None else frozenset()
 
 
-@dataclass(frozen=True)
-class LegacyDetector:
-    """A model type the serving layer detects but has no adapter for yet.
-
-    Detection has to keep naming these models so ``serving_speech.py`` can route
-    them down its legacy path, but they own none of the adapter contract. Each
-    entry is a migration debt: delete it when the model gets an adapter. The
-    pre-commit gate (``tools/pre_commit/check_tts_adapter.py``) fails if the list
-    grows.
-
-    Exposes the subset of the :class:`TTSModelAdapter` class surface that
-    detection reads, so both kinds live in one sorted sequence.
-    """
-
-    name: str
-    stage_keys: frozenset[str] = frozenset()
-    model_archs: frozenset[str] = frozenset()
-    arch_identifies_entry_stage: bool = False
-    detect_priority: int = 100
-
-    def matches(self, model_stage: str | None, model_arch: str | None) -> bool:
-        if model_arch is not None and model_arch in self.model_archs:
-            return True
-        return model_stage is not None and model_stage in self.stage_keys
-
-
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
-    "LegacyDetector",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",

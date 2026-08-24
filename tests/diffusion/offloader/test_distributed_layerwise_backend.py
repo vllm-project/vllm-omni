@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for DistributedLayerwiseOffloadHook and backend utilities."""
 
 import gc
 import json
-import os
-import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -18,6 +16,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     TensorBinding,
@@ -65,26 +64,9 @@ def dummy_stream(_stream):
     yield None
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
-
-
 def _cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
-
-    for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-        os.environ.pop(key, None)
 
     gc.collect()
     if current_omni_platform.is_available():
@@ -94,10 +76,7 @@ def _cleanup_distributed() -> None:
 
 @pytest.fixture(scope="module")
 def dist_group():
-    master_port = _find_free_port()
-    _set_dist_env(rank=0, world_size=1, master_port=master_port)
-
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
     try:
         yield
     finally:
@@ -184,6 +163,79 @@ class TestDistributedLayerwiseOffloadHook:
 
         assert next_block.weight.stride() == expected_stride
         assert torch.equal(next_block.weight, expected)
+
+    def test_allgather_reconstructs_online_fp8_weight_and_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """DLO must reconstruct finalized online-FP8 tensors byte-for-byte."""
+
+        class OnlineFp8Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical_weight = torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0, 4.0],
+                        [5.0, 6.0, 7.0, 8.0],
+                        [9.0, 10.0, 11.0, 12.0],
+                    ],
+                    dtype=torch.float32,
+                ).to(torch.float8_e4m3fn)
+                self.weight = nn.Parameter(logical_weight.t(), requires_grad=False)
+                self.weight_scale = nn.Parameter(torch.tensor([0.25]), requires_grad=False)
+
+        current_block = OnlineFp8Block()
+        rank0_block = OnlineFp8Block()
+        rank1_block = OnlineFp8Block()
+        expected_weight = rank0_block.weight.detach().clone()
+        expected_scale = rank0_block.weight_scale.detach().clone()
+        expected_stride = rank0_block.weight.stride()
+
+        rank0_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank0_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank1_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank1_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=1,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(OnlineFp8Block())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert rank0_block.weight.stride() == expected_stride
+        torch.testing.assert_close(
+            rank0_block.weight.float(),
+            expected_weight.float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(rank0_block.weight_scale, expected_scale)
 
     def test_dtensor_wrapper_preserved_across_prefetch_and_offload(self, dist_group, patched_offload_runtime):
         """DTensor wrapper should be preserved through prefetch/offload cycle."""

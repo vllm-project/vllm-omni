@@ -114,41 +114,6 @@ _OMNI_MODELS = {
         "omnivoice",
         "OmniVoiceModel",
     ),
-    "MammothModa2Qwen2ForCausalLM": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2Qwen2ForCausalLM",
-    ),
-    "MammothModa2ARForConditionalGeneration": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2ARForConditionalGeneration",
-    ),
-    "MammothModa2Qwen3ARForConditionalGeneration": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2Qwen3ARForConditionalGeneration",
-    ),
-    "MammothModa2Qwen3ForCausalLM": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2Qwen3ForCausalLM",
-    ),
-    "MammothModa2DiTPipeline": (
-        "mammoth_moda2",
-        "pipeline_mammothmoda2_dit",
-        "MammothModa2DiTPipeline",
-    ),
-    "MammothModa2ForConditionalGeneration": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2ForConditionalGeneration",
-    ),
-    "Mammothmoda2Model": (
-        "mammoth_moda2",
-        "mammoth_moda2",
-        "MammothModa2ForConditionalGeneration",
-    ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
@@ -456,6 +421,17 @@ _OMNI_MODELS = {
         "aura_omni",
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
+    ),
+    ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
+    "MiniMaxMusic3TalkerForConditionalGeneration": (
+        "minimax_music3",
+        "talker",
+        "MiniMaxMusic3TalkerForConditionalGeneration",
+    ),
+    "MiniMaxMusic3AcousticForConditionalGeneration": (
+        "minimax_music3",
+        "acoustic",
+        "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
 }
 

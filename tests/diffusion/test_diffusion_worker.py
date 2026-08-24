@@ -13,11 +13,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from vllm_omni.diffusion.worker.diffusion_worker import (
-    DiffusionWorker,
-    _create_diffusion_worker_vllm_config,
-    _make_diffusion_vllm_model_config,
-)
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
 
@@ -56,34 +52,6 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}
     return worker
-
-
-def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods():
-    from types import SimpleNamespace
-
-    from vllm_omni.quantization import build_quant_config
-
-    od_config = SimpleNamespace(
-        model="dummy",
-        dtype=torch.bfloat16,
-        quantization_config=build_quant_config(
-            {
-                "quant_method": "modelopt",
-                "quant_algo": "FP8",
-                "ignore": [],
-            }
-        ),
-        tf_model_config=SimpleNamespace(),
-        enforce_eager=True,
-        is_moe=False,
-    )
-
-    model_config = _make_diffusion_vllm_model_config(od_config)
-
-    assert model_config.dtype is torch.bfloat16
-    assert model_config.quantization == "modelopt"
-    assert model_config.quantization_config is od_config.quantization_config
-    assert model_config.is_quantized()
 
 
 class TestDiffusionWorkerSleep:
@@ -329,49 +297,3 @@ class TestDiffusionWorkerWakeUp:
         mock_buffer2.data.copy_.assert_not_called()
 
         assert result is True
-
-
-class TestWorkerVllmConfigAdditionalConfig:
-    """Test worker-side VllmConfig construction with additional_config."""
-
-    def test_create_diffusion_worker_vllm_config_passes_additional_config(self, mocker: MockerFixture):
-        mock_vllm_config = mocker.Mock()
-        mock_vllm_cls = mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
-            return_value=mock_vllm_config,
-        )
-        od_config = mocker.Mock(additional_config={"torchair_graph_config": {"enabled": True}})
-
-        result = _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)
-
-        assert result is mock_vllm_config
-        assert mock_vllm_cls.call_args.kwargs["additional_config"] == od_config.additional_config
-
-    def test_create_diffusion_worker_vllm_config_falls_back_when_constructor_rejects_additional_config(
-        self, mocker: MockerFixture
-    ):
-        mock_vllm_config = mocker.Mock()
-        mock_vllm_cls = mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
-            side_effect=[
-                TypeError("VllmConfig.__init__() got an unexpected keyword argument 'additional_config'"),
-                mock_vllm_config,
-            ],
-        )
-        od_config = mocker.Mock(additional_config={"ascend_scheduler_config": {"foo": "bar"}})
-
-        result = _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)
-
-        assert result is mock_vllm_config
-        assert mock_vllm_cls.call_count == 2
-        assert getattr(mock_vllm_config, "additional_config") == od_config.additional_config
-
-    def test_create_diffusion_worker_vllm_config_reraises_other_type_errors(self, mocker: MockerFixture):
-        mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
-            side_effect=TypeError("additional_config values must be hashable"),
-        )
-        od_config = mocker.Mock(additional_config={"ascend_scheduler_config": {"foo": "bar"}})
-
-        with pytest.raises(TypeError, match="hashable"):
-            _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)

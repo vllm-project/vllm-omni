@@ -1,4 +1,15 @@
 steps:
+  - label: "Platforms Test"
+    key: ready-platforms-test
+    depends_on: upload-ready-pipeline
+    mirror_hardwares: a3_npu_2
+    commands:
+      - >-
+        pytest -s -v
+        tests/platforms/npu/test_minicpmo_code2wav_npugraph.py
+        -m 'core_model and npu and A3 and omni'
+        --run-level 'core_model'
+
   - group: ":card_index_dividers: Omni Model Test"
     key: ready-omni-group
     depends_on: upload-ready-pipeline
@@ -32,7 +43,7 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
-        mirror_hardwares: a2b3_npu_1
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"

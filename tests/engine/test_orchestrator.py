@@ -19,6 +19,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
@@ -805,8 +806,72 @@ async def test_run_abort(orchestrator_factory) -> None:
         assert stages[0].abort_calls == [["req-abort"]]
         assert stages[1].abort_calls == []
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
+        # Fire-and-forget abort must not emit an RPC result.
+        assert orchestrator_fixture.queues[2].sync_q.empty()
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> None:
+    stages = [
+        FakeStageClient(stage_type="llm", final_output=False),
+        FakeStageClient(stage_type="llm", final_output=True),
+    ]
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-ack", token_ids=[1], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-ack", token_ids=[2], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory(stages, output_processors=processors)
+    request = SimpleNamespace(request_id="req-ack", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-ack",
+            prompt=request,
+            original_prompt={"prompt": "cancel with ack"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
+
+        orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["req-ack"], rpc_id="abort-1"))
+        result = await _get_rpc_message(orchestrator_fixture)
+        assert isinstance(result, AbortResultMessage)
+        assert result.rpc_id == "abort-1"
+        assert result.success is True
+        assert result.error is None
+        assert result.rpc_correlation_key == ("abort", "abort-1")
+        assert stages[0].abort_calls == [["req-ack"]]
+        assert "req-ack" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_handle_abort_emits_error_result_on_failure() -> None:
+    rpc_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_queue,
+        stage_pools=[],
+    )
+
+    async def boom(_request_ids, *, abort=False):
+        del _request_ids, abort
+        raise RuntimeError("cleanup exploded")
+
+    orchestrator._cleanup_request_ids = boom  # type: ignore[method-assign]
+
+    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["req-fail"], rpc_id="abort-err"))
+
+    result = rpc_queue.get_nowait()
+    assert isinstance(result, AbortResultMessage)
+    assert result.rpc_id == "abort-err"
+    assert result.success is False
+    assert "cleanup exploded" in (result.error or "")
 
 
 def _duplex_open_message(

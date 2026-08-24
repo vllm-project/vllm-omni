@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3-TTS serving adapter."""
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    DEFAULT_TTS_LANGUAGES,
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+)
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -37,7 +45,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if request.task_type is None and request.voice in server.precomputed_speakers:
+            if request.task_type is None and request.voice in self.capabilities.precomputed_speakers:
                 request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 
@@ -48,21 +56,23 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Validate language (case-insensitive; normalized to the title-cased config form)
         if request.language is not None:
             request.language = request.language.title()
-            if request.language not in server.supported_languages:
+            if request.language not in self.capabilities.supported_languages:
                 return (
-                    f"Invalid language '{request.language}'. Supported: {', '.join(sorted(server.supported_languages))}"
+                    f"Invalid language '{request.language}'. Supported: "
+                    f"{', '.join(sorted(self.capabilities.supported_languages))}"
                 )
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
-            if not server.supported_speakers:
+            available_speakers = server._get_available_speakers()
+            if not available_speakers:
                 return (
                     "This model does not support CustomVoice task (no speakers configured). "
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in server.supported_speakers:
-                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            if request.voice is not None and request.voice not in available_speakers:
+                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
@@ -74,7 +84,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # Base task validation so callers don't need to pass it explicitly.
             request.x_vector_only_mode = True
             emb_len = len(request.speaker_embedding)
-            dim_err = server._validate_qwen_tts_speaker_embedding_dim(emb_len)
+            dim_err = self.validate_tts_embedding_dim(emb_len)
             if dim_err is not None:
                 return dim_err
         # Validate Base task requirements
@@ -103,8 +113,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                     file_path = Path(speaker_info["file_path"])
                     if not file_path.exists():
                         return f"Data file for uploaded speaker '{request.voice}' not found on disk"
-                elif voice_lower in server.precomputed_speakers:
-                    profile = server.precomputed_speakers[voice_lower]
+                elif voice_lower in self.capabilities.precomputed_speakers:
+                    profile = self.capabilities.precomputed_speakers[voice_lower]
                     mode = str(profile.get("mode") or "xvec").lower()
                     ref_text = request.ref_text or profile.get("ref_text")
                     if mode == "icl" and (not isinstance(ref_text, str) or not ref_text.strip()):
@@ -163,3 +173,57 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             model_type=tts_params.get("task_type", ["unknown"])[0],
             warmup_artifact_key=warmup_key,
         )
+
+    def _get_expected_speaker_embedding_dim(self) -> int:
+        """Return the loaded Qwen3-TTS speaker embedding dim, if known.
+
+        The user-provided speaker embedding is concatenated directly with
+        talker codec embeddings, so the real compatibility requirement is the
+        talker hidden size.
+        """
+        hf_config = self.ctx.engine_client.model_config.hf_config
+        talker_config = hf_config.talker_config
+        return int(talker_config.hidden_size)
+
+    def _load_precomputed_speakers(self) -> dict[str, dict]:
+        return load_precomputed_speakers(
+            self.ctx.engine_client,
+            expected_model_type=self.name,
+            validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
+                profile,
+                tensors,
+                expected_embedding_dim=self._get_expected_speaker_embedding_dim(),
+            ),
+        )
+
+    def _load_supported_languages(self) -> frozenset[str]:
+        try:
+            config = self.ctx.engine_client.model_config.hf_config.talker_config
+
+            if isinstance(config, dict):
+                codec_language_id = config.get("codec_language_id")
+            else:
+                codec_language_id = getattr(config, "codec_language_id", None)
+
+            if codec_language_id and isinstance(codec_language_id, Mapping):
+                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
+
+            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
+        except Exception as exc:
+            logger.warning("Could not load languages from model config: %s", exc)
+        return DEFAULT_TTS_LANGUAGES
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        expected_dim = self._get_expected_speaker_embedding_dim()
+        if emb_dim != expected_dim:
+            return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
+        return None
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
