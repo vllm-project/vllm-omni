@@ -2267,13 +2267,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                             "Audio sample rate changed during streaming: "
                             f"{source_sample_rate} Hz to {sample_rate_val} Hz"
                         )
-                if source_sample_rate is None:
-                    source_sample_rate = sample_rate_val
-                    if target_sample_rate is not None and target_sample_rate != source_sample_rate:
-                        resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
-
-                output_sample_rate = target_sample_rate or sample_rate_val
-
                 audio_val = audio_output[audio_key]
                 if isinstance(audio_val, list):
                     # Cumulative mode: each update grows the list; emit only new tail.
@@ -2286,6 +2279,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         prev_count += 1
                     else:
                         new_chunks = []
+
+                if new_chunks and source_sample_rate is None:
+                    if response_format == "wav" and sr_raw is None:
+                        raise ValueError("First audio output must include sample rate metadata for WAV streaming")
+                    source_sample_rate = sample_rate_val
+                    if target_sample_rate is not None and target_sample_rate != source_sample_rate:
+                        resampler = StreamingAudioResampler(source_sample_rate, target_sample_rate)
+
+                output_sample_rate = target_sample_rate or sample_rate_val
 
                 for chunk_tensor in new_chunks:
                     chunk_np = (
@@ -2304,11 +2306,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         continue
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
-                        # Assert that sample rate has been set from chunk metadata (not just default)
-                        # This ensures the WAV header contains the correct sample rate
-                        assert sr_raw is not None, (
-                            "First audio chunk must include sample rate metadata for WAV streaming"
-                        )
                         num_channels = _infer_audio_num_channels(np.asarray(chunk_np))
                         wav_header = _create_wav_header(
                             sample_rate=output_sample_rate,
@@ -3814,6 +3811,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             voice=_pick("voice"),
             instructions=_pick("instructions"),
             response_format=_pick("response_format") or "wav",
+            sample_rate=_pick("sample_rate"),
             speed=picked_speed if picked_speed is not None else 1.0,
             stream=False,
             task_type=_pick("task_type"),

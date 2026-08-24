@@ -3295,6 +3295,28 @@ class TestMergeBatchItem:
 
         assert merged.non_streaming_mode is False
 
+    def test_sample_rate_batch_default_used(self):
+        """Batch-level sample_rate should be used when the item omits it."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            sample_rate=8000,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.sample_rate == 8000
+
+    def test_sample_rate_item_override_wins(self):
+        """Per-item sample_rate should override the batch-level default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", sample_rate=24000)],
+            sample_rate=8000,
+        )
+
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+
+        assert merged.sample_rate == 24000
+
 
 def test_streaming_speech_session_config_accepts_non_streaming_mode():
     config = StreamingSpeechSessionConfig(non_streaming_mode=True)
@@ -3307,9 +3329,10 @@ def test_speech_requests_accept_supported_sample_rates(sample_rate):
     assert OpenAICreateSpeechRequest(input="hello", sample_rate=sample_rate).sample_rate == sample_rate
 
 
-def test_speech_request_rejects_unsupported_sample_rate():
+@pytest.mark.parametrize("sample_rate", [0, -8000])
+def test_speech_request_rejects_non_positive_sample_rate(sample_rate):
     with pytest.raises(ValidationError):
-        OpenAICreateSpeechRequest(input="hello", sample_rate=16000)
+        OpenAICreateSpeechRequest(input="hello", sample_rate=sample_rate)
 
 
 def test_sample_rate_uses_adapter_capabilities():
@@ -3318,6 +3341,11 @@ def test_sample_rate_uses_adapter_capabilities():
 
     server._tts_model_type = "qwen3_tts"
     assert server._validate_speech_sample_rate(request) is None
+
+    request.sample_rate = 16000
+    assert server._validate_speech_sample_rate(request) == (
+        "sample_rate=16000 is not supported by the current TTS model; supported rates: 8000, 24000"
+    )
 
     server._tts_model_type = "fish_speech"
     assert server._validate_speech_sample_rate(request) == (
@@ -5095,6 +5123,34 @@ class TestTTSAsyncOffloading:
             )
         ]
 
+        assert struct.unpack("<I", chunks[0][24:28])[0] == 8000
+
+    @pytest.mark.asyncio
+    async def test_streaming_resampler_retains_first_chunk_sample_rate_metadata(self, qwen3_tts_server):
+        async def pcm_generator():
+            first = create_mock_audio_output_for_test()
+            first.multimodal_output.update(
+                audio=torch.zeros(10, dtype=torch.float32),
+                sr=24000,
+            )
+            yield first
+
+            second = create_mock_audio_output_for_test()
+            second.multimodal_output.update(audio=torch.zeros(230, dtype=torch.float32))
+            second.multimodal_output.pop("sr", None)
+            yield second
+
+        chunks = [
+            chunk
+            async for chunk in qwen3_tts_server._generate_audio_chunks(
+                pcm_generator(),
+                "req-retained-sr",
+                response_format="wav",
+                target_sample_rate=8000,
+            )
+        ]
+
+        assert chunks[0][:4] == b"RIFF"
         assert struct.unpack("<I", chunks[0][24:28])[0] == 8000
 
     @pytest.mark.asyncio

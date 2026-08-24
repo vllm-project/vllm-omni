@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -15,7 +15,7 @@ _MAX_EMBEDDING_DIM = 8192
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
 DEFAULT_AUDIO_FORMAT: str = "wav"
-SpeechSampleRate = Literal[8000, 24000]
+SpeechSampleRate = Annotated[int, Field(gt=0)]
 
 
 def _normalize_ref_audio_value(value):
@@ -426,6 +426,7 @@ class SpeechBatchItem(BaseModel):
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] | None = None
+    sample_rate: SpeechSampleRate | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -446,6 +447,7 @@ class BatchSpeechRequest(BaseModel):
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
+    sample_rate: SpeechSampleRate | None = None
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
