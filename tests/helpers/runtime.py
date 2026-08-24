@@ -358,7 +358,13 @@ class OmniServer:
             pass
 
     def __enter__(self):
-        self._start_server()
+        try:
+            self._start_server()
+        except BaseException:
+            # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
+            # any processes / log handles already launched.
+            self.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -398,6 +404,8 @@ class OmniServerStageCli(OmniServer):
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_replica_counts = load_stage_replica_counts(resolved_cfg)
         self.stage_procs: dict[tuple[int, int], subprocess.Popen] = {}
+        self._stage_log_paths: dict[tuple[int, int], Path] = {}
+        self._stage_log_files: dict[tuple[int, int], Any] = {}
         self.proc = None
 
     def _build_stage_cmd(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> list[str]:
@@ -439,11 +447,9 @@ class OmniServerStageCli(OmniServer):
         # debugging "Stage N exited before API server ready" doesn't rely on
         # guessing; the file is surfaced in the RuntimeError message.
         log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_replica_{replica_id}_{self.master_port}.log"
-        self._stage_log_paths = getattr(self, "_stage_log_paths", {})
         stage_key = (stage_id, replica_id)
         self._stage_log_paths[stage_key] = log_path
         log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in ``__exit__``
-        self._stage_log_files = getattr(self, "_stage_log_files", {})
         self._stage_log_files[stage_key] = log_fh
         proc = subprocess.Popen(
             cmd,
@@ -463,7 +469,7 @@ class OmniServerStageCli(OmniServer):
         for (stage_id, replica_id), proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                log_path = getattr(self, "_stage_log_paths", {}).get((stage_id, replica_id))
+                log_path = self._stage_log_paths.get((stage_id, replica_id))
                 tail = ""
                 if log_path and log_path.exists():
                     try:
@@ -520,7 +526,7 @@ class OmniServerStageCli(OmniServer):
         captures them post-run. Head covers engine init; tail covers
         whatever state the stage was in when it was torn down.
         """
-        log_paths = getattr(self, "_stage_log_paths", {}) or {}
+        log_paths = self._stage_log_paths
         for stage_id, replica_id in sorted(log_paths):
             log_path = log_paths[(stage_id, replica_id)]
             if not log_path or not log_path.exists():
@@ -557,8 +563,8 @@ class OmniServerStageCli(OmniServer):
 
         # Close per-stage log handles; delete temp files unless VLLM_OMNI_KEEP_LOG is set.
         keep_logs = os.environ.get("VLLM_OMNI_KEEP_LOG", "").lower() in ("1", "true", "yes")
-        log_files = getattr(self, "_stage_log_files", {}) or {}
-        log_paths = getattr(self, "_stage_log_paths", {}) or {}
+        log_files = self._stage_log_files
+        log_paths = self._stage_log_paths
         for stage_key in set(log_files) | set(log_paths):
             log_fh = log_files.get(stage_key)
             if log_fh is not None:
@@ -603,19 +609,26 @@ class OmniRunner:
         self.model_name = model_name
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
-        from vllm_omni.entrypoints.omni import Omni
+        self.omni: Any = None
+        try:
+            from vllm_omni.entrypoints.omni import Omni
 
-        self.omni = Omni(
-            model=model_name,
-            log_stats=log_stats,
-            stage_init_timeout=stage_init_timeout,
-            init_timeout=init_timeout,
-            deploy_config=deploy_config,
-            **kwargs,
-        )
-        startup_s = time.perf_counter() - startup_t0
-        if log_stats:
-            print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
+            self.omni = Omni(
+                model=model_name,
+                log_stats=log_stats,
+                stage_init_timeout=stage_init_timeout,
+                init_timeout=init_timeout,
+                deploy_config=deploy_config,
+                **kwargs,
+            )
+            startup_s = time.perf_counter() - startup_t0
+            if log_stats:
+                print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
+        except BaseException:
+            # ``with OmniRunner(...)`` never reaches ``__enter__``/``__exit__``
+            # when construction fails after worker processes have started.
+            self.__exit__(None, None, None)
+            raise
 
     def get_default_sampling_params_list(self) -> list[Any]:
         if not hasattr(self.omni, "default_sampling_params_list"):
@@ -876,8 +889,9 @@ class OmniRunner:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if hasattr(self.omni, "close"):
-            self.omni.close()
+        omni = getattr(self, "omni", None)
+        if omni is not None and hasattr(omni, "close"):
+            omni.close()
         self._cleanup_process()
         cleanup_test_environment()
 
