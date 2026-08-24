@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import concurrent.futures
 import contextlib
 import importlib
@@ -443,6 +446,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     plan.engine_args_dict = {}
 
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    runtime._init_visible_devices_baseline = "0"
     plan.metadata.runtime_cfg = {
         "devices": "0",
         "env": {runtime_env_var: "stage-value"},
@@ -663,11 +667,12 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
 
     monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
-    monkeypatch.setattr(
-        runtime_mod.StageEngineCoreClientBase,
-        "make_async_mp_client",
-        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
-    )
+
+    def _make_async_mp_client(**kwargs):
+        captured["client_log_stats"] = kwargs["log_stats"]
+        return stage_client
+
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _make_async_mp_client)
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
     assert captured["log_stats"] is True
@@ -889,7 +894,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
 
     def _initialize_stage_replicas(_stage_plans, _stage_init_timeout):
         exc = RuntimeError("replica launch failed")
-        exc._initialized_clients_by_stage = {0: [None, initialized_client]}
+        setattr(exc, "_initialized_clients_by_stage", {0: [None, initialized_client]})
         raise exc
 
     monkeypatch.setattr(runtime, "_initialize_stage_replicas", _initialize_stage_replicas)

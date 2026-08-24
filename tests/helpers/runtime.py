@@ -75,14 +75,17 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     ) from last_exc
 
 
-def get_file_init_method() -> str:
-    """Return a fresh ``file://`` init_method for ``torch.distributed`` process groups.
+def get_distributed_init_method(prefix: str = "torch_dist_init_") -> str:
+    """Return a ``file://`` init_method for a ``torch.distributed`` process group.
 
-    Rendezvous happens through a filesystem path instead of a pre-agreed TCP port,
-    so there's no bind-time race to retry around: the path is unique per call and
-    the real rank-0 process is the only one that ever creates it.
+    Args:
+        prefix: Prefix for the temporary rendezvous filename. Defaults to
+            ``torch_dist_init_``.
+
+    Returns:
+        An init_method string for ``torch.distributed.init_process_group``.
     """
-    with tempfile.NamedTemporaryFile(prefix="torch_dist_init_") as f:
+    with tempfile.NamedTemporaryFile(prefix=prefix) as f:
         return f"file://{f.name}"
 
 
