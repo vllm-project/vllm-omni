@@ -90,6 +90,9 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        # Queue-less streams need the request state to process the terminal
+        # engine output sent after an idle final input update.
+        self.awaiting_terminal_output: bool = False
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -425,6 +428,29 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             else:
                 self._native_text_metrics_by_request.pop(request_id, None)
         return super().abort_requests(request_ids, internal)
+
+    def _update_streaming_request_state(
+        self,
+        req_state: RequestState,
+        request: EngineCoreRequest,
+        prompt: str | None,
+    ) -> None:
+        """Retain queue-less idle streams until their terminal output arrives.
+
+        StagePool does not provide a per-request collector, so the upstream
+        idle-final path cannot emit ``STREAM_FINISHED``. Retaining the state
+        lets the scheduler's terminal output flow through normal processing.
+        """
+        if isinstance(req_state, OmniRequestState) and not request.resumable:
+            if req_state.awaiting_terminal_output:
+                # A final update can be retried before the terminal output.
+                return
+            if req_state.queue is None and req_state.streaming_input and req_state.input_chunk_queue is None:
+                req_state.streaming_input = False
+                req_state.awaiting_terminal_output = True
+                return
+
+        super()._update_streaming_request_state(req_state, request, prompt)
 
     def add_request(
         self,
