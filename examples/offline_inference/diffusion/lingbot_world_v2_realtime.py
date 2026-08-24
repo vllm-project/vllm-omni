@@ -172,7 +172,14 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     )
     manager = ARDiffusionSessionManager(
         tick_consumer=consumer,
-        lifecycle=ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=180.0),
+        lifecycle=ARDiffusionWorkerLifecycle(
+            engine,
+            stage_ids=[0],
+            timeout=180.0,
+            # Ticks are pinned to the replica owning the session's AR state;
+            # reset/close hand the id back to the load balancer.
+            route_release=consumer.release_session_route,
+        ),
         max_pending_events=32,
         control_reducer_factory=LingBotCameraControlReducer,
     )

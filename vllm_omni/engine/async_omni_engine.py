@@ -655,6 +655,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        session_id: str | None = None,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
@@ -749,6 +750,7 @@ class AsyncOmniEngine:
             preprocess_ms=_preprocess_ms,
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
+            session_id=session_id,
         )
 
     def _build_cfg_companions(
@@ -1314,6 +1316,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        session_id: str | None = None,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -1337,6 +1340,7 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            session_id=session_id,
         )
         # CFG companions are built before the parent is admitted, so the group
         # is all-or-nothing: a build failure raises here, nothing is enqueued,
@@ -1378,6 +1382,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        session_id: str | None = None,
     ) -> None:
         """Async add_request API."""
         self.add_request(
@@ -1395,7 +1400,29 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            session_id=session_id,
         )
+
+    def release_session_affinity(
+        self,
+        session_id: str,
+        *,
+        stage_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Drop the replica route pinned to ``session_id``; idempotent.
+
+        Called when a stateful session is reset or closed, after its
+        worker-local state has been released. Only the routing entry goes
+        away here — freeing the state itself is the session lifecycle's job.
+
+        ``stage_ids`` defaults to every stage, which is what a caller that
+        cannot know where the session's state landed should use.
+        """
+        pools = self.stage_pools
+        selected = range(len(pools)) if stage_ids is None else stage_ids
+        for stage_id in selected:
+            if 0 <= stage_id < len(pools):
+                pools[stage_id].release_session(session_id)
 
     def add_streaming_update(
         self,

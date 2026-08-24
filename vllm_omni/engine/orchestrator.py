@@ -710,6 +710,7 @@ class Orchestrator:
                 req_state,
                 prompt,
                 prompt_text=msg.output_prompt_text,
+                session_id=msg.session_id,
             ),
             req_id=request_id,
             stage_id=stage_id,

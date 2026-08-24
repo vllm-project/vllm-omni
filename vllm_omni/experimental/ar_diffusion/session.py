@@ -15,11 +15,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, Protocol, TypeVar
 
+from vllm.logger import init_logger
+
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
 )
+
+logger = init_logger(__name__)
 
 
 class ARDiffusionSessionError(RuntimeError):
@@ -180,7 +184,23 @@ def _collect_rpc_support_results(value: Any, *, errors: list[str], supported: li
 
 
 class ARDiffusionWorkerLifecycle:
-    """Routes reset/close through the existing orchestrator collective RPC."""
+    """Routes reset/close through the existing orchestrator collective RPC.
+
+    The RPC fans out to every live replica of the selected stages and the
+    worker-side release is idempotent for unknown session ids, so a replicated
+    stage is cleaned up correctly without the caller knowing which replica
+    owned the session.
+
+    ``route_release`` is invoked after a successful reset/close to drop the
+    session's replica affinity (see ``StagePool.release_session``). It runs
+    last, and only on success: a session whose worker state could not be
+    released must stay pinned to the replica still holding it.
+
+    It is optional only for backwards compatibility. ``StagePool.release_session``
+    is the only path that drops a binding, so a lifecycle built without the hook
+    leaves one entry per session behind for the life of the process; construction
+    warns in that case.
+    """
 
     def __init__(
         self,
@@ -188,6 +208,7 @@ class ARDiffusionWorkerLifecycle:
         *,
         stage_ids: Sequence[int],
         timeout: float | None = None,
+        route_release: Callable[[str], None] | None = None,
     ) -> None:
         normalized_stage_ids = tuple(stage_ids)
         if not normalized_stage_ids:
@@ -197,6 +218,18 @@ class ARDiffusionWorkerLifecycle:
         self._rpc_client = rpc_client
         self._stage_ids = normalized_stage_ids
         self._timeout = timeout
+        self._route_release = route_release
+        if route_release is None:
+            # Releasing the worker state does not release the replica route:
+            # StagePool.release_session is the only path that drops a binding.
+            # Without this hook a closed session keeps its affinity entry
+            # forever, so the table grows with every session the server sees.
+            logger.warning(
+                "ARDiffusionWorkerLifecycle was built without route_release, so "
+                "reset/close will not free the session's replica affinity. Pass "
+                "ARDiffusionOmniTickConsumer.release_session_route to keep the "
+                "StagePool session table bounded on a replicated stage."
+            )
 
     async def _invoke(self, method: str, session_id: str) -> None:
         results = await self._rpc_client.collective_rpc(
@@ -213,11 +246,19 @@ class ARDiffusionWorkerLifecycle:
         if not supported or not all(supported):
             raise ARDiffusionSessionError(f"{method} is not supported by every selected worker.")
 
+    def _release_route(self, session_id: str) -> None:
+        if self._route_release is not None:
+            self._route_release(session_id)
+
     async def reset_session(self, session_id: str) -> None:
         await self._invoke("reset_ar_diffusion_session", session_id)
+        # Every replica has now dropped this session's state, so the next tick
+        # is free to be re-placed by the ordinary load-balancing policy.
+        self._release_route(session_id)
 
     async def close_session(self, session_id: str) -> None:
         await self._invoke("close_ar_diffusion_session", session_id)
+        self._release_route(session_id)
 
 
 def _default_request_id(session_id: str, chunk_index: int) -> str:

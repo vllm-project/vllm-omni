@@ -27,6 +27,10 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    # Routing key for long-lived stateful workloads (realtime AR-Diffusion
+    # ticks): pins this request to the replica owning the session's persistent
+    # state. ``None`` keeps the ordinary request-level routing behavior.
+    session_id: str | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

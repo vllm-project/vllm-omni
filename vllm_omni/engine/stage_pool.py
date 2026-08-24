@@ -57,6 +57,19 @@ class StageUnavailableError(RuntimeError):
     """
 
 
+class SessionOwnerLostError(StageUnavailableError):
+    """Raised when the replica owning a live session's state is gone.
+
+    Phase 0 session affinity is fail-closed: persistent per-session state is
+    worker-local and is not migrated or rebuilt, so a tick for a session whose
+    owner died cannot be re-routed to a replica that holds no state without
+    silently corrupting the rollout. Subclassing ``StageUnavailableError``
+    keeps the existing dispatch guards' behavior — fail this one request and
+    keep the server serving — while letting callers distinguish "lost owner"
+    from ordinary "no replica available".
+    """
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -83,6 +96,13 @@ class StagePool:
     In non-distributed mode (no hub attached), :meth:`pick` falls back to the
     legacy ``select_replica_id`` round-robin path so the multi-stage
     in-process invocation is unchanged.
+
+    Session affinity: callers that own long-lived worker-local state (realtime
+    AR-Diffusion sessions) pass a ``session_id`` to the dispatch entry points.
+    The first tick picks a replica with the ordinary load-balancing policy and
+    binds the session to it; every later tick for that session is routed back
+    to the owning replica until :meth:`release_session` runs. Requests without
+    a ``session_id`` are routed exactly as before.
 
     Dynamic replica membership: when a remote replica is added or removed
     (driven by :class:`Orchestrator` via :meth:`add_client` /
@@ -140,6 +160,23 @@ class StagePool:
         # Kept separate from the legacy ``_request_bindings`` so the two
         # binding shapes do not collide.
         self._affinity: dict[str, str] = {}
+
+        # ``session_id`` → replica route for long-lived stateful sessions
+        # (e.g. realtime AR-Diffusion ticks). Deliberately a third pair of
+        # maps rather than a reuse of the request-scoped ones above: a session
+        # outlives every individual request bound to it, is keyed in its own
+        # namespace so a session_id can never collide with a request_id, and
+        # is released explicitly on reset/close instead of on request
+        # completion. Same split as above — replica_id locally, input_addr in
+        # distributed mode, where replica_id is not stable across the hub.
+        self._session_bindings: dict[str, int] = {}
+        self._session_affinity: dict[str, str] = {}
+        # Sessions whose owner replica died. The route row is dropped eagerly
+        # so nothing points at a dead replica, but the id is remembered so the
+        # next tick still fails closed instead of silently landing on a replica
+        # that holds none of the session's state. Cleared only by an explicit
+        # release_session(), i.e. session reset/close.
+        self._lost_sessions: set[str] = set()
 
     # ---- Stage-level properties ----
 
@@ -296,6 +333,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -306,9 +344,23 @@ class StagePool:
 
         In non-distributed (legacy) mode: delegates to
         :meth:`select_replica_id`.
+
+        When ``session_id`` is given, an existing session route wins over every
+        other policy, and a fresh pick binds the session to the chosen replica.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_id=session_id,
+            )
+
+        # 0. Session-sticky: the owner of this session's state wins outright.
+        if session_id is not None:
+            owner_replica_id = self._resolve_session_replica_id(session_id)
+            if owner_replica_id is not None:
+                self._affinity[request_id] = self._session_affinity[session_id]
+                return owner_replica_id
 
         # 1. Sticky: previously bound and still serviceable?
         bound_addr = self._affinity.get(request_id)
@@ -338,6 +390,8 @@ class StagePool:
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if session_id is not None:
+                    self.bind_session(session_id, replica_id)
                 return replica_id
 
             now = _time.monotonic()
@@ -346,6 +400,15 @@ class StagePool:
                     f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s"
                 )
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
+            # The sleep above is the only suspension point between the session
+            # lookup at step 0 and the bind below, so it is also the only place
+            # a concurrent first tick for the same session could have installed
+            # an owner. Re-resolve rather than racing it to the bind.
+            if session_id is not None:
+                owner_replica_id = self._resolve_session_replica_id(session_id)
+                if owner_replica_id is not None:
+                    self._affinity[request_id] = self._session_affinity[session_id]
+                    return owner_replica_id
 
     def preselect_replica_id(
         self,
@@ -353,6 +416,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -365,7 +429,17 @@ class StagePool:
         submit-time router wait without blocking the caller.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_id=session_id,
+            )
+
+        if session_id is not None:
+            owner_replica_id = self._resolve_session_replica_id(session_id)
+            if owner_replica_id is not None:
+                self._affinity[request_id] = self._session_affinity[session_id]
+                return owner_replica_id
 
         bound_addr = self._affinity.get(request_id)
         if bound_addr is not None:
@@ -390,6 +464,8 @@ class StagePool:
         lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
+        if session_id is not None:
+            self.bind_session(session_id, replica_id)
         return replica_id
 
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
@@ -431,11 +507,139 @@ class StagePool:
         self._affinity.pop(request_id, None)
         self.release_binding(request_id)
 
+    # ---- Session affinity (long-lived stateful sessions) ----
+
+    def has_session(self, session_id: str) -> bool:
+        """True iff ``session_id`` has ever acquired an owner and not been released.
+
+        Includes sessions whose owner has since died, so callers can tell
+        "never bound" (route freely) apart from "owner lost" (fail closed).
+        """
+        return (
+            session_id in self._session_bindings
+            or session_id in self._session_affinity
+            or session_id in self._lost_sessions
+        )
+
+    def get_session_replica_id(self, session_id: str) -> int | None:
+        """Return the replica owning ``session_id``, or ``None`` if unusable.
+
+        ``None`` covers both "no binding" and "the bound replica is gone or
+        DOWN"; use :meth:`has_session` to distinguish them.
+        """
+        if self._hub is not None:
+            input_addr = self._session_affinity.get(session_id)
+            if input_addr is None:
+                return None
+            return self._serviceable_replica_id_for_addr(input_addr)
+
+        replica_id = self._session_bindings.get(session_id)
+        if replica_id is None:
+            return None
+        if not self.is_replica_available(replica_id) or self.clients[replica_id] is None:
+            return None
+        return replica_id
+
+    def bind_session(self, session_id: str, replica_id: int) -> None:
+        """Pin ``session_id`` to ``replica_id`` for the rest of its lifetime."""
+        if not 0 <= replica_id < self.num_replicas:
+            raise ValueError(f"stage {self.stage_id} has no replica {replica_id} to bind session {session_id!r} to")
+
+        if self._hub is None:
+            self._session_bindings[session_id] = replica_id
+            self._lost_sessions.discard(session_id)
+            return
+
+        # Distributed mode keys on the address, never the slot index: a slot
+        # can be reused by a different replica after remove/add, which would
+        # silently re-point the session at a worker holding none of its state.
+        client = self.clients[replica_id]
+        input_addr = None if client is None else self._client_input_addr(client)
+        if input_addr is None:
+            raise ValueError(
+                f"stage {self.stage_id} replica {replica_id} advertises no input address; "
+                f"session {session_id!r} cannot be pinned to it"
+            )
+        self._session_affinity[session_id] = input_addr
+        self._lost_sessions.discard(session_id)
+
+    def release_session(self, session_id: str) -> None:
+        """Drop the route for ``session_id``; idempotent.
+
+        Called on session reset/close, and the only thing that clears a
+        lost-owner tombstone. Only the routing entry is dropped here —
+        releasing the worker-local state itself is the session lifecycle's job.
+        """
+        self._session_bindings.pop(session_id, None)
+        self._session_affinity.pop(session_id, None)
+        self._lost_sessions.discard(session_id)
+
+    def session_ids_for_replica(self, replica_id: int) -> list[str]:
+        """Return the sessions currently owned by ``replica_id``."""
+        owned = [sid for sid, bound in self._session_bindings.items() if bound == replica_id]
+        owned.extend(
+            sid
+            for sid, input_addr in self._session_affinity.items()
+            if self._addr_to_replica_id.get(input_addr) == replica_id
+        )
+        return list(dict.fromkeys(owned))
+
+    def orphan_replica_sessions(self, replica_id: int) -> list[str]:
+        """Tombstone every session owned by ``replica_id``; return their ids.
+
+        The route row is dropped so nothing points at the dead replica, but the
+        session stays known-lost: every later tick for it fails closed with
+        :class:`SessionOwnerLostError` rather than silently landing on a
+        replica that holds none of its state. Call sites are replica eviction
+        and hub-driven address invalidation.
+        """
+        orphaned = self.session_ids_for_replica(replica_id)
+        for session_id in orphaned:
+            self._session_bindings.pop(session_id, None)
+            self._session_affinity.pop(session_id, None)
+            self._lost_sessions.add(session_id)
+        if orphaned:
+            logger.warning(
+                "[StagePool] stage %s replica %s died owning %d live session(s); "
+                "their ticks will fail until the sessions are reset or closed: %s",
+                self.stage_id,
+                replica_id,
+                len(orphaned),
+                orphaned,
+            )
+        return orphaned
+
+    def _resolve_session_replica_id(self, session_id: str) -> int | None:
+        """Return the owner replica for ``session_id``, failing closed if lost.
+
+        Returns ``None`` only for a session that has never been placed, which
+        is the caller's signal to run the ordinary load-balancing policy.
+        """
+        replica_id = self.get_session_replica_id(session_id)
+        if replica_id is not None:
+            return replica_id
+        if self.has_session(session_id):
+            # Bound before, but the owner is not serviceable now. Tombstone it
+            # so the session cannot be resurrected against fresh, empty state
+            # by this or any later tick, and surface a distinguishable failure.
+            self._session_bindings.pop(session_id, None)
+            self._session_affinity.pop(session_id, None)
+            self._lost_sessions.add(session_id)
+            raise SessionOwnerLostError(
+                f"stage {self.stage_id}: the replica owning session {session_id!r} is no longer available; "
+                "its worker-local state is not recoverable in this version. "
+                "Reset or close the session to release the route."
+            )
+        return None
+
     def invalidate_addr(self, input_addr: str) -> list[str]:
         """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is not None:
+            self.orphan_replica_sessions(replica_id)
         return affected
 
     # ---- Legacy (non-distributed) route binding ----
@@ -534,6 +738,7 @@ class StagePool:
         """Evict a failed replica from admission and release its bindings."""
         if 0 <= replica_id < self.num_replicas:
             self._unavailable_replicas.add(replica_id)
+        self.orphan_replica_sessions(replica_id)
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
@@ -551,8 +756,15 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
+        if session_id is not None:
+            owner_replica_id = self._resolve_session_replica_id(session_id)
+            if owner_replica_id is not None:
+                self._request_bindings[request_id] = owner_replica_id
+                return owner_replica_id
+
         cached = self.get_bound_replica_id(request_id)
         if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
@@ -580,6 +792,8 @@ class StagePool:
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
+        if session_id is not None:
+            self.bind_session(session_id, chosen)
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
@@ -947,10 +1161,15 @@ class StagePool:
         *,
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
     ) -> int:
-        """Submit a stage-entry request into this pool."""
+        """Submit a stage-entry request into this pool.
+
+        ``session_id`` pins this request to the replica owning that session's
+        persistent state; see the session-affinity note on :class:`StagePool`.
+        """
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -965,6 +1184,7 @@ class StagePool:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                session_id=session_id,
             )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
@@ -973,6 +1193,7 @@ class StagePool:
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+            session_id=session_id,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -1085,11 +1306,20 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_id=session_id,
+            )
+        return self.select_replica_id(
+            request_id,
+            affinity_request_id=affinity_request_id,
+            session_id=session_id,
+        )
 
     # ---- Stage-local polling ----
 

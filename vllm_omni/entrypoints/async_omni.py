@@ -467,6 +467,7 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        session_id: str | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -490,6 +491,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            session_id: Optional routing key for long-lived stateful
+                workloads. Every request carrying the same ``session_id`` is
+                routed to the replica that owns that session's persistent
+                worker-local state; the first one is placed by the ordinary
+                load-balancing policy. Release it with
+                :meth:`release_session_affinity` when the session ends.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -609,6 +616,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    session_id=session_id,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -1028,6 +1036,20 @@ class AsyncOmni(EngineClient, OmniBase):
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
+
+    def release_session_affinity(
+        self,
+        session_id: str,
+        *,
+        stage_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Drop the replica route pinned to ``session_id``; idempotent.
+
+        See :meth:`generate` for how a session acquires a route. Call this
+        once the session's worker-local state has been released, so the id is
+        free to be placed again.
+        """
+        self.engine.release_session_affinity(session_id, stage_ids=stage_ids)
 
     async def submit_interaction_async(
         self,

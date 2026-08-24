@@ -105,8 +105,9 @@ tested commit.
 
 - Only the 14B causal-fast checkpoint is supported.
 - The realtime control plane is internal; there is no public server transport yet.
-- AR-Diffusion stages currently require one replica because session-affine
-  routing across replicas is not implemented.
+- AR-Diffusion stages may be replicated: ticks are pinned to the replica
+  owning the session's state. Session state is not migrated, so if that
+  replica is lost the session fails and must be reset or closed.
 - One AR block is generated per request and `max_num_seqs` must be one.
 - Stateful streaming VAE decode is not implemented; the realtime example emits
   latent chunks.

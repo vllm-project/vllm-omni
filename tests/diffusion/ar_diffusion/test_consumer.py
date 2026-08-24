@@ -33,8 +33,8 @@ class FakeStagePool:
 
 
 class FakeEngine:
-    def __init__(self, num_replicas: int = 1) -> None:
-        self.stage_pools = [FakeStagePool(num_replicas)]
+    def __init__(self, num_replicas: int = 1, num_stages: int = 2) -> None:
+        self.stage_pools = [FakeStagePool(num_replicas) for _ in range(num_stages)]
 
 
 class FakeGenerateClient:
@@ -51,6 +51,10 @@ class FakeGenerateClient:
         self.applied_event_ids = applied_event_ids
         self.output_error = output_error
         self.calls: list[dict[str, Any]] = []
+        self.released_sessions: list[tuple[str, Any]] = []
+
+    def release_session_affinity(self, session_id: str, *, stage_ids: Sequence[int] | None = None) -> None:
+        self.released_sessions.append((session_id, None if stage_ids is None else list(stage_ids)))
 
     async def generate(
         self,
@@ -59,6 +63,7 @@ class FakeGenerateClient:
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams],
         output_modalities: list[str] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[OmniRequestOutput]:
         self.calls.append(
             {
@@ -66,6 +71,7 @@ class FakeGenerateClient:
                 "request_id": request_id,
                 "sampling_params_list": sampling_params_list,
                 "output_modalities": output_modalities,
+                "session_id": session_id,
             }
         )
         params = sampling_params_list[0]
@@ -112,13 +118,25 @@ def make_tick() -> ARDiffusionTickRequest:
     )
 
 
-def test_consumer_rejects_replicated_ar_diffusion_stage() -> None:
-    client = FakeGenerateClient(num_replicas=2)
+def test_consumer_accepts_replicated_ar_diffusion_stage() -> None:
+    """Replicated AR stages are allowed now that ticks carry session affinity."""
+    client = FakeGenerateClient(num_replicas=4)
 
-    with pytest.raises(
-        ValueError,
-        match=r"require exactly one replica.*num_replicas=2",
-    ):
+    consumer = ARDiffusionOmniTickConsumer(
+        client,
+        prompt_provider=lambda tick: tick.prompt or "",
+        sampling_params_list=[OmniDiffusionSamplingParams()],
+        diffusion_stage_id=0,
+    )
+
+    assert consumer is not None
+    assert client.calls == []
+
+
+def test_consumer_rejects_non_positive_replica_count() -> None:
+    client = FakeGenerateClient(num_replicas=0)
+
+    with pytest.raises(ValueError, match=r"positive num_replicas"):
         ARDiffusionOmniTickConsumer(
             client,
             prompt_provider=lambda tick: tick.prompt or "",
@@ -126,7 +144,34 @@ def test_consumer_rejects_replicated_ar_diffusion_stage() -> None:
             diffusion_stage_id=0,
         )
 
-    assert client.calls == []
+
+@pytest.mark.asyncio
+async def test_consumer_pins_tick_to_its_session() -> None:
+    client = FakeGenerateClient(num_replicas=2)
+    consumer = ARDiffusionOmniTickConsumer(
+        client,
+        prompt_provider=lambda tick: tick.prompt or "",
+        sampling_params_list=[OmniDiffusionSamplingParams()],
+        diffusion_stage_id=0,
+    )
+
+    await consumer.execute_tick(make_tick())
+
+    assert client.calls[0]["session_id"] == "world-1"
+
+
+def test_consumer_releases_session_route_on_the_owning_stage() -> None:
+    client = FakeGenerateClient(num_replicas=2)
+    consumer = ARDiffusionOmniTickConsumer(
+        client,
+        prompt_provider=lambda tick: tick.prompt or "",
+        sampling_params_list=[OmniDiffusionSamplingParams(), OmniDiffusionSamplingParams()],
+        diffusion_stage_id=1,
+    )
+
+    consumer.release_session_route("world-1")
+
+    assert client.released_sessions == [("world-1", [1])]
 
 
 @pytest.mark.asyncio
