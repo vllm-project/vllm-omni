@@ -251,6 +251,7 @@ class AsyncOmniEngine:
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
         self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
+        self._engines_waiting_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -415,6 +416,7 @@ class AsyncOmniEngine:
                 pd_config=pd_config,
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
+                engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
