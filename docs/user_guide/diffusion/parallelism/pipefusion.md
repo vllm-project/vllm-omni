@@ -108,33 +108,6 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 --vae-patch-parallel-size=4
 ```
 
-### Online Serving
-
-Enable PipeFusion in online serving:
-
-```bash
-vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 \
-  --pipeline-parallel-size 4 \
-  --enable-pipefusion \
-  --vae-patch-parallel-size 4
-```
-
-Request-level parameters can be passed through the video generation request:
-
-```bash
-curl http://localhost:8091/v1/videos/generations \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-    "prompt": "A cinematic drone shot over snowy mountains",
-    "height": 704,
-    "width": 1280,
-    "num_frames": 81,
-    "pipefusion_warmup_steps": 1,
-    "pipefusion_split_dim": "height"
-  }'
-```
-
 ---
 
 ## Configuration Parameters
@@ -146,7 +119,7 @@ In `DiffusionParallelConfig`
 | `pipeline_parallel_size` | int  | 1       | Number of pipeline-parallel stages. Must be greater than 1 for PipeFusion    |
 | `enable_pipefusion`      | bool | `False` | Enables PipeFusion patch-wise async execution on top of Pipeline Parallelism |
 
-In `OmniDiffusionSamplingParams` or video generation requests
+In `OmniDiffusionSamplingParams`
 
 | Parameter                 | Type                                | Default | Description                                                                                                       |
 |---------------------------|-------------------------------------|---------|-------------------------------------------------------------------------------------------------------------------|
@@ -220,7 +193,7 @@ parallel_config = DiffusionParallelConfig(
 )
 ```
 
-2. If you are on one GPU, disable PipeFusion.
+1. If you are on one GPU, disable PipeFusion.
 
 ### Common Issue 2: PipeFusion run hangs
 

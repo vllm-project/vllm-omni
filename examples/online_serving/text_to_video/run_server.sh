@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Wan2.2 online serving startup script
 
 MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
@@ -28,4 +31,4 @@ vllm serve "$MODEL" --omni \
     --boundary-ratio "$BOUNDARY_RATIO" \
     --flow-shift "$FLOW_SHIFT" \
     $CACHE_BACKEND_FLAG \
-    $(if [ "$ENABLE_CACHE_DIT_SUMMARY" != "0" ]; then echo "--enable-cache-dit-summary"; fi) "$@"
+    $(if [ "$ENABLE_CACHE_DIT_SUMMARY" != "0" ]; then echo "--enable-cache-dit-summary"; fi)
