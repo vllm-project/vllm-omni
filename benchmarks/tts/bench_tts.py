@@ -57,8 +57,13 @@ _TASK_TO_DATASET: dict[str, str] = {
     "sound_effect": "sound-effect",
 }
 
+# Report median + P99 first-audio latency per concurrency
+_DEFAULT_METRIC_PERCENTILES = "50,99"
+
 # Default design dataset path (bundled with the repo)
-_DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
+_DEFAULT_DESIGN_DATASET_PATH = str(
+    _REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design"
+)
 
 
 def load_model_configs(path: Path) -> dict[str, Any]:
@@ -87,12 +92,15 @@ def build_bench_args(
     served_model_name: str | None = None,
     num_warmups: int = 2,
     request_seed: int | None = None,
+    metric_percentiles: str = _DEFAULT_METRIC_PERCENTILES,
 ) -> list[str]:
     """Build the ``vllm bench serve --omni`` command for one (task, concurrency) run."""
     dataset_name = _TASK_TO_DATASET[task]
     backend: str = model_cfg["backend"]
     endpoint: str = model_cfg["endpoint"]
-    task_extra_body: dict[str, Any] = dict((model_cfg.get("task_extra_body") or {}).get(task) or {})
+    task_extra_body: dict[str, Any] = dict(
+        (model_cfg.get("task_extra_body") or {}).get(task) or {}
+    )
     if request_seed is not None:
         task_extra_body["seed"] = request_seed
 
@@ -127,6 +135,8 @@ def build_bench_args(
         str(num_warmups),
         "--percentile-metrics",
         "ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun",
+        "--metric-percentiles",
+        metric_percentiles,
     ]
 
     if resolved_dataset_path:
@@ -180,7 +190,9 @@ def run_one_benchmark(cmd: list[str]) -> dict[str, Any] | None:
             result_file = result_dir / cmd[fname_idx + 1]
         else:
             # find most recently modified json
-            jsons = sorted(result_dir.glob("result_*.json"), key=lambda p: p.stat().st_mtime)
+            jsons = sorted(
+                result_dir.glob("result_*.json"), key=lambda p: p.stat().st_mtime
+            )
             result_file = jsons[-1] if jsons else None
         if result_file and result_file.is_file():
             return json.loads(result_file.read_text(encoding="utf-8"))
@@ -189,13 +201,48 @@ def run_one_benchmark(cmd: list[str]) -> dict[str, Any] | None:
     return None
 
 
+def _percentile_value(
+    percentiles_rows: Any, target: float, default: float = float("nan")
+) -> float:
+    """Extract the value for ``target`` from a ``[[p, value], ...]`` row list."""
+    if not isinstance(percentiles_rows, list):
+        return default
+    for row in percentiles_rows:
+        try:
+            p, value = row
+        except (TypeError, ValueError):
+            continue
+        if float(p) == float(target):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
+def _first_audio_latency_rows(result: dict[str, Any]) -> tuple[float, float]:
+    """Return (median, P99) of client-observed first-audio latency (ms)."""
+    rows = result.get("percentiles_audio_ttfp_ms")
+    p50 = result.get("median_audio_ttfp_ms", result.get("p50_audio_ttfp_ms"))
+    p99 = result.get("p99_audio_ttfp_ms")
+    if p50 is None and rows:
+        p50 = _percentile_value(rows, 50.0)
+    if p99 is None and rows:
+        p99 = _percentile_value(rows, 99.0)
+    return (
+        float(p50 if p50 is not None else float("nan")),
+        float(p99 if p99 is not None else float("nan")),
+    )
+
+
 def print_summary_table(results: list[dict[str, Any]]) -> None:
     """Print a unified metrics table across all (task, concurrency) runs."""
     if not results:
         return
     header = (
         f"{'Task':<16} {'Concurrency':>11} {'RTF mean':>10} "
-        f"{'TTFP (ms)':>10} {'Throughput':>12} {'WER':>7} {'SIM':>7} {'UTMOS':>7}"
+        f"{'TTFP (ms)':>11} {'TTFP p50':>10} {'TTFP p99':>10} "
+        f"{'Throughput':>12} {'WER':>7} {'SIM':>7} {'UTMOS':>7}"
     )
     print(f"\n{'=' * len(header)}")
     print("BENCHMARK SUMMARY")
@@ -207,6 +254,7 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
         conc = r.get("_concurrency", "?")
         rtf = r.get("mean_audio_rtf", float("nan"))
         ttfp = r.get("mean_audio_ttfp_ms", float("nan"))
+        ttfp_p50, ttfp_p99 = _first_audio_latency_rows(r)
         throughput = r.get("audio_throughput", float("nan"))
         wer = r.get("seed_tts_mean_wer", float("nan"))
         sim = r.get("seed_tts_mean_sim", float("nan"))
@@ -216,7 +264,8 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
             return f"{v:.{digits}f}" if not math.isnan(v) else "  n/a"
 
         print(
-            f"{task:<16} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>10} "
+            f"{task:<16} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>11} "
+            f"{fmt(ttfp_p50, 0):>10} {fmt(ttfp_p99, 0):>10} "
             f"{fmt(throughput):>12} {fmt(wer):>7} {fmt(sim):>7} {fmt(utmos):>7}"
         )
     print("=" * len(header))
@@ -229,7 +278,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--model", required=True, help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)"
+        "--model",
+        required=True,
+        help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)",
     )
     parser.add_argument(
         "--served-model-name",
@@ -237,9 +288,15 @@ def main() -> None:
         help="Model name/path accepted by the running server. Use this when --model selects a registry entry "
         "but the server was launched from a local bundle path.",
     )
-    parser.add_argument("--task", default="all", help="Task type: voice_clone | default_voice | voice_design | all")
+    parser.add_argument(
+        "--task",
+        default="all",
+        help="Task type: voice_clone | default_voice | voice_design | all",
+    )
     parser.add_argument("--locale", default="en", choices=["en", "zh"])
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4], metavar="N")
+    parser.add_argument(
+        "--concurrency", type=int, nargs="+", default=[1, 4], metavar="N"
+    )
     parser.add_argument(
         "--num-prompts",
         type=int,
@@ -248,7 +305,12 @@ def main() -> None:
         metavar="N",
         help="Number of prompts per run. If one value, applied to all concurrency levels.",
     )
-    parser.add_argument("--num-warmups", type=int, default=2, help="Warmup requests before each measured run")
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=2,
+        help="Warmup requests before each measured run",
+    )
     parser.add_argument(
         "--request-seed",
         type=int,
@@ -256,13 +318,23 @@ def main() -> None:
         help="Optional model sampling seed added to every request body for reproducible quality runs",
     )
     parser.add_argument(
-        "--dataset-path", default=None, help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
+        "--dataset-path",
+        default=None,
+        help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)",
     )
-    parser.add_argument("--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval")
-    parser.add_argument("--output-dir", default=None, help="Directory to save result JSON files")
+    parser.add_argument(
+        "--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval"
+    )
+    parser.add_argument(
+        "--output-dir", default=None, help="Directory to save result JSON files"
+    )
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-configs", default=str(_DEFAULT_MODEL_CONFIGS), help="Path to model_configs.yaml")
+    parser.add_argument(
+        "--model-configs",
+        default=str(_DEFAULT_MODEL_CONFIGS),
+        help="Path to model_configs.yaml",
+    )
     parser.add_argument(
         "--output-len",
         type=int,
@@ -272,7 +344,20 @@ def main() -> None:
         "this as 'max_new_frames' so smaller values cap audio length per "
         "request and keep bench runtime tractable).",
     )
-    parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
+    parser.add_argument(
+        "--metric-percentiles",
+        default=_DEFAULT_METRIC_PERCENTILES,
+        help="Comma-separated percentiles requested from vllm bench serve for "
+        "the --percentile-metrics set.  The default '50,99' makes every "
+        "per-concurrency run emit both the median and P99 of client-observed "
+        "first-audio latency (audio_ttfp) so the summary table can report a "
+        "per-concurrency (median, P99) pair.",
+    )
+    parser.add_argument(
+        "extra",
+        nargs=argparse.REMAINDER,
+        help="Extra args passed directly to vllm bench serve",
+    )
     args = parser.parse_args()
 
     if args.num_warmups < 0:
@@ -281,7 +366,9 @@ def main() -> None:
     model_configs = load_model_configs(Path(args.model_configs))
     if args.model not in model_configs:
         known = "\n  ".join(model_configs.keys())
-        print(f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\nKnown models:\n  {known}")
+        print(
+            f"[bench_tts] ERROR: model '{args.model}' not in model_configs.yaml.\nKnown models:\n  {known}"
+        )
         sys.exit(1)
 
     model_cfg = model_configs[args.model]
@@ -333,6 +420,7 @@ def main() -> None:
                 served_model_name=args.served_model_name,
                 num_warmups=args.num_warmups,
                 request_seed=args.request_seed,
+                metric_percentiles=args.metric_percentiles,
             )
             result = run_one_benchmark(cmd)
             if result is not None:
@@ -343,7 +431,9 @@ def main() -> None:
                 if args.output_dir and result_filename:
                     result_path = Path(args.output_dir) / result_filename
                     if result_path.is_file():
-                        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                        result_path.write_text(
+                            json.dumps(result, indent=2), encoding="utf-8"
+                        )
 
     print_summary_table(all_results)
 
