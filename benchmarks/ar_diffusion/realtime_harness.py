@@ -151,10 +151,7 @@ async def _drive_session(
                 # every index by the steady period delays chunk 1 by 3 frames
                 # and manufactures a deadline miss.  Anchor to the first real
                 # submit so session construction time is not part of playout.
-                due = (
-                    events[0].t_submit
-                    + config.profile.cumulative_frames(chunk_index) / config.profile.target_fps
-                )
+                due = events[0].t_submit + config.profile.cumulative_frames(chunk_index) / config.profile.target_fps
                 lag = due - clock()
                 if lag > 0:
                     await sleep(lag)
