@@ -15,6 +15,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
 from tests.helpers.runtime import get_distributed_init_method
+from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
 from vllm_omni.platforms import current_omni_platform
 
@@ -201,6 +202,12 @@ class _PPSplitBlockModel(nn.Module):
         )
 
 
+class _PPSplitPipeline(nn.Module):
+    def __init__(self, num_layers: int, start_layer: int, end_layer: int):
+        super().__init__()
+        self.transformer = _PPSplitBlockModel(num_layers, start_layer, end_layer)
+
+
 class _MultiBlockWithUnrelatedPPSlice(nn.Module):
     """start_layer/end_layer must not slice every block container."""
 
@@ -212,6 +219,35 @@ class _MultiBlockWithUnrelatedPPSlice(nn.Module):
         self.end_layer = 1
         self.transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(2)])
         self.single_transformer_blocks = nn.ModuleList([_DummyBlock() for _ in range(3)])
+
+
+class TestLayerWiseOffloadBackend:
+    def test_enable_installs_hooks_only_on_local_pp_blocks_and_wraps_ring(self, patched_offload_runtime):
+        pipeline = _PPSplitPipeline(num_layers=8, start_layer=4, end_layer=8)
+        backend = LayerWiseOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False),
+            torch.device("cpu"),
+        )
+
+        backend.enable(pipeline)
+
+        blocks = pipeline.transformer.blocks
+        hook_name = LayerwiseOffloadHook._HOOK_NAME
+        hooked_indices = [
+            index
+            for index, block in enumerate(blocks)
+            if (registry := getattr(block, "_hook_registry", None)) is not None and hook_name in registry._hooks
+        ]
+        assert hooked_indices == [4, 5, 6, 7]
+
+        first_local_hook = blocks[4]._hook_registry._hooks[hook_name]
+        last_local_hook = blocks[7]._hook_registry._hooks[hook_name]
+        assert first_local_hook.next_block is blocks[5]
+        assert last_local_hook.next_block is blocks[4]
+        assert first_local_hook._prev_hook is last_local_hook
+        assert backend._blocks == [[blocks[4], blocks[5], blocks[6], blocks[7]]]
+
+        backend.disable()
 
 
 class TestGetBlocksFromDit:

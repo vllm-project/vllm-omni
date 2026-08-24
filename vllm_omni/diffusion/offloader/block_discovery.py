@@ -23,33 +23,21 @@ def select_local_offload_blocks(model: nn.Module, modules: list[nn.Module]) -> l
 
     Pipeline-parallel DiTs built with vLLM ``make_layers`` store a full-length
     ``ModuleList`` and fill non-local slots with ``PPMissingLayer``. The offload
-    hook ring must cover only ``blocks[start_layer:end_layer]`` so the last
-    local layer prefetches the first local layer of the next forward.
+    hook ring must skip those placeholders so the last local layer prefetches
+    the first local layer of the next forward.
     """
     if not modules:
         return []
 
-    start = getattr(model, "start_layer", None)
-    end = getattr(model, "end_layer", None)
-    n_executable = sum(1 for module in modules if not _is_pp_missing_layer(module))
-    if (
-        isinstance(start, int)
-        and isinstance(end, int)
-        and 0 <= start < end <= len(modules)
-        and (end - start) == n_executable
-    ):
-        sliced = modules[start:end]
-        if sliced and not any(_is_pp_missing_layer(module) for module in sliced):
-            if len(sliced) != len(modules):
-                logger.info(
-                    "Restricting layerwise offload ring to local PP slice [%d, %d) (%d blocks)",
-                    start,
-                    end,
-                    len(sliced),
-                )
-            return list(sliced)
+    executable_modules = [module for module in modules if not _is_pp_missing_layer(module)]
+    if len(executable_modules) != len(modules):
+        logger.info(
+            "Filtered layerwise offload ring from %d blocks to %d executable blocks",
+            len(modules),
+            len(executable_modules),
+        )
 
-    return [module for module in modules if not _is_pp_missing_layer(module)]
+    return executable_modules
 
 
 def get_blocks_attr_names(model: nn.Module) -> list[str]:
@@ -77,9 +65,9 @@ def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
 def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
     """Retrieve executable blocks and attribute names from a DiT model.
 
-    Each declared block container is reduced to this rank's local PP slice
-    before containers are concatenated, so the prefetch ring wraps inside a
-    pipeline stage rather than across ``PPMissingLayer`` placeholders.
+    Each declared block container is filtered before containers are concatenated,
+    so the prefetch ring wraps inside executable layers rather than across
+    ``PPMissingLayer`` placeholders.
     """
     blocks_attr_names = get_blocks_attr_names(model)
     if not blocks_attr_names:
