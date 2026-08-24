@@ -2070,6 +2070,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         yield f"data: {data}\n\n"
 
                 elif final_output_type == "audio":
+                    if not omni_res.multimodal_output:
+                        continue
                     # Observe audio_ttfp_s on first audio packet for this request_id
                     # (once-per-request guard via first_audio_ts). The same hook
                     # also captures (stage, replica) for the streaming-continuity
