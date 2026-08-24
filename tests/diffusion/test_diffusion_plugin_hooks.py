@@ -40,6 +40,12 @@ class TestPlatformDiffusionHooks:
         result = OmniPlatform.get_diffusion_model_runner_cls()
         assert result == "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
+    def test_get_diffusion_kv_block_tables_cls_default(self):
+        """Test the default paged-KV BlockTables implementation."""
+        from vllm.v1.worker.gpu.block_table import BlockTables
+
+        assert OmniPlatform.get_diffusion_kv_block_tables_cls() is BlockTables
+
     def test_oot_enum_exists(self):
         """Test OOT is a valid platform enum value."""
         assert OmniPlatformEnum.OOT.value == "oot"

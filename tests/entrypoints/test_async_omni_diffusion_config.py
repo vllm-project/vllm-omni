@@ -225,7 +225,7 @@ def test_default_stage_config_whitelist_none_fallback():
     engine_args = stage_cfg["engine_args"]
 
     assert engine_args["trust_remote_code"] is False
-    assert engine_args["distributed_executor_backend"] == "mp"
+    assert engine_args["distributed_executor_backend"] is None
     assert engine_args["dtype"] == "auto"
     assert engine_args["enforce_eager"] is False
 

@@ -74,8 +74,10 @@ For fields whose deploy default is `null`, the deploy layer contributes no
 override. The effective value may still come from a platform section, an
 explicit CLI or stage override, or the downstream vLLM engine default.
 
-Note: for diffusion path, `distributed_executor_backend` currently defaults to
-`mp`, and `ray` / `external_launcher` are not fully supported yet.
+Note: for the diffusion path, an omitted `distributed_executor_backend` selects
+`uni` on a single GPU (in-process worker, no MessageQueue / `/dev/shm` output
+segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
+subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
 
 ### Stage fields
 

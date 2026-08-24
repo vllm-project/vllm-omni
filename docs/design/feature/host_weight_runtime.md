@@ -15,8 +15,11 @@ specified in the [Host Weight Runtime module design](../module/host_weight_runti
 ## Status
 
 The first implementation provides contracts and a CPU local-filesystem store.
-It does not enable cached loading for a model by itself. A consumer must still
-provide an exact identity, a representation producer, and a model restorer.
+The initial diffusion consumer contract additionally defines typed,
+representation-independent final-layout identity/restoration mechanics plus a
+concrete BF16-with-preserved-FP32 policy for MiniMax H3. It remains
+library-only: no loader or DLO path selects, publishes, restores, or transports
+that artifact yet.
 
 V1 includes:
 
@@ -24,16 +27,17 @@ V1 includes:
 - coordinated local lookup and one-producer publication;
 - descriptor-backed safetensors mmap leases;
 - preferred and required resolution policy;
+- explicit, separately reported post-load publication;
 - validation, deny, quarantine, cleanup, and capacity controls; and
 - typed reports for every terminal resolution outcome.
 
 V1 does not include:
 
-- a public CLI or default-on model integration;
-- a generic BF16, FP8, quantized, or model-specific producer;
+- a public CLI, loader activation, or default-on model integration;
+- lease handoff to DLO or another transport consumer;
+- FP8, quantized, merged-adaptation, or additional model producers;
 - CUDA registration, pinned staging, H2D scheduling, or GPU kernels;
 - a remote artifact provider or cross-node coordination;
-- post-load publication (V1 accepts only pre-load-safe producers);
 - automatic eviction; or
 - a change to DLO AllGather or no-AllGather behavior.
 
@@ -84,6 +88,12 @@ flowchart TD
     F -->|"preferred"| C
     F -->|"required"| E["Fail startup"]
     P -->|"nonretryable failure"| E
+    C --> W{"Post-load publication enabled?"}
+    W -->|"yes"| B2["Publish final model through POST_LOAD_ONLY producer"]
+    B2 --> CL["Close validated publication lease"]
+    CL --> R2["Return separate publication report"]
+    R2 --> D
+    W -->|"no"| D["Keep canonical model"]
 ```
 
 The modes are:
@@ -94,10 +104,12 @@ The modes are:
 | `preferred` | Return an exact lease when available; otherwise use canonical fallback only for a miss, invalid cache entry, or typed retryable failure. |
 | `required` | Fail when an exact lease cannot be acquired. |
 
-An unsupported capability, semantic identity collision, producer failure, or
-publication failure is nonretryable and remains visible even in preferred
-mode. Storage policy must never disguise a semantic or configuration error as
-a cache miss.
+During pre-load resolution, an unsupported capability, semantic identity
+collision, producer failure, or publication failure is nonretryable and remains
+visible even in preferred mode. A post-load publication failure is likewise
+visible in its own report, but cannot revise the canonical-fallback outcome.
+Storage policy must never disguise a semantic or configuration error as a cache
+miss.
 
 ## Loader and restoration sequence
 
@@ -118,30 +130,50 @@ sequenceDiagram
     R->>S: lookup(exact identity)
     alt validated hit
         S-->>R: HostWeightLease
+        R-->>L: lease and LOCAL_HIT report
+        L->>X: plan_restore(model, lease)
+        X-->>L: validation-only restore plan
+        L->>X: commit() once
     else miss with allowed producer
         R->>S: get_or_build(identity, producer)
         S->>P: produce(store-scoped writer)
         P-->>S: final-layout tensors and metadata
         S-->>R: validated HostWeightLease
+        R-->>L: lease and LOCAL_PRODUCTION report
+        L->>X: plan_restore(model, lease)
+        X-->>L: validation-only restore plan
+        L->>X: commit() once
     else policy permits canonical fallback
         R-->>L: CANONICAL_FALLBACK
         L->>L: Run canonical loader
+        opt explicit post-load publication enabled
+            L->>R: publish_after_load(identity, POST_LOAD_ONLY producer)
+            R->>S: get_or_build(identity, producer)
+            S-->>R: validated HostWeightLease or typed failure
+            R->>R: close publication lease
+            R-->>L: separate publication report
+        end
     else required or nonretryable failure
         R-->>L: FAILED report
     end
-    R-->>L: lease and terminal report
-    L->>X: plan_restore(model, lease)
-    X-->>L: validation-only restore plan
-    L->>X: commit() once
-    L->>T: consume restored CPU tensors
+    L->>T: consume final CPU tensors and any lease
     T-->>L: transfer teardown complete
-    L->>L: close lease
+    L->>L: close lease when one was acquired
 ```
 
 `plan_restore()` must not mutate the model or lease. `commit() -> None` is the
 sole one-shot model mutation. If planning fails, canonical fallback may reuse
 the untouched model. If commit begins and fails, the partially hydrated model
 must be discarded and canonical fallback must construct a fresh model.
+
+`publish_after_load()` is synchronous in V1 and accepts only a
+`POST_LOAD_ONLY` producer. Its report is separate from the terminal resolution,
+so a publication failure cannot rewrite a successful canonical fallback. A
+successful publication closes the store-returned lease inside the runtime and
+warms only future startups. It does not restore, rebind, or otherwise mutate the
+canonically loaded model serving the current startup.
+`allow_local_build` gates producers during pre-load resolution, while
+`allow_post_load_publish` independently gates this explicit post-load path.
 
 ## Exact representation identity
 
@@ -187,6 +219,56 @@ its matching restorer.
 Dynamic LoRA overlays are not part of a reusable base-weight artifact. A
 statically merged adapter is cacheable only as a separate identity containing
 the adapter fingerprint and merge semantics.
+
+### Initial diffusion final-layout contract
+
+The shared diffusion contract covers complete final-layout DiT parameters and
+persistent buffers. Text encoders, VAEs, non-persistent derived state, and other
+pipeline components remain outside the artifact. One explicit representation
+policy selects allowed dtypes, tensor roles, physical layout identity, producer
+ABI, manifest schema, and restoration schema.
+
+The contract is intentionally separate from loader activation:
+
+- `FinalLayoutRequest` contains typed loader identity/configuration fingerprints,
+  TP coordinate, and conservative SP semantics. It has no open metadata bag,
+  DP coordinate, SP rank, device identity, DLO transfer mode, registration
+  policy, or store path.
+- `FinalLayoutArtifactSpec` binds one `WeightRepresentation` and runtime-layout
+  name to explicit producer/restorer schemas and a canonical, versioned
+  implementation ABI descriptor. Compatibility never depends on reflective
+  source inspection.
+- `PreparedWeightSource` snapshots immutable revisions or exact local file
+  content plus a typed checkpoint-adapter identity before ordinary
+  materialization. Source replacement before or during production fails
+  publication. A hash-looking symlink basename is trusted only for an explicit
+  Hugging Face Hub source whose repository ID and
+  `models--.../snapshots/<revision> -> blobs/<hash>` topology validate; every
+  local or otherwise unverified symlink target is content-hashed.
+- the tensor ownership digest records exact runtime names, kinds, shapes,
+  semantic roles, dtypes, and strides from a CPU or meta model skeleton;
+- `FinalLayoutTensorRestorer` accepts only an exact lease identity, validates
+  complete policy-defined coverage without mutation, and returns a one-shot
+  commit plan;
+- each model declares one dtype-neutral `FinalLayoutModelContract` with an
+  explicit implementation version and a post-commit validator; and
+- `FinalLayoutBF16Producer` accepts only the matching identity context and a
+  finalized CPU model. It is `POST_LOAD_ONLY` and `SINGLE_PROCESS` per exact TP
+  coordinate. Its BF16 policy preserves model-declared FP32 parameters and
+  buffers and revalidates MiniMax H3 mixed-precision invariants.
+
+Other representations reuse source identity, typed parallel identity, tensor
+ownership, and exact restoration only when their policy proves those semantics.
+For example, runtime FP8 needs a separate policy/producer for generated scales,
+quantization metadata, and Cutlass physical layouts; it is not enabled by
+changing a dtype string on the BF16 producer.
+
+This stage makes no startup, sharing, or DLO performance claim. A following
+consumer PR owns disabled/preferred/required precedence, mixed-component loader
+transactions, warm-hit restoration, and transactional lease handoff. A TP2
+prewarm deployment will require a matching TP2 producer cohort to populate both
+TP-coordinate identities even though the store coordinates each artifact
+independently.
 
 ## Host sharing and GPU transport
 
@@ -252,7 +334,8 @@ removing live mappings.
 | Retryable lock, domain, or capacity failure | Canonical fallback | Fail |
 | Unsupported producer or backend | Fail | Fail |
 | Identity collision | Fail | Fail |
-| Producer or publication failure | Fail | Fail |
+| Pre-load producer or atomic publication failure | Fail | Fail |
+| Post-load publication failure after canonical fallback | Keep canonical model; report publication failure | Not reached through required resolution |
 | Restore planning failure | Canonical fallback may reuse untouched model | Fail |
 | Restore commit failure | Discard model; fallback requires a fresh instance | Fail |
 
@@ -275,7 +358,8 @@ A consumer PR must:
    a failed restore commit.
 7. Retain the lease until every transport operation that may access mapped
    memory has completed.
-8. Emit and test the terminal resolution report.
+8. Emit and test the terminal resolution report and any separate post-load
+   publication report.
 
 Consumer validation must prove:
 

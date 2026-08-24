@@ -21,6 +21,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizeMethodBase,
     )
+    from vllm.model_executor.models.utils import (
+        WeightsMapper,
+    )
 
 
 # Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8/mixed) only quantize the
@@ -111,6 +114,14 @@ class ComponentQuantizationConfig(QuantizationConfig):
             if prefix.startswith(comp_prefix):
                 return self._components[comp_prefix]
         return self._default
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
+        """Apply a weight mapper to every routed quantization config."""
+        for quant_config in self._components.values():
+            if quant_config is not None:
+                quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
+        if self._default is not None:
+            self._default.apply_vllm_mapper(hf_to_vllm_mapper)
 
     def get_name(self) -> str:
         return "component"

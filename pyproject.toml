@@ -135,13 +135,6 @@ docs = [
     "pydantic",
 ]
 
-soulx-svs = [
-    "funasr>=1.0.0",
-    "g2pM>=0.1.2.5",
-    "g2p-en>=2.1.0",
-    "ToJyutping>=3.2.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
 Repository = "https://github.com/vllm-project/vllm-omni"
@@ -192,6 +185,7 @@ select = [
     "N",      # pep8-naming
     "UP",     # pyupgrade
     "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
