@@ -531,7 +531,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         return height, width, ori_height, ori_width
 
     def predict(
-        self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_image_hidden_states=None
+        self, t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_image_hidden_states=None
     ):
         """One transformer velocity prediction (upstream ``predict``).
 
@@ -544,7 +544,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             latents,
             timestep,
             instruction_embeds,
-            freqs_cis,
+            freqs_real,
             instruction_attention_mask,
             ref_image_hidden_states=ref_image_hidden_states,
         )
@@ -697,7 +697,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             generator,
         )
 
-        freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(
+        freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
             self.transformer.axes_dim_rope,
             self.transformer.axes_lens,
             theta=10000,
@@ -720,7 +720,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 image_gs = image_guidance_scale if in_cfg_range else 1.0
 
                 model_pred = self.predict(
-                    t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_latents
+                    t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_latents
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
@@ -729,7 +729,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         ref_latents,
                     )
@@ -737,7 +737,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         None,
                     )
@@ -750,7 +750,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         ref_latents,
                     )
@@ -758,7 +758,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
                     model_pred_drop_image = self.predict(
-                        t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, None
+                        t, latents, instruction_embeds, freqs_real, instruction_attention_mask, None
                     )
                     model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
                 elif text_gs > 1.0:
@@ -767,7 +767,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         None,
                     )
