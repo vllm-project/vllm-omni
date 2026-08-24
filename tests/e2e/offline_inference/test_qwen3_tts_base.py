@@ -73,9 +73,8 @@ def get_prompt():
 def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
     """
     Test text input processing and audio output via offline Omni runner.
-    Deploy Setting: qwen3_tts_no_async_chunk.yaml + enforce_eager=true
-    Input Modal: text
-    Output Modal: audio
+    Input Modality: text
+    Output Modality: audio
     Input Setting: stream=False
     Extra Setting: task_type=Base, voice=clone, ref_audio/ref_text provided
     Datasets: few requests
@@ -88,3 +87,93 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
         "ref_text": REF_TEXT,
     }
     omni_runner_handler.send_audio_speech_request(request_config)
+
+
+BASE_SMOKE_INPUTS = [
+    pytest.param(
+        "Hello! Can you believe it? The price is $19.99 — what a deal...",
+        id="special-characters",
+    ),
+    pytest.param(
+        "Uh um so like, ya know, the the the thing is... mhmm, kinda sorta maybe?!",
+        id="disfluent-text",
+    ),
+]
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+@pytest.mark.parametrize("input_text", BASE_SMOKE_INPUTS)
+def test_base_voice_clone_smoke(omni_runner, omni_runner_handler, input_text) -> None:
+    """Smoke test: verify Base voice-clone pipeline produces audio without crashing."""
+    request_config = {
+        "input": input_text,
+        "task_type": "Base",
+        "voice": "clone",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+    }
+    omni_runner_handler.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+def test_base_rejects_empty_input(omni_runner, omni_runner_handler) -> None:
+    """
+    Negative test: empty input text should be rejected even with valid ref_audio.
+    Input Modality: empty string
+    Expected: ValueError
+    """
+    request_config = {
+        "input": "",
+        "task_type": "Base",
+        "voice": "clone",
+        "ref_audio": REF_AUDIO_URL,
+        "ref_text": REF_TEXT,
+    }
+    with pytest.raises(ValueError):
+        omni_runner_handler.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+@pytest.mark.xfail(reason="Offline pipeline does not validate missing ref_audio for Base task (#3707)", strict=True)
+def test_base_rejects_missing_ref_audio(omni_runner, omni_runner_handler) -> None:
+    """
+    Negative test: Base task without ref_audio or ref_text should be rejected.
+    Input Modality: valid text, task_type=Base, no ref_audio/ref_text
+    Expected: ValueError
+    """
+    request_config = {
+        "input": get_prompt(),
+        "task_type": "Base",
+    }
+    with pytest.raises(ValueError):
+        omni_runner_handler.send_audio_speech_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
+@pytest.mark.xfail(reason="Offline pipeline does not validate missing ref_text for Base task (#3708)", strict=True)
+def test_base_rejects_missing_ref_text(omni_runner, omni_runner_handler) -> None:
+    """
+    Negative test: Base task with ref_audio but no ref_text should be rejected.
+    Input Modality: valid text, task_type=Base, ref_audio provided, no ref_text
+    Expected: ValueError
+    """
+    request_config = {
+        "input": get_prompt(),
+        "task_type": "Base",
+        "voice": "clone",
+        "ref_audio": REF_AUDIO_URL,
+    }
+    with pytest.raises(ValueError):
+        omni_runner_handler.send_audio_speech_request(request_config)
