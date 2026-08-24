@@ -164,12 +164,32 @@ In `DiffusionParallelConfig`:
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `enable_combine_qkv_a2a` | bool | `True` | Global override for the combined QKV all-to-all optimization. Set to `False` to disable it everywhere, regardless of per-model opt-in. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
 - Total sequence parallel size equals to `ulysses_degree × ring_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
+
+### Combined QKV All-to-All
+
+During Ulysses-SP, each attention layer normally issues **three** all-to-all collectives to reshard Q, K and V. When enabled, this optimization stacks Q/K/V into a single tensor and performs **one** all-to-all instead, reducing per-layer collective launch overhead.
+
+**Trade-off (communication vs. memory):**
+
+- ✅ Fewer collectives → lower NCCL launch overhead. Best for **image models**.
+- ⚠️ Stacking allocates an intermediate `(B, S/P, 3, H, D)` tensor. For very long sequences (e.g. video), this extra memory can outweigh the communication savings.
+
+**Coverage:** this is an opt-in optimization that individual models enable. It is currently enabled for:
+
+| Model | Enabled |
+|-------|---------|
+| FLUX.2 | ✅ |
+| Qwen-Image | ✅ |
+| Qwen-Image-Edit | ✅ |
+
+It only takes effect in **strict** Ulysses mode when Q/K/V shapes match (i.e. no GQA/MQA). It is on by default for the models above; set `enable_combine_qkv_a2a=False` in `DiffusionParallelConfig` to disable it globally.
 
 
 ## Best Practices

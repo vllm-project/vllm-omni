@@ -667,6 +667,7 @@ class QwenImageCrossAttention(nn.Module):
                 joint_key=txt_key,
                 joint_value=txt_value,
                 joint_strategy="front",
+                combine_qkv_a2a=True,
             )
             if hidden_states_mask is not None:
                 attn_metadata.attn_mask = hidden_states_mask
@@ -675,7 +676,7 @@ class QwenImageCrossAttention(nn.Module):
 
             joint_hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
         else:
-            attn_metadata = None
+            attn_metadata = AttentionMetadata(combine_qkv_a2a=True)
             if hidden_states_mask is not None or encoder_hidden_states_mask is not None:
                 mask_list: list[torch.Tensor] = []
                 if encoder_hidden_states_mask is not None:
@@ -699,7 +700,7 @@ class QwenImageCrossAttention(nn.Module):
                         )
                     )
                 joint_mask = torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0]
-                attn_metadata = AttentionMetadata(attn_mask=joint_mask)
+                attn_metadata.attn_mask = joint_mask
 
             joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
 

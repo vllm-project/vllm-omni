@@ -137,6 +137,11 @@ class AttentionMetadata:
     # a replicated tensor among processes appended to the front or rear of value, depends the joint_strategy
     joint_strategy: str = "front"
     # the strategy to joint the query, key, and value, can be "front" or "rear"
+    combine_qkv_a2a: bool = False
+    # Hint for Ulysses parallel strategy: stack Q/K/V into a single
+    # 5D tensor and perform one all-to-all instead of three.
+    # Only effective in strict mode when Q/K/V shapes match.
+
     extra: dict[str, Any] = field(default_factory=dict)
     # Opaque backend-specific per-forward parameters (e.g. block masks, KV indices).
     # Backends MUST silently ignore unknown keys.
