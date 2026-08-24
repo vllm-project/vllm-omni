@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-Omni model.
 """
@@ -33,6 +33,16 @@ LONG_VIDEO_FRAMES = 3600
 LARGE_IMAGE_WIDTH = 1920
 LARGE_IMAGE_HEIGHT = 1080
 LONG_AUDIO_DURATION_SEC = 120
+
+# Qwen3-Omni's talker samples at temperature 0.9, so transcript and preset-voice
+# quality are distributions rather than deterministic per-request properties. Keep
+# these full-pipeline checks as catastrophic-regression gates: only sampled quality
+# mismatches consume the budget; serving, media, and keyword failures still fail fast.
+# The public H100 logs linked from issue #6090 bottom out at 34/40 successes for a
+# fully observed run. A five-success margin accounts for sampling noise while still
+# limiting tolerated quality failures to 11/40.
+SAMPLED_QUALITY_REQUESTS = 40
+SAMPLED_QUALITY_MIN_SUCCESSES = 29
 
 
 def get_batch_token_config(default_path):
@@ -248,7 +258,12 @@ def test_text_audio_to_text_audio_002(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(
+        request_config,
+        request_num=SAMPLED_QUALITY_REQUESTS,
+        min_successes=SAMPLED_QUALITY_MIN_SUCCESSES,
+        max_concurrency=get_max_batch_size(),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -300,7 +315,12 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_omni_request(
+        request_config,
+        request_num=SAMPLED_QUALITY_REQUESTS,
+        min_successes=SAMPLED_QUALITY_MIN_SUCCESSES,
+        max_concurrency=get_max_batch_size(),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -499,7 +519,10 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
     # on tighter cards, since each judge loads whisper on the same device as the talker and
     # code2wav stages.
     openai_client.send_omni_request(
-        request_config, request_num=40, min_successes=29, max_concurrency=get_max_batch_size()
+        request_config,
+        request_num=SAMPLED_QUALITY_REQUESTS,
+        min_successes=SAMPLED_QUALITY_MIN_SUCCESSES,
+        max_concurrency=get_max_batch_size(),
     )
 
 
@@ -550,17 +573,12 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
-    _gender_assert_substr = "estimated gender"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _gender_assert_substr not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    openai_client.send_omni_request(
+        request_config,
+        request_num=SAMPLED_QUALITY_REQUESTS,
+        min_successes=SAMPLED_QUALITY_MIN_SUCCESSES,
+        max_concurrency=get_max_batch_size(),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
