@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -400,7 +400,9 @@ def test_serve_cli_accepts_diffusion_attention_backend():
             "Qwen/Qwen-Image",
             "--omni",
             "--diffusion-attention-backend",
-            "FLASH_ATTN",
+            "FASTVIDEO_VSA",
+            "--fastvideo-vsa-topk",
+            "96",
         ]
     )
 
@@ -408,10 +410,12 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
     diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
 
-    assert args.diffusion_attention_backend == "FLASH_ATTN"
+    assert args.diffusion_attention_backend == "FASTVIDEO_VSA"
+    assert args.fastvideo_vsa_topk == 96
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+    assert diffusion_attention_config.default.backend == "FASTVIDEO_VSA"
+    assert diffusion_attention_config.default.backend_kwargs() == {"topk": 96}
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():

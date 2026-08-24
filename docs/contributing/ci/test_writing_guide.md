@@ -509,7 +509,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 #### 3.2 Testing Content and Scope
 
 - ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
-- ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen3_omni_*.json` (Omni), `test_tts.json` / `test_voxcpm2.json` / `test_higgs_audio_v3.json` (TTS), and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file` in nightly **Perf Test** steps) to drive throughput, latency, and memory benchmarks. Each JSON **case** may declare an optional top-level **`mark`** array: exactly one ``hardware_marks`` object plus pytest marker name strings (`full_model`, `omni` / `tts` / `diffusion`, …). Runners attach those marks to each parametrized `(server, benchmark index)` pair so **local** bulk runs can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Nightly CI perf jobs select workloads by **`--test-config-file`**, not `-m`. Details are in the Performance Tests example below.
+- ***Performance Testing***: JSON configs under `tests/dfx/perf/tests/` drive Omni, TTS, and diffusion serving benchmarks via `run_benchmark.py` or `run_diffusion_benchmark.py`, measuring throughput, latency, and related metrics under configured workloads.
 - ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 #### 3.3 Test Directory and Execution Files
@@ -567,7 +567,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
     - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`). Weekly CI (`.buildkite/cuda/test-weekly.yml`) runs one step per suite (`WEEKLY=1` or PR label `weekly-test`)
+    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
 - ***Script Example***:
 
 <details>

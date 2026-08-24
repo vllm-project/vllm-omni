@@ -1267,8 +1267,6 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -1306,6 +1304,7 @@ stages:
             ({"model_type": "step_audio_2"}, None, "step_audio_2"),
             (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
             (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
+            (None, {"_class_name": "WanDMDPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(

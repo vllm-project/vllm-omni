@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 
@@ -57,6 +57,11 @@ _DIFFUSION_MODELS = {
         "OvisImagePipeline",
     ),
     "WanPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
+    ),
+    "WanDMDPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
         "Wan22Pipeline",
@@ -271,11 +276,6 @@ _DIFFUSION_MODELS = {
         "pipeline_sensenova_u1",
         "SenseNovaU1Pipeline",
     ),
-    "AudioXPipeline": (
-        "audiox",
-        "pipeline_audiox",
-        "AudioXPipeline",
-    ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5",
@@ -362,7 +362,6 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
-    "AudioXPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
@@ -465,6 +464,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     try:
         sp_size = od_config.parallel_config.sequence_parallel_size
+        assert sp_size is not None
         if sp_size <= 1:
             return
 
@@ -545,6 +545,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
@@ -556,7 +557,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
-    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
@@ -619,6 +619,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
+    "WanDMDPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
@@ -710,6 +711,7 @@ def register_diffusion_model(
 
 def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
     """Load and return a process function from the appropriate module."""
+    assert od_config.model_class_name is not None
     mod_folder, mod_relname, _ = _DIFFUSION_MODELS[od_config.model_class_name]
     if mod_relname == "":
         # Full module path (registered via register_diffusion_model)

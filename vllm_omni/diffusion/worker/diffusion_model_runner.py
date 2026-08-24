@@ -81,6 +81,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _dit_any_rank_failed(local_failed: bool) -> bool:
+    """All-reduce a per-request failure flag across the DiT process group.
+
+    Every DiT rank must reach this point in lockstep; the caller wraps
+    ``pipeline.prepare_encode`` so both the success and the exception paths
+    call the helper. In single-rank execution this collapses to the local
+    flag with no collectives issued.
+    """
+    if not torch.distributed.is_initialized():
+        return local_failed
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+
+        group = get_dit_group()
+    except (AssertionError, ImportError):
+        group = None
+    if group is None:
+        return local_failed
+    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
+    if current_omni_platform.is_available():
+        signal = signal.to(device=current_omni_platform.device_type)
+    torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group)
+    return bool(signal.item())
+
+
 def _normalize_pipeline_outputs(
     outputs: object,
     *,
@@ -853,25 +878,70 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
-    def _prepare_batch_inputs(self, states: list[StepRequestState], new_request_ids: list[str]) -> InputBatch:
+    def _prepare_batch_inputs(
+        self,
+        states: list[StepRequestState],
+        new_request_ids: list[str],
+    ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
+        prepared_states: list[StepRequestState] = []
+        error_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids:
-                self._initialize_generator(state.sampling)
-                clear_pipeline_stage_durations(self.pipeline)
-                # encode
-                self.pipeline.prepare_encode(state)
-                merge_stage_durations(
-                    state,
-                    consume_pipeline_stage_durations(self.pipeline),
-                )
+                # Everything that runs before ``_dit_any_rank_failed`` must be
+                # inside the try: an exception in ``_initialize_generator`` or
+                # ``clear_pipeline_stage_durations`` on one rank would skip the
+                # all-reduce here while every peer proceeds into it, and the
+                # peers then hang on the NCCL collective until timeout.
+                per_req_exc: BaseException | None = None
+                try:
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(self.pipeline)
+                    # encode
+                    self.pipeline.prepare_encode(state)
+                    merge_stage_durations(
+                        state,
+                        consume_pipeline_stage_durations(self.pipeline),
+                    )
+                except Exception as exc:
+                    per_req_exc = exc
+                # Pipelines that do rank-0-only work (e.g. MiniMax H3
+                # reference-video prep) must broadcast per-request failures
+                # internally so downstream collectives stay in step; even so,
+                # cross-check that every DiT rank agrees so a rank-local error
+                # (or a future pipeline that omits the guard) does not leave
+                # the process group half-way through a new request.
+                if _dit_any_rank_failed(per_req_exc is not None):
+                    self.state_cache.pop(state.request_id, None)
+                    if per_req_exc is None:
+                        per_req_exc = RuntimeError(
+                            f"Stepwise preparation failed on another DiT rank for {state.request_id}"
+                        )
+                    logger.error(
+                        "Stepwise request preparation failed for %s: %s",
+                        state.request_id,
+                        per_req_exc,
+                        exc_info=isinstance(per_req_exc, Exception),
+                    )
+                    error_outputs.append(
+                        RunnerOutput(
+                            request_id=state.request_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=DiffusionOutput.from_exception(per_req_exc),
+                        )
+                    )
+                    continue
+            prepared_states.append(state)
 
+        if not prepared_states:
+            return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
-            states,
+            prepared_states,
             cached_batch=getattr(self, "input_batch", None),
         )
         self.input_batch = input_batch
-        return input_batch
+        return prepared_states, input_batch, error_outputs
 
     def _update_states_after(
         self,
@@ -978,7 +1048,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
+            states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
+            if input_batch is None:
+                return BatchRunnerOutput.from_list(runner_output_list)
             attn_metadata = {}
 
             with set_forward_context(
@@ -995,7 +1067,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         denoise_stage_durations,
                     )
 
-                runner_output_list = []
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
                 if noise_pred is None and pipeline_interrupted:
                     for state in states:
@@ -1048,6 +1119,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
+                            self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,
@@ -1059,7 +1131,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                     request_id=req.request_id,
                                     step_index=req.step_index,
                                     finished=True,
-                                    result=DiffusionOutput(error=str(per_req_exc)),
+                                    result=DiffusionOutput.from_exception(per_req_exc),
                                 )
                             )
 

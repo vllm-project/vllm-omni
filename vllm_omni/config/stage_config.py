@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage configuration system for vLLM-Omni."""
 
 from __future__ import annotations
@@ -237,6 +237,7 @@ class PipelineConfig:
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
+    diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
     # Optional model-owned duplex planner loaded by the stable engine runtime.
     duplex_runtime_extension: str | None = None
@@ -359,6 +360,7 @@ class StageDeployConfig:
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
     diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
