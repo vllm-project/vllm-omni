@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import httpx
 import numpy as np
 import torch
+from numpy.typing import DTypeLike
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
 from vllm.logger import init_logger
@@ -468,14 +469,14 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
         video_array = _normalize_video_tensor(video)
         return list(video_array)
     if isinstance(video, np.ndarray):
-        video_array = _normalize_video_array(video)
-        if isinstance(video_array, list):
+        normalized_array = _normalize_video_array(video)
+        if isinstance(normalized_array, list):
             raise ValueError("Batched video arrays must be split before encoding.")
-        if video_array.ndim == 4:
-            return list(video_array)
-        if video_array.ndim == 3:
-            return [video_array]
-        raise ValueError(f"Unsupported video array shape: {video_array.shape}")
+        if normalized_array.ndim == 4:
+            return list(normalized_array)
+        if normalized_array.ndim == 3:
+            return [normalized_array]
+        raise ValueError(f"Unsupported video array shape: {normalized_array.shape}")
     if isinstance(video, list):
         if not video:
             return []
@@ -688,7 +689,7 @@ def _iter_baseline_planar_video_frames(
     import av
 
     height, width = frames[0].shape[:2]
-    scratch_dtype = np.float64 if np.issubdtype(common_dtype, np.bool_) else common_dtype
+    scratch_dtype: DTypeLike = np.float64 if np.issubdtype(common_dtype, np.bool_) else common_dtype
     scratch = None if common_dtype == np.uint8 else np.empty((height, width), dtype=scratch_dtype)
 
     for frame in frames:
@@ -696,7 +697,7 @@ def _iter_baseline_planar_video_frames(
         for plane, channel in zip(av_frame.planes, (1, 2, 0)):
             if plane.height < height or plane.line_size < width:
                 raise ValueError("PyAV video plane is smaller than the requested frame dimensions.")
-            plane_view = np.frombuffer(
+            plane_view = np.frombuffer(  # type: ignore[call-overload]  # VideoPlane exposes the buffer protocol at runtime.
                 plane,
                 dtype=np.uint8,
                 count=plane.height * plane.line_size,
@@ -869,7 +870,8 @@ def _encode_video_bytes(
             height=frame_shape[0],
             audio_waveform=audio_np,
             fps=float(fps),
-            audio_sample_rate=effective_audio_sample_rate,
+            # None occurs only without audio; the muxer does not consume the rate then.
+            audio_sample_rate=cast(int, effective_audio_sample_rate),
             video_codec_options=video_codec_options,
         )
 

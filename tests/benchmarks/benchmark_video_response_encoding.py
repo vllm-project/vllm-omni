@@ -65,19 +65,24 @@ def _measure(
 ) -> tuple[bytes, dict[str, object]]:
     cpu_start = time.process_time_ns()
     wall_start = time.perf_counter_ns()
-    encoder = _encode_video_bytes if variant.frame_conversion_workers is not None else _encode_video_bytes_legacy
-    kwargs = {
-        "fps": fps,
-        "audio": audio,
-        "audio_sample_rate": audio_sample_rate,
-        "video_codec_options": {"preset": "ultrafast", "threads": "0"},
-    }
-    if variant.frame_conversion_workers is not None:
-        kwargs["frame_conversion_workers"] = variant.frame_conversion_workers
-    output = encoder(
-        video,
-        **kwargs,
-    )
+    video_codec_options = {"preset": "ultrafast", "threads": "0"}
+    if variant.frame_conversion_workers is None:
+        output = _encode_video_bytes_legacy(
+            video,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
+    else:
+        output = _encode_video_bytes(
+            video,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+            video_codec_options=video_codec_options,
+            frame_conversion_workers=variant.frame_conversion_workers,
+        )
     wall_ms = (time.perf_counter_ns() - wall_start) / 1_000_000
     process_cpu_ms = (time.process_time_ns() - cpu_start) / 1_000_000
     return output, {
