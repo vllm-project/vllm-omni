@@ -883,7 +883,11 @@ def test_text_attention_uses_sdpa_with_local_gqa_heads(monkeypatch):
         head_dim=2,
         rms_norm_eps=1e-6,
     )
-    attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
     assert isinstance(attention.attn, SDPAImpl)
     attn_call = {}
 

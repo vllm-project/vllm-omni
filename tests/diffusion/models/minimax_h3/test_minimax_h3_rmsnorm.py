@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -50,7 +51,11 @@ def test_qwen3_vl_decoder_uses_fused_post_attention_residual_contract() -> None:
         rms_norm_eps=1e-6,
     )
     group = SimpleNamespace(rank_in_group=0, world_size=1)
-    layer = MiniMaxH3Qwen3VLTextDecoderLayer(group, config, torch.float32)
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        layer = MiniMaxH3Qwen3VLTextDecoderLayer(group, config, torch.float32)
     layer.input_layernorm = nn.Identity()
     layer.self_attn = ConstantAttention()
     layer.mlp = nn.Identity()
