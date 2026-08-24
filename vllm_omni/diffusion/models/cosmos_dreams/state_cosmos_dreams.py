@@ -120,9 +120,7 @@ class CosmosDreamsSessionFingerprint:
     height: int
     width: int
     fps: float
-    domain_id: int
-    embodiment: str
-    action_contract_sha256: str
+    conditioning: tuple[tuple[str, Any], ...]
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
@@ -134,12 +132,11 @@ class CosmosDreamsSessionFingerprint:
             raise ValueError(
                 f"Cosmos-Dreams fingerprint resolution/FPS must be positive, got {self.height}x{self.width}@{self.fps}"
             )
-        if self.domain_id < 0:
-            raise ValueError(f"Cosmos-Dreams domain_id must be non-negative, got {self.domain_id}")
-        if not self.embodiment:
-            raise ValueError("Cosmos-Dreams session fingerprint requires an embodiment")
-        if not self.action_contract_sha256:
-            raise ValueError("Cosmos-Dreams session fingerprint requires action_contract_sha256")
+        if not self.conditioning:
+            raise ValueError("Cosmos-Dreams session fingerprint requires conditioning")
+        names = [name for name, _ in self.conditioning]
+        if any(not name for name in names) or len(names) != len(set(names)):
+            raise ValueError("Cosmos-Dreams conditioning fingerprint keys must be non-empty and unique")
         if not self.real_text_kv_lengths:
             raise ValueError("Cosmos-Dreams fingerprint requires at least one text KV branch")
         if any(length <= 0 for _, length in self.real_text_kv_lengths):

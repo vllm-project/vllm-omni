@@ -9,6 +9,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -57,6 +58,20 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionRequestContract:
+    domain_id: int
+    embodiment: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionConditioning:
+    request: _ActionRequestContract
+    raw_action: torch.Tensor | None
+    layout: str | None
+    domain_ids: torch.Tensor
 
 
 def _nested_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -162,7 +177,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        self.manifest = CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+        self.manifest = self._load_manifest(od_config)
         self.manifest.require_exported_artifact()
         if not isinstance(self.transformer, CosmosDreamsTransformer):
             raise TypeError(
@@ -184,18 +199,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             sample_type=self.manifest.sample_type,
             num_train_timesteps=self.manifest.num_train_timesteps,
         )
-        action_schema = self.manifest.action_schema
-        if action_schema is None:
-            raise ValueError("Cosmos-Dreams requires a validated v2 action_schema.")
-        self.action_normalizers = {
-            embodiment: QuantileRotAffineNormalizer.from_contract(contract)
-            for embodiment, contract in action_schema.normalizers.items()
-        }
-        self.default_domain_id = int(_nested_config_value(od_config, "default_domain_id", 0))
-        self.default_embodiment = action_schema.resolve_embodiment(
-            action_schema.default_embodiment,
-            self.default_domain_id,
-        )
+        self._init_conditioning(od_config)
         self.default_fps = float(_nested_config_value(od_config, "default_fps", 15.0))
         if not math.isfinite(self.default_fps) or self.default_fps <= 0:
             raise ValueError(f"Cosmos-Dreams default_fps must be positive, got {self.default_fps}.")
@@ -218,6 +222,26 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             estimate.self_attention_bytes / 2**30,
             estimate.scratch_bytes / 2**30,
             estimate.cross_attention_bytes / 2**30,
+        )
+
+    def _load_manifest(self, od_config: OmniDiffusionConfig) -> CosmosDreamsManifest:
+        return CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+
+    def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
+        """Initialize the Humanoid action adapter from the v2 payload."""
+
+        action_schema = self.manifest.action_schema
+        if action_schema is None:
+            raise ValueError("Cosmos-Dreams requires a validated v2 action_schema.")
+        action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
+        self.action_normalizers = {
+            embodiment: QuantileRotAffineNormalizer.from_contract(contract)
+            for embodiment, contract in action_schema.normalizers.items()
+        }
+        self.default_domain_id = int(_nested_config_value(od_config, "default_domain_id", 0))
+        self.default_embodiment = action_schema.resolve_embodiment(
+            action_schema.default_embodiment,
+            self.default_domain_id,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -411,6 +435,93 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- Session and conditioning -----------------------------------------
 
+    def _parse_tick(self, tick: ARDiffusionTickRequest):
+        """Parse the Humanoid-owned typed action track."""
+
+        return parse_cosmos_dreams_tick(tick)
+
+    def _validate_conditioning_request(self, sp, typed_inputs: Any | None) -> _ActionRequestContract:
+        """Resolve Humanoid domain and embodiment without mutating state."""
+
+        domain_name = (
+            typed_inputs.domain_name if typed_inputs is not None else self._get_sp_param(sp, "domain_name", None)
+        )
+        domain_value = typed_inputs.domain_id if typed_inputs is not None else self._get_sp_param(sp, "domain_id", None)
+        if domain_value is None and domain_name is None:
+            domain_value = self.default_domain_id
+        if domain_value is not None:
+            domain_id = _admission_int(domain_value, "domain_id")
+            if domain_id < 0:
+                raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}.")
+        else:
+            try:
+                domain_id = self.manifest.resolve_domain_name(str(domain_name))
+            except ValueError as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if domain_id >= self.manifest.num_embodiment_domains:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos-Dreams domain_id is outside the exported embodiment table: "
+                f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
+            )
+        try:
+            embodiment = self.manifest.resolve_embodiment(domain_name, domain_id)
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        return _ActionRequestContract(domain_id=domain_id, embodiment=embodiment)
+
+    def _prepare_conditioning(
+        self,
+        sp,
+        *,
+        typed_inputs: Any | None,
+        request: _ActionRequestContract,
+        start_frame: int,
+        target_frame: int,
+    ) -> _ActionConditioning:
+        """Normalize action rows and freeze their request-wide indexing mode."""
+
+        raw_action = self._prepare_raw_action(
+            sp,
+            embodiment=request.embodiment,
+            action_value=typed_inputs.action if typed_inputs is not None else None,
+        )
+        layout = self._resolve_action_layout(
+            raw_action,
+            start_frame=start_frame,
+            target_frame=target_frame,
+        )
+        domain_ids = torch.tensor([request.domain_id], device=self.device, dtype=torch.long)
+        return _ActionConditioning(
+            request=request,
+            raw_action=raw_action,
+            layout=layout,
+            domain_ids=domain_ids,
+        )
+
+    def _conditioning_fingerprint(self, request: _ActionRequestContract) -> tuple[tuple[str, Any], ...]:
+        return (
+            ("domain_id", request.domain_id),
+            ("embodiment", request.embodiment),
+            ("action_contract_sha256", self.manifest.action_contract_sha256),
+        )
+
+    def _build_prompt_tokens(
+        self,
+        prompt: str,
+        *,
+        sampling_params: Any,
+        prompt_data: Any,
+        fps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the Humanoid AR prompt without a system prompt."""
+
+        del sampling_params, prompt_data, fps
+        return self._tokenize_prompt(
+            prompt,
+            max_sequence_length=1 << 30,
+            use_system_prompt=False,
+        )
+
     def _get_or_create_state(self, session_id: str) -> CosmosDreamsSessionState:
         state = self._states.get(session_id)
         if state is None:
@@ -463,8 +574,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         height: int,
         width: int,
         fps: float,
-        domain_id: int,
-        embodiment: str,
+        conditioning_request: _ActionRequestContract,
     ) -> CosmosDreamsSessionFingerprint:
         return CosmosDreamsSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
@@ -472,9 +582,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             height=height,
             width=width,
             fps=fps,
-            domain_id=domain_id,
-            embodiment=embodiment,
-            action_contract_sha256=self.manifest.action_contract_sha256,
+            conditioning=self._conditioning_fingerprint(conditioning_request),
             checkpoint_id=self.checkpoint_id,
             manifest_id=self.manifest.digest,
             sampler_id=self.manifest.sampler_id,
@@ -506,10 +614,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         real_text_kv_len: int,
         frame_start: int,
         fps: float,
-        action_latents: torch.Tensor,
-        action_domain_ids: torch.Tensor,
+        conditioning_kwargs: Mapping[str, Any],
         condition_vision: bool,
-        null_action_frame_indexes: tuple[int, ...],
         commit_current: bool,
     ) -> CosmosDreamsTransformerOutput:
         paged_state = self._ar_diffusion_kv_state
@@ -532,12 +638,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             real_text_kv_len=real_text_kv_len,
             frame_start=frame_start,
             fps=fps,
-            action_latents=action_latents,
-            action_domain_ids=action_domain_ids,
             paged_kv=paged_kv,
             dense_history=dense_history,
             condition_vision=condition_vision,
-            null_action_frame_indexes=null_action_frame_indexes,
+            **conditioning_kwargs,
         )
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
@@ -675,9 +779,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
         fps: float,
-        action: torch.Tensor,
-        domain_ids: torch.Tensor,
-        null_action: bool,
+        conditioning_kwargs: Mapping[str, Any],
     ) -> None:
         self._transformer_forward(
             state,
@@ -687,12 +789,188 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             real_text_kv_len=real_text_kv_len,
             frame_start=frame_idx,
             fps=fps,
-            action_latents=action,
-            action_domain_ids=domain_ids,
+            conditioning_kwargs=conditioning_kwargs,
             condition_vision=True,
-            null_action_frame_indexes=(0,) if null_action else (),
             commit_current=True,
         )
+
+    def _denoise_chunk(
+        self,
+        state: CosmosDreamsSessionState,
+        *,
+        chunk_start: int,
+        chunk_end: int,
+        seed: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        conditioning_kwargs: Mapping[str, Any],
+        tick_durations: dict[str, float],
+        measure_tick_latency: bool,
+    ) -> torch.Tensor:
+        """Denoise one canonical AR chunk without committing its noisy K/V."""
+
+        chunk_frames = chunk_end - chunk_start
+        noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
+        initial_noise = torch.randn(
+            1,
+            self.transformer.latent_channel_size,
+            chunk_frames,
+            self.manifest.latent_height,
+            self.manifest.latent_width,
+            generator=noise_generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            output = self._transformer_forward(
+                state,
+                x.to(self.dtype),
+                timestep,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                frame_start=chunk_start,
+                fps=fps,
+                conditioning_kwargs=conditioning_kwargs,
+                condition_vision=False,
+                commit_current=False,
+            )
+            return output.video.float()
+
+        with self._timed_tick_stage(
+            tick_durations,
+            "denoise_s",
+            enabled=measure_tick_latency,
+        ):
+            return self.distilled_sampler.sample(
+                velocity_fn,
+                initial_noise,
+                seed=seed,
+                frame_idx=chunk_start,
+            ).to(self.dtype)
+
+    def _run_chunk(
+        self,
+        state: CosmosDreamsSessionState,
+        *,
+        chunk_start: int,
+        chunk_end: int,
+        target_frame: int,
+        terminal_request: bool,
+        request_start_frame: int,
+        seed: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        conditioning: _ActionConditioning,
+        tick_durations: dict[str, float],
+        measure_tick_latency: bool,
+    ) -> torch.Tensor:
+        """Run Humanoid action conditioning, denoise, then clean-refresh."""
+
+        action_chunk, null_action_indexes = self._actions_for_frames(
+            conditioning.raw_action,
+            layout=conditioning.layout,
+            request_start_frame=request_start_frame,
+            frame_start=chunk_start,
+            frame_end=chunk_end,
+        )
+        conditioning_kwargs = {
+            "action_latents": action_chunk,
+            "action_domain_ids": conditioning.domain_ids,
+            "null_action_frame_indexes": null_action_indexes,
+        }
+        clean_chunk = self._denoise_chunk(
+            state,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+            seed=seed,
+            text_kv=text_kv,
+            real_text_kv_len=real_text_kv_len,
+            fps=fps,
+            conditioning_kwargs=conditioning_kwargs,
+            tick_durations=tick_durations,
+            measure_tick_latency=measure_tick_latency,
+        )
+
+        action_count = self.manifest.action_tokens_per_frame
+        with self._timed_tick_stage(
+            tick_durations,
+            "clean_cache_commit_s",
+            enabled=measure_tick_latency,
+        ):
+            for local_idx, frame_idx in iter_clean_commit_frames(
+                chunk_start,
+                chunk_end,
+                target_frame=target_frame,
+                terminal_request=terminal_request,
+            ):
+                action_start = local_idx * action_count
+                action_frame = action_chunk[:, action_start : action_start + action_count]
+                self._commit_clean_frame(
+                    state,
+                    clean_chunk[:, :, local_idx : local_idx + 1],
+                    frame_idx=frame_idx,
+                    text_kv=text_kv,
+                    real_text_kv_len=real_text_kv_len,
+                    fps=fps,
+                    conditioning_kwargs={
+                        "action_latents": action_frame,
+                        "action_domain_ids": conditioning.domain_ids,
+                        "null_action_frame_indexes": (0,) if local_idx in null_action_indexes else (),
+                    },
+                )
+        return clean_chunk
+
+    def _prefill_first_frame(
+        self,
+        state: CosmosDreamsSessionState,
+        initial_latent: torch.Tensor | None,
+        *,
+        target_frame: int,
+        terminal_request: bool,
+        request_start_frame: int,
+        text_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        real_text_kv_len: int,
+        fps: float,
+        conditioning: _ActionConditioning,
+        tick_durations: dict[str, float],
+        measure_tick_latency: bool,
+        retain_latent: bool,
+    ) -> torch.Tensor | None:
+        """Seed and commit the optional Humanoid first-frame condition."""
+
+        if initial_latent is None or state.next_frame_idx != 0:
+            return None
+        initial_action, initial_null = self._actions_for_frames(
+            conditioning.raw_action,
+            layout=conditioning.layout,
+            request_start_frame=request_start_frame,
+            frame_start=0,
+            frame_end=1,
+        )
+        if target_frame > 1 or not terminal_request:
+            with self._timed_tick_stage(
+                tick_durations,
+                "clean_cache_commit_s",
+                enabled=measure_tick_latency,
+            ):
+                self._commit_clean_frame(
+                    state,
+                    initial_latent,
+                    frame_idx=0,
+                    text_kv=text_kv,
+                    real_text_kv_len=real_text_kv_len,
+                    fps=fps,
+                    conditioning_kwargs={
+                        "action_latents": initial_action,
+                        "action_domain_ids": conditioning.domain_ids,
+                        "null_action_frame_indexes": (0,) if initial_null else (),
+                    },
+                )
+        state.append_chunk(initial_latent, frame_start=0, retain_latent=retain_latent)
+        return initial_latent
 
     def _denormalize_vae_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(device=self.device, dtype=self.vae.dtype)
@@ -764,7 +1042,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
         try:
             typed_tick = ARDiffusionTickRequest.from_extra_args(extra)
-            typed_inputs = parse_cosmos_dreams_tick(typed_tick) if typed_tick is not None else None
+            typed_inputs = self._parse_tick(typed_tick) if typed_tick is not None else None
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if typed_tick is not None:
@@ -825,30 +1103,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
-        domain_name = (
-            typed_inputs.domain_name if typed_inputs is not None else self._get_sp_param(sp, "domain_name", None)
-        )
-        domain_value = typed_inputs.domain_id if typed_inputs is not None else self._get_sp_param(sp, "domain_id", None)
-        if domain_value is None and domain_name is None:
-            domain_value = self.default_domain_id
-        if domain_value is not None:
-            domain_id = _admission_int(domain_value, "domain_id")
-            if domain_id < 0:
-                raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}.")
-        else:
-            try:
-                domain_id = self.manifest.resolve_domain_name(str(domain_name))
-            except ValueError as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
-        if domain_id >= self.manifest.num_embodiment_domains:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams domain_id is outside the exported embodiment table: "
-                f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
-            )
-        try:
-            embodiment = self.manifest.resolve_embodiment(domain_name, domain_id)
-        except ValueError as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        conditioning_request = self._validate_conditioning_request(sp, typed_inputs)
 
         guidance_scale = _admission_float(
             _first_not_none(self._get_sp_param(sp, "guidance_scale", None), 1.0),
@@ -864,10 +1119,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 f"got num_inference_steps={sp.num_inference_steps}."
             )
 
-        text_ids, text_mask = self._tokenize_prompt(
+        text_ids, text_mask = self._build_prompt_tokens(
             prompt,
-            max_sequence_length=1 << 30,
-            use_system_prompt=False,
+            sampling_params=sp,
+            prompt_data=prompt_data,
+            fps=fps,
         )
         real_text_kv_len = int(text_mask[0].sum().item())
         if real_text_kv_len > self.manifest.text_cache_max_len:
@@ -881,8 +1137,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             height=height,
             width=width,
             fps=fps,
-            domain_id=domain_id,
-            embodiment=embodiment,
+            conditioning_request=conditioning_request,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
         requested_frame_idx = _admission_int(
@@ -904,14 +1159,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     "Cosmos-Dreams tick output_type cannot change within a session; session reset required."
                 )
 
-        try:
-            raw_action = self._prepare_raw_action(
-                sp,
-                embodiment=embodiment,
-                action_value=typed_inputs.action if typed_inputs is not None else None,
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         try:
             initial_latent = self._initial_condition_latent(prompt_data, sp)
         except (TypeError, ValueError) as exc:
@@ -956,11 +1203,16 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams full rollout target precedes existing session state; session reset required."
                 )
-        action_layout = self._resolve_action_layout(
-            raw_action,
-            start_frame=start_frame,
-            target_frame=target_frame,
-        )
+        try:
+            conditioning = self._prepare_conditioning(
+                sp,
+                typed_inputs=typed_inputs,
+                request=conditioning_request,
+                start_frame=start_frame,
+                target_frame=target_frame,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
         # ---- Side effects begin ---------------------------------------------
         tick_durations: dict[str, float] = {}
@@ -973,40 +1225,28 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             state.initialize(fingerprint)
         if tick and state.tick_output_type is None:
             state.tick_output_type = tick_output_type
-        domain_ids = torch.tensor([domain_id], device=self.device, dtype=torch.long)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
         request_latent_chunks: list[torch.Tensor] = []
 
-        if initial_latent is not None and state.next_frame_idx == 0:
-            initial_action, initial_null = self._actions_for_frames(
-                raw_action,
-                layout=action_layout,
-                request_start_frame=start_frame,
-                frame_start=0,
-                frame_end=1,
-            )
-            if target_frame > 1 or not terminal_request:
-                with self._timed_tick_stage(
-                    tick_durations,
-                    "clean_cache_commit_s",
-                    enabled=measure_tick_latency,
-                ):
-                    self._commit_clean_frame(
-                        state,
-                        initial_latent,
-                        frame_idx=0,
-                        text_kv=text_kv,
-                        real_text_kv_len=real_text_kv_len,
-                        fps=fps,
-                        action=initial_action,
-                        domain_ids=domain_ids,
-                        null_action=bool(initial_null),
-                    )
-            state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick)
-            request_latent_chunks.append(initial_latent)
+        prefilled = self._prefill_first_frame(
+            state,
+            initial_latent,
+            target_frame=target_frame,
+            terminal_request=terminal_request,
+            request_start_frame=start_frame,
+            text_kv=text_kv,
+            real_text_kv_len=real_text_kv_len,
+            fps=fps,
+            conditioning=conditioning,
+            tick_durations=tick_durations,
+            measure_tick_latency=measure_tick_latency,
+            retain_latent=not tick,
+        )
+        if prefilled is not None:
+            request_latent_chunks.append(prefilled)
 
         generation_start = state.next_frame_idx
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
@@ -1014,82 +1254,21 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             target_frame,
             self.manifest.chunk_size,
         ):
-            chunk_frames = chunk_end - chunk_start
-            action_chunk, null_action_indexes = self._actions_for_frames(
-                raw_action,
-                layout=action_layout,
+            clean_chunk = self._run_chunk(
+                state,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_frame=target_frame,
+                terminal_request=terminal_request,
                 request_start_frame=start_frame,
-                frame_start=chunk_start,
-                frame_end=chunk_end,
+                seed=seed,
+                text_kv=text_kv,
+                real_text_kv_len=real_text_kv_len,
+                fps=fps,
+                conditioning=conditioning,
+                tick_durations=tick_durations,
+                measure_tick_latency=measure_tick_latency,
             )
-            noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
-            initial_noise = torch.randn(
-                1,
-                self.transformer.latent_channel_size,
-                chunk_frames,
-                self.manifest.latent_height,
-                self.manifest.latent_width,
-                generator=noise_generator,
-                device=self.device,
-                # The reference draws checkpoint-dtype noise, then promotes it
-                # to fp32 inside the distilled sampler.
-                dtype=self.dtype,
-            )
-
-            def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-                output = self._transformer_forward(
-                    state,
-                    x.to(self.dtype),
-                    timestep,
-                    text_kv=text_kv,
-                    real_text_kv_len=real_text_kv_len,
-                    frame_start=chunk_start,
-                    fps=fps,
-                    action_latents=action_chunk,
-                    action_domain_ids=domain_ids,
-                    condition_vision=False,
-                    null_action_frame_indexes=null_action_indexes,
-                    commit_current=False,
-                )
-                return output.video.float()
-
-            with self._timed_tick_stage(
-                tick_durations,
-                "denoise_s",
-                enabled=measure_tick_latency,
-            ):
-                clean_chunk = self.distilled_sampler.sample(
-                    velocity_fn,
-                    initial_noise,
-                    seed=seed,
-                    frame_idx=chunk_start,
-                ).to(self.dtype)
-
-            action_count = self.manifest.action_tokens_per_frame
-            with self._timed_tick_stage(
-                tick_durations,
-                "clean_cache_commit_s",
-                enabled=measure_tick_latency,
-            ):
-                for local_idx, frame_idx in iter_clean_commit_frames(
-                    chunk_start,
-                    chunk_end,
-                    target_frame=target_frame,
-                    terminal_request=terminal_request,
-                ):
-                    action_start = local_idx * action_count
-                    action_frame = action_chunk[:, action_start : action_start + action_count]
-                    self._commit_clean_frame(
-                        state,
-                        clean_chunk[:, :, local_idx : local_idx + 1],
-                        frame_idx=frame_idx,
-                        text_kv=text_kv,
-                        real_text_kv_len=real_text_kv_len,
-                        fps=fps,
-                        action=action_frame,
-                        domain_ids=domain_ids,
-                        null_action=local_idx in null_action_indexes,
-                    )
             state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick)
             request_latent_chunks.append(clean_chunk)
 

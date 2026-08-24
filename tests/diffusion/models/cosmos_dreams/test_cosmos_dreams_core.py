@@ -13,6 +13,12 @@ from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
     canonical_sha256,
     float32_value,
 )
+from vllm_omni.diffusion.models.cosmos_dreams.action_packing import (
+    build_interleaved_mrope_position_ids,
+    interleave_action_vision_tokens,
+    split_interleaved_action_vision_tokens,
+    zero_null_action_values,
+)
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 from vllm_omni.diffusion.models.cosmos_dreams.normalizer import QuantileRotAffineNormalizer
 from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
@@ -22,13 +28,9 @@ from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     append_dense_kv_history,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.utils import (
-    build_interleaved_mrope_position_ids,
     estimate_kv_memory_bytes,
-    interleave_action_vision_tokens,
     iter_ar_chunk_ranges,
     iter_clean_commit_frames,
-    split_interleaved_action_vision_tokens,
-    zero_null_action_values,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -195,6 +197,13 @@ def _artifact() -> dict[str, Any]:
     }
 
 
+def _action_manifest(**overrides: Any) -> CosmosDreamsManifest:
+    return CosmosDreamsManifest(
+        conditioning=CosmosDreamsActionSchema.model_validate(_action_schema_payload()),
+        **overrides,
+    )
+
+
 def _fingerprint(**overrides) -> CosmosDreamsSessionFingerprint:
     values = {
         "prompt_hash": "prompt",
@@ -202,9 +211,11 @@ def _fingerprint(**overrides) -> CosmosDreamsSessionFingerprint:
         "height": 720,
         "width": 1280,
         "fps": 15.0,
-        "domain_id": 15,
-        "embodiment": "agibotworld",
-        "action_contract_sha256": "contract",
+        "conditioning": (
+            ("domain_id", 15),
+            ("embodiment", "agibotworld"),
+            ("action_contract_sha256", "contract"),
+        ),
         "checkpoint_id": "checkpoint",
         "manifest_id": "manifest",
         "sampler_id": "sampler",
@@ -282,6 +293,12 @@ def test_manifest_rejects_deployment_defaults_and_placeholder_hash() -> None:
     with pytest.raises(ValueError, match="all-zero template"):
         CosmosDreamsManifest(checkpoint_hash="0" * 64)
 
+    CosmosDreamsManifest(
+        checkpoint_id="checkpoint",
+        checkpoint_iteration=1600,
+        checkpoint_hash="a" * 64,
+    ).require_exported_artifact()
+
     manifest = CosmosDreamsManifest(
         checkpoint_id="checkpoint",
         checkpoint_iteration=1600,
@@ -290,6 +307,52 @@ def test_manifest_rejects_deployment_defaults_and_placeholder_hash() -> None:
     )
     with pytest.raises(ValueError, match="Unknown Cosmos-Dreams domain_name"):
         manifest.resolve_domain_name("unknown")
+
+
+def test_manifest_construction_is_conditioning_neutral_but_action_properties_are_not() -> None:
+    manifest = CosmosDreamsManifest()
+
+    assert manifest.vision_tokens_per_frame == 920
+    with pytest.raises(ValueError, match="action_schema is unavailable"):
+        _ = manifest.action_tokens_per_frame
+    with pytest.raises(ValueError, match="action_schema is unavailable"):
+        _ = manifest.tokens_per_frame
+
+
+def test_v2_parser_maps_action_schema_into_generic_conditioning_slot() -> None:
+    artifact = _artifact()
+    config = SimpleNamespace(
+        model_config={},
+        tf_model_config={"cosmos_dreams": artifact},
+        custom_pipeline_args={},
+    )
+
+    manifest = CosmosDreamsManifest.from_od_config(config, require_explicit=True)
+
+    assert manifest.conditioning is manifest.action_schema
+    assert manifest.conditioning.digest == manifest.action_schema.digest
+
+
+def test_manifest_dispatches_schema_version_before_field_validation() -> None:
+    artifact = _artifact()
+    artifact["schema_version"] = 3
+    config = SimpleNamespace(
+        model_config={},
+        tf_model_config={"cosmos_dreams": artifact},
+        custom_pipeline_args={},
+    )
+
+    with pytest.raises(ValueError, match="Unsupported Cosmos-Dreams manifest schema_version=3"):
+        CosmosDreamsManifest.from_od_config(config, require_explicit=True)
+
+
+def test_action_payload_owns_temporal_cadence_validation() -> None:
+    schema = CosmosDreamsActionSchema.model_validate(_action_schema_payload())
+    manifest = CosmosDreamsManifest(temporal_compression_factor=8, conditioning=schema)
+
+    assert manifest.temporal_compression_factor == 8
+    with pytest.raises(ValueError, match="action_tokens_per_frame must equal"):
+        schema.validate_temporal_compression_factor(manifest.temporal_compression_factor)
 
 
 def test_action_contract_rejects_legacy_unsupported_and_tampered_payloads() -> None:
@@ -491,7 +554,7 @@ def test_text_padding_must_be_sliced_before_joint_softmax() -> None:
 
 
 def test_kv_estimator_counts_managed_scratch_and_text_pools() -> None:
-    manifest = CosmosDreamsManifest(window_frames=2, text_cache_max_len=3, height=32, width=32)
+    manifest = _action_manifest(window_frames=2, text_cache_max_len=3, height=32, width=32)
     estimate = estimate_kv_memory_bytes(
         manifest,
         num_layers=2,
@@ -515,9 +578,7 @@ def test_kv_estimator_counts_managed_scratch_and_text_pools() -> None:
         ("height", 704),
         ("width", 1216),
         ("fps", 24.0),
-        ("domain_id", 2),
-        ("embodiment", "agibot_gear_gripper"),
-        ("action_contract_sha256", "other-contract"),
+        ("conditioning", (("domain_id", 2),)),
         ("checkpoint_id", "other-checkpoint"),
         ("manifest_id", "other-manifest"),
         ("sampler_id", "other-sampler"),
@@ -607,7 +668,7 @@ def test_ar_cache_spec_uses_frame_pages_and_does_not_cap_at_resident_window() ->
         CosmosDreamsPipeline,
     )
 
-    manifest = CosmosDreamsManifest(
+    manifest = _action_manifest(
         height=32,
         width=32,
         window_frames=2,
@@ -661,7 +722,7 @@ def test_bound_ar_cache_geometry_must_match_the_manifest() -> None:
         CosmosDreamsPipeline,
     )
 
-    manifest = CosmosDreamsManifest(
+    manifest = _action_manifest(
         height=32,
         width=32,
         window_frames=2,
@@ -771,7 +832,7 @@ def _action_layout_pipeline_stub():
     )
 
     stub = SimpleNamespace(
-        manifest=CosmosDreamsManifest(),
+        manifest=_action_manifest(),
         device=torch.device("cpu"),
         dtype=torch.float32,
     )

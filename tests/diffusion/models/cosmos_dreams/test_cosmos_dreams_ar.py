@@ -81,6 +81,7 @@ def _attention_forward(
     dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
     paged_context=None,
     null_action: bool = False,
+    action_tokens_per_frame: int | None = 2,
 ):
     freqs_cos = torch.ones(1, BLOCK, 1, HEAD_DIM)
     freqs_sin = torch.zeros_like(freqs_cos)
@@ -95,9 +96,46 @@ def _attention_forward(
         paged_context=paged_context,
         num_frames=1,
         tokens_per_frame=BLOCK,
-        action_tokens_per_frame=2,
+        action_tokens_per_frame=action_tokens_per_frame,
         null_action_frame_indexes=(0,) if null_action else (),
     )
+
+
+def test_joint_attention_skips_action_value_zeroing_without_conditioning_tokens() -> None:
+    torch.manual_seed(3)
+    attention = _joint_attention()
+    hidden = torch.randn(1, BLOCK, HIDDEN)
+    text_k = torch.randn(1, 3, N_HEADS, HEAD_DIM)
+    text_v = torch.randn_like(text_k)
+
+    action = _attention_forward(
+        attention,
+        hidden,
+        text_k,
+        text_v,
+        real_text_kv_len=3,
+    )
+    no_conditioning = _attention_forward(
+        attention,
+        hidden,
+        text_k,
+        text_v,
+        real_text_kv_len=3,
+        action_tokens_per_frame=None,
+    )
+
+    for action_value, generic_value in zip(action, no_conditioning, strict=True):
+        assert torch.equal(action_value, generic_value)
+    with pytest.raises(ValueError, match="require action conditioning tokens"):
+        _attention_forward(
+            attention,
+            hidden,
+            text_k,
+            text_v,
+            real_text_kv_len=3,
+            null_action=True,
+            action_tokens_per_frame=None,
+        )
 
 
 def test_gathered_paged_joint_attention_is_exactly_the_dense_oracle() -> None:

@@ -288,6 +288,21 @@ class CosmosDreamsActionSchema(_StrictModel):
             },
         }
 
+    @property
+    def digest(self) -> str:
+        """Digest the complete conditioning payload, including provenance."""
+
+        return canonical_sha256(self.model_dump(mode="json", exclude_none=True))
+
+    def validate_temporal_compression_factor(self, temporal_compression_factor: int) -> None:
+        """Validate the action-token cadence against the model's VAE cadence."""
+
+        if self.action_tokens_per_frame != temporal_compression_factor:
+            raise ValueError(
+                "Cosmos-Dreams action_tokens_per_frame must equal temporal_compression_factor; "
+                f"got {self.action_tokens_per_frame} and {temporal_compression_factor}"
+            )
+
     @model_validator(mode="after")
     def verify_target_contract(self) -> CosmosDreamsActionSchema:
         if not self.embodiment_to_domain:
