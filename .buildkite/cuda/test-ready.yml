@@ -5,7 +5,6 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
-  # debug for test
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
