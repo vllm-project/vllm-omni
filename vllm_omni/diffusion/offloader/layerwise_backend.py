@@ -146,14 +146,7 @@ class LayerwiseOffloadHook(ModelHook):
             current_offset = 0
             for name, original_tensor, local_tensor in weights_with_local:
                 numel = local_tensor.numel()
-                # Non-contiguous tensors (e.g. FP8 padded weights stored as
-                # F.pad(...).t(), column-major) must be serialised in physical
-                # storage order. .flatten() on a column-major tensor re-orders
-                # data in C-logical order; .view(shape) on restore then assigns
-                # C-major strides — a different layout than the original, causing
-                # the Cutlass W8A8 kernel to read wrong data. Fix: if the tensor
-                # is 2-D and its transpose is contiguous (F-order), store .t()
-                # in the flat buffer and restore via .view(t_shape).t().
+                # Non-contiguous tensors must be serialised in physical storage order. 
                 if local_tensor.dim() == 2 and local_tensor.t().is_contiguous():
                     data_to_store = local_tensor.t()
                     store_transposed = True
