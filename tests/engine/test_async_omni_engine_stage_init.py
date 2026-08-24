@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import concurrent.futures
 import contextlib
 import importlib
@@ -511,6 +514,39 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         "batch_size": 4,
         "use_inline": True,
     }
+
+
+def test_initialize_diffusion_stage_default_batch_size_keeps_yaml_max_num_seqs(monkeypatch):
+    """The default batch_size (1) must not clobber the deploy YAML's max_num_seqs.
+
+    Online serving never passes diffusion_batch_size, so the stage YAML is its
+    only way to enable request batching.
+    """
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    od_config = types.SimpleNamespace(max_num_seqs=8)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
+
+    def _capture_client(model, config, metadata, stage_init_timeout, batch_size, use_inline):
+        captured.update(batch_size=batch_size)
+        return object()
+
+    monkeypatch.setattr(client_mod, "create_diffusion_client", _capture_client)
+
+    init_mod.initialize_diffusion_stage(
+        0,
+        "dummy-model",
+        types.SimpleNamespace(),
+        _make_diffusion_metadata(0),
+        stage_init_timeout=12,
+        batch_size=1,
+        use_inline=True,
+    )
+
+    assert od_config.max_num_seqs == 8
+    assert captured["batch_size"] == 8
 
 
 def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch):
