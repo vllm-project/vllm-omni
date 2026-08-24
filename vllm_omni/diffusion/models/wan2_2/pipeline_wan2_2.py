@@ -13,6 +13,7 @@ from typing import Any, ClassVar, cast
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -34,7 +35,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_z
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
-from vllm_omni.diffusion.postprocess import interpolate_video_tensor
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor, prepare_video_for_transport
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
@@ -195,8 +196,6 @@ def create_transformer_from_config(
 def get_wan22_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
-    from diffusers.video_processor import VideoProcessor
-
     video_processor = VideoProcessor(vae_scale_factor=8)
 
     def post_process_func(
@@ -209,16 +208,24 @@ def get_wan22_post_process_func(
         if output_type == "latent":
             return video
         video_metadata = {}
-        if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
-            video, multiplier = interpolate_video_tensor(
-                video,
-                exp=sampling_params.frame_interpolation_exp,
-                scale=sampling_params.frame_interpolation_scale,
-                model_path=sampling_params.frame_interpolation_model_path,
-            )
-            video_metadata["video_fps_multiplier"] = multiplier
+        frame_interpolation = sampling_params is not None and getattr(
+            sampling_params, "enable_frame_interpolation", False
+        )
+        requested_output_type = getattr(sampling_params, "output_type", None) if sampling_params is not None else None
+        if sampling_params is not None and requested_output_type in (None, "np") and not frame_interpolation:
+            processed_video = video.detach().cpu().numpy()
+        else:
+            if frame_interpolation:
+                video, multiplier = interpolate_video_tensor(
+                    video,
+                    exp=sampling_params.frame_interpolation_exp,
+                    scale=sampling_params.frame_interpolation_scale,
+                    model_path=sampling_params.frame_interpolation_model_path,
+                )
+                video_metadata["video_fps_multiplier"] = multiplier
+            processed_video = video_processor.postprocess_video(video, output_type=output_type)
         return {
-            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+            "payload": {"video": processed_video},
             "metadata": {"video": video_metadata} if video_metadata else {},
         }
 
@@ -408,6 +415,7 @@ class Wan22Pipeline(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         ).to(self.device)
+        self.video_processor = VideoProcessor(vae_scale_factor=8)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
@@ -848,6 +856,9 @@ class Wan22Pipeline(
             )
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
+
+            if output_type == "np" and not getattr(req.sampling_params, "enable_frame_interpolation", False):
+                output = prepare_video_for_transport(output, self.video_processor)
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()

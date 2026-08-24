@@ -22,6 +22,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.postprocess import prepare_video_for_transport
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.platforms import current_omni_platform
@@ -556,7 +557,10 @@ class LTXRuntime(
             )
 
         if video.numel() > 0:
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            if output_type == "np":
+                video = prepare_video_for_transport(video, self.video_processor)
+            else:
+                video = self.video_processor.postprocess_video(video, output_type=output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
         audio = self.vocoder(generated_mel)
         return self._make_output((video, audio))

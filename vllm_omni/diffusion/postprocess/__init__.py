@@ -6,5 +6,10 @@ from vllm_omni.diffusion.postprocess.rife_interpolator import (
     FrameInterpolator,
     interpolate_video_tensor,
 )
+from vllm_omni.diffusion.postprocess.video import prepare_video_for_transport
 
-__all__ = ["FrameInterpolator", "interpolate_video_tensor"]
+__all__ = [
+    "FrameInterpolator",
+    "interpolate_video_tensor",
+    "prepare_video_for_transport",
+]

@@ -497,10 +497,16 @@ def get_ltx2_post_process_func(od_config: Any):
         revision=getattr(od_config, "revision", None),
     )
 
-    def post_process_func(output: tuple[torch.Tensor, torch.Tensor] | torch.Tensor):
+    def post_process_func(
+        output: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
+        sampling_params: Any | None = None,
+    ):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         video, audio = output
+        output_type = getattr(sampling_params, "output_type", None) if sampling_params is not None else None
+        if output_type in (None, "np") and sampling_params is not None and isinstance(video, torch.Tensor):
+            video = video.detach().cpu().numpy()
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
         result: dict[str, Any] = {"video": video, "audio": audio}
