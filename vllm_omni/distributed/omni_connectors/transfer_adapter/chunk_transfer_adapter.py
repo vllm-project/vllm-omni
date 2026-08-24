@@ -262,11 +262,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
                     if key == "codes":
-                        if use_tensor_codes and isinstance(value, dict):
+                        if isinstance(value, Mapping):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                            merged_sub.update(value)
-                            info[key] = merged_sub
+                            # Generation stages consume ``codes.audio`` as
+                            # prompt ids. Preserve the first-chunk reference
+                            # waveform separately so Code2Wav can condition
+                            # its prompt; the old branch dropped the entire
+                            # ``codes`` mapping whenever audio was a list.
+                            if value.get("ref") is not None:
+                                merged_sub["ref"] = value["ref"]
+                            if use_tensor_codes:
+                                merged_sub.update(value)
+                            if merged_sub:
+                                info[key] = merged_sub
                         continue
                     if isinstance(value, dict):
                         existing_sub = info.get(key)

@@ -11,6 +11,9 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import hashlib
+import json
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -44,20 +47,131 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_CODEC_TRACE_ENV = "MINICPMO45_CODEC_SAMPLING_TRACE"
+_FIRST_LOGITS_TRACE_ENV = "MINICPMO45_FIRST_LOGITS_TRACE_DIR"
+
+
+def _trace_first_codec_step(
+    *,
+    request_id: str,
+    step: int,
+    hidden_state: torch.Tensor,
+    raw_logits: torch.Tensor,
+    processed_logits: torch.Tensor,
+    sampled_token: torch.Tensor,
+    history: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    min_tokens: int,
+    seed: int,
+    warpers_applied: bool,
+) -> None:
+    """Write an opt-in first-step diagnostic without changing sampling."""
+    root = os.environ.get(_FIRST_LOGITS_TRACE_ENV, "").strip()
+    if not root or step != 0 or not request_id.startswith("chatcmpl-"):
+        return
+
+    def tensor_summary(value: torch.Tensor, *, include_values: bool = False) -> dict[str, Any]:
+        tensor = value.detach().float().cpu().contiguous()
+        result: dict[str, Any] = {
+            "shape": [int(dim) for dim in tensor.shape],
+            "numel": int(tensor.numel()),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+        if include_values:
+            result["values"] = [float(item) for item in tensor.reshape(-1).tolist()]
+        return result
+
+    def topk_summary(value: torch.Tensor, count: int = 32) -> dict[str, Any]:
+        vector = value.detach().float().reshape(-1)
+        keep = min(count, int(vector.numel()))
+        values, indices = torch.topk(vector, keep)
+        return {
+            "indices": [int(item) for item in indices.cpu().tolist()],
+            "values": [float(item) for item in values.cpu().tolist()],
+        }
+
+    try:
+        os.makedirs(root, exist_ok=True)
+        record = {
+            "stage": "talker.first_codec_step",
+            "request_id": request_id,
+            "step": step,
+            "hidden_state": tensor_summary(hidden_state, include_values=True),
+            "raw_logits": tensor_summary(raw_logits, include_values=True),
+            "raw_topk": topk_summary(raw_logits),
+            "processed_logits": tensor_summary(processed_logits),
+            "processed_topk": topk_summary(processed_logits),
+            "processed_finite_count": int(torch.isfinite(processed_logits).sum().item()),
+            "sampled_token": int(sampled_token.item()),
+            "history": [int(item) for item in history.detach().cpu().reshape(-1).tolist()],
+            "sampling": {
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "repetition_penalty": repetition_penalty,
+                "min_tokens": min_tokens,
+                "seed": seed,
+                "first_step_warpers_applied": warpers_applied,
+            },
+        }
+        with open(os.path.join(root, "first_logits_trace.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("minicpmo45_first_logits_trace_failed error=%s", exc)
+
+
+
+
+def _trace_talker_condition(
+    *,
+    request_id: str,
+    token_ids: torch.Tensor,
+    condition: torch.Tensor,
+) -> None:
+    """Write the numeric condition used by this request for oracle replay."""
+    root = os.environ.get(_FIRST_LOGITS_TRACE_ENV, "").strip()
+    if not root or not request_id.startswith("chatcmpl-"):
+        return
+    try:
+        ids = token_ids.detach().cpu().reshape(-1).tolist()
+        values = condition.detach().float().cpu().contiguous()
+        payload = {
+            "stage": "talker.condition",
+            "request_id": request_id,
+            "tts_token_ids": {
+                "shape": [int(dim) for dim in token_ids.shape],
+                "numel": int(token_ids.numel()),
+                "values": [int(item) for item in ids],
+            },
+            "condition": {
+                "shape": [int(dim) for dim in values.shape],
+                "numel": int(values.numel()),
+                "sha256": hashlib.sha256(values.numpy().tobytes()).hexdigest(),
+                "values": [float(item) for item in values.reshape(-1).tolist()],
+            },
+        }
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "condition_trace.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning("minicpmo45_condition_trace_failed error=%s", exc)
+
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
-    """Bound codec generation with a conservative text-length estimate.
+    """Return the checkpoint's native codec generation limit.
 
-    EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
-    limit can terminate short responses before EOS is eligible. The 2048
-    ceiling matches the checkpoint's native generation default and keeps the
-    sequence within the Talker's 4096-position context.
+    The Transformers reference path allows up to 2048 codec tokens and stops
+    on the model EOS token (after the first 50 tokens). A text-length-derived
+    ``condition_tokens * 10`` cap is not part of that contract and can cut off
+    perfectly valid Chinese utterances before EOS; ``condition_tokens`` is
+    retained for API/test compatibility and intentionally unused.
     """
-    return max(
-        _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN),
-    )
+    del condition_tokens
+    return _MAX_AUDIO_TOKENS
 
 
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:
@@ -147,12 +261,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._num_audio_tokens = getattr(tts_config, "num_audio_tokens", 6562)
             self._hidden_size = getattr(tts_config, "hidden_size", 768)
             self._normalize = getattr(tts_config, "normalize_projected_hidden", True)
-            self._codec_seed = int(getattr(tts_config, "seed", _CODEC_SEED))
-            self._codec_temperature = float(getattr(tts_config, "temperature", _CODEC_TEMPERATURE))
-            self._codec_top_k = int(getattr(tts_config, "top_k", _CODEC_TOP_K))
-            self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
-            self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
-            self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
+            # MiniCPMTTS.generate_chunk() invokes gen_logits() without
+            # generation-config overrides. These values are part of the
+            # model TTS contract, not generic HF generation config.
+            self._codec_seed = _CODEC_SEED
+            self._codec_temperature = _CODEC_TEMPERATURE
+            self._codec_top_k = _CODEC_TOP_K
+            self._codec_top_p = _CODEC_TOP_P
+            self._codec_repetition_penalty = _CODEC_REPETITION_PENALTY
+            self._codec_min_tokens = _CODEC_MIN_TOKENS
+            self._codec_sampling_source = "official_minicpm_tts"
         else:
             self._tts_config = None
 
@@ -290,6 +408,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 hidden_states,
                 native_duplex=native_duplex,
             )
+            _trace_talker_condition(
+                request_id=str(info_dict.get("request_id", "0")),
+                token_ids=token_ids,
+                condition=full_embeds,
+            )
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
             request_id = str(info_dict.get("request_id", "0"))
             meta = info_dict.get("meta")
@@ -377,7 +500,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        raw_logits = self.head_code[0](hidden_state).float()
+        logits = raw_logits / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
@@ -392,18 +516,57 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
-        )
-        probabilities = torch.softmax(logits, dim=-1)
-        return torch.multinomial(
+        # MiniCPMTTS skips logits warpers for the first codec token while
+        # audio_bos is active. Subsequent tokens use the official
+        # TopP-then-TopK order implemented above.
+        apply_warpers = step > 0
+        if apply_warpers:
+            logits = _apply_top_k_top_p(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+        if os.getenv(_CODEC_TRACE_ENV) == "1":
+            logger.warning(
+                "minicpmo45_codec_sampling request_id=%s step=%s source=%s "
+                "seed=%s temperature=%s top_k=%s top_p=%s repetition_penalty=%s "
+                "min_tokens=%s warpers=%s",
+                request_id,
+                step,
+                getattr(self, "_codec_sampling_source", "official_minicpm_tts"),
+                self._codec_seed,
+                self._codec_temperature,
+                self._codec_top_k,
+                self._codec_top_p,
+                self._codec_repetition_penalty,
+                min_tokens,
+                apply_warpers,
+            )
+        processed_logits = logits
+        probabilities = torch.softmax(processed_logits, dim=-1)
+        sampled_token = torch.multinomial(
             probabilities,
             num_samples=1,
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
+        _trace_first_codec_step(
+            request_id=request_id,
+            step=step,
+            hidden_state=hidden_state,
+            raw_logits=raw_logits,
+            processed_logits=processed_logits,
+            sampled_token=sampled_token,
+            history=history,
+            temperature=self._codec_temperature,
+            top_k=self._codec_top_k,
+            top_p=self._codec_top_p,
+            repetition_penalty=self._codec_repetition_penalty,
+            min_tokens=min_tokens,
+            seed=self._codec_seed,
+            warpers_applied=apply_warpers,
+        )
+        return sampled_token
 
     def make_omni_output(
         self,
