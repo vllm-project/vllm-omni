@@ -112,3 +112,7 @@ pytest -q tests/diffusion/models/sensenova_u1/
   then proceeds on the in-tree config. Generation is unaffected.
 - The LoRA targets the generation tower only (`*_mot_gen`); understanding-tower weights are
   untouched.
+- Autoregressive decode (think and image-to-text) runs on a paged K/V cache under a captured
+  CUDA graph. It falls back to the ordinary cache when the device or the bundled
+  `flash_attn_varlen_func` cannot support it; set `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` to force
+  that fallback.
