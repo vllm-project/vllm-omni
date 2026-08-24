@@ -51,7 +51,13 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
 
+from .paged_decode import (
+    DecodeGraphRunner,
+    PagedDecodeCache,
+    paged_decode_supported,
+)
 from .sensenova_u1_transformer import (
+    SenseNovaU1CausalLMOutput,
     SenseNovaU1ForCausalLM,
     clear_flash_kv_cache,
     create_block_causal_mask,
@@ -722,8 +728,44 @@ class SenseNovaU1Pipeline(
         sigma = shift * sigma / (1 + (shift - 1) * sigma)
         return 1 - sigma
 
-    def _ar_step(self, next_token, t_idx, past_key_values):
+    def _decode_context(self, past_key_values):
+        """Paged cache plus a captured graph for the AR loop, or ``None``.
+
+        Decode is where a think request spends most of its time, and every step
+        issues the same work at the same shapes, so it is worth capturing. The
+        cache has to be paged for that: it keeps the buffers a fixed size while
+        the kernel reads only ``seqused_k`` of them, which is what lets one
+        capture serve every step until the next bucket.
+        """
+        if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
+            return None
+        head_dim = self.language_model.model.layers[0].self_attn.head_dim
+        if not paged_decode_supported(torch.device(self.device), head_dim):
+            return None
+        if past_key_values is None or not past_key_values.layers:
+            return None
+        cache = PagedDecodeCache.from_dynamic_cache(
+            past_key_values,
+            len(self.language_model.model.layers),
+            torch.device(self.device),
+            past_key_values.layers[0].keys.dtype,
+        )
+        if cache is None:
+            return None
+        return cache, DecodeGraphRunner(self.language_model, cache, torch.device(self.device))
+
+    def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
         """One autoregressive token step. Constructs single-token `indexes` explicitly."""
+        if decode is not None:
+            cache, runner = decode
+            if cache.length + 1 > cache.bucket:
+                cache.grow(cache.length + 1)
+            cache.set_length(cache.length + 1)
+            logits = runner.step(int(next_token), t_idx + 1)
+            # The caller reassigns its cache handle from this field; the paged
+            # tokens are merged into it once, at the hand-off below.
+            return SenseNovaU1CausalLMOutput(logits=logits, past_key_values=past_key_values)
+
         indexes = torch.tensor([[t_idx + 1], [0], [0]], dtype=torch.long, device=self.device)
         outputs = self.language_model(
             input_ids=next_token.unsqueeze(0),
@@ -738,23 +780,27 @@ class SenseNovaU1Pipeline(
         think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         think_token_ids = []
         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+        decode = self._decode_context(past_key_values)
 
         for _ in range(max_think_tokens):
             token_item = next_token.item()
             if token_item == eos_token_id:
                 break
             if token_item == think_end_token_id:
-                outputs = self._ar_step(next_token, t_idx, past_key_values)
+                outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
                 past_key_values = outputs.past_key_values
                 t_idx += 1
                 think_token_ids.append(token_item)
                 break
 
             think_token_ids.append(token_item)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             t_idx += 1
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+
+        if decode is not None:
+            decode[0].to_dynamic_cache(past_key_values)
 
         # Append "\n\n<img>" tokens to cache
         append_ids = self.tokenizer(
