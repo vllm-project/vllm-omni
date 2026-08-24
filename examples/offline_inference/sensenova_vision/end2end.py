@@ -21,6 +21,13 @@ the pipeline routes outputs through the standard BAGEL modality contract:
                        decoded with ``decode_point_map``, optional text)
     mixed            — ``caption_generate``: returns an image plus the
                        intermediate caption text
+    think-text2text  — ``think_understanding`` on the two-stage think topology
+    think-text2img   — ``think_generate`` on the two-stage think topology
+    think-img2img    — ``think_edit`` on the two-stage think topology
+
+The ``think-*`` modalities wrap the user content with the BAGEL think system
+prompt and require the ``sensenova_vision_think`` deploy YAML (selected
+automatically unless ``--deploy-config`` is given).
 
 Examples:
 
@@ -58,6 +65,12 @@ Examples:
     python examples/offline_inference/sensenova_vision/end2end.py \
         --modality mixed \
         --image-path /path/to/photo.jpg \
+        --output ./out
+
+    # Think-mode image generation (two-stage think topology)
+    python examples/offline_inference/sensenova_vision/end2end.py \
+        --modality think-text2img \
+        --prompts "A cute corgi astronaut on the moon" \
         --output ./out
 """
 
@@ -121,7 +134,25 @@ CAPTION_GENERATE_PROMPT = (
 )
 EDIT_PROMPT = "Turn this image into a vibrant cartoon-style illustration."
 
+# recon3d output geometry (upstream ``recon3d_vae_transform`` =
+# ``ImageTransform(512, 256, 16)``: long edge 512, short edge 256).
+RECON3D_HEIGHT = 256
+RECON3D_WIDTH = 512
+
+# BAGEL/SenseNovaVision chat-scaffold markers.  The AR multimodal processor
+# expands each <|image_pad|> into the ViT patch block of one ``image`` item and
+# each <|fim_middle|> into the VAE+ViT conditioning block of one ``img2img``
+# item, so the number of markers must equal the number of supplied items.
+_IM_START = "<|im_start|>"
+_IM_END = "<|im_end|>"
+_FIM_MIDDLE = "<|fim_middle|>"
+_IMAGE_PAD_BLOCK = "<|image_pad|>\n"
+# Understanding tasks continue after an opened assistant turn.
+_UNDERSTANDING_SUFFIX = f"{_IM_END}\n{_IM_START}assistant\n"
+
 # ``--modality`` choices and the SenseNovaVision pipeline mode they map to.
+# The ``think-*`` entries require the ``sensenova_vision_think`` topology
+# (auto-selected in ``main()`` via ``THINK_MODALITIES``).
 MODALITY_MODE = {
     "text2text": "understanding",
     "img2text": "understanding",
@@ -133,7 +164,14 @@ MODALITY_MODE = {
     "multi-img2text": "understanding",
     "recon3d": "recon3d",
     "mixed": "caption_generate",
+    "think-text2text": "think_understanding",
+    "think-text2img": "think_generate",
+    "think-img2img": "think_edit",
 }
+
+# Modalities that must run on the two-stage think topology: stage 0 decodes
+# its <thinking> tokens to EOS before the KV cache transfers to the DiT.
+THINK_MODALITIES = frozenset({"think-text2text", "think-text2img", "think-img2img"})
 
 # Output-name prefixes per modality (deterministic filenames).
 _MODALITY_PREFIX = {
@@ -147,6 +185,9 @@ _MODALITY_PREFIX = {
     "multi-img2text": "multi_img2text",
     "recon3d": "recon3d",
     "mixed": "mixed",
+    "think-text2text": "think_text2text",
+    "think-text2img": "think_text2img",
+    "think-img2img": "think_img2img",
 }
 
 
@@ -189,8 +230,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--deploy-config",
         type=str,
-        default="vllm_omni/deploy/sensenova_vision.yaml",
-        help="Path to the SenseNovaVision deploy YAML (two-stage thinker + DiT).",
+        default=None,
+        help="Path to the SenseNovaVision deploy YAML (two-stage thinker + DiT). "
+        "Defaults to sensenova_vision.yaml, or sensenova_vision_think.yaml for the think-* modalities.",
+    )
+    p.add_argument(
+        "--num-views",
+        type=int,
+        default=None,
+        help="recon3d: number of output views to decode (default 4, upstream num_output_vae).",
     )
     p.add_argument(
         "--cfg-text-scale",
@@ -254,12 +302,24 @@ _ACTIVE_MODALITY = "text2img"
 
 
 def _format_text2text_prompts(prompts):
-    return [{"prompt": p, "modalities": ["text"], "mode": "understanding"} for p in prompts]
+    return [
+        {
+            "prompt": f"{_IM_START}user\n{p}{_UNDERSTANDING_SUFFIX}",
+            "modalities": ["text"],
+            "mode": "understanding",
+        }
+        for p in prompts
+    ]
 
 
 def _format_img2text_prompts(prompts, image):
     return [
-        {"prompt": p, "multi_modal_data": {"image": image}, "modalities": ["text"], "mode": "understanding"}
+        {
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
+            "multi_modal_data": {"image": image},
+            "modalities": ["text"],
+            "mode": "understanding",
+        }
         for p in prompts
     ]
 
@@ -267,7 +327,7 @@ def _format_img2text_prompts(prompts, image):
 def _format_dense_detection_prompts(prompts, image):
     return [
         {
-            "prompt": p,
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "dense_detection",
@@ -279,7 +339,7 @@ def _format_dense_detection_prompts(prompts, image):
 def _format_dense_ocr_prompts(prompts, image):
     return [
         {
-            "prompt": p,
+            "prompt": f"{_IM_START}user\n{_IMAGE_PAD_BLOCK}{p}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": image},
             "modalities": ["text"],
             "mode": "dense_OCR",
@@ -289,15 +349,20 @@ def _format_dense_ocr_prompts(prompts, image):
 
 
 def _format_text2img_prompts(prompts):
-    return [{"prompt": p, "modalities": ["image"], "mode": "generate"} for p in prompts]
+    # Generation scaffold: no user/assistant turns, <|im_start|> wraps the raw
+    # prompt (matches ``build_text_to_image_prompt`` and the passing e2e test).
+    return [{"prompt": f"{_IM_START}{p}{_IM_END}", "modalities": ["image"], "mode": "generate"} for p in prompts]
 
 
 def _format_img2img_prompts(prompts, image):
+    # img2img conditioning: <|fim_middle|> marks where the VAE+ViT block of the
+    # input image is expanded; modalities must say "img2img" so the AR stage
+    # routes embeddings through VAE+ViT (not ViT-only understanding).
     return [
         {
-            "prompt": p,
-            "multi_modal_data": {"image": image},
-            "modalities": ["image"],
+            "prompt": f"{_FIM_MIDDLE}{_IM_START}{p}{_IM_END}",
+            "multi_modal_data": {"img2img": image},
+            "modalities": ["img2img"],
             "mode": "edit",
         }
         for p in prompts
@@ -307,9 +372,9 @@ def _format_img2img_prompts(prompts, image):
 def _format_img2dense_prompts(prompts, image):
     return [
         {
-            "prompt": p,
-            "multi_modal_data": {"image": image},
-            "modalities": ["image"],
+            "prompt": f"{_FIM_MIDDLE}{_IM_START}{p}{_IM_END}",
+            "multi_modal_data": {"img2img": image},
+            "modalities": ["img2img"],
             "mode": "dense_perception",
         }
         for p in prompts
@@ -317,10 +382,12 @@ def _format_img2dense_prompts(prompts, image):
 
 
 def _format_multi_img2text_prompts(prompts, images):
-    image_block = "<image>" * len(images)
+    # Multi-view understanding: one <|image_pad|> per input view, in input
+    # order, before the prompt text (requires the SenseNova mm limit of 10).
+    image_block = _IMAGE_PAD_BLOCK * len(images)
     return [
         {
-            "prompt": f"{image_block}{p}",
+            "prompt": f"{_IM_START}user\n{image_block}{p}{_UNDERSTANDING_SUFFIX}",
             "multi_modal_data": {"image": images},
             "modalities": ["text"],
             "mode": "understanding",
@@ -330,11 +397,16 @@ def _format_multi_img2text_prompts(prompts, images):
 
 
 def _format_recon3d_prompts(prompts, images):
+    # Multi-view generation conditioning (mirrors upstream reconstruct_3d,
+    # which interleaves [*images, prompt]): N <|fim_middle|> markers expand to
+    # N VAE+ViT blocks, then the chat-wrapped prompt.  Order matters: the
+    # first marker binds view 0.
+    fim_block = _FIM_MIDDLE * len(images)
     return [
         {
-            "prompt": p,
-            "multi_modal_data": {"image": images},
-            "modalities": ["image"],
+            "prompt": f"{fim_block}{_IM_START}{p}{_IM_END}",
+            "multi_modal_data": {"img2img": images},
+            "modalities": ["img2img"],
             "mode": "recon3d",
         }
         for p in prompts
@@ -342,12 +414,51 @@ def _format_recon3d_prompts(prompts, images):
 
 
 def _format_mixed_prompts(prompts, image):
+    # caption_generate conditions on the image like edit/dense_perception;
+    # caption folding into the prompt text is upstream divergence #1 (out of
+    # scope), and modalities stay single-key img2img.
     return [
         {
-            "prompt": p,
-            "multi_modal_data": {"image": image},
-            "modalities": ["image", "text"],
+            "prompt": f"{_FIM_MIDDLE}{_IM_START}{p}{_IM_END}",
+            "multi_modal_data": {"img2img": image},
+            "modalities": ["img2img"],
             "mode": "caption_generate",
+        }
+        for p in prompts
+    ]
+
+
+def _format_think_text2text_prompts(prompts):
+    from vllm_omni.model_executor.models.sensenova_vision.prompt_utils import build_think_prompt
+
+    return [
+        {
+            "prompt": f"{build_think_prompt(p, mode='think_understanding')}{_UNDERSTANDING_SUFFIX}",
+            "modalities": ["text"],
+            "mode": "think_understanding",
+        }
+        for p in prompts
+    ]
+
+
+def _format_think_text2img_prompts(prompts):
+    from vllm_omni.model_executor.models.sensenova_vision.prompt_utils import build_think_prompt
+
+    # Think image generation: the think system+user wrapper replaces the plain
+    # <|im_start|>{p}<|im_end|> generation scaffold; prepare_prompts adds the
+    # port's single bos/eos pair around it (see prompt_utils docstring caveat).
+    return [{"prompt": build_think_prompt(p), "modalities": ["image"], "mode": "think_generate"} for p in prompts]
+
+
+def _format_think_img2img_prompts(prompts, image):
+    from vllm_omni.model_executor.models.sensenova_vision.prompt_utils import build_think_prompt
+
+    return [
+        {
+            "prompt": f"{_FIM_MIDDLE}{build_think_prompt(p)}",
+            "multi_modal_data": {"img2img": image},
+            "modalities": ["img2img"],
+            "mode": "think_edit",
         }
         for p in prompts
     ]
@@ -443,6 +554,9 @@ def main():
         "multi-img2text": [CAMERA_POSE_PROMPT],
         "recon3d": [RECON3D_PROMPT],
         "mixed": [CAPTION_GENERATE_PROMPT],
+        "think-text2text": [UNDERSTANDING_PROMPT],
+        "think-text2img": ["A cute corgi astronaut on the moon, cinematic"],
+        "think-img2img": [EDIT_PROMPT],
     }
     if args.modality == "img2dense":
         prompts = args.prompts or default_prompts["img2dense"][args.dense_task]
@@ -457,6 +571,7 @@ def main():
         "img2img",
         "img2dense",
         "mixed",
+        "think-img2img",
     ):
         if not images:
             raise ValueError(f"--modality {args.modality} requires at least one --image-path")
@@ -464,8 +579,18 @@ def main():
     elif args.modality in ("multi-img2text", "recon3d"):
         if len(images) < 2:
             raise ValueError(f"--modality {args.modality} requires at least two --image-path values")
-    elif args.modality == "text2img" and not args.image_path:
+    elif args.modality in ("text2img", "think-text2img", "text2text", "think-text2text") and not args.image_path:
         pass
+
+    # Think modalities need the two-stage think topology (stage 0 decodes its
+    # <thinking> tokens before KV transfer); everything else uses the default
+    # transfer-at-prefill topology.  An explicit --deploy-config always wins.
+    if args.deploy_config is None:
+        args.deploy_config = (
+            "vllm_omni/deploy/sensenova_vision_think.yaml"
+            if args.modality in THINK_MODALITIES
+            else "vllm_omni/deploy/sensenova_vision.yaml"
+        )
 
     omni_kwargs = {
         "model": args.model,
@@ -491,6 +616,12 @@ def main():
         formatted = _format_multi_img2text_prompts(prompts, images)
     elif args.modality == "recon3d":
         formatted = _format_recon3d_prompts(prompts, images)
+    elif args.modality == "think-text2text":
+        formatted = _format_think_text2text_prompts(prompts)
+    elif args.modality == "think-text2img":
+        formatted = _format_think_text2img_prompts(prompts)
+    elif args.modality == "think-img2img":
+        formatted = _format_think_img2img_prompts(prompts, image)
     else:  # mixed
         formatted = _format_mixed_prompts(prompts, image)
 
@@ -499,12 +630,30 @@ def main():
     diffusion_params.num_inference_steps = args.steps  # type: ignore
     if args.seed is not None:
         diffusion_params.seed = args.seed  # type: ignore
-    if args.height is not None:
-        diffusion_params.height = args.height  # type: ignore
-    if args.width is not None:
-        diffusion_params.width = args.width  # type: ignore
 
     extra = getattr(diffusion_params, "extra_args", {}) or {}
+
+    # Output resolution: recon3d defaults to the recon3d_vae_transform target
+    # (ImageTransform(512, 256, 16)); other modes use the checkpoint max.
+    default_hw = (RECON3D_HEIGHT, RECON3D_WIDTH) if args.modality == "recon3d" else (None, None)
+    if args.height is not None or default_hw[0] is not None:
+        diffusion_params.height = args.height if args.height is not None else default_hw[0]  # type: ignore
+    if args.width is not None or default_hw[1] is not None:
+        diffusion_params.width = args.width if args.width is not None else default_hw[1]  # type: ignore
+
+    if args.modality == "recon3d":
+        if args.num_views is not None:
+            extra["num_views"] = args.num_views
+            if len(images) > args.num_views:
+                raise ValueError(
+                    f"recon3d got {len(images)} input views but --num-views {args.num_views}; "
+                    "the output view count must cover every input view"
+                )
+        if args.cfg_text_scale is None:
+            # Benchmark default (inference/benchmark/batch_recon3d.py:87-93):
+            # overrides BASE_PARAMS' cfg_text_scale 1.0 with 4.0.
+            extra["cfg_text_scale"] = 4.0
+
     if args.cfg_text_scale is not None:
         extra["cfg_text_scale"] = args.cfg_text_scale
     if args.cfg_img_scale is not None:
@@ -529,6 +678,7 @@ def main():
         "dense_detection",
         "dense_OCR",
         "multi-img2text",
+        "think-text2text",
     }
 
     if args.modality in text_modalities:

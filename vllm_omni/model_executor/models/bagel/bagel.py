@@ -784,11 +784,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             post_text-> M+2, M+3, ...
 
         When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
-
-        A single request may carry SEVERAL img2img blocks (multi-image
-        requests): every block collapses to two logical positions anchored at
-        its own M, with interleaved text resuming at M+2, so a request with
-        k blocks occupies ``#text_tokens + 2*k`` logical positions.
         """
         info_list = self._pending_img2img_info
         self._pending_img2img_info = []
@@ -813,83 +808,10 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
 
         img2img_idx = 0
-        # Host copy of input_ids for placeholder matching (same rationale as
-        # the positions copy above: per-element device indexing would sync on
-        # every token).
-        ids_list = input_ids.tolist() if input_ids is not None else None
         for req_idx in range(num_requests):
             start = boundaries[req_idx]
             end = boundaries[req_idx + 1]
             req_len = end - start
-
-            # Match this request's <|fim_middle|> blocks against the pending
-            # infos. A block is a contiguous placeholder stretch of exactly
-            # ``num_vae + 1 + num_vit`` tokens for its image, so adjacent
-            # blocks (no text between them) concatenate into longer runs that
-            # this scan still splits correctly by advancing block_len tokens
-            # per matched info. Infos left over stay queued for the following
-            # requests in the batch.
-            spans = []
-            if ids_list is not None and img2img_idx < len(info_list):
-                req_ids = ids_list[start:end]
-                tok = self._img2img_token_id
-                scan = 0
-                info_i = img2img_idx
-                while info_i < len(info_list):
-                    num_vae, num_vit = info_list[info_i][0], info_list[info_i][1]
-                    block_len = num_vae + 1 + num_vit
-                    while scan < req_len and req_ids[scan] != tok:
-                        scan += 1
-                    if scan >= req_len or req_len - scan < block_len:
-                        break
-                    if any(req_ids[scan + j] != tok for j in range(block_len)):
-                        break
-                    spans.append((scan, *info_list[info_i]))
-                    scan += block_len
-                    info_i += 1
-
-            if spans:
-                # Logical positions are rebased per request: leading text keeps
-                # 0..M1-1, every block collapses to TWO shared logical positions
-                # (VAE+separator -> M, ViT -> M+1) regardless of token count,
-                # and text after a block resumes at M+2. NOTE: a block's logical
-                # anchor M is NOT its token offset once earlier blocks have
-                # compressed their tokens, hence the threaded cursor.
-                first_off = spans[0][0]
-                if first_off > 0:
-                    new_positions[start : start + first_off] = torch.arange(
-                        0, first_off, device=positions.device, dtype=positions.dtype
-                    )
-                logical_m = first_off
-                for k, (off, num_vae, num_vit, img_H, img_W) in enumerate(spans):
-                    img_start = start + off
-                    vit_start = img_start + num_vae + 1
-                    new_positions[img_start:vit_start] = logical_m  # VAE section + separator
-                    new_positions[vit_start : vit_start + num_vit] = logical_m + 1  # ViT section
-                    vae_lo = img_start + 1
-                    vae_hi = img_start + num_vae - 1
-                    if vae_hi > vae_lo:
-                        vae_mask[vae_lo:vae_hi] = True
-                    block_end = off + num_vae + 1 + num_vit
-                    next_off = spans[k + 1][0] if k + 1 < len(spans) else req_len
-                    gap_len = next_off - block_end
-                    if gap_len > 0:
-                        new_positions[start + block_end : start + block_end + gap_len] = torch.arange(
-                            logical_m + 2,
-                            logical_m + 2 + gap_len,
-                            device=positions.device,
-                            dtype=positions.dtype,
-                        )
-                    logical_m += 2 + gap_len
-                self._ropes_pending.append(
-                    {
-                        "ropes": [logical_m],
-                        "image_shape": [spans[-1][3], spans[-1][4]],
-                        "prefill_position_count": req_len,
-                    }
-                )
-                img2img_idx += len(spans)
-                continue
 
             if img2img_idx < len(info_list):
                 cur_info = info_list[img2img_idx]

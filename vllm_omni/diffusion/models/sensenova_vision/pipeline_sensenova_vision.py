@@ -62,7 +62,6 @@ class SenseNovaVisionGenParams:
     cfg_renorm_type: str = "global"
     # SenseNovaVision-specific additive flags (not consumed by the BAGEL core).
     think: bool = False
-    caption: bool = False
     understanding_output: bool = False
     max_think_token_n: int = 1000
     do_sample: bool = False
@@ -90,7 +89,6 @@ class SenseNovaVisionGenParams:
             cfg_renorm_min=float(base.pop("cfg_renorm_min", 1.0)),
             cfg_renorm_type=str(base.pop("cfg_renorm_type", "global")),
             think=bool(base.pop("think", False)),
-            caption=bool(base.pop("caption", False)),
             understanding_output=bool(base.pop("understanding_output", False)),
             max_think_token_n=int(base.pop("max_think_token_n", 1000)),
             do_sample=bool(base.pop("do_sample", False)),
@@ -133,7 +131,8 @@ _BASE_PARAMS: dict[str, dict[str, Any]] = {
         "num_timesteps": 50,
         "cfg_renorm_min": 1.0,
         "cfg_renorm_type": "global",
-        "caption": True,
+        "think": True,  # `caption` serve same purpose as `think` flag in og repo.
+        # "caption": True,
     },
     "dense_perception": {
         "cfg_text_scale": 4.0,
@@ -507,7 +506,9 @@ class SenseNovaVisionPipeline(BagelPipeline):
                 text = text_group.get("text_output") or text_group.get("think_text")
         if text is None:
             extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-            text = extra_args.get("text_output") or extra_args.get("caption")
+            candidate = extra_args.get("text_output")
+            if isinstance(candidate, str) and candidate:
+                text = candidate
         if text is None:
             return output
 
@@ -556,7 +557,6 @@ class SenseNovaVisionPipeline(BagelPipeline):
         extra_args.setdefault("cfg_renorm_min", defaults.cfg_renorm_min)
         extra_args.setdefault("cfg_renorm_type", defaults.cfg_renorm_type)
         extra_args.setdefault("think", defaults.think)
-        extra_args.setdefault("caption", defaults.caption)
         extra_args.setdefault("max_think_tokens", defaults.max_think_token_n)
         extra_args.setdefault("do_sample", defaults.do_sample)
         extra_args.setdefault("text_temperature", defaults.text_temperature)

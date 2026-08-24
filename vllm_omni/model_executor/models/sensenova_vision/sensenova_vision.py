@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import torch
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -56,6 +57,7 @@ class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": 10, "img2img": 10}
+
 
 class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
     """SenseNovaVision multimodal processor with recon3d view plumbing.
@@ -137,3 +139,197 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         ``return_raw_latent`` when decoding images.
         """
         return None
+
+    def _adjust_positions_for_img2img(
+        self,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Rewrite position IDs for img2img.
+
+        Supports an optional ``pre_text_len`` prefix (thinking-mode) detected
+        via the ``<|fim_middle|>`` token in *input_ids*:
+
+            pre_text -> 0 .. M-1
+            VAE      -> M       (all share)
+            separator-> M
+            ViT      -> M+1     (all share)
+            post_text-> M+2, M+3, ...
+
+        When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
+
+        A single request may carry SEVERAL img2img blocks (multi-image
+        requests): every block collapses to two logical positions anchored at
+        its own M, with interleaved text resuming at M+2, so a request with
+        k blocks occupies ``#text_tokens + 2*k`` logical positions.
+        """
+        info_list = self._pending_img2img_info
+        self._pending_img2img_info = []
+
+        if not info_list:
+            self._vae_token_mask = None
+            self._has_vae_tokens = False
+            self._has_non_vae_tokens = True
+            return positions
+
+        boundaries = [0]
+        # Copy positions to the host once: indexing the CUDA tensor element by
+        # element in the loop below would sync the device on every iteration.
+        pos_list = positions.tolist()
+        for i in range(1, len(pos_list)):
+            if pos_list[i] < pos_list[i - 1]:
+                boundaries.append(i)
+        boundaries.append(len(pos_list))
+
+        num_requests = len(boundaries) - 1
+        new_positions = positions.clone()
+        vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
+
+        img2img_idx = 0
+        # Host copy of input_ids for placeholder matching (same rationale as
+        # the positions copy above: per-element device indexing would sync on
+        # every token).
+        ids_list = input_ids.tolist() if input_ids is not None else None
+        for req_idx in range(num_requests):
+            start = boundaries[req_idx]
+            end = boundaries[req_idx + 1]
+            req_len = end - start
+
+            # Match this request's <|fim_middle|> blocks against the pending
+            # infos. A block is a contiguous placeholder stretch of exactly
+            # ``num_vae + 1 + num_vit`` tokens for its image, so adjacent
+            # blocks (no text between them) concatenate into longer runs that
+            # this scan still splits correctly by advancing block_len tokens
+            # per matched info. Infos left over stay queued for the following
+            # requests in the batch.
+            spans = []
+            if ids_list is not None and img2img_idx < len(info_list):
+                req_ids = ids_list[start:end]
+                tok = self._img2img_token_id
+                scan = 0
+                info_i = img2img_idx
+                while info_i < len(info_list):
+                    num_vae, num_vit = info_list[info_i][0], info_list[info_i][1]
+                    block_len = num_vae + 1 + num_vit
+                    while scan < req_len and req_ids[scan] != tok:
+                        scan += 1
+                    if scan >= req_len or req_len - scan < block_len:
+                        break
+                    if any(req_ids[scan + j] != tok for j in range(block_len)):
+                        break
+                    spans.append((scan, *info_list[info_i]))
+                    scan += block_len
+                    info_i += 1
+
+            if spans:
+                # Logical positions are rebased per request: leading text keeps
+                # 0..M1-1, every block collapses to TWO shared logical positions
+                # (VAE+separator -> M, ViT -> M+1) regardless of token count,
+                # and text after a block resumes at M+2. NOTE: a block's logical
+                # anchor M is NOT its token offset once earlier blocks have
+                # compressed their tokens, hence the threaded cursor.
+                first_off = spans[0][0]
+                if first_off > 0:
+                    new_positions[start : start + first_off] = torch.arange(
+                        0, first_off, device=positions.device, dtype=positions.dtype
+                    )
+                logical_m = first_off
+                for k, (off, num_vae, num_vit, img_H, img_W) in enumerate(spans):
+                    img_start = start + off
+                    vit_start = img_start + num_vae + 1
+                    new_positions[img_start:vit_start] = logical_m  # VAE section + separator
+                    new_positions[vit_start : vit_start + num_vit] = logical_m + 1  # ViT section
+                    vae_lo = img_start + 1
+                    vae_hi = img_start + num_vae - 1
+                    if vae_hi > vae_lo:
+                        vae_mask[vae_lo:vae_hi] = True
+                    block_end = off + num_vae + 1 + num_vit
+                    next_off = spans[k + 1][0] if k + 1 < len(spans) else req_len
+                    gap_len = next_off - block_end
+                    if gap_len > 0:
+                        new_positions[start + block_end : start + block_end + gap_len] = torch.arange(
+                            logical_m + 2,
+                            logical_m + 2 + gap_len,
+                            device=positions.device,
+                            dtype=positions.dtype,
+                        )
+                    logical_m += 2 + gap_len
+                self._ropes_pending.append(
+                    {
+                        "ropes": [logical_m],
+                        "image_shape": [spans[-1][3], spans[-1][4]],
+                        "prefill_position_count": req_len,
+                    }
+                )
+                img2img_idx += len(spans)
+                continue
+
+            if img2img_idx < len(info_list):
+                cur_info = info_list[img2img_idx]
+            elif self._last_img2img_info is not None:
+                cur_info = self._last_img2img_info
+            else:
+                cur_info = None
+
+            if cur_info is not None:
+                num_vae, num_vit, img_H, img_W = cur_info
+                num_img2img = num_vae + 1 + num_vit  # +1 separator
+
+                if req_len >= num_img2img:
+                    pre_text_len = 0
+                    if input_ids is not None:
+                        req_ids_slice = input_ids[start:end]
+                        indices = (req_ids_slice == self._img2img_token_id).nonzero(as_tuple=True)[0]
+                        if indices.numel() > 0:
+                            pre_text_len = int(indices[0].item())
+
+                    M = pre_text_len
+                    img_start = start + M
+                    post_text_start = img_start + num_img2img
+
+                    if M > 0:
+                        new_positions[start:img_start] = torch.arange(
+                            0, M, device=positions.device, dtype=positions.dtype
+                        )
+
+                    new_positions[img_start : img_start + num_vae] = M
+                    new_positions[img_start + num_vae] = M  # separator
+                    vit_start = img_start + num_vae + 1
+                    new_positions[vit_start : vit_start + num_vit] = M + 1
+
+                    num_post_text = end - post_text_start
+                    if num_post_text > 0:
+                        new_positions[post_text_start:end] = torch.arange(
+                            M + 2,
+                            M + 2 + num_post_text,
+                            device=positions.device,
+                            dtype=positions.dtype,
+                        )
+
+                    vae_patches_start = img_start + 1
+                    vae_patches_end = img_start + num_vae - 1
+                    if vae_patches_end > vae_patches_start:
+                        vae_mask[vae_patches_start:vae_patches_end] = True
+
+                    rope = M + 2 + num_post_text
+                    self._ropes_pending.append(
+                        {
+                            "ropes": [rope],
+                            "image_shape": [img_H, img_W],
+                            "prefill_position_count": req_len,
+                        }
+                    )
+                    img2img_idx += 1
+                    continue
+
+            rope = int(new_positions[end - 1].item()) + 1
+            self._ropes_pending.append({"ropes": [rope]})
+
+        # Resolve mask occupancy once here (the only .any() syncs on this path)
+        # and cache it; the per-layer routing reads these flags instead of
+        # re-checking the mask on every decoder layer.
+        has_vae = bool(vae_mask.any())
+        self._vae_token_mask = vae_mask if has_vae else None
+        self._has_vae_tokens = has_vae
+        self._has_non_vae_tokens = bool((~vae_mask).any()) if has_vae else True
+        return new_positions

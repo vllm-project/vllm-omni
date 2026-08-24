@@ -251,7 +251,7 @@ def _merged_output(think_text: str | None = None) -> DiffusionOutput:
 
 
 def test_merge_uses_extra_args_when_metadata_has_no_text() -> None:
-    """``forward`` falls back to request extra_args (caption/text_output)."""
+    """``forward`` falls back to request ``extra_args["text_output"]``."""
     output = _merged_output()
     req = DiffusionRequestBatch(
         requests=[
@@ -260,15 +260,15 @@ def test_merge_uses_extra_args_when_metadata_has_no_text() -> None:
                 request_id="req-mixed",
                 sampling_params=OmniDiffusionSamplingParams(
                     num_inference_steps=1,
-                    extra_args={"caption": "caption from extra args"},
+                    extra_args={"text_output": "text from extra args"},
                 ),
             )
         ]
     )
     merged = _make_pipeline()._merge_mixed_task_text(req, output)
 
-    assert merged.output["payload"]["text"] == "caption from extra args"
-    assert merged.output["metadata"]["text"]["text_output"] == "caption from extra args"
+    assert merged.output["payload"]["text"] == "text from extra args"
+    assert merged.output["metadata"]["text"]["text_output"] == "text from extra args"
 
 
 def test_merge_leaves_payload_unchanged_without_text() -> None:
