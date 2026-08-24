@@ -10,6 +10,10 @@ async_chunk: false
 
 stages:
   - stage_id: 0
+    # Kept at 1 so the default deployment serves one request at a time.
+    # Gr00tN1d7Pipeline supports request-level batching, so raising this in an
+    # overlay lets concurrent OpenPI sessions share one policy forward.
+    # Opt-in instructions are in recipes/NVIDIA/GR00T-N1.7.md.
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: Gr00tN1d7Pipeline

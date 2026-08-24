@@ -49,11 +49,11 @@ vllm serve nvidia/GR00T-N1.7-3B \
 
 Notes:
 
-- Only `max_num_seqs: 1` is supported (configured in the deploy YAML). The
-  policy is markovian (`state_history_length=1`, `reset()` returns `{}`) — the
-  reason for the cap is that `Gr00tPolicy` does its own per-sample
-  (un)batching inside `get_action` and is not integrated with vLLM's
-  continuous batching path.
+- The deploy YAML defaults to `max_num_seqs: 1`, serving one request at a
+  time. The policy is markovian (`state_history_length=1`, `reset()` returns
+  `{}`), and `Gr00tN1d7Pipeline` implements the request-batch contract, so
+  raising `max_num_seqs` in an overlay batches concurrent sessions into one
+  policy call — see "Optional: batch concurrent sessions" below.
 - This pipeline is a thin wrapper around the upstream HF policy
   (`AutoModel.from_pretrained` + `enforce_eager`, `tensor_parallel_size=1`,
   pipeline `load_weights` is a no-op). The standard diffusion accelerators
@@ -90,6 +90,55 @@ The test sends a synthetic two-frame DROID observation and checks:
 - Action shapes: `eef_9d (1,40,9)`, `gripper_position (1,40,1)`, `joint_position (1,40,7)`
 - All action values are finite float32
 - Reset response is `"reset successful"`
+
+## Optional: batch concurrent sessions
+
+The bundled deploy config serves one request at a time (`max_num_seqs: 1`):
+with N robots connected, every observation waits for the requests ahead of it,
+so latency grows linearly with N while throughput stays flat.
+`Gr00tN1d7Pipeline` supports request-level batching — the scheduler groups
+in-flight requests into one wave and the pipeline serves the whole wave with a
+single `Gr00tPolicy.get_action()` call. Opt in with an overlay:
+
+```yaml
+# gr00t_batch.yaml
+base_config: vllm_omni/deploy/Gr00tN1d7.yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+```
+
+```bash
+vllm serve nvidia/GR00T-N1.7-3B --omni --deploy-config gr00t_batch.yaml
+```
+
+Measured on 1xA30 (eager, DP=1, 30 requests/client after 20 warmup requests),
+closed-loop OpenPI WebSocket clients:
+
+| concurrent sessions | `max_num_seqs: 1` (default) | `max_num_seqs: 8` |
+| --- | --- | --- |
+| 1 | 6.56 req/s, 152 ms | 6.76 req/s, 148 ms |
+| 2 | 6.68 req/s, 297 ms | 6.94 req/s, 286 ms |
+| 4 | 6.71 req/s, 589 ms | 10.89 req/s, 366 ms |
+| 8 | 6.77 req/s, 1165 ms | 13.84 req/s, 576 ms |
+
+Notes:
+
+- Batches form opportunistically: requests that arrive while a wave is running
+  are grouped into the next wave, so a single client is served exactly as
+  before (wave size 1, no added wait). `request_batch_max_wait_ms` (default 0)
+  can trade first-request latency for fuller waves.
+- Actions for a request depend only on that request's observation — a
+  neighbor's content never leaks into your actions. Batched execution does
+  change bf16 kernel shapes, which shifts actions on the order of 5e-2 versus
+  a solo run (1e-5 when the same comparison is done in fp32) — well inside the
+  policy's own seed-to-seed sampling spread (~8e-1). With a fixed
+  `GR00T_NOISE_SEED`, per-request noise additionally depends on the wave size,
+  so bit-exact reproducibility holds per wave shape, not across load levels.
+  The single-session golden test is unaffected (wave size 1).
+- Batching grows the per-wave activation footprint only modestly: waves of 7
+  peak at ~6.4 GiB reserved vs ~5.9 GiB for single-request serving on A30
+  (the model dominates; per-observation activations are small).
 
 ## Notes
 

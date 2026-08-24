@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
-from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
@@ -31,6 +30,13 @@ class Gr00tN1d7Pipeline(nn.Module):
     `sampling_params.extra_args["robot_obs"]`, this pipeline runs GR00T policy
     inference, and actions are returned through `DiffusionOutput.output["actions"]`.
     """
+
+    # forward() consumes the whole DiffusionRequestBatch: per-request
+    # observations are concatenated along the batch axis and served by one
+    # Gr00tPolicy.get_action() call. The scheduler only builds waves larger
+    # than one request when the stage's max_num_seqs allows it, so the
+    # bundled deploy config (max_num_seqs: 1) keeps one-request waves.
+    supports_request_batch = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -108,21 +114,88 @@ class Gr00tN1d7Pipeline(nn.Module):
         return actions
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Run one policy inference for every request in the wave.
+
+        Returns one DiffusionOutput per request, in ``req.requests`` order.
+        Malformed requests fail individually; they never take the rest of the
+        wave down with them. ``reset`` is honoured before inference — the
+        policy is process-wide, so a reset requested by any session applies to
+        all of them (Gr00tPolicy.reset() is stateless today, see reset()).
+        """
         del kwargs
-        extra_args = req.sampling_params.extra_args or {}
-        robot_obs = extra_args.get("robot_obs")
-        if robot_obs is None:
-            if req.request_id == DUMMY_DIFFUSION_REQUEST_ID:
-                return DiffusionOutput(output={"actions": self._dummy_actions()})
-            return DiffusionOutput(error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs'].")
-        if not isinstance(robot_obs, Mapping):
-            return DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        pending: list[tuple[int, dict[str, Any]]] = []
 
-        if extra_args.get("reset"):
-            self.reset()
+        for idx, request in enumerate(req.requests):
+            extra_args = request.sampling_params.extra_args or {}
+            robot_obs = extra_args.get("robot_obs")
+            if robot_obs is None:
+                if request.is_dummy_run_request_id(request.request_id):
+                    outputs[idx] = DiffusionOutput(output={"actions": self._dummy_actions()})
+                else:
+                    outputs[idx] = DiffusionOutput(
+                        error="Gr00tN1d7Pipeline.forward expects sampling_params.extra_args['robot_obs']."
+                    )
+                continue
+            if not isinstance(robot_obs, Mapping):
+                outputs[idx] = DiffusionOutput(error=f"robot_obs must be a dict, got {type(robot_obs).__name__}.")
+                continue
+            if extra_args.get("reset"):
+                self.reset()
+            pending.append((idx, _normalize_observation(robot_obs, language_key=self.policy.language_key)))
 
-        policy_obs = _normalize_observation(robot_obs, language_key=self.policy.language_key)
+        if pending:
+            policy_outputs = self._policy_outputs([obs for _, obs in pending])
+            for (idx, _), output in zip(pending, policy_outputs):
+                outputs[idx] = output
+
+        assert all(output is not None for output in outputs)
+        return outputs  # type: ignore[return-value]
+
+    def _policy_outputs(self, obs_list: list[dict[str, Any]]) -> list[DiffusionOutput]:
+        """Serve normalized observations, batched into one policy call when possible.
+
+        A single observation takes the direct path, byte-for-byte the previous
+        single-request behavior (exceptions propagate to the runner). Multiple
+        observations are concatenated along the batch axis for one
+        ``get_action`` call; if they are not structurally compatible, or the
+        batched call fails, each observation falls back to its own call so a
+        poisoned request only fails itself.
+        """
+        if len(obs_list) == 1:
+            return [self._forward_one(obs_list[0])]
+
+        merged = _merge_observations(obs_list)
+        if merged is not None:
+            batched_obs, sizes = merged
+            logger.debug("GR00T request batch: %d observations in one policy call.", len(obs_list))
+            try:
+                result = self.policy.get_action(batched_obs)
+                actions = result[0] if isinstance(result, tuple) else result
+                if isinstance(actions, Mapping):
+                    per_request = _split_actions(_to_float32_action_dict(actions), sizes)
+                    return [DiffusionOutput(output={"actions": actions_i}) for actions_i in per_request]
+                logger.warning(
+                    "GR00T batched get_action returned %s; falling back to per-request inference.",
+                    type(actions).__name__,
+                )
+            except Exception:
+                logger.warning(
+                    "GR00T batched get_action failed for %d observations; falling back to per-request inference.",
+                    len(obs_list),
+                    exc_info=True,
+                )
+
+        outputs = []
+        for obs in obs_list:
+            try:
+                outputs.append(self._forward_one(obs))
+            except Exception as exc:
+                outputs.append(DiffusionOutput(error=f"GR00T policy inference failed: {exc}"))
+        return outputs
+
+    def _forward_one(self, policy_obs: dict[str, Any]) -> DiffusionOutput:
         result = self.policy.get_action(policy_obs)
         actions = result[0] if isinstance(result, tuple) else result
         if not isinstance(actions, Mapping):
@@ -130,6 +203,69 @@ class Gr00tN1d7Pipeline(nn.Module):
         # Return actions via output.output (like the DreamZero OpenPI policy) so the engine's
         # empty-output guard passes.
         return DiffusionOutput(output={"actions": _to_float32_action_dict(actions)})
+
+
+def _merge_observations(
+    obs_list: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[int]] | None:
+    """Concatenate normalized observations along the batch axis.
+
+    Mirrors ``Gr00tPolicy._unbatch_observation``: every array modality carries
+    a leading batch dimension, language is a per-sample list. Returns the
+    merged observation and each observation's batch size, or ``None`` when the
+    observations are not structurally compatible (different modality or
+    per-modality keys, missing video, mismatched trailing shapes) — the caller
+    then serves each observation individually.
+    """
+    try:
+        first = obs_list[0]
+        if any(set(obs) != set(first) for obs in obs_list[1:]):
+            return None
+        for modality in first:
+            if not all(isinstance(obs[modality], Mapping) for obs in obs_list):
+                return None
+            if any(set(obs[modality]) != set(first[modality]) for obs in obs_list[1:]):
+                return None
+
+        sizes: list[int] = []
+        for obs in obs_list:
+            video = obs.get("video")
+            if not isinstance(video, Mapping) or not video:
+                return None
+            sizes.append(len(next(iter(video.values()))))
+
+        merged: dict[str, Any] = {}
+        for modality, first_value in first.items():
+            if modality == "language":
+                merged[modality] = {
+                    key: [sample for obs in obs_list for sample in obs[modality][key]] for key in first_value
+                }
+                continue
+            merged[modality] = {
+                key: np.concatenate([np.asarray(obs[modality][key]) for obs in obs_list], axis=0) for key in first_value
+            }
+    except (TypeError, ValueError):
+        # Malformed or mismatched observations must not take the wave down;
+        # the per-observation fallback surfaces the error on the culprit only.
+        return None
+    return merged, sizes
+
+
+def _split_actions(actions: dict[str, np.ndarray], sizes: list[int]) -> list[dict[str, np.ndarray]]:
+    """Slice a batched action dict back into per-request action dicts."""
+    total = sum(sizes)
+    for key, value in actions.items():
+        if value.shape[0] != total:
+            raise RuntimeError(
+                f"GR00T policy returned action '{key}' with batch size {value.shape[0]} "
+                f"for a request batch of total size {total}."
+            )
+    per_request: list[dict[str, np.ndarray]] = []
+    offset = 0
+    for size in sizes:
+        per_request.append({key: value[offset : offset + size] for key, value in actions.items()})
+        offset += size
+    return per_request
 
 
 def _normalize_observation(robot_obs: Mapping[str, Any], *, language_key: str) -> dict[str, Any]:
