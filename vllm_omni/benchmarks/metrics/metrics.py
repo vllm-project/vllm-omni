@@ -13,6 +13,23 @@ from vllm_omni.metrics import definitions as defs
 _PERCENTILE_ROWS_TYPE = list[tuple[float, float]] | None
 _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
+VALID_GOODPUT_METRICS = ("ttft", "tpot", "e2el", defs.AUDIO_TTFP)
+
+
+def validate_goodput_config(goodput_config_dict: dict[str, float]) -> None:
+    """Validate request-level goodput SLO names and values."""
+    for slo_name, slo_val in goodput_config_dict.items():
+        if slo_name not in VALID_GOODPUT_METRICS:
+            raise ValueError(
+                f"Invalid metric name found, {slo_name}: {slo_val}. "
+                "The service level objective name should be one of "
+                f"{list(VALID_GOODPUT_METRICS)}. "
+            )
+        if slo_val < 0:
+            raise ValueError(
+                f"Invalid value found, {slo_name}: {slo_val}. The service level objective value should be non-negative."
+            )
+
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEAN_AUDIO_TTFP_MS, float, field(default=0.0)),
@@ -712,6 +729,8 @@ def calculate_metrics(
     Returns:
         A tuple of the benchmark metrics and the actual output lengths.
     """
+    validate_goodput_config(goodput_config_dict)
+
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -795,9 +814,9 @@ def calculate_metrics(
         if "ttft" in goodput_config_dict:
             valid_metrics.append(ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "audio_ttft" in goodput_config_dict:
+        if defs.AUDIO_TTFP in goodput_config_dict:
             valid_metrics.append(audio_ttfps)
-            slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
+            slo_values.append(goodput_config_dict[defs.AUDIO_TTFP] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
             slo_values.append(goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION)

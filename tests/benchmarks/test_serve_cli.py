@@ -6,7 +6,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from vllm.benchmarks import serve as vllm_benchmark_serve
 
+import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.entrypoints.cli.benchmark.cli_args import (
     add_omni_args,
     extend_omni_choices,
@@ -87,6 +89,7 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
 def test_update_omni_help_updates_upstream_actions() -> None:
     parser = TrackingArgumentParser()
     parser.add_argument("--percentile-metrics", help="Upstream percentile help.")
+    parser.add_argument("--goodput", help="Upstream goodput help.")
     parser.add_argument("--random-mm-limit-mm-per-prompt", help="Upstream limit help.")
     parser.add_argument("--random-mm-bucket-config", help="Upstream bucket help.")
 
@@ -94,8 +97,25 @@ def test_update_omni_help_updates_upstream_actions() -> None:
 
     actions = {action.dest: action for action in parser._actions}
     assert all(metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf"))
+    assert "audio_ttfp" in actions["goodput"].help
     assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
     assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
+
+
+def test_goodput_accepts_audio_ttfp_and_combines_slos() -> None:
+    args = argparse.Namespace(goodput=["ttft:500", "audio_ttfp:1000"])
+
+    assert vllm_benchmark_serve.check_goodput_args(args) == {
+        "ttft": 500.0,
+        "audio_ttfp": 1000.0,
+    }
+
+
+def test_goodput_rejects_unsupported_metric() -> None:
+    args = argparse.Namespace(goodput=["audio_ttft:500"])
+
+    with pytest.raises(ValueError, match="Invalid metric name"):
+        vllm_benchmark_serve.check_goodput_args(args)
 
 
 @pytest.mark.parametrize(

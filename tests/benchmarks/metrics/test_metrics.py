@@ -66,6 +66,63 @@ def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutp
     return output
 
 
+def test_audio_ttfp_goodput_and_combined_slos() -> None:
+    fast = _make_output(100)
+    fast.audio_ttfp = 0.2
+    slow_audio = _make_output(100)
+    slow_audio.audio_ttfp = 0.8
+
+    audio_metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[fast, slow_audio],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={"audio_ttfp": 500.0},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    assert audio_metrics.request_goodput == 1.0
+
+    slow_ttft = _make_output(100)
+    slow_ttft.audio_ttfp = 0.2
+    slow_ttft.ttft = 0.8
+    combined_metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[fast, slow_ttft],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[99.0],
+        goodput_config_dict={"ttft": 500.0, "audio_ttfp": 500.0},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    assert combined_metrics.request_goodput == 1.0
+
+
+def test_goodput_rejects_unsupported_direct_metric() -> None:
+    with pytest.raises(ValueError, match="Invalid metric name"):
+        calculate_metrics(
+            input_requests=[],
+            outputs=[],
+            dur_s=1.0,
+            tokenizer=None,
+            selected_percentiles=[99.0],
+            goodput_config_dict={"audio_ttft": 500.0},
+            task_type=TaskType.GENERATION,
+            selected_percentile_metrics=[],
+            max_concurrency=None,
+            request_rate=float("inf"),
+            benchmark_duration=1.0,
+        )
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================

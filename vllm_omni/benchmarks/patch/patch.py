@@ -1520,11 +1520,22 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
+    validate_goodput_config,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args):
+    """Parse goodput SLOs with vLLM-Omni request-level metrics."""
+    if not args.goodput:
+        return {}
+
+    goodput_config_dict = serve.parse_goodput(args.goodput)
+    validate_goodput_config(goodput_config_dict)
+    return goodput_config_dict
 
 
 def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
@@ -2001,3 +2012,4 @@ async def benchmark(
 
 
 serve.benchmark = benchmark
+serve.check_goodput_args = check_goodput_args
