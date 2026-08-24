@@ -3348,9 +3348,7 @@ def test_sample_rate_uses_adapter_capabilities():
     )
 
     server._tts_model_type = "fish_speech"
-    assert server._validate_speech_sample_rate(request) == (
-        "sample_rate is not supported by the current TTS model"
-    )
+    assert server._validate_speech_sample_rate(request) == ("sample_rate is not supported by the current TTS model")
 
 
 def test_streaming_speech_session_config_scopes_native_speed_to_http():
