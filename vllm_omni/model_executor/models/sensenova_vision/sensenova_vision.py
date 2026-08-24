@@ -10,6 +10,8 @@ and only overrides the SenseNovaVision checkpoint defaults plus additive feature
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
@@ -33,9 +35,22 @@ SENSENOVA_VISION_DEFAULT_MAX_LATENT_SIZE = 64
 SENSENOVA_VISION_DEFAULT_VIT_MAX_NUM_PATCH_PER_SIDE = 70
 
 
+class OmniSenseNovaVisionProcessingInfo(OmniBagelProcessingInfo):
+    """Multi-modal limits for SenseNova-Vision.
+
+    The shared BAGEL base caps ``image`` / ``img2img`` at 1 item per request;
+    SenseNova-Vision raises both to 10, matching the upstream recon3d
+    ``max_images=10``.  A finite cap (never ``None``) keeps mm memory
+    profiling bounded.
+    """
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": 10, "img2img": 10}
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     OmniBagelMultiModalProcessor,
-    info=OmniBagelProcessingInfo,
+    info=OmniSenseNovaVisionProcessingInfo,
     dummy_inputs=OmniBagelDummyInputsBuilder,
 )
 class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGeneration):
