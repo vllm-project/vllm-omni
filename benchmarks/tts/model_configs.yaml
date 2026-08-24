@@ -28,6 +28,16 @@ models:
     task_extra_body:
       default_voice: {}
       voice_clone: {}
+  # Audio8 0.1B: Falcon-H1 hybrid Slow AR, same 44.1 kHz codec (same sample-rate
+  # caveat above applies).
+  Audio8/Audio8-TTS-Preview-0.1b:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
 
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
