@@ -1114,6 +1114,167 @@ class TestSupportedPipelines:
         assert supports_step_execution(pipeline) is True
         assert isinstance(pipeline, SupportsStepExecution) is True
 
+    def test_z_image_supports_step_execution(self):
+        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        # Avoid loading model weights; protocol membership depends on the class contract.
+        pipeline = object.__new__(ZImagePipeline)
+
+        assert pipeline.supports_step_execution is True
+        assert supports_step_execution(pipeline) is True
+        assert isinstance(pipeline, SupportsStepExecution) is True
+
+
+@pytest.mark.cpu
+class TestZImageStepExecution:
+    """CPU-only regressions for Z-Image request-local CFG metadata."""
+
+    @staticmethod
+    def _make_state(
+        request_id: str,
+        *,
+        timestep: float,
+        cfg_truncation: float | None,
+        cfg_normalization: float,
+    ) -> StepRequestState:
+        sampling = OmniDiffusionSamplingParams(guidance_scale=2.0)
+        state = StepRequestState(request_id=request_id, sampling=sampling, prompt="prompt")
+        state.latents = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
+        state.timesteps = torch.tensor([timestep], dtype=torch.float32)
+        state.guidance = torch.tensor([2.0], dtype=torch.float32)
+        state.do_true_cfg = True
+        state.extra["z_image_cfg_normalization"] = torch.tensor([cfg_normalization], dtype=torch.float32)
+        state.extra["z_image_cfg_truncation"] = cfg_truncation
+        state.extra["z_image_guidance_scale"] = 2.0
+        state.extra["z_image_normalized_timesteps"] = [(1000 - timestep) / 1000]
+        state.extra["z_image_output_type"] = "pil"
+        return state
+
+    @staticmethod
+    def _make_input_batch(states: list[StepRequestState]) -> SimpleNamespace:
+        batch_size = len(states)
+        return SimpleNamespace(
+            latents=torch.cat([state.latents for state in states], dim=0),
+            timesteps=torch.stack([state.timesteps[0] for state in states]),
+            prompt_embeds=torch.zeros((batch_size, 1, 1), dtype=torch.float32),
+            prompt_embeds_mask=torch.ones((batch_size, 1), dtype=torch.bool),
+            negative_prompt_embeds=torch.zeros((batch_size, 1, 1), dtype=torch.float32),
+            negative_prompt_embeds_mask=torch.ones((batch_size, 1), dtype=torch.bool),
+            guidance=torch.tensor([2.0] * batch_size, dtype=torch.float32),
+            do_true_cfg=True,
+            states=states,
+        )
+
+    @staticmethod
+    def _make_pipeline(transformer):
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        pipeline = object.__new__(ZImagePipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.od_config = SimpleNamespace(dtype=torch.float32)
+        pipeline.transformer = transformer
+        return pipeline
+
+    def test_prepare_encode_preserves_disabled_cfg_truncation(self, mocker: MockerFixture):
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        pipeline = object.__new__(ZImagePipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.scheduler = SimpleNamespace()
+        context = {
+            "prompt_embeds": [torch.zeros((2, 3), dtype=torch.float32)],
+            "negative_prompt_embeds": [torch.zeros((2, 3), dtype=torch.float32)],
+            "latents": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+            "timesteps": torch.tensor([800.0, 200.0]),
+            "do_classifier_free_guidance": True,
+            "guidance_scale": 2.0,
+            "cfg_normalization": 0.5,
+            "cfg_truncation": None,
+            "output_type": "latent",
+        }
+        mocker.patch.object(pipeline, "_prepare_generation_context", return_value=context)
+        state = StepRequestState(
+            request_id="req-none-truncation",
+            sampling=OmniDiffusionSamplingParams(guidance_scale=2.0),
+            prompt="prompt",
+        )
+
+        pipeline.prepare_encode(state)
+
+        assert state.extra["z_image_cfg_truncation"] is None
+        assert state.extra["z_image_guidance_scale"] == 2.0
+        assert state.extra["z_image_normalized_timesteps"] == pytest.approx([0.2, 0.8])
+
+    def test_prepare_encode_normalizes_late_i2i_latents_to_fp32(self, mocker: MockerFixture):
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        pipeline = object.__new__(ZImagePipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.scheduler = SimpleNamespace()
+        context = {
+            "prompt_embeds": [torch.zeros((2, 3), dtype=torch.bfloat16)],
+            "negative_prompt_embeds": [],
+            "latents": torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16),
+            "timesteps": torch.tensor([800.0, 200.0]),
+            "do_classifier_free_guidance": False,
+            "guidance_scale": 0.0,
+            "cfg_normalization": False,
+            "cfg_truncation": 1.0,
+            "output_type": "latent",
+        }
+        mocker.patch.object(pipeline, "_prepare_generation_context", return_value=context)
+        states = [
+            StepRequestState(
+                request_id=request_id,
+                sampling=OmniDiffusionSamplingParams(guidance_scale=0.0),
+                prompt="prompt",
+            )
+            for request_id in ("running-i2i", "new-i2i")
+        ]
+
+        pipeline.prepare_encode(states[0])
+        states[0].step_index = 1
+        states[0].latents = states[0].latents.float()
+        pipeline.prepare_encode(states[1])
+
+        assert all(state.latents.dtype == torch.float32 for state in states)
+        batch = InputBatch.make_batch(states)
+        assert batch.latents.dtype == torch.float32
+        assert batch.latents.shape[0] == 2
+
+    def test_denoise_applies_mixed_row_cfg_on_device(self, mocker: MockerFixture):
+        states = [
+            self._make_state("active-normalized", timestep=800.0, cfg_truncation=0.5, cfg_normalization=0.5),
+            self._make_state("active-untruncated", timestep=200.0, cfg_truncation=None, cfg_normalization=0.0),
+            self._make_state("truncated", timestep=200.0, cfg_truncation=0.5, cfg_normalization=0.5),
+        ]
+        positive = [torch.full((1, 1, 1, 1), 2.0) for _ in states]
+        negative = [torch.full((1, 1, 1, 1), 1.0) for _ in states]
+        transformer = mocker.Mock(return_value=(positive + negative,))
+        pipeline = self._make_pipeline(transformer)
+
+        output = pipeline.denoise_step(self._make_input_batch(states))
+
+        torch.testing.assert_close(output.flatten(), torch.tensor([-1.0, -4.0, -2.0]))
+        latent_model_input = transformer.call_args.args[0]
+        assert len(latent_model_input) == 2 * len(states)
+
+    def test_denoise_skips_negative_branch_when_all_rows_are_truncated(self, mocker: MockerFixture):
+        states = [
+            self._make_state("truncated-1", timestep=200.0, cfg_truncation=0.5, cfg_normalization=0.5),
+            self._make_state("truncated-2", timestep=100.0, cfg_truncation=0.5, cfg_normalization=0.5),
+        ]
+        positive = [torch.full((1, 1, 1, 1), 2.0) for _ in states]
+        transformer = mocker.Mock(return_value=(positive,))
+        pipeline = self._make_pipeline(transformer)
+
+        output = pipeline.denoise_step(self._make_input_batch(states))
+
+        torch.testing.assert_close(output.flatten(), torch.tensor([-2.0, -2.0]))
+        latent_model_input = transformer.call_args.args[0]
+        assert len(latent_model_input) == len(states)
+
 
 @hardware_test(
     res={"cuda": "L4"},

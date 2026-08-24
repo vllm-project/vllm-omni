@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
     )
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -320,7 +321,7 @@ class ZImageAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
@@ -342,16 +343,33 @@ class ZImageAttention(nn.Module):
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
-        # From [batch, seq_len] to [batch, 1, 1, seq_len] -> broadcast to [batch, heads, seq_len, seq_len]
-        if attention_mask is not None and attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
+        attn_metadata = None
+        if attention_mask is not None:
+            # Keep the canonical [batch, sequence] key-padding layout. Mask-aware
+            # backends either unpad it directly (FlashAttention) or broadcast it
+            # to [batch, heads, query, key] internally (SDPA).
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+            # Ring kernels do not consume padding masks. Context/noise refiners
+            # run outside the SP-sharded region and therefore still use local
+            # masked attention even when ring parallelism is configured.
+            ring_is_active = (
+                getattr(self.attn, "use_ring", False)
+                and self.attn._get_active_parallel_strategy() is not self.attn._no_parallel_strategy
+            )
+            if ring_is_active:
+                raise ValueError(
+                    "Z-Image variable-length batching is not supported with ring "
+                    "sequence parallelism because ring attention cannot apply padding masks. "
+                    "Use ring_degree=1 or batch requests with equal sequence lengths."
+                )
 
         # Compute joint attention
         hidden_states = self.attn(
             query,
             key,
             value,
-            # attn_mask=attention_mask, # we don't support multi prompts now.
+            attn_metadata,
         )
 
         # Reshape back
@@ -459,7 +477,7 @@ class ZImageTransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor,
+        attn_mask: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         adaln_input: torch.Tensor | None = None,
@@ -975,9 +993,11 @@ class ZImageTransformer2DModel(CachedTransformer):
         x = pad_sequence(x, batch_first=True, padding_value=0.0)
         x_cos = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
         x_sin = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
-        x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(x_item_seqlens):
-            x_attn_mask[i, :seq_len] = 1
+        x_attn_mask = None
+        if len(set(x_item_seqlens)) > 1:
+            x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(x_item_seqlens):
+                x_attn_mask[i, :seq_len] = 1
 
         for layer in self.noise_refiner:
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
@@ -1004,9 +1024,11 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
         cap_cos = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
         cap_sin = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
-        cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(cap_item_seqlens):
-            cap_attn_mask[i, :seq_len] = 1
+        cap_attn_mask = None
+        if len(set(cap_item_seqlens)) > 1:
+            cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(cap_item_seqlens):
+                cap_attn_mask[i, :seq_len] = 1
 
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
@@ -1016,6 +1038,12 @@ class ZImageTransformer2DModel(CachedTransformer):
         unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
             x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
         )
+        unified_item_seqlens = [x_len + cap_len for x_len, cap_len in zip(x_item_seqlens, cap_item_seqlens)]
+        if len(set(unified_item_seqlens)) == 1:
+            # Preserve the dense fast path, including ring attention. This is
+            # decided from replicated Python lengths so every SP rank makes the
+            # same choice without a device-to-host sync.
+            unified_attn_mask = None
 
         # Main transformer blocks
         for layer in self.layers:

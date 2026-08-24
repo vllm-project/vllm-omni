@@ -2,13 +2,14 @@
 Tests of common diffusion feature combinations in online serving mode
 for Z-Image.
 
-Coverage is intentionally limited to the minimal 4xL4 cases that
-exercise Z-Image's supported feature combinations:
+Coverage is intentionally limited to the minimal L4 cases that exercise
+Z-Image's supported feature combinations and step-execution batching:
 - CacheDiT + FP8 + Ring=2 + TP=2
 - TeaCache + FP8 + Ulysses=2 + Ring=2
 - Layerwise CPU offload + Ulysses=2 + Ring=2
 - Layerwise CPU offload + TP=2
 - Layerwise CPU offload + HSDP
+- Step execution with two concurrent, variable-length prompts
 """
 
 import pytest
@@ -20,6 +21,15 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
+STEP_EXECUTION_PROMPTS = [
+    "A red fox resting in fresh snow.",
+    (
+        "A cinematic wide-angle photograph of a quiet mountain observatory at blue hour, "
+        "with warm window light, a detailed brass telescope, layered clouds below the ridge, "
+        "subtle stars appearing overhead, realistic stone textures, and a lone astronomer "
+        "wearing a dark coat beside the open dome."
+    ),
+]
 
 FOUR_CARD_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 
@@ -103,6 +113,22 @@ def _get_diffusion_feature_cases():
     ]
 
 
+STEP_EXECUTION_CASE = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--step-execution",
+                "--max-num-seqs",
+                "2",
+            ],
+        ),
+        id="step_execution_batch2_variable_prompt_lengths",
+        marks=hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    )
+]
+
+
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(),
@@ -126,3 +152,32 @@ def test_zimage(
     }
 
     openai_client.send_diffusion_request(request_config)
+
+
+@pytest.mark.parametrize(
+    "omni_server",
+    STEP_EXECUTION_CASE,
+    indirect=True,
+)
+def test_zimage_step_execution_batches_variable_length_prompts(
+    omni_server: OmniServer,
+    openai_client: OpenAIClientHandler,
+):
+    """Send two distinct prompt lengths concurrently through one step batch."""
+    request_configs = [
+        {
+            "model": omni_server.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "extra_body": {
+                "height": 512,
+                "width": 512,
+                "num_inference_steps": 2,
+                "seed": 42 + request_idx,
+            },
+        }
+        for request_idx, prompt in enumerate(STEP_EXECUTION_PROMPTS)
+    ]
+
+    responses = openai_client.send_diffusion_request(request_configs)
+
+    assert len(responses) == 2

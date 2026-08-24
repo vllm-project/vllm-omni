@@ -1,0 +1,118 @@
+[
+  {
+    "test_name": "test_zimage_step_execution_baseline_serial",
+    "description": "Z-Image request-level serial baseline",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Tongyi-MAI/Z-Image-Turbo",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps8_t2i_serial",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 8,
+        "num-prompts": 16,
+        "max-concurrency": 1,
+        "warmup-requests": 4,
+        "warmup-concurrency": 1,
+        "warmup-num-inference-steps": 8
+      },
+      {
+        "name": "1024x1024_steps8_t2i_serial",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 8,
+        "num-prompts": 8,
+        "max-concurrency": 1,
+        "warmup-requests": 4,
+        "warmup-concurrency": 1,
+        "warmup-num-inference-steps": 8
+      }
+    ]
+  },
+  {
+    "test_name": "test_zimage_step_execution_batch2",
+    "description": "Z-Image step-wise batching sweep",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "Tongyi-MAI/Z-Image-Turbo",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 2
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps8_t2i_step_batch2",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 8,
+        "num-prompts": [
+          16,
+          32
+        ],
+        "max-concurrency": [
+          1,
+          2
+        ],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 8
+      },
+      {
+        "name": "1024x1024_steps8_t2i_step_batch2",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 1024,
+        "height": 1024,
+        "num-inference-steps": 8,
+        "num-prompts": [
+          8,
+          16
+        ],
+        "max-concurrency": [
+          1,
+          2
+        ],
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 8
+      },
+      {
+        "name": "512x512_steps8_t2i_step_batch2_variable_prompts",
+        "dataset": "custom",
+        "dataset-path-inline": {
+          "type": "jsonl",
+          "content": [
+            {
+              "prompt": "A red fox resting in snow."
+            },
+            {
+              "prompt": "A cinematic wide-angle photograph of a quiet mountain observatory at blue hour, with warm light glowing through tall windows, a detailed brass telescope beneath the open dome, layered clouds below the ridge, subtle stars appearing overhead, realistic stone and metal textures, frost along the railings, and a lone astronomer in a dark coat studying handwritten notes beside the instrument while distant peaks fade into the evening haze."
+            }
+          ]
+        },
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 8,
+        "num-prompts": 32,
+        "max-concurrency": 2,
+        "warmup-requests": 4,
+        "warmup-concurrency": 2,
+        "warmup-num-inference-steps": 8
+      }
+    ]
+  }
+]
