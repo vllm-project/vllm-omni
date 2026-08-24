@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.fixture(autouse=True)
 def _distributed():
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -33,7 +33,11 @@ def _distributed():
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29517")
-    with set_current_vllm_config(VllmConfig()):
+    # These contract tests are deliberately CPU-only.  Do not rely on vLLM's
+    # auto platform detection: a CPU CI worker has no accelerator plugin from
+    # which ``DeviceConfig(device="auto")`` can infer a device type.
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    with set_current_vllm_config(config):
         init_distributed_environment(
             world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="gloo"
         )
