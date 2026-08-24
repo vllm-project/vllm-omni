@@ -11,7 +11,7 @@ from collections.abc import Callable
 from contextlib import ExitStack, suppress
 from typing import Any, Literal
 
-import cloudpickle
+import cloudpickle  # noqa: TID251
 from typing_extensions import ParamSpec
 from vllm.platforms import current_platform
 

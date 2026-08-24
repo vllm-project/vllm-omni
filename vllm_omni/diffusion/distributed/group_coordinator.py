@@ -3,7 +3,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-import pickle
+import pickle  # noqa: TID251
 from collections import namedtuple
 from typing import Any
 

@@ -25,7 +25,7 @@ do not exercise the full model-registry pipeline.
 """
 
 import os
-import pickle
+import pickle  # noqa: TID251
 import tempfile
 
 import pytest

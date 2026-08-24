@@ -212,6 +212,8 @@ ignore = [
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pickle".msg = "The pickle module is banned"
+"cloudpickle".msg = "The cloudpickle module is banned"
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
 "torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
 "torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
