@@ -318,6 +318,27 @@ async def test_paced_mode_holds_the_release_period_when_generation_is_faster() -
 
 
 @pytest.mark.asyncio
+async def test_paced_mode_uses_the_shorter_causal_opening_period() -> None:
+    clock = VirtualClock()
+    factory, _ = make_factory(clock, tick_s=0.10)
+    config = BenchmarkConfig(
+        profile=WorkloadProfile(
+            frames_per_chunk=12,
+            frames_per_first_chunk=9,
+            target_fps=16.0,
+        ),
+        mode=LoadMode.PACED,
+        chunks_per_session=3,
+        arrivals=burst_arrivals(1),
+    )
+    run = await drive(config, factory, clock)
+    # Submits land at 0, 9/16 and (9+12)/16 seconds.  Using the steady
+    # 12/16 period for chunk 1 would make this 1.60 seconds instead.
+    assert run.wall_s == pytest.approx((9 + 12) / 16.0 + 0.10)
+    assert run.sessions[0].continuous_play_ratio == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
 async def test_paced_mode_records_misses_when_generation_is_too_slow() -> None:
     clock = VirtualClock()
     factory, _ = make_factory(clock, tick_s=2.0)
