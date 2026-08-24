@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the additive structured Omni config."""
 
 from __future__ import annotations
@@ -1150,6 +1150,35 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert stage.diffusion_config.diffusion_kv_max_rows_per_request == 2
+
+
+def test_from_pipeline_config_forwards_fastvideo_vsa_topk(tmp_path, monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    deploy_path = tmp_path / "dreamzero_fastvideo_vsa.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_attention_backend: FASTVIDEO_VSA",
+                "    fastvideo_vsa_topk: 96",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+    ).stage_by_id(0)
+
+    attention_config = stage.diffusion_config.diffusion_attention_config
+    assert attention_config.default is not None
+    assert attention_config.default.backend == "FASTVIDEO_VSA"
+    assert attention_config.default.fastvideo_vsa_topk == 96
 
 
 def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):

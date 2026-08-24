@@ -244,6 +244,17 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
         _forward_context.denoise_step_idx = step_idx
 
 
+def set_forward_context_denoise_timestep(timestep: float | None) -> None:
+    """Set the normalized (descending, 1 -> 0) denoise timestep.
+
+    Timestep-gated attention features read this; pipelines that drive their own
+    denoise loop can publish it directly instead of going through
+    :meth:`DenoiseProgressMixin.record_denoise_step`.
+    """
+    if _forward_context is not None:
+        _forward_context.denoise_timestep = None if timestep is None else float(timestep)
+
+
 class DenoiseProgressMixin:
     def record_denoise_step(
         self,
