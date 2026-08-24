@@ -330,6 +330,31 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
 
 
 @pytest.mark.cpu
+def test_abort_drops_consumed_metric_message_ids_with_state():
+    """Abort pops ``request_states[rid]`` and the per-request de-dup set
+    attached to it drops with the state (no class-level dict to maintain).
+    Regression guard for #6462 under the ``ClientRequestState``-attached
+    layout adopted in #6561 review — a stray class-level
+    ``_consumed_metric_messages`` re-introduction would resurface the leak.
+    """
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+
+    async def run():
+        omni = get_async_omni_instance()
+        state = ClientRequestState(request_id="req-1-cccc", external_request_id="req-1")
+        state.consumed_metric_message_ids.add(12345)
+        state.input_stream_task = None
+        omni.request_states["req-1-cccc"] = state
+
+        assert not hasattr(omni, "_consumed_metric_messages")
+
+        await omni.abort("req-1")
+        assert "req-1-cccc" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
         submitted_request_ids: list[str] = []
