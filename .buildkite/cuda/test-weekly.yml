@@ -74,6 +74,19 @@ steps:
             exit $$EXIT
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Omni · Perf Test · Async Chunk · Random"
+        key: weekly-omni-performance-async-chunk-random
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk_cuda_weekly.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_2
+
       - label: ":full_moon: Omni · Perf Test · Multi-Replica"
         key: weekly-omni-performance-multi-replicas
         timeout_in_minutes: 180
