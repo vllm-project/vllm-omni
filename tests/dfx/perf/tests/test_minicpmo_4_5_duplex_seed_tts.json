@@ -37,7 +37,7 @@
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
-        "seed_tts_locale": "en",
+        "seed_tts_locale": "zh",
         "seed_tts_turns_per_session": 4,
         "expected_duplex_audio_turns_per_session": 4,
         "extra_body": {

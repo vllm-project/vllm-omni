@@ -41,7 +41,7 @@
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
-        "seed_tts_locale": "en",
+        "seed_tts_locale": "zh",
         "extra_body": {
           "modalities": [
             "text",
@@ -126,7 +126,7 @@
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
-        "seed_tts_locale": "en",
+        "seed_tts_locale": "zh",
         "extra_body": {
           "modalities": [
             "text",
