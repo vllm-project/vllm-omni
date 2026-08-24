@@ -158,25 +158,25 @@ The legacy fallback reports effective workers `0`.
 
 #### Memory model
 
-Each pooled worker reuses one thread-local single-channel scratch buffer; one
-converted frame may coexist with the `2 * W_eff` pending futures. The
+Each pooled worker reuses one thread-local single-channel scratch buffer. The
+consumer still holds the previous frame while fetching the next one, so the
 derived conservative per-request capacity is:
 
 ```text
-min(F, 2 * W_eff + 1) * PyAV_frame_bytes
+min(F, 2 * W_eff + 2) * PyAV_frame_bytes
   + W_eff * single_channel_scratch_bytes
 ```
 
-For explicitly configured `W_eff = 1`, conversion is serial, no pool is
-created, and at most one converted frame and one scratch buffer are used. For
+For explicitly configured `W_eff = 1`, conversion is serial without a thread
+pool, and up to `min(F, 2)` converted frames plus one scratch buffer are used. For
 the validated 124-frame, 1344x768 `gbrp` input, one PyAV frame is 3,096,576
 bytes and one float32 single-channel scratch buffer is 4,128,768 bytes:
 
 | Configured workers | Pending futures | Known frame slots | Derived capacity |
 | ---: | ---: | ---: | ---: |
-| `8` | `16` | `17` | `81.703125 MiB` |
-| `16` | `32` | `33` | `160.453125 MiB` |
-| `32` | `64` | `65` | `317.953125 MiB` |
+| `8` | `16` | `18` | `84.65625 MiB` |
+| `16` | `32` | `34` | `163.40625 MiB` |
+| `32` | `64` | `66` | `320.90625 MiB` |
 
 These are conservative known capacities, not total RSS; they exclude input,
 audio, futures, executor objects, libx264 buffers, allocator overhead, and
