@@ -48,6 +48,10 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
 
+_SKIP_ISSUE_6418 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/6418",
+)
+
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
 # tests rather than duplicating asset bytes.
@@ -78,6 +82,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -95,7 +100,7 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -112,7 +117,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             request_num=3,
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -144,7 +148,6 @@ class TestHiggsAudioV3OnlineHappyPath:
             }
         )
 
-    @pytest.mark.skip(reason="issue#4411")
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -187,6 +190,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     They do not assert audio quality (out of scope for CI).
     """
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -203,6 +207,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -219,6 +224,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -237,6 +243,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -253,6 +260,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
             }
         )
 
+    @_SKIP_ISSUE_6418
     @pytest.mark.slow
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)

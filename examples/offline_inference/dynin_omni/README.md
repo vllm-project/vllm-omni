@@ -107,4 +107,4 @@ python <REPO_ROOT>/examples/offline_inference/dynin_omni/end2end.py \
 - If you want to force local config resolution, pass `--dynin-config-path <PATH_TO_DYNIN_OMNI_YAML>`.
 - If you see the warning
   `max_num_batched_tokens (32768) exceeds max_num_seqs * max_model_len (4096)`,
-  reduce `max_num_batched_tokens` in stage config (for example, `4096` in CI config).
+  reduce `max_num_batched_tokens` in the deploy config (for example, `4096` in the CI config).

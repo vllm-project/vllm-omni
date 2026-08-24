@@ -8,7 +8,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig, OffloadStrategy
+from .base import OffloadBackend, OffloadConfig, OffloadStrategy, SupportsModelCpuOffload
 from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
@@ -23,6 +23,7 @@ from .sequential_backend import (
     ModelLevelOffloadBackend,
     apply_sequential_offload,
     remove_sequential_offload,
+    sequential_offload_component,
 )
 from .tensor_utils import (
     dtype_size,
@@ -39,6 +40,7 @@ __all__ = [
     "OffloadConfig",
     "OffloadPlan",
     "OffloadStrategy",
+    "SupportsModelCpuOffload",
     "LayerWiseOffloadBackend",
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
@@ -46,6 +48,7 @@ __all__ = [
     "PinnedModuleStager",
     "apply_sequential_offload",
     "remove_sequential_offload",
+    "sequential_offload_component",
     "apply_distributed_block_hook",
     "remove_distributed_block_hook",
     "get_offload_backend",

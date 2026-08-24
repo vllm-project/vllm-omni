@@ -9,7 +9,6 @@ import re
 import struct
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -20,7 +19,6 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
-from transformers.utils.hub import cached_file
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
@@ -70,13 +68,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.speaker_cache import (
-    get_speaker_cache,
-    iter_custom_voice_profiles,
-    load_validated_profile_tensors,
-)
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
@@ -103,21 +96,6 @@ _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DE
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
-_TTS_LANGUAGES = frozenset(
-    {
-        "Auto",
-        "Chinese",
-        "English",
-        "Japanese",
-        "Korean",
-        "German",
-        "French",
-        "Russian",
-        "Portuguese",
-        "Spanish",
-        "Italian",
-    }
-)
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -297,9 +275,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError:
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
-        self.uploaded_speakers: dict[str, dict] = {}
-        self.precomputed_speakers: dict[str, dict[str, Any]] = {}
-        self.supported_speakers: set[str] = set()
+        self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
         self._ref_audio_resolve_cache_bytes = 0
@@ -391,7 +367,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             speaker_data.setdefault("name", voice_name_lower)
             speaker_data.setdefault("file_size", int(path.stat().st_size))
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
             self._last_upload_ts = max(self._last_upload_ts, int(speaker_data.get("created_at", 0)))
             restored += 1
         if restored:
@@ -419,6 +394,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
+        instance._adapter = None
         instance._init_speaker_storage()
         return instance
 
@@ -443,7 +419,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
-        self.precomputed_speakers = self._load_precomputed_speakers()
+        # Resolve the per-model serving adapter (RFC #4327), keyed on the
+        # detected model-type. Every dedicated TTS model has an adapter; the
+        # adapter owns request validation, prompt/param building, capability
+        # metadata, and sampling overrides. The model-type label remains in the
+        # orchestrator for compatibility during this incremental migration.
+        self._adapter = None
+        if self._tts_stage is not None:
+            adapter_cls = resolve_adapter(self._tts_model_type)
+            if adapter_cls is not None:
+                ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+                self._adapter = adapter_cls(ctx)
+                logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
+
+        adapter = self._adapter
+        if adapter is not None:
+            adapter.load_capabilities()
+        available_speakers = self._get_available_speakers()
+        logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 
         # Sub-variant inside the full MOSS-TTS family. We collapse all five
         # variants onto the same _tts_model_type="moss_tts" because they share
@@ -459,32 +452,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
 
-        # Merge built-in speakers into the set initialized by _init_speaker_storage.
-        self.supported_speakers |= self._load_supported_speakers()
-        self.supported_speakers |= set(self.precomputed_speakers)
-
-        self.supported_languages = self._load_supported_languages()
-
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._audex_tokenizer = None
         self._audex_tta_rvq = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
 
-        if self.supported_speakers:
-            logger.info(
-                "Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers)
-            )
-        else:
-            logger.info(
-                "No built-in speakers configured; only '%s' and uploaded voices are available", _DEFAULT_VOICE_NAME
-            )
-
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
-
-        # Load speech tokenizer codec parameters for prompt length estimation
-        self._codec_frame_rate: float | None = self._load_codec_frame_rate()
 
         # Shared thread pool executor for blocking TTS preprocessing
         # operations. max_workers=1 serializes tokenizer access to avoid
@@ -493,18 +468,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
-
-        # Resolve the per-model serving adapter (RFC #4327), keyed on the
-        # detected model-type. Every dedicated TTS model has an adapter; the
-        # adapter owns request validation, prompt/param building, and sampling
-        # overrides; the model-type label remains available for compatibility.
-        self._adapter = None
-        if self._tts_stage is not None:
-            adapter_cls = resolve_adapter(self._tts_model_type)
-            if adapter_cls is not None:
-                ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
-                self._adapter = adapter_cls(ctx)
-                logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
     def _get_tts_adapter(self):
         """Return the per-model serving adapter for the current ``_tts_model_type``.
@@ -527,11 +490,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._adapter is None or type(self._adapter) is not adapter_cls:
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
+            self._adapter.load_capabilities()
         return self._adapter
 
     def _uses_native_speed_control(self) -> bool:
         adapter = self._get_tts_adapter()
         return bool(adapter is not None and adapter.native_speed_control)
+
+    def _get_available_speakers(self) -> set[str]:
+        """Return all built-in, precomputed, and runtime-uploaded speakers."""
+        available_speakers = set(self.uploaded_speakers)
+        if self._adapter is not None:
+            available_speakers.update(self._adapter.capabilities.supported_speakers)
+            available_speakers.update(self._adapter.capabilities.precomputed_speakers)
+        return available_speakers
 
     def _audio_encode_speed(self, request: OpenAICreateSpeechRequest) -> float:
         if self._uses_native_speed_control():
@@ -539,133 +511,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return float(request.speed or 1.0)
 
     async def warmup(self) -> None:
-        """Run a synthetic speech request to trigger all first-request warmup.
+        """Run model-specific startup warmup through the resolved adapter.
 
-        Unlike qwen3-tts, whose CUDA Graph warmup targets a standalone tokenizer
-        decoder (no vLLM dependencies) and can complete entirely at model-init
-        time, VoxCPM2 needs to warm up PagedAttention scaffold/residual LLMs.
-        Their CUDA Graph capture requires a vLLM ``ForwardContext``
-        (attn_metadata, slot_mapping, etc.) that only exists during real
-        inference steps.  The same request also pays the one-time torch.compile
-        JIT tax for the LocDiT estimator, feat_encoder, AudioVAE decoder, and
-        projection helpers.
-
-        For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
-        the first user request to server startup.
+        Warmup requirements differ by model. For example, Qwen3-TTS can warm up
+        its standalone tokenizer decoder during model initialization, while
+        VoxCPM2 requires a real inference request with an active vLLM
+        ``ForwardContext``. The adapter owns that model-specific lifecycle logic.
         """
-        if self._tts_model_type != "voxcpm2":
+        if self._adapter is None:
             return
-
-        t0 = time.time()
-        logger.info("Running warmup speech request for model_type=%s", self._tts_model_type)
-        # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
-        # mode (no voice cloning).  The voice field is required by the OpenAI
-        # API schema but semantically ignored by the model.
-        warmup_req = OpenAICreateSpeechRequest(
-            input="Warmup.",
-            voice="default",
-            response_format="wav",
-            speed=1.0,
-            stream=False,
-            model=self.model_name,
-        )
-        try:
-            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
-        except Exception as exc:
-            logger.warning("Speech warmup failed (non-fatal): %s", exc)
-            return
-
-        elapsed = time.time() - t0
-        logger.info("Speech warmup complete in %.1fs", elapsed)
-
-    def _get_qwen_tts_expected_speaker_embedding_dim(self) -> int | None:
-        """Return the loaded Qwen3-TTS speaker embedding dim, if known.
-
-        The user-provided speaker embedding is concatenated directly with
-        talker codec embeddings, so the real compatibility requirement is the
-        talker hidden size.
-        """
-        if self._tts_model_type != "qwen3_tts":
-            return None
-        hf_config = self.engine_client.model_config.hf_config
-        talker_config = hf_config.talker_config
-        return int(talker_config.hidden_size)
-
-    def _validate_qwen_tts_speaker_embedding_dim(self, emb_dim: int) -> str | None:
-        expected_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
-        if expected_dim is None:
-            return None
-        if emb_dim != expected_dim:
-            return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
-        return None
-
-    def _load_codec_frame_rate(self) -> float | None:
-        """Load codec frame rate from speech tokenizer config for prompt length estimation."""
-        if self._tts_model_type == "ming_tts":
-            try:
-                from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig
-
-                hf_config = self.engine_client.model_config.hf_config
-                ming_cfg = MingTTSConfig.from_hf_config(hf_config)
-                patch_size = int(ming_cfg.patch_size)
-                audio_frame_hop = int(ming_cfg.audio_frame_hop)
-                sample_rate = int(ming_cfg.sample_rate)
-                if patch_size <= 0 or audio_frame_hop <= 0 or sample_rate <= 0:
-                    raise ValueError(
-                        "Ming config has invalid tokenizer timing values: "
-                        f"patch_size={patch_size}, audio_frame_hop={audio_frame_hop}, sample_rate={sample_rate}"
-                    )
-                rate = float(sample_rate) / float(audio_frame_hop * patch_size)
-                logger.info(
-                    "Derived Ming codec frame rate: %.1f Hz (sample_rate=%s, audio_frame_hop=%s, patch_size=%s)",
-                    rate,
-                    sample_rate,
-                    audio_frame_hop,
-                    patch_size,
-                )
-                return rate
-            except Exception as e:
-                logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
-
-        try:
-            model_path = self.engine_client.model_config.model
-            st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
-            if not os.path.exists(st_config_path):
-                st_config_path = cached_file(model_path, "speech_tokenizer/config.json")
-            if st_config_path is not None and os.path.exists(st_config_path):
-                with open(st_config_path) as f:
-                    st_config = json.load(f)
-                output_sr = st_config.get("output_sample_rate")
-                downsample = st_config.get("encode_downsample_rate")
-                if output_sr and downsample and downsample > 0:
-                    rate = float(output_sr) / float(downsample)
-                    logger.info(
-                        "Loaded codec frame rate: %.1f Hz (output_sample_rate=%s, encode_downsample_rate=%s)",
-                        rate,
-                        output_sr,
-                        downsample,
-                    )
-                    return rate
-        except Exception as e:
-            logger.warning("Failed to load codec frame rate from speech tokenizer config: %s", e)
-
-        # Fallback: try codec_frame_rate_hz from hf_config
-        try:
-            hf_config = self.engine_client.model_config.hf_config
-            rate = getattr(hf_config, "codec_frame_rate_hz", None)
-            if rate is not None:
-                logger.info("Using codec frame rate from hf_config: %s Hz", rate)
-                return float(rate)
-        except Exception:
-            pass
-        return None
+        await self._adapter.warmup()
 
     def shutdown(self) -> None:
         """Shut down the TTS thread pool executor."""
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
-        for name in list(self.uploaded_speakers.keys()):
+        for name in list(self.uploaded_speakers):
             self._speaker_cache.clear(name)
 
     def _find_tts_stage(self):
@@ -708,45 +570,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             getattr(self._tts_stage.engine_args, "model_arch", None),
         )
 
-    def _get_custom_voice_dir(self) -> str | None:
-        try:
-            value = getattr(self.engine_client.model_config.hf_config, "custom_voice_dir", None)
-        except AttributeError:
-            return None
-        if isinstance(value, os.PathLike):
-            return os.fspath(value)
-        if isinstance(value, str) and value:
-            return value
-        return None
-
-    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
-        """Load precomputed voice names from ``custom_voice_dir`` for API validation."""
-        if self._tts_model_type not in ("qwen3_tts", "voxcpm2"):
-            return {}
-        custom_voice_dir = self._get_custom_voice_dir()
-        if not custom_voice_dir:
-            return {}
-
-        profiles: dict[str, dict[str, Any]] = {}
-        qwen3_embedding_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
-        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type=self._tts_model_type):
-            tensors = load_validated_profile_tensors(
-                profile,
-                expected_model_type=self._tts_model_type,
-                qwen3_embedding_dim=qwen3_embedding_dim,
-            )
-            if tensors is None:
-                continue
-            profiles[profile["voice_name_lower"]] = profile
-        if profiles:
-            logger.info(
-                "Loaded %d precomputed %s voice profile(s) from %s",
-                len(profiles),
-                self._tts_model_type,
-                custom_voice_dir,
-            )
-        return profiles
-
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
 
@@ -768,64 +591,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _get_available_voices(self) -> set[str]:
         """Get all voice names accepted by the API, including the placeholder default."""
-        return self.supported_speakers | self.uploaded_speakers.keys() | {_DEFAULT_VOICE_NAME}
-
-    def _load_supported_speakers(self) -> set[str]:
-        """Load supported speakers (case-insensitive) from the model configuration."""
-        if self._tts_model_type == "ming_flash_omni_tts":
-            # Ming-flash-omni drives speaker selection via the caption JSON
-            # (audio_sequence[0]["说话人"]) rather than a spk_id table, so there
-            # is no static speaker list to surface here.
-            return set()
-        try:
-            if self._tts_model_type == "glm_tts":
-                return set()
-            if self._tts_model_type == "ming_tts":
-                return set()
-            if self._tts_model_type == "voxcpm2":
-                return {"default"}
-            if self._tts_model_type == "voxtral_tts":
-                config = self.engine_client.model_config.hf_config.audio_config
-            else:
-                # Default is qwen3_tts path
-                config = getattr(self.engine_client.model_config.hf_config, "talker_config", None)
-                if config is None:
-                    return set()
-
-            # Check for speakers in either spk_id or speaker_id
-            for attr_name in ["spk_id", "speaker_id"]:
-                if isinstance(config, dict):
-                    speakers_dict = config.get(attr_name)
-                else:
-                    speakers_dict = getattr(config, attr_name, None)
-                if speakers_dict and isinstance(speakers_dict, dict):
-                    return {speaker.lower() for speaker in speakers_dict.keys()}
-
-            logger.warning("No speakers found in config (checked spk_id and speaker_id)")
-        except Exception as e:
-            logger.warning("Could not load speakers from model config: %s", e)
-
-        return set()
-
-    def _load_supported_languages(self) -> frozenset[str]:
-        """Load supported languages (title-cased) from the model configuration"""
-        if self._tts_model_type != "qwen3_tts":
-            return _TTS_LANGUAGES
-        try:
-            config = self.engine_client.model_config.hf_config.talker_config
-
-            if isinstance(config, dict):
-                codec_language_id = config.get("codec_language_id")
-            else:
-                codec_language_id = getattr(config, "codec_language_id", None)
-
-            if codec_language_id and isinstance(codec_language_id, Mapping):
-                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
-
-            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
-        except Exception as e:
-            logger.warning("Could not load languages from model config: %s", e)
-        return _TTS_LANGUAGES
+        return self._get_available_speakers() | {_DEFAULT_VOICE_NAME}
 
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
@@ -833,7 +599,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         The codec produces one frame per (output_sample_rate / encode_downsample_rate)
         audio samples, so ref_code_len = ceil(duration_seconds * codec_frame_rate).
         """
-        if self._codec_frame_rate is None:
+        codec_frame_rate = self._adapter.capabilities.codec_frame_rate
+        if codec_frame_rate is None:
             return None
         try:
             # ref_audio comes from tts_params as [[wav_array, sr]] or similar nested structure
@@ -858,7 +625,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if sr <= 0 or n_samples <= 0:
                 return None
             duration = n_samples / sr
-            return math.ceil(duration * self._codec_frame_rate)
+            return math.ceil(duration * codec_frame_rate)
         except Exception:
             return None
 
@@ -1041,7 +808,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
         elif request.voice is not None:
-            voice_profile = self.precomputed_speakers.get(request.voice.lower())
+            voice_profile = self._adapter.capabilities.precomputed_speakers.get(request.voice.lower())
         return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
@@ -1204,7 +971,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if voice_name_lower not in self.uploaded_speakers:
             return
         old = self.uploaded_speakers.pop(voice_name_lower)
-        self.supported_speakers.discard(voice_name_lower)
         self._ref_audio_data_url_cache.pop(voice_name_lower, None)
         old_path = old.get("file_path")
         if old_path:
@@ -1346,7 +1112,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(f"Failed to save voice file: {e}")
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
 
         logger.info("Uploaded new voice '%s' with consent ID '%s'", name, consent)
 
@@ -1397,13 +1162,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
-        if self._tts_model_type == "ming_tts":
-            if emb_dim != SPEAKER_EMBEDDING_DIM:
-                raise ValueError(f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}")
-        else:
-            dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
-            if dim_err is not None:
-                raise ValueError(dim_err)
+        dim_err = self._adapter.validate_tts_embedding_dim(emb_dim) if self._adapter is not None else None
+        if dim_err is not None:
+            raise ValueError(dim_err)
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
@@ -1443,7 +1204,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             speaker_data["file_size"] = file_path.stat().st_size
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
 
         logger.info("Uploaded voice '%s' from speaker embedding (%d-dim)", name, emb_dim)
 
@@ -1473,7 +1233,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return False
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
-            self.supported_speakers.discard(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
 
             file_path = speaker_info.get("file_path")
@@ -2507,6 +2266,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Speaker (voice)
         if request.voice is not None:
             voice_lower = request.voice.lower()
+            precomputed_speakers = self._adapter.capabilities.precomputed_speakers if self._adapter is not None else {}
             params["speaker"] = [request.voice]
             params["voice_created_at"] = [self._voice_created_at(voice_lower)]
 
@@ -2540,8 +2300,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.info(
                         "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
                     )
-            elif voice_lower in self.precomputed_speakers and request.ref_audio is None:
-                profile = self.precomputed_speakers[voice_lower]
+            elif voice_lower in precomputed_speakers and request.ref_audio is None:
+                profile = precomputed_speakers[voice_lower]
                 mode = str(profile.get("mode") or "xvec").lower()
                 params["speaker"] = [voice_lower]
                 params["task_type"] = ["Base"]
@@ -3349,7 +3109,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         if voice is not None:
             voice = voice.lower()
-            if voice not in self.uploaded_speakers and voice not in self.supported_speakers:
+            available_speakers = self._get_available_speakers()
+            if voice not in available_speakers:
                 raise ValueError(
                     f"Invalid voice '{voice}'. Supported: {', '.join(sorted(self._get_available_voices()))}"
                 )
@@ -3534,7 +3295,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
         if request.voice is not None:
-            if _is_default_voice(request.voice.lower(), self.supported_speakers):
+            if _is_default_voice(request.voice.lower(), self._get_available_speakers()):
                 request.voice = None
 
         if self._diffusion_mode:

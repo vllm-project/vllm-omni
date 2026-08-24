@@ -11,6 +11,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
@@ -192,6 +193,11 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+    )
+    runner.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
+        vllm_config=runner.vllm_config,
+        od_config=runner.od_config,
+        device=runner.device,
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,

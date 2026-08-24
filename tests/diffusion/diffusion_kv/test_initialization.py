@@ -22,6 +22,7 @@ class _Executor:
         self.specs = [{"layer0": object()}, {"layer0": object()}]
         self.memory = [1024, 1024]
         self.configs = None
+        self.resolved_max_model_len = None
         self.profile_requests = None
 
     def get_kv_cache_specs(self):
@@ -31,8 +32,9 @@ class _Executor:
         self.profile_requests = profile_requests
         return self.memory
 
-    def set_kv_cache_configs(self, configs) -> None:
+    def set_kv_cache_configs(self, configs, resolved_max_model_len) -> None:
         self.configs = configs
+        self.resolved_max_model_len = resolved_max_model_len
 
 
 def _od_config(**overrides):
@@ -55,6 +57,7 @@ def _od_config(**overrides):
         ),
         gpu_memory_utilization=0.9,
         kv_cache_memory_bytes=None,
+        max_num_seqs=1,
         max_num_batched_tokens=64,
         num_gpus=1,
     )
@@ -64,9 +67,9 @@ def _od_config(**overrides):
 
 def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     executor = _Executor()
-    od_config = _od_config(num_gpus=2)
+    od_config = _od_config(num_gpus=2, max_model_len=-1)
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=4096),
+        model_config=SimpleNamespace(max_model_len=256),
         max_in_flight_tokens=128,
     )
     worker_configs = [object(), object()]
@@ -91,6 +94,7 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     build.assert_called_once_with(vllm_config, executor.specs, executor.memory)
     assert result == (scheduler_kv_cache_config, 16, 16, vllm_config)
     assert executor.configs == worker_configs
+    assert executor.resolved_max_model_len == vllm_config.model_config.max_model_len
     assert executor.profile_requests is profile_requests
 
 
