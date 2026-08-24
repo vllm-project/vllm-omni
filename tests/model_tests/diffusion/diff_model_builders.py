@@ -149,6 +149,28 @@ def tiny_flux_kontext_builder() -> str:
     )
 
 
+def _shrink_sd3_transformer(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["attention_head_dim"] = 32
+    config["num_attention_heads"] = 4
+    config["caption_projection_dim"] = 128
+    config["dual_attention_layers"] = [0]
+    return config
+
+
+def tiny_sd3_builder() -> str:
+    return build_tiny_from_configs(
+        "StableDiffusion3Pipeline",
+        "stabilityai/stable-diffusion-3.5-medium",
+        transform={
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_clip_text_encoder,
+            "text_encoder_3": _shrink_flux_t5_text_encoder,
+            "transformer": _shrink_sd3_transformer,
+        },
+    )
+
+
 def tiny_flux2_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
         # The real checkpoint ships language_model.lm_head.weight as its own
