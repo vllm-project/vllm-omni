@@ -856,6 +856,10 @@ class SenseNovaU1Pipeline(
         """Autoregressive text decoding seeded from prefix logits."""
         eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         generated_ids: list[int] = []
+        # Same paged decode as the think loop. No write-back at the end: the
+        # caller returns the decoded string and never reads the cache again,
+        # unlike the think path, which hands it to the generation stage.
+        decode = self._decode_context(past_key_values)
 
         logits = prefix_logits[:, -1, :]
         for _ in range(max_tokens):
@@ -869,7 +873,7 @@ class SenseNovaU1Pipeline(
             if token_id == eos_token_id:
                 break
             generated_ids.append(token_id)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
             t_idx += 1

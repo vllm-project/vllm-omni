@@ -312,3 +312,56 @@ def test_the_kill_switch_returns_no_cache(monkeypatch):
     # The env check returns before anything else on the pipeline is touched.
     host = object.__new__(SenseNovaU1Pipeline)
     assert SenseNovaU1Pipeline._decode_context(host, object()) is None
+
+
+class _Tok:
+    """The two tokenizer calls ``_generate_text`` makes."""
+
+    EOS = 7
+
+    def convert_tokens_to_ids(self, token):
+        return self.EOS
+
+    def decode(self, ids, skip_special_tokens=False):
+        return " ".join(str(i) for i in ids)
+
+
+class _Out:
+    def __init__(self, logits, past_key_values):
+        self.logits = logits
+        self.past_key_values = past_key_values
+
+
+class _TextHost:
+    """Carries only what ``_generate_text`` touches."""
+
+    def __init__(self, context):
+        self._context = context
+        self.seen: list[object] = []
+        self.tokenizer = _Tok()
+
+    def _decode_context(self, past_key_values):
+        return self._context
+
+    def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
+        self.seen.append(decode)
+        # Stop the loop: argmax of this row is the EOS id.
+        logits = torch.full((1, 1, 8), -1.0)
+        logits[0, 0, _Tok.EOS] = 1.0
+        return _Out(logits, past_key_values)
+
+
+def test_text_decoding_uses_the_paged_context_too():
+    """Image-to-text and text-to-text run their own decode loop. It used to call
+    ``_ar_step`` without the context, so the paged path was documented but never
+    reached outside think."""
+    from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+
+    context = object()
+    host = _TextHost(context)
+    prefix = torch.full((1, 1, 8), -1.0)
+    prefix[0, 0, 5] = 1.0  # not EOS, so one step runs
+    SenseNovaU1Pipeline._generate_text(host, prefix, past_key_values=None, t_idx=0)
+    assert host.seen == [context], f"text decoding ran with decode={host.seen}"
