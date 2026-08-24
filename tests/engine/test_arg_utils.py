@@ -20,6 +20,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.utils.dataclass_utils import trackable_to_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -413,3 +414,10 @@ def test_tensor_parallel_size_none_is_handled():
     )
     assert isinstance(args, dict)
     assert "tensor_parallel_size" not in args
+
+
+def test_trackable_omni_engine_args_can_filter():
+    """Ensure OmniEngineArgs is @trackable."""
+    omni_args = OmniEngineArgs("my-model", stage_id=1)
+    filtered_kwargs = trackable_to_kwargs(omni_args)
+    assert filtered_kwargs == {"model": "my-model", "stage_id": 1}

@@ -27,6 +27,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
@@ -38,6 +39,7 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.dataclass_utils import trackable_to_kwargs
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -176,6 +178,17 @@ class AsyncOmni(EngineClient, OmniBase):
 
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
+
+    @classmethod
+    def from_engine_args(
+        cls,
+        engine_args: OmniEngineArgs,
+    ) -> AsyncOmni:
+        # Drops non-explicit defaults; this is functionally the same
+        # as the way in which TrackingArgumentParser filters omitted
+        # kwargs to avoid clobbering config defaults
+        kwargs_dict = trackable_to_kwargs(engine_args)
+        return cls(**kwargs_dict)
 
     def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:
         """Look up the sticky-routed replica for (stage_id, request_id).

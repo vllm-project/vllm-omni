@@ -16,6 +16,7 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
+from vllm_omni.utils.dataclass_utils import trackable
 
 logger = init_logger(__name__)
 
@@ -136,6 +137,7 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
+@trackable
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
