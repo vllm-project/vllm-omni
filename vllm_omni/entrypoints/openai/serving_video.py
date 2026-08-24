@@ -243,10 +243,6 @@ class OmniOpenAIServingVideo:
             gen_params.true_cfg_scale = request.true_cfg_scale
         if "seed" in provided_fields and request.seed is not None:
             gen_params.seed = request.seed
-        if "pipefusion_warmup_steps" in provided_fields:
-            gen_params.pipefusion_warmup_steps = request.pipefusion_warmup_steps
-        if "pipefusion_split_dim" in provided_fields:
-            gen_params.pipefusion_split_dim = request.pipefusion_split_dim
         if "boundary_ratio" in provided_fields and request.boundary_ratio is not None:
             gen_params.boundary_ratio = request.boundary_ratio
 
