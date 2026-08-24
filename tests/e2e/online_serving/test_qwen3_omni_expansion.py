@@ -633,6 +633,83 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"
 
 
+_TOOL_CALL_TEST_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string", "description": "City name"}},
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+tool_call_params = [
+    pytest.param(
+        OmniServerParams(
+            model=model,
+            stage_config_path=default_path,
+            server_args=[
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "hermes",
+            ],
+        ),
+        id="tool_call",
+    ),
+]
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", tool_call_params, indirect=True)
+def test_tool_call_suppresses_audio(omni_server, openai_client) -> None:
+    """When the model calls a tool, audio chunks must be suppressed."""
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="What is the weather in Paris right now?",
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["text", "audio"],
+        "tools": _TOOL_CALL_TEST_TOOLS,
+        "tool_choice": "auto",
+        "stream": True,
+    }
+    responses = openai_client.send_omni_request(request_config, request_num=1)
+    resp = responses[0]
+    assert resp.tool_calls, "Expected model to call get_weather"
+    assert resp.tool_calls[0]["name"] == "get_weather"
+    assert not resp.audio_data, f"Expected no audio when tool calls are present, got {len(resp.audio_data)} chunks"
+
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", tool_call_params, indirect=True)
+def test_no_tool_call_produces_audio(omni_server, openai_client) -> None:
+    """When tools are available but the model answers directly, audio must still be produced."""
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="What is the capital of China? Answer in 20 words.",
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["text", "audio"],
+        "tools": _TOOL_CALL_TEST_TOOLS,
+        "tool_choice": "auto",
+        "stream": True,
+    }
+    responses = openai_client.send_omni_request(request_config, request_num=1)
+    resp = responses[0]
+    assert not resp.tool_calls, f"Expected no tool calls for arithmetic, got {resp.tool_calls}"
+    assert resp.audio_data, "Expected audio output when no tool calls are made"
+    assert resp.text_content, "Expected text output"
+
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params[:1], indirect=True)
 def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:

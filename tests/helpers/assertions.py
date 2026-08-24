@@ -705,7 +705,9 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
     if run_level in {"advanced_model", "full_model"}:
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=False)
         # Verify output success
-        if "audio" in modalities:
+        # When tool calls are present, audio is intentionally suppressed,
+        # the talker would vocalize tool-call JSON syntax as garbled speech.
+        if "audio" in modalities and not getattr(response, "tool_calls", None):
             assert _response_has_audio_output(response), "No audio output is generated"
             if transcript is not None:
                 print(f"audio content is: {transcript}")
@@ -740,7 +742,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     )
 
         # Verify similarity (Whisper transcript vs streamed/detokenized text)
-        if "audio" in modalities:
+        if "audio" in modalities and not getattr(response, "tool_calls", None):
             audio_ref_text = request_config.get("audio_ref_text")
             similarity_threshold = request_config.get("similarity_threshold", 0.8)
             if "text" in modalities:
