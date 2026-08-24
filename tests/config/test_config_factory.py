@@ -38,7 +38,7 @@ from vllm_omni.config.stage_config import (
     pipeline_cfg_resolver,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, OmniEngineArgs, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, OmniEngineArgs, internal_blacklist_keys
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
