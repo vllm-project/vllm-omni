@@ -10,6 +10,7 @@ import json
 import math
 import os
 import signal
+from collections.abc import Mapping
 from types import FrameType
 
 import uvloop
@@ -42,6 +43,54 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+_OMNI_VAE_ADDITIONAL_CONFIG_PATHS: dict[tuple[str, ...], str] = {
+    ("vae_patch_parallel_size",): "--vae-patch-parallel-size",
+    ("vae_parallel_mode",): "--vae-parallel-mode",
+    ("vae_use_tiling",): "--vae-use-tiling",
+    ("parallel_config", "vae_patch_parallel_size"): "--vae-patch-parallel-size",
+    ("parallel_config", "vae_parallel_mode"): "--vae-parallel-mode",
+    ("parallel_config", "vae_use_tiling"): "--vae-use-tiling",
+}
+
+
+def _warn_on_misplaced_omni_vae_config(args: argparse.Namespace) -> None:
+    """Warn when platform config is mistaken for Omni VAE config.
+
+    ``--additional-config`` is forwarded unchanged to the platform plugin via
+    ``VllmConfig.additional_config``. It is not an overlay for Omni's
+    diffusion configuration, so VAE fields placed there would otherwise be
+    accepted by the parser but silently have no effect.
+    """
+    if not getattr(args, "omni", False):
+        return
+
+    additional_config = getattr(args, "additional_config", None)
+    if not isinstance(additional_config, Mapping):
+        return
+
+    misplaced: list[tuple[str, str]] = []
+    for path, flag in _OMNI_VAE_ADDITIONAL_CONFIG_PATHS.items():
+        value: object = additional_config
+        for key in path:
+            if not isinstance(value, Mapping) or key not in value:
+                break
+            value = value[key]
+        else:
+            misplaced.append((".".join(path), flag))
+
+    if not misplaced:
+        return
+
+    fields = ", ".join(path for path, _ in misplaced)
+    flags = ", ".join(dict.fromkeys(flag for _, flag in misplaced))
+    logger.warning(
+        "--additional-config is forwarded to the platform plugin and does not "
+        "configure Omni VAE options. These fields will not take effect here: "
+        "%s. Use the dedicated CLI flags instead: %s.",
+        fields,
+        flags,
+    )
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -143,6 +192,8 @@ class OmniServeCommand(CLISubcommand):
         # vLLM equivalents on the command line would silently disagree with
         # those sources of truth, so reject them at parse time.
         if getattr(args, "omni", False):
+            _warn_on_misplaced_omni_vae_config(args)
+
             explicit_cli_keys: set[str] = getattr(args, "_cli_explicit_keys", set()) or set()
             prohibited_with_omni: dict[str, str] = {
                 "data_parallel_size": "--data-parallel-size",

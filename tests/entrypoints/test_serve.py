@@ -76,6 +76,61 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_validate_warns_for_omni_vae_fields_in_additional_config(mocker: MockerFixture) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    command = OmniServeCommand()
+    command.subparser_init(subparsers)
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--additional-config",
+            '{"vae_use_tiling":true,"parallel_config":'
+            '{"vae_patch_parallel_size":2,"vae_parallel_mode":"spatial_shard_height"}}',
+        ]
+    )
+    original_config = args.additional_config.copy()
+    warning = mocker.patch("vllm_omni.entrypoints.cli.serve.logger.warning")
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=True)
+
+    command.validate(args)
+
+    warning.assert_called_once()
+    fmt, *fmt_args = warning.call_args.args
+    message = fmt % tuple(fmt_args)
+    assert "parallel_config.vae_patch_parallel_size" in message
+    assert "parallel_config.vae_parallel_mode" in message
+    assert "vae_use_tiling" in message
+    assert "--vae-patch-parallel-size" in message
+    assert "--vae-parallel-mode" in message
+    assert "--vae-use-tiling" in message
+    assert args.additional_config == original_config
+
+
+def test_validate_does_not_warn_for_platform_additional_config(mocker: MockerFixture) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    command = OmniServeCommand()
+    command.subparser_init(subparsers)
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--additional-config",
+            '{"torchair_graph_config":{"enabled":true}}',
+        ]
+    )
+    warning = mocker.patch("vllm_omni.entrypoints.cli.serve.logger.warning")
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=True)
+
+    command.validate(args)
+
+    warning.assert_not_called()
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
