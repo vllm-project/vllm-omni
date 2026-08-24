@@ -97,6 +97,15 @@ _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DE
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
+# Voice cloning reproduces the reference's onset behaviour along with its timbre, so
+# leading silence in the reference propagates into generated speech. Opt-in; see #4966.
+_REF_AUDIO_TRIM_SILENCE_ENV = "VLLM_OMNI_TRIM_REF_SILENCE"
+_REF_AUDIO_TRIM_REL_FRAC = 0.05  # threshold = 5% of the reference's own peak
+_REF_AUDIO_TRIM_ABS_FLOOR = 0.01  # never treat anything below this as speech
+_REF_AUDIO_TRIM_FRAME_MS = 5.0  # analysis hop
+_REF_AUDIO_TRIM_PREROLL_MS = 20.0  # keep lead-in so plosives are not shaved
+_REF_AUDIO_TRIM_MIN_RUN = 2  # consecutive frames above threshold to call it speech
+_REF_AUDIO_TRIM_MAX_FRAC = 0.8  # refuse to remove more than this much of a clip
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
 _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
@@ -1726,6 +1735,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
+        if os.environ.get(_REF_AUDIO_TRIM_SILENCE_ENV, "0") == "1":
+            trimmed = self._trim_leading_silence(wav_np, sr)
+            if len(trimmed) < len(wav_np):
+                logger.info(
+                    "Trimmed %.0f ms of leading silence from ref_audio",
+                    (len(wav_np) - len(trimmed)) / sr * 1000.0,
+                )
+            wav_np = trimmed
         artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
         if duration < _REF_AUDIO_MIN_DURATION:
@@ -1751,6 +1768,59 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
         return wav_list, sr
+
+    @staticmethod
+    def _trim_leading_silence(wav: np.ndarray, sr: int) -> np.ndarray:
+        """Drop leading silence from reference audio.
+
+        Voice cloning reproduces the reference speaker's onset behaviour along with
+        their timbre, so leading silence in the reference propagates into generated
+        speech. This trims the *reference* only -- never generated audio -- so a bad
+        cut degrades timbre marginally rather than clipping a soft onset in the
+        output.
+
+        The threshold is relative to the reference's own peak (with an absolute
+        floor) so it behaves across recording levels, and it is applied to per-frame
+        RMS rather than per-frame peak so an isolated click in the silence does not
+        halt trimming early. A short pre-roll is preserved so hard consonant attacks
+        are not shaved, and the trim is clamped so it never takes a clip below
+        ``_REF_AUDIO_MIN_DURATION`` -- enabling the flag must not start rejecting
+        references that used to resolve fine.
+        """
+        peak = float(np.abs(wav).max()) if wav.size else 0.0
+        if peak <= 0.0:
+            return wav
+        thresh = max(_REF_AUDIO_TRIM_ABS_FLOOR, _REF_AUDIO_TRIM_REL_FRAC * peak)
+        n = max(1, int(sr * _REF_AUDIO_TRIM_FRAME_MS / 1000.0))
+        back = int(sr * _REF_AUDIO_TRIM_PREROLL_MS / 1000.0)
+
+        # Speech onset requires two consecutive frames above threshold. A single
+        # click or pop in the silence trips one frame; speech does not stop after
+        # 5 ms. This is what keeps an isolated impulse from halting the trim.
+        start = None
+        run = 0
+        for i in range(0, max(0, len(wav) - n), n):
+            frame = wav[i : i + n]
+            rms = float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
+            if rms >= thresh:
+                run += 1
+                if run >= _REF_AUDIO_TRIM_MIN_RUN:
+                    onset = i - (run - 1) * n
+                    start = max(0, onset - back)
+                    break
+            else:
+                run = 0
+        if not start:
+            return wav  # starts at speech, or is entirely sub-threshold
+
+        # Never trim so much that a reference which previously passed validation
+        # would now be rejected by the minimum-duration gate.
+        min_samples = int(_REF_AUDIO_MIN_DURATION * sr)
+        if len(wav) - start < min_samples:
+            start = max(0, len(wav) - min_samples)
+        if start == 0:
+            return wav
+        return np.ascontiguousarray(wav[start:])
 
     @staticmethod
     def _make_ref_audio_artifact_cache_key(wav: np.ndarray, sr: int) -> str:
