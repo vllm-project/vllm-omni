@@ -3,13 +3,20 @@
 """Unit tests for Int8 quantization config."""
 
 import math
+import os
 
 import pytest
 import torch
+import torch.distributed as dist
 from pytest_mock import MockerFixture
 from torch.nn import Module, Parameter
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 
+import vllm_omni.quantization.int8_config as int8_config
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
@@ -22,6 +29,90 @@ gpu_available = pytest.mark.skipif(
     not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm()),
     reason="CUDA or ROCm platform not available.",
 )
+
+
+def _make_int8_layer(weight, *, input_size=None, scale_tp_group=None):
+    layer = Module()
+    layer.weight = Parameter(weight, requires_grad=False)
+    layer.input_size = weight.shape[1] if input_size is None else input_size
+    layer.input_size_per_partition = weight.shape[1]
+    if scale_tp_group is not None:
+        layer._int8_scale_tp_group = scale_tp_group
+    return layer
+
+
+def _distributed_int8_quant_worker(rank: int, init_method: str) -> None:
+    # FileStore still asks Gloo for a local interface. Use loopback so this
+    # regression does not depend on the host name being resolvable in CI.
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        full_weight = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [-1.3984375, 2.796875, -2.0, 1.0],
+            ],
+            dtype=torch.bfloat16,
+        )
+        local_weight = full_weight.chunk(2, dim=1)[rank].contiguous()
+        layer = _make_int8_layer(
+            local_weight,
+            input_size=full_weight.shape[1],
+            scale_tp_group=dist.group.WORLD,
+        )
+
+        qweight, scale = int8_config._quantize_input_sharded_weight(layer)
+
+        full_amax = full_weight.abs().amax(dim=1, keepdim=True).float()
+        inv_scale = torch.where(
+            full_amax == 0,
+            torch.zeros_like(full_amax),
+            torch.iinfo(torch.int8).max / full_amax,
+        )
+        expected = full_weight.float().mul(inv_scale).round().clamp(-127, 127).to(torch.int8)
+        assert torch.equal(qweight, expected.chunk(2, dim=1)[rank])
+        assert torch.equal(scale, full_amax / torch.iinfo(torch.int8).max)
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_accelerator_int8_quant_worker(rank: int, init_method: str) -> None:
+    device = torch.device(current_omni_platform.device_type, rank)
+    current_omni_platform.set_device(device)
+    dist.init_process_group(
+        "nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        full_weight = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [-1.3984375, 2.796875, -2.0, 1.0],
+            ],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        full_qweight, full_scale, _ = int8_config.ops.scaled_int8_quant(full_weight, scale=None)
+        local_weight = full_weight.chunk(2, dim=1)[rank].contiguous()
+        layer = _make_int8_layer(
+            local_weight,
+            input_size=full_weight.shape[1],
+            scale_tp_group=dist.group.WORLD,
+        )
+
+        qweight, scale = int8_config._quantize_input_sharded_weight(layer)
+
+        assert torch.equal(qweight, full_qweight.chunk(2, dim=1)[rank])
+        assert torch.equal(scale, full_scale)
+    finally:
+        dist.destroy_process_group()
 
 
 def test_int8_config_creation():
@@ -412,7 +503,9 @@ class TestInt8LinearMethod:
     def mock_kernel(self, mocker):
         kernel = mocker.Mock()
         kernel.process_weights_after_loading = mocker.Mock()
-        kernel.apply_weights = mocker.Mock(return_value=torch.randn(1, 10))
+        kernel.apply_weights = mocker.Mock(
+            side_effect=lambda layer, x, bias: torch.empty(x.shape[0], 10, dtype=x.dtype)
+        )
         return kernel
 
     @pytest.fixture
@@ -498,10 +591,199 @@ class TestInt8OnlineLinearMethod:
         from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod
 
         method = Int8OnlineLinearMethod(mock_quant_config)
-        layer = Module()
-        layer.weight = Parameter(torch.randn(128, 64))
+        layer = _make_int8_layer(torch.randn(128, 64))
         method.process_weights_after_loading(layer)
         mock_deps["quant"].assert_called_once_with(layer.weight, scale=None)
+
+
+@pytest.mark.cpu
+class TestInt8OnlineTensorParallelScales:
+    @staticmethod
+    def _make_method(mocker, method_name):
+        kernel = mocker.Mock()
+        kernel.layer_param_names = ("weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj")
+        mocker.patch.object(int8_config, "init_int8_linear_kernel", return_value=kernel)
+        return getattr(int8_config, method_name)(mocker.Mock())
+
+    @pytest.mark.parametrize(
+        ("input_size_per_partition", "expected"),
+        [(2, True), (4, False)],
+    )
+    def test_create_weights_records_full_and_local_input_sizes(self, mocker, input_size_per_partition, expected):
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
+        layer = Module()
+        method = self._make_method(mocker, "Int8OnlineLinearMethod")
+
+        method.create_weights(
+            layer,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=[2],
+            input_size=4,
+            output_size=2,
+            params_dtype=torch.bfloat16,
+            weight_loader=mocker.Mock(),
+        )
+
+        assert layer.input_size == 4
+        assert layer.input_size_per_partition == input_size_per_partition
+        assert (layer.input_size != layer.input_size_per_partition) is expected
+
+    @pytest.mark.parametrize("method_name", ["Int8OnlineLinearMethod", "NPUInt8OnlineLinearMethod"])
+    def test_bare_input_sharded_weight_matches_unsharded_quantization(self, mocker, method_name):
+        full_weight = torch.tensor(
+            [[1, -2, 8, -64], [2, -3, 7, -56]],
+            dtype=torch.bfloat16,
+        )
+        int8_max = torch.iinfo(torch.int8).max
+        full_amax = full_weight.abs().amax(dim=1, keepdim=True).float()
+        full_scale = full_amax / int8_max
+        full_inv_scale = int8_max / full_amax
+        full_qweight = full_weight.float().mul(full_inv_scale).round().clamp(-int8_max, int8_max).to(torch.int8)
+
+        # BAGEL's gen_exp is a plain Module that owns an input-sharded weight.
+        local_layer = _make_int8_layer(full_weight[:, :2], input_size=full_weight.shape[1])
+        local_amax = local_layer.weight.abs().amax(dim=1, keepdim=True).float()
+        local_scale = local_amax / int8_max
+        local_qweight = (
+            local_layer.weight.float().mul(int8_max / local_amax).round().clamp(-int8_max, int8_max).to(torch.int8)
+        )
+        if method_name == "Int8OnlineLinearMethod":
+            native_quant = mocker.patch.object(
+                int8_config.ops,
+                "scaled_int8_quant",
+                return_value=(local_qweight, local_scale, None),
+            )
+        else:
+            torch_npu = mocker.Mock()
+            native_quant = torch_npu.npu_dynamic_quant
+            native_quant.return_value = (local_qweight, local_scale.squeeze(-1))
+            mocker.patch.object(int8_config, "torch_npu", torch_npu)
+
+        tp_group = mocker.Mock()
+        tp_group.device_group = mocker.sentinel.tp_group
+        mocker.patch("vllm_omni.quantization.int8_config.get_tp_group", return_value=tp_group)
+
+        def max_reduce(row_amax, op, group):
+            assert op is torch.distributed.ReduceOp.MAX
+            assert group is tp_group.device_group
+            row_amax.copy_(full_amax)
+
+        all_reduce = mocker.patch("torch.distributed.all_reduce", side_effect=max_reduce)
+
+        method = self._make_method(mocker, method_name)
+        method.process_weights_after_loading(local_layer)
+
+        all_reduce.assert_called_once()
+        native_quant.assert_not_called()
+        assert torch.equal(local_layer.weight.t(), full_qweight[:, :2])
+        expected_scale = full_scale if method_name == "Int8OnlineLinearMethod" else full_scale.squeeze(-1)
+        assert torch.equal(local_layer.weight_scale, expected_scale)
+
+    @pytest.mark.parametrize("method_name", ["Int8OnlineLinearMethod", "NPUInt8OnlineLinearMethod"])
+    def test_input_sharded_weight_uses_explicit_group(self, mocker, method_name):
+        weight = torch.tensor([[1, -2]], dtype=torch.bfloat16)
+        scale_tp_group = mocker.sentinel.minimax_text_encoder_group
+        layer = _make_int8_layer(weight, input_size=4, scale_tp_group=scale_tp_group)
+
+        if method_name == "Int8OnlineLinearMethod":
+            native_quant = mocker.patch.object(int8_config.ops, "scaled_int8_quant")
+        else:
+            torch_npu = mocker.Mock()
+            native_quant = torch_npu.npu_dynamic_quant
+            mocker.patch.object(int8_config, "torch_npu", torch_npu)
+
+        get_tp_group = mocker.patch("vllm_omni.quantization.int8_config.get_tp_group")
+        all_reduce = mocker.patch("torch.distributed.all_reduce")
+
+        method = self._make_method(mocker, method_name)
+        method.process_weights_after_loading(layer)
+
+        get_tp_group.assert_not_called()
+        native_quant.assert_not_called()
+        all_reduce.assert_called_once()
+        assert all_reduce.call_args.kwargs["group"] is scale_tp_group
+
+    @pytest.mark.parametrize("method_name", ["Int8OnlineLinearMethod", "NPUInt8OnlineLinearMethod"])
+    def test_non_input_sharded_weight_does_not_reduce(self, mocker, method_name):
+        local_weight = torch.tensor([[1, -2, 8, -64]], dtype=torch.bfloat16)
+        layer = _make_int8_layer(local_weight)
+        qweight = torch.ones_like(local_weight, dtype=torch.int8)
+        weight_scale = torch.ones((1, 1), dtype=torch.float32)
+
+        if method_name == "Int8OnlineLinearMethod":
+            native_quant = mocker.patch.object(
+                int8_config.ops,
+                "scaled_int8_quant",
+                return_value=(qweight, weight_scale, None),
+            )
+        else:
+            weight_scale = weight_scale.squeeze(-1)
+            torch_npu = mocker.Mock()
+            native_quant = torch_npu.npu_dynamic_quant
+            native_quant.return_value = (qweight, weight_scale)
+            mocker.patch.object(int8_config, "torch_npu", torch_npu)
+
+        all_reduce = mocker.patch("torch.distributed.all_reduce")
+        method = self._make_method(mocker, method_name)
+        original_weight = layer.weight
+        method.process_weights_after_loading(layer)
+
+        if method_name == "Int8OnlineLinearMethod":
+            native_quant.assert_called_once_with(original_weight, scale=None)
+        else:
+            native_quant.assert_called_once_with(original_weight)
+        all_reduce.assert_not_called()
+
+    def test_shared_quantizer_matches_native_rounding_and_zero_row(self, mocker):
+        weight = torch.tensor(
+            [
+                [0.0, 0.0],
+                [-1.3984375, 2.796875],
+            ],
+            dtype=torch.bfloat16,
+        )
+        layer = _make_int8_layer(
+            weight,
+            input_size=4,
+            scale_tp_group=mocker.sentinel.tp_group,
+        )
+        mocker.patch("torch.distributed.all_reduce")
+
+        qweight, scale = int8_config._quantize_input_sharded_weight(layer)
+
+        assert torch.equal(
+            qweight,
+            torch.tensor([[0, 0], [-64, 127]], dtype=torch.int8),
+        )
+        assert torch.equal(
+            scale,
+            torch.tensor([[0.0], [2.796875 / 127]], dtype=torch.float32),
+        )
+
+    def test_shared_quantizer_runs_real_two_rank_collective(self, tmp_path):
+        init_method = f"file://{tmp_path / 'int8-gloo-init'}"
+        torch.multiprocessing.spawn(
+            _distributed_int8_quant_worker,
+            args=(init_method,),
+            nprocs=2,
+            join=True,
+        )
+
+
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325"},
+    num_cards=2,
+)
+@pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Test requires two GPUs.")
+def test_shared_quantizer_matches_native_kernel_on_two_gpus(tmp_path):
+    init_method = f"file://{tmp_path / 'int8-accelerator-init'}"
+    torch.multiprocessing.spawn(
+        _distributed_accelerator_int8_quant_worker,
+        args=(init_method,),
+        nprocs=2,
+        join=True,
+    )
 
 
 @npu_available
@@ -581,11 +863,7 @@ class TestNPUInt8Smoke:
     @pytest.fixture
     def real_layer(self):
         """Create a real linear layer with fp16 weights on NPU"""
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(
-            torch.randn(128, 64, dtype=torch.float16, device="npu"),
-            requires_grad=False,
-        )
+        layer = _make_int8_layer(torch.randn(128, 64, dtype=torch.float16, device="npu"))
         layer.logical_widths = [128]
         layer.input_size_per_partition = 64
         layer.output_size_per_partition = 128
@@ -617,6 +895,31 @@ class TestNPUInt8Smoke:
         assert hasattr(real_layer, "weight_scale")
         assert real_layer.weight_scale.shape == (128,)
 
+    def test_real_npu_shared_quantizer_matches_dynamic_quant(self, mocker):
+        """The shared-scale arithmetic must match the vendor dynamic quantizer."""
+        import torch_npu
+
+        weight = torch.tensor(
+            [
+                [0.0, 0.0],
+                [-1.3984375, 2.796875],
+            ],
+            dtype=torch.bfloat16,
+            device="npu",
+        )
+        native_qweight, native_scale = torch_npu.npu_dynamic_quant(weight)
+        layer = _make_int8_layer(
+            weight,
+            input_size=4,
+            scale_tp_group=mocker.sentinel.npu_tp_group,
+        )
+        mocker.patch("torch.distributed.all_reduce")
+
+        qweight, scale = int8_config._quantize_input_sharded_weight(layer)
+
+        assert torch.equal(qweight, native_qweight)
+        assert torch.equal(scale.squeeze(-1), native_scale)
+
     def test_real_npu_int8_apply_forward(self, quant_config):
         """Smoke test: forward pass with real npu_quant_matmul."""
         import torch_npu
@@ -641,17 +944,14 @@ class TestNPUInt8Smoke:
 
 
 @gpu_available
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 class TestGPUInt8Smoke:
-    """Smoke tests using the upstream CUDA or ROCm INT8 kernels."""
+    """Smoke tests using real upstream INT8 kernels on CUDA or ROCm."""
 
     @pytest.fixture
     def real_layer(self):
-        """Create a real linear layer with fp16 weights on the active GPU."""
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(
-            torch.randn(128, 64, dtype=torch.float16, device="cuda"),
-            requires_grad=False,
-        )
+        """Create a real linear layer with fp16 weights on the GPU."""
+        layer = _make_int8_layer(torch.randn(128, 64, dtype=torch.float16, device=current_omni_platform.device_type))
         layer.logical_widths = [128]
         layer.input_size_per_partition = 64
         layer.output_size_per_partition = 128
@@ -662,7 +962,7 @@ class TestGPUInt8Smoke:
         """Smoke test: verify scaled_int8_quant returns correct shapes."""
         from vllm import _custom_ops as ops
 
-        weight = torch.randn(128, 64, dtype=torch.float16, device="cuda")
+        weight = torch.randn(128, 64, dtype=torch.float16, device=current_omni_platform.device_type)
         qweight, scale, _ = ops.scaled_int8_quant(weight, scale=None)
 
         assert qweight.shape == weight.shape
@@ -691,7 +991,7 @@ class TestGPUInt8Smoke:
 
         # Create layer with pre-processed weights
         layer = torch.nn.Module()
-        weight_fp16 = torch.randn(128, 64, dtype=torch.float16, device="cuda")
+        weight_fp16 = torch.randn(128, 64, dtype=torch.float16, device=current_omni_platform.device_type)
         qweight, scale, _ = ops.scaled_int8_quant(weight_fp16, scale=None)
         layer.weight = torch.nn.Parameter(qweight.t(), requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
@@ -702,7 +1002,7 @@ class TestGPUInt8Smoke:
         layer.azp_adj = None
 
         # Forward pass
-        x = torch.randn(2, 16, 64, dtype=torch.float16, device="cuda")
+        x = torch.randn(2, 16, 64, dtype=torch.float16, device=current_omni_platform.device_type)
         output = method.apply(layer, x)
 
         assert output.shape == (2, 16, 128)
