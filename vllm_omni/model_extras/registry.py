@@ -8,10 +8,6 @@ from typing import Any, Literal, Protocol
 
 from PIL import Image
 
-from vllm_omni.model_extras.audiox import (
-    AUDIOX_EXTRA_BODY_PARAMS,
-    AUDIOX_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -58,17 +54,6 @@ from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
 )
-from vllm_omni.model_extras.mammothmodal2_preview import (
-    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
-    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
-    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-)
-from vllm_omni.model_extras.mammothmodal2_preview import (
-    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
-)
-from vllm_omni.model_extras.mammothmodal2_preview import (
-    build_x_to_text_prompt as build_mammothmoda2_x_to_text_prompt,
-)
 from vllm_omni.model_extras.ming_flash_omni import (
     MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
     MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
@@ -80,6 +65,7 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -145,7 +131,6 @@ def default_x_to_text_prompt(
 _X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
     "bagel": build_bagel_x_to_text_prompt,
     "hunyuan_image3": build_hunyuan_x_to_text_prompt,
-    "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
 }
 
 
@@ -160,8 +145,6 @@ def get_x_to_text_model_family(model: str) -> str:
         return "bagel"
     if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
         return "hunyuan_image3"
-    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
-        return "mammoth_moda2"
     return "generic"
 
 
@@ -193,10 +176,6 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
-    "AudioXPipeline": {
-        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
-        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
-    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -262,16 +241,16 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
         "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
     },
+    "SanaVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "SanaImageToVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
-    },
-    "MammothModa2DiTPipeline": {
-        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
-        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
-        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
     },
     "MingImagePipeline": {
         "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
@@ -286,10 +265,6 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
 
 
-# Multi-stage discovery reports the top-level wrapper rather than its DiT
-# submodule, so both names must resolve to the same request builders.
-_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
-_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 # Alias: some code paths surface HunyuanImage3's pipeline class name rather than
 # the architecture name; point both at the same spec.
 _EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]

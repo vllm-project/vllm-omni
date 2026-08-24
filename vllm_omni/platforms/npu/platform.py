@@ -81,6 +81,27 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         init_ascend_config(vllm_config)
 
     @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+        return AscendBlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build the Ascend metadata required by the native NPU backend."""
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+        kwargs = dict(kwargs)
+        seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+        kwargs["seq_lens_np"] = seq_lens_cpu.detach().cpu().numpy()
+        # The diffusion adapter always supplies a paged cache and the current
+        # K/V write span. ChunkedPrefill is Ascend's cache-backed FIA state for
+        # both multi-token updates and single-token updates in this path.
+        kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
+        return build_attn_metadata(**kwargs)
+
+    @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 

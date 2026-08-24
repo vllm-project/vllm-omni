@@ -723,11 +723,11 @@ def extract_flux2_klein_context(
 def extract_longcat_context(
     module: nn.Module,  # LongCatImageTransformer2DModel
     hidden_states,
-    timestep,
-    guidance,
-    encoder_hidden_states,
-    txt_ids,
-    img_ids,
+    encoder_hidden_states=None,
+    timestep=None,
+    img_ids=None,
+    txt_ids=None,
+    guidance=None,
     **kwargs,
 ) -> CacheContext:
     """Extract the cache context for LongCat Image.
@@ -1259,12 +1259,11 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
+    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        _BF16_DTYPE,
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
         _build_rope_table,
-        _modulate_scale_shift,
         _required_kwarg,
     )
 
@@ -1305,6 +1304,9 @@ def extract_minimax_h3_context(
     psp = _required_kwarg(kwargs, "packed_seq_params")
     cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
     max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    # Mirror forward()'s host-side scalar so the refiner sees the number of
+    # packed requests without reading cu_seqlens off-device.
+    num_requests = int(module._psp_optional(psp, "num_requests", 1))
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1331,6 +1333,7 @@ def extract_minimax_h3_context(
         text_pos=text_pos.to(device),
         refiner_cu_seqlens=refiner_cu.to(device),
         refiner_max_seqlen=refiner_max,
+        num_requests=num_requests,
         seq_len=seq_len,
         device=device,
         local_span=(0, seq_len),
@@ -1341,13 +1344,12 @@ def extract_minimax_h3_context(
     cu_seqlens = cu_seqlens.to(device)
 
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
-    modulated_hidden = module.blocks[0].norm1(decoder_input)
-    modulated_input = _modulate_scale_shift(
-        modulated_hidden,
+    modulated_input = module.blocks[0].norm1(decoder_input)
+    modulated_input = indexed_scale_shift_(
+        modulated_input,
         shift_msa,
         scale_msa,
         combined_indices,
-        dtype=_BF16_DTYPE,
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:

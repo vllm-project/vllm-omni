@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for DistributedLayerwiseOffloadHook and backend utilities."""
 
 import gc
 import json
-import os
-import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -18,6 +16,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     TensorBinding,
@@ -39,6 +38,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
     get_offload_plan,
 )
+from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -65,26 +65,9 @@ def dummy_stream(_stream):
     yield None
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
-    os.environ["RANK"] = str(rank)
-    os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
-
-
 def _cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
-
-    for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-        os.environ.pop(key, None)
 
     gc.collect()
     if current_omni_platform.is_available():
@@ -94,10 +77,7 @@ def _cleanup_distributed() -> None:
 
 @pytest.fixture(scope="module")
 def dist_group():
-    master_port = _find_free_port()
-    _set_dist_env(rank=0, world_size=1, master_port=master_port)
-
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
     try:
         yield
     finally:
@@ -184,6 +164,79 @@ class TestDistributedLayerwiseOffloadHook:
 
         assert next_block.weight.stride() == expected_stride
         assert torch.equal(next_block.weight, expected)
+
+    def test_allgather_reconstructs_online_fp8_weight_and_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """DLO must reconstruct finalized online-FP8 tensors byte-for-byte."""
+
+        class OnlineFp8Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical_weight = torch.tensor(
+                    [
+                        [1.0, 2.0, 3.0, 4.0],
+                        [5.0, 6.0, 7.0, 8.0],
+                        [9.0, 10.0, 11.0, 12.0],
+                    ],
+                    dtype=torch.float32,
+                ).to(torch.float8_e4m3fn)
+                self.weight = nn.Parameter(logical_weight.t(), requires_grad=False)
+                self.weight_scale = nn.Parameter(torch.tensor([0.25]), requires_grad=False)
+
+        current_block = OnlineFp8Block()
+        rank0_block = OnlineFp8Block()
+        rank1_block = OnlineFp8Block()
+        expected_weight = rank0_block.weight.detach().clone()
+        expected_scale = rank0_block.weight_scale.detach().clone()
+        expected_stride = rank0_block.weight.stride()
+
+        rank0_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank0_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=0,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank1_hook = DistributedLayerwiseOffloadHook(
+            next_block=rank1_block,
+            device=torch.device("cpu"),
+            dp_group=object(),
+            dp_size=2,
+            rank=1,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+        )
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(OnlineFp8Block())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert rank0_block.weight.stride() == expected_stride
+        torch.testing.assert_close(
+            rank0_block.weight.float(),
+            expected_weight.float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(rank0_block.weight_scale, expected_scale)
 
     def test_dtensor_wrapper_preserved_across_prefetch_and_offload(self, dist_group, patched_offload_runtime):
         """DTensor wrapper should be preserved through prefetch/offload cycle."""
@@ -643,6 +696,67 @@ class _SingleBlockModel(nn.Module):
         self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
 
 
+class _HWRPipeline(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = _SingleBlockModel(num_blocks=3)
+
+
+class _FakeHostWeightLease:
+    def __init__(self, resolution_id: str):
+        self.closed = False
+        self.provenance = SimpleNamespace(resolution_id=resolution_id)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeLeaseCarrier:
+    def __init__(self, lease: _FakeHostWeightLease):
+        self.lease = lease
+        self.taken = False
+
+    @property
+    def closed(self):
+        return self.taken or self.lease.closed
+
+    def take(self):
+        if self.taken:
+            raise RuntimeError("already taken")
+        self.taken = True
+        return self.lease
+
+    def close(self):
+        if not self.taken:
+            self.lease.close()
+
+
+def _fake_hwr_plan(resolution_id: str = "hwr-test"):
+    lease = _FakeHostWeightLease(resolution_id)
+    carrier = _FakeLeaseCarrier(lease)
+    plan = HostWeightPlan(
+        backing_kind="host_weight_runtime",
+        bindings={},
+        lease_carrier=carrier,
+    )
+    return plan, carrier, lease
+
+
+def _hwr_backend():
+    plan, carrier, lease = _fake_hwr_plan()
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dp_size=1,
+            dlo_use_allgather=False,
+        ),
+        torch.device("cpu"),
+        host_weight_plan=plan,
+    )
+    return _HWRPipeline(), backend, carrier, lease
+
+
 class _MultiBlockModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
@@ -785,6 +899,47 @@ class TestMmapWeightLoading:
         assert backend.dp_group is None
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
+
+    def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
+        """A warm HWR plan uses the existing two-slot rank-local transport."""
+        pipeline, backend, carrier, lease = _hwr_backend()
+        model_bytes = sum(param.numel() * param.element_size() for param in pipeline.transformer.parameters())
+
+        backend.enable(pipeline)
+
+        assert carrier.taken
+        assert backend._using_rank_local_mmap
+        assert all(len(hook.cpu_staging_buffers) == 2 for group in backend._all_hook_groups for hook in group)
+        staging_bytes = sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in backend._all_hook_groups[0][0].cpu_staging_buffers[0].values()
+        )
+        assert staging_bytes * 2 < model_bytes
+        assert not lease.closed
+
+        backend.disable()
+        assert lease.closed
+
+    def test_hwr_backend_failure_drains_partial_setup_before_lease_close(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        pipeline, backend, carrier, lease = _hwr_backend()
+        monkeypatch.setattr(
+            backend,
+            "_allocate_shared_buffers",
+            lambda hooks: (_ for _ in ()).throw(RuntimeError("device buffer allocation failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="device buffer allocation failed"):
+            backend.enable(pipeline)
+
+        assert carrier.taken
+        assert lease.closed
+        assert not backend.enabled
+        assert not backend._blocks
+        assert not backend._all_hook_groups
 
 
 class TestGetBlocksFromDit:
@@ -1452,6 +1607,48 @@ class TestMmapValidation:
 class TestConfigValidation:
     """Tests for configuration validation in OffloadConfig / execute_request."""
 
+    @pytest.mark.parametrize(
+        ("dp", "sp", "tp", "use_allgather", "expected_dlo_group"),
+        [
+            (1, 1, 1, True, 1),
+            (2, 1, 1, True, 2),
+            (1, 4, 1, True, 4),
+            (2, 2, 2, True, 2),
+            (2, 2, 2, False, 1),
+            (1, 4, 2, False, 1),
+        ],
+    )
+    def test_dlo_group_selection_covers_dp_sp_tp_matrix(
+        self,
+        dp,
+        sp,
+        tp,
+        use_allgather,
+        expected_dlo_group,
+    ):
+        """DLO sharding follows DP, falls back to SP, and never uses TP."""
+
+        config = OffloadConfig.from_od_config(
+            SimpleNamespace(
+                enable_cpu_offload=False,
+                enable_layerwise_offload=False,
+                enable_distributed_layerwise_offload=True,
+                dlo_use_allgather=use_allgather,
+                dlo_resident_layers=0,
+                pin_cpu_memory=False,
+                parallel_config=SimpleNamespace(
+                    data_parallel_size=dp,
+                    use_hsdp=False,
+                    hsdp_shard_size=-1,
+                    hsdp_replicate_size=1,
+                    sequence_parallel_size=sp,
+                    tensor_parallel_size=tp,
+                ),
+            )
+        )
+        assert config.dp_size == expected_dlo_group
+        assert config.dlo_use_allgather is use_allgather
+
     def test_loader_plan_cannot_be_silently_dropped_on_unsupported_platform(self, monkeypatch):
         import vllm_omni.diffusion.offloader as offloader_module
 
@@ -1485,6 +1682,53 @@ class TestConfigValidation:
                 device=torch.device("cpu"),
                 host_weight_plan=plan,
             )
+
+    def test_startup_recovery_stays_inside_offloader_boundary(self, monkeypatch):
+        import vllm_omni.diffusion.offloader as offloader_module
+
+        class FailingBackend:
+            def __init__(self):
+                self.disabled = False
+
+            def enable(self, pipeline):
+                del pipeline
+                raise RuntimeError("initial prefetch failed")
+
+            def disable(self):
+                self.disabled = True
+
+        warm_pipeline = nn.Module()
+        canonical_pipeline = nn.Module()
+        plan, carrier, _lease = _fake_hwr_plan("hwr-recovery")
+        failing_backend = FailingBackend()
+        calls = []
+
+        def fake_backend(od_config, device, host_weight_plan):
+            del od_config, device
+            calls.append(host_weight_plan)
+            return failing_backend if host_weight_plan is plan else None
+
+        attach_offload_startup_state(
+            warm_pipeline,
+            OffloadStartupState(
+                host_weight_plan=plan,
+                fresh_model_loader=lambda: canonical_pipeline,
+                allow_fresh_retry=True,
+            ),
+        )
+        monkeypatch.setattr(offloader_module, "get_offload_backend", fake_backend)
+
+        recovered, backend = offloader_module.enable_offload_backend(
+            SimpleNamespace(),
+            warm_pipeline,
+            device=torch.device("cpu"),
+        )
+
+        assert recovered is canonical_pipeline
+        assert backend is None
+        assert failing_backend.disabled
+        assert carrier.closed
+        assert calls == [plan, None]
 
     def test_hsdp_with_allgather_rejected(self):
         """HSDP + DLO + AllGather should raise ValueError (double sharding)."""

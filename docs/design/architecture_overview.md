@@ -335,8 +335,8 @@ The single resolution boundary is implemented by
 `StageConfigFactory.create_from_model()` and
 `VllmOmniConfig.from_pipeline_config()` in
 [`vllm_omni/config`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/config).
-The legacy `stage_args` YAML path remains only for models that have not yet
-migrated to `PipelineConfig` and `DeployConfig`.
+The legacy `stage_args` YAML path has been removed. Model topology now resolves
+through `PipelineConfig`, with runtime overrides supplied by `DeployConfig`.
 
 In the typed path, each stage configuration derives from
 `BaseVllmOmniStageConfig` and is specialized as

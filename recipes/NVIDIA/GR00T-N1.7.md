@@ -44,7 +44,7 @@ vllm serve nvidia/GR00T-N1.7-3B \
   --host 127.0.0.1 \
   --port 8000 \
   --served-model-name gr00t-n1d7 \
-  --stage-configs-path vllm_omni/deploy/Gr00tN1d7.yaml
+  --deploy-config vllm_omni/deploy/Gr00tN1d7.yaml
 ```
 
 Notes:

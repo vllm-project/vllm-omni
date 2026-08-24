@@ -52,16 +52,14 @@ stages:
     devices: "1"
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # Codec sampling is model-owned by the checkpoint's tts_config (defaults:
-    # T=0.8, top-k=25, top-p=0.85, repetition penalty=1.05, seed=42).
-    # These parameters only govern vLLM's binary continue/stop token.
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      temperature: 0.8
+      top_p: 0.85
+      top_k: 25
+      # See minicpmo_4_5.yaml: the Talker rescores this over a 16-frame window.
+      repetition_penalty: 1.05
       min_tokens: 50
-      max_tokens: 2048
-      stop_token_ids: [1]
+      max_tokens: 4096
       seed: 42
       detokenize: false
 

@@ -32,7 +32,7 @@ stages:
     max_num_batched_tokens: 16384
     devices: "0"
     # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
-    # Keep these in YAML so they survive both --deploy-config and --stage-configs-path.
+    # Keep these in YAML so they are applied through --deploy-config.
     interleave_mm_strings: true
     media_io_kwargs:
       video:
@@ -64,15 +64,20 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # Codec sampling comes from the checkpoint's tts_config. These parameters
-    # govern only vLLM's binary continue/stop token.
+    # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
+    # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).
+    # Values track upstream utils.TTSSamplingParams (min_p/win_size/tau_r are
+    # declared there but never read, so they stay out). repetition_penalty is
+    # consumed by the Talker, which rescores it over upstream's 16-frame window
+    # instead of the Sampler's whole-stream presence penalty.
+    # min_tokens is upstream's min_new_token.
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      temperature: 0.8
+      top_p: 0.85
+      top_k: 25
+      repetition_penalty: 1.05
       min_tokens: 50
-      max_tokens: 2048
-      stop_token_ids: [1]
+      max_tokens: 4096
       seed: 42
       detokenize: false
 

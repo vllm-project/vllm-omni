@@ -10,6 +10,30 @@ For user-facing commands, see the
 [distributed layerwise offloading guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md)
 and the [Cosmos3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md).
 
+## Feature compatibility
+
+Host-storage optimization and runtime compatibility are separate decisions.
+When direct checkpoint mmap is unavailable, DLO can still use tensors produced
+by the ordinary loader. "Compatibility path" below means that fallback is
+implemented but has less end-to-end coverage than the primary path.
+
+Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsupported.
+
+| Feature | DLO + AllGather | DLO without AllGather |
+| --- | --- | --- |
+| **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
+| **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
+| **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
+| **HSDP** | ❌ Rejected to avoid double-sharding parameters. | ⚠️ Limited end-to-end coverage. |
+| **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
+| **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
+| **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
+
+See [Parallelism compatibility](#parallelism-compatibility) and
+[Request and loading constraints](#request-and-loading-constraints) for the
+detailed contracts and validation boundaries.
+
 ## Status
 
 DLO is implemented for multi-device diffusion execution. The default
@@ -145,10 +169,167 @@ This mode means:
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
+### Final-layout Host Weight Runtime consumer
+
+> **Status:** PR2 implementation. The representation-independent identity,
+> producer, and restoration contracts landed in
+> [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445); this consumer
+> wires the final-layout BF16 path into eligible no-AllGather DLO.
+
+Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
+only to no-AllGather DLO. Enable it with
+`--host-weight-runtime-mode preferred` (or `required`) and
+`--host-weight-runtime-root <node-local-root>`. Registration of shared mappings
+and direct asynchronous H2D remain a separate PR3 transport change.
+
+The modes express operator fallback policy, not different artifact formats:
+
+- `preferred` consumes an exact hit, but on a miss it allows canonical loading
+  followed by post-load publication. It is the normal population path.
+- `required` consumes the same exact artifact but fails startup on a miss or
+  unusable artifact. It never invokes canonical DiT fallback or post-load
+  publication and therefore cannot populate an empty store.
+
+PR2 has no separate prewarm command. Operators populate one matching producer
+cohort per node-local storage domain in `preferred` mode, then restart the same
+model revision and parallel layout with `required`. TP coordinates have distinct
+identities, while equivalent DP replicas share them.
+
+The current producer/consumer boundary is the model-declared final-layout BF16
+contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
+and TP2 rank identities plus SP layout identities; online quantization, HSDP,
+LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
+`disabled`, DLO-disabled, and DLO AllGather configurations stop before source
+identity or store construction and retain the existing checkpoint-mmap or
+ordinary-loader path.
+
+Eligibility is decided before constructing HWR, resolving canonical sources,
+hashing identity inputs, probing a filesystem, or emitting an HWR observer
+event:
+
+```text
+DLO disabled / HWR disabled / DLO AllGather
+  -> zero final-layout HWR interaction
+  -> preserve current checkpoint-mmap or ordinary-loader behavior
+```
+
+When final-layout HWR is explicitly enabled for no-AllGather DLO, runtime
+outcomes are authoritative:
+
+- `LOCAL_HIT`: plan and commit an exact restoration, then transfer the lease
+  transactionally to DLO.
+- `CANONICAL_FALLBACK`: bypass checkpoint mmap, canonically materialize and
+  finalize the DiT, then call `publish_after_load()` for a future startup. The
+  current startup retains its canonical tensors.
+- `FAILED`: fail startup. Preferred mode does not reinterpret nonretryable
+  identity, configuration, or compatibility failures as misses.
+- Required mode cannot bootstrap an empty store through a `POST_LOAD_ONLY`
+  producer.
+
+Checkpoint mmap remains an unchanged control path whenever final-layout HWR is
+not selected.
+
+#### Pre-service transaction boundary
+
+The startup transaction does not end at restore commit. A lease-backed model is
+disposable until backend setup and initial prefetch complete:
+
+```text
+UNRESOLVED
+  -> LEASE_OWNED_BY_LOADER
+  -> RESTORE_PLANNED
+  -> COMMIT_STARTED
+  -> CARRIER_OWNED
+  -> BACKEND_OWNED
+  -> BACKEND_READY
+  -> IN_SERVICE
+```
+
+Failure before `COMMIT_STARTED` closes the loader-owned lease. Preferred mode
+may canonically load using the untouched skeleton; required mode fails.
+
+Failure from `COMMIT_STARTED` through `BACKEND_READY` must:
+
+1. synchronize or otherwise quiesce partial backend and initial-prefetch work;
+2. release hook, staging, restore-plan, and model references;
+3. close the lease through its current owner;
+4. discard the restored model; and
+5. in preferred mode, construct a fresh canonical model while bypassing HWR
+   lookup, HWR publication, and checkpoint mmap for that recovery attempt.
+
+Required mode fails instead of constructing the fresh fallback. Once the model
+enters service, failures follow normal runtime handling rather than startup
+fallback.
+
+#### Finalization phases
+
+Cold canonical loading separates byte-changing work from shared runtime-state
+finalization:
+
+```text
+Cold-only byte-changing:
+  casting, reordering, packing, quantization, generated scales,
+  model-specific weight transforms, and calibration that mutates
+  parameters or persistent buffers
+
+Shared cold/warm non-byte:
+  validation, hook installation, eval state, bookkeeping,
+  and non-persistent runtime state
+```
+
+The warm path must snapshot restored tensor bytes and backing pointers before
+shared finalization and prove both are unchanged afterward.
+
+#### Lease ownership
+
+Lease transfer is single-owner and single-take:
+
+```text
+loader owns
+  -> restore plan borrows
+  -> commit succeeds
+  -> runner carrier takes once
+  -> backend takes once before asynchronous work
+  -> backend drains pending H2D work
+  -> backend releases hooks, staging, and model references
+  -> backend closes lease
+```
+
+The runner carrier is process-local, rejects serialization, and rejects a
+duplicate `take()`. If the carrier still owns the lease, runner cleanup closes
+it. Once the backend takes ownership, only backend abort or teardown may drain
+work and close it.
+
+The implementation keeps the final-layout lease through backend setup and
+initial prefetch. The backend uses the existing two bounded rank-local staging
+slots for the immutable HWR tensors, and its transactional `enable()` cleanup
+removes partial hooks and closes the lease before reporting a setup failure.
+Preferred mode then uses the runner's fresh canonical retry; required mode
+propagates the failure.
+
+#### PR2 promotion gates
+
+- Warm hit performs zero ordinary DiT materialization and zero producer calls.
+- Shared warm finalization changes neither restored bytes nor backing pointers.
+- Preferred `FAILED` outcomes do not silently fall back.
+- Planning failure leaves the skeleton untouched.
+- Any pre-service failure after commit begins discards the restored model;
+  preferred mode uses a fresh canonical model and required mode fails.
+- Mixed components load normally and no required tensor remains on `meta`.
+- Disabled mode and AllGather emit zero final-layout HWR interaction.
+- The lease carrier rejects duplicate take and serialization.
+- Backend setup or prefetch failure drains asynchronous work before lease close.
+- Compatible checkpoint mmap remains an unchanged benchmark and control path.
+- Prewarm uses one matching producer cohort per TP/SP topology and storage
+  domain.
+- Benchmarks compare ordinary loading, cold publication, and warm staging with
+  output parity, startup latency, aggregate PSS, page-cache state, HBM, and H2D
+  payload.
+
 ## Parallelism compatibility
 
 | Parallelism | DLO + AllGather | DLO without AllGather |
-|---|---|---|
+| --- | --- | --- |
 | **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages on each node; fallback runtime tensors remain private. |
 | **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active, but DLO keeps standard-loader rank-local weights and adds no SP weight collective. |
 | **TP > 1** | Outside the Phase A shared-mmap support scope. The loader falls back before mutation, preserves TP-local layouts, and DLO may apply DP/SP host sharding to those ordinary runtime tensors. | Outside the Phase A shared-mmap support scope. The ordinary TP-aware loader produces rank-local tensors, which DLO streams without an additional weight collective; DP replicas retain private runtime storage. |
@@ -161,7 +342,8 @@ This mode means:
   the SP group becomes DLO's sharding group in AllGather mode.
 - **DP + TP/SP without AllGather:** standard model loading defines the
   rank-local tensor layout. DLO adds no cross-DP, cross-TP, or cross-SP weight
-  collective.
+  collective. When the model declares the final-layout contract, HWR keys the
+  reusable artifact by TP rank/size and SP layout.
 - **HSDP + SP:** the general parallel configuration permits HSDP over SP, but
   DLO must use `--dlo-no-use-allgather`. HSDP remains responsible for weight
   materialization and synchronization.
@@ -181,13 +363,17 @@ requirements.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
-ordinary loader. Online quantization remains incompatible with DLO AllGather;
-use `--dlo-no-use-allgather` or disable online quantization.
+ordinary loader. Per-tensor online FP8 linears can use DLO AllGather after the
+ordinary loader finalizes their runtime weights and scales; DLO then shards and
+reconstructs those tensors with their recorded layouts. Other online methods
+must use `--dlo-no-use-allgather` or disable online quantization until their
+runtime layouts are validated.
 
-A normalized runtime mmap cache, built through the ordinary loader, is the
-proposed general mechanism for sharing transformed TP or quantized layouts.
-That cache and its publication/lifecycle protocol are intentionally outside
-this phase; see [RFC #6195](https://github.com/vllm-project/vllm-omni/issues/6195).
+The Host Weight Runtime representation and publication contracts are merged;
+see [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414) and
+[PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445). The planned
+no-AllGather consumer above is the PR2 implementation; registration and direct
+asynchronous H2D remain a separate transport follow-up.
 
 ## Validation coverage
 
@@ -197,6 +383,8 @@ Current source-level validation includes:
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
+- ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
+  sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
 - rank-local mmap source retention, bounded two-slot staging, and adapter
   transforms without parameter-side flags;
@@ -214,7 +402,7 @@ VAEs at TP1. They validate the ordinary-loader fallback only, not direct mmap
 or shared-mmap host-memory savings.
 
 | Configuration | Result | Warm E2E | Peak device memory | Host PSS |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | DP4xTP1 AllGather | Passed, 4 concurrent requests | 2.87 s / 4 requests | 13.84 GiB | 211.99 GiB |
 | DP4xTP1 no-AllGather | Passed, 1 request | 15.02 s | 13.23 GiB | 187.77 GiB |
 | DP2xTP2 AllGather | Passed, 2 concurrent requests | 4.16 s / 2 requests | 12.50 GiB | 211.97 GiB |
@@ -246,7 +434,7 @@ pipeline components, so each worker should be compared with the same worker in
 the other storage mode.
 
 | Worker | Ordinary RSS | mmap RSS | Ordinary PSS | mmap PSS | PSS reduction |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | DP worker 0 | 168.27 GiB | 132.76 GiB | 167.84 GiB | 101.43 GiB | 66.40 GiB |
 | DP worker 1 | 116.19 GiB | 79.97 GiB | 115.73 GiB | 48.64 GiB | 67.09 GiB |
 | **Two-worker total** | — | — | **283.56 GiB** | **150.08 GiB** | **133.48 GiB (47.1%)** |
