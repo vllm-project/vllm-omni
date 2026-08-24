@@ -1355,13 +1355,23 @@ def extract_minimax_h3_context(
     inverse_indices = inverse_indices.to(device)
     cu_seqlens = cu_seqlens.to(device)
 
+    # In strict SP, _embed already returns this rank's packed rows while
+    # combined_indices still describes the full packed sequence. TeaCache uses
+    # the first block's modulation as part of its rank-local cache state, so
+    # the modulation indices must be sliced to the same local layout. Keep the
+    # full indices below: local_sp_prepare owns the global-to-local conversion
+    # for transformer-block inputs.
+    state_combined_indices = combined_indices.narrow(0, local_start, local_len)
+    if local_len == seq_len:
+        state_combined_indices = combined_indices
+
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
     modulated_input = module.blocks[0].norm1(decoder_input)
     modulated_input = indexed_scale_shift_(
         modulated_input,
         shift_msa,
         scale_msa,
-        combined_indices,
+        state_combined_indices,
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
@@ -1388,7 +1398,11 @@ def extract_minimax_h3_context(
                 packed_total=seq_len,
                 video_layout=video_layout,
             )
-        hidden = module.sp_gather(hidden)
+        # TeaCache stores residuals as block_output - decoder_input. Strict SP
+        # must keep both tensors rank-local until postprocess projects local
+        # rows to compact logits and gathers them exactly once.
+        if local_len == seq_len:
+            hidden = module.sp_gather(hidden)
         return (hidden,)
 
     def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

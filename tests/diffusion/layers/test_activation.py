@@ -5,12 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+@pytest.mark.cpu
 def test_silu_and_mul_native_matches_packed_reference() -> None:
     packed = torch.randn(257, 256, dtype=torch.float32)
     gate, up = packed.chunk(2, dim=-1)
@@ -18,7 +19,7 @@ def test_silu_and_mul_native_matches_packed_reference() -> None:
     torch.testing.assert_close(SiluAndMul().forward_native(packed), F.silu(gate) * up)
 
 
-@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+@hardware_test(res={"npu": "A3"}, num_cards=1)
 def test_silu_and_mul_npu_matches_packed_reference() -> None:
     packed = torch.randn(257, 256, device="npu", dtype=torch.bfloat16)
     gate, up = packed.chunk(2, dim=-1)
