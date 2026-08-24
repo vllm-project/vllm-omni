@@ -141,16 +141,20 @@ async def _drive_session(
     events: list[ChunkEvent] = []
     decoder_bytes: list[int] = []
     lost_reason: str | None = None
-    period = config.profile.release_period_s
     gauge.enter()
     try:
         for chunk_index in range(config.chunks_per_session):
             if config.mode is LoadMode.PACED and events:
-                # A paced client consumes one chunk per release period, so the
-                # next tick is not issued before the previous chunk's playout
-                # would have finished. Falling behind never pushes the client
-                # ahead: the due time is anchored to the playout grid.
-                due = t_start + chunk_index * period
+                # Pace against the video actually delivered before this
+                # chunk.  A causal decoder's opening chunk can be shorter than
+                # steady state (LingBot/Wan: 9 frames, then 12), so multiplying
+                # every index by the steady period delays chunk 1 by 3 frames
+                # and manufactures a deadline miss.  Anchor to the first real
+                # submit so session construction time is not part of playout.
+                due = (
+                    events[0].t_submit
+                    + config.profile.cumulative_frames(chunk_index) / config.profile.target_fps
+                )
                 lag = due - clock()
                 if lag > 0:
                     await sleep(lag)
