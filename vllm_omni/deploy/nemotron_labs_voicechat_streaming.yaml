@@ -1,0 +1,84 @@
+# NemotronVoiceChat-11B STREAMING speech-to-speech deployment (async-chunk).
+#
+# Same 3 stages as nemotron_labs_voicechat.yaml, but the stages overlap:
+# the thinker streams its frame-locked text timeline to the talker per decode
+# step (cumulative ids.all payloads), and the talker streams prompt-trimmed
+# cumulative code stacks to code2wav every `codec_chunk_frames` frames. The
+# codec re-decodes the full prefix per chunk and emits only the new samples
+# (NeMo decode_one_audio_step semantics), so the concatenated stream is
+# seam-free. First audio arrives after ~codec_chunk_frames thinker steps
+# instead of after the whole pipeline completes.
+#
+# The non-streaming yaml remains the parity-acceptance path (bit-exact WAV);
+# streamed audio is validated by ASR/WER instead (prefix decodes are not
+# bit-identical to the one-shot decode of the final stack).
+pipeline: nemotron_voicechat
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      # Streaming cadence for talker -> code2wav: emit a chunk once this many
+      # NEW frames (80 ms each) have accumulated; ~1 s of audio per chunk.
+      codec_chunk_frames: 13
+
+stages:
+  - stage_id: 0  # thinker: speech -> frame-locked text (final text output)
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.62
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    dtype: float32
+    mamba_ssm_cache_dtype: float32
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      ignore_eos: true
+      seed: 0
+
+  - stage_id: 1  # talker: text timeline -> 31-quantizer code stacks
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    skip_tokenizer_init: true
+    max_num_batched_tokens: 4096
+    max_model_len: 16384
+    dtype: float32
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 16383
+      stop_token_ids: [1]
+      detokenize: false
+      seed: 0
+
+  - stage_id: 2  # code2wav: codes -> 22.05 kHz PCM (fp32 codec)
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.06
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    skip_tokenizer_init: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      detokenize: false
+      seed: 0

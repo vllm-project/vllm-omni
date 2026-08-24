@@ -1,0 +1,318 @@
+# Qwen3-Omni: Online serving
+
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_omni>.
+
+
+## 🛠️ Installation
+
+Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
+
+## Run examples (Qwen3-Omni)
+
+### Launch the Server
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+The default deployment configuration situated at `vllm_omni/deploy/qwen3_omni_moe.yaml` is resolved and loaded
+automatically via the model registry, obviating the necessity for the `--deploy-config` flag in standard deployment topologies.
+The bundled Qwen3-Omni setup defaults `VLLM_USE_FLASHINFER_MOE_FP16=0`. This keeps the Thinker & Talker on vLLM's
+Triton unquantized MoE path and avoids the performance regression observed with the FlashInfer CUTLASS unquantized MoE
+backend.
+Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
+
+To explicitly utilize a custom deployment YAML, specify the configuration path:
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config /path/to/deploy_config_file
+```
+
+### Launch individual stages (stage-based CLI)
+
+Adopt the stage-based CLI architecture to independently instantiate execution processes per functional stage.
+The example below pins Stage 0 to GPU 0 and Stage 1/2 to GPU 1 via
+`CUDA_VISIBLE_DEVICES`.
+
+**1. Stage 0 (Thinker + API server)**
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --port 8091 \
+    --stage-id 0 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**2. Stage 1 (Talker)**
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**3. Stage 2 (Code2Wav)**
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 2 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+Add `--deploy-config /path/to/deploy_config_file` to every command if you want
+to override the bundled deploy YAML.
+
+For the regular one-process launch, stage-specific CLI tuning is usually done
+with `--stage-overrides`, for example:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+To experiment with the FlashInfer FP16 MoE path, set `VLLM_USE_FLASHINFER_MOE_FP16=1` before launching the server:
+```bash
+VLLM_USE_FLASHINFER_MOE_FP16=1 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+For the stage-based CLI, you usually do **not** need `--stage-overrides` for
+that kind of change. Since each command launches one stage, just pass the knob
+directly on that stage command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --gpu-memory-utilization 0.5 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+### Send Multi-modal Request
+
+Get into the example folder
+```bash
+cd examples/online_serving/qwen3_omni
+```
+
+####  Send request via python
+
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py --query-type use_image --port 8091 --host "localhost"
+```
+
+The Python client supports the following command-line arguments:
+
+- `--query-type` (or `-q`): Query type (default: `use_video`). Options: `text`, `use_audio`, `use_image`, `use_video`
+- `--model` (or `-m`): Model name/path (default: `Qwen/Qwen3-Omni-30B-A3B-Instruct`)
+- `--video-path` (or `-v`): Path to local video file or URL. If not provided and query-type is `use_video`, uses default video URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs. Example: `--video-path /path/to/video.mp4` or `--video-path https://example.com/video.mp4`
+- `--image-path` (or `-i`): Path to local image file or URL. If not provided and query-type is `use_image`, uses default image URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common image formats: JPEG, PNG, GIF, WebP. Example: `--image-path /path/to/image.jpg` or `--image-path https://example.com/image.png`
+- `--audio-path` (or `-a`): Path to local audio file or URL. If not provided and query-type is `use_audio`, uses default audio URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common audio formats: MP3, WAV, OGG, FLAC, M4A. Example: `--audio-path /path/to/audio.wav` or `--audio-path https://example.com/audio.mp3`
+- `--prompt` (or `-p`): Custom text prompt/question. If not provided, uses default prompt for the selected query type. Example: `--prompt "What are the main activities shown in this video?"`
+
+
+For example, to use a local video file with custom prompt:
+
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type use_video \
+    --video-path /path/to/your/video.mp4 \
+    --prompt "What are the main activities shown in this video?"
+```
+
+####  Send request via curl
+
+```bash
+bash run_curl_multimodal_generation.sh use_image
+```
+
+## Modality control
+You can control output modalities to specify which types of output the model should generate. This is useful when you only need text output and want to skip audio generation stages for better performance.
+
+### Supported modalities
+
+| Modalities | Output |
+|------------|--------|
+| `["text"]` | Text only |
+| `["audio"]` | Audio only |
+| `["text", "audio"]` | Text + Audio |
+| Not specified | Text + Audio (default) |
+
+### Using curl
+
+#### Text only
+
+```bash
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
+    "modalities": ["text"]
+  }'
+```
+
+#### Text + Audio
+
+```bash
+response=$(curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
+    "modalities": ["text", "audio"]
+  }')
+
+echo "$response" | jq -r '.choices[0].message.content'
+echo "$response" | jq -r '.choices[1].message.audio.data' | base64 -d > output.wav
+```
+
+### Using Python client
+
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type use_image \
+    --modalities text
+```
+
+### Using OpenAI Python SDK
+
+#### Text only
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    messages=[{"role": "user", "content": "Describe vLLM in brief."}],
+    modalities=["text"]
+)
+print(response.choices[0].message.content)
+```
+
+#### Text + Audio
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    messages=[{"role": "user", "content": "Describe vLLM in brief."}],
+    modalities=["text", "audio"]
+)
+# Response contains two choices: one with text, one with audio
+print(response.choices[0].message.content)  # Text response
+print(response.choices[1].message.audio)    # Audio response
+```
+
+## Streaming Output
+If you want to enable streaming output, please set the argument as below. The final output will be obtained just after generated by corresponding stage. We support both text streaming output and audio streaming output. Other modalities can output normally.
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type use_image \
+    --stream
+```
+
+## Run Local Web UI Demo
+
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
+This Web UI demo allows users to interact with the model through a web browser.
+
+### Running Gradio Demo
+
+The Gradio demo connects to a vLLM API server. You have two options:
+
+#### Option 1: One-step Launch Script (Recommended)
+
+The convenience script launches both the vLLM server and Gradio demo together:
+
+```bash
+./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
+```
+
+This script will:
+1. Start the vLLM server in the background
+2. Wait for the server to be ready
+3. Launch the Gradio demo
+4. Handle cleanup when you press Ctrl+C
+
+The script supports the following arguments:
+- `--model`: Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)
+- `--server-port`: Port for vLLM server (default: 8091)
+- `--gradio-port`: Port for Gradio demo (default: 7861)
+- `--deploy-config`: Path to custom deploy config YAML file (optional)
+- `--server-host`: Host for vLLM server (default: 0.0.0.0)
+- `--gradio-ip`: IP for Gradio demo (default: 127.0.0.1)
+- `--share`: Share Gradio demo publicly (creates a public link)
+
+#### Option 2: Manual Launch (Two-Step Process)
+
+**Step 1: Launch the vLLM API server**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+If you have a custom deploy config file:
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
+```
+
+**Step 2: Run the Gradio demo**
+
+In a separate terminal:
+
+```bash
+python gradio_demo.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --api-base http://localhost:8091/v1 --port 7861
+```
+
+Then open `http://localhost:7861/` on your local browser to interact with the web UI.
+
+The gradio script supports the following arguments:
+
+- `--model`: Model name/path (should match the server model)
+- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8091/v1)
+- `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
+- `--port`: Port for Gradio server (default: 7861)
+- `--share`: Share the Gradio demo publicly (creates a public link)
+
+## Example materials
+
+??? abstract "gradio_demo.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_omni/gradio_demo.py"
+    ``````
+??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
+    ``````
+??? abstract "qwen3_omni_moe_thinking.yaml"
+    ``````yaml
+    --8<-- "vllm_omni/deploy/qwen3_omni_moe_thinking.yaml"
+    ``````
+??? abstract "run_curl_multimodal_generation.sh"
+    ``````sh
+    --8<-- "examples/online_serving/qwen3_omni/run_curl_multimodal_generation.sh"
+    ``````
+??? abstract "run_gradio_demo.sh"
+    ``````sh
+    --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
+    ``````

@@ -1,0 +1,2 @@
+-r common.txt
+onnxruntime-rocm>=1.22.2

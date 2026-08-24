@@ -1,0 +1,73 @@
+suite: test pvc
+templates:
+  - pvc.yaml
+tests:
+  - it: should create PVC when modelCache is enabled
+    set:
+      modelCache:
+        enabled: true
+        storageSize: "50Gi"
+        storageClassName: ""
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PersistentVolumeClaim
+      - equal:
+          path: spec.accessModes[0]
+          value: ReadWriteOnce
+      - equal:
+          path: spec.resources.requests.storage
+          value: 50Gi
+
+  - it: should not create PVC when modelCache is disabled
+    set:
+      modelCache:
+        enabled: false
+        storageSize: "50Gi"
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should use custom storage size
+    set:
+      modelCache:
+        enabled: true
+        storageSize: "100Gi"
+        storageClassName: ""
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - equal:
+          path: spec.resources.requests.storage
+          value: 100Gi
+
+  - it: should set storageClassName when specified
+    set:
+      modelCache:
+        enabled: true
+        storageSize: "50Gi"
+        storageClassName: "fast-ssd"
+        accessModes:
+          - ReadWriteOnce
+    asserts:
+      - equal:
+          path: spec.storageClassName
+          value: fast-ssd
+
+  - it: should support ReadWriteMany access mode
+    set:
+      modelCache:
+        enabled: true
+        storageSize: "50Gi"
+        storageClassName: ""
+        accessModes:
+          - ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.accessModes[0]
+          value: ReadWriteMany

@@ -1,0 +1,46 @@
+# Covo-Audio-Chat deploy: fused_thinker_talker → code2wav on a single GPU.
+# Verified on 1x A100-80G.
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Non-default choices in this file:
+#   * async_chunk: false — pipeline defines no async-chunk processor funcs.
+#   * Stage 1 max_num_batched_tokens=2048, max_model_len=2048 — audio code
+#     sequences are short; the 32k default is unnecessary here.
+#   * Stage 1 dtype: float32 — BigVGAN vocoder weights are fp32; the default
+#     bf16 triggers mat1/mat2 dtype mismatch during warmup.
+#   * Stage 1 enforce_eager: true — the code2wav forward pass performs a
+#     GPU→CPU sync (int(code.flatten()[0]) in covo_audio.py) which is
+#     illegal during CUDA graph capture.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.5
+    mm_processor_cache_gb: 0
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    dtype: float32
+    max_num_batched_tokens: 2048
+    max_model_len: 2048
+    mm_processor_cache_gb: 0
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1

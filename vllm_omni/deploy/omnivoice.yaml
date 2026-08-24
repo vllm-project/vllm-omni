@@ -1,0 +1,13 @@
+# OmniVoice TTS deploy: diffusion engine single stage (dit).
+# Text → iterative unmasking → codebook tokens → DAC decode → 24kHz audio.
+
+async_chunk: false
+pipeline: omnivoice
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    enforce_eager: true
+    trust_remote_code: true
+    distributed_executor_backend: "mp"
+    dtype: "float32"

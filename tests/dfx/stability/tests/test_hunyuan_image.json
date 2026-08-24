@@ -1,0 +1,36 @@
+[
+    {
+        "test_name": "test_hunyuan_image_stability_tp2_fp8_sp2",
+        "server_params": {
+            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "serve_args": {
+                "tensor-parallel-size": 2,
+                "usp": 2,
+                "quantization": "fp8",
+                "distributed-executor-backend": "mp",
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2i",
+                "backend": "vllm-omni",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "width": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "height": {
+                    "min": 512,
+                    "max": 1024
+                },
+                "num_inference_steps": 50,
+                "enable_negative_prompt": true
+            }
+        ]
+    }
+]

@@ -1,0 +1,430 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import regex as re
+import yaml
+
+logger = logging.getLogger("mkdocs")
+
+ROOT_DIR = Path(__file__).parent.parent.parent.parent
+ROOT_DIR_RELATIVE = "../../../../.."
+EXAMPLE_DIR = ROOT_DIR / "examples"
+EXAMPLE_DOC_DIR = ROOT_DIR / "docs/user_guide/examples"
+NAV_FILE = ROOT_DIR / "docs/.nav.yml"
+MODEL_DISPLAY_NAMES_FILE = EXAMPLE_DIR / "model_display_names.yml"
+MAX_INLINE_MATERIAL_SIZE = 8 * 1024
+
+SERVING_MODE_TITLES = {
+    "offline_inference": "Offline inference",
+    "online_serving": "Online serving",
+}
+
+# Keep the Examples navigation focused on reusable modality/task entry points.
+# Model-specific scripts remain available under ``examples/`` and are surfaced
+# from these shared pages instead of getting one page per model.
+GENERAL_EXAMPLE_SLUGS = frozenset(
+    {
+        "image_to_image",
+        "image_to_video",
+        "speech_to_video",
+        "text_to_audio",
+        "text_to_image",
+        "text_to_speech",
+        "text_to_video",
+        "x_to_text",
+        "x_to_video_audio",
+    }
+)
+
+
+def load_model_display_names() -> dict[str, str]:
+    try:
+        with open(MODEL_DISPLAY_NAMES_FILE, encoding="utf-8") as f:
+            model_display_names = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Failed to load MODEL_DISPLAY_NAMES_FILE at {MODEL_DISPLAY_NAMES_FILE}: {exc}") from exc
+
+    if not isinstance(model_display_names, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in model_display_names.items()
+    ):
+        raise ValueError(
+            "MODEL_DISPLAY_NAMES_FILE "
+            f"at {MODEL_DISPLAY_NAMES_FILE} must contain a YAML mapping "
+            "of string model IDs to string display names"
+        )
+    return model_display_names
+
+
+MODEL_DISPLAY_NAMES = load_model_display_names()
+
+
+def is_general_example(example: "Example") -> bool:
+    """Return whether an example should get a generated serving page."""
+    if example.category not in SERVING_MODE_TITLES:
+        return True
+    return example.path.stem in GENERAL_EXAMPLE_SLUGS
+
+
+def fix_case(text: str) -> str:
+    subs = {
+        "api": "API",
+        "cli": "CLI",
+        "cpu": "CPU",
+        "llm": "LLM",
+        "mae": "MAE",
+        "tpu": "TPU",
+        "gguf": "GGUF",
+        "lora": "LoRA",
+        "rlhf": "RLHF",
+        "vllm": "vLLM",
+        "openai": "OpenAI",
+        "lmcache": "LMCache",
+        "multilora": "MultiLoRA",
+        "mlpspeculator": "MLPSpeculator",
+        r"fp\d+": lambda x: x.group(0).upper(),  # e.g. fp16, fp32
+        r"int\d+": lambda x: x.group(0).upper(),  # e.g. int8, int16
+    }
+    for pattern, repl in subs.items():
+        text = re.sub(rf"\b{pattern}\b", repl, text, flags=re.IGNORECASE)
+    return text
+
+
+@dataclass
+class Example:
+    """
+    Example class for generating documentation content from a given path.
+
+    Attributes:
+        path (Path): The path to the main directory or file.
+        category (str): The category of the document.
+        main_file (Path): The main file in the directory.
+        other_files (list[Path]): list of other files in the directory.
+        title (str): The title of the document.
+        nav_title (str): The concise title used in navigation.
+
+    Methods:
+        __post_init__(): Initializes the main_file, other_files, and title attributes.
+        determine_main_file() -> Path: Determines the main file in the given path.
+        determine_other_files() -> list[Path]: Determines other files in the directory excluding the main file.
+        determine_title() -> str: Determines the title of the document.
+        generate() -> str: Generates the documentation content.
+    """  # noqa: E501
+
+    path: Path
+    category: str = None
+    main_file: Path = field(init=False)
+    other_files: list[Path] = field(init=False)
+    title: str = field(init=False)
+
+    def __post_init__(self):
+        self.main_file = self.determine_main_file()
+        self.other_files = self.determine_other_files()
+        self.title = self.determine_title()
+
+    @property
+    def is_code(self) -> bool:
+        return self.main_file.suffix != ".md"
+
+    @property
+    def model_display_name(self) -> str | None:
+        if self.category not in SERVING_MODE_TITLES:
+            return None
+        return MODEL_DISPLAY_NAMES.get(self.path.stem)
+
+    @property
+    def nav_title(self) -> str:
+        return self.model_display_name or self.title
+
+    def determine_main_file(self) -> Path:
+        """
+        Determines the main file in the given path.
+        If the path is a file, it returns the path itself. Otherwise, it searches
+        for Markdown files (*.md) in the directory and returns the first one found.
+        Returns:
+            Path: The main file path, either the original path if it's a file or the first
+            Markdown file found in the directory.
+        Raises:
+            IndexError: If no Markdown files are found in the directory.
+        """  # noqa: E501
+        return self.path if self.path.is_file() else list(self.path.glob("*.md")).pop()
+
+    def determine_other_files(self) -> list[Path]:
+        """
+        Determine other files in the directory excluding the main file.
+
+        This method checks if the given path is a file. If it is, it returns an empty list.
+        Otherwise, it recursively searches through the directory and returns a list of all
+        files that are not the main file.
+
+        Returns:
+            list[Path]: A list of Path objects representing the other files in the directory.
+        """  # noqa: E501
+        if self.path.is_file():
+            return []
+        # Binary file extensions to exclude
+        binary_extensions = {
+            ".wav",
+            ".mp3",
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".mkv",  # Audio/Video
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".ico",
+            ".svg",  # Images
+            ".pdf",
+            ".zip",
+            ".tar",
+            ".gz",
+            ".bz2",
+            ".xz",  # Archives/Documents
+            ".exe",
+            ".so",
+            ".dll",
+            ".dylib",  # Binaries
+            ".bin",
+            ".dat",
+            ".db",
+            ".sqlite",  # Data files
+            ".pyc",
+            ".pyo",
+            ".pyd",  # Python compiled
+            ".npy",
+            ".npz",
+            ".pkl",
+            ".pickle",  # Serialized data
+        }
+        excluded_dirs = {"__pycache__", ".git", "node_modules", ".tox", ".mypy_cache"}
+
+        def is_other_file(file: Path) -> bool:
+            if any(part in excluded_dirs for part in file.parts):
+                return False
+            return file.is_file() and file != self.main_file and file.suffix.lower() not in binary_extensions
+
+        return [file for file in self.path.rglob("*") if is_other_file(file)]
+
+    def determine_title(self) -> str:
+        model_display_name = self.model_display_name
+        if not self.is_code:
+            # Specify encoding for building on Windows
+            with open(self.main_file, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            match = re.match(r"^#\s+(?P<title>.+)$", first_line)
+            if model_display_name:
+                expected_title = f"{model_display_name}: {SERVING_MODE_TITLES[self.category]}"
+                actual_title = match.group("title") if match else first_line
+                if actual_title != expected_title:
+                    raise ValueError(
+                        f"Model example title mismatch in {self.main_file}: "
+                        f"expected '# {expected_title}', got {first_line!r}"
+                    )
+                return expected_title
+            if match:
+                return match.group("title")
+        elif model_display_name:
+            raise ValueError(f"Mapped model example must use a Markdown README: {self.path}")
+        return fix_case(self.path.stem.replace("_", " ").title())
+
+    def fix_relative_links(self, content: str) -> str:
+        """
+        Fix relative links in markdown content by converting them to gh-file
+        format.
+
+        Args:
+            content (str): The markdown content to process
+
+        Returns:
+            str: Content with relative links converted to gh-file format
+        """
+        # Regex to match markdown links [text](relative_path)
+        # This matches links that don't start with http, https, ftp, or #
+        link_pattern = r"\[([^\]]*)\]\((?!(?:https?|ftp)://|#)([^)]+)\)"
+
+        def replace_link(match):
+            link_text = match.group(1)
+            relative_path = match.group(2)
+
+            # Make relative to repo root
+            gh_file = (self.main_file.parent / relative_path).resolve()
+            gh_file = gh_file.relative_to(ROOT_DIR)
+
+            # Make GitHub URL
+            url = "https://github.com/vllm-project/vllm-omni/"
+            url += "tree/main" if self.path.is_dir() else "blob/main"
+            gh_url = f"{url}/{gh_file}"
+
+            return f"[{link_text}]({gh_url})"
+
+        return re.sub(link_pattern, replace_link, content)
+
+    def github_url(self, path: Path) -> str:
+        url = "https://github.com/vllm-project/vllm-omni/"
+        url += "tree/main" if path.is_dir() else "blob/main"
+        return f"{url}/{path.relative_to(ROOT_DIR).as_posix()}"
+
+    def generate(self) -> str:
+        content = f"# {self.title}\n\n"
+        content += f"Source <{self.github_url(self.path)}>.\n\n"
+
+        # Use long code fence to avoid issues with
+        # included files containing code fences too
+        code_fence = "``````"
+
+        if self.is_code:
+            main_file_rel = self.main_file.relative_to(ROOT_DIR).as_posix()
+            content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{main_file_rel}"\n{code_fence}\n'
+        else:
+            with open(self.main_file, encoding="utf-8") as f:
+                # Skip the title from md snippets as it's been included above
+                main_content = f.readlines()[1:]
+            content += self.fix_relative_links("".join(main_content))
+        content += "\n"
+
+        if not self.other_files:
+            return content
+
+        content += "## Example materials\n\n"
+        for file in sorted(self.other_files):
+            content += f'??? abstract "{file.relative_to(self.path).as_posix()}"\n'
+            if file.stat().st_size > MAX_INLINE_MATERIAL_SIZE:
+                content += (
+                    f"    Large file omitted from the rendered docs. View it on GitHub: <{self.github_url(file)}>.\n\n"
+                )
+                continue
+            if file.suffix != ".md":
+                content += f"    {code_fence}{file.suffix[1:]}\n"
+            content += f'    --8<-- "{file.relative_to(ROOT_DIR).as_posix()}"\n'
+            if file.suffix != ".md":
+                content += f"    {code_fence}\n"
+
+        return content
+
+
+def update_nav_file(examples: list[Example]):
+    """
+    Update the .nav.yml file to include all generated examples.
+    This function completely regenerates the examples section based on the actual
+    folder structure, ensuring consistency between the examples folder and nav file.
+
+    Args:
+        examples: List of Example objects that have been generated
+    """
+    if not NAV_FILE.exists():
+        logger.warning("Navigation file not found: %s", NAV_FILE)
+        return
+
+    # Read the current nav file
+    with open(NAV_FILE, encoding="utf-8") as f:
+        nav_data = yaml.safe_load(f) or {}
+
+    nav_list = nav_data.get("nav", [])
+
+    # Find the "User Guide" section
+    user_guide_idx = None
+    examples_idx = None
+    for i, item in enumerate(nav_list):
+        if isinstance(item, dict) and "User Guide" in item:
+            user_guide_idx = i
+            user_guide_content = item["User Guide"]
+            # Find the "Examples" subsection
+            for j, subitem in enumerate(user_guide_content):
+                if isinstance(subitem, dict) and "Examples" in subitem:
+                    examples_idx = j
+                    break
+            break
+
+    if user_guide_idx is None or examples_idx is None:
+        logger.warning("Could not find 'User Guide' -> 'Examples' section in nav file")
+        return
+
+    # Get existing Examples section to preserve non-example items (like README.md)
+    existing_examples_content = nav_list[user_guide_idx]["User Guide"][examples_idx]["Examples"]
+
+    # Preserve string items (like "examples/README.md") that are not example categories
+    preserved_items = [
+        item
+        for item in existing_examples_content
+        if isinstance(item, str) and not item.startswith("user_guide/examples/")
+    ]
+
+    # Group examples by category
+    examples_by_category = {}
+    for example in examples:
+        category = example.category
+        if category not in examples_by_category:
+            examples_by_category[category] = []
+        examples_by_category[category].append(example)
+
+    def category_items(category: str) -> list[dict[str, str]]:
+        items = []
+        for example in sorted(examples_by_category[category], key=lambda e: e.path.stem):
+            doc_path = EXAMPLE_DOC_DIR / example.category / f"{example.path.stem}.md"
+            rel_path = doc_path.relative_to(ROOT_DIR / "docs")
+            items.append({example.nav_title: rel_path.as_posix()})
+        return items
+
+    # Build the new Examples section - start with preserved items.
+    examples_section = preserved_items.copy()
+    for category in sorted(examples_by_category.keys()):
+        items = category_items(category)
+        if items:
+            category_title = fix_case(category.replace("_", " ").title())
+            examples_section.append({category_title: items})
+
+    # Update the nav structure
+    nav_list[user_guide_idx]["User Guide"][examples_idx]["Examples"] = examples_section
+
+    # Write back to file
+    nav_data["nav"] = nav_list
+    with open(NAV_FILE, "w", encoding="utf-8") as f:
+        yaml.dump(nav_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    logger.info("Updated navigation file: %s", NAV_FILE.relative_to(ROOT_DIR))
+
+
+def on_startup(command: Literal["build", "gh-deploy", "serve"], dirty: bool):
+    logger.info("Generating example documentation")
+    logger.debug("Root directory: %s", ROOT_DIR.resolve())
+    logger.debug("Example directory: %s", EXAMPLE_DIR.resolve())
+    logger.debug("Example document directory: %s", EXAMPLE_DOC_DIR.resolve())
+
+    # Create the EXAMPLE_DOC_DIR if it doesn't exist
+    if not EXAMPLE_DOC_DIR.exists():
+        EXAMPLE_DOC_DIR.mkdir(parents=True)
+
+    categories = sorted(p for p in EXAMPLE_DIR.iterdir() if p.is_dir())
+
+    examples = []
+    glob_patterns = ["*.py", "*.md", "*.sh"]
+    # Find categorised examples
+    for category in categories:
+        globs = [category.glob(pattern) for pattern in glob_patterns]
+        for path in itertools.chain(*globs):
+            examples.append(Example(path, category.stem))
+        # Find examples in subdirectories
+        for path in category.glob("*/*.md"):
+            examples.append(Example(path.parent, category.stem))
+
+    examples = [example for example in examples if is_general_example(example)]
+
+    # Generate the example documentation
+    for example in sorted(examples, key=lambda e: e.path.stem):
+        example_name = f"{example.path.stem}.md"
+        doc_path = EXAMPLE_DOC_DIR / example.category / example_name
+        if not doc_path.parent.exists():
+            doc_path.parent.mkdir(parents=True)
+        # Specify encoding for building on Windows
+        with open(doc_path, "w+", encoding="utf-8") as f:
+            f.write(example.generate())
+        logger.debug("Example generated: %s", doc_path.relative_to(ROOT_DIR))
+
+    # Update the navigation file
+    update_nav_file(examples)

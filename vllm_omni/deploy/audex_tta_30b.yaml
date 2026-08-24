@@ -1,0 +1,57 @@
+# Audex 30B-A3B text-to-audio deploy: TTA thinker → XCodec1.
+# See audex_tta.yaml for the task notes and audex_tts_30b.yaml for the
+# 30B sizing notes (hybrid Mamba: no prefix caching; single-H100 layout,
+# TP2 fallback; pass this yaml explicitly).
+pipeline: audex_tta
+async_chunk: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      audiocodec_token_offset: 196613
+      audiocodec_vocab_size: 8192
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.85
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 8192
+    dtype: bfloat16
+    devices: "0"
+    logits_processors:
+      - "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor"
+      - "vllm_omni.model_executor.models.audex.tta:TTARVQPhaseMaskLogitsProcessor"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 80
+      max_tokens: 4200
+      seed: 0
+
+  - stage_id: 1
+    model: hf-audio/xcodec-hubert-general-balanced
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.08
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 8192
+      seed: 0

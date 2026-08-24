@@ -1,0 +1,20 @@
+# Experimental validation profile: 4-way thinker TP and four Stage1 replicas.
+# This is not a recommended production entrypoint.
+#
+# Stage 0: GPU 0, 1, 2, and 3
+# Stage 1: replicas on GPU 4, 5, 6, and 7
+base_config: minicpmo_4_5_8x4090.yaml
+pipeline: minicpmo_4_5
+session_mode: duplex
+
+stages:
+  - stage_id: 0
+    async_scheduling: false
+    gpu_memory_utilization: 0.40
+    max_num_batched_tokens: 16384
+
+  - stage_id: 1
+    devices: "4,5,6,7"
+    num_replicas: 4
+    async_scheduling: false
+    gpu_memory_utilization: 0.8

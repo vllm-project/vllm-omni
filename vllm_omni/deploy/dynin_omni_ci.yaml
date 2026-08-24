@@ -1,0 +1,35 @@
+# Dynin-Omni deploy for e2e smoke tests (3-stage, one GPU).
+#
+# Topology is frozen in models/dynin_omni/pipeline.py; ``pipeline: dynin_omni``
+# pins it explicitly so this CI YAML resolves regardless of model_type
+# auto-detection. Differs from the default deploy only in reduced GPU memory
+# and a smaller max_num_batched_tokens so the pipeline fits L4-class CI GPUs.
+pipeline: dynin_omni
+async_chunk: false
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.5
+    max_num_batched_tokens: 4096
+    enforce_eager: true
+    async_scheduling: false
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    max_num_batched_tokens: 4096
+    enforce_eager: true
+    async_scheduling: false
+
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    max_num_batched_tokens: 4096
+    enforce_eager: true
+    async_scheduling: false

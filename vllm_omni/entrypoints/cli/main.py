@@ -1,0 +1,78 @@
+"""
+CLI entry point for vLLM-Omni that intercepts vLLM commands.
+"""
+
+import importlib.metadata
+import sys
+
+
+def main():
+    """Main CLI entry point that intercepts vLLM commands."""
+    # Check if --omni flag is present
+    if "--omni" not in sys.argv:
+        from vllm.entrypoints.cli.main import main as vllm_main
+
+        vllm_main()
+        return
+    else:
+        # Force colored logging even when piped (e.g. `| tee`).
+        # Must be set before any vLLM import because the logger
+        # formatter is configured at import time via _use_color().
+        import os
+
+        if "VLLM_LOGGING_COLOR" not in os.environ:
+            os.environ["VLLM_LOGGING_COLOR"] = "1"
+
+        from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+
+        import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.serve
+        from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+        CMD_MODULES = [
+            vllm_omni.entrypoints.cli.serve,
+            vllm_omni.entrypoints.cli.benchmark.main,
+        ]
+
+        cli_env_setup()
+
+        from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
+
+        _ensure_vllm_platform()
+
+        parser = TrackingArgumentParser(
+            description="vLLM OMNI CLI",
+            epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+        )
+        try:
+            _omni_version = importlib.metadata.version("vllm_omni")
+        except importlib.metadata.PackageNotFoundError:
+            try:
+                from vllm_omni.version import __version__ as _omni_version  # type: ignore
+            except Exception:
+                _omni_version = "dev"
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=_omni_version,
+        )
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd_module in CMD_MODULES:
+            new_cmds = cmd_module.cmd_init()
+            for cmd in new_cmds:
+                cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+                cmds[cmd.name] = cmd
+        args = parser.parse_args()
+        if args.subparser in cmds:
+            cmds[args.subparser].validate(args)
+
+        if hasattr(args, "dispatch_function"):
+            args.dispatch_function(args)
+        else:
+            parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

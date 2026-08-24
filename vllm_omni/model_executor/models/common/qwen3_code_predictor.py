@@ -1,0 +1,1217 @@
+"""Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
+
+Shared by Qwen3-Omni and Qwen3-TTS talker models.
+
+* SDPA attention (F.scaled_dot_product_attention) with native GQA support
+* HF-compatible CPU/CUDA numerics with packed qkv/gate_up projections
+  and NPU-only fused norm/RoPE fast paths
+* Per-call embedding buffer to avoid cross-request aliasing
+* Pre-allocated position_ids (read-only, safe to persist)
+* torch.compile (epilogue_fusion=False) on inner transformer by default
+* Optional manual CUDA graph capture per batch-size bucket
+* Inline sampling (top-k + top-p) -- no custom op overhead
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Iterable, Sequence
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
+
+_GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
+_UNIFORM_EPS = 1e-20
+
+if current_omni_platform.is_npu():
+    import torch_npu
+
+
+# ===================================================================
+# Portable layers for code predictor
+# ===================================================================
+#
+# These use plain PyTorch ops (nn.Linear, manual RMSNorm in float32,
+# rotate_half RoPE) to produce outputs numerically identical to the
+# HuggingFace reference on CPU/CUDA. vLLM's fused kernels (RMSNorm,
+# QKVParallel, get_rope) introduce small precision differences that compound
+# across the autoregressive steps of the code predictor, causing severe audio
+# quality degradation. Packing qkv/gate_up into plain ``nn.Linear`` keeps the
+# same algebra but can still change GPU bit-level accumulation. The Ascend
+# fused norm/RoPE kernels below are dispatched by the current device platform.
+#
+# See: https://github.com/vllm-project/vllm-omni/issues/2274
+
+
+class _RMSNorm(CustomOp):
+    """RMSNorm with HuggingFace-compatible CPU/CUDA math and an NPU fast path."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = torch_npu.npu_rms_norm(
+            hidden_states,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return hidden_states
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_xpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(hidden_states)
+
+    def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class _RotaryEmbedding(CustomOp):
+    """RoPE with cached cos/sin tables; ``forward_native`` keeps the HF on-the-fly math."""
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        rope_theta = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build the cos/sin lookup tables once.  ``num_code_groups + 1``
+        # positions cover every re-prefill step of the code predictor.  Compute
+        # in float32 (matching HF) and cast per-call in forward.
+        max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
+        positions = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def _lookup(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # position_ids: [batch, seq_len] -> cos/sin: [batch, seq_len, head_dim]
+        cos = self.cos_cached[position_ids]
+        sin = self.sin_cached[position_ids]
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def forward_npu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._lookup(x, position_ids)
+
+    def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._lookup(x, position_ids)
+
+    def forward_xpu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._lookup(x, position_ids)
+
+    def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # HuggingFace on-the-fly computation, kept as a numeric reference.
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Force float32 (matching HF)
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# ===================================================================
+#  Attention
+# ===================================================================
+
+
+class CodePredictorAttention(nn.Module):
+    """Multi-head self-attention for code predictor.
+
+    Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
+    No KV cache -- the code predictor always re-prefills the full (short)
+    sequence each AR step.
+
+    Input : [B, seq_len, hidden_size]
+    Output: [B, seq_len, hidden_size]
+    """
+
+    def __init__(self, config, *, prefix: str = "") -> None:
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        assert self.num_heads % self.num_kv_heads == 0
+        self.is_gqa = self.num_kv_heads != self.num_heads
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        self.hidden_size = config.hidden_size
+        self.scaling = self.head_dim**-0.5
+        self.max_seq = int(config.num_code_groups) + 1
+
+        # Fused QKV projection.
+        #
+        # The HF reference uses three separate ``nn.Linear`` modules for
+        # q/k/v. Packing those weights row-wise into one ``nn.Linear`` keeps
+        # the same matmul at the algebra level; see the module-level
+        # HF-numerics note for the GPU bit-level drift caveat. The goal here
+        # is narrower: reduce eager host launch overhead while keeping the
+        # downstream q_norm / k_norm / SDPA math and HF checkpoint loading
+        # contract intact.
+        bias = getattr(config, "attention_bias", False)
+        self._q_size = self.num_heads * self.head_dim
+        self._kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(
+            self.hidden_size,
+            self._q_size + 2 * self._kv_size,
+            bias=bias,
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        if current_omni_platform.is_npu():
+            if self.max_seq > 2048:
+                raise ValueError(
+                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                    f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
+                )
+            # Ascend SDPA is_causal migration example uses a fixed 2048x2048
+            # compressed causal mask with sparse_mode=2.
+            fusion_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool),
+                diagonal=1,
+            )
+            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+
+    def _split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_raw = qkv[..., : self._q_size]
+        kv_raw = qkv[..., self._q_size :]
+        # ``split`` would leave the non-leading k/v slices strided like the
+        # packed qkv buffer. Materialize them once here so SDPA sees the same
+        # dense k/v layout as the unfused projection path.
+        k_raw, v_raw = (t.contiguous() for t in kv_raw.split(self._kv_size, dim=-1))
+        return q_raw, k_raw, v_raw
+
+    def _forward_npu_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        q_f, k_f, v_f = q, k, v
+        if self.is_gqa:
+            k_f = (
+                k[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+            v_f = (
+                v[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+
+        mask = self._fusion_causal_mask
+        mask = mask.contiguous()
+        q_f = q_f.contiguous()
+        k_f = k_f.contiguous()
+        v_f = v_f.contiguous()
+        return torch_npu.npu_fusion_attention(
+            q_f,
+            k_f,
+            v_f,
+            self.num_heads,
+            "BNSD",
+            pse=None,
+            padding_mask=None,
+            atten_mask=mask,
+            scale=float(self.scaling),
+            keep_prob=1.0,
+            # Keep torch_npu's API spelling.
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=None,
+            actual_seq_kvlen=None,
+            # Ascend SDPA is_causal migration example uses sparse_mode=2.
+            sparse_mode=2,
+            gen_mask_parallel=True,
+            # Keep sync=True for the NPU fused attention path.
+            sync=True,
+        )[0]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        # Single fused matmul. ``q`` is immediately consumed by RMSNorm; for
+        # ``k/v`` we re-densify the packed tail once so SDPA does not inherit
+        # the packed-buffer stride pattern from the fused projection.
+        qkv = self.qkv_proj(hidden_states)
+        q_raw, k_raw, v_raw = self._split_qkv(qkv)
+        q = self.q_norm(q_raw.view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(k_raw.view(hidden_shape_kv)).transpose(1, 2)
+        v = v_raw.view(hidden_shape_kv).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
+        cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+        sin = sin.unsqueeze(1)
+        if current_omni_platform.is_npu():
+            q = torch_npu.npu_rotary_mul(q, cos, sin)
+            k = torch_npu.npu_rotary_mul(k, cos, sin)
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        else:
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scaling,
+                is_causal=True,
+                enable_gqa=self.is_gqa,
+            )
+
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_out)
+
+
+# ===================================================================
+#  MLP
+# ===================================================================
+
+
+class CodePredictorMLP(nn.Module):
+    """SiLU-gated MLP for code predictor, matching HF's implementation."""
+
+    def __init__(self, config, *, prefix: str = "") -> None:
+        super().__init__()
+        # Fused gate_up projection. Same packing idea as ``qkv_proj`` above:
+        # one matmul instead of two, with the same algebraic result as
+        # separate gate/up linears. See the module-level HF-numerics note for
+        # the GPU bit-level drift caveat.
+        self._intermediate_size = int(config.intermediate_size)
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size,
+            2 * config.intermediate_size,
+            bias=False,
+        )
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+# ===================================================================
+#  Decoder Layer
+# ===================================================================
+
+
+class CodePredictorDecoderLayer(nn.Module):
+    """Transformer decoder layer (SDPA, no KV cache)."""
+
+    def __init__(self, config, *, prefix: str = "") -> None:
+        super().__init__()
+        self.self_attn = CodePredictorAttention(config, prefix=f"{prefix}.self_attn")
+        self.mlp = CodePredictorMLP(config, prefix=f"{prefix}.mlp")
+        self.input_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        if current_omni_platform.is_npu():
+            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+# ===================================================================
+#  Base Transformer Model (re-prefill, no KV cache)
+# ===================================================================
+
+
+class CodePredictorBaseModel(nn.Module):
+    """Inner transformer for code predictor.
+
+    Signature: ``forward(inputs_embeds, position_ids) -> hidden_states``
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        embedding_dim: int | None = None,
+        use_parallel_embedding: bool = False,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+
+        emb_dim = int(embedding_dim) if embedding_dim is not None else int(config.hidden_size)
+        if use_parallel_embedding:
+            self.codec_embedding = nn.ModuleList(
+                [VocabParallelEmbedding(config.vocab_size, emb_dim) for _ in range(config.num_code_groups - 1)]
+            )
+        else:
+            self.codec_embedding = nn.ModuleList(
+                [nn.Embedding(config.vocab_size, emb_dim) for _ in range(config.num_code_groups - 1)]
+            )
+
+        self.layers = nn.ModuleList(
+            [
+                CodePredictorDecoderLayer(config, prefix=f"{prefix}.layers.{idx}")
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = _RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = _RotaryEmbedding(config)
+
+    def get_input_embeddings(self) -> nn.ModuleList:
+        return self.codec_embedding
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Run the transformer body in float32 when the model is in fp16.
+        # fp16 lacks the dynamic range for stable attention scores and
+        # SiLU-gated MLP intermediates, producing NaN on GPUs without
+        # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
+        # layers already upcast internally; this extends the same
+        # treatment to attention and MLP.
+        # autocast to float32 is unsupported on CPU; skip fp32 upcast there
+        # (CPU uses full-precision intermediates internally).
+        input_dtype = inputs_embeds.dtype
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
+        if use_fp32:
+            inputs_embeds = inputs_embeds.float()
+        hidden_states = inputs_embeds
+        with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, position_embeddings)
+            hidden_states = self.norm(hidden_states)
+        return hidden_states.to(input_dtype)
+
+    # Mapping from HF checkpoint shard name to the (fused parameter,
+    # slice index) pair used to assemble the fused tensor.  See
+    # ``load_weights`` below.
+    _FUSED_QKV_SHARDS: tuple[tuple[str, str, int], ...] = (
+        ("q_proj", "qkv_proj", 0),
+        ("k_proj", "qkv_proj", 1),
+        ("v_proj", "qkv_proj", 2),
+    )
+    _FUSED_GATE_UP_SHARDS: tuple[tuple[str, str, int], ...] = (
+        ("gate_proj", "gate_up_proj", 0),
+        ("up_proj", "gate_up_proj", 1),
+    )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights, transparently re-packing HF q/k/v and gate/up shards
+        into the fused ``qkv_proj`` and ``gate_up_proj`` parameters.
+
+        HF checkpoints ship q_proj / k_proj / v_proj (and gate_proj /
+        up_proj) as separate tensors.  Our model defines a single
+        ``qkv_proj`` (``gate_up_proj``) whose weight is the row-wise
+        concatenation of those shards in q/k/v (gate/up) order.  We
+        buffer the shards per layer prefix and write the fused parameter
+        in one go once all shards have arrived.
+
+        Both ``.weight`` and ``.bias`` shards are packed this way, so a
+        code-predictor config with ``attention_bias=True`` is handled
+        correctly: the q/k/v bias vectors are concatenated into
+        ``qkv_proj.bias`` instead of being dropped (which would leave the
+        fused bias randomly initialized).  ``gate_up_proj`` has no bias,
+        so only its ``.weight`` shards are ever routed.
+        """
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+        fused_layer_prefixes = {
+            name.split(marker, 1)[0]
+            for name in params_dict
+            for marker in (".self_attn.qkv_proj.", ".mlp.gate_up_proj.")
+            if marker in name
+        }
+        touched_fused_layers: set[str] = set()
+
+        # layer_prefix -> {fused_name: {kind: {slice_idx: shard_tensor}}}
+        # where ``kind`` is "weight" or "bias".
+        pending: dict[str, dict[str, dict[str, dict[int, torch.Tensor]]]] = {}
+
+        def _try_finalize_fused(
+            layer_prefix: str,
+            fused_name: str,
+            kind: str,
+            num_shards: int,
+        ) -> None:
+            bucket = pending.get(layer_prefix, {}).get(fused_name, {}).get(kind)
+            if bucket is None or len(bucket) < num_shards:
+                return
+            target_param_name = f"{layer_prefix}.{fused_name}.{kind}"
+            target_param = params_dict.get(target_param_name)
+            if target_param is None:
+                return
+            ordered = [bucket[i] for i in range(num_shards)]
+            fused_weight = torch.cat(ordered, dim=0)
+            weight_loader = getattr(target_param, "weight_loader", default_weight_loader)
+            weight_loader(target_param, fused_weight)
+            loaded_params.add(target_param_name)
+            del pending[layer_prefix][fused_name][kind]
+            if not pending[layer_prefix][fused_name]:
+                del pending[layer_prefix][fused_name]
+            if not pending[layer_prefix]:
+                del pending[layer_prefix]
+
+        def _route_shard(
+            name: str,
+            loaded_weight: torch.Tensor,
+            shard_table: tuple[tuple[str, str, int], ...],
+            parent_attr: str,
+        ) -> bool:
+            """Stash a HF ``.weight``/``.bias`` shard if its fused counterpart
+            exists in this module; return True iff the shard was consumed."""
+            for shard_name, fused_name, slice_idx in shard_table:
+                for kind in ("weight", "bias"):
+                    suffix = f".{parent_attr}.{shard_name}.{kind}"
+                    if not name.endswith(suffix):
+                        continue
+                    layer_prefix = name[: -len(f".{shard_name}.{kind}")]  # ...self_attn or ...mlp
+                    fused_param_name = f"{layer_prefix}.{fused_name}.{kind}"
+                    if fused_param_name not in params_dict:
+                        # e.g. a gate/up ``.bias`` shard when the fused
+                        # projection has no bias: nothing to pack into.
+                        return False
+                    pending.setdefault(layer_prefix, {}).setdefault(fused_name, {}).setdefault(kind, {})[slice_idx] = (
+                        loaded_weight
+                    )
+                    _try_finalize_fused(layer_prefix, fused_name, kind, num_shards=len(shard_table))
+                    return True
+            return False
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            touched_fused_layers.update(
+                layer_prefix for layer_prefix in fused_layer_prefixes if name.startswith(f"{layer_prefix}.")
+            )
+            if _route_shard(name, loaded_weight, self._FUSED_QKV_SHARDS, parent_attr="self_attn"):
+                continue
+            if _route_shard(name, loaded_weight, self._FUSED_GATE_UP_SHARDS, parent_attr="mlp"):
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        if pending:
+            unfinished = {
+                lp: {fn: list(kinds.keys()) for fn, kinds in buckets.items()} for lp, buckets in pending.items()
+            }
+            raise RuntimeError(
+                f"CodePredictor load_weights: incomplete fused shards for layers {unfinished}; "
+                f"check that the checkpoint contains all q/k/v and gate/up tensors."
+            )
+
+        missing_fused = sorted(
+            name
+            for name in params_dict
+            if (".self_attn.qkv_proj." in name or ".mlp.gate_up_proj." in name)
+            and name not in loaded_params
+            and any(name.startswith(f"{layer_prefix}.") for layer_prefix in touched_fused_layers)
+        )
+        if missing_fused:
+            raise RuntimeError(
+                f"CodePredictor load_weights: missing fused parameters {missing_fused}; "
+                f"check that the checkpoint contains the q/k/v and gate/up shards, "
+                f"or the already-fused qkv_proj/gate_up_proj tensors."
+            )
+        return loaded_params
+
+
+# ===================================================================
+#  Wrapper Configuration
+# ===================================================================
+
+
+@dataclasses.dataclass
+class CodePredictorWrapperConfig:
+    """Controls behavioral differences between model-specific code predictors."""
+
+    use_cuda_graphs: bool = False
+    use_parallel_embedding: bool = False
+    use_projection: bool = False
+    return_proj_buf: bool = False
+    sampling_mode: str = "stored"
+
+
+# ===================================================================
+#  Code Predictor Wrapper (optimized re-prefill, persistent buffers)
+# ===================================================================
+
+
+class CodePredictorWrapper(nn.Module):
+    """Optimized code predictor -- re-prefill approach, no KV cache.
+
+    Each AR step forwards the full growing sequence (len 2 -> num_code_groups+1)
+    through the transformer.  The extra O(T^2) FLOPs are negligible for
+    short sequences, and this avoids all KV-cache management overhead.
+
+    Optimizations:
+      1. Per-call embedding buffer -- avoids cross-request aliasing.
+      2. Pre-allocated position_ids -- no torch.arange per step.
+      3. Cached module references -- bypass ModuleList indexing.
+      4. torch.compile on inner transformer.
+      5. Inline sampling (top-k + top-p) -- no custom op overhead.
+      6. Optional manual CUDA graph capture per batch-size bucket.
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        cp_config,
+        wrapper_config: CodePredictorWrapperConfig,
+        talker_hidden_size: int | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self._vllm_config = vllm_config
+        self.config = cp_config
+        self._wrapper_config = wrapper_config
+        self.prefix = prefix
+
+        self._num_groups = int(cp_config.num_code_groups)
+        self._cp_hidden = int(cp_config.hidden_size)
+
+        # For Omni backward compat (accessed by the talker)
+        self.num_code_groups = self._num_groups
+
+        # Determine embedding dimension
+        _talker_hidden = int(talker_hidden_size) if talker_hidden_size is not None else self._cp_hidden
+
+        self.model = CodePredictorBaseModel(
+            cp_config,
+            embedding_dim=_talker_hidden,
+            use_parallel_embedding=wrapper_config.use_parallel_embedding,
+            prefix=f"{prefix}.model" if prefix else "model",
+        )
+
+        self.lm_head = nn.ModuleList(
+            [nn.Linear(cp_config.hidden_size, cp_config.vocab_size, bias=False) for _ in range(self._num_groups - 1)]
+        )
+
+        # Projection: Identity when hidden sizes match or not needed
+        if wrapper_config.use_projection and _talker_hidden != self._cp_hidden:
+            self.small_to_mtp_projection = nn.Linear(_talker_hidden, self._cp_hidden, bias=True)
+        else:
+            self.small_to_mtp_projection = nn.Identity()
+
+        # Sampling defaults for "stored" mode
+        self._top_k: int = 50
+        self._top_p: float = 0.8
+
+        # Lazily initialised state
+        self._proj_buf: torch.Tensor | None = None
+        self._model_dtype: torch.dtype | None = None
+        self._compiled_model_fwd = None
+        self._bucket_sizes: list[int] = []
+        self._bucket_pos_ids: dict[int | tuple[int, int], torch.Tensor] = {}
+        self._lm_heads_list: list[nn.Module] | None = None
+        self._codec_embeds_list: list[nn.Module] | None = None
+        self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
+        prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
+        prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
+        is_npu = current_omni_platform.is_npu()
+        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs and not is_npu
+        if prefix_graphs_requested and not self._prefix_graphs_enabled:
+            logger.info_once(
+                "code_predictor: prefix CUDA graphs requested but disabled because use_cuda_graphs=%s is_npu=%s",
+                wrapper_config.use_cuda_graphs,
+                is_npu,
+            )
+        self._prefix_graph_buckets = self._parse_positive_int_set(
+            prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
+        )
+        self._prefix_graph_seq_lens = self._parse_positive_int_set(
+            prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
+        )
+
+    def get_input_embeddings(self) -> nn.ModuleList:
+        return self.model.get_input_embeddings()
+
+    def set_sampling_params(self, top_k: int = 50, top_p: float = 0.8) -> None:
+        """Configure sampling parameters to maintain consistency with previous implementation."""
+        self._top_k = top_k
+        self._top_p = top_p
+        logger.debug("Sampling parameters updated: top_k=%d, top_p=%.2f", top_k, top_p)
+
+    # ------------------------------------------------------------------
+    #  Lazy-init helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_buffers(self, device: torch.device, dtype: torch.dtype, bsz: int) -> None:
+        """Ensure the projection buffer can hold at least *bsz* rows."""
+        max_seq = self._num_groups + 1
+        if (
+            self._proj_buf is not None
+            and self._proj_buf.device == device
+            and self._proj_buf.dtype == dtype
+            and self._proj_buf.shape[0] >= bsz
+        ):
+            return
+        self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
+
+    def _setup_compile(self) -> None:
+        """Lazily set up torch.compile with optional device graph capture."""
+        if self._compiled_model_fwd is not None:
+            return
+
+        # Cache model parameter dtype so forward() doesn't need to query it
+        # on every call.  Also ensures warmup buffers match model precision
+        # even when upstream modules produce a different dtype (#2385).
+        self._model_dtype = next(self.model.parameters()).dtype
+        self._lm_heads_list = list(self.lm_head)
+        self._codec_embeds_list = list(self.model.codec_embedding)
+
+        # Torch 2.13 XPU Dynamo can double-register built-in handlers when
+        # spawned workers compile this predictor. Keep this narrow path eager
+        # until the upstream XPU compiler issue is resolved.
+        if current_omni_platform.is_xpu() or not current_omni_platform.supports_torch_inductor():
+            # NPU or other platforms without Inductor support
+            self._compiled_model_fwd = self.model.forward
+
+            if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
+                # For NPU, use eager + NPU graphs (no torch.compile)
+                self._warmup_buckets()
+                self._capture_npu_graphs()
+                logger.info("code_predictor: eager mode + NPU graphs")
+            else:
+                logger.warning_once("code_predictor: torch.compile disabled")
+            return
+
+        # torch.compile fuses RMSNorm/RoPE in ways that lose float32
+        # precision, compounding across AR steps. Use epilogue_fusion=False
+        # to disable the problematic fusions while still getting kernel
+        # fusion benefits for the linear layers and SDPA.
+        self._compiled_model_fwd = torch.compile(
+            self.model.forward,
+            dynamic=False,
+            options={"epilogue_fusion": False},
+        )
+        self._warmup_buckets()
+
+        if self._wrapper_config.use_cuda_graphs:
+            self._capture_cuda_graphs()
+            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
+        else:
+            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
+
+    def _padded_bsz(self, bsz: int) -> int:
+        """Round batch size up to nearest power-of-2 bucket."""
+        for bucket in self._bucket_sizes:
+            if bsz <= bucket:
+                return bucket
+        return bsz
+
+    @staticmethod
+    def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
+        model_cfg = getattr(vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    @staticmethod
+    def _parse_bool_config(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(value, int):
+            return bool(value)
+        return False
+
+    @staticmethod
+    def _parse_positive_int_set(value: object) -> set[int]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            raw_values = [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+        elif isinstance(value, int):
+            raw_values = [value]
+        else:
+            try:
+                raw_values = list(value)
+            except TypeError as exc:
+                raise ValueError(f"Invalid positive int config value {value!r}") from exc
+        values: set[int] = set()
+        for item in raw_values:
+            try:
+                parsed = int(item)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid positive int config value {item!r}") from exc
+            if parsed > 0:
+                values.add(parsed)
+        return values
+
+    @staticmethod
+    def _normalize_generators(
+        generator: _GeneratorLike, batch_size: int
+    ) -> torch.Generator | list[torch.Generator | None] | None:
+        if generator is None or isinstance(generator, torch.Generator):
+            return generator
+
+        row_generators = list(generator)
+        if len(row_generators) != batch_size:
+            raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+        return row_generators
+
+    @classmethod
+    def _sample_codes_gumbel(cls, logits: torch.Tensor, generator: _GeneratorLike = None) -> torch.Tensor:
+        """Sample ``logits`` via Gumbel-max with optional per-row generators."""
+        row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
+        u = torch.empty_like(logits, dtype=torch.float32)
+        if isinstance(row_generators, list):
+            for row, row_generator in enumerate(row_generators):
+                u[row : row + 1].uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=row_generator)
+        else:
+            u.uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=row_generators)
+        return (logits.float() - torch.log(-torch.log(u))).argmax(dim=-1, keepdim=True)
+
+    def _prefix_seq_lens(self, max_seq: int) -> list[int]:
+        all_seq_lens = list(range(2, max_seq))
+        if not self._prefix_graph_seq_lens:
+            return all_seq_lens
+        allowed = set(all_seq_lens)
+        return sorted(seq_len for seq_len in self._prefix_graph_seq_lens if seq_len in allowed)
+
+    def _warmup_buckets(self) -> None:
+        """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
+        max_bsz = self._vllm_config.scheduler_config.max_num_seqs
+        bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
+        if max_bsz not in bucket_sizes:
+            bucket_sizes.append(max_bsz)
+        self._bucket_sizes = sorted(bucket_sizes)
+
+        max_seq = self._num_groups + 1
+        device = next(self.model.parameters()).device
+
+        # Ensure proj_buf matches model parameter dtype to avoid dtype
+        # mismatch during warmup compilation (see #2385).
+        self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
+        proj_buf = self._proj_buf
+
+        if self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    pos_ids = (
+                        torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+                    )
+                    self._bucket_pos_ids[bsz] = pos_ids
+                    for _ in range(3):
+                        self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        pos_ids = (
+                            torch.arange(seq_len, device=device, dtype=torch.long)
+                            .unsqueeze(0)
+                            .expand(bsz, -1)
+                            .contiguous()
+                        )
+                        self._bucket_pos_ids[(bsz, seq_len)] = pos_ids
+                        for _ in range(2):
+                            self._compiled_model_fwd(proj_buf[:bsz, :seq_len, :], pos_ids)
+            logger.info(
+                "code_predictor: prefix warmup done for buckets %s prefix_buckets=%s seq_lens=%s",
+                self._bucket_sizes,
+                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
+                prefix_seq_lens,
+            )
+        else:
+            for bsz in self._bucket_sizes:
+                pos_ids = (
+                    torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+                )
+                self._bucket_pos_ids[bsz] = pos_ids
+                for _ in range(3):
+                    self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+            logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
+
+    def _capture_cuda_graphs(self) -> None:
+        """Capture a CUDA graph per bucket using vLLM's global graph pool."""
+        from vllm.platforms import current_platform
+
+        pool = current_platform.get_global_graph_pool()
+        max_seq = self._num_groups + 1
+        proj_buf = self._proj_buf
+
+        if self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    static_input = proj_buf[:bsz, :max_seq, :]
+                    pos_ids = self._bucket_pos_ids[bsz]
+
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                    self._device_graphs[bsz] = (g, static_output)
+
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        static_input = proj_buf[:bsz, :seq_len, :]
+                        pos_ids = self._bucket_pos_ids[(bsz, seq_len)]
+
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, pool=pool):
+                            static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                        self._device_graphs[(bsz, seq_len)] = (g, static_output)
+
+            logger.info(
+                "code_predictor: captured prefix CUDA graphs for buckets %s prefix_buckets=%s seq_lens=%s",
+                self._bucket_sizes,
+                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
+                prefix_seq_lens,
+            )
+        else:
+            for bsz in self._bucket_sizes:
+                static_input = proj_buf[:bsz, :max_seq, :]
+                pos_ids = self._bucket_pos_ids[bsz]
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                self._device_graphs[bsz] = (g, static_output)
+
+            logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+
+    def _capture_npu_graphs(self) -> None:
+        """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
+        max_seq = self._num_groups + 1
+        proj_buf = self._proj_buf
+        pool = torch.npu.graph_pool_handle()
+
+        for bsz in self._bucket_sizes:
+            static_input = proj_buf[:bsz, :max_seq, :]
+            pos_ids = self._bucket_pos_ids[bsz]
+
+            g = torch.npu.NPUGraph()
+            with torch.npu.graph(g, pool=pool):
+                static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+            self._device_graphs[bsz] = (g, static_output)
+
+        logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
+
+    # ------------------------------------------------------------------
+    #  Forward -- re-prefill + inline sampling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _multinomial(
+        probs: torch.Tensor,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None,
+    ) -> torch.Tensor:
+        """Sample one code per row, optionally with per-row generators.
+
+        Per-row generators keep explicitly-seeded requests deterministic in a
+        multi-row batch: each row consumes draws only from its own generator,
+        so the transformer forward can stay batched (#4883).
+        """
+        if generators is None:
+            return torch.multinomial(probs, num_samples=1, generator=generator)
+        return torch.cat(
+            [
+                torch.multinomial(probs[row : row + 1], num_samples=1, generator=row_generator)
+                for row, row_generator in enumerate(generators)
+            ]
+        )
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        bsz = int(layer0_code.shape[0])
+        if generators is not None and len(generators) != bsz:
+            raise ValueError(f"generators must have one entry per row: got {len(generators)} for batch {bsz}")
+        sample_generator: _GeneratorLike = generators if generators is not None else generator
+        num_groups = self._num_groups
+        device = layer0_code.device
+
+        # _setup_compile caches _model_dtype on first call; use it for buffers
+        # so they always match model weight precision (#2385).
+        self._setup_compile()
+        dtype = self._model_dtype
+
+        padded_bsz = self._padded_bsz(bsz)
+        self._ensure_buffers(device, dtype, padded_bsz)
+
+        proj_buf = self._proj_buf
+        max_seq = num_groups + 1
+        projection = self.small_to_mtp_projection
+        model_fwd = self._compiled_model_fwd
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+
+        # Zero the padded region of the buffer
+        proj_buf[:padded_bsz].zero_()
+
+        # Fill buffer positions 0 (talker hidden) & 1 (layer0 embed)
+        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+
+        # Prepare sampling parameters
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
+
+        # Output codes -- shape depends on return mode
+        if self._wrapper_config.return_proj_buf:
+            all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
+        else:
+            all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz)
+
+        # Autoregressive loop: predict layers 1..G-1
+        for step in range(1, num_groups):
+            graph_key: int | tuple[int, int] = padded_bsz
+            seq_len = max_seq
+            if self._prefix_graphs_enabled:
+                prefix_key = (padded_bsz, step + 1)
+                if prefix_key in self._device_graphs:
+                    graph_key = prefix_key
+                    seq_len = step + 1
+            pos_ids = self._bucket_pos_ids.get(graph_key)
+            if pos_ids is None:
+                pos_ids = (
+                    torch.arange(seq_len, device=device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(padded_bsz, -1)
+                    .contiguous()
+                )
+
+            # Use captured device graph if available, otherwise call compiled fn.
+            device_graph_entry = self._device_graphs.get(graph_key)
+
+            if device_graph_entry is not None:
+                device_graph_entry[0].replay()
+                hidden_out = device_graph_entry[1]
+            else:
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+
+            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+
+            # Sample next code via Gumbel-max.
+            #
+            # ``argmax_i(logits_i + Gumbel_i)`` with
+            # ``Gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0, 1)`` is
+            # distributionally identical to sampling from ``softmax(logits)``.
+            # In this file the motivations are practical rather than graph
+            # related: it is measurably cheaper than ``softmax + multinomial``
+            # on the B x 2048 shapes used here, it stays well-defined for
+            # degenerate masked rows with a surviving finite entry (and is more
+            # defensive than ``multinomial`` around fully-masked/NaN inputs),
+            # and the helper below can honor either one batch generator or one
+            # generator per seeded row.
+            if stored_mode:
+                # "stored" mode: top-k -> top-p -> Gumbel-max
+                if s_top_k > 0:
+                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+                if s_top_p < 1.0:
+                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                    sorted_logits[remove_mask] = float("-inf")
+                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                code = self._sample_codes_gumbel(logits, generator=sample_generator)
+            else:
+                # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
+                if use_sampling:
+                    scaled = logits * inv_temperature
+                    if top_k > 0:
+                        topk_vals, _ = scaled.topk(top_k, dim=-1)
+                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    code = self._sample_codes_gumbel(scaled, generator=sample_generator)
+                else:
+                    code = logits.argmax(dim=-1, keepdim=True)
+
+            # Store code
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, step] = code
+            else:
+                all_codes[:, step] = code.reshape(bsz)
+
+            # Embed predicted code -> project -> next buffer position
+            if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
+                new_embed = codec_embeds[step - 1](code)
+                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+
+        if self._wrapper_config.return_proj_buf:
+            return all_codes, proj_buf[:bsz].clone()
+        return all_codes
+
+    # ------------------------------------------------------------------
+    #  Weight loading
+    # ------------------------------------------------------------------
+
+    def _prepare_npu_weights(self) -> None:
+        from vllm_ascend.utils import maybe_trans_nz
+
+        linear_count = 0
+        with torch.no_grad():
+            # Pack linear weights once for NPU matmul.
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.data = maybe_trans_nz(module.weight.data)
+                    linear_count += 1
+        logger.info("Prepared NPU code predictor weights: linear=%d", linear_count)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load wrapper weights, delegating inner-model tensors to the fused loader.
+
+        Qwen3-TTS checkpoints use the current ``model.*`` wrapper layout, while
+        some Qwen3-Omni artifacts expose the shared body directly as
+        ``layers.*`` / ``codec_embedding.*``.  Normalize both forms before
+        calling ``CodePredictorBaseModel.load_weights`` so its q/k/v and gate/up
+        repacking guards see the HF shards instead of treating them as unrelated
+        wrapper-level tensors.
+        """
+        loaded: set[str] = set()
+        model_weights: list[tuple[str, torch.Tensor]] = []
+        other_weights: list[tuple[str, torch.Tensor]] = []
+        inner_model_prefixes = ("codec_embedding.", "layers.", "norm.", "rotary_emb.")
+        wrapper_prefixes = tuple(
+            dict.fromkeys(
+                prefix
+                for prefix in (
+                    f"{self.prefix}.",
+                    f"{self.prefix.rsplit('.', 1)[-1]}." if self.prefix else "",
+                    "code_predictor.",
+                )
+                if prefix
+            )
+        )
+
+        for name, w in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            normalized_name = name
+            for wrapper_prefix in wrapper_prefixes:
+                if normalized_name.startswith(wrapper_prefix):
+                    normalized_name = normalized_name[len(wrapper_prefix) :]
+                    break
+
+            if normalized_name.startswith("model."):
+                model_weights.append((normalized_name[len("model.") :], w))
+            elif normalized_name.startswith(inner_model_prefixes):
+                model_weights.append((normalized_name, w))
+            else:
+                other_weights.append((normalized_name, w))
+
+        loaded_model = self.model.load_weights(model_weights)
+        loaded |= {f"model.{n}" for n in loaded_model}
+
+        params = dict(self.named_parameters(remove_duplicate=False))
+        for name, w in other_weights:
+            param = params.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, w)
+            loaded.add(name)
+
+        if current_omni_platform.is_npu():
+            self._prepare_npu_weights()
+
+        return loaded

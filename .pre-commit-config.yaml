@@ -1,0 +1,170 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # list of supported hooks: https://pre-commit.com/hooks.html
+      - id: check-yaml
+        args: ["--unsafe"]
+        exclude: "examples/online_serving/chart-helm/templates/"
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.10
+    hooks:
+    - id: ruff-check
+      args: [--output-format, github, --fix]
+    - id: ruff-format
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.49.0
+    hooks:
+      - id: typos
+        # only for staged files
+
+  - repo: https://github.com/rhysd/actionlint
+    # v1.7.8+ sets `go 1.24.0` in go.mod, which older Go toolchains (and most
+    # current CI images) cannot parse. Pin to v1.7.7 until actionlint fixes the
+    # go.mod directive.
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+        files: ^\.github/workflows/.*\.ya?ml$
+
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.23.2
+    hooks:
+      - id: markdownlint-cli2
+        language_version: lts
+        args: [--fix]
+        files: (^docs/|^recipes/|(^|/)README\.md$|^CONTRIBUTING\.md$)
+        # Agent skill docs and CLAUDE.md are not user-facing docs/READMEs.
+        exclude: (^|/)CLAUDE\.md$|^\.claude/|^\.cursor/
+
+  # Keep `local` last so `suggestion` stays the final hook. Autofix repos
+  # (ruff, typos, markdownlint, trailing-whitespace, etc.) must run first;
+  # otherwise their "files were modified" output displaces the SKIP tip.
+  - repo: local
+    hooks:
+    - id: signoff-commit
+      name: Sign-off Commit
+      entry: bash
+      args:
+        - -c
+        - |
+          if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+            printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+          fi
+      language: system
+      verbose: true
+      stages: [commit-msg]
+
+    # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup
+    # is less awkward. Local wrapper groups files so follow_imports=skip on
+    # tests does not leak into library code.
+    # mypy-3.10 runs on git commit (changed files). CI SKIPs it because
+    # --all-files is not clean yet. Extra versions are manual-stage only
+    # (not in default `pre-commit run --all-files`):
+    #   pre-commit run --hook-stage manual mypy-3.12
+    - id: mypy-3.10
+      name: Run mypy for Python 3.10
+      entry: python tools/pre_commit/mypy.py "3.10"
+      <<: &mypy_common
+        language: python
+        types_or: [python, pyi]
+        require_serial: true
+        additional_dependencies:
+          - mypy==1.11.1
+          - regex
+          - types-cachetools
+          - types-setuptools
+          - types-PyYAML
+          - types-requests
+          - types-torch
+          - pydantic
+    - id: mypy-3.11
+      name: Run mypy for Python 3.11
+      entry: python tools/pre_commit/mypy.py "3.11"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.12
+      name: Run mypy for Python 3.12
+      entry: python tools/pre_commit/mypy.py "3.12"
+      <<: *mypy_common
+      stages: [manual]
+    - id: mypy-3.13
+      name: Run mypy for Python 3.13
+      entry: python tools/pre_commit/mypy.py "3.13"
+      <<: *mypy_common
+      stages: [manual]
+
+    - id: check-test-ci-coverage
+      name: Ensure test files have pytestmarks
+      entry: python tools/pre_commit/check_test_marks.py
+      language: python
+      types: [python]
+      files: ^tests/
+
+    - id: check-tts-adapter-migration
+      name: Ratchet TTS per-model branches out of serving_speech.py
+      entry: python tools/pre_commit/check_tts_adapter.py
+      language: python
+      pass_filenames: false
+      files: ^(vllm_omni/entrypoints/openai/serving_speech\.py|tools/pre_commit/check_tts_adapter\.py)$
+      # The budget-is-now-slack reminder is printed on a PASSING run, and
+      # pre-commit hides output from passing hooks unless the hook is verbose.
+      verbose: true
+
+    - id: shellcheck
+      name: Lint shell scripts
+      # language: script breaks on Windows (shebang path loses slashes).
+      # Invoke the vLLM-style wrapper with bash so Linux CI and Win/Git Bash work.
+      entry: bash
+      args: [tools/pre_commit/shellcheck.sh]
+      language: system
+      types: [shell]
+
+    - id: check-spdx-header
+      name: Check SPDX headers
+      entry: python tools/pre_commit/check_spdx_header.py
+      language: python
+      types_or: [python, pyi, rust, proto, shell]
+      files: \.(py|pyi|rs|proto|sh)$
+
+    - id: check-forbidden-imports
+      name: Check forbidden imports
+      entry: python tools/pre_commit/check_forbidden_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
+    - id: check-torch-cuda-call
+      name: Prevent new torch.cuda API calls
+      entry: python tools/pre_commit/check_torch_cuda.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
+
+    - id: check-buildkite
+      name: Validate Buildkite Pipelines
+      entry: python tools/pre_commit/check_buildkite.py
+      language: python
+      files: ^\.buildkite/.*\.ya?ml$
+      additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
+
+    # Keep `suggestion` as the final hook. Run after autofix hooks so the
+    # bypass/SKIP tip is not displaced.
+    - id: suggestion
+      name: Suggestion
+      entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
+      language: system
+      verbose: true
+      pass_filenames: false
+    # Insert new entries above the `suggestion` entry
