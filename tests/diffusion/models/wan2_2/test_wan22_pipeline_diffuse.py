@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -96,7 +97,7 @@ def _make_pipeline() -> Wan22Pipeline:
 
 
 def _make_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": None,
         "width": None,
         "num_frames": 1,
@@ -402,6 +403,31 @@ def _make_gate_loading_pipeline():
     gate.to_gate_compress = nn.Linear(1, 1)
     pipeline.gate_holder = gate
     return pipeline, gate
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("pipeline_wan2_2", "Wan22Pipeline"),
+        ("pipeline_wan2_2_i2v", "Wan22I2VPipeline"),
+        ("pipeline_wan2_2_s2v", "Wan22S2VPipeline"),
+        ("pipeline_wan2_2_vace", "Wan22VACEPipeline"),
+    ],
+)
+def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_name, class_name) -> None:
+    module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
+    pipeline_cls = getattr(module, class_name)
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    expected = {"loaded"}
+
+    def fake_loader(model, weights):
+        assert model is pipeline
+        assert list(weights) == [("weight", torch.ones(1))]
+        return expected
+
+    monkeypatch.setattr(module, "load_wan_weights_with_optional_gate", fake_loader)
+
+    assert pipeline_cls.load_weights(pipeline, iter((("weight", torch.ones(1)),))) is expected
 
 
 def test_load_weights_removes_unloaded_vsa_gate(monkeypatch) -> None:

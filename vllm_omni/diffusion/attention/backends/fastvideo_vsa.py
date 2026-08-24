@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -160,7 +160,7 @@ def _get_vsa_dit_seq_shape(attn_metadata: AttentionMetadata | None) -> tuple[int
         return None
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         return None
-    return tuple(int(dim) for dim in value)
+    return (int(value[0]), int(value[1]), int(value[2]))
 
 
 def _get_gate_compress(attn_metadata: AttentionMetadata | None) -> torch.Tensor | None:
@@ -246,7 +246,7 @@ class FastVideoVSAImpl(AttentionImpl):
         if isinstance(value, int):
             return (value, value, value)
         if isinstance(value, (list, tuple)) and len(value) == 3:
-            return tuple(int(x) for x in value)
+            return (int(value[0]), int(value[1]), int(value[2]))
         raise ValueError(f"FASTVIDEO_VSA block_size must be an int or length-3 tuple/list, got {value!r}")
 
     def _fallback(

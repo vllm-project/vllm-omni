@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 import types
+from typing import Any
 
 import pytest
 import torch
@@ -23,7 +24,7 @@ def test_fastvideo_vsa_backend_is_registered():
 
 
 def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
-    calls = {}
+    calls: dict[str, Any] = {}
     fake_module = types.ModuleType("fastvideo_kernel")
 
     def fake_video_sparse_attn_bshd(
@@ -45,7 +46,7 @@ def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
         calls["block_size"] = block_size
         return q + k + v
 
-    fake_module.video_sparse_attn_bshd = fake_video_sparse_attn_bshd
+    setattr(fake_module, "video_sparse_attn_bshd", fake_video_sparse_attn_bshd)
     monkeypatch.setitem(sys.modules, "fastvideo_kernel", fake_module)
 
     impl = FastVideoVSAImpl(
@@ -79,7 +80,7 @@ def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
 
 
 def test_fastvideo_vsa_uses_learned_gate_when_provided(monkeypatch):
-    calls = {}
+    calls: dict[str, Any] = {}
     fake_module = types.ModuleType("fastvideo_kernel")
 
     def fake_video_sparse_attn_bshd(
@@ -96,7 +97,7 @@ def test_fastvideo_vsa_uses_learned_gate_when_provided(monkeypatch):
         calls["compress_shape"] = tuple(compress_attn_weight.shape)
         return q + k + v
 
-    fake_module.video_sparse_attn_bshd = fake_video_sparse_attn_bshd
+    setattr(fake_module, "video_sparse_attn_bshd", fake_video_sparse_attn_bshd)
     monkeypatch.setitem(sys.modules, "fastvideo_kernel", fake_module)
 
     impl = FastVideoVSAImpl(
@@ -125,7 +126,7 @@ def test_fastvideo_vsa_uses_learned_gate_when_provided(monkeypatch):
 
 
 def test_fastvideo_vsa_falls_back_without_dit_shape(monkeypatch):
-    calls = {}
+    calls: dict[str, Any] = {}
 
     impl = FastVideoVSAImpl(
         num_heads=2,
@@ -154,7 +155,7 @@ def test_fastvideo_vsa_falls_back_without_dit_shape(monkeypatch):
 
 
 def test_fastvideo_vsa_falls_back_for_mask(monkeypatch):
-    calls = {}
+    calls: dict[str, Any] = {}
 
     impl = FastVideoVSAImpl(
         num_heads=2,

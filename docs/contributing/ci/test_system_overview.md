@@ -12,8 +12,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <th>Level</th>
       <th>Scope & Focus</th>
       <th>Model Coverage Strategy</th>
-      <th>Feature Coverage Strategy</th>
-      <th>Interface Coverage Strategy</th>
+      <th>Module Strategy</th>
       <th>Tags</th>
       <th>Time Cost</th>
       <th>Test Dir</th>
@@ -31,14 +30,12 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>/</td>
       <td>/</td>
       <td>/</td>
-      <td>/</td>
       <td><a href="https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md">PR Checklist</a></td>
       <td>/</td>
       <td>/</td>
     </tr>
     <tr>
       <td>CI Failure Description</td>
-      <td>/</td>
       <td>/</td>
       <td>/</td>
       <td>/</td>
@@ -51,7 +48,6 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L1</strong><br>(Unit & Logic)</td>
       <td>Unit tests for components like entrypoints, models</td>
-      <td>/</td>
       <td>/</td>
       <td>/</td>
       <td><code>core_model and cpu</code></td>
@@ -71,9 +67,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L2</strong><br>(E2E across models & GPU-required UT)</td>
       <td>Online (basic deployment scenarios):<br>dummy, normal inference function (output format, stream), some instance startup UT</td>
-      <td>High-priority models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
-      <td>High-priority features and component tests that require launching instances</td>
-      <td>High-priority interfaces (using random lightweight models)</td>
+      <td>Key models + online basic scenarios; request success, non-empty output, format match (no Whisper/accuracy)</td>
+      <td>Key features and modules that require launching instances (prefer random weights)</td>
       <td><code>core_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>
         <strong>Model E2E:</strong><br>
@@ -95,9 +90,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L3</strong><br>(Important Perf & Integration & Accuracy)</td>
       <td>Online & Offline (multiple deployment scenarios):<br>real model, normal inference function, normal accuracy</td>
-      <td>High/medium-priority models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
-      <td>Medium-priority features and component tests that require launching instances</td>
-      <td>Medium-priority interfaces (using random lightweight models)</td>
+      <td>Key models + key online/offline scenarios; real weights, Whisper/similarity, preset voice gender, basic accuracy</td>
+      <td>Key features and modules that require launching instances (using real weights)</td>
       <td><code>advanced_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;30min</td>
       <td>
@@ -120,9 +114,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
     <tr>
       <td><strong>L4</strong><br>(Perf & Integration & Accuracy)</td>
       <td>Online: full functional scenarios + performance test + doc test + accuracy test</td>
-      <td>High-priority models: function, performance, accuracy, and doc testing<br>Medium-priority models: function and doc testing</td>
-      <td>Low-priority features and component tests that require launching instances</td>
-      <td>Low-priority interfaces (using real weights)</td>
+      <td>Key models: function, performance, accuracy, and doc testing</td>
+      <td>Other features and modules that require launching instances (using real weights)</td>
       <td><code>full_model and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td>&lt;3 hour</td>
       <td>
@@ -147,11 +140,10 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td>GPU</td>
     </tr>
     <tr>
-      <td><strong>L5</strong><br>(Stability & Reliability)</td>
-      <td>Online: long-term stability test + reliability test</td>
-      <td>Long-term stability and reliability testing for high-priority models<br>Low-priority models: function and doc testing</td>
+      <td><strong>L5</strong><br>(Stability & Reliability & selected Perf)</td>
+      <td>Online: long-term stability + reliability; coverage test</td>
+      <td>Long-term stability and reliability testing for key models<br>Non-critical scenario performance and accuracy testing for key models<br>Other models: function and doc testing</td>
       <td>/</td>
-      <td>Invalid-parameter validation for high-priority interfaces</td>
       <td><code>slow and hardware_test(H100, L4, etc.) and omni/tts/diffusion</code></td>
       <td> Depends on reality </td>
       <td>
@@ -178,8 +170,8 @@ For per-level test authoring (markers, examples), see [Test Writing Guide](./tes
 
 Before entering specific testing levels, the project establishes two common specifications aimed at standardizing the development process and quickly locating issues.
 
-1.  ***PR Checklist ([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
-2.  ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
+1. ***PR Checklist ([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/.github/PULL_REQUEST_TEMPLATE.md))***: This template defines the self-check items that must be completed before submitting a code review (Pull Request). It ensures that each code change meets basic requirements such as code style, dependency updates, and documentation synchronization before entering the automated testing pipeline, serving as the first manual line of defense for quality assurance.
+2. ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
 ## Notes
 

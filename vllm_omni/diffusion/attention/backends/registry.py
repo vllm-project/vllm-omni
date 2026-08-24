@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusion attention backend registry.
 
 This module provides an enum-based registry for diffusion attention backends,
@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 class _DiffusionBackendEnumMeta(EnumMeta):
     """Metaclass for DiffusionAttentionBackendEnum to provide better error messages."""
 
-    def __getitem__(cls, name: str) -> "DiffusionAttentionBackendEnum":
+    def __getitem__(cls, name: str) -> "DiffusionAttentionBackendEnum":  # type: ignore[override]
         """Get backend by name with helpful error messages."""
         try:
             return super().__getitem__(name)  # type: ignore[return-value]

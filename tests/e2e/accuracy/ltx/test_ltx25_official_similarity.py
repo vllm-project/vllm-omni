@@ -463,7 +463,7 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     }
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -591,7 +591,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
     assert audio_metrics["relative_l2"] <= LTX25_AUDIO_RELATIVE_L2_THRESHOLD
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

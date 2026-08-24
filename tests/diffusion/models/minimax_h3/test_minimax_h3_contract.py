@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import sys
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
+from typing import Any, TypeVar
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -13,6 +14,14 @@ import torch
 import torch.nn as nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+_ItemT = TypeVar("_ItemT")
+_ResultT = TypeVar("_ResultT")
+
+
+def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
+    items.append(item)
+    return result
 
 
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
@@ -185,6 +194,7 @@ def test_startup_task_rejects_unsupported_value():
 
 def test_combined_task_inference_and_transformer_routing():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.errors import OmniClientError
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -196,6 +206,9 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    assert pipeline._resolve_task("fl2va", {"image": object()}, has_turbo_lora=True) == "fl2va"
+    with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
+        pipeline._resolve_task("ref2va", {}, has_turbo_lora=True)
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
@@ -260,7 +273,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
         ):
             (tmp_path / partition_name / component).mkdir()
 
-    created = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
+    created: dict[str, list[Any]] = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
 
     class FakeModule(torch.nn.Module):
         def __init__(self, *args, **kwargs):
@@ -278,15 +291,15 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
 
         return create
 
-    tokenizer_calls = []
-    processor_calls = []
+    tokenizer_calls: list[Any] = []
+    processor_calls: list[Any] = []
     tokenizer_cls = Mock(spec=pipeline_module.Qwen2TokenizerFast)
-    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
-        tokenizer_calls.append((args, kwargs)) or object()
+    tokenizer_cls.from_pretrained.side_effect = lambda *args, **kwargs: _append_and_return(
+        tokenizer_calls, (args, kwargs), object()
     )
     processor_cls = Mock(spec=pipeline_module.Qwen3VLProcessor)
-    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: (
-        processor_calls.append((args, kwargs)) or object()
+    processor_cls.from_pretrained.side_effect = lambda *args, **kwargs: _append_and_return(
+        processor_calls, (args, kwargs), object()
     )
     monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeDiT)
     monkeypatch.setattr(
@@ -626,7 +639,7 @@ def test_partially_constructed_pipeline_falls_back_to_the_uniform_schedule():
 
 
 def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
-    diffuse_calls = []
+    diffuse_calls: list[dict[str, Any]] = []
     base_schedule = [1.0, 0.7, 0.4, 0.15, 0.0]
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": base_schedule, "ref2va": None})
 
@@ -643,7 +656,7 @@ def test_distilled_forward_reports_denoising_steps_not_sigma_boundaries():
 
 
 def test_distilled_forward_accepts_the_matching_explicit_step_count():
-    diffuse_calls = []
+    diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
 
     pipeline.forward(_t2va_batch(num_inference_steps=4))
@@ -713,8 +726,10 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     )
 
     assert output.shape == q.shape
-    assert attention.attention.metadata.attn_mask is None
-    assert attention.attention.metadata.extra["valid_kv_length"] == 5
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
 
 
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
@@ -754,9 +769,11 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         packed_total=8,
     )
 
-    assert attention.attention.metadata.attn_mask is None
-    assert attention.attention.metadata.extra["valid_kv_length"] == 5
-    assert attention.attention.metadata.extra["npu_attn_varlen"] is True
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+    assert metadata.extra["npu_attn_varlen"] is True
 
 
 def test_packed_attention_keeps_padding_mask_for_other_backends():
@@ -796,8 +813,10 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
         packed_total=8,
     )
 
+    metadata = attention.attention.metadata
+    assert metadata is not None
     assert torch.equal(
-        attention.attention.metadata.attn_mask,
+        metadata.attn_mask,
         torch.tensor([[True, True, True, True, True, False, False, False]]),
     )
 
@@ -1038,6 +1057,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
     )
     expected = torch.ones(2, 3)
     pipeline.text_encoder = Mock(return_value=expected)
+    pipeline._model_cpu_offload_modules = [pipeline.text_encoder]
     input_ids = torch.tensor([1, 2])
     vision_kwargs = {"pixel_values": torch.ones(1, 4)}
 
@@ -1401,7 +1421,7 @@ def test_distributed_video_vae_encodes_references_sequentially(monkeypatch):
         lambda path: f"frames:{path}",
     )
 
-    rows, shapes = pipeline._encode_video_conditions(None, count=2)
+    rows, shapes = pipeline._encode_video_conditions_resident(None, count=2)
 
     assert pipeline.video_vae.calls == [
         "frames:video-1.mp4",
@@ -1483,12 +1503,12 @@ def test_r7_r8_ref2va_video_segment_matrix(monkeypatch, tmp_path, case, start_ti
         "audio_codecs": (),
         "file_size": 1024,
     }
-    transcode_calls = []
+    transcode_calls: list[Any] = []
     monkeypatch.setattr(reference_video_module, "_probe_video", lambda _path: metadata)
     monkeypatch.setattr(
         reference_video_module,
         "_transcode_reference_video",
-        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or "prepared.mp4",
+        lambda source, **kwargs: _append_and_return(transcode_calls, (source, kwargs), "prepared.mp4"),
     )
 
     prepared = reference_video_module.prepare_reference_videos(
@@ -1509,7 +1529,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
     decoded = np.arange(3 * 2 * 2 * 3, dtype=np.uint8).reshape(3, 2, 2, 3)
-    decode_calls = []
+    decode_calls: list[Any] = []
     monkeypatch.setattr(
         reference_video_module,
         "_probe_video",
@@ -1522,7 +1542,7 @@ def test_ref2va_qwen_sampling_uses_one_selective_decode(monkeypatch):
     monkeypatch.setattr(
         reference_video_module,
         "_decode_video_frames_ffmpeg",
-        lambda path, **kwargs: decode_calls.append((path, kwargs)) or decoded,
+        lambda path, **kwargs: _append_and_return(decode_calls, (path, kwargs), decoded),
     )
 
     sampled = reference_video_module.sample_reference_video_frames("prepared.mp4")
@@ -1583,7 +1603,7 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
     expected = np.zeros((2, 2, 3, 3), dtype=np.uint8)
-    decode_calls = []
+    decode_calls: list[Any] = []
     monkeypatch.setitem(sys.modules, "decord", None)
     monkeypatch.setattr(
         reference_video_module,
@@ -1597,7 +1617,7 @@ def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
     monkeypatch.setattr(
         reference_video_module,
         "_decode_video_frames_ffmpeg",
-        lambda path, **kwargs: decode_calls.append((path, kwargs)) or expected,
+        lambda path, **kwargs: _append_and_return(decode_calls, (path, kwargs), expected),
     )
 
     actual = reference_video_module.load_video_frames("prepared.mp4")
@@ -1637,7 +1657,7 @@ def test_ref2va_ffmpeg_decode_rejects_invalid_metadata(kwargs, message):
 def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    calls = []
+    calls: list[Any] = []
     probe = {
         "streams": [
             {
@@ -1655,7 +1675,11 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs)) or SimpleNamespace(stdout=json.dumps(probe)),
+        lambda command, **kwargs: _append_and_return(
+            calls,
+            (command, kwargs),
+            SimpleNamespace(stdout=json.dumps(probe)),
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")
@@ -1668,7 +1692,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    calls = []
+    calls: list[Any] = []
     stream = {
         "codec_type": "video",
         "width": 4,
@@ -1688,8 +1712,11 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs))
-        or SimpleNamespace(stdout=json.dumps(first_probe if len(calls) == 1 else second_probe)),
+        lambda command, **kwargs: _append_and_return(
+            calls,
+            (command, kwargs),
+            SimpleNamespace(stdout=json.dumps(first_probe if not calls else second_probe)),
+        ),
     )
 
     metadata = reference_video_module._probe_video("prepared.mp4")
@@ -1749,12 +1776,16 @@ def test_ref2va_two_video_recipe_tolerates_container_rounding(monkeypatch, tmp_p
             "file_size": 1024,
         },
     }
-    transcode_calls = []
+    transcode_calls: list[Any] = []
     monkeypatch.setattr(reference_video_module, "_probe_video", lambda path: metadata[str(path)])
     monkeypatch.setattr(
         reference_video_module,
         "_transcode_reference_video",
-        lambda source, **kwargs: transcode_calls.append((source, kwargs)) or f"{source}.prepared.mp4",
+        lambda source, **kwargs: _append_and_return(
+            transcode_calls,
+            (source, kwargs),
+            f"{source}.prepared.mp4",
+        ),
     )
 
     prepared = reference_video_module.prepare_reference_videos(
@@ -1964,7 +1995,7 @@ def test_ref2va_audio_duration_validation_precedes_rank_branch(monkeypatch):
 
     waveform = torch.zeros(1, 10)
     with pytest.raises(ValueError, match="max_duration_seconds must be positive"):
-        pipeline._encode_audio_conditions(
+        pipeline._encode_audio_conditions_resident(
             [(waveform, 10)],
             max_duration_seconds=0,
         )
@@ -1985,7 +2016,7 @@ def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
     pipeline.audio_vae = FakeAudioVAE()
     waveform = torch.arange(40, dtype=torch.float32).reshape(1, 40)
 
-    encoded, lengths = pipeline._encode_audio_conditions(
+    encoded, lengths = pipeline._encode_audio_conditions_resident(
         [(waveform, 10)],
         max_duration_seconds=2.5,
     )

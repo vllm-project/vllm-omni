@@ -36,8 +36,8 @@ BASELINE_MODEL = os.environ.get("QWEN2_5_OMNI_BASELINE_MODEL", BASELINE_MODEL)
 
 _CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
 
-_SKIP_ISSUE_4663 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/4663",
+_SKIP_ISSUE_5652 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/5652",
 )
 
 
@@ -65,7 +65,7 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_4663
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler):
@@ -84,7 +84,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_4663
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler):
@@ -108,7 +108,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_4663
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler):
@@ -130,7 +130,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_4663
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler):
@@ -152,7 +152,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_4663
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler):

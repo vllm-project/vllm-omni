@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -64,6 +64,30 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     raise ValueError(
         f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
     )
+
+
+def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
+    gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
+    has_gate_compress_weights = False
+
+    def tracked_weights():
+        nonlocal has_gate_compress_weights
+        for name, weight in weights:
+            if ".to_gate_compress." in name:
+                has_gate_compress_weights = True
+            yield name, weight
+
+    loaded_weights = AutoWeightsLoader(model).load_weights(tracked_weights())
+    setattr(model, "has_gate_compress_weights", has_gate_compress_weights)
+    if not has_gate_compress_weights:
+        for module in model.modules():
+            if isinstance(module, WanSelfAttention):
+                module.to_gate_compress = None
+
+    # Optional gate parameters are absent from public FullAttn/DMD checkpoints.
+    loaded_weights.update(gate_param_names)
+    return loaded_weights
 
 
 def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
@@ -1043,26 +1067,7 @@ class Wan22Pipeline(
         return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load checkpoint weights and discard unused optional VSA gates."""
-        gate_param_names = {name for name, _ in self.named_parameters() if ".to_gate_compress." in name}
-        has_gate_compress_weights = False
-
-        def tracked_weights():
-            nonlocal has_gate_compress_weights
-            for name, weight in weights:
-                if ".to_gate_compress." in name:
-                    has_gate_compress_weights = True
-                yield name, weight
-
-        loaded_weights = AutoWeightsLoader(self).load_weights(tracked_weights())
-        self.has_gate_compress_weights = has_gate_compress_weights
-        if not has_gate_compress_weights:
-            for module in self.modules():
-                if isinstance(module, WanSelfAttention):
-                    module.to_gate_compress = None
-        # Optional gate parameters are absent from public FullAttn/DMD checkpoints.
-        loaded_weights.update(gate_param_names)
-        return loaded_weights
+        return load_wan_weights_with_optional_gate(self, weights)
 
     def check_inputs(
         self,

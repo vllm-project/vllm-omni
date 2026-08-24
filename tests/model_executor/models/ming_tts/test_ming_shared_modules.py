@@ -7,8 +7,14 @@ import pytest
 import torch
 
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAEConfig
-from vllm_omni.model_executor.models.common.ming.fm import Solver
+from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor, CFMSampler
+from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
+from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
+from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, get_epss_timesteps
+from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
+from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
@@ -24,7 +30,6 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     VAE_PATCH_SIZE,
 )
-from vllm_omni.model_executor.models.ming_tts.flowloss_head import FlowLoss
 from vllm_omni.model_executor.models.ming_tts.ming_tts_llm import MingLLMModel
 from vllm_omni.model_executor.models.ming_tts.speaker_extractor import _resolve_speaker_embeddings
 from vllm_omni.model_executor.models.ming_tts.validation import validate_ming_tts_config
@@ -44,7 +49,87 @@ def test_ming_tts_audio_vae_uses_common_config():
 
 def test_ming_tts_cfm_solver_uses_common_implementation():
     """Ming dense imports the shared solver implementation directly."""
-    assert Solver.__module__ == "vllm_omni.model_executor.models.common.ming.fm"
+    assert Solver.__module__ == "vllm_omni.model_executor.models.common.ming.cfm_solver"
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected_module"),
+    [
+        (Aggregator, "vllm_omni.model_executor.models.common.ming.aggregator"),
+        (DiT, "vllm_omni.model_executor.models.common.ming.cfm_dit"),
+        (FlowLoss, "vllm_omni.model_executor.models.common.ming.cfm_head"),
+        (CFMGraphExecutor, "vllm_omni.model_executor.models.common.ming.cfm_cudagraph"),
+        (CFMSampler, "vllm_omni.model_executor.models.common.ming.cfm_cudagraph"),
+        (SpeakerEmbeddingExtractor, "vllm_omni.model_executor.models.common.ming.speaker_extractor"),
+        (SpkembExtractor, "vllm_omni.model_executor.models.common.ming.spk_embedding"),
+    ],
+)
+def test_ming_tts_reusable_modules_live_in_common(symbol, expected_module):
+    """The pieces a second Ming-family TTS model reuses live under common/ming.
+
+    Guards the promotion: if an implementation drifts back into `ming_tts`
+    (or into another model package), a second model would have to reach across
+    packages to get it.
+    """
+    assert symbol.__module__ == expected_module
+
+
+def test_ming_flash_talker_uses_the_shared_aggregator():
+    """Ming flash no longer carries its own copy of the aggregator.
+
+    Both Ming packages ran near-identical aggregators one directory apart,
+    which is the duplication this module layout exists to remove.
+    """
+    from vllm_omni.model_executor.models.ming_flash_omni import talker_module
+
+    assert talker_module.Aggregator is Aggregator
+    assert not any(
+        isinstance(obj, type) and obj.__module__ == talker_module.__name__ and name == "Aggregator"
+        for name, obj in vars(talker_module).items()
+    )
+
+
+def test_shared_aggregator_matches_the_ming_flash_construction():
+    """The shared aggregator reproduces Ming flash's former default geometry.
+
+    `talker_module.Aggregator` defaulted to `in_channels=64` while the
+    shared class defaults to 4, so the call site now passes `latent_dim`
+    explicitly. This pins the resulting shapes rather than the default.
+    """
+    latent_dim, llm_hidden = 64, 32
+    aggregator = Aggregator(
+        in_channels=latent_dim,
+        llm_input_dim=llm_hidden,
+        hidden_size=16,
+        depth=1,
+        num_heads=2,
+    )
+
+    assert aggregator.x_embedder.in_features == latent_dim
+    assert aggregator.final_layer.linear.out_features == llm_hidden
+
+    out = aggregator(torch.randn(1, 3, latent_dim))
+    # Keeps only the CLS projection: [B, T, D] -> [B, 1, llm_hidden].
+    assert out.shape == (1, 1, llm_hidden)
+
+
+def test_shared_aggregator_rejects_mismatched_latent_width():
+    """Wrong-width input fails loudly instead of silently projecting incorrect."""
+    aggregator = Aggregator(in_channels=64, llm_input_dim=32, hidden_size=16, depth=1, num_heads=2)
+
+    with pytest.raises(ValueError, match="feature dim mismatch"):
+        aggregator(torch.randn(1, 3, 4))
+
+
+def test_cfm_solver_owns_the_timestep_schedule():
+    """get_epss_timesteps sits with the solver, not with the DiT blocks."""
+    from vllm_omni.model_executor.models.common.ming import dit_blocks
+
+    assert not hasattr(dit_blocks, "get_epss_timesteps")
+
+    t = get_epss_timesteps(10, device="cpu", dtype=torch.float32)
+    assert t.shape == (11,)
+    assert float(t[0]) == 0.0 and float(t[-1]) == 1.0
 
 
 def test_ming_tts_flowloss_preserves_checkpoint_prefix():

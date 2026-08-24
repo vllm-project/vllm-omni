@@ -33,6 +33,9 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
     sched.skipped_waiting = set()
+    sched._free_request_blocks = MagicMock()
+    sched.encoder_cache_manager = MagicMock()
+    sched._inflight_prefills = set()
     return sched
 
 
@@ -276,29 +279,33 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
         "meta": {"turn_eos_token_id": 99},
     }
     assert session.status == RequestStatus.WAITING
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
-def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None:
+def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
+    session = _make_request()
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=False,
         segment_finished_requests=set(),
+        requests_num_chunks_sent={session.external_req_id: 59},
     )
-    session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 59
     session._all_token_ids.clear()
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 59
     session.num_computed_tokens = 59
+    session.num_in_flight_tokens = 2
     update = _make_update([0] * 10)
     update.additional_information = None
     update.model_intermediate_buffer = {
         "ids": {"tts": list(range(8))},
         "hidden_states": {"tts": [[0.0]] * 8},
         "meta": {
-            "replace_streaming_prompt": True,
             "next_stage_prompt_len": 10,
+            "replace_streaming_prompt": True,
         },
     }
 
@@ -308,6 +315,42 @@ def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None
     assert list(session._all_token_ids) == [0] * 10
     assert session.num_prompt_tokens == 10
     assert session.num_computed_tokens == 0
+    assert session.num_stale_output_tokens == 2
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
+    sched = _make_scheduler(stage_id=1)
+    session = _make_request()
+    session.external_req_id = "external-ar-streaming-test"
+    session.num_in_flight_tokens = 2
+    # _update_request_as_session() may have already fenced this frame before
+    # the connector marks the explicit replacement ready.
+    session.num_stale_output_tokens = 2
+    session.num_output_placeholders = 2
+    session.spec_token_ids = [-1, -1]
+    sched.requests = {session.request_id: session}
+    sched._inflight_prefills.add(session)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        replaced_streaming_prompt_ids={session.request_id},
+        requests_with_ready_chunks={session.request_id},
+        requests_num_chunks_sent={session.external_req_id: 4090},
+    )
+
+    sched._reset_ready_async_chunk_replacements()
+    sched._reset_ready_async_chunk_replacements()
+
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+    assert session not in sched._inflight_prefills
+    assert session.num_stale_output_tokens == 2
+    assert session.num_output_placeholders == 0
+    assert session.spec_token_ids == []
+    assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
+    assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {session.request_id}
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}

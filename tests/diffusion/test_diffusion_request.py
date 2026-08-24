@@ -52,6 +52,7 @@ def test_dummy_run_request_is_identified_by_reserved_request_id():
 
     assert req.is_dummy_run()
     assert OmniDiffusionRequest.is_dummy_run_request_id(DUMMY_DIFFUSION_REQUEST_ID)
+    assert OmniDiffusionRequest.is_dummy_run_request_id(f"{DUMMY_DIFFUSION_REQUEST_ID}/kv-profile-1")
 
 
 def test_non_dummy_request_is_not_identified_as_dummy_run():
