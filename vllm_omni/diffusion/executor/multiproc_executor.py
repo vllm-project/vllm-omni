@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
@@ -104,7 +105,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        ctx = get_mp_context()
+        self.wake_events = [ctx.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -300,7 +302,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
-        mp.set_start_method("spawn", force=True)
+        ctx = get_mp_context()
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -312,9 +314,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = ctx.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = ctx.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank

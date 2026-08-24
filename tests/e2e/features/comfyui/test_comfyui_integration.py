@@ -8,7 +8,6 @@ It ensures that
 
 from __future__ import annotations
 
-import multiprocessing
 import time
 import traceback
 from collections.abc import Iterable, Sequence
@@ -38,6 +37,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
@@ -542,7 +542,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
         except Exception:
             traceback.print_exc()
 
-    server_process = multiprocessing.Process(target=run_server)
+    server_process = get_mp_context().Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.

@@ -18,12 +18,12 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import multiprocessing.connection
-import os
 import signal
 import weakref
 from typing import Any
 
 from vllm.utils.network_utils import get_open_ports_list
+from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.distributed.omni_coordinator.omni_coordinator import OmniCoordinator
 
@@ -49,26 +49,6 @@ def run_omni_coordinator_proc(
     ready_pipe.close()
 
     coordinator.wait_for_shutdown()
-
-
-def _get_coordinator_mp_context() -> multiprocessing.context.BaseContext:
-    """Return the multiprocessing context used for OmniCoordinator.
-
-    For the current vllm-omni startup path, ``spawn`` is too expensive: the
-    child re-imports a heavy CLI / model stack before it can acknowledge the
-    ready pipe, which can exceed the coordinator startup timeout. Prefer
-    ``fork`` on platforms that support it.
-
-    ``fork`` must happen before the parent initializes CUDA or owns long-lived
-    ZMQ sockets; otherwise the child inherits unsafe state. If coordinator
-    startup moves later, switch this to ``spawn``/``forkserver``.
-
-    TODO: make the coordinator child entry cheap and spawn-safe, then revisit
-    whether ``spawn`` is still needed here.
-    """
-    if os.name != "nt" and "fork" in multiprocessing.get_all_start_methods():
-        return multiprocessing.get_context("fork")
-    return multiprocessing.get_context("spawn")
 
 
 def _shutdown_proc(proc: multiprocessing.Process) -> None:
@@ -107,7 +87,7 @@ class OmniCoordinatorRuntime:
 
         self._closed = False
 
-        ctx = _get_coordinator_mp_context()
+        ctx = get_mp_context()
         parent_conn, child_conn = ctx.Pipe(duplex=False)
 
         self._proc: multiprocessing.Process = ctx.Process(

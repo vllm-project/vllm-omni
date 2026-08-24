@@ -5,8 +5,6 @@ import base64
 import dataclasses
 import io
 import json
-import multiprocessing
-import multiprocessing.forkserver as forkserver
 import os
 
 # Image generation API imports
@@ -629,8 +627,7 @@ async def build_async_omni(
     """Build an AsyncOmni instance from command-line arguments.
 
     Creates an async context manager that yields an AsyncOmni instance
-    configured from the provided arguments. Handles forkserver setup if
-    needed and ensures proper cleanup on exit.
+    configured from the provided arguments.
 
     Args:
         args: Parsed command-line arguments containing model and configuration
@@ -641,15 +638,6 @@ async def build_async_omni(
     Yields:
         EngineClient instance (AsyncOmni) ready for use
     """
-    if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
-        # The executor is expected to be mp.
-        # Pre-import heavy modules in the forkserver process
-        logger.debug("Setup forkserver with pre-imports")
-        multiprocessing.set_start_method("forkserver")
-        multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
-        forkserver.ensure_running()
-        logger.debug("Forkserver setup complete!")
-
     # Context manager to handle async_omni lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
     async with build_async_omni_from_stage_config(

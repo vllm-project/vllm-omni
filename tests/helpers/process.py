@@ -99,11 +99,6 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
         if os.environ.get("RUNNING_IN_SUBPROCESS") == "1":
             return f(*args, **kwargs)
 
-        import torch.multiprocessing as mp
-
-        with suppress(RuntimeError):
-            mp.set_start_method("spawn")
-
         module_name = f.__module__
         env = os.environ.copy()
         env["RUNNING_IN_SUBPROCESS"] = "1"
