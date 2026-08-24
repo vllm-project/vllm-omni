@@ -1356,9 +1356,7 @@ class DiffusionEngine:
             # would be cached forever by the executor result pump (issue #6413).
             # Tell the executor to drop it before returning the aborted result.
             if runner_output is not None and runner_output.async_output_id is not None:
-                drop_output = getattr(self.executor, "drop_output", None)
-                if drop_output is not None:
-                    drop_output(runner_output.async_output_id)
+                self.executor.drop_output(runner_output.async_output_id)
             # Preserve runner-provided abort details when available.
             if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
                 return runner_output.result
