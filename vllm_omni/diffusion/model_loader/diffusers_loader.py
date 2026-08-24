@@ -3,6 +3,7 @@
 import contextlib
 import dataclasses
 import glob
+import json
 import os
 import re
 import time
@@ -10,21 +11,20 @@ from collections.abc import Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
+import huggingface_hub
 import torch
 from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
-    download_safetensors_index_file_from_hf,
     download_weights_from_hf,
-    filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
-from vllm.transformers_utils.repo_utils import file_exists
+from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -42,6 +42,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -88,6 +89,23 @@ def _natural_sort_key(filepath: str) -> list:
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+SHARDED_SAFETENSORS_PATTERN = re.compile(r"^(?P<family>.+)-\d+-of-(?P<count>\d+)\.safetensors$")
+
+
+def _validate_unindexed_safetensors_layout(weight_files: Sequence[str]) -> None:
+    """Reject ambiguous shard families when no index is available."""
+    shard_counts: dict[str, set[int]] = {}
+    for weight_file in weight_files:
+        match = SHARDED_SAFETENSORS_PATTERN.fullmatch(os.path.basename(weight_file))
+        if match is not None:
+            shard_counts.setdefault(match.group("family"), set()).add(int(match.group("count")))
+
+    conflicts = {family: sorted(counts) for family, counts in shard_counts.items() if len(counts) > 1}
+    if conflicts:
+        raise ValueError(
+            "Ambiguous unindexed safetensors checkpoint with conflicting shard totals: "
+            f"{conflicts}. Refusing to load potentially stale checkpoint shards."
+        )
 
 
 def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> type:
@@ -148,6 +166,60 @@ class DiffusersPipelineLoader:
         self.host_weight_plan = None
         return plan
 
+    @staticmethod
+    def _repo_relative_path(subfolder: str | None, filename: str) -> str:
+        if subfolder is None:
+            return filename
+        prefix = f"{subfolder.rstrip('/')}/"
+        return filename if filename.startswith(prefix) else f"{prefix}{filename.lstrip('/')}"
+
+    def _resolve_weight_index(
+        self,
+        model_name_or_path: Path | str,
+        subfolder: str | None,
+        revision: str | None,
+    ) -> list[str] | None:
+        """Resolve an index and return its authoritative shard manifest."""
+        is_local = os.path.isdir(model_name_or_path)
+        index_paths: list[tuple[str, Path]] = []
+        for index_file in INDEX_FILES:
+            repo_index_path = self._repo_relative_path(subfolder, index_file)
+            if is_local:
+                index_path = Path(model_name_or_path) / repo_index_path
+                if index_path.is_file():
+                    index_paths.append((index_file, index_path))
+                continue
+
+            try:
+                index_path = hf_api().hf_hub_download(
+                    repo_id=str(model_name_or_path),
+                    filename=repo_index_path,
+                    cache_dir=self.load_config.download_dir,
+                    revision=revision,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                )
+            except huggingface_hub.errors.EntryNotFoundError:
+                continue
+            index_paths.append((index_file, Path(index_path)))
+
+        if len(index_paths) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: "
+                f"{[index_file for index_file, _ in index_paths]}"
+            )
+        if not index_paths:
+            return None
+
+        index_file, index_path = index_paths[0]
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Weight index {index_file} must contain a non-empty `weight_map`")
+        if not all(isinstance(filename, str) and filename for filename in weight_map.values()):
+            raise ValueError(f"Weight index {index_file} contains an invalid shard filename")
+        return sorted(set(weight_map.values()))
+
     def _prepare_weights(
         self,
         model_name_or_path: Path | str,
@@ -164,17 +236,11 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        possible_index_files = [
-            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
-        ]
-        available_index_file = [
-            f for f in possible_index_files if file_exists(model_name_or_path, f, revision=revision)
-        ]
-        if len(available_index_file) > 1:
-            raise ValueError(
-                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
-            )
-        index_file = available_index_file[0] if available_index_file else ""
+        indexed_weight_files = (
+            self._resolve_weight_index(model_name_or_path, subfolder, revision)
+            if allow_patterns_overrides is None
+            else None
+        )
 
         # only hf is supported currently
         if load_format == "auto":
@@ -192,7 +258,16 @@ class DiffusersPipelineLoader:
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
 
-        if not is_local:
+        if not is_local and indexed_weight_files is not None:
+            hf_folder = download_weights_from_hf_specific(
+                model_name_or_path=str(model_name_or_path),
+                cache_dir=self.load_config.download_dir,
+                allow_patterns=[self._repo_relative_path(subfolder, filename) for filename in indexed_weight_files],
+                revision=revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+                require_all=True,
+            )
+        elif not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
@@ -207,31 +282,24 @@ class DiffusersPipelineLoader:
         if subfolder is not None:
             hf_folder = os.path.join(hf_folder, subfolder)
 
-        hf_weights_files: list[str] = []
-        for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
-            if len(hf_weights_files) > 0:
-                # Decide by actual files rather than pattern name (patterns may include subfolders).
-                use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
-                break
-
-        if use_safetensors:
-            # For models like Mistral-7B-Instruct-v0.3
-            # there are both sharded safetensors files and a consolidated
-            # safetensors file. Using both breaks.
-            # Here, we download the `model.safetensors.index.json` and filter
-            # any files not found in the index.
-            if not is_local:
-                download_safetensors_index_file_from_hf(
-                    model_name_or_path,
-                    index_file,
-                    cache_dir=self.load_config.download_dir,
-                    subfolder=subfolder,
-                    revision=revision,
-                )
-            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
+        if indexed_weight_files is not None:
+            hf_weights_files = [os.path.join(hf_folder, filename) for filename in indexed_weight_files]
+            missing_files = [filename for filename in hf_weights_files if not os.path.isfile(filename)]
+            if missing_files:
+                raise FileNotFoundError(f"Weight files referenced in index but missing: {missing_files}")
+            use_safetensors = any(filename.endswith(".safetensors") for filename in hf_weights_files)
         else:
-            hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
+            hf_weights_files = []
+            for pattern in allow_patterns:
+                hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+                if hf_weights_files:
+                    # Decide by actual files rather than pattern name (patterns may include subfolders).
+                    use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
+                    break
+            if use_safetensors:
+                _validate_unindexed_safetensors_layout(hf_weights_files)
+            else:
+                hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
             raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
