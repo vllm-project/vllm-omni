@@ -84,6 +84,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.replaced_streaming_prompt_ids: set[str] = set()
         self.requests_origin_status = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
@@ -246,7 +247,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 replace_prompt = meta.get("replace_streaming_prompt") is True
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
-                    construct_next_stage_streaming_input_prompt(payload_data, request)
+                    replaced = construct_next_stage_streaming_input_prompt(payload_data, request)
+                    if replaced:
+                        self.replaced_streaming_prompt_ids.add(req_id)
 
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -275,15 +278,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 else:
                     prompt_token_ids = new_ids
                 request.prompt_token_ids = prompt_token_ids
+                # Full-snapshot producers opt in explicitly; generation and
+                # diffusion models keep their existing incremental merge.
                 prev_info = getattr(request, "additional_information", None)
-                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                replace_snapshot = meta.get("replace_runtime_additional_information") is True
+                info = {} if replace_snapshot else (dict(prev_info) if isinstance(prev_info, dict) else {})
                 for key, value in payload_data.items():
                     if key == "codes":
-                        if use_tensor_codes and isinstance(value, dict):
+                        if isinstance(value, dict):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                            merged_sub.update(value)
-                            info[key] = merged_sub
+                            for subkey, subvalue in value.items():
+                                # A 1-D audio tensor is represented by the
+                                # placeholder prompt above, but sibling fields
+                                # such as the reference voice still belong in
+                                # the current runtime snapshot.
+                                if subkey == "audio" and not use_tensor_codes:
+                                    continue
+                                merged_sub[subkey] = subvalue
+                            if merged_sub:
+                                info[key] = merged_sub
                         continue
                     if isinstance(value, dict):
                         existing_sub = info.get(key)
@@ -455,6 +469,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
+        self.replaced_streaming_prompt_ids.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
@@ -564,6 +579,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 RequestStatus.RUNNING,
                 self._finished_load_reqs,
             )
+            self._requeue_replaced_prompts(waiting_queue, running_queue)
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
                 request.status = RequestStatus.PREEMPTED
@@ -578,8 +594,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
+        self._requeue_replaced_prompts(waiting_queue, running_queue)
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        """Move a replaced running prompt back through scheduler admission."""
+        for request in list(running_queue):
+            request_id = request.request_id
+            if (
+                request_id not in self.replaced_streaming_prompt_ids
+                or request_id not in self.requests_with_ready_chunks
+            ):
+                continue
+            running_queue.remove(request)
+            request.status = RequestStatus.WAITING
+            self.requests_origin_status[request_id] = RequestStatus.WAITING
+            waiting_queue.add_request(request)
 
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:
@@ -852,6 +883,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_data in scheduler_output.scheduled_new_reqs:
                 if req_data.req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_data.req_id)
+                if req_data.req_id in self.replaced_streaming_prompt_ids:
+                    external_req_id = self.request_ids_mapping.get(req_data.req_id)
+                    if external_req_id is not None:
+                        self.requests_num_chunks_sent.pop(external_req_id, None)
+                    self.replaced_streaming_prompt_ids.remove(req_data.req_id)
 
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
@@ -869,13 +905,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         else:
             request_ids = requests.keys()
 
+        connector_owned_ids = {
+            request.request_id
+            for queue in (
+                self.waiting_for_chunk_waiting_requests,
+                self.waiting_for_chunk_running_requests,
+                self._held_non_active,
+            )
+            for request in queue
+        }
+
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
-            if request is None or request.is_finished():
+            if request is None:
                 # Invalid request ID.
                 continue
-            if req_id in self.requests_origin_status:
+            resumable_segment_stop = bool(
+                getattr(request, "resumable", False) and request.status == RequestStatus.FINISHED_STOPPED
+            )
+            if request.is_finished() and not resumable_segment_stop:
+                continue
+            # Once restored to a scheduler queue, the saved origin is stale and
+            # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
+            if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
 
         request_ids = set(request_ids)
@@ -891,11 +944,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
-            self._active_streams.pop(req_id, None)
-            self.requests_with_ready_chunks.discard(req_id)
-            self.upstream_exhausted_requests.discard(req_id)
-            self._finished_load_reqs.discard(req_id)
-            self._cancelled_load_reqs.add(req_id)
-            self._waiting_since.pop(req_id, None)
+            self.cleanup_receiver(req_id)
 
         return []

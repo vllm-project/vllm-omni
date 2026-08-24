@@ -2,8 +2,17 @@
 """Unit tests for OmniChatCompletionResponse/StreamResponse metrics field."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+
+from tests.helpers.serving_chat import (
+    build_serving_chat,
+    collect_stream,
+    make_request,
+    make_text_omni_output,
+    parse_sse_chunks,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -52,6 +61,65 @@ def test_omni_chat_completion_stream_response_metrics():
     )
     assert response.modality == "audio"
     assert response.metrics == {"stage_latency": 0.5}
+
+
+@pytest.mark.asyncio
+async def test_stream_prompt_token_details_include_zero_cached_and_multimodal_tokens():
+    serving_chat = build_serving_chat()
+    serving_chat.enable_prompt_tokens_details = True
+    request = make_request(modalities=["text"], include_usage=True)
+
+    async def result_generator():
+        yield make_text_omni_output(
+            token_ids=[10],
+            finish_reason="stop",
+            num_cached_tokens=0,
+        )
+
+    raw_lines = await collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+            mm_token_counts={"image": 7},
+        )
+    )
+
+    chunks = parse_sse_chunks(raw_lines)
+    usage = next(chunk["usage"] for chunk in chunks if chunk.get("usage"))
+
+    assert usage["prompt_tokens_details"] == {
+        "cached_tokens": 0,
+        "multimodal_tokens": {"image": 7},
+    }
+
+
+def test_non_stream_prompt_token_details_include_zero_cached_and_multimodal_tokens():
+    serving_chat = build_serving_chat()
+    serving_chat.enable_prompt_tokens_details = True
+    request = make_request(modalities=["text"], stream=False)
+    omni_output = make_text_omni_output(
+        token_ids=[10],
+        finish_reason="stop",
+        num_cached_tokens=0,
+    )
+
+    _, usage, _, _, _ = serving_chat._create_text_choice(
+        request=request,
+        omni_outputs=omni_output,
+        tokenizer=MagicMock(),
+        conversation=[],
+        role="assistant",
+        mm_token_counts={"audio": 5},
+    )
+
+    assert usage.prompt_tokens_details is not None
+    assert usage.prompt_tokens_details.cached_tokens == 0
+    assert usage.prompt_tokens_details.multimodal_tokens == {"audio": 5}
 
 
 def test_create_image_choice_exposes_diffusion_metrics():

@@ -97,34 +97,6 @@ steps:
         mirror_hardwares:
           default: h100_2
           b200: b200_2
-      - label: ":full_moon: Omni · Perf Test · vLLM Text"
-        key: nightly-omni-performance-vllm-text
-        timeout_in_minutes: 180
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-        mirror_hardwares:
-          default: h100_2
-          b200: b200_2
-      - label: ":full_moon: Omni · Perf Test · Multi-Replica"
-        key: nightly-omni-performance-multi-replicas
-        timeout_in_minutes: 180
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-        mirror_hardwares:
-          default: h100_3
-          b200: b200_3
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         key: nightly-omni-performance-minicpmo-4-5
         timeout_in_minutes: 180
@@ -276,6 +248,13 @@ steps:
         mirror_hardwares:
           default: h100_4
           b200: b200_4
+
+      - label: ":full_moon: HiDream-O1-Image · Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
+        # H100-only (test marked cuda H100). String h100_2 is skipped when MIRROR_HW=b200.
+        mirror_hardwares: h100_2
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image"
         key: nightly-diffusion-x2iat-performance-qwen-image
         timeout_in_minutes: 180
@@ -434,8 +413,6 @@ steps:
     depends_on:
       - nightly-omni-performance-no-async-chunk
       - nightly-omni-performance-async-chunk
-      - nightly-omni-performance-vllm-text
-      - nightly-omni-performance-multi-replicas
       - nightly-tts-performance
       - nightly-diffusion-x2iat-performance-qwen-image
       - nightly-diffusion-x2v-performance
@@ -447,8 +424,6 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-tts-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-no-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-async-chunk
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-vllm-text
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-multi-replicas
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance
       - python tools/nightly/generate_nightly_perf_excel.py

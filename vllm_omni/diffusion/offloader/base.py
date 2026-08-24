@@ -4,6 +4,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 import torch
 from torch import nn
@@ -12,6 +13,26 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+@runtime_checkable
+class SupportsModelCpuOffload(Protocol):
+    """Pipeline-owned lifecycle for model-level CPU offload.
+
+    Pipelines with non-forward component entry points (for example VAE
+    ``decode_latent`` methods) need to activate those stages explicitly, so
+    generic forward-hook discovery cannot manage their full lifecycle.
+    """
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None: ...
+
+    def disable_omni_model_cpu_offload(self) -> None: ...
 
 
 class OffloadStrategy(Enum):
@@ -62,7 +83,7 @@ class OffloadConfig:
         dp_size = 1
         if parallel_config is not None:
             dp_size = getattr(parallel_config, "data_parallel_size", 1)
-            # HSDP's fully_shard_degree also contributes to effective DP
+            # HSDP shard and replica sizes determine the effective group size.
             hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
             hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
             if use_hsdp and hsdp_shard_size > 0:

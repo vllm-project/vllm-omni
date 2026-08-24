@@ -337,7 +337,7 @@ class StageRuntime:
         self,
         omni_transfer_config: Any,
         replicas_per_stage: Sequence[int],
-        replica_devices_map: Mapping[int, Sequence[str]],
+        replica_devices_map: Mapping[int, Sequence[str | None]],
     ) -> list[LogicalStageInitPlan]:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []

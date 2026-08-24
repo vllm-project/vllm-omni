@@ -38,7 +38,7 @@ full-duplex control plane:
 CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
   /path/to/personaplex-7b-v1 \
   --omni \
-  --stage-configs-path vllm_omni/deploy/personaplex.yaml
+  --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
 
 Validate the actual `/v1/realtime?duplex=1` scheduler path with paced 24 kHz

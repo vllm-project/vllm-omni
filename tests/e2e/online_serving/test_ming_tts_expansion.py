@@ -18,7 +18,6 @@ from tests.helpers.stage_config import get_deploy_config_path
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
 ]
 
 MODEL = "inclusionAI/Ming-omni-tts-0.5B"

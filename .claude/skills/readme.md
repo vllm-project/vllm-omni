@@ -31,9 +31,12 @@ self-check.
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
   performance optimization, including profiling traces, parallel strategies,
   stage timing analysis, and benchmark-driven tuning
+- [`find-simplifications`](find-simplifications/SKILL.md): finds evidence-backed
+  opportunities to remove or merge dead, duplicated, speculative,
+  over-generalized, or unnecessarily defensive vLLM-Omni code
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
-  PR by validating title format, dead code, accuracy and performance claims,
-  and merge readiness
+  PR by validating title format, dead code, simplification opportunities,
+  accuracy and performance claims, and merge readiness
 - [`quantization`](quantization/SKILL.md): guides quantization method selection,
   model integration, checkpoint loading, and quality/performance validation
   for vLLM-Omni

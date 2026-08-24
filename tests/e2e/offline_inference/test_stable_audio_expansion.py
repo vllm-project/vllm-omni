@@ -84,8 +84,7 @@ def test_stable_audio_quantization_and_teacache() -> None:
     # ``model_class_name`` must be passed explicitly: the default-stage-cfg
     # factory in ``async_omni_engine.py`` reads it out of ``kwargs`` when
     # deciding ``final_output_type`` (#2077), and at construction time the
-    # auto-resolution from ``model_index.json`` has not run yet. AudioX's
-    # offline test follows the same pattern.
+    # auto-resolution from ``model_index.json`` has not run yet.
     m = Omni(
         model="stabilityai/stable-audio-open-1.0",
         model_class_name="StableAudioPipeline",

@@ -7,6 +7,8 @@ import torch.nn as nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    plan_token2wav_encode_slices,
+    relpos_encode_token_budget,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -215,6 +217,43 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_relpos_encode_token_budget_leaves_room_for_upsample_and_cache():
+    # The NPU crash was 6968 vs 985: 3333 tokens * 2 + cache overflowed max_pos=5000.
+    assert relpos_encode_token_budget(max_pos=5000, stride=2, cache_offset=150, lookahead=3) <= 1024
+    assert relpos_encode_token_budget(max_pos=5000, stride=2, cache_offset=150, lookahead=3, cap=3000) == 2346
+    assert plan_token2wav_encode_slices(3333, max_frames=1024, min_nonfinal=4, last_chunk=True) == [
+        (0, 1024),
+        (1024, 2048),
+        (2048, 3072),
+        (3072, 3333),
+    ]
+    assert plan_token2wav_encode_slices(50, max_frames=40, min_nonfinal=20, last_chunk=False) == [
+        (0, 30),
+        (30, 50),
+    ]
+
+
+def test_decode_batch_splits_overlong_prefill_inside_relpos_budget():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    setup_encodes = len(token2wav.flow.encoder.calls)
+    adapter._max_encode_token_frames = lambda _states: 4
+
+    audios, _ = adapter.decode_batch(
+        torch.arange(10, dtype=torch.long).reshape(1, -1),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+
+    assert token2wav.flow.encoder.calls[setup_encodes:] == [1, 1, 1]
+    assert token2wav.flow.encoder.last_chunk_calls[setup_encodes:] == [False, False, True]
+    assert len(audios) == 1
+    assert audios[0].numel() > 0
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
@@ -498,6 +537,15 @@ def test_empty_final_ignores_generation_scheduler_placeholder_token():
         # The runner injects the engine request id on every step (GPU
         # _preprocess, NPU _gather_runtime_additional_information)...
         {"request_id": "a", "meta": {"request_id": "a"}},
+        # Runtime snapshot bookkeeping alone is not a Talker payload.
+        {
+            "request_id": "a",
+            "meta": {
+                "request_id": "a",
+                "num_processed_tokens": 0,
+                "resumable": True,
+            },
+        },
         # ...but a pre-warm step can also reach the model with nothing at all.
         {},
     ],

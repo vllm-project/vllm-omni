@@ -89,6 +89,56 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
+def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+    )
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+
+    async def _generate_both_response_types():
+        request = VideoGenerationRequest(prompt="test prompt")
+        await handler.generate_video_bytes(request, "raw-request")
+        await handler.generate_videos(request, "base64-request")
+
+    asyncio.run(_generate_both_response_types())
+
+    assert "encoding_config" not in raw_encoder.call_args.kwargs
+    assert "encoding_config" not in base64_encoder.call_args.kwargs
+
+
+def test_resolve_diffusion_od_config_falls_back_to_attribute():
+    od_config = SimpleNamespace(model_class_name="WanPipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=od_config),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is od_config
+
+
+def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
+    attribute_config = SimpleNamespace(model_class_name="WanPipeline")
+    getter_config = SimpleNamespace(model_class_name="MiniMaxH3Pipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(
+            od_config=attribute_config,
+            get_diffusion_od_config=lambda: getter_config,
+        ),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is getter_config
+
+
 class BlockingVideoHandler:
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -1157,7 +1207,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
 def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
     audio_sample_rates = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, video_codec_options=None):
+    def _fake_encode(
+        video,
+        fps,
+        audio=None,
+        audio_sample_rate=None,
+        video_codec_options=None,
+    ):
         del video, fps, audio, video_codec_options
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
@@ -2166,6 +2222,31 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
     assert captured.quality == "high"
+
+
+def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "drive forward",
+            "extra_params": json.dumps(
+                {
+                    "sana_wm": {"action": "d-4", "rotation_speed_deg": 1.5},
+                    "sana_wm_native_max_tokens": 30000,
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_params = engine.captured_sampling_params_list[0]
+    # The camera block reaches the model through extra_args; the Sana preprocess
+    # hook is what lifts it onto the prompt.
+    assert captured_params.extra_args["sana_wm"]["action"] == "d-4"
+    assert captured_params.extra_args["sana_wm"]["rotation_speed_deg"] == 1.5
+    assert captured_params.extra_args["sana_wm_native_max_tokens"] == 30000
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):

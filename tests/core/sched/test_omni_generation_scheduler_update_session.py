@@ -410,12 +410,13 @@ class TestRealignRequestStatusToQueues:
         assert stale.status == RequestStatus.RUNNING
         assert clean.status == RequestStatus.RUNNING
 
-    def test_finished_request_is_skipped(self) -> None:
+    def test_non_resumable_finished_request_is_skipped(self) -> None:
         """Already-finished requests must not be touched -- they may
         have legitimate finished statuses (FINISHED_STOPPED etc.) that
         a status flip would corrupt.
         """
         req = _make_request(request_id="req-finished")
+        req.resumable = False
         req.status = RequestStatus.FINISHED_STOPPED
 
         sched = _RealignSchedulerStub(

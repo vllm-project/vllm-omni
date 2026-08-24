@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Server/client/runner runtime primitives for tests."""
 
 import asyncio
@@ -16,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -50,6 +54,7 @@ from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     decode_b64_image,
+    release_audio_transcriber,
 )
 from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -174,6 +179,17 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
+
+
+def get_distributed_init_method() -> str:
+    """Return a fresh ``file://`` init_method for ``torch.distributed`` process groups.
+
+    Rendezvous happens through a filesystem path instead of a pre-agreed TCP port,
+    so there's no bind-time race to retry around: the path is unique per call and
+    the real rank-0 process is the only one that ever creates it.
+    """
+    with tempfile.NamedTemporaryFile(prefix="torch_dist_init_") as f:
+        return f"file://{f.name}"
 
 
 def dummy_messages_from_mix_data(
@@ -768,6 +784,7 @@ class OmniResponse:
     success: bool = False
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
     #: HTTP status + error text for the error-handling path (e.g. validator
     #: rejections); populated when the OpenAI client raises an APIError.
@@ -1087,6 +1104,7 @@ class OpenAIClientHandler:
                     result.prompt_tokens = chunk.usage.prompt_tokens
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
+                        result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
 
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1119,6 +1137,7 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
+                    result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
             result.text_content = text_content
@@ -1151,7 +1170,7 @@ class OpenAIClientHandler:
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
 
-                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                # OpenAI audio responses populate `message.audio`.
                 audio_obj = getattr(choice.message, "audio", None)
                 audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
                 if audio_b64:
@@ -3143,6 +3162,21 @@ class OmniRunnerHandler:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _whisper_device_free_around():
+    """Keep the Whisper judge off the accelerator around a server/runner lifecycle.
+
+    Released on entry so the next instance -- e.g. the next parametrization in
+    the same module -- initializes on a clean device, and again on exit
+    (including when a test raises) so it does not linger for the instance after.
+    """
+    release_audio_transcriber()
+    try:
+        yield
+    finally:
+        release_audio_transcriber()
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -3152,7 +3186,7 @@ def iter_omni_server(
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
-    with omni_fixture_lock:
+    with omni_fixture_lock, _whisper_device_free_around():
         params: OmniServerParams = request.param
         # For now, when a tiny model is substituted, we preserve the original model
         # name via --served-model-name (so that the server still accepts requests with
@@ -3240,7 +3274,7 @@ def iter_omni_runner(
     """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
-    with omni_fixture_lock:
+    with omni_fixture_lock, _whisper_device_free_around():
         param = request.param
         if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
             raise ValueError(

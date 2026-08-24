@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import sys
@@ -61,21 +62,41 @@ def test_bootstrap_steps_loaded_from_file() -> None:
 
 
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
-    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 still gates scheduled CI."""
+    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
     assert "key: upload-nightly-pipeline" in rendered
     assert "key: upload-weekly-pipeline" in rendered
-    # Scheduled nightly also uploads L2/L3 with --e2e
-    assert "key: upload-ready-pipeline" in rendered
-    assert "key: upload-merge-pipeline" in rendered
-    assert 'build.env("NIGHTLY") == "1"' in rendered
+    # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
+    assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
     assert "weekly-test" not in rendered
     assert "merge-test" not in rendered
     assert 'labels includes "ready"' not in rendered
     assert "if: false" not in rendered
+
+
+def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
+    """NPU skip_all: scheduled NIGHTLY still uploads L4, not L2 ready."""
+    rendered = _render_bootstrap_pipeline(
+        BOOTSTRAP_STEPS_TEMPLATE,
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "upload-ready-pipeline" not in by_key
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
