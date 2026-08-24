@@ -150,3 +150,12 @@ def test_decode_point_map_float_in_uint8_range_scaled():
 def test_decode_point_map_invalid_shape():
     with pytest.raises(ValueError):
         decode_point_map(np.zeros((4, 4), dtype=np.float32))
+
+
+def test_decode_point_map_pil_image():
+    """A PIL point-map image is rescaled from [0, 255] to [-1, 1]."""
+    arr = np.full((4, 4, 3), 128, dtype=np.uint8)
+    out = decode_point_map(Image.fromarray(arr))
+    assert out.shape == (4, 4, 3)
+    assert out.dtype == np.float32
+    assert np.allclose(out, 128.0 / 255.0 * 2.0 - 1.0, atol=1e-6)

@@ -22,12 +22,18 @@ import tempfile
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
+from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelGenParams, BagelPipeline
 from vllm_omni.diffusion.models.sensenova_vision.tokenization_sensenova_vision import (
     VLLMSenseNovaVisionTokenizer,
+)
+from vllm_omni.diffusion.models.sensenova_vision.transforms_sensenova_vision import (
+    PER_TASK_VAE_SIDE,
+    recon3d_packing,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -341,11 +347,138 @@ class SenseNovaVisionPipeline(BagelPipeline):
         if hasattr(bagel.latent_pos_embed, "max_num_patch_per_side"):
             bagel.latent_pos_embed.max_num_patch_per_side = self._sensenova_vision_max_latent_size
 
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        """Run SenseNovaVision image/text generation with per-mode defaults."""
+    def forward(self, req) -> DiffusionOutput:
+        """Run SenseNovaVision image/text generation with per-mode defaults.
+
+        The BAGEL core already models ``num_output_vae`` view packing for a
+        multi-view image decode directly (``image_sizes`` length-N,
+        ``packed_seqlens`` length-N, ``generate_image`` returns N unpacked
+        latents).  SenseNovaVision only needs to branch the AR-supplied KV
+        context across those ``N`` view branches and emit one PIL image per
+        view.  ``recon3d`` is the first task to request this; all other modes
+        delegate to the BAGEL core unchanged.
+        """
+
         self._apply_mode_defaults(req)
+        if self._is_recon3d(req):
+            return self._forward_recon3d(req)
         output = super().forward(req)
         return self._merge_mixed_task_text(req, output)
+
+    @staticmethod
+    def _is_recon3d(req: DiffusionRequestBatch) -> bool:
+        """True when the request selects the multi-view ``recon3d`` mode."""
+        params = getattr(req, "sampling_params", None)
+        extra_args = getattr(params, "extra_args", None) or {}
+        return bool(extra_args.get("sensenova_vision_mode") == "recon3d")
+
+    def _forward_recon3d(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        """Multi-view ``recon3d`` decode: one AR context, N output views.
+
+        Mirrors the upstream ``gen_image`` packing (``gen_image`` in
+        ``SenseNova-Vision/inference/inferencer.py``): the first view
+        continues from the injected AR KV cache while further views start
+        from an empty 0-length KV prefix, all sharing one VAE target shape
+        and one flow-matching decode loop.  ``generate_image`` splits its
+        denoised ``x_t`` by ``packed_seqlens - 2`` into ``num_views`` latent
+        branches, which this override decodes individually.
+
+        Precision note: upstream ``decode_image(..., output_raw_tensor=True)``
+        returns the raw float VAE tensor; this pipeline emits standard 8-bit
+        PIL images (via :meth:`BagelPipeline._decode_image_from_latent`), an
+        accepted fidelity trade-off for the serving path.  Downstream example
+        rewrites re-map these back to float point maps.
+        """
+        params = req.sampling_params
+        extra_args = getattr(params, "extra_args", None) or {}
+
+        # ``num_output_vae`` in upstream ``gen_image``.  SenseNovaVision logs
+        # 4-view recon3d by default; ``num_views`` is the per-request knob.
+        num_views = int(extra_args.get("num_views", 4))
+        if num_views < 1:
+            raise ValueError(f"recon3d requires num_views >= 1, got {num_views}.")
+
+        # The multi-view decode continues from the AR KV context.  Without an
+        # injected cache there is no conditioning to branch from.
+        injected_kv = getattr(params, "past_key_values", None)
+        if injected_kv is None:
+            raise ValueError("recon3d requires an injected KV cache (past_key_values).")
+        gen_cache = NaiveCache.from_object(injected_kv)
+        kv_len = gen_cache.key_cache[0].shape[0]
+
+        kv_metadata = getattr(params, "kv_metadata", None) or {}
+        if "image_shape" in kv_metadata:
+            image_shape = tuple(kv_metadata["image_shape"])
+        else:
+            # Per-task VAE target side (512 for recon3d), clamped to the
+            # checkpoint latent budget so the DiT grid stays in-bounds.
+            side = PER_TASK_VAE_SIDE.get("recon3d")
+            if side is None or side // self.bagel.latent_downsample > self.bagel.max_latent_size:
+                side = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
+            image_shape = (side, side)
+
+        ropes = kv_metadata.get("ropes") or [kv_len]
+        base_rope = int(ropes[0])
+        kv_lens, view_ropes = recon3d_packing(num_views, kv_len, base_rope)
+        # ``PackedAttentionMoT._forward_gen`` splits the injected cache by
+        # ``key_values_lens`` into one slice per view branch: branch 0 owns the
+        # full AR context, the rest start empty (0 rows).
+        gen_cache.key_values_lens = kv_lens
+
+        generation_input = self.bagel.prepare_vae_latent(
+            curr_kvlens=kv_lens,
+            curr_rope=view_ropes,
+            image_sizes=[image_shape] * num_views,
+            new_token_ids=self.new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(self.device)
+
+        gen_params = BagelGenParams(
+            num_timesteps=int(params.num_inference_steps or 50),
+            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
+            cfg_text_scale=float(extra_args.get("cfg_text_scale", 1.0)),
+            cfg_img_scale=float(extra_args.get("cfg_img_scale", 1.0)),
+            cfg_interval=extra_args.get("cfg_interval", (0.0, 1.0)),
+            cfg_renorm_type=extra_args.get("cfg_renorm_type", "global"),
+            cfg_renorm_min=float(extra_args.get("cfg_renorm_min", 0.0)),
+        )
+
+        if params.seed is not None:
+            torch.manual_seed(params.seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(params.seed)
+
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            latents, _, _, _ = self.bagel.generate_image(
+                past_key_values=gen_cache,
+                num_timesteps=gen_params.num_timesteps,
+                timestep_shift=gen_params.timestep_shift,
+                cfg_text_scale=gen_params.cfg_text_scale,
+                cfg_img_scale=gen_params.cfg_img_scale,
+                cfg_interval=gen_params.cfg_interval,
+                cfg_renorm_min=gen_params.cfg_renorm_min,
+                cfg_renorm_type=gen_params.cfg_renorm_type,
+                return_trajectory_latents=False,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
+                **generation_input,
+            )
+
+        # 8-bit decode: each view branch is a ``(h*w, latent_channel*patch^2)``
+        # latent reshaped to the shared image_shape and passed to the VAE
+        # decoder.  Upstream emits raw float32 tensors here; we accept the
+        # 8-bit PIL representation (see method docstring).
+        images = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in latents]
+        return build_sensenova_vision_diffusion_output(
+            image=images,
+            stage_durations=getattr(self, "stage_durations", None),
+        )
 
     def _merge_mixed_task_text(self, req: DiffusionRequestBatch, output: DiffusionOutput) -> DiffusionOutput:
         """Lift an available caption/think string into the mixed text+image payload.
