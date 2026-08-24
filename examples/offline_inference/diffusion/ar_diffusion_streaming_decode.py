@@ -27,7 +27,8 @@ Examples::
         --sessions 2 --chunks 6 --output-dir /tmp/stream-demo
 
     python examples/offline_inference/diffusion/ar_diffusion_streaming_decode.py \
-        --vae <checkpoint> --height 480 --width 832 --sessions 1 --chunks 4
+        --vae <checkpoint>/vae --device cuda --dtype bf16 \
+        --height 480 --width 832 --sessions 1 --chunks 4
 """
 
 from __future__ import annotations
@@ -58,6 +59,8 @@ _DEMO_VAE_CONFIG = {
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--vae", default=None, help="VAE checkpoint or path. Omit for the built-in demo config.")
+    parser.add_argument("--device", default="cpu", help="Torch device for the VAE and latent inputs.")
+    parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--sessions", type=int, default=2, help="Concurrent sessions, ticking round-robin.")
     parser.add_argument("--chunks", type=int, default=6, help="Chunks each session generates.")
     parser.add_argument("--latent-frames", type=int, default=3, help="Latent frames per chunk.")
@@ -72,10 +75,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def build_vae(args: argparse.Namespace):
     from diffusers import AutoencoderKLWan
 
+    dtype = {
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[args.dtype]
     if args.vae is not None:
-        return AutoencoderKLWan.from_pretrained(args.vae).eval()
-    torch.manual_seed(args.seed)
-    return AutoencoderKLWan(**_DEMO_VAE_CONFIG).eval()
+        vae = AutoencoderKLWan.from_pretrained(args.vae, torch_dtype=dtype)
+    else:
+        torch.manual_seed(args.seed)
+        vae = AutoencoderKLWan(**_DEMO_VAE_CONFIG)
+    return vae.to(device=args.device, dtype=dtype).eval()
 
 
 def spatial_ratio(vae) -> int:
@@ -100,11 +110,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"sessions                    : {args.sessions}, {args.chunks} chunks each")
     print()
 
-    generator = torch.Generator().manual_seed(args.seed)
+    generator = torch.Generator(device=args.device).manual_seed(args.seed)
     # One distinct latent stream per session: distinct inputs are what make the
     # isolation check at the end discriminating rather than vacuous.
     latents = [
-        torch.randn(1, vae.config.z_dim, args.chunks * args.latent_frames, latent_h, latent_w, generator=generator)
+        torch.randn(
+            1,
+            vae.config.z_dim,
+            args.chunks * args.latent_frames,
+            latent_h,
+            latent_w,
+            generator=generator,
+            device=args.device,
+            dtype=next(vae.parameters()).dtype,
+        )
         for _ in range(args.sessions)
     ]
 
