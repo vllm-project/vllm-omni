@@ -1033,6 +1033,10 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
         # hidden_states is 5D on the first PP stage, 3D on others; dims always carries the original shape.
         batch_size, num_channels, num_frames, height, width = dims
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
 
         if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence. SP sharding happens at
