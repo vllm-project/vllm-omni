@@ -151,10 +151,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     plateaued = all(len(set(series[1:])) <= 1 for series in per_session_bytes if len(series) > 1)
 
-    # Isolation: each session's streamed output must equal its solo decode.
+    # Isolation: each interleaved session must equal a solo, single-call run
+    # through the same per-frame path.  Do not use ``vae._decode`` as the
+    # oracle: it applies post_quant_conv to the whole tensor and can select a
+    # different BF16 CUDA kernel, measuring that numerical artifact instead of
+    # whether chunking or session interleaving changed the result.
     isolated = True
     for session in range(args.sessions):
-        solo = vae._decode(latents[session], return_dict=False)[0]
+        solo_state = decoder.new_decode_state(f"solo-{session}")
+        solo = decoder.decode_chunk(latents[session], solo_state)
         streamed = torch.cat(emitted[session], dim=2)
         if streamed.shape != solo.shape or not torch.equal(streamed, solo):
             isolated = False
@@ -181,7 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"decoder state/session: {summary['resident_decoder_bytes_per_session'][0] / 2**20:.2f} MiB")
     print()
     print(f"bounded state (plateaued)            : {plateaued}")
-    print(f"streamed output == whole-clip decode : {isolated}")
+    print(f"streamed output == solo single call  : {isolated}")
     print(f"sessions produced distinct video     : {distinct}")
 
     if args.output_dir is not None:
