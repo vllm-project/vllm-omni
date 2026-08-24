@@ -25,6 +25,23 @@ class _Backend:
         return True
 
 
+class _RunnerKVBackend:
+    def __init__(self) -> None:
+        self.kv_cache_config = None
+
+    def register_kv_cache_layers(self, layers):
+        return {layer_name: spec for layer_name, (_layer, spec) in layers.items()}
+
+    def initialize_kv_cache(self, config) -> None:
+        configured_layers = {layer_name for group in config.kv_cache_groups for layer_name in group.layer_names}
+        if configured_layers != {"image_attention"}:
+            raise ValueError(
+                "Rank-local Diffusion KVCacheConfig layer mismatch: "
+                f"expected=['image_attention'], configured={sorted(configured_layers)}"
+            )
+        self.kv_cache_config = config
+
+
 def _attention(*, enabled: bool) -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
@@ -47,6 +64,7 @@ def _runner(attention: Attention) -> DiffusionModelRunner:
     pipeline = nn.Module()
     pipeline.image_attention = attention
     runner.pipeline = pipeline
+    runner.diffusion_kv_backend = _RunnerKVBackend()
     return runner
 
 
@@ -102,14 +120,21 @@ def test_worker_selects_its_rank_local_config() -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 1
     worker.od_config = SimpleNamespace(num_gpus=2)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=None),
+        cache_config=SimpleNamespace(num_gpu_blocks=None),
+    )
+    worker._maybe_get_memory_pool_context = lambda _tag: nullcontext()
     worker.model_runner = SimpleNamespace(set_kv_cache_config=lambda config: setattr(worker, "installed", config))
-    configs = [object(), object()]
+    configs = [SimpleNamespace(num_blocks=4), SimpleNamespace(num_blocks=8)]
 
-    worker.set_kv_cache_configs(configs)
+    worker.set_kv_cache_configs(configs, 64)
 
     assert worker.installed is configs[1]
+    assert worker.vllm_config.model_config.max_model_len == 64
+    assert worker.vllm_config.cache_config.num_gpu_blocks == 8
     with pytest.raises(ValueError, match="rank count mismatch"):
-        worker.set_kv_cache_configs(configs[:1])
+        worker.set_kv_cache_configs(configs[:1], 64)
 
 
 def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:

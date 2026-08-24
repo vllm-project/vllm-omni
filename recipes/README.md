@@ -39,7 +39,6 @@ recipes/
 
 | Recipe | Task | Hardware |
 |--------|------|----------|
-| [`audiox/AudioX.md`](./audiox/AudioX.md) | Offline + online unified text/video→audio diffusion | 1x L4 24GB |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
@@ -58,7 +57,6 @@ recipes/
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU |
 | [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified |
-| [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |

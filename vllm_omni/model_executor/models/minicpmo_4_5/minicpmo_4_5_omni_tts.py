@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 """MiniCPM-o 4.5 native autoregressive Talker.
@@ -34,6 +34,14 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 _REPETITION_PENALTY_CHUNK_SIZE = 16
+# ``past_window`` of MiniCPMTTS's codec repetition penalty: both generate() and
+# generate_chunk() build it through gen_logits(), which hardcodes
+# CustomRepetitionPenaltyLogitsProcessorRepeat(penalty, num_code, 16).
+_CODEC_PENALTY_WINDOW = 16
+# MiniCPMTTS.generate's max_new_token. The Talker context bounds this further;
+# without it a request that never samples codec EOS keeps emitting frames for
+# twice as long as upstream would, which is audible as a long silent tail.
+_OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # Native duplex Talker must finish after one MiniCPMTTS.generate_chunk:
 # 25 codec frames (``codec_chunk_frames``) plus the terminating sample.
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
@@ -72,23 +80,31 @@ def _apply_batched_repetition_penalty(
     logits: torch.Tensor,
     histories: Sequence[torch.Tensor],
     *,
-    penalty: float,
+    penalty: float | torch.Tensor,
     window_size: int,
 ) -> torch.Tensor:
-    """Apply request-local frequency penalties to a batch of codec logits."""
+    """Apply request-local frequency penalties to a batch of codec logits.
+
+    ``penalty`` may be a scalar or one value per row, mirroring upstream's
+    per-request ``sampling_params.repetition_penalty``.
+    """
     if logits.ndim != 2:
         raise ValueError(f"batched codec logits must be 2D, got shape {tuple(logits.shape)}")
     batch_size, vocab_size = logits.shape
     if len(histories) != batch_size:
         raise ValueError(f"expected {batch_size} codec histories, got {len(histories)}")
-    if penalty == 1.0:
-        return logits
-
     if batch_size == 0:
         return logits
 
+    penalties = torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype).reshape(-1)
+    if penalties.numel() == 1:
+        penalties = penalties.expand(batch_size)
+    elif penalties.numel() != batch_size:
+        raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
+    if not bool((penalties != 1.0).any()):
+        return logits
+
     penalized = logits.clone()
-    penalty_tensor = torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype)
     for start in range(0, batch_size, _REPETITION_PENALTY_CHUNK_SIZE):
         end = min(start + _REPETITION_PENALTY_CHUNK_SIZE, batch_size)
         chunk_logits = logits[start:end]
@@ -106,7 +122,7 @@ def _apply_batched_repetition_penalty(
             encoded,
             minlength=(end - start) * vocab_size,
         ).reshape(end - start, vocab_size)
-        alpha = torch.pow(penalty_tensor, frequencies.to(dtype=logits.dtype))
+        alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
     return penalized
@@ -139,6 +155,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self._force_eos_rows: list[bool] | None = None
         self._mask_eos_rows: list[bool] | None = None
+        self._pending_force_eos_rows: list[bool] | None = None
+        self._penalty_histories: list[torch.Tensor] | None = None
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
@@ -315,11 +333,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"tts_ids={token_ids.shape[0]} tts_hidden={hidden_states.shape[0]} "
                     f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
-            state: dict[str, Any] = {"finished": empty_condition, "step": 0}
             if native_duplex:
                 max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
-                state["max_tokens"] = max_tokens
-                state["min_tokens"] = min_tokens
+            else:
+                # MiniCPMTTS.generate()'s max_new_token, clamped to what the
+                # Talker context can still hold. Sampler min_tokens (upstream's
+                # min_new_token=50) comes from the deploy YAML.
+                remaining = int(self._tts_config.max_position_embeddings) - target_len
+                max_tokens = max(min(_OFFLINE_CODEC_MAX_NEW_TOKENS, remaining), 1)
+                min_tokens = None
+            state: dict[str, Any] = {
+                "finished": empty_condition,
+                "step": 0,
+                "max_tokens": max_tokens,
+                "min_tokens": min_tokens,
+            }
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -354,7 +382,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # hand the same id to make_omni_output so Code2Wav sees it this step.
         code = input_ids.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)[-1:]
         embeds = self.emb_code[0](code)
-        if int(code.item()) == int(self._codec_eos_id):
+        code_id = int(code.item())
+        if code_id == int(self._codec_eos_id):
             if isinstance(state, dict):
                 state["finished"] = True
             elif stored is None:
@@ -388,6 +417,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
+        empty_history = hidden.new_empty((0,), dtype=torch.long)
+        penalty_histories = [empty_history for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
@@ -444,13 +475,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             audio = codes.get("audio") if isinstance(codes, Mapping) else None
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
                 codec_deltas[index] = audio.to(device=hidden.device, dtype=torch.long).reshape(-1, 1)
-                if state.get("max_tokens") is not None:
-                    state["step"] = int(state.get("step", 0)) + 1
+                state["step"] = int(state.get("step", 0)) + 1
+                # ``audio`` is the id sampled last step, i.e. exactly upstream's
+                # ``new_tokens[:, 0:t]`` history for the logits computed below.
+                recent = state.get("recent_codes")
+                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
+                state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
+            recent_codes = state.get("recent_codes")
+            if recent_codes:
+                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
-            # 26 samples include the terminating EOS, so force it after 25
-            # forwarded frames — the same cadence as generate_chunk.
+            # Duplex: 26 samples include the terminating EOS, so force it after
+            # 25 forwarded frames — the same cadence as generate_chunk.
+            # Offline: force-stop at the remaining Talker context rather than
+            # waiting for a sampled EOS.
             hit_chunk_limit = max_tokens is not None and step >= int(max_tokens) - 1
             chunk_done = empty_speech or hit_chunk_limit
             if hit_chunk_limit:
@@ -462,11 +502,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             mask_eos_rows[index] = not force_eos_rows[index] and min_tokens is not None and step < int(min_tokens)
             terminal_flags[index] = torch.tensor(chunk_done, dtype=torch.bool)
 
-        # Empty-speech and finished duplex chunks must sample codec EOS so
-        # the scheduler releases the request; mid-chunk rows mask EOS until
-        # the 26-token generate_chunk budget is met.
+        # Empty-speech rows, finished duplex chunks, and offline requests that
+        # fill the remaining Talker context must sample codec EOS so the
+        # scheduler releases the request. Mid-chunk rows mask EOS until
+        # min_tokens.
         self._force_eos_rows = force_eos_rows
         self._mask_eos_rows = mask_eos_rows
+        self._penalty_histories = penalty_histories
         meta_outputs = {"finished": terminal_flags}
         if emit_duplex_metadata:
             meta_outputs.update(
@@ -549,6 +591,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows = None
         need_force = bool(force_eos and len(force_eos) == logits.shape[0] and any(force_eos))
         need_mask = bool(mask_eos and len(mask_eos) == logits.shape[0] and any(mask_eos))
+        # sample() re-applies the decision on the sampled ids: vLLM's
+        # MinTokensLogitsProcessor runs after this and would blank the codec EOS
+        # we just forced (it is in the stage's ``stop_token_ids``), leaving an
+        # all -inf row and a request that never releases.
+        self._pending_force_eos_rows = force_eos if need_force else None
         if need_force or need_mask:
             logits = logits.clone()
             eos_id = int(self._codec_eos_id)
@@ -572,7 +619,64 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sampling_metadata,
                 prompt_token_ids=blank_scheduler_prompt_for_penalties(prompt_ids, logits.shape[-1]),
             )
-        return Sampler()(logits, sampling_metadata)
+        logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
+        force_eos = self._pending_force_eos_rows
+        self._pending_force_eos_rows = None
+        output = Sampler()(logits, sampling_metadata)
+        return self._force_eos_on_sampled_ids(output, force_eos)
+
+    def _apply_codec_repetition_penalty(self, logits, sampling_metadata):
+        """Score MiniCPMTTS.generate's windowed codec penalty, not vLLM's.
+
+        Upstream taxes a code by ``penalty ** frequency`` over the last
+        ``past_window`` frames only (``gen_logits`` builds
+        ``CustomRepetitionPenaltyLogitsProcessorRepeat(penalty, num_code, 16)``).
+        vLLM's is presence-based over the whole stream, so on a codec stream
+        thousands of frames long every code ever sampled ends up taxed by the
+        same flat factor while never-sampled codes stay untouched, and the tail
+        of a long answer drifts off the speech manifold into near-silence.
+
+        Runs before ``Sampler`` so the penalty lands ahead of top-k/top-p, as
+        upstream does. Upstream scores it after dividing by temperature, but
+        the penalty only rescales and preserves sign, so the two orders agree.
+        """
+        histories = self._penalty_histories
+        self._penalty_histories = None
+        penalties = getattr(sampling_metadata, "repetition_penalties", None)
+        if (
+            not isinstance(logits, torch.Tensor)
+            or histories is None
+            or len(histories) != logits.shape[0]
+            or not isinstance(penalties, torch.Tensor)
+            or getattr(sampling_metadata, "no_penalties", False)
+        ):
+            return logits, sampling_metadata
+        logits = _apply_batched_repetition_penalty(
+            logits,
+            histories,
+            penalty=penalties.to(device=logits.device, dtype=logits.dtype),
+            window_size=_CODEC_PENALTY_WINDOW,
+        )
+        # Neutralize the sampler's own pass so the penalty is scored once.
+        return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
+
+    def _force_eos_on_sampled_ids(self, output: Any, force_eos: list[bool] | None) -> Any:
+        """Overwrite sampled ids for rows the model terminated this step.
+
+        The codec EOS is a stage ``stop_token_ids`` entry, so vLLM's
+        ``min_tokens`` processor masks it for the first ``min_tokens`` steps.
+        A row the model forced to EOS therefore reaches the sampler as all
+        -inf and comes back as an arbitrary codec id, which keeps an
+        already-finished request decoding until its length cap.
+        """
+        if not force_eos or not any(force_eos):
+            return output
+        sampled = getattr(output, "sampled_token_ids", None)
+        if not isinstance(sampled, torch.Tensor) or sampled.shape[0] != len(force_eos):
+            return output
+        rows = torch.tensor(force_eos, dtype=torch.bool, device=sampled.device)
+        sampled[rows] = int(self._codec_eos_id)
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)

@@ -334,7 +334,7 @@ These PR shapes all trigger skip-ci:
 Skip-ci does **not** apply when the diff also touches product code (for example `vllm_omni/`), or when test files change assertions, imports, fixtures, or other non-skip logic. If the diff cannot be resolved (non-PR branches outside `main`), CI runs as usual.
 
 !!! note
-    Skipping L2/L3 does **not** disable the Docker image build step. Nightly (L4) upload can still run when the PR has a `nightly-test` label or on scheduled `main` builds with `NIGHTLY=1`. Bootstrap child steps live in `bootstrap-upload-steps.yml`; the hook entry step runs `upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml`, which injects `if` by step `key` from skip-ci before upload. See [CI Settings — Diff-aware CI](./ci/ci_settings.md#diff-aware-ci) and [Test System Overview](./ci/test_system_overview.md).
+    Skipping L2/L3 does **not** disable the Docker image build step. Nightly (L4) upload can still run when the PR has a `nightly-test` label or on scheduled `main` builds with `NIGHTLY=1`. Weekly (L5) upload can still run with `weekly-test`, `WEEKLY=1`, or `NON_CRITICAL=1`. Bootstrap child steps live in `bootstrap-upload-steps.yml`; the hook entry step runs `upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml`, which injects `if` by step `key` from skip-ci before upload. See [CI Settings — Diff-aware CI](./ci/ci_settings.md#diff-aware-ci) and [Test System Overview](./ci/test_system_overview.md).
 
 ### Code Quality
 

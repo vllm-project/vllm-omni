@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for data_entry_keys."""
 
 import msgspec
@@ -372,12 +375,12 @@ class TestSerializeDeserializePayload:
         assert torch.equal(restored["hidden_states"]["layers"][24], torch.tensor([3.0]))
 
     def test_tensor_dtype_preserved(self):
-        # bfloat16 excluded: numpy() doesn't support it; callers must cast before serializing.
-        for dtype in [torch.float16, torch.float32, torch.int64, torch.int32, torch.bool]:
+        for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.int32, torch.bool]:
             original: OmniPayload = {"codes": {"audio": torch.tensor([1], dtype=dtype)}}
             wire = serialize_payload(original)
             restored = deserialize_payload(wire)
             assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
+            assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
 
     def test_tensor_shape_preserved(self):
         t = torch.randn(3, 4, 5)

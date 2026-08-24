@@ -3649,7 +3649,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if reference_audios:
                 gen_params.extra_args["audio_path"] = reference_audios[0]
 
-            # Generate image or audio (e.g. AudioX) via AsyncOmni
+            # Generate image or audio via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
             default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)
