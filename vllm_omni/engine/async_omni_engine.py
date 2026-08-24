@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Async Omni Engine for vLLM-Omni multi-stage runtime.
 
@@ -375,9 +378,13 @@ class AsyncOmniEngine:
                     getattr(self, "_duplex_runtime_extension_path", None)
                 )
                 if duplex_runtime_extension is not None:
+                    stage_clients = []
+                    for pool in self.stage_pools:
+                        assert pool.stage_client is not None
+                        stage_clients.append(pool.stage_client)
                     validate_duplex_runtime_extension(
                         duplex_runtime_extension,
-                        sampling_defaults=tuple(pool.stage_client.default_sampling_params for pool in self.stage_pools),
+                        sampling_defaults=tuple(client.default_sampling_params for client in stage_clients),
                     )
 
             orchestrator = Orchestrator(
@@ -685,6 +692,7 @@ class AsyncOmniEngine:
             )
 
             # Full input processing (tokenization, multimodal, etc.)
+            assert self.input_processor is not None
             _t_preprocess = time.perf_counter()
             try:
                 request = self.input_processor.process_inputs(
@@ -763,11 +771,13 @@ class AsyncOmniEngine:
             Exception: Whatever prompt expansion or input processing raised.
                 The caller is expected to let it reach the client.
         """
+        assert self.prompt_expand_func is not None
         expanded = self.prompt_expand_func(original_prompt, stage0_params)
         if not expanded:
             return []
 
         companions: list[AddCompanionRequestMessage] = []
+        assert self.input_processor is not None
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
@@ -864,7 +874,7 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
-        if cache_backend in ("step_cache"):
+        if cache_backend == "step_cache":
             return {
                 "step_cache_dit_enabled": True,
                 "velocity_sim_thresholds": [0.95, 0.93],
@@ -1018,10 +1028,12 @@ class AsyncOmniEngine:
         if (
             kwargs.get("diffusion_attention_config") is not None
             or kwargs.get("diffusion_attention_backend") is not None
+            or kwargs.get("fastvideo_vsa_topk") is not None
         ):
             attention_config = parse_attention_config(
                 kwargs.get("diffusion_attention_config"),
                 attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
             )
 
         stage_engine_args = {
@@ -1223,6 +1235,7 @@ class AsyncOmniEngine:
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None
+                    or kwargs.get("fastvideo_vsa_topk") is not None
                 ):
                     has_stage_attention = (
                         hasattr(cfg.engine_args, "diffusion_attention_config")
@@ -1232,6 +1245,7 @@ class AsyncOmniEngine:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
+                            fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
                         )
                 quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:
