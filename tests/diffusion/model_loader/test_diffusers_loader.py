@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Tests for the DiffusersPipelineLoader.
@@ -23,6 +23,13 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     TensorBinding,
 )
 from vllm_omni.diffusion.models.helios import HeliosPipeline
+from vllm_omni.diffusion.models.interface import (
+    consumes_borrowed_weight_tensors,
+    consumes_borrowed_weights_synchronously,
+)
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
+    QwenImagePipeline,
+)
 from vllm_omni.diffusion.registry import initialize_model
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -257,6 +264,201 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
 
     with pytest.raises(ValueError, match="vae.weight"):
         loader.load_weights(model)
+
+
+def test_qwen_image_declares_borrowed_weight_contract():
+    pipeline = object.__new__(QwenImagePipeline)
+    assert consumes_borrowed_weights_synchronously(pipeline)
+
+
+def test_pinned_staging_wraps_final_stream_before_borrowing_consumer(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    events: list[str] = []
+
+    class _BorrowingModel(_DummyPipelineModel):
+        @consumes_borrowed_weight_tensors
+        def load_weights(self, weights):
+            events.append("consume")
+            return super().load_weights(weights)
+
+    model = _BorrowingModel(source_prefix="transformer.")
+    loader = _make_loader_with_weights(["transformer.weight"])
+    loader._should_use_pinned_staging = lambda _model: True  # type: ignore[method-assign]
+    empty_host_cache_calls: list[None] = []
+
+    def _stage(weights, *, state):
+        state.allocated = True
+        events.append("stage")
+        yield from weights
+
+    monkeypatch.setattr(loader_mod, "pinned_staging_weights_iterator", _stage)
+    monkeypatch.setattr(
+        loader_mod,
+        "release_pinned_staging_cache",
+        lambda: empty_host_cache_calls.append(None),
+    )
+    loader.load_weights(model)
+
+    assert events == ["consume", "stage"]
+    assert empty_host_cache_calls == [None]
+
+
+def test_undecorated_consumer_is_not_eligible_for_pinned_staging(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    class _UndecoratedCudaModel(nn.Module):
+        def load_weights(self, weights):
+            return list(weights)
+
+        def parameters(self, recurse: bool = True):
+            del recurse
+            return iter([SimpleNamespace(device=torch.device("cuda"))])
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False, tensor_parallel_size=1),
+        quantization_config=None,
+        enable_multithread_weight_load=True,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    monkeypatch.setattr(loader_mod, "is_pin_memory_available", lambda: True)
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING", "1")
+
+    assert not loader._should_use_pinned_staging(_UndecoratedCudaModel())
+
+
+def test_pinned_staging_cleanup_runs_on_consumer_error(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    events: list[str] = []
+
+    class _FailingBorrower(_DummyPipelineModel):
+        @consumes_borrowed_weight_tensors
+        def load_weights(self, weights):
+            next(iter(weights))
+            raise RuntimeError("injected consumer failure")
+
+    def _stage(weights, *, state):
+        state.allocated = True
+        try:
+            yield from weights
+        finally:
+            events.append("closed")
+
+    model = _FailingBorrower(source_prefix="transformer.")
+    loader = _make_loader_with_weights(["transformer.weight"])
+    loader._should_use_pinned_staging = lambda _model: True  # type: ignore[method-assign]
+    monkeypatch.setattr(loader_mod, "pinned_staging_weights_iterator", _stage)
+    monkeypatch.setattr(
+        loader_mod,
+        "release_pinned_staging_cache",
+        lambda: events.append("emptied"),
+    )
+
+    with pytest.raises(RuntimeError, match="injected consumer failure"):
+        loader.load_weights(model)
+
+    assert events == ["closed", "emptied"]
+
+
+def test_pinned_staging_eligibility_requires_accelerator_and_safe_mode(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    class _CudaBorrowingModel(nn.Module):
+        @consumes_borrowed_weight_tensors
+        def load_weights(self, weights):
+            return list(weights)
+
+        def parameters(self, recurse: bool = True):
+            del recurse
+            return iter([SimpleNamespace(device=torch.device("cuda"))])
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+        enable_multithread_weight_load=True,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = _CudaBorrowingModel()
+    monkeypatch.setattr(loader_mod, "is_pin_memory_available", lambda: True)
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING", "1")
+
+    assert loader._should_use_pinned_staging(model)
+
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING", "0")
+    assert not loader._should_use_pinned_staging(model)
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING", "1")
+
+    loader._active_load_format = "custom_pipeline"
+    assert not loader._should_use_pinned_staging(model)
+    loader._active_load_format = "default"
+
+    od_config.enable_cpu_offload = True
+    assert not loader._should_use_pinned_staging(model)
+    od_config.enable_cpu_offload = False
+
+    od_config.enable_layerwise_offload = True
+    assert not loader._should_use_pinned_staging(model)
+    od_config.enable_layerwise_offload = False
+
+    od_config.enable_distributed_layerwise_offload = True
+    assert not loader._should_use_pinned_staging(model)
+    od_config.enable_distributed_layerwise_offload = False
+
+    od_config.parallel_config.use_hsdp = True
+    assert not loader._should_use_pinned_staging(model)
+    od_config.parallel_config.use_hsdp = False
+
+    od_config.parallel_config.tensor_parallel_size = 2
+    assert not loader._should_use_pinned_staging(model)
+    od_config.parallel_config.tensor_parallel_size = 1
+
+    loader.quant_config = object()
+    assert not loader._should_use_pinned_staging(model)
+    loader.quant_config = None
+
+    od_config.enable_multithread_weight_load = False
+    assert not loader._should_use_pinned_staging(model)
+    od_config.enable_multithread_weight_load = True
+
+    loader.host_weight_plan = HostWeightPlan(backing_kind="checkpoint_mmap", bindings={})
+    assert not loader._should_use_pinned_staging(model)
+    loader.host_weight_plan = None
+
+    loader.load_config.safetensors_load_strategy = "torchao"
+    assert not loader._should_use_pinned_staging(model)
+    loader.load_config.safetensors_load_strategy = "lazy"
+
+    monkeypatch.setattr(loader_mod, "is_pin_memory_available", lambda: False)
+    assert not loader._should_use_pinned_staging(model)
+
+
+def test_online_quant_stream_bypasses_pinned_staging(monkeypatch):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    model = _DummyPipelineModel(source_prefix="transformer.")
+    loader = _make_loader_with_weights(["transformer.weight"])
+    loader._should_use_pinned_staging = lambda _model: True  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        loader,
+        "_stream_online_quant_weights_to_cpu",
+        lambda _model, weights: weights,
+    )
+    monkeypatch.setattr(
+        loader_mod,
+        "pinned_staging_weights_iterator",
+        lambda _weights: pytest.fail("online quant must not stage"),
+    )
+
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
 
 
 def test_stream_online_quant_weights_offloads_layers_after_processing():

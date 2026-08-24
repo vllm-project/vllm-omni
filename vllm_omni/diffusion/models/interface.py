@@ -1,16 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
     Literal,
+    ParamSpec,
     Protocol,
+    TypeVar,
     runtime_checkable,
 )
+
+_BORROWED_WEIGHT_CONSUMER_MARKER = "_consumes_borrowed_weight_tensors"
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def consumes_borrowed_weight_tensors(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Declare synchronous consumption of each ``load_weights`` tensor.
+
+    The decorated method must finish every read or copy from the current
+    checkpoint tensor, retain no aliases, and enqueue no asynchronous use
+    before requesting the next iterator item.
+
+    This is a method marker rather than a class capability so a subclass that
+    overrides ``load_weights`` must explicitly re-declare the contract.
+    """
+    setattr(method, _BORROWED_WEIGHT_CONSUMER_MARKER, True)
+    return method
+
+
+def consumes_borrowed_weights_synchronously(model: object) -> bool:
+    """Return whether the effective ``load_weights`` method declares the contract."""
+    method = getattr(type(model), "load_weights", None)
+    return bool(getattr(method, _BORROWED_WEIGHT_CONSUMER_MARKER, False))
+
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

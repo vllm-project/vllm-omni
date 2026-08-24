@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
@@ -12,6 +15,7 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -25,6 +29,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    "VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING": lambda: (
+        os.getenv(
+            "VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING",
+            "0",
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes"}
+    ),
 }
 
 

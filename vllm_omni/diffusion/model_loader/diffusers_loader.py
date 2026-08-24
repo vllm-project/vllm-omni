@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import contextlib
 import dataclasses
 import glob
@@ -9,7 +9,7 @@ import re
 import time
 from collections.abc import Generator, Iterable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import huggingface_hub
 import torch
@@ -26,8 +26,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.diffusion import envs as diffusion_envs
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp_to_model
@@ -39,7 +41,15 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.pinned_staging import (
+    PinnedStagingState,
+    pinned_staging_weights_iterator,
+    release_pinned_staging_cache,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.models.interface import (
+    consumes_borrowed_weights_synchronously,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -159,6 +169,7 @@ class DiffusersPipelineLoader:
         self.quant_config = od_config.quantization_config
         self.parallel_config = od_config.parallel_config
         self.host_weight_plan: HostWeightPlan | None = None
+        self._active_load_format = "default"
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -353,8 +364,8 @@ class DiffusersPipelineLoader:
 
     def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
         quant_config = self.quant_config
-        if hasattr(quant_config, "resolve"):
-            return quant_config.resolve(source.prefix.rstrip("."))
+        if quant_config is not None and hasattr(quant_config, "resolve"):
+            return cast(Any, quant_config).resolve(source.prefix.rstrip("."))
         return quant_config
 
     def _get_checkpoint_adapter(
@@ -471,6 +482,7 @@ class DiffusersPipelineLoader:
         self.host_weight_plan = None
         if load_format is None:
             load_format = "default"
+        self._active_load_format = load_format
         # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
         # weights are already quantized in the checkpoint — load directly on CPU.
         # For online quantization, load on device so quantization can run on accelerator,
@@ -524,19 +536,19 @@ class DiffusersPipelineLoader:
                     )
                     self.host_weight_plan = plan_result.plan
 
-                _skip_load = self.host_weight_plan is not None
+                host_weight_plan = self.host_weight_plan
 
-                if _skip_load:
+                if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
                         "AllGather" if _use_ag and _dlo_group_size > 1 else "rank-local",
-                        self.host_weight_plan.backing_kind,
-                        sorted(self.host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
+                        host_weight_plan.backing_kind,
+                        sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
                     ordinary_sources = tuple(
                         source
                         for source in weight_sources
-                        if source.prefix not in self.host_weight_plan.planned_source_prefixes
+                        if source.prefix not in host_weight_plan.planned_source_prefixes
                     )
                     if ordinary_sources:
                         logger.info(
@@ -546,7 +558,7 @@ class DiffusersPipelineLoader:
                         self.load_weights(
                             model,
                             sources=ordinary_sources,
-                            planned_weights=self.host_weight_plan.bindings,
+                            planned_weights=host_weight_plan.bindings,
                         )
                 else:
                     if _dist_offload and _use_ag and _has_online_quant:
@@ -609,7 +621,7 @@ class DiffusersPipelineLoader:
         marked = 0
         for module in model.modules():
             quant_method = getattr(module, "quant_method", None)
-            if getattr(quant_method, "supports_offload_after_quant", False):
+            if quant_method is not None and getattr(quant_method, "supports_offload_after_quant", False):
                 quant_method.enable_offload_after_quant()
                 marked += 1
         return marked
@@ -750,9 +762,25 @@ class DiffusersPipelineLoader:
     ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
+        staged_weights = None
+        staging_state = None
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
-        loaded_weights = model.load_weights(weights)
+        elif self._should_use_pinned_staging(model):
+            staging_state = PinnedStagingState()
+            staged_weights = pinned_staging_weights_iterator(
+                iter(weights),
+                state=staging_state,
+            )
+            weights = staged_weights
+        try:
+            loaded_weights = model.load_weights(weights)
+        finally:
+            if staged_weights is not None:
+                staged_weights.close()
+                del weights
+                if staging_state is not None and staging_state.allocated:
+                    release_pinned_staging_cache()
         if loaded_weights is not None:
             loaded_weights = set(loaded_weights).union(planned_weights)
 
@@ -781,6 +809,37 @@ class DiffusersPipelineLoader:
                 logger.warning(
                     f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
                 )
+
+    def _should_use_pinned_staging(self, model: nn.Module) -> bool:
+        if self._active_load_format != "default":
+            return False
+        if not consumes_borrowed_weights_synchronously(model):
+            return False
+        if self.host_weight_plan is not None:
+            return False
+        if self.quant_config is not None:
+            return False
+        if self.load_config.safetensors_load_strategy == "torchao":
+            return False
+        if not diffusion_envs.VLLM_OMNI_ENABLE_PINNED_WEIGHT_STAGING:
+            return False
+        if not getattr(self.od_config, "enable_multithread_weight_load", False):
+            return False
+        if any(
+            getattr(self.od_config, field, False)
+            for field in (
+                "enable_cpu_offload",
+                "enable_layerwise_offload",
+                "enable_distributed_layerwise_offload",
+            )
+        ):
+            return False
+        if self.parallel_config.use_hsdp or not is_pin_memory_available():
+            return False
+        if int(getattr(self.parallel_config, "tensor_parallel_size", 1)) != 1:
+            return False
+        parameter = next(model.parameters(), None)
+        return parameter is not None and parameter.device.type == "cuda"
 
     @staticmethod
     def _is_expected_quantized_weight(name: str) -> bool:
