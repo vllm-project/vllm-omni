@@ -116,3 +116,6 @@ pytest -q tests/diffusion/models/sensenova_u1/
   CUDA graph. It falls back to the ordinary cache when the device or the bundled
   `flash_attn_varlen_func` cannot support it; set `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` to force
   that fallback.
+- The first request after startup also pays the engine's lazy regional compile. Measured on one
+  A800 with cold inductor and triton caches: 1.43 s with the paged path on and 1.67 s with it
+  off, so the graph capture is not what dominates a cold first request.

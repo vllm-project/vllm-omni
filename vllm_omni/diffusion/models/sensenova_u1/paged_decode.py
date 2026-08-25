@@ -17,6 +17,17 @@ The way out is a paged cache. ``flash_attn_varlen_func`` takes the used length
 as a *tensor* (``seqused_k``) alongside a ``block_table``, so the buffers stay
 bucket-sized and capturable while the kernel reads only the valid prefix. One
 captured graph then serves every length in the bucket.
+
+Scope, and when to delete this. The cache is model-local on purpose:
+``DiffusionKVCacheManager`` reserves once per scheduler request, and
+``ARDiffusionModelRunner`` lives under ``vllm_omni/experimental``. SenseNova runs
+its whole autoregressive loop inside one pipeline ``forward``, so the decode
+steps never surface to the scheduler and it cannot admit, pool, evict, reuse a
+prefix for, or continuously batch them. What is here is therefore per-request
+buffers behind an identity block table, not general paged-KV support: it holds
+while the pipeline serves one sequence per forward. Once the decode loop is
+driven by a scheduler-visible runner, or the pipeline handles more than one
+sequence per forward, delete this file and use the manager instead.
 """
 
 from __future__ import annotations
