@@ -10,6 +10,7 @@ import torch
 
 from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
     RANGE_FLOOR,
+    ActionNormalizerContract,
     QuantileRotNormalizerContract,
 )
 
@@ -17,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class QuantileRotAffineNormalizer:
-    """Unclamped affine transform resolved from target q01/q99 statistics."""
+class ActionAffineNormalizer:
+    """Unclamped affine transform from a validated action contract."""
 
     offset: tuple[float, ...]
     scale: tuple[float, ...]
@@ -27,15 +28,16 @@ class QuantileRotAffineNormalizer:
     @classmethod
     def from_contract(
         cls,
-        contract: QuantileRotNormalizerContract,
-    ) -> QuantileRotAffineNormalizer:
-        suspicious = [index for index, value in enumerate(contract.transform.scale) if value <= 100.0 * RANGE_FLOOR]
-        if suspicious:
-            logger.warning(
-                "Cosmos-Dreams normalizer %s has scales close to range_floor at channels %s.",
-                contract.transform_sha256,
-                suspicious,
-            )
+        contract: ActionNormalizerContract,
+    ) -> ActionAffineNormalizer:
+        if isinstance(contract, QuantileRotNormalizerContract):
+            suspicious = [index for index, value in enumerate(contract.transform.scale) if value <= 100.0 * RANGE_FLOOR]
+            if suspicious:
+                logger.warning(
+                    "Cosmos-Dreams normalizer %s has scales close to range_floor at channels %s.",
+                    contract.transform_sha256,
+                    suspicious,
+                )
         return cls(
             offset=contract.transform.offset,
             scale=contract.transform.scale,
@@ -77,3 +79,7 @@ class QuantileRotAffineNormalizer:
         if not torch.isfinite(denormalized).all():
             raise ValueError("Cosmos-Dreams denormalized actions must contain only finite values.")
         return denormalized
+
+
+class QuantileRotAffineNormalizer(ActionAffineNormalizer):
+    """Backward-compatible name for the original AgiBot-only runtime API."""

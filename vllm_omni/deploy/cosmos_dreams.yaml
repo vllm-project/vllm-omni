@@ -18,7 +18,6 @@ stages:
       action_gen: true
       action_dim: 64
       num_embodiment_domains: 32
-      default_domain_id: 15
       default_fps: 15.0
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.35

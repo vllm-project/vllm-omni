@@ -26,7 +26,7 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_pre_process_func,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
-from vllm_omni.diffusion.models.cosmos_dreams.normalizer import QuantileRotAffineNormalizer
+from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
@@ -235,10 +235,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("Cosmos-Dreams requires a validated v2 action_schema.")
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
         self.action_normalizers = {
-            embodiment: QuantileRotAffineNormalizer.from_contract(contract)
+            embodiment: ActionAffineNormalizer.from_contract(contract)
             for embodiment, contract in action_schema.normalizers.items()
         }
-        self.default_domain_id = int(_nested_config_value(od_config, "default_domain_id", 0))
+        configured_domain_id = _nested_config_value(od_config, "default_domain_id")
+        artifact_domain_id = action_schema.embodiment_to_domain[action_schema.default_embodiment]
+        self.default_domain_id = int(artifact_domain_id if configured_domain_id is None else configured_domain_id)
         self.default_embodiment = action_schema.resolve_embodiment(
             action_schema.default_embodiment,
             self.default_domain_id,

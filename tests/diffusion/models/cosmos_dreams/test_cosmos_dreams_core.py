@@ -20,7 +20,10 @@ from vllm_omni.diffusion.models.cosmos_dreams.action_packing import (
     zero_null_action_values,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
-from vllm_omni.diffusion.models.cosmos_dreams.normalizer import QuantileRotAffineNormalizer
+from vllm_omni.diffusion.models.cosmos_dreams.normalizer import (
+    ActionAffineNormalizer,
+    QuantileRotAffineNormalizer,
+)
 from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
@@ -82,6 +85,25 @@ def _action_layout() -> dict[str, Any]:
                 "unit": "open_fraction",
                 "closed_value": 0.0,
                 "open_value": 1.0,
+            },
+        ],
+    }
+
+
+def _camera_action_layout() -> dict[str, Any]:
+    return {
+        "id": "camera_pose_backward_framewise_rot6d_v1",
+        "pose_convention": "backward_framewise",
+        "delta_equation": "T_i^-1 @ T_{i+1}",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+            {"name": "camera_translation", "offset": 0, "size": 3, "unit": "meter"},
+            {
+                "name": "camera_rotation",
+                "offset": 3,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
             },
         ],
     }
@@ -163,6 +185,82 @@ def _action_schema_payload() -> dict[str, Any]:
             "layout": schema["layout"],
             "padding": schema["padding"],
             "normalizer_sha256_by_embodiment": {"agibotworld": normalizer["transform_sha256"]},
+        }
+    )
+    return schema
+
+
+def _camera_action_schema_payload() -> dict[str, Any]:
+    translation_scale = 10.0
+    rotation_scale = 1.0
+    training_config_excerpt = {
+        "datasets": [
+            {
+                "dataset_class": "CameraDatasetSharded",
+                "embodiment": "camera_pose",
+                "method": "pose_scale",
+                "apply_forward_clamp": False,
+                "mode": "forward_dynamics",
+                "pose_convention": "backward_framewise",
+                "rotation_format": "rot6d",
+                "translation_scale": translation_scale,
+                "rotation_scale": rotation_scale,
+            }
+        ],
+        "experiment": "causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f",
+    }
+    normalizer: dict[str, Any] = {
+        "schema_version": 1,
+        "method": "pose_scale",
+        "transform": {
+            "type": "affine",
+            "offset": [0.0] * 9,
+            "scale": [float32_value(1.0 / translation_scale)] * 3 + [float32_value(1.0 / rotation_scale)] * 6,
+            "forward_clamp": False,
+        },
+        "derivation": {
+            "translation_scale": translation_scale,
+            "rotation_scale": rotation_scale,
+        },
+        "training_config": {
+            "experiment": training_config_excerpt["experiment"],
+            "resolved_sha256": canonical_sha256(training_config_excerpt),
+            "repository_revision": "d" * 40,
+        },
+    }
+    normalizer["transform_sha256"] = canonical_sha256(
+        {
+            "schema_version": normalizer["schema_version"],
+            "method": normalizer["method"],
+            "transform": normalizer["transform"],
+            "derivation": normalizer["derivation"],
+        }
+    )
+    schema: dict[str, Any] = {
+        "schema_version": 2,
+        "action_tokens_per_frame": 4,
+        "raw_action_dim": 9,
+        "model_action_dim": 64,
+        "num_embodiment_domains": 32,
+        "default_embodiment": "camera_pose",
+        "embodiment_to_domain": {"camera_pose": 2},
+        "layout": _camera_action_layout(),
+        "padding": {"stage": "after_normalization", "value": 0.0},
+        "training_config_excerpt": training_config_excerpt,
+        "normalizers": {"camera_pose": normalizer},
+    }
+    schema["contract_sha256"] = canonical_sha256(
+        {
+            "schema_version": schema["schema_version"],
+            "action_tokens_per_frame": schema["action_tokens_per_frame"],
+            "raw_action_dim": schema["raw_action_dim"],
+            "model_action_dim": schema["model_action_dim"],
+            "num_embodiment_domains": schema["num_embodiment_domains"],
+            "default_embodiment": schema["default_embodiment"],
+            "embodiment_to_domain": schema["embodiment_to_domain"],
+            "layout": schema["layout"],
+            "padding": schema["padding"],
+            "normalizer_sha256_by_embodiment": {"camera_pose": normalizer["transform_sha256"]},
         }
     )
     return schema
@@ -418,6 +516,28 @@ def test_action_contract_resolves_embodiment_and_rejects_domain_mismatch() -> No
         schema.resolve_embodiment("unknown", 15)
 
 
+def test_camera_action_contract_accepts_pose_scale_checkpoint_format() -> None:
+    schema = CosmosDreamsActionSchema.model_validate(_camera_action_schema_payload())
+
+    assert schema.raw_action_dim == 9
+    assert schema.layout.id == "camera_pose_backward_framewise_rot6d_v1"
+    assert schema.resolve_embodiment(None, 2) == "camera_pose"
+    assert schema.normalizers["camera_pose"].method == "pose_scale"
+    assert schema.normalizers["camera_pose"].transform.scale == pytest.approx((0.1,) * 3 + (1.0,) * 6)
+
+
+def test_camera_action_contract_rejects_tampered_scale_semantics() -> None:
+    payload = _camera_action_schema_payload()
+    payload["normalizers"]["camera_pose"]["derivation"]["translation_scale"] = 5.0
+    with pytest.raises(ValueError, match="pose_scale transform does not match"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _camera_action_schema_payload()
+    payload["normalizers"]["camera_pose"]["source"] = {}
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+
 def test_deployment_cannot_override_artifact_action_schema() -> None:
     artifact = _artifact()
     config = SimpleNamespace(
@@ -653,6 +773,28 @@ def test_pipeline_normalizes_float32_before_zero_padding_to_model_width() -> Non
     assert result.shape == (1, 64)
     assert result.dtype == torch.float16
     torch.testing.assert_close(result, torch.zeros_like(result))
+
+
+def test_pipeline_normalizes_camera_pose_and_uses_artifact_default_domain() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    action_schema = CosmosDreamsActionSchema.model_validate(_camera_action_schema_payload())
+    manifest = CosmosDreamsManifest(action_schema=action_schema)
+    stub = SimpleNamespace(manifest=manifest)
+    od_config = SimpleNamespace(custom_pipeline_args={}, model_config={}, tf_model_config={})
+
+    CosmosDreamsPipeline._init_conditioning(stub, od_config)
+
+    assert stub.default_domain_id == 2
+    assert stub.default_embodiment == "camera_pose"
+    raw = torch.tensor([[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    normalized = ActionAffineNormalizer.from_contract(action_schema.normalizers["camera_pose"]).normalize(raw)
+    torch.testing.assert_close(
+        normalized,
+        torch.tensor([[10.0, 20.0, 30.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]),
+    )
 
 
 def test_pipeline_disables_incompatible_generic_warmup() -> None:

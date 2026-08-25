@@ -34,6 +34,7 @@ def test_cosmos_dreams_topology_and_deploy_route_to_ar_diffusion() -> None:
     assert stage["max_num_seqs"] == 1
     assert stage["enforce_eager"] is True
     assert stage["model_class_name"] == "CosmosDreamsPipeline"
+    assert "default_domain_id" not in stage["model_config"]
     engine = DiffusionEngine.resolve_engine_class(SimpleNamespace(engine_backend=stage["engine_backend"]))
     assert issubclass(engine, ARDiffusionEngine)
 
