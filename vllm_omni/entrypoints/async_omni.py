@@ -162,6 +162,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self.endpoint_restrictions = self.engine.endpoint_restrictions
         self.duplex_session_config = self.engine.duplex_session_config
         self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
+        self.duplex_use_openai = self.engine.duplex_use_openai
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
