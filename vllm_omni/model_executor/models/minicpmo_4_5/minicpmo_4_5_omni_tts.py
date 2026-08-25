@@ -76,7 +76,8 @@ def _apply_repetition_penalty(
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
+    frequencies = torch.zeros(logits.shape[-1], device=logits.device, dtype=logits.dtype)
+    frequencies.scatter_add_(0, recent, torch.ones_like(recent, dtype=logits.dtype))
     alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
