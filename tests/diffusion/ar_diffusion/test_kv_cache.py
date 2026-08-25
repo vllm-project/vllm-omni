@@ -203,6 +203,90 @@ def test_key_and_value_caches_do_not_share_storage():
     assert torch.equal(k_pools[0], torch.zeros_like(k_pools[0]))
 
 
+def test_compiled_paged_write_does_not_clone_the_pool():
+    """The compiled graph must write the pools in place, not through a clone.
+
+    ``test_key_and_value_caches_do_not_share_storage`` pins the mechanism --
+    two allocations rather than one. This pins the effect that mechanism buys,
+    which is the reason the change exists: when K and V are halves of one
+    tensor, inductor's reinplace pass re-inplaces only the first, and
+    ``auto_functionalized_v2``'s clone of the pool survives into the generated
+    code as a full-pool allocation plus a copy, once per compiled region per
+    denoising step.
+
+    The stand-in op mirrors the real one's contract -- both pools declared in
+    ``mutates_args`` -- because that declaration is what drives the pass.
+
+    Inductor caches compiled code across ``torch._dynamo.reset()``, so without
+    ``force_disable_caches`` the second compile here would return the first
+    one's code and the assertion would silently describe the wrong graph.
+    """
+    import re
+
+    from torch._inductor import config as inductor_config
+    from torch._inductor.utils import run_and_get_code
+
+    num_blocks, num_layers, heads, dim = 8, 1, 4, 16
+    pool_numel = num_blocks * BLOCK * heads * dim
+
+    op_name = "test_kv_pool_clone::write"
+    if "write" not in getattr(torch.ops, "test_kv_pool_clone", []):
+
+        @torch.library.custom_op(op_name, mutates_args=("key_pool", "value_pool"))
+        def _write(key_pool: torch.Tensor, value_pool: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+            key_pool[0, 0, 0, 0] = value[0]
+            value_pool[0, 0, 0, 0] = value[0]
+            return value * 2
+
+        @_write.register_fake
+        def _(key_pool, value_pool, value):
+            return torch.empty_like(value)
+
+    class _Holder(torch.nn.Module):
+        def __init__(self, key_cache, value_cache):
+            super().__init__()
+            self.register_buffer("key_cache", key_cache)
+            self.register_buffer("value_cache", value_cache)
+
+        def forward(self, value):
+            return torch.ops.test_kv_pool_clone.write(self.key_cache, self.value_cache, value)
+
+    def pool_sized_allocations(code: str) -> list[int]:
+        sizes = []
+        for shape in re.findall(r"empty_strided_\w+\(\(([\d, ]*?)\)", code):
+            dims = [int(part) for part in shape.replace(" ", "").strip(",").split(",") if part]
+            numel = 1
+            for dim_size in dims:
+                numel *= dim_size
+            if dims and numel >= pool_numel:
+                sizes.append(numel)
+        return sizes
+
+    kv_pools, _, _ = allocate_kv_pool_with_views(
+        num_blocks=num_blocks,
+        block_size=BLOCK,
+        num_layers=num_layers,
+        num_kv_heads=heads,
+        head_dim=dim,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    key_cache, value_cache = kv_pools[0]
+
+    torch._dynamo.reset()
+    with inductor_config.patch(force_disable_caches=True):
+        _, codes = run_and_get_code(
+            torch.compile(_Holder(key_cache, value_cache), backend="inductor", fullgraph=True),
+            torch.ones(1),
+        )
+
+    generated = "\n".join(codes)
+    assert not pool_sized_allocations(generated), (
+        "the compiled graph allocates a pool-sized buffer, so the pool is being "
+        f"cloned rather than written in place: {pool_sized_allocations(generated)}"
+    )
+
+
 def test_build_manager_allocate_free_roundtrip():
     """End-to-end: a ARDiffusionRequestAdapter drives a real KVCacheManager.
 
