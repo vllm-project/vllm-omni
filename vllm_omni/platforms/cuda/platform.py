@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 
@@ -121,6 +121,18 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             # not abort startup — just treat FlashInfer as unavailable.
             logger.debug("FlashInfer probe failed (%s); treating as unavailable", e)
 
+        # FLASHINFER_ATTN needs BatchPrefillWithRaggedKVCacheWrapper, not just a
+        # top-level flashinfer package. Probe the actual symbol so a stub /
+        # partial wheel is not auto-routed then crash at layer init.
+        flashinfer_prefill_available = False
+        if flashinfer_available:
+            try:
+                from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper  # noqa: F401
+
+                flashinfer_prefill_available = True
+            except Exception as e:
+                logger.debug("FlashInfer prefill wrapper probe failed (%s); treating as unavailable", e)
+
         # TRTLLM_ATTN needs the trtllm-gen kernel specifically, not just any FlashInfer
         # wheel. Probe the actual symbol so a released wheel lacking it does not get
         # auto-routed to TRTLLM_ATTN and then crash on the first forward.
@@ -207,6 +219,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     "FLASHINFER_ATTN was explicitly selected, but FlashInfer is unavailable. "
                     "Install a compatible FlashInfer build or select a different backend."
                 )
+            if backend_upper == "FLASHINFER_ATTN" and not flashinfer_prefill_available:
+                raise ValueError(
+                    "FLASHINFER_ATTN was explicitly selected, but the installed FlashInfer build does not "
+                    "provide BatchPrefillWithRaggedKVCacheWrapper. Install a compatible build."
+                )
             if backend_upper == "CUDNN_ATTN":
                 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend
 
@@ -266,7 +283,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                 head_size,
             )
 
-        if is_blackwell and flashinfer_available:
+        if is_blackwell and flashinfer_prefill_available:
             from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionBackend
 
             if FlashInferAttentionBackend.supports_head_size(head_size):

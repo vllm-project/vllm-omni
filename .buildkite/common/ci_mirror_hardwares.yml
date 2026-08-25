@@ -8,8 +8,9 @@
 #     default: h100_2
 #     b200: b200_2
 # Unset/empty MIRROR_HW → default; MIRROR_HW=b200 → b200 entry.
-# Mapping without a key for MIRROR_HW omits that step (e.g. H100-only: default only).
-# CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW names a different chip.
+# MIRROR_HW must be empty or b200 (case-insensitive); unknown values fail the upload.
+# Mapping without a key for a known MIRROR_HW omits that step (e.g. H100-only: default only).
+# CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW=b200.
 # Unset MIRROR_HW keeps string presets. NPU presets ignore MIRROR_HW.
 #
 # CUDA naming: {chip}_{count}

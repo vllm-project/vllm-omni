@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
     _expand_mirror_hardwares,
+    _get_mirror_hw_selector,
     _load_bootstrap_steps,
     _render_bootstrap_pipeline,
     _render_test_pipeline,
@@ -255,6 +256,43 @@ def test_mirror_hardwares_mapping_requires_default() -> None:
         _expand_mirror_hardwares(
             {"label": "bad", "mirror_hardwares": {"b200": "b200_2"}},
         )
+
+
+@pytest.mark.parametrize("selector", ["", "   "])
+def test_mirror_hw_empty_selector_uses_default(monkeypatch: pytest.MonkeyPatch, selector: str) -> None:
+    monkeypatch.setenv("MIRROR_HW", selector)
+    assert _get_mirror_hw_selector() == ""
+
+
+@pytest.mark.parametrize("selector", ["b200", "B200"])
+def test_mirror_hw_known_selector_is_accepted(monkeypatch: pytest.MonkeyPatch, selector: str) -> None:
+    monkeypatch.setenv("MIRROR_HW", selector)
+    assert _get_mirror_hw_selector() == "b200"
+
+
+@pytest.mark.parametrize("selector", ["h100", "l4", "h200", "b20o"])
+def test_mirror_hw_unknown_selector_fails_closed(monkeypatch: pytest.MonkeyPatch, selector: str) -> None:
+    """Only empty or b200 are allowed; anything else must fail the upload."""
+    monkeypatch.setenv("MIRROR_HW", selector)
+    with pytest.raises(ValueError, match=rf"unsupported MIRROR_HW='{selector}'"):
+        _get_mirror_hw_selector()
+
+
+def test_mirror_hw_typo_fails_before_skipping_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typos must fail the upload, not silently drop CUDA steps (leave CPU report only)."""
+    monkeypatch.setenv("MIRROR_HW", "b20o")
+    doc = {
+        "steps": [
+            {"label": "CPU report", "commands": ["echo ok"]},
+            {
+                "label": "Nightly Omni",
+                "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"},
+            },
+            {"label": "H100 string", "mirror_hardwares": "h100_4"},
+        ],
+    }
+    with pytest.raises(ValueError, match=r"unsupported MIRROR_HW='b20o'"):
+        _render_test_pipeline(doc, changed_files=None)
 
 
 def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:

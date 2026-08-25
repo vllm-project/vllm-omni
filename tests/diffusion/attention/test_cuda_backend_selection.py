@@ -1,16 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 import types
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.envs import PACKAGES_CHECKER
-from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+# Importing CudaOmniPlatform pulls in vllm.platforms.cuda, which imports the
+# CUDA-only ``vllm._C_stable_libtorch`` extension at module top level. That
+# extension is absent on non-CUDA builds (e.g. Intel/XPU), so skip the whole
+# module there before the import can crash collection. ``is_cuda()`` resolves
+# the platform without importing cuda.py.
+if not current_platform.is_cuda():
+    pytest.skip("CUDA-only diffusion backend selection tests", allow_module_level=True)
+
+from vllm_omni.platforms.cuda.platform import CudaOmniPlatform  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -26,7 +36,20 @@ def _blackwell_sm120(monkeypatch: pytest.MonkeyPatch, *, cudnn_version: int = 90
 
 
 def _install_dummy_flashinfer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Top-level ``flashinfer`` only — no ``prefill`` wrapper (partial install)."""
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    # A previously imported real submodule must not satisfy the wrapper probe.
+    monkeypatch.delitem(sys.modules, "flashinfer.prefill", raising=False)
+
+
+def _install_dummy_flashinfer_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FlashInfer stub that exposes the prefill wrapper FLASHINFER_ATTN needs."""
+    prefill = types.ModuleType("flashinfer.prefill")
+    setattr(prefill, "BatchPrefillWithRaggedKVCacheWrapper", type("BatchPrefillWithRaggedKVCacheWrapper", (), {}))
+    pkg = types.ModuleType("flashinfer")
+    setattr(pkg, "prefill", prefill)
+    monkeypatch.setitem(sys.modules, "flashinfer", pkg)
+    monkeypatch.setitem(sys.modules, "flashinfer.prefill", prefill)
 
 
 def test_auto_selects_cudnn_for_supported_blackwell_head_size(monkeypatch: pytest.MonkeyPatch):
@@ -58,11 +81,29 @@ def test_auto_routes_non_multiple_head_size_to_sdpa_without_flashinfer(monkeypat
 
 def test_auto_selects_flashinfer_when_cudnn_too_old(monkeypatch: pytest.MonkeyPatch):
     _blackwell_sm120(monkeypatch, cudnn_version=90499)
-    _install_dummy_flashinfer(monkeypatch)
+    _install_dummy_flashinfer_prefill(monkeypatch)
 
     path = CudaOmniPlatform.get_diffusion_attn_backend_cls(None, head_size=128)
 
     assert path == DiffusionAttentionBackendEnum.FLASHINFER_ATTN.get_path()
+
+
+def test_auto_skips_flashinfer_when_only_toplevel_package(monkeypatch: pytest.MonkeyPatch):
+    """A stub that only imports ``flashinfer`` must not be auto-selected."""
+    _blackwell_sm120(monkeypatch, cudnn_version=90499)
+    _install_dummy_flashinfer(monkeypatch)
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(None, head_size=128)
+
+    assert path == DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+
+
+def test_explicit_flashinfer_raises_without_prefill_wrapper(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+    _install_dummy_flashinfer(monkeypatch)
+
+    with pytest.raises(ValueError, match="BatchPrefillWithRaggedKVCacheWrapper"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASHINFER_ATTN", head_size=128)
 
 
 def test_auto_skips_flashinfer_for_unsupported_head_size_when_cudnn_too_old(monkeypatch: pytest.MonkeyPatch):

@@ -100,7 +100,7 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
       b200: b200_2
     ```
 
-    Unset/`empty` `MIRROR_HW` → `default`; `MIRROR_HW=b200` → `b200` entry (resolved at upload time). If the mapping has no key for the current `MIRROR_HW` (for example only `default: h100_4`), that step is **skipped**. A CUDA preset string such as `mirror_hardwares: h100_4` is also skipped when `MIRROR_HW` is a different chip (e.g. `b200`). Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`.
+    Unset/`empty` `MIRROR_HW` → `default`; `MIRROR_HW=b200` → `b200` entry (resolved at upload time). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. If the mapping has no key for a *known* `MIRROR_HW` (for example only `default: h100_4`), that step is **skipped**. A CUDA preset string such as `mirror_hardwares: h100_4` is also skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`.
 
     **Conventions**
 

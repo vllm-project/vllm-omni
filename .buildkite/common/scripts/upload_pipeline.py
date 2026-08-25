@@ -22,9 +22,11 @@ Test pipeline mode (e.g. test-merge.yml):
         b200: b200_2
 
     Unset / empty ``MIRROR_HW`` → ``default``; ``MIRROR_HW=b200`` → ``b200`` entry.
-    If the mapping has no key for ``MIRROR_HW``, that step is omitted (H100-only jobs
-    list ``default`` and omit ``b200``). A CUDA preset string such as ``h100_4`` is
-    omitted when ``MIRROR_HW`` names a different chip (e.g. ``b200``).
+    ``MIRROR_HW`` must be empty or ``b200`` (case-insensitive); unknown values
+    (e.g. ``b20o``) fail the upload. If the mapping has no key for a *known*
+    ``MIRROR_HW``, that step is omitted (H100-only jobs list ``default`` and omit
+    ``b200``). A CUDA preset string such as ``h100_4`` is omitted when
+    ``MIRROR_HW=b200``.
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
@@ -247,6 +249,7 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
 
 # Longer tokens first so ``h100`` is not matched as a prefix of ``h200``.
 _CUDA_MIRROR_CHIPS = ("b200", "h200", "h100", "l4")
+_SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"b200"})
 
 
 def _cuda_chip_from_preset(preset: str) -> str | None:
@@ -259,8 +262,17 @@ def _cuda_chip_from_preset(preset: str) -> str | None:
 
 
 def _get_mirror_hw_selector() -> str:
-    """Return lowercase ``MIRROR_HW``, or empty to use the mapping ``default`` key."""
-    return os.environ.get("MIRROR_HW", "").strip().lower()
+    """Return lowercase ``MIRROR_HW``, or empty to use the mapping ``default`` key.
+
+    A set value must be ``b200`` (case-insensitive). Unknown values fail closed
+    so a typo cannot silently drop the CUDA pipeline.
+    """
+    selector = os.environ.get("MIRROR_HW", "").strip().lower()
+    if not selector:
+        return ""
+    if selector not in _SUPPORTED_MIRROR_HW_SELECTORS:
+        raise ValueError(f"unsupported MIRROR_HW={selector!r}; expected empty or 'b200'")
+    return selector
 
 
 def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | None:
@@ -273,7 +285,8 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | No
           b200: b200_2
 
     Selection uses env ``MIRROR_HW`` (case-insensitive). Unset/empty → ``default``.
-    Missing mapping key for the selector omits the step (returns None).
+    Only ``b200`` is a supported set value; anything else raises (fail the upload).
+    Missing mapping key for a *known* selector omits the step (returns None).
     A CUDA preset string is omitted when ``MIRROR_HW`` names a different chip.
     """
     if isinstance(hardware, str):
@@ -429,6 +442,10 @@ def _render_test_pipeline(
     e2e_only: bool = False,
 ) -> dict[str, Any]:
     """Filter steps by PR diff and strip uploader-only ``source_file_dependencies`` metadata."""
+    # Validate MIRROR_HW once up front. Per-step skip must not run for typos
+    # (e.g. b20o), or a pipeline can shrink to leftover CPU-only steps and
+    # still upload successfully.
+    _get_mirror_hw_selector()
     steps = doc.get("steps")
     if not isinstance(steps, list):
         return doc
