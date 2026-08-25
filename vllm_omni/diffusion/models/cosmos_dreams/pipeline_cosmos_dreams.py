@@ -228,11 +228,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         return CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
-        """Initialize the Humanoid action adapter from the v2 payload."""
+        """Initialize action adapters from the exported contract."""
 
         action_schema = self.manifest.action_schema
         if action_schema is None:
-            raise ValueError("Cosmos-Dreams requires a validated v2 action_schema.")
+            raise ValueError("Cosmos-Dreams requires a validated action_schema.")
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
         self.action_normalizers = {
             embodiment: ActionAffineNormalizer.from_contract(contract)
@@ -698,7 +698,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             action_value = self._get_sp_param(sp, "action", None)
         if action_value is None:
             return None
-        action = self.action_normalizers[embodiment].normalize(load_action_tensor(action_value))
+        action = load_action_tensor(action_value)
+        expected_raw_action_dim = self.manifest.raw_action_dim_for(embodiment)
+        if action.shape[-1] != expected_raw_action_dim:
+            raise ValueError(
+                f"Cosmos-Dreams embodiment {embodiment!r} requires raw action dimension "
+                f"{expected_raw_action_dim}, got {action.shape[-1]}."
+            )
+        action = self.action_normalizers[embodiment].normalize(action)
         action = pad_action_to_dim(action, self.manifest.max_action_dim)
         return action.to(device=self.device, dtype=self.dtype)
 

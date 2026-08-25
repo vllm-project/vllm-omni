@@ -345,6 +345,9 @@ class CosmosDreamsManifest:
     def raw_action_dim(self) -> int:
         return self.require_action_schema().raw_action_dim
 
+    def raw_action_dim_for(self, embodiment: str) -> int:
+        return self.require_action_schema().raw_action_dim_for(embodiment)
+
     @property
     def max_action_dim(self) -> int:
         return self.require_action_schema().model_action_dim

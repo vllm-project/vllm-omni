@@ -11,12 +11,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
 
-ACTION_SCHEMA_VERSION = 2
+ACTION_SCHEMA_VERSION = 3
 NORMALIZER_SCHEMA_VERSION = 1
 AGIBOT_RAW_ACTION_DIM = 29
 CAMERA_RAW_ACTION_DIM = 9
-# Backward-compatible name for the original v2 action family.
-RAW_ACTION_DIM = AGIBOT_RAW_ACTION_DIM
 MODEL_ACTION_DIM = 64
 ACTION_TOKENS_PER_FRAME = 4
 NUM_EMBODIMENT_DOMAINS = 32
@@ -359,45 +357,87 @@ ActionNormalizerContract = Annotated[
 ]
 
 
-class CosmosDreamsActionSchema(_StrictModel):
-    schema_version: Literal[2]
-    action_tokens_per_frame: Literal[4]
+class CosmosDreamsEmbodimentContract(_StrictModel):
+    """Per-embodiment raw action semantics for schema v3."""
+
+    domain_id: StrictInt = Field(ge=0, lt=NUM_EMBODIMENT_DOMAINS)
     raw_action_dim: Literal[9, 29]
+    layout: ActionLayout
+    normalizer: ActionNormalizerContract
+
+    @model_validator(mode="after")
+    def verify_layout_family(self) -> CosmosDreamsEmbodimentContract:
+        camera_variant = self.layout.id == CAMERA_LAYOUT_ID
+        expected_domain_id = CAMERA_DOMAIN_ID if camera_variant else AGIBOT_DOMAIN_ID
+        expected_raw_action_dim = CAMERA_RAW_ACTION_DIM if camera_variant else AGIBOT_RAW_ACTION_DIM
+        expected_normalizer_type = PoseScaleNormalizerContract if camera_variant else QuantileRotNormalizerContract
+        if self.domain_id != expected_domain_id:
+            raise ValueError(
+                f"Cosmos-Dreams layout {self.layout.id!r} requires domain_id={expected_domain_id}, "
+                f"got {self.domain_id}."
+            )
+        if self.raw_action_dim != expected_raw_action_dim:
+            raise ValueError(
+                f"Cosmos-Dreams layout {self.layout.id!r} requires raw_action_dim={expected_raw_action_dim}, "
+                f"got {self.raw_action_dim}."
+            )
+        if not isinstance(self.normalizer, expected_normalizer_type):
+            expected_method = "pose_scale" if camera_variant else "quantile_rot"
+            raise ValueError(f"Cosmos-Dreams layout {self.layout.id!r} requires method={expected_method!r}.")
+        return self
+
+
+class CosmosDreamsActionSchema(_StrictModel):
+    """Per-embodiment action contract for action-conditioned checkpoints."""
+
+    schema_version: Literal[3]
+    action_tokens_per_frame: Literal[4]
     model_action_dim: Literal[64]
     num_embodiment_domains: Literal[32]
     default_embodiment: str = Field(min_length=1)
-    embodiment_to_domain: dict[str, StrictInt]
-    layout: ActionLayout
+    embodiments: dict[str, CosmosDreamsEmbodimentContract]
     padding: ActionPadding
     training_config_excerpt: ResolvedTrainingConfigExcerpt
-    normalizers: dict[str, ActionNormalizerContract]
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def behavioral_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "action_tokens_per_frame": self.action_tokens_per_frame,
-            "raw_action_dim": self.raw_action_dim,
             "model_action_dim": self.model_action_dim,
             "num_embodiment_domains": self.num_embodiment_domains,
             "default_embodiment": self.default_embodiment,
-            "embodiment_to_domain": dict(sorted(self.embodiment_to_domain.items())),
-            "layout": self.layout.model_dump(mode="json", exclude_none=True),
-            "padding": self.padding.model_dump(mode="json"),
-            "normalizer_sha256_by_embodiment": {
-                name: normalizer.transform_sha256 for name, normalizer in sorted(self.normalizers.items())
+            "embodiments": {
+                name: {
+                    "domain_id": contract.domain_id,
+                    "raw_action_dim": contract.raw_action_dim,
+                    "layout": contract.layout.model_dump(mode="json", exclude_none=True),
+                    "normalizer_sha256": contract.normalizer.transform_sha256,
+                }
+                for name, contract in sorted(self.embodiments.items())
             },
+            "padding": self.padding.model_dump(mode="json"),
         }
 
     @property
     def digest(self) -> str:
-        """Digest the complete conditioning payload, including provenance."""
-
         return canonical_sha256(self.model_dump(mode="json", exclude_none=True))
 
-    def validate_temporal_compression_factor(self, temporal_compression_factor: int) -> None:
-        """Validate the action-token cadence against the model's VAE cadence."""
+    @property
+    def embodiment_to_domain(self) -> dict[str, int]:
+        return {name: contract.domain_id for name, contract in self.embodiments.items()}
 
+    @property
+    def normalizers(self) -> dict[str, ActionNormalizerContract]:
+        return {name: contract.normalizer for name, contract in self.embodiments.items()}
+
+    @property
+    def raw_action_dim(self) -> int:
+        """Compatibility view of the default embodiment's raw width."""
+
+        return self.embodiments[self.default_embodiment].raw_action_dim
+
+    def validate_temporal_compression_factor(self, temporal_compression_factor: int) -> None:
         if self.action_tokens_per_frame != temporal_compression_factor:
             raise ValueError(
                 "Cosmos-Dreams action_tokens_per_frame must equal temporal_compression_factor; "
@@ -406,60 +446,33 @@ class CosmosDreamsActionSchema(_StrictModel):
 
     @model_validator(mode="after")
     def verify_target_contract(self) -> CosmosDreamsActionSchema:
-        camera_variant = self.layout.id == CAMERA_LAYOUT_ID
-        expected_raw_action_dim = CAMERA_RAW_ACTION_DIM if camera_variant else AGIBOT_RAW_ACTION_DIM
-        if self.raw_action_dim != expected_raw_action_dim:
-            raise ValueError(
-                f"Cosmos-Dreams action_schema.raw_action_dim must be {expected_raw_action_dim} "
-                f"for layout {self.layout.id!r}."
-            )
-        if not self.embodiment_to_domain:
+        if not self.embodiments:
             raise ValueError("Cosmos-Dreams action contract must declare at least one embodiment.")
-        if set(self.embodiment_to_domain) != set(self.normalizers):
-            raise ValueError("Cosmos-Dreams normalizers must define exactly one entry per declared embodiment.")
-        if self.default_embodiment not in self.normalizers:
+        if self.default_embodiment not in self.embodiments:
             raise ValueError("Cosmos-Dreams default_embodiment must name one declared embodiment.")
-        if camera_variant:
-            if self.default_embodiment != "camera_pose":
-                raise ValueError("Cosmos-Dreams camera-pose action contract requires default camera_pose embodiment.")
-            if self.embodiment_to_domain != {"camera_pose": CAMERA_DOMAIN_ID}:
-                raise ValueError(
-                    f"Cosmos-Dreams camera-pose action contract requires camera_pose domain {CAMERA_DOMAIN_ID}."
-                )
-            if any(not isinstance(normalizer, PoseScaleNormalizerContract) for normalizer in self.normalizers.values()):
-                raise ValueError("Cosmos-Dreams camera-pose action contract requires pose_scale normalizers.")
-        else:
-            invalid_domains = {
-                name: domain_id
-                for name, domain_id in self.embodiment_to_domain.items()
-                if domain_id != AGIBOT_DOMAIN_ID
-            }
-            if invalid_domains:
-                raise ValueError(
-                    f"Cosmos-Dreams target action contract supports only domain {AGIBOT_DOMAIN_ID}, "
-                    f"got {invalid_domains}."
-                )
-            if any(
-                not isinstance(normalizer, QuantileRotNormalizerContract) for normalizer in self.normalizers.values()
-            ):
-                raise ValueError("Cosmos-Dreams AgiBot action contract requires quantile_rot normalizers.")
+
         descriptor_by_embodiment: dict[
             str,
             ResolvedDatasetDescriptor | CameraResolvedDatasetDescriptor,
         ] = {}
         for descriptor in self.training_config_excerpt.datasets:
-            if camera_variant != isinstance(descriptor, CameraResolvedDatasetDescriptor):
-                raise ValueError("Cosmos-Dreams action layout and training dataset family disagree.")
             previous = descriptor_by_embodiment.get(descriptor.embodiment)
             if previous is not None and previous != descriptor:
                 raise ValueError(f"Cosmos-Dreams embodiment {descriptor.embodiment!r} has conflicting semantics.")
             descriptor_by_embodiment[descriptor.embodiment] = descriptor
-        descriptor_embodiments = set(descriptor_by_embodiment)
-        if descriptor_embodiments != set(self.normalizers):
-            raise ValueError("Cosmos-Dreams training dataset descriptors must cover exactly the declared normalizers.")
+        if set(descriptor_by_embodiment) != set(self.embodiments):
+            raise ValueError("Cosmos-Dreams embodiment contracts must exactly cover the resolved dataset descriptors.")
+
         resolved_sha256 = canonical_sha256(self.training_config_excerpt.model_dump(mode="json"))
         repository_revisions: set[str] = set()
-        for embodiment, normalizer in self.normalizers.items():
+        for embodiment, contract in self.embodiments.items():
+            descriptor = descriptor_by_embodiment[embodiment]
+            camera_variant = isinstance(descriptor, CameraResolvedDatasetDescriptor)
+            if camera_variant != (contract.layout.id == CAMERA_LAYOUT_ID):
+                raise ValueError(
+                    f"Cosmos-Dreams embodiment {embodiment!r} layout disagrees with its dataset descriptor."
+                )
+            normalizer = contract.normalizer
             if normalizer.training_config.experiment != self.training_config_excerpt.experiment:
                 raise ValueError(f"Cosmos-Dreams normalizer {embodiment!r} disagrees with the training experiment.")
             if normalizer.training_config.resolved_sha256 != resolved_sha256:
@@ -467,7 +480,6 @@ class CosmosDreamsActionSchema(_StrictModel):
                     f"Cosmos-Dreams normalizer {embodiment!r} has the wrong resolved training-config hash."
                 )
             repository_revisions.add(normalizer.training_config.repository_revision)
-            descriptor = descriptor_by_embodiment[embodiment]
             if isinstance(normalizer, QuantileRotNormalizerContract):
                 if normalizer.source.repository_revision != normalizer.training_config.repository_revision:
                     raise ValueError(f"Cosmos-Dreams normalizer {embodiment!r} mixes source and training revisions.")
@@ -499,18 +511,43 @@ class CosmosDreamsActionSchema(_StrictModel):
         return self
 
     def resolve_embodiment(self, name: str | None, domain_id: int | None) -> str:
-        """Resolve the normalizer independently of the model's domain embedding."""
-
         if name is None or not str(name).strip():
-            embodiment = self.default_embodiment
+            candidates = [
+                embodiment
+                for embodiment, contract in self.embodiments.items()
+                if domain_id is not None and contract.domain_id == int(domain_id)
+            ]
+            if domain_id is None or self.default_embodiment in candidates:
+                embodiment = self.default_embodiment
+            elif len(candidates) == 1:
+                embodiment = candidates[0]
+            elif not candidates:
+                raise ValueError(f"No Cosmos-Dreams embodiment uses domain_id={domain_id}.")
+            else:
+                raise ValueError(
+                    f"Cosmos-Dreams domain_id={domain_id} is ambiguous across {sorted(candidates)}; "
+                    "supply an embodiment name."
+                )
         else:
             embodiment = str(name).strip().lower()
-        if embodiment not in self.normalizers:
-            raise ValueError(f"Unknown Cosmos-Dreams embodiment {name!r}; expected one of {sorted(self.normalizers)}.")
-        expected_domain = self.embodiment_to_domain[embodiment]
+        if embodiment not in self.embodiments:
+            raise ValueError(f"Unknown Cosmos-Dreams embodiment {name!r}; expected one of {sorted(self.embodiments)}.")
+        expected_domain = self.embodiments[embodiment].domain_id
         if domain_id is not None and int(domain_id) != expected_domain:
             raise ValueError(
                 "Cosmos-Dreams embodiment/domain mismatch: "
                 f"{embodiment!r} requires domain_id={expected_domain}, got {domain_id}."
             )
         return embodiment
+
+    def raw_action_dim_for(self, embodiment: str) -> int:
+        resolved = self.resolve_embodiment(embodiment, None)
+        return self.embodiments[resolved].raw_action_dim
+
+    def layout_for(self, embodiment: str) -> ActionLayout:
+        resolved = self.resolve_embodiment(embodiment, None)
+        return self.embodiments[resolved].layout
+
+    def normalizer_for(self, embodiment: str) -> ActionNormalizerContract:
+        resolved = self.resolve_embodiment(embodiment, None)
+        return self.embodiments[resolved].normalizer

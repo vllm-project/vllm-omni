@@ -20,7 +20,7 @@ TransferHint = Literal["edge", "blur", "depth", "seg"]
 
 
 class CosmosDreamsActionConditioning(CosmosDreamsActionSchema):
-    """Schema-v3 action branch, retaining the complete schema-v2 payload."""
+    """Schema-v3 action-conditioning branch."""
 
     mode: Literal["action"]
 

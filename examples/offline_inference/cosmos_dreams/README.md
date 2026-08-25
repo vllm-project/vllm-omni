@@ -5,9 +5,11 @@ payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`imag
 `action`, `fps`/`conditioning_fps`, `domain_id`, and
 `domain_name`/`embodiment`, or point to a pickle with `pickle_path`,
 `pkl_path`, or `data_path`. The first source frame is used as the causal prefix;
-action rows are normalized using the selected embodiment's exported contract
-and padded to 64 dimensions. When no embodiment is supplied, the artifact's
-declared default (currently `agibotworld`) is used.
+action rows are validated and normalized using the selected embodiment's
+exported raw dimension, layout, and normalizer before being padded to 64
+dimensions. Mixed-layout checkpoints select the entry through `domain_name` or
+a unique `domain_id`; when neither is supplied, the artifact's declared default
+is used. Supply `domain_name` when several normalizers share one domain ID.
 
 ```bash
 python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
