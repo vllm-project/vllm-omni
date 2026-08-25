@@ -440,9 +440,41 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
         return parse_cosmos_dreams_tick(tick)
 
-    def _validate_conditioning_request(self, sp, typed_inputs: Any | None) -> _ActionRequestContract:
+    def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
+        """Resolve the request FPS used by prompts, mRoPE, and fingerprints."""
+
+        del prompt_data
+        return _admission_float(
+            _first_not_none(
+                self._get_sp_param(sp, "resolved_frame_rate", None),
+                self._get_sp_param(sp, "frame_rate", None),
+                self._get_sp_param(sp, "fps", None),
+                self.default_fps,
+            ),
+            "FPS",
+        )
+
+    def _resolve_requested_pixel_frames(
+        self,
+        sp: Any,
+        prompt_data: Any,
+        conditioning_request: Any,
+    ) -> int:
+        """Return the authoritative pixel-frame count for a full rollout."""
+
+        del prompt_data, conditioning_request
+        return _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
+
+    def _validate_conditioning_request(
+        self,
+        sp,
+        typed_inputs: Any | None,
+        *,
+        prompt_data: Any = None,
+    ) -> _ActionRequestContract:
         """Resolve Humanoid domain and embodiment without mutating state."""
 
+        del prompt_data
         domain_name = (
             typed_inputs.domain_name if typed_inputs is not None else self._get_sp_param(sp, "domain_name", None)
         )
@@ -477,9 +509,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         request: _ActionRequestContract,
         start_frame: int,
         target_frame: int,
+        prompt_data: Any = None,
     ) -> _ActionConditioning:
         """Normalize action rows and freeze their request-wide indexing mode."""
 
+        del prompt_data
         raw_action = self._prepare_raw_action(
             sp,
             embodiment=request.embodiment,
@@ -574,7 +608,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         height: int,
         width: int,
         fps: float,
-        conditioning_request: _ActionRequestContract,
+        conditioning_request: Any,
     ) -> CosmosDreamsSessionFingerprint:
         return CosmosDreamsSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
@@ -1092,18 +1126,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos-Dreams resolution is fixed per deployment: "
                 f"requested {height}x{width}, configured {self.manifest.height}x{self.manifest.width}."
             )
-        fps = _admission_float(
-            _first_not_none(
-                self._get_sp_param(sp, "resolved_frame_rate", None),
-                self._get_sp_param(sp, "frame_rate", None),
-                self._get_sp_param(sp, "fps", None),
-                self.default_fps,
-            ),
-            "FPS",
-        )
+        fps = self._resolve_request_fps(sp, prompt_data)
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
-        conditioning_request = self._validate_conditioning_request(sp, typed_inputs)
+        conditioning_request = self._validate_conditioning_request(
+            sp,
+            typed_inputs,
+            prompt_data=prompt_data,
+        )
 
         guidance_scale = _admission_float(
             _first_not_none(self._get_sp_param(sp, "guidance_scale", None), 1.0),
@@ -1168,6 +1198,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos-Dreams initial media may only be supplied at frame 0; session reset required."
             )
 
+        requested_pixel_frames: int | None = None
         if tick:
             tick_frames = _admission_int(
                 (
@@ -1193,7 +1224,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     f"chunk boundary, got target latent frame {target_frame}."
                 )
         else:
-            requested_pixel_frames = _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
+            requested_pixel_frames = self._resolve_requested_pixel_frames(
+                sp,
+                prompt_data,
+                conditioning_request,
+            )
             if requested_pixel_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos-Dreams num_frames must be positive, got {requested_pixel_frames}."
@@ -1210,6 +1245,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 request=conditioning_request,
                 start_frame=start_frame,
                 target_frame=target_frame,
+                prompt_data=prompt_data,
             )
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
@@ -1291,7 +1327,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 else:
                     output_value = self._decode_latents(accumulated).clamp(-1, 1)
             if not tick:
-                output_value = output_value[:, :, : int(sp.num_frames or 1)]
+                assert requested_pixel_frames is not None
+                output_value = output_value[:, :, :requested_pixel_frames]
 
         if not tick:
             state.terminal = True

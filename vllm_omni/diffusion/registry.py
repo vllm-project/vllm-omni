@@ -331,6 +331,21 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos_dreams",
         "CosmosDreamsPipeline",
     ),
+    "CosmosDreamsTransferPipeline": (
+        "cosmos_dreams",
+        "pipeline_cosmos_dreams_transfer",
+        "CosmosDreamsTransferPipeline",
+    ),
+    "CosmosDreamsTransferOmniPipeline": (
+        "cosmos_dreams",
+        "pipeline_cosmos_dreams_transfer",
+        "CosmosDreamsTransferPipeline",
+    ),
+    "Cosmos3TransferInteractivePipeline": (
+        "cosmos_dreams",
+        "pipeline_cosmos_dreams_transfer",
+        "CosmosDreamsTransferPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -386,6 +401,9 @@ _NO_CACHE_ACCELERATION = {
     "CosmosDreamsPipeline",
     "CosmosDreamsOmniPipeline",
     "Cosmos3InteractivePipeline",
+    "CosmosDreamsTransferPipeline",
+    "CosmosDreamsTransferOmniPipeline",
+    "Cosmos3TransferInteractivePipeline",
 }
 
 
@@ -613,6 +631,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "CosmosDreamsPipeline": "get_cosmos_dreams_post_process_func",
     "CosmosDreamsOmniPipeline": "get_cosmos_dreams_post_process_func",
     "Cosmos3InteractivePipeline": "get_cosmos_dreams_post_process_func",
+    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_post_process_func",
+    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_post_process_func",
+    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
@@ -629,6 +650,9 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "CosmosDreamsPipeline": "get_cosmos_dreams_ir_op_priority_func",
     "CosmosDreamsOmniPipeline": "get_cosmos_dreams_ir_op_priority_func",
     "Cosmos3InteractivePipeline": "get_cosmos_dreams_ir_op_priority_func",
+    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
+    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
+    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -663,6 +687,9 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "CosmosDreamsPipeline": "get_cosmos_dreams_pre_process_func",
     "CosmosDreamsOmniPipeline": "get_cosmos_dreams_pre_process_func",
     "Cosmos3InteractivePipeline": "get_cosmos_dreams_pre_process_func",
+    "CosmosDreamsTransferPipeline": "get_cosmos_dreams_transfer_pre_process_func",
+    "CosmosDreamsTransferOmniPipeline": "get_cosmos_dreams_transfer_pre_process_func",
+    "Cosmos3TransferInteractivePipeline": "get_cosmos_dreams_transfer_pre_process_func",
 }
 
 

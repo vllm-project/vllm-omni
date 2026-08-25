@@ -11,6 +11,11 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 from vllm_omni.diffusion.models.cosmos_dreams.action_contract import CosmosDreamsActionSchema
+from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
+    CosmosDreamsActionConditioning,
+    CosmosDreamsControlVideoConditioning,
+    parse_cosmos_dreams_v3_conditioning,
+)
 
 _V2_EXPORTED_ARTIFACT_FIELDS = frozenset(
     {
@@ -38,7 +43,7 @@ _V2_EXPORTED_ARTIFACT_FIELDS = frozenset(
 )
 _EXPORTED_ARTIFACT_REQUIRED_FIELDS_BY_VERSION = {2: _V2_EXPORTED_ARTIFACT_FIELDS}
 _EXPORTED_ARTIFACT_ALLOWED_FIELDS_BY_VERSION = {2: _V2_EXPORTED_ARTIFACT_FIELDS}
-_CONDITIONING_ARTIFACT_FIELD_BY_VERSION = {2: "action_schema"}
+_CONDITIONING_ARTIFACT_FIELDS = frozenset({"action_schema", "conditioning"})
 _LEGACY_NORMALIZER_FIELDS = {"action_normalizer", "normalizer_id", "normalizer_source"}
 
 
@@ -90,10 +95,9 @@ def _exported_artifact_source(config: Any) -> dict[str, Any]:
     return _mapping(transformer_config.get("cosmos_dreams"))
 
 
-def _validate_deploy_overrides(config: Any, artifact: dict[str, Any], *, schema_version: int) -> None:
+def _validate_deploy_overrides(config: Any, artifact: dict[str, Any]) -> None:
     """Reject deploy values that contradict the signed artifact contract."""
 
-    conditioning_field = _CONDITIONING_ARTIFACT_FIELD_BY_VERSION.get(schema_version)
     for attr in ("custom_pipeline_args", "model_config"):
         root = _mapping(getattr(config, attr, None))
         legacy_root_fields = sorted(_LEGACY_NORMALIZER_FIELDS & set(root))
@@ -101,7 +105,7 @@ def _validate_deploy_overrides(config: Any, artifact: dict[str, Any], *, schema_
             raise ValueError(
                 f"Cosmos-Dreams deployment contains legacy normalizer fields in {attr}: {legacy_root_fields}."
             )
-        if conditioning_field is not None and conditioning_field in root:
+        for conditioning_field in sorted(_CONDITIONING_ARTIFACT_FIELDS & set(root)):
             raise ValueError(
                 f"Cosmos-Dreams {conditioning_field} may only come from transformer/config.json, "
                 f"not {attr}.{conditioning_field}."
@@ -114,7 +118,7 @@ def _validate_deploy_overrides(config: Any, artifact: dict[str, Any], *, schema_
                     "Cosmos-Dreams deployment contains legacy normalizer fields in "
                     f"{attr}.{key}: {legacy_override_fields}."
                 )
-            if conditioning_field is not None and conditioning_field in override:
+            for conditioning_field in sorted(_CONDITIONING_ARTIFACT_FIELDS & set(override)):
                 raise ValueError(
                     f"Cosmos-Dreams {conditioning_field} may only come from transformer/config.json, "
                     f"not {attr}.{key}.{conditioning_field}."
@@ -191,10 +195,30 @@ def _parse_v2_manifest(
     }
 
 
+_V3_EXPORTED_ARTIFACT_FIELDS = (_V2_EXPORTED_ARTIFACT_FIELDS - {"action_schema"}) | {"conditioning"}
+_EXPORTED_ARTIFACT_REQUIRED_FIELDS_BY_VERSION[3] = _V3_EXPORTED_ARTIFACT_FIELDS
+_EXPORTED_ARTIFACT_ALLOWED_FIELDS_BY_VERSION[3] = _V3_EXPORTED_ARTIFACT_FIELDS
+
+
+def _parse_v3_manifest(
+    manifest_cls: type[CosmosDreamsManifest],
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Parse the additive v3 control-video conditioning contract."""
+
+    values = _parse_v2_manifest(manifest_cls, sources)
+    raw_conditioning = _first(sources, "conditioning", default=None)
+    values.update(
+        schema_version=3,
+        conditioning=parse_cosmos_dreams_v3_conditioning(raw_conditioning) if raw_conditioning is not None else None,
+    )
+    return values
+
+
 _MANIFEST_PARSERS_BY_VERSION: dict[
     int,
     Callable[[type[CosmosDreamsManifest], list[dict[str, Any]]], dict[str, Any]],
-] = {2: _parse_v2_manifest}
+] = {2: _parse_v2_manifest, 3: _parse_v3_manifest}
 
 
 @dataclass(frozen=True)
@@ -295,12 +319,23 @@ class CosmosDreamsManifest:
             )
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
             raise ValueError("Cosmos-Dreams checkpoint_hash cannot be the all-zero template value")
+        if self.schema_version == 3 and not isinstance(
+            conditioning,
+            CosmosDreamsActionConditioning | CosmosDreamsControlVideoConditioning,
+        ):
+            raise ValueError("Cosmos-Dreams schema v3 requires conditioning with a recognized mode discriminator.")
 
     def require_action_schema(self) -> CosmosDreamsActionSchema:
         schema = self.action_schema
         if schema is None:
             raise ValueError("Cosmos-Dreams action_schema is unavailable.")
         return schema
+
+    def require_control_video_conditioning(self) -> CosmosDreamsControlVideoConditioning:
+        conditioning = self.conditioning
+        if not isinstance(conditioning, CosmosDreamsControlVideoConditioning):
+            raise ValueError("Cosmos-Dreams control_video conditioning is unavailable.")
+        return conditioning
 
     @property
     def action_tokens_per_frame(self) -> int:
@@ -330,6 +365,8 @@ class CosmosDreamsManifest:
     def conditioning_tokens_per_frame(self) -> int:
         """Token contribution owned by the selected conditioning payload."""
 
+        if isinstance(self.conditioning, CosmosDreamsControlVideoConditioning):
+            return 0
         return self.action_tokens_per_frame
 
     @property
@@ -381,7 +418,7 @@ class CosmosDreamsManifest:
                 raise ValueError(
                     f"Cosmos-Dreams transformer artifact contains unknown fields: {unknown_artifact_fields}."
                 )
-            _validate_deploy_overrides(od_config, artifact, schema_version=schema_version)
+            _validate_deploy_overrides(od_config, artifact)
         else:
             artifact = _exported_artifact_source(od_config)
         sources = [artifact] if artifact else _manifest_sources(od_config)
@@ -399,7 +436,7 @@ class CosmosDreamsManifest:
                 f"expected one of {sorted(_MANIFEST_PARSERS_BY_VERSION)}"
             )
         if artifact and not require_explicit:
-            _validate_deploy_overrides(od_config, artifact, schema_version=schema_version)
+            _validate_deploy_overrides(od_config, artifact)
         return cls(**parser(cls, sources))
 
     def require_exported_artifact(self) -> None:

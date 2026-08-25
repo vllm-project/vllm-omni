@@ -227,6 +227,47 @@ def transfer_max_frames_from_extra_args(extra_args: Mapping[str, Any] | None) ->
     return max(1, int(value))
 
 
+def parse_transfer_hint(key: str, raw: Any) -> Cosmos3TransferHint:
+    """Parse and validate one Transfer hint using the shared Cosmos3 contract."""
+
+    if key not in _TRANSFER_HINT_FIELDS:
+        raise ValueError(f"Unsupported Cosmos3 transfer hint: {key!r}.")
+    if raw is True:
+        raw = {}
+    elif isinstance(raw, str | Path):
+        raw = {"control_path": str(raw)}
+    if not isinstance(raw, Mapping):
+        raise TypeError(f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}.")
+    unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
+            f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
+        )
+    try:
+        control_weight = float(raw.get("control_weight", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number.") from exc
+    if not math.isfinite(control_weight) or control_weight < 0.0:
+        raise ValueError(
+            f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
+        )
+
+    hint = Cosmos3TransferHint(
+        key=key,
+        control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
+        control=raw.get("control"),
+        control_weight=control_weight,
+        preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
+        preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
+    )
+    if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
+        raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
+    if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
+        raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
+    return hint
+
+
 def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3TransferConfig | None:
     extra = _extra_args(sp)
     hints: dict[str, Cosmos3TransferHint] = {}
@@ -234,38 +275,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
         raw = _param(extra, sp, prompt_data, key, None)
         if raw is None:
             continue
-        if raw is True:
-            raw = {}
-        elif isinstance(raw, str | Path):
-            raw = {"control_path": str(raw)}
-        if not isinstance(raw, Mapping):
-            raise TypeError(
-                f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}."
-            )
-        unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
-        if unknown_fields:
-            raise ValueError(
-                f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
-                f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
-            )
-        try:
-            control_weight = float(raw.get("control_weight", 1.0))
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number."
-            ) from exc
-        if not math.isfinite(control_weight) or control_weight < 0.0:
-            raise ValueError(
-                f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
-            )
-        hints[key] = Cosmos3TransferHint(
-            key=key,
-            control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
-            control=raw.get("control"),
-            control_weight=control_weight,
-            preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
-            preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
-        )
+        hints[key] = parse_transfer_hint(key, raw)
 
     if not hints:
         transfer_only = (
@@ -367,11 +377,6 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
         raise ValueError("Cosmos3 transfer max_frames must be positive.")
     if config.num_first_chunk_conditional_frames < 0:
         raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames must be non-negative.")
-    for hint in hints.values():
-        if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
-            raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
-        if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
-            raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
     _ = config.normalized_control_weights
     return config
 

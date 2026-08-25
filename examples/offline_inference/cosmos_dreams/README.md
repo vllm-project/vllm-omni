@@ -22,3 +22,21 @@ python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
 Use `--output-type latent --output sample_0.pt` for the pre-VAE parity gate.
 Full rollouts send both `reset=True` and `close_session=True`, preventing the
 default session from leaking history into the next sample.
+
+## Transfer variant
+
+`cosmos_dreams_transfer.py` accepts the imaginaire4 Transfer JSON shape:
+`prompt`, optional `vision_path`, `num_frames`, and exactly one of `edge`,
+`blur`, `depth`, or `seg`. Edge and blur can be computed from `vision_path`;
+depth and segmentation records normally provide `control_path` inside the
+selected hint object. T1 accepts only full clips with `F >= 17` and
+`(F - 1) % 16 == 0` and runs through the dense oracle deployment.
+
+```bash
+python examples/offline_inference/cosmos_dreams/cosmos_dreams_transfer.py \
+  --model /checkpoints/cosmos-dreams-transfer-diffusers \
+  --input-json /data/transfer_video_edge.json \
+  --num-frames 97 \
+  --seed 42 \
+  --output cosmos_dreams_transfer.mp4
+```

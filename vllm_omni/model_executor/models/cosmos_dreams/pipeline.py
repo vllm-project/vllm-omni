@@ -24,3 +24,21 @@ COSMOS_DREAMS_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+COSMOS_DREAMS_TRANSFER_PIPELINE = PipelineConfig(
+    model_type="cosmos_dreams_transfer",
+    default_deploy_config_name="cosmos_dreams_transfer.yaml",
+    model_arch="CosmosDreamsTransferPipeline",
+    diffusers_class_name="CosmosDreamsTransferPipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="video",
+            model_arch="CosmosDreamsTransferPipeline",
+        ),
+    ),
+)

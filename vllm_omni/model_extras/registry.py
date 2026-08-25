@@ -28,6 +28,10 @@ from vllm_omni.model_extras.cosmos_dreams import (
     COSMOS_DREAMS_EXTRA_BODY_PARAMS,
     COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.cosmos_dreams_transfer import (
+    COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS,
+    COSMOS_DREAMS_TRANSFER_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -194,6 +198,17 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "CosmosDreamsPipeline",
             "CosmosDreamsOmniPipeline",
             "Cosmos3InteractivePipeline",
+        )
+    },
+    **{
+        model_class_name: {
+            "extra_body_params": COSMOS_DREAMS_TRANSFER_EXTRA_BODY_PARAMS,
+            "extra_output_params": COSMOS_DREAMS_TRANSFER_EXTRA_OUTPUT_PARAMS,
+        }
+        for model_class_name in (
+            "CosmosDreamsTransferPipeline",
+            "CosmosDreamsTransferOmniPipeline",
+            "Cosmos3TransferInteractivePipeline",
         )
     },
     "MagiHumanPipeline": {

@@ -335,14 +335,14 @@ def test_v2_parser_maps_action_schema_into_generic_conditioning_slot() -> None:
 
 def test_manifest_dispatches_schema_version_before_field_validation() -> None:
     artifact = _artifact()
-    artifact["schema_version"] = 3
+    artifact["schema_version"] = 4
     config = SimpleNamespace(
         model_config={},
         tf_model_config={"cosmos_dreams": artifact},
         custom_pipeline_args={},
     )
 
-    with pytest.raises(ValueError, match="Unsupported Cosmos-Dreams manifest schema_version=3"):
+    with pytest.raises(ValueError, match="Unsupported Cosmos-Dreams manifest schema_version=4"):
         CosmosDreamsManifest.from_od_config(config, require_explicit=True)
 
 

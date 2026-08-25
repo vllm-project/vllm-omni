@@ -3,6 +3,10 @@
 
 from vllm_omni.diffusion.models.cosmos_dreams.action_contract import CosmosDreamsActionSchema
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
+    CosmosDreamsActionConditioning,
+    CosmosDreamsControlVideoConditioning,
+)
 
 __all__ = [
     "AgiBotKeyboardController",
@@ -10,9 +14,14 @@ __all__ = [
     "AgiBotSceneState",
     "Cosmos3InteractivePipeline",
     "CosmosDreamsActionSchema",
+    "CosmosDreamsActionConditioning",
+    "CosmosDreamsControlVideoConditioning",
     "CosmosDreamsManifest",
     "CosmosDreamsOmniPipeline",
     "CosmosDreamsPipeline",
+    "CosmosDreamsTransferPipeline",
+    "CosmosDreamsTransferOmniPipeline",
+    "Cosmos3TransferInteractivePipeline",
     "CosmosDreamsTickRuntime",
     "get_cosmos_dreams_post_process_func",
     "get_cosmos_dreams_pre_process_func",
@@ -38,4 +47,12 @@ def __getattr__(name: str):
         from vllm_omni.diffusion.models.cosmos_dreams import pipeline_cosmos_dreams
 
         return getattr(pipeline_cosmos_dreams, name)
+    if name in {
+        "CosmosDreamsTransferPipeline",
+        "CosmosDreamsTransferOmniPipeline",
+        "Cosmos3TransferInteractivePipeline",
+    }:
+        from vllm_omni.diffusion.models.cosmos_dreams import pipeline_cosmos_dreams_transfer
+
+        return getattr(pipeline_cosmos_dreams_transfer, name)
     raise AttributeError(name)

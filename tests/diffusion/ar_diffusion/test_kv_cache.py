@@ -30,6 +30,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 BLOCK = 16
 
+
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
         block_size=BLOCK,
