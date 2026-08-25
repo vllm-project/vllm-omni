@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -182,8 +186,20 @@ def assert_result(result, params, num_prompt) -> None:
         )
         if isinstance(hardware_baseline, dict):
             for metric_name, threshold in hardware_baseline.items():
-                actual = float(result.get(metric_name) or 0.0)
+                assert metric_name in result, f"Required baseline metric {metric_name} is missing on {hardware}"
+                try:
+                    actual = float(result[metric_name])
+                except (TypeError, ValueError) as exc:
+                    raise AssertionError(
+                        f"Required baseline metric {metric_name} is not numeric on {hardware}: {result[metric_name]!r}"
+                    ) from exc
                 expected = float(threshold)
+                assert math.isfinite(actual), (
+                    f"Required baseline metric {metric_name} is non-finite on {hardware}: {actual}"
+                )
+                assert math.isfinite(expected), (
+                    f"Baseline threshold {metric_name} is non-finite on {hardware}: {expected}"
+                )
                 if metric_name == "request_throughput":
                     assert actual >= expected, f"{metric_name}={actual} is below baseline {expected} on {hardware}"
                 else:

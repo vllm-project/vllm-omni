@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for patch.py
@@ -142,6 +142,8 @@ async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
     )
 
     client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
@@ -336,6 +338,8 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     )
 
     client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
     assert client.configure_kwargs["native_duplex"] is True
     assert client.configure_kwargs["auto_response"] is True
     assert client.configure_kwargs["ref_audio"] == "data:audio/wav;base64,AAAA"
@@ -349,6 +353,8 @@ async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch,
     assert output.success is True
     assert output.generated_text == "native turn 1 native turn 2"
     assert output.output_tokens == 8
+    assert output.itl == []
+    assert output.text_latency == pytest.approx(output.ttft + 0.0095 * (output.output_tokens - 1))
     assert output.duplex_session_metrics["audio_turn_count"] == 2
     assert output.duplex_session_metrics["mean_tpot_ms"] == 9.5
     assert output.duplex_session_metrics["input_chunk_ms"] == 200

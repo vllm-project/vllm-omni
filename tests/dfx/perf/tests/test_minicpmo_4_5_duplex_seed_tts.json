@@ -1,12 +1,12 @@
 [
   {
     "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "description": "H100 demo-cadence native duplex gate: serial 200ms paced appends; each <=1400ms input is padded to the model's 1000ms unit before commit; global RTF is session wall time including inter-turn input and acknowledgements, not model-only RTF",
     "mark": [
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
-            "npu": "A3"
+            "cuda": "H100"
           },
           "num_cards": 1
         }
@@ -50,29 +50,32 @@
         "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
+            "request_throughput": [
+              0.015
+            ],
             "mean_ttft_ms": [
-              6500.0
+              480.0
             ],
             "mean_tpot_ms": [
-              22.0
+              25.0
             ],
             "mean_e2el_ms": [
-              85000.0
+              61000.0
             ],
             "mean_audio_ttfp_ms": [
-              6500.0
+              485.0
             ],
             "mean_audio_rtf": [
-              3.3
+              1.75
             ],
             "mean_duplex_global_ttft_ms": [
-              19000.0
+              465.0
             ],
             "mean_duplex_global_ttfp_ms": [
-              19000.0
+              465.0
             ],
             "mean_duplex_global_rtf": [
-              3.4
+              2.1
             ]
           }
         }

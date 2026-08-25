@@ -373,4 +373,7 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("--realtime-duplex-chunk-ms must be positive")
         extra_body["realtime_duplex_chunk_ms"] = chunk_ms
         extra_body["realtime_duplex_pacing"] = not getattr(args, "no_realtime_duplex_pacing", False)
+        temperature = getattr(args, "temperature", None)
+        if temperature is not None:
+            extra_body["temperature"] = temperature
     args.extra_body = extra_body
