@@ -226,7 +226,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
+        waiting = getattr(self, "waiting")
+        running = getattr(self, "running")
+        for queue in (waiting, running):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
@@ -234,7 +236,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         original_waiting = None
         if self._should_defer_waiting_admission():
-            original_waiting = self.waiting
+            original_waiting = waiting
             self.waiting = create_request_queue(self.policy)
 
         try:
@@ -505,8 +507,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # valid new-segment frames or underflowed the drain
                     # assert whenever placeholder counts diverged from
                     # scheduled counts (spec drafts, in-flight prefill).
+                    # Assign, never accumulate: _handle_stopped_request above
+                    # may already have fenced the same in-flight tokens through
+                    # a queued streaming update, and adding twice swallows the
+                    # next duplex unit's listen/speak under async scheduling.
                     if request.num_in_flight_tokens > 0:
-                        request.num_stale_output_tokens += request.num_in_flight_tokens
+                        request.num_stale_output_tokens = request.num_in_flight_tokens
                     if outstanding_async_tokens > 0:
                         # Discard only outputs that are already in flight and
                         # roll back their optimistic computed-token accounting.
@@ -642,10 +648,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # pre-replacement frame will drain, so the counter reaches exactly
         # zero and the new segment's frames are never swallowed. This also
         # covers an in-flight prefill chunk, which carries no placeholders
-        # but must still have its late output dropped.
+        # but must still have its late output dropped. Assign, never
+        # accumulate: update_from_output fences the same in-flight tokens when
+        # a resumable stop applies a queued update through this helper.
         in_flight_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         if in_flight_tokens > 0:
-            session.num_stale_output_tokens += in_flight_tokens
+            session.num_stale_output_tokens = in_flight_tokens
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
