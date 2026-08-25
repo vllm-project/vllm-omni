@@ -774,6 +774,12 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     assert metadata.attn_mask is None
     assert metadata.extra["valid_kv_length"] == 5
     assert metadata.extra["npu_attn_varlen"] is True
+    packed_padding = metadata.packed_padding
+    assert packed_padding is not None
+    assert packed_padding.q_length == 5
+    assert packed_padding.kv_length == 5
+    assert packed_padding.cu_seqlens_q.tolist() == [0, 5]
+    assert packed_padding.cu_seqlens_k.tolist() == [0, 5]
 
 
 def test_packed_attention_keeps_padding_mask_for_other_backends():
