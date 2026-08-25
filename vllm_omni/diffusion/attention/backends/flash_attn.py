@@ -38,6 +38,20 @@ class FlashAttentionBackend(AttentionBackend):
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
+        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
+        # over the caller's cu_seqlens without a mask, so an arbitrary
+        # N-document packing keeps its boundaries. NPU's forward path
+        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
+        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
+        # back to a padding-mask rebuild that spans the whole packed row,
+        # so N>=2 real documents would silently attend across request
+        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
+        # therefore stay False here.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
+
+    @classmethod
     def supports_attention_mask(cls) -> bool:
         return True
 
