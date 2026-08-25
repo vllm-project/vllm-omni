@@ -97,7 +97,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
     active_stream_window: int
-    code2wav_dtype: str
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
@@ -329,8 +328,6 @@ class OmniStageModelConfig:
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
-    # Qwen3-TTS Code2Wav decoder compute dtype: fp32, bf16, or fp16.
-    code2wav_dtype: str = "fp32"
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None

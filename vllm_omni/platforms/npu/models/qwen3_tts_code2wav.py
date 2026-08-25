@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -72,11 +73,17 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
 
 
 def resolve_npu_code2wav_runtime_dtype(vllm_config: VllmConfig) -> torch.dtype:
-    """Resolve the Code2Wav decoder compute dtype, defaulting to FP32."""
+    """Resolve Code2Wav dtype from connector extras, defaulting to FP16."""
     model_config = getattr(vllm_config, "model_config", None)
-    configured_dtype = getattr(model_config, "code2wav_dtype", Code2WavDtype.FP32)
+    stage_connector_config = getattr(model_config, "stage_connector_config", None)
+    connector_extra = stage_connector_config.get("extra", {}) if isinstance(stage_connector_config, Mapping) else {}
+    configured_dtype = (
+        connector_extra.get("code2wav_dtype", Code2WavDtype.FP16)
+        if isinstance(connector_extra, Mapping)
+        else Code2WavDtype.FP16
+    )
     if configured_dtype is None:
-        configured_dtype = Code2WavDtype.FP32
+        configured_dtype = Code2WavDtype.FP16
     try:
         dtype = Code2WavDtype(configured_dtype)
     except (TypeError, ValueError) as exc:

@@ -46,6 +46,9 @@ connectors:
       #   decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
+      # Qwen3-TTS Code2Wav decoder compute dtype on NPU.
+      # Supported values: fp32, bf16, fp16. The implementation defaults to fp16.
+      code2wav_dtype: fp16
 
 stages:
   - stage_id: 0
@@ -119,8 +122,5 @@ platforms:
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
-        # Code2Wav decoder compute dtype. Supported values: fp32, bf16, fp16.
-        # The framework fallback is fp32; this NPU profile selects fp16.
-        code2wav_dtype: fp32
         compilation_config:
           cudagraph_mode: PIECEWISE
