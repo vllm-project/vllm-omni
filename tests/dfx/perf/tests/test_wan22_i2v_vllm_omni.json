@@ -103,6 +103,11 @@
             "throughput_qps": 0.05263,
             "latency_mean": 18.9415,
             "peak_memory_mb_mean": 50053.7
+          },
+          "A3": {
+            "throughput_qps": 0.0153,
+            "latency_mean": 65.5305,
+            "peak_memory_mb_mean": 59927.6571
           }
         }
       },
@@ -130,6 +135,11 @@
             "throughput_qps": 0.009595,
             "latency_mean": 104.1058,
             "peak_memory_mb_mean": 59718.0
+          },
+          "A3": {
+            "throughput_qps": 0.0021,
+            "latency_mean": 465.9997,
+            "peak_memory_mb_mean": 59881.7714
           }
         }
       }
