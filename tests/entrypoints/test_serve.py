@@ -57,31 +57,6 @@ def test_serve_parser_accepts_deploy_config() -> None:
     assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
 
 
-def test_serve_parser_forwards_diffusion_batch_size() -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    command = OmniServeCommand()
-    command.subparser_init(subparsers)
-
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--diffusion-batch-size", "4"])
-    command.validate(args)
-
-    assert args.diffusion_batch_size == 4
-    assert args.get_explicit_kwargs_dict()["diffusion_batch_size"] == 4
-
-
-def test_serve_parser_rejects_nonpositive_diffusion_batch_size() -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    command = OmniServeCommand()
-    command.subparser_init(subparsers)
-
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--diffusion-batch-size", "0"])
-
-    with pytest.raises(ValueError, match="--diffusion-batch-size must be >= 1"):
-        command.validate(args)
-
-
 def test_serve_parser_rejects_stage_configs_path() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")

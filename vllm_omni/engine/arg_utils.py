@@ -484,7 +484,6 @@ class OrchestratorArgs:
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
-    diffusion_batch_size: int = 1
 
     # === Cluster / Backend ===
     worker_backend: str = "multi_process"
