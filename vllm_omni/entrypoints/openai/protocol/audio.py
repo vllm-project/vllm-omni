@@ -339,6 +339,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     input: str = Field(
         description="Text prompt describing the audio to generate",
     )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
     model: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(
@@ -349,6 +357,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
@@ -361,10 +370,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     guidance_scale: float | None = Field(
         default=None,
+        gt=0,
+        le=1000,
         description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
+        ge=1,
+        le=1000,
         description="Number of inference steps",
     )
     seed: int | None = Field(
