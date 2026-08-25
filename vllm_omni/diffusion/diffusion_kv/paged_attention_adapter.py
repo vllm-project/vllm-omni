@@ -699,19 +699,32 @@ class DiffusionPagedAttentionAdapter:
                 query_offsets.append(query_offsets[-1] + query_len)
             query_start_loc_cpu = torch.tensor(query_offsets, dtype=torch.int32)
             seq_lens_cpu = torch.tensor(seq_lens_values, dtype=torch.int32)
-            metadata_by_segment.append(
-                self._build_native_metadata(
-                    query_lens=query_lens,
-                    query_start_loc=query_start_loc_cpu.to(self.device),
-                    query_start_loc_cpu=query_start_loc_cpu,
-                    seq_lens=seq_lens_cpu.to(self.device),
-                    seq_lens_cpu=seq_lens_cpu,
-                    positions=batch.positions.index_select(0, packed_segment.query_indices),
-                    block_tables=batch.block_tables,
-                    slot_mappings=batch.slot_mappings.index_select(-1, packed_segment.query_indices),
-                    causal=(row_segments[0].mode == "causal"),
-                )
+            segment_metadata = self._build_native_metadata(
+                query_lens=query_lens,
+                query_start_loc=query_start_loc_cpu.to(self.device),
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens_cpu.to(self.device),
+                seq_lens_cpu=seq_lens_cpu,
+                positions=batch.positions.index_select(0, packed_segment.query_indices),
+                block_tables=batch.block_tables,
+                slot_mappings=batch.slot_mappings.index_select(-1, packed_segment.query_indices),
+                causal=(row_segments[0].mode == "causal"),
             )
+            # FA3's full-CUDA-graph metadata builder reuses one persistent
+            # scheduler buffer across builds. Piecewise attention prepares all
+            # segments before executing any of them, so each segment needs its
+            # own snapshot rather than a view overwritten by the next build.
+            snapshotted = set()
+            for native_metadata in segment_metadata.values():
+                metadata_id = id(native_metadata)
+                if metadata_id in snapshotted:
+                    continue
+                snapshotted.add(metadata_id)
+                for field_name in ("scheduler_metadata", "prefix_scheduler_metadata"):
+                    scheduler_metadata = getattr(native_metadata, field_name, None)
+                    if isinstance(scheduler_metadata, torch.Tensor):
+                        setattr(native_metadata, field_name, scheduler_metadata.clone())
+            metadata_by_segment.append(segment_metadata)
         self._active_piecewise_native_metadata = tuple(metadata_by_segment)
         return self._active_piecewise_native_metadata
 

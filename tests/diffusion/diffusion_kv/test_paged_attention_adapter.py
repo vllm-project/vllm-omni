@@ -493,6 +493,48 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
     ]
 
 
+def test_piecewise_metadata_snapshots_reused_native_scheduler_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    shared_scheduler_metadata = torch.zeros(1, dtype=torch.int32)
+    build_id = 0
+
+    def build_metadata(**kwargs):
+        nonlocal build_id
+        shared_scheduler_metadata.fill_(build_id)
+        metadata = SimpleNamespace(
+            build_id=build_id,
+            causal=kwargs["causal"],
+            seq_lens=kwargs["seq_lens"].clone(),
+            query_start_loc_cpu=kwargs["query_start_loc_cpu"].clone(),
+            positions=kwargs["positions"].clone(),
+            slot_mappings=kwargs["slot_mappings"].clone(),
+            scheduler_metadata=shared_scheduler_metadata,
+            prefix_scheduler_metadata=None,
+        )
+        build_id += 1
+        return {"layer-0": metadata}
+
+    monkeypatch.setattr(adapter_module.current_omni_platform, "build_diffusion_kv_attn_metadata", build_metadata)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(full_attn_spans=[[(1, 3)]], extra={})
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    segment_schedules = [item.scheduler_metadata for item in context.piecewise_native_metadata]
+    assert [item.item() for item in segment_schedules] == [1, 2, 3]
+    assert len({item.data_ptr() for item in segment_schedules}) == 3
+
+
 def test_omni_paged_backend_treats_empty_full_spans_as_causal(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
