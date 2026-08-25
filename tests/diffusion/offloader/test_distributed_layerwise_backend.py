@@ -49,6 +49,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
     get_offload_plan,
 )
+from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.diffusion.offloader.tensor_utils import (
     make_offload_placeholder,
     set_tensor_storage,
@@ -61,7 +62,6 @@ from vllm_omni.diffusion.offloader.weight_transport_backend import (
     TransportStreams,
     select_transport,
 )
-from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
 
