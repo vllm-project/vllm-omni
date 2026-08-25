@@ -337,6 +337,7 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     """Request model for audio generation via diffusion models (e.g. Stable Audio)."""
 
     input: str = Field(
+        min_length=1,
         description="Text prompt describing the audio to generate",
     )
     model: str | None = None
@@ -349,10 +350,13 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
+        gt=0,
+        le=47.0,
         description="Audio length in seconds",
     )
     audio_start: float | None = Field(
         default=0.0,
+        ge=0,
         description="Audio start time in seconds",
     )
     negative_prompt: str | None = Field(
@@ -361,16 +365,27 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     guidance_scale: float | None = Field(
         default=None,
+        gt=0,
+        le=20.0,
         description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
+        ge=1,
+        le=200,
         description="Number of inference steps",
     )
     seed: int | None = Field(
         default=None,
         description="Random seed for reproducibility",
     )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("input must not be empty or whitespace-only")
+        return v
 
     @field_validator("stream_format")
     @classmethod

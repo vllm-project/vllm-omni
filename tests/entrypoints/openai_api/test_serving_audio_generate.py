@@ -192,6 +192,89 @@ class TestRequestValidation:
         req = OpenAICreateAudioGenerateRequest(input="test", stream_format="audio")
         assert req.stream_format == "audio"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input": ""},
+            {"input": " "},
+            {"input": "\t\n"},
+        ],
+    )
+    def test_rejects_empty_or_whitespace_input(self, payload):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(**payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input": "valid", "audio_length": 0},
+            {"input": "valid", "audio_length": -1},
+            {"input": "valid", "audio_length": 47.1},
+        ],
+    )
+    def test_rejects_invalid_audio_length(self, payload):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(**payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input": "valid", "audio_start": -1},
+        ],
+    )
+    def test_rejects_invalid_audio_start(self, payload):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(**payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input": "valid", "num_inference_steps": 0},
+            {"input": "valid", "num_inference_steps": -1},
+            {"input": "valid", "num_inference_steps": 201},
+        ],
+    )
+    def test_rejects_invalid_num_inference_steps(self, payload):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(**payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input": "valid", "guidance_scale": -1.0},
+            {"input": "valid", "guidance_scale": 0},
+            {"input": "valid", "guidance_scale": 21},
+        ],
+    )
+    def test_rejects_invalid_guidance_scale(self, payload):
+        with pytest.raises(Exception):
+            OpenAICreateAudioGenerateRequest(**payload)
+
+    def test_audio_generate_validation_accepts_valid_boundaries(self):
+        req = OpenAICreateAudioGenerateRequest(
+            input="valid",
+            audio_length=0.1,
+            audio_start=0,
+            num_inference_steps=1,
+            guidance_scale=0.1,
+        )
+        assert req.input == "valid"
+        assert req.audio_length == 0.1
+        assert req.audio_start == 0
+        assert req.num_inference_steps == 1
+        assert req.guidance_scale == 0.1
+
+    def test_audio_generate_validation_accepts_upper_boundaries(self):
+        req = OpenAICreateAudioGenerateRequest(
+            input="valid",
+            audio_length=47.0,
+            num_inference_steps=200,
+            guidance_scale=20.0,
+        )
+        assert req.audio_length == 47.0
+        assert req.num_inference_steps == 200
+        assert req.guidance_scale == 20.0
+
 
 # Constructor & Class Methods
 class TestConstructor:
