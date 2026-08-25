@@ -81,14 +81,22 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         num_kv_heads //= ulysses_degree
 
         attention_config = vllm_config.attention_config
+        parallel_config = vllm_config.parallel_config
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
+        previous_pcp_size = parallel_config.prefill_context_parallel_size
         try:
             # This is a portable vLLM backend request. The active platform
             # resolves it to its native implementation, such as FlashAttention
             # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
+            # Omni maps strict Ulysses onto vLLM's PCP group for expert
+            # collectives. Paged attention runs after the Ulysses all-to-all,
+            # where every rank owns the full sequence and rank-local heads, so
+            # native attention must select a non-PCP kernel.
+            if ulysses_degree > 1:
+                parallel_config.prefill_context_parallel_size = 1
             with set_current_vllm_config(vllm_config):
                 attn_backend = get_attn_backend(
                     head_size=spec.head_size,
@@ -100,6 +108,7 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
+            parallel_config.prefill_context_parallel_size = previous_pcp_size
         canonical_spec = replace(
             spec,
             num_kv_heads=num_kv_heads,
@@ -175,6 +184,7 @@ class DiffusionPagedAttentionRow:
     query_len: int
     seq_len: int
     kv_start_pos: int = 0
+    imported_prefix_len: int = 0
     sequence_id: int | None = None
     context_id: str | None = None
 
@@ -193,6 +203,13 @@ class DiffusionPagedAttentionRow:
             raise ValueError("Paged attention seq_len must be a positive integer")
         if type(self.kv_start_pos) is not int or self.kv_start_pos < 0:
             raise ValueError("Paged attention kv_start_pos must be a non-negative integer")
+        if type(self.imported_prefix_len) is not int or self.imported_prefix_len < 0:
+            raise ValueError("Paged attention imported_prefix_len must be a non-negative integer")
+        if self.imported_prefix_len not in (0, self.kv_start_pos):
+            raise ValueError(
+                "Paged attention imported prefix must fill the complete cached prefix: "
+                f"imported={self.imported_prefix_len}, kv_start_pos={self.kv_start_pos}"
+            )
         if self.kv_start_pos + self.query_len > self.seq_len:
             raise ValueError(
                 "Paged attention write span exceeds seq_len: "
@@ -217,7 +234,9 @@ class PreparedDiffusionPagedAttentionBatch:
     slot_mappings: torch.Tensor
     attn_metadata: dict[str, Any]
     slot_mappings_by_layer: dict[str, torch.Tensor]
+    imported_prefix_slot_mappings_by_layer: dict[str, torch.Tensor]
     num_tokens: int
+    num_imported_prefix_tokens: int
     _owner: object = field(repr=False, compare=False)
     _generation: int = field(repr=False, compare=False)
 
@@ -231,6 +250,9 @@ class DiffusionPagedAttentionContext:
     key_write: torch.Tensor
     value_write: torch.Tensor
     slot_mapping: torch.Tensor
+    imported_prefix_key: torch.Tensor | None
+    imported_prefix_value: torch.Tensor | None
+    imported_prefix_slot_mapping: torch.Tensor | None
     native_metadata: Any
     piecewise_plan: PagedPiecewisePlan | None
     piecewise_native_metadata: tuple[Any, ...]
@@ -458,6 +480,36 @@ class DiffusionPagedAttentionAdapter:
             row_indices,
             num_reqs_padded=len(rows),
         )
+        imported_prefix_lens = [row.imported_prefix_len for row in rows]
+        num_imported_prefix_tokens = sum(imported_prefix_lens)
+        imported_prefix_slot_mappings_by_layer: dict[str, torch.Tensor] = {}
+        if num_imported_prefix_tokens:
+            imported_prefix_offsets = [0]
+            for prefix_len in imported_prefix_lens:
+                imported_prefix_offsets.append(imported_prefix_offsets[-1] + prefix_len)
+            imported_prefix_start_loc = torch.tensor(
+                imported_prefix_offsets,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            imported_prefix_positions = torch.cat(
+                [torch.arange(prefix_len, dtype=torch.int64, device=self.device) for prefix_len in imported_prefix_lens]
+            )
+            imported_prefix_slot_mappings = self.block_tables.compute_slot_mappings(
+                row_indices,
+                imported_prefix_start_loc,
+                imported_prefix_positions,
+                num_tokens_padded=num_imported_prefix_tokens,
+            )
+            # BlockTables owns reusable slot buffers. Preserve the imported
+            # prefix before the current-write mapping reuses the same storage.
+            imported_prefix_slot_mappings_by_layer = {
+                layer_name: mapping.reshape(-1)[:num_imported_prefix_tokens].clone()
+                for layer_name, mapping in build_slot_mappings_by_layer(
+                    imported_prefix_slot_mappings,
+                    self.kv_cache_config,
+                ).items()
+            }
         slot_mappings = self.block_tables.compute_slot_mappings(
             row_indices,
             query_start_loc,
@@ -492,7 +544,9 @@ class DiffusionPagedAttentionAdapter:
             slot_mappings=slot_mappings,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
+            imported_prefix_slot_mappings_by_layer=imported_prefix_slot_mappings_by_layer,
             num_tokens=num_tokens,
+            num_imported_prefix_tokens=num_imported_prefix_tokens,
             _owner=self._owner,
             _generation=generation,
         )
@@ -570,6 +624,25 @@ class DiffusionPagedAttentionAdapter:
         raise ValueError(
             f"Paged attention {name} supports packed [T, ...] or uniform batched [B, T, ...] token layouts; "
             f"got token shape={token_shape}"
+        )
+
+    @staticmethod
+    def _validate_imported_prefix_layout(
+        token_shape: tuple[int, ...],
+        batch: PreparedDiffusionPagedAttentionBatch,
+        *,
+        name: str,
+    ) -> None:
+        prefix_lens = tuple(row.imported_prefix_len for row in batch.rows)
+        if len(token_shape) == 1 and token_shape[0] == batch.num_imported_prefix_tokens:
+            return
+        if len(token_shape) == 2:
+            batch_size, tokens_per_row = token_shape
+            if batch_size == len(batch.rows) and all(prefix_len == tokens_per_row for prefix_len in prefix_lens):
+                return
+        raise ValueError(
+            f"Paged attention {name} layout must match imported prefixes: "
+            f"shape={token_shape}, row_prefix_lens={prefix_lens}"
         )
 
     def _get_piecewise_plan(
@@ -659,6 +732,10 @@ class DiffusionPagedAttentionAdapter:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
         full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        imported_prefix_key = getattr(omni_attn_metadata, "paged_kv_prefix_key", None)
+        imported_prefix_value = getattr(omni_attn_metadata, "paged_kv_prefix_value", None)
+        if (imported_prefix_key is None) != (imported_prefix_value is None):
+            raise ValueError("Paged attention imported prefix key and value must be provided together")
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(
             query,
@@ -681,6 +758,30 @@ class DiffusionPagedAttentionAdapter:
         self._validate_token_layout(query_token_shape, batch, name="query")
         self._validate_token_layout(key_token_shape, batch, name="key")
         self._validate_token_layout(value_token_shape, batch, name="value")
+        imported_prefix_key_flat = imported_prefix_value_flat = None
+        imported_prefix_slot_mapping = None
+        if imported_prefix_key is not None:
+            if batch.num_imported_prefix_tokens == 0:
+                raise ValueError("Paged attention received imported prefix K/V for a batch without imported rows")
+            imported_prefix_key_flat, imported_key_shape, _ = self._flatten_tensor(
+                imported_prefix_key,
+                num_heads=layer.num_kv_heads,
+                head_size=layer.head_size,
+                name="imported prefix key",
+            )
+            imported_prefix_value_flat, imported_value_shape, _ = self._flatten_tensor(
+                imported_prefix_value,
+                num_heads=layer.num_kv_heads,
+                head_size=layer.head_size_v,
+                name="imported prefix value",
+            )
+            self._validate_imported_prefix_layout(imported_key_shape, batch, name="imported prefix key")
+            self._validate_imported_prefix_layout(imported_value_shape, batch, name="imported prefix value")
+            imported_prefix_slot_mapping = batch.imported_prefix_slot_mappings_by_layer.get(layer_name)
+            if imported_prefix_slot_mapping is None:
+                raise KeyError(f"No imported-prefix slot mapping was built for diffusion layer {layer_name!r}")
+        elif batch.num_imported_prefix_tokens:
+            raise ValueError("Paged attention batch requires imported prefix K/V for the current layer")
         if query.device != self.device or key.device != self.device or value.device != self.device:
             raise ValueError(
                 f"Paged attention Q/K/V must be on {self.device}; "
@@ -693,6 +794,11 @@ class DiffusionPagedAttentionAdapter:
             raise ValueError(
                 f"Paged attention Q/K/V dtype must match model activation dtype {expected_dtype}; got {query.dtype}"
             )
+        if imported_prefix_key is not None:
+            if imported_prefix_key.device != self.device or imported_prefix_value.device != self.device:
+                raise ValueError("Paged attention imported prefix K/V must use the paged cache device")
+            if imported_prefix_key.dtype != query.dtype or imported_prefix_value.dtype != query.dtype:
+                raise ValueError("Paged attention imported prefix K/V dtype must match the current Q/K/V dtype")
         if not bool(getattr(layer.spec, "non_causal", False)):
             non_suffix_rows = [row.identity for row in batch.rows if row.kv_start_pos + row.query_len != row.seq_len]
             if non_suffix_rows:
@@ -738,6 +844,11 @@ class DiffusionPagedAttentionAdapter:
             key_write=key_flat,
             value_write=value_flat,
             slot_mapping=slot_mapping,
+            imported_prefix_key=None if imported_prefix_key_flat is None else imported_prefix_key_flat.contiguous(),
+            imported_prefix_value=None
+            if imported_prefix_value_flat is None
+            else imported_prefix_value_flat.contiguous(),
+            imported_prefix_slot_mapping=imported_prefix_slot_mapping,
             native_metadata=native_metadata,
             piecewise_plan=piecewise_plan,
             piecewise_native_metadata=piecewise_native_metadata,

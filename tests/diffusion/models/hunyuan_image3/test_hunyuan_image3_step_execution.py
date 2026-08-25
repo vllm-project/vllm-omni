@@ -270,6 +270,14 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline._ensure_grouped_attention_backend_supported(2)
 
 
+def test_grouped_denoise_allows_scheduler_paged_attention_backend():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+
+    pipeline._ensure_grouped_attention_backend_supported(2)
+
+
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
     pipeline = _pipeline()
     pipeline._pipeline = SimpleNamespace(prepare_extra_func_kwargs=lambda step, kwargs: {})

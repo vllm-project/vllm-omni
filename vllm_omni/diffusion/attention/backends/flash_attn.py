@@ -267,6 +267,19 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
+        if paged_kv_context.imported_prefix_key is not None:
+            update_cache = getattr(native_impl, "do_kv_cache_update", None)
+            if not callable(update_cache):
+                raise NotImplementedError(
+                    f"Native paged backend {layer.attn_backend.get_name()!r} cannot import a dense KV prefix"
+                )
+            update_cache(
+                layer,
+                paged_kv_context.imported_prefix_key,
+                paged_kv_context.imported_prefix_value,
+                kv_cache,
+                paged_kv_context.imported_prefix_slot_mapping,
+            )
         if not layer.attn_backend.forward_includes_kv_cache_update:
             native_impl.do_kv_cache_update(
                 layer,

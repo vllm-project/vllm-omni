@@ -24,6 +24,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
 )
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
     override_paged_kv_adapter,
     set_forward_context,
 )
@@ -280,6 +281,48 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][0].shape == (5, 2, 4)
     assert layer.native_events == ["update", "forward"]
     assert layer.calls[0][3] is events[0][2]
+
+
+def test_omni_paged_backend_imports_dense_prefix_before_current_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, block_tables, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=3,
+                seq_len=7,
+                kv_start_pos=4,
+                imported_prefix_len=4,
+            )
+        ]
+    )
+    query = torch.randn(1, 3, 2, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    prefix_key = torch.randn(1, 4, 2, 4)
+    prefix_value = torch.randn_like(prefix_key)
+    metadata = SimpleNamespace(
+        full_attn_spans=None,
+        paged_kv_prefix_key=prefix_key,
+        paged_kv_prefix_value=prefix_value,
+        extra={},
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", query, key, value, omni_attn_metadata=metadata)
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, query)
+    assert [call[2].tolist() for call in block_tables.slot_calls] == [[0, 1, 2, 3], [4, 5, 6]]
+    assert layer.native_events == ["update", "update", "forward"]
+    assert torch.equal(layer.updates[0][0], prefix_key.reshape(4, 2, 4))
+    assert torch.equal(layer.updates[0][1], prefix_value.reshape(4, 2, 4))
+    assert layer.updates[0][2].tolist() == [0, 1, 2, 3]
+    assert torch.equal(layer.updates[1][0], key.reshape(3, 2, 4))
+    assert layer.updates[1][2].tolist() == [4, 5, 6]
 
 
 def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1003,12 +1046,19 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     original_backend_per_kind = {"full": object()}
     config = SimpleNamespace(
         attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
         model_config=SimpleNamespace(dtype=torch.float16),
         cache_config=SimpleNamespace(cache_dtype="auto"),
     )
 
     def select_backend(**_kwargs):
-        selected_backends.append((config.attention_config.backend, config.attention_config.backend_per_kind))
+        selected_backends.append(
+            (
+                config.attention_config.backend,
+                config.attention_config.backend_per_kind,
+                config.parallel_config.prefill_context_parallel_size,
+            )
+        )
         return native_backend
 
     monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
@@ -1031,9 +1081,10 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         ulysses_degree=2,
     )
 
-    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {})]
+    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 1)]
     assert config.attention_config.backend is None
     assert config.attention_config.backend_per_kind is original_backend_per_kind
+    assert config.parallel_config.prefill_context_parallel_size == 2
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
@@ -1092,6 +1143,51 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     assert events == ["pre", "prepare", "kernel", "post"]
     assert torch.equal(output, torch.full_like(original, 6))
+
+
+def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
+    events: list[tuple[str, tuple[int, ...]]] = []
+
+    class Strategy:
+        name = "ulysses"
+
+        def pre_attention(self, query, key, value, metadata):
+            return query, key, value, metadata, SimpleNamespace(joint_len=0, joint_strategy="front")
+
+        def post_attention(self, output, _ctx):
+            events.append(("post", tuple(output.shape)))
+            return output
+
+    class Adapter:
+        def prepare_layer_context(self, _layer_name, query, key, value, *, omni_attn_metadata):
+            assert omni_attn_metadata is None
+            events.append(("kernel_input", tuple(query.shape)))
+            assert query[:, -1].tolist() == [[[3.0]]]
+            assert torch.equal(query, key)
+            assert torch.equal(query, value)
+            return SimpleNamespace(query=query)
+
+    class Backend:
+        def forward_paged(self, context):
+            return context.query
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.attention = Backend()
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.arange(5, dtype=torch.float32).reshape(1, 5, 1, 1)
+
+    with set_forward_context(), override_paged_kv_adapter(Adapter()):
+        get_forward_context().sp_padding_size = 1
+        output = layer._forward_impl(tensor, tensor, tensor)
+
+    assert events == [("kernel_input", (1, 4, 1, 1)), ("post", (1, 5, 1, 1))]
+    assert output.flatten().tolist() == [0.0, 1.0, 2.0, 3.0, 0.0]
 
 
 def test_omni_attention_rejects_paged_request_for_backend_without_paged_support() -> None:

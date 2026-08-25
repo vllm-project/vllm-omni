@@ -1106,11 +1106,38 @@ class ImageKVCacheManager(nn.Module):
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
         paged_attention = self.attn.is_paged_kv_active()
+        paged_prefix_key = paged_prefix_value = None
         if paged_attention:
-            if self.sp_size > 1:
-                raise NotImplementedError("Hunyuan Scheduler-paged KV does not yet support sequence parallelism")
-            if uncond_cfg_prefill or self._injected_ar_kv is not None:
-                raise NotImplementedError("Hunyuan Scheduler-paged KV does not yet support imported AR KV")
+            if uncond_cfg_prefill:
+                raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
+            if self._injected_ar_kv is not None:
+                if self.sp_size > 1:
+                    raise NotImplementedError("Hunyuan paged Ulysses does not yet support an imported AR KV prefix")
+                imported_prefix_len = int(kwargs.get("ar_kv_reuse_len", 0))
+                if imported_prefix_len <= 0 or len(self._injected_ar_kv) != bs:
+                    raise ValueError(
+                        "Hunyuan paged imported AR KV does not match the current rows: "
+                        f"prefix_len={imported_prefix_len}, imported_rows={len(self._injected_ar_kv)}, batch={bs}"
+                    )
+                paged_prefix_key = torch.stack(
+                    [
+                        prefix_key[:imported_prefix_len].reshape(imported_prefix_len, kv_head_num_per_rank, head_dim)
+                        for prefix_key, _ in self._injected_ar_kv
+                    ],
+                    dim=0,
+                ).contiguous()
+                paged_prefix_value = torch.stack(
+                    [
+                        prefix_value[:imported_prefix_len].reshape(
+                            imported_prefix_len,
+                            kv_head_num_per_rank,
+                            head_dim,
+                        )
+                        for _, prefix_value in self._injected_ar_kv
+                    ],
+                    dim=0,
+                ).contiguous()
+                self._injected_ar_kv = None
             if first_step:
                 self.image_kv_cache_map = None
                 self.image_kv_cache_lens = None
@@ -1146,10 +1173,24 @@ class ImageKVCacheManager(nn.Module):
                     query = query[:, join_query_len:, :, :]
                     key = key[:, local_prompt_len:, :, :]
                     value = value[:, local_prompt_len:, :, :]
+            elif self.sp_size > 1:
+                local_prompt_len = seq_len - shard_image_size
+                joint_query_len = query.shape[1] - shard_image_size
+                if local_prompt_len != joint_query_len:
+                    raise ValueError(
+                        "Hunyuan paged Ulysses prompt layout mismatch: "
+                        f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
+                    )
+                joint_text_query = query[:, :joint_query_len, :, :]
+                joint_text_key = key[:, :local_prompt_len, :, :]
+                joint_text_value = value[:, :local_prompt_len, :, :]
+                query = query[:, joint_query_len:, :, :]
+                key = key[:, local_prompt_len:, :, :]
+                value = value[:, local_prompt_len:, :, :]
         else:
             if self.sp_size <= 1 and not paged_attention:
                 key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
-            elif self.sp_size > 1:
+            elif self.sp_size > 1 and not paged_attention:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
@@ -1167,7 +1208,20 @@ class ImageKVCacheManager(nn.Module):
         if paged_attention:
             # Paged attention derives the cache layout from full-attention spans;
             # passing the dense mask would select an unsupported fallback.
-            attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
+            if self.sp_size > 1 and first_step:
+                attn_metadata = AttentionMetadata(
+                    joint_query=joint_text_query,
+                    joint_key=joint_text_key,
+                    joint_value=joint_text_value,
+                    joint_strategy="front",
+                    full_attn_spans=full_attn_spans,
+                )
+            else:
+                attn_metadata = AttentionMetadata(
+                    full_attn_spans=full_attn_spans,
+                    paged_kv_prefix_key=paged_prefix_key,
+                    paged_kv_prefix_value=paged_prefix_value,
+                )
         elif self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
@@ -2085,6 +2139,9 @@ class HunyuanImage3Model(nn.Module):
         gen_timestep_scatter_index: torch.Tensor | None,
         ar_kv_reuse_len: int,
         row_identities: list[tuple[str, int]] | None,
+        uncond_cfg_prefill: bool = False,
+        shard_image_size: int = 0,
+        shard_padding_size: int = 0,
     ):
         if not is_forward_context_available():
             return nullcontext()
@@ -2093,10 +2150,8 @@ class HunyuanImage3Model(nn.Module):
             return nullcontext()
         if mode != "gen_image":
             raise ValueError("Hunyuan Scheduler-paged KV only supports image generation")
-        if get_sequence_parallel_world_size() > 1:
-            raise NotImplementedError("Hunyuan Scheduler-paged KV does not yet support sequence parallelism")
-        if ar_kv_reuse_len:
-            raise NotImplementedError("Hunyuan Scheduler-paged KV does not yet support imported AR KV")
+        if uncond_cfg_prefill:
+            return nullcontext()
         if row_identities is None:
             raise ValueError("Hunyuan Scheduler-paged KV requires request and CFG sequence identities")
         if len(row_identities) != len(query_lens) or len(seq_lens) != len(query_lens):
@@ -2104,6 +2159,22 @@ class HunyuanImage3Model(nn.Module):
                 "Hunyuan paged row metadata must match model batch rows: "
                 f"identities={len(row_identities)}, query_lens={len(query_lens)}, seq_lens={len(seq_lens)}"
             )
+
+        sp_world_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_rank()
+        if sp_world_size > 1:
+            if ar_kv_reuse_len:
+                raise NotImplementedError("Hunyuan paged Ulysses does not yet support an imported AR KV prefix")
+            if shard_image_size <= 0:
+                raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
+            if shard_padding_size < 0 or shard_padding_size >= sp_world_size:
+                raise ValueError(
+                    "Hunyuan paged Ulysses received invalid image padding: "
+                    f"padding={shard_padding_size}, sp_world_size={sp_world_size}"
+                )
+            global_image_size = shard_image_size * sp_world_size - shard_padding_size
+            query_lens = [int(length) - shard_image_size + global_image_size for length in query_lens]
+            seq_lens = [int(length) - shard_image_size + global_image_size for length in seq_lens]
 
         if first_step:
             if gen_timestep_scatter_index is None:
@@ -2113,10 +2184,12 @@ class HunyuanImage3Model(nn.Module):
                     "Hunyuan generated timestep rows do not match paged identities: "
                     f"positions={len(gen_timestep_scatter_index)}, identities={len(row_identities)}"
                 )
-            if any(int(query_len) != int(seq_len) for query_len, seq_len in zip(query_lens, seq_lens, strict=True)):
+            if any(
+                int(query_len) + int(ar_kv_reuse_len) != int(seq_len)
+                for query_len, seq_len in zip(query_lens, seq_lens, strict=True)
+            ):
                 raise ValueError(
-                    "Hunyuan first-step paged KV requires the complete sequence as the query when imported AR KV "
-                    "is disabled"
+                    "Hunyuan first-step paged KV requires the query plus imported AR prefix to cover the sequence"
                 )
             rows = [
                 DiffusionPagedAttentionRow(
@@ -2124,6 +2197,8 @@ class HunyuanImage3Model(nn.Module):
                     sequence_id=sequence_id,
                     query_len=int(query_len),
                     seq_len=int(seq_len),
+                    kv_start_pos=int(ar_kv_reuse_len),
+                    imported_prefix_len=int(ar_kv_reuse_len),
                 )
                 for (request_id, sequence_id), query_len, seq_len in zip(
                     row_identities,
@@ -2140,6 +2215,13 @@ class HunyuanImage3Model(nn.Module):
                 zip(row_identities, query_lens, seq_lens, strict=True)
             ):
                 kv_start_pos = int(position_ids[row_index, 0].item())
+                if sp_world_size > 1:
+                    kv_start_pos -= sp_rank * shard_image_size
+                    if kv_start_pos < 0:
+                        raise ValueError(
+                            "Hunyuan paged Ulysses resolved a negative global KV start: "
+                            f"row={row_index}, start={kv_start_pos}, sp_rank={sp_rank}"
+                        )
                 active_seq_len = kv_start_pos + int(query_len)
                 if active_seq_len > int(padded_seq_len):
                     raise ValueError(
@@ -2556,6 +2638,9 @@ class HunyuanImage3Model(nn.Module):
             gen_timestep_scatter_index=gen_timestep_scatter_index,
             ar_kv_reuse_len=ar_kv_reuse_len,
             row_identities=diffusion_kv_row_identities,
+            uncond_cfg_prefill=uncond_cfg_prefill,
+            shard_image_size=shard_image_size,
+            shard_padding_size=shard_padding_size,
         )
         with paged_attention_context:
             for layer_idx, decoder_layer in enumerate(self.layers):
@@ -2580,6 +2665,7 @@ class HunyuanImage3Model(nn.Module):
                     shard_image_size=shard_image_size,
                     shard_padding_size=shard_padding_size,
                     uncond_cfg_prefill=uncond_cfg_prefill,
+                    ar_kv_reuse_len=ar_kv_reuse_len,
                     full_attn_spans=full_attn_spans,
                 )
 
@@ -2824,6 +2910,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
+        if isinstance(model_kwargs.get("diffusion_kv_row_identities"), list):
+            model_kwargs["diffusion_kv_row_identities"] = model_kwargs["diffusion_kv_row_identities"][
+                s.start : s.stop
+            ]
 
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:

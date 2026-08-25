@@ -1019,14 +1019,6 @@ class OmniDiffusionConfig:
             self.omni_kv_config = dict(self.omni_kv_config)
         else:
             raise TypeError("omni_kv_config must be a mapping")
-        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
-            "need_recv_cache", False
-        ):
-            raise ValueError(
-                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
-                "disable need_recv_cache until connector-aware admission is implemented"
-            )
-
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:

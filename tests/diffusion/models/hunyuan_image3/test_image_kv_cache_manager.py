@@ -50,6 +50,8 @@ class MockAttention(nn.Module):
         if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
             self.paged_calls.append((query, key, value))
             self.paged_metadata.append(attn_metadata)
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return torch.cat((attn_metadata.joint_query, query), dim=1)
         return query
 
 
@@ -113,6 +115,7 @@ def _call_mgr(
     gen_timestep_scatter_index=None,
     position_ids=None,
     full_attn_spans=None,
+    ar_kv_reuse_len=0,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
@@ -130,6 +133,7 @@ def _call_mgr(
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
         full_attn_spans=full_attn_spans,
+        ar_kv_reuse_len=ar_kv_reuse_len,
     )
 
 
@@ -245,12 +249,30 @@ def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
     assert [(row.kv_start_pos, row.query_len, row.seq_len) for row in adapter.rows] == [(4, 3, 7), (5, 3, 8)]
 
 
+def test_cfg_parallel_splits_paged_row_identities() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Text2ImagePipeline,
+    )
+
+    model_kwargs = {
+        "diffusion_kv_row_identities": [("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)]
+    }
+
+    HunyuanImage3Text2ImagePipeline._split_model_kwargs_for_cfg_parallel(
+        model_kwargs,
+        batch_size=2,
+        cfg_rank=1,
+    )
+
+    assert model_kwargs["diffusion_kv_row_identities"] == [("req-0", 1), ("req-1", 1)]
+
+
 def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
     from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
 
     with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=object()):
-        with pytest.raises(ValueError, match="complete sequence as the query"):
+        with pytest.raises(ValueError, match="query plus imported AR prefix"):
             HunyuanImage3Model._paged_attention_context(
                 mode="gen_image",
                 first_step=True,
@@ -261,6 +283,116 @@ def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
                 ar_kv_reuse_len=0,
                 row_identities=[("req", 0)],
             )
+
+
+def test_hunyuan_model_builds_imported_prefix_paged_row() -> None:
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+
+    class FakeAdapter:
+        def prepare_batch(self, rows):
+            self.rows = tuple(rows)
+            return self.rows
+
+        @contextmanager
+        def activate(self, batch):
+            yield batch
+
+    adapter = FakeAdapter()
+    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=adapter):
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=True,
+            query_lens=[8],
+            seq_lens=[12],
+            position_ids=torch.arange(4, 12).reshape(1, -1),
+            gen_timestep_scatter_index=torch.tensor([[2]]),
+            ar_kv_reuse_len=4,
+            row_identities=[("req", 0)],
+        ):
+            pass
+
+    row = adapter.rows[0]
+    assert (row.kv_start_pos, row.imported_prefix_len, row.query_len, row.seq_len) == (4, 4, 8, 12)
+
+
+def test_hunyuan_model_builds_global_paged_rows_for_ulysses() -> None:
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+
+    class FakeAdapter:
+        def prepare_batch(self, rows):
+            self.rows = tuple(rows)
+            return self.rows
+
+        @contextmanager
+        def activate(self, batch):
+            yield batch
+
+    adapter = FakeAdapter()
+    with patched_mgr_env(sp_size=2), set_forward_context(paged_kv_runtime=adapter):
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=True,
+            query_lens=[7],
+            seq_lens=[7],
+            position_ids=torch.arange(7).reshape(1, -1),
+            gen_timestep_scatter_index=torch.tensor([[3]]),
+            ar_kv_reuse_len=0,
+            row_identities=[("req", 0)],
+            shard_image_size=4,
+            shard_padding_size=1,
+        ):
+            pass
+        assert (adapter.rows[0].query_len, adapter.rows[0].seq_len) == (10, 10)
+
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=False,
+            query_lens=[4],
+            seq_lens=[7],
+            position_ids=torch.arange(3, 7).reshape(1, -1),
+            gen_timestep_scatter_index=None,
+            ar_kv_reuse_len=0,
+            row_identities=[("req", 0)],
+            shard_image_size=4,
+            shard_padding_size=1,
+        ):
+            pass
+
+    row = adapter.rows[0]
+    assert (row.kv_start_pos, row.query_len, row.seq_len) == (3, 7, 10)
+
+
+def test_cache_manager_attaches_dense_imported_prefix_to_paged_attention() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    prefix_len = 4
+    prefix_key, prefix_value = _make_known_kv(prefix_len, base=100.0)
+    mgr._injected_ar_kv = [(prefix_key, prefix_value)]
+    current_key, current_value = _make_known_kv(3, base=1.0)
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        _call_mgr(
+            mgr,
+            bs=1,
+            q_len=3,
+            seq_len=7,
+            key_flat=current_key,
+            value_flat=current_value,
+            first_step=True,
+            gen_timestep_scatter_index=torch.tensor([[0]]),
+            full_attn_spans=[[(4, 7)]],
+            ar_kv_reuse_len=prefix_len,
+        )
+
+    metadata = mgr.attn.paged_metadata[-1]
+    assert mgr._injected_ar_kv is None
+    assert metadata.paged_kv_prefix_key.shape == (1, 4, NUM_KV_HEADS, HEAD_DIM)
+    assert metadata.paged_kv_prefix_value.shape == (1, 4, NUM_KV_HEADS, HEAD_DIM)
+    assert torch.equal(metadata.paged_kv_prefix_key[0], prefix_key)
 
 
 @pytest.mark.parametrize(

@@ -1859,6 +1859,10 @@ class HunyuanImage3Pipeline(
     def _ensure_grouped_attention_backend_supported(self, num_states: int) -> None:
         if num_states <= 1:
             return
+        # Scheduler-paged attention carries each request's logical length in
+        # native metadata, so grouped rows do not rely on the padded dense mask.
+        if self._uses_scheduler_paged_kv():
+            return
         spec, source = self.od_config.diffusion_attention_config.resolve_with_source(role="self")
         backend = spec.backend.upper() if spec is not None else "AUTO"
         if backend == "TORCH_SDPA":
