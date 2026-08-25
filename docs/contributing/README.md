@@ -44,6 +44,149 @@ vLLM-Omni's `pre-commit` hooks will now run automatically every time you commit.
     pre-commit run --show-diff-on-failure --color=always --all-files  # runs on all files (short for --all-files)
     ```
 
+!!! warning
+    GitHub Actions `pre-commit` **skips** several local gates so a whole-tree
+    `--all-files` run stays green while historical debt is cleaned up. The
+    current `SKIP` list in
+    [`.github/workflows/pre-commit.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.github/workflows/pre-commit.yml)
+    is `check-test-ci-coverage`, `markdownlint-cli2`, `shellcheck`,
+    `check-spdx-header`, and `mypy-3.10`. Those hooks still run on **your
+    commit** for changed files. A passing GitHub pre-commit check does not mean
+    they passed locally. Hooks **not** on that list (forbidden imports,
+    `torch.cuda`, TTS adapter ratchet, Buildkite schema, Ruff, typos, …) run in
+    both places.
+
+The hooks below are new relative to the previous Omni config (Ruff, typos,
+actionlint, YAML/whitespace, DCO sign-off, and the pickle-only checker were
+already there). `check-pickle-imports` is gone: pickle is now one rule inside
+`check-forbidden-imports`.
+
+| Hook id | Enforces | GitHub Actions |
+| ------- | -------- | -------------- |
+| `markdownlint-cli2` | Markdown in `docs/`, `recipes/`, `README.md`, `CONTRIBUTING.md` (not `.claude/` / `.cursor/` / `CLAUDE.md`) | skipped |
+| `mypy-3.10` | Type-check changed `vllm_omni/` files (model trees excluded). `tests/` uses `--follow-imports skip` | skipped |
+| `mypy-3.11` / `3.12` / `3.13` | Same checker, extra Python versions | not installed; `pre-commit run --hook-stage manual mypy-3.12` |
+| `check-test-ci-coverage` | Every `tests/**/test_*.py` has a CI level mark and a hardware mark/helper | skipped |
+| `check-tts-adapter-migration` | `self._tts_model_type` branches in `serving_speech.py` must not increase | runs |
+| `shellcheck` | `*.sh` quoting / undefined vars | skipped |
+| `check-spdx-header` | Omni SPDX header on `.py` / `.pyi` / `.sh` / `.rs` / `.proto` | skipped |
+| `check-forbidden-imports` | pickle, stdlib `re`/`base64`, Triton, TileLang, Hugging Face Hub download/API | runs |
+| `check-torch-cuda-call` | Direct `torch.cuda.*` helpers outside platform adapters | runs |
+| `check-buildkite` | `.buildkite/*.yml` against the Buildkite schema | runs |
+
+Related config (not a new hook id): Ruff `TID251` also bans `librosa` and several
+`torch.cuda.*` names; typos is pinned and ignores git-describe hashes (`+g` +
+hex) and NumPy `writeable`. Keep the `suggestion` hook last in
+`.pre-commit-config.yaml` so autofix output does not bury the SKIP tip.
+
+#### SPDX headers
+
+Source files must start with:
+
+```text
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+```
+
+Rust and proto files use `//` instead of `#`. Empty files are exempt. A stale
+`Copyright contributors to the vLLM project` line is **rewritten in place** to
+the Omni copyright; the hook then exits non-zero so you restage the rewrite.
+
+#### Forbidden imports
+
+Under `vllm_omni/`, do not use:
+
+- stdlib `re` → `import regex as re`
+- stdlib `base64` → `import pybase64` (or `import pybase64 as base64`)
+- `pickle` / `cloudpickle` (also banned in most tests)
+- `from huggingface_hub import snapshot_download` / `hf_hub_download` / `HfApi`
+  / similar → `vllm.transformers_utils.repo_utils`
+- direct `triton` / `tilelang` → `vllm.triton_utils` / `vllm.tilelang_utils`
+
+`examples/`, `tests/`, `benchmarks/`, `apps/`, `docs/`, `tools/`, `scripts/`,
+`.buildkite/`, and `.github/` may keep stdlib `re` and `base64`
+(`_NON_LIBRARY_DIRS`). Pickle is stricter: tests are not exempt unless the
+file is on the pickle allowlist.
+
+#### `torch.cuda` call sites
+
+Prefer `current_omni_platform` / `OmniPlatform`. Platform adapters under
+`vllm_omni/platforms/` are allowed; other files must not add new
+`torch.cuda.*` helpers (`device_count`, `synchronize`, `empty_cache`,
+`device()`, `manual_seed`, and similar). `import torch` is fine.
+
+#### shellcheck
+
+The hook does **not** download a binary. Install `shellcheck` with a signed
+package manager, then re-run:
+
+- Debian/Ubuntu/WSL: `sudo apt-get install shellcheck`
+- Fedora: `sudo dnf install ShellCheck`
+- macOS: `brew install shellcheck`
+- Git Bash (MINGW): `scoop install shellcheck` so `shellcheck.exe` is on PATH.
+  WSL is Linux: use `apt-get`, not a Windows `.exe`.
+
+If no native binary is found, the wrapper prints those commands (and
+[the upstream install page](https://github.com/koalaman/shellcheck?tab=readme-ov-file#installing))
+and exits 1. AMD and other vendor scripts are **not** excluded.
+
+#### mypy
+
+`mypy-3.10` runs on commit for changed files. `[tool.mypy]` uses Python 3.12,
+`ignore_missing_imports = true`, and `follow_imports = "silent"`. Wrapper
+`tools/pre_commit/mypy.py` skips `vllm_omni/model_executor/models/` and
+`vllm_omni/diffusion/models/`, and type-checks `tests/` with
+`--follow-imports skip`. Extra versions:
+
+```bash
+pre-commit run --hook-stage manual mypy-3.12
+```
+
+#### Test CI marks
+
+`check-test-ci-coverage` requires each collected test module under `tests/` to
+have at least one CI **level** mark (`core_model`, `advanced_model`,
+`full_model`, `local_model`, or `slow`) and a **hardware** mark (`cpu`, `cuda`,
+`H100`, …) or helper (`hardware_test(` / `hardware_marks(`). GitHub Actions
+skips this hook; local commit does not. See the
+[test writing guide](./ci/test_writing_guide.md).
+
+#### TTS adapter ratchet
+
+`check-tts-adapter-migration` counts `self._tts_model_type` comparisons in
+`vllm_omni/entrypoints/openai/serving_speech.py`. The count must stay at or
+below `MAX_MODEL_TYPE_BRANCHES` in
+[`tools/pre_commit/check_tts_adapter.py`](https://github.com/vllm-project/vllm-omni/blob/main/tools/pre_commit/check_tts_adapter.py).
+New per-model behavior belongs in
+`vllm_omni/entrypoints/openai/tts_adapters/`. Removing branches **must** lower
+the budget in the same change; raising it is a reviewable policy edit.
+
+#### Markdownlint and Buildkite
+
+`markdownlint-cli2` auto-fixes `docs/`, `recipes/`, and the root README /
+CONTRIBUTING (rules in `.markdownlint.yaml`). Skill files under `.claude/` and
+`.cursor/` are excluded.
+
+`check-buildkite` validates `.buildkite/*.yml` against the official schema
+after the same expansion `upload_pipeline.py` uses. Omni-only keys such as
+`mirror_hardwares` are stripped or rendered first. A few files are skipped in
+`SKIP_FILES` inside `tools/pre_commit/check_buildkite.py`.
+
+#### Extending allowlists and budgets
+
+Prefer fixing the call site. Growing an allowlist or raising a budget is a
+policy change and needs review — do not edit these just to make the hook pass.
+
+| Gate | File | What to edit |
+| ---- | ---- | ------------ |
+| pickle, `re`, `base64`, Hugging Face Hub, Triton/TileLang | [`tools/pre_commit/check_forbidden_imports.py`](https://github.com/vllm-project/vllm-omni/blob/main/tools/pre_commit/check_forbidden_imports.py) | `CHECK_IMPORTS[<rule>].allowed_files`. Use `allowed_dirs` only when a whole tree should stay exempt. |
+| `torch.cuda` | [`tools/pre_commit/check_torch_cuda.py`](https://github.com/vllm-project/vllm-omni/blob/main/tools/pre_commit/check_torch_cuda.py) | `ALLOWED_FILES`, or `ALLOWED_PREFIXES` for a platform adapter tree. |
+| TTS `_tts_model_type` branches | [`tools/pre_commit/check_tts_adapter.py`](https://github.com/vllm-project/vllm-omni/blob/main/tools/pre_commit/check_tts_adapter.py) | `MAX_MODEL_TYPE_BRANCHES` (down only, unless the PR justifies a raise). |
+| Buildkite skip list | [`tools/pre_commit/check_buildkite.py`](https://github.com/vllm-project/vllm-omni/blob/main/tools/pre_commit/check_buildkite.py) | `SKIP_FILES` for pipelines that cannot be expanded. |
+
+To skip one hook for a single commit (discouraged): `SKIP=<hook-id> git commit`.
+To bypass every hook: `git commit --no-verify` (also discouraged).
+
 ### Documentation
 
 MkDocs is a fast, simple and downright gorgeous static site generator that's geared towards building project documentation. Documentation source files are written in Markdown, and configured with a single YAML configuration file, `mkdocs.yml`.
@@ -162,12 +305,14 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-review against project conventions:
 
 The skill offers two modes:
+
 - **Quick (~3 min):** catches showstoppers — PR title format, missing benchmark claims, rebase status
 - **Full (~10 min):** thorough maintainer-grade review — dead code scan, copy-paste detection, import hygiene
 
 The precheck covers five PR types: Bug Fix, Performance, New Model, Diffusion Model, and General. Each type has a tailored checklist that validates evidence quality (repro steps, A/B benchmarks, registry entries, etc.). See the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) for the full checklist.
 
 ### Local Test
+
 Please run the L1 and L2 test cases locally first and attach the results before contacting us to add the "ready" label. Please refer to the [test instructions](./ci/test_execution_guide.md) for running the test cases.
 
 ### Automatic skip-ci (docs and pytest skip marks)
@@ -189,7 +334,7 @@ These PR shapes all trigger skip-ci:
 Skip-ci does **not** apply when the diff also touches product code (for example `vllm_omni/`), or when test files change assertions, imports, fixtures, or other non-skip logic. If the diff cannot be resolved (non-PR branches outside `main`), CI runs as usual.
 
 !!! note
-    Skipping L2/L3 does **not** disable the Docker image build step. Nightly (L4) upload can still run when the PR has a `nightly-test` label or on scheduled `main` builds with `NIGHTLY=1`. Bootstrap child steps live in `bootstrap-upload-steps.yml`; the hook entry step runs `upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml`, which injects `if` by step `key` from skip-ci before upload. See [CI Settings — Diff-aware CI](./ci/ci_settings.md#diff-aware-ci) and [Test System Overview](./ci/test_system_overview.md).
+    Skipping L2/L3 does **not** disable the Docker image build step. Nightly (L4) upload can still run when the PR has a `nightly-test` label or on scheduled `main` builds with `NIGHTLY=1`. Weekly (L5) upload can still run with `weekly-test`, `WEEKLY=1`, or `NON_CRITICAL=1`. Bootstrap child steps live in `bootstrap-upload-steps.yml`; the hook entry step runs `upload_pipeline.py --upload <platform>/bootstrap-upload-steps.yml`, which injects `if` by step `key` from skip-ci before upload. See [CI Settings — Diff-aware CI](./ci/ci_settings.md#diff-aware-ci) and [Test System Overview](./ci/test_system_overview.md).
 
 ### Code Quality
 

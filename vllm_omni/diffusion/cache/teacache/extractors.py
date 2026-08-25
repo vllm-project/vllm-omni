@@ -723,11 +723,11 @@ def extract_flux2_klein_context(
 def extract_longcat_context(
     module: nn.Module,  # LongCatImageTransformer2DModel
     hidden_states,
-    timestep,
-    guidance,
-    encoder_hidden_states,
-    txt_ids,
-    img_ids,
+    encoder_hidden_states=None,
+    timestep=None,
+    img_ids=None,
+    txt_ids=None,
+    guidance=None,
     **kwargs,
 ) -> CacheContext:
     """Extract the cache context for LongCat Image.

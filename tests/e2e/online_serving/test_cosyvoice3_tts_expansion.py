@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for CosyVoice3 TTS model with voice cloning.
 
@@ -17,8 +17,16 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.slow, pytest.mark.tts]
+if current_omni_platform.is_rocm():
+    os.environ.setdefault("COSYVOICE3_TRT", "0")
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.core_model,
+]
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
@@ -40,6 +48,13 @@ def get_prompt(prompt_type="zh"):
         "en": "Hello, this is a voice cloning test with English text.",
     }
     return prompts.get(prompt_type, prompts["zh"])
+
+
+def _set_rocm_request_timeout(request_config: dict) -> None:
+    if current_omni_platform.is_rocm():
+        # A cold AITER MHA kernel build took 301 seconds on MI300X.
+        # Allow 600 seconds for the first request; later requests reuse the cache.
+        request_config["timeout"] = 600.0
 
 
 tts_server_params = [
@@ -65,8 +80,7 @@ tts_async_chunk_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_zh_001(omni_server, openai_client) -> None:
     """
@@ -85,11 +99,11 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
+    _set_rocm_request_timeout(request_config)
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     """
@@ -109,11 +123,11 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
+    _set_rocm_request_timeout(request_config)
     openai_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4644")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_en_001(omni_server, openai_client) -> None:
     """
@@ -132,4 +146,5 @@ def test_voice_clone_en_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
+    _set_rocm_request_timeout(request_config)
     openai_client.send_audio_speech_request(request_config)

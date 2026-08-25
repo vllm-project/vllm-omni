@@ -59,9 +59,10 @@ stages:
       to_stage_2: connector_of_shared_memory
     default_sampling_params:
       temperature: 0.8
-      top_p: 0.8
-      top_k: 100
-      repetition_penalty: 1.02
+      top_p: 0.85
+      top_k: 25
+      # See minicpmo_4_5.yaml: the Talker rescores this over a 16-frame window.
+      repetition_penalty: 1.05
       min_tokens: 50
       max_tokens: 4096
       seed: 42

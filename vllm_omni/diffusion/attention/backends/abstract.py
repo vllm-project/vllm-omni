@@ -15,6 +15,11 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    # A backend that supports this capability can consume the opaque paged-KV
+    # context prepared by the diffusion Worker data plane.  Keeping the
+    # capability on the backend class prevents a paged request from silently
+    # falling back to dense attention on an incompatible implementation.
+    supports_paged_kv: bool = False
     # The backend can represent a contiguous valid K/V prefix by slicing the
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
@@ -220,6 +225,18 @@ class AttentionImpl(ABC, Generic[T]):
             return self.forward_musa(query, key, value, attn_metadata)
         else:
             raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
+
+    def forward_paged(self, paged_kv_context: Any) -> torch.Tensor:
+        """Execute one Worker-prepared paged-KV attention call.
+
+        The context is intentionally opaque to the common attention layer.
+        Backends opt in by setting ``supports_paged_kv`` on their backend
+        class and implementing this method.  Dense callers continue to use
+        ``forward`` unchanged.
+        """
+
+        del paged_kv_context
+        raise NotImplementedError(f"{type(self).__name__} does not support paged KV attention")
 
     def forward_cuda(
         self,

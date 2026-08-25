@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Server/client/runner runtime primitives for tests."""
 
 import asyncio
@@ -176,6 +179,17 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
+
+
+def get_distributed_init_method() -> str:
+    """Return a fresh ``file://`` init_method for ``torch.distributed`` process groups.
+
+    Rendezvous happens through a filesystem path instead of a pre-agreed TCP port,
+    so there's no bind-time race to retry around: the path is unique per call and
+    the real rank-0 process is the only one that ever creates it.
+    """
+    with tempfile.NamedTemporaryFile(prefix="torch_dist_init_") as f:
+        return f"file://{f.name}"
 
 
 def dummy_messages_from_mix_data(
@@ -770,6 +784,7 @@ class OmniResponse:
     success: bool = False
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
     #: HTTP status + error text for the error-handling path (e.g. validator
     #: rejections); populated when the OpenAI client raises an APIError.
@@ -1089,6 +1104,7 @@ class OpenAIClientHandler:
                     result.prompt_tokens = chunk.usage.prompt_tokens
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
+                        result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
 
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -1121,6 +1137,7 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
+                    result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
             result.text_content = text_content
@@ -1153,7 +1170,7 @@ class OpenAIClientHandler:
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
 
-                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                # OpenAI audio responses populate `message.audio`.
                 audio_obj = getattr(choice.message, "audio", None)
                 audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
                 if audio_b64:

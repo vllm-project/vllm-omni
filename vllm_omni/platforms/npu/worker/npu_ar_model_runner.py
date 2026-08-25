@@ -778,6 +778,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if callable(flush_pending_metadata):
                 flush_pending_metadata(req_ids[:num_reqs])
 
+            # [Omni] Hand the model the batch's req_ids in logits order, for
+            # models that gate logits per request. Mirrors gpu_ar_model_runner.
+            # Only valid without spec decode: there logits_indices carries several
+            # rows per request, so row i no longer corresponds to req_ids[i].
+            if spec_decode_metadata is None:
+                set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                if callable(set_batch_req_ids):
+                    set_batch_req_ids(req_ids[:num_reqs])
+
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
             if multimodal_outputs is not None:

@@ -195,11 +195,13 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 # Transfer V2V with a precomputed depth control video. `control_path` can point
 # to a local image/video; edge and blur can also be computed from `input_reference`
-# by passing `"edge":true` or `"blur":true`.
+# by passing `"edge":true` or `"blur":true`. The reference negative prompt is
+# optional; omit the `negative_prompt` form field to use an empty negative branch.
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Nano" \
   -F "prompt=Generate a realistic scene following the provided control video." \
+  --form-string "negative_prompt=$(jq -c . recipes/cosmos3/negative_prompt.json)" \
   -F "size=1280x720" -F "num_frames=121" \
   -F "num_inference_steps=50" -F "seed=125" \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
@@ -322,15 +324,34 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `extra_params={"guardrails":false}` (per request) toggles safety. The
   per-request flag only takes effect when the server was launched **with**
   guardrails enabled (it cannot re-enable them on a `--no-guardrails` server).
-  `use_resolution_template` / `use_duration_template` are off by default and only
-  needed when not using upsampled prompts that already encode resolution/duration.
+  Outside transfer mode, `use_resolution_template` / `use_duration_template`
+  are off by default and only needed when not using upsampled prompts that
+  already encode resolution/duration.
   For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
   frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
   API decodes the first or last needed reference frames (`"first"` by default).
 - **Transfer controls:** `extra_params` may include `edge`, `blur`, `depth`,
   `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
   `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
-  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`. Every hint
+  accepts a non-negative `control_weight`; weights are normalized across active
+  controls and therefore only set their relative influence. A single positive
+  weight always normalizes to `1.0`; use `control_guidance` to change the
+  absolute strength of a single control. With two or more active controls, the
+  per-control attention passes run replicated on every sequence-parallel
+  (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
+  multi-control transfer requests.
+  Transfer always uses Cosmos3's transfer-specific system prompt. By default it
+  also appends a directive naming every active hint and asking the model to
+  follow its shape, position, and motion precisely; set the request-level
+  `emphasize_control_in_prompt` option to `false` for prompt ablations. Transfer
+  does not add a negative prompt automatically. An optional reference prompt is
+  provided in [`negative_prompt.json`](negative_prompt.json); compact the JSON
+  with `jq -c` and pass it through `negative_prompt` as shown in the transfer
+  example. Transfer enables duration/FPS and resolution metadata on both CFG
+  branches. Set `use_duration_template` or `use_resolution_template` to
+  `false` to disable either template. `negative_metadata_mode` accepts `same`
+  (the transfer default), `inverse`, or `none`.
   Transfer-level options include `control_guidance`,
   `control_guidance_interval`, `num_video_frames_per_chunk` (default `93`,
   `101` for WSM), `num_conditional_frames` (default `1`),

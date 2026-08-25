@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -87,6 +90,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "num_weight_load_threads",
         "omni_kv_config",
         "parallel_config",
+        "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",
         "tokenizer_subdir",
