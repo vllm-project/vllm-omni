@@ -27,6 +27,9 @@ from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter import (
+    MiniCPMO45ServingRuntimeAdapter,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
 )
@@ -39,7 +42,11 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     ResponseCreateOptions,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import NativeRealtimeSessionProtocol
-from vllm_omni.experimental.fullduplex.openai.runtime_adapter import ServingRuntimeConfigError
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    ServingRuntimeConfigError,
+    runtime_capabilities,
+    validate_serving_runtime_adapter,
+)
 from vllm_omni.experimental.fullduplex.openai.serving import (
     OmniDuplexSessionHandler,
     should_enable_duplex_endpoint,
@@ -1305,6 +1312,60 @@ def _native_session_create(
     event["session"]["instructions"] = "You are a concise assistant."
     event["session"]["extra_body"] = {"minicpmo45_native_duplex": True}
     return event
+
+
+class _LegacyCapabilitiesAdapter(MiniCPMO45ServingRuntimeAdapter):
+    """Adapter published before runtime-derived capabilities were added."""
+
+    capabilities_with_runtime_config_v1 = None
+
+    @staticmethod
+    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        return DuplexCapabilities.minicpmo45_native(max_sessions=max_sessions)
+
+
+class _InvalidRuntimeCapabilitiesAdapter(MiniCPMO45ServingRuntimeAdapter):
+    @staticmethod
+    def capabilities_with_runtime_config_v1(*, max_sessions: int) -> DuplexCapabilities:
+        return DuplexCapabilities.minicpmo45_native(max_sessions=max_sessions)
+
+
+@pytest.mark.asyncio
+async def test_native_session_create_accepts_legacy_capabilities_adapter():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        serving_runtime_adapter=_LegacyCapabilitiesAdapter(lambda *_: None),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-legacy-capabilities"))
+    ws.put({"type": "session.close"})
+
+    await handler.handle_session(ws)
+
+    assert ws.sent_types()[0] == "session.created"
+    assert engine.opened == ["sid-legacy-capabilities"]
+
+
+def test_runtime_capabilities_uses_versioned_runtime_hook():
+    adapter = MiniCPMO45ServingRuntimeAdapter(lambda *_: None)
+
+    capabilities = runtime_capabilities(
+        adapter,
+        max_sessions=1,
+        runtime_config={"streaming_audio_chunk_ms": 600},
+    )
+
+    assert capabilities.chunk_period_ms == 600
+
+
+def test_runtime_capabilities_rejects_invalid_optional_hook_signature():
+    adapter = _InvalidRuntimeCapabilitiesAdapter(lambda *_: None)
+
+    with pytest.raises(TypeError, match="capabilities_with_runtime_config_v1"):
+        validate_serving_runtime_adapter(adapter)
 
 
 def _native_realtime_session_update(

@@ -51,7 +51,16 @@ class MiniCPMO45ServingRuntimeAdapter:
     def capabilities(
         *,
         max_sessions: int,
-        runtime_config: Mapping[str, object] | None = None,
+    ) -> DuplexCapabilities:
+        return DuplexCapabilities.minicpmo45_native(
+            max_sessions=max_sessions,
+        )
+
+    @staticmethod
+    def capabilities_with_runtime_config_v1(
+        *,
+        max_sessions: int,
+        runtime_config: Mapping[str, object],
     ) -> DuplexCapabilities:
         chunk_period_ms = MiniCPMO45NativeDuplexServingAdapter.runtime_streaming_audio_chunk_ms(runtime_config)
         return DuplexCapabilities.minicpmo45_native(
