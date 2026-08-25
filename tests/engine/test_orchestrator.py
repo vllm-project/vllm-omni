@@ -880,6 +880,55 @@ async def test_async_chunk_data_then_raw_terminal_finishes_once(orchestrator_fac
 
 
 @pytest.mark.asyncio
+async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orchestrator_factory) -> None:
+    request_id = "req-stream-processed-terminal"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processed_terminal = _build_request_output(
+        request_id,
+        token_ids=[20, 21],
+        finished=True,
+        text="last audio chunk",
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[
+            FakeOutputProcessor(),
+            FakeOutputProcessor(request_outputs=[processed_terminal]),
+        ],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+
+        assert terminal_msg.engine_outputs is processed_terminal
+        assert terminal_msg.finished is True
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_shutdown(orchestrator_factory) -> None:
     stages = [
         FakeStageClient(stage_type="llm", final_output=False),

@@ -1371,6 +1371,12 @@ class Orchestrator:
                 continue
 
             final_output_type = getattr(pool.stage_client, "final_output_type", None)
+            logger.info(
+                "[Orchestrator] req=%s stage-%s raw terminal produced no processed terminal; returning empty %s output",
+                request_id,
+                stage_id,
+                final_output_type or "text",
+            )
             terminal_output = _build_terminal_empty_output(
                 request_id,
                 final_output_type=final_output_type,
