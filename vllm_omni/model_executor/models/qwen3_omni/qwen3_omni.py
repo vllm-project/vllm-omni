@@ -1009,7 +1009,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         target_len = thinker_result_ids.shape[-1]
         im_start_indexes = torch.cat(
             (
-                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
+                torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(-1),
                 torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,

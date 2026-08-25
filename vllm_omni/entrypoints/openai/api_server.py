@@ -14,7 +14,7 @@ import random
 import tempfile
 import time
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
@@ -79,7 +79,6 @@ from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -127,7 +126,9 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.realtime.connection import (
+    FullDuplexRealtimeConnection,
+)
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -171,6 +172,40 @@ MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
 profiler_router = APIRouter()
+
+_QWEN3_OMNI_REALTIME_ARCH = "Qwen3OmniMoeForConditionalGeneration"
+_QWEN3_OMNI_REALTIME_STAGES = {"thinker", "talker", "code2wav"}
+
+
+def _supports_qwen3_omni_realtime(stage_configs: Any) -> bool:
+    def stage_arg(stage: Any, name: str) -> Any:
+        engine_args = getattr(stage, "engine_args", None)
+        return engine_args.get(name) if isinstance(engine_args, Mapping) else getattr(engine_args, name, None)
+
+    stages = stage_configs or ()
+    return (
+        len(stages) == len(_QWEN3_OMNI_REALTIME_STAGES)
+        and all(stage_arg(stage, "model_arch") == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
+        and {stage_arg(stage, "model_stage") for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
+    )
+
+
+async def _reject_realtime_websocket(websocket: WebSocket, message: str) -> None:
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "event_id": f"evt_{random_uuid()}",
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unsupported_model",
+                "message": message,
+                "param": "model",
+                "event_id": None,
+            },
+        }
+    )
+    await websocket.close(code=1008)
 
 
 def _load_model_chat_template_json(model: str) -> str | None:
@@ -824,7 +859,6 @@ async def omni_init_app_state(
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
-        state.openai_serving_duplex = None
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
@@ -1708,23 +1742,25 @@ async def streaming_video_output(websocket: WebSocket):
 
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
-    """WebSocket endpoint for OpenAI-style realtime interactions."""
-    duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
-    duplex_query = websocket.query_params.get("duplex")
-    use_duplex_realtime = (
-        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
-    )
-    if use_duplex_realtime and duplex_handler is not None:
-        await duplex_handler.handle_realtime_session(websocket)
+    """Handle an OpenAI-compatible Realtime API session."""
+    state = websocket.app.state
+    if not _supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
+        await _reject_realtime_websocket(websocket, "The Realtime API is only supported for Qwen3-Omni")
         return
 
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
-    if serving is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
-        await websocket.close()
+    model_name = state.openai_serving_models.base_model_paths[0].name
+    requested_model = websocket.query_params.get("model")
+    if requested_model is not None and requested_model != model_name:
+        await _reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
         return
-    connection = RealtimeConnection(websocket, serving)
+
+    connection = FullDuplexRealtimeConnection(
+        websocket=websocket,
+        engine=state.engine_client,
+        model_name=model_name,
+        tool_call_parser=getattr(state.args, "tool_call_parser", None),
+        enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
+    )
     await connection.handle_connection()
 
 
@@ -1747,14 +1783,10 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 @router.websocket("/v1/duplex")
 async def duplex_websocket(websocket: WebSocket):
-    """WebSocket endpoint for vLLM-Omni duplex session control."""
-    handler = getattr(websocket.app.state, "openai_serving_duplex", None)
-    if handler is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
-        await websocket.close()
-        return
-    await handler.handle_session(websocket)
+    """Reject unsupported duplex sessions."""
+    await websocket.accept()
+    await websocket.send_json({"type": "error", "error": "Duplex API is not available", "code": "unsupported"})
+    await websocket.close()
 
 
 # Health and Model endpoints for diffusion mode
