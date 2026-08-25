@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import subprocess
 import sys
 from functools import lru_cache
@@ -259,8 +260,7 @@ def _cuda_chip_from_preset(preset: str) -> str | None:
 
 def _get_mirror_hw_selector() -> str:
     """Return lowercase ``MIRROR_HW``, or empty to use the mapping ``default`` key."""
-    # TEMP: force B200 debug. Restore: return os.environ.get("MIRROR_HW", "").strip().lower()
-    return "b200"
+    return os.environ.get("MIRROR_HW", "").strip().lower()
 
 
 def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | None:
