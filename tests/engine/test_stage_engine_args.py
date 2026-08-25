@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -8,8 +11,23 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from vllm.config import CacheConfig as VllmCacheConfig
+from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import ParallelConfig as VllmParallelConfig
+from vllm.config import ProfilerConfig as VllmProfilerConfig
+from vllm.config import SchedulerConfig as VllmSchedulerConfig
+from vllm.engine.arg_utils import EngineArgs
 
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    _LLM_STAGE_ENGINE_FIELDS,
+    OmniStageCacheConfig,
+    OmniStageLoadConfig,
+    OmniStageParallelConfig,
+    OmniStageSchedulerConfig,
+    VllmOmniARStageConfig,
+    VllmOmniConfig,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -30,6 +48,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -53,6 +72,31 @@ def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
+_OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
+    {
+        "active_stream_window",
+        "codec_frame_rate_hz",
+        "custom_voice_dir",
+        "devices",
+        "disable_autocast",
+        "enable_multithread_weight_load",
+        "env",
+        "has_sampling_extra_args",
+        "log_level",
+        "log_stats",
+        "model_arch",
+        "model_subdir",
+        "num_gpus",
+        "num_replicas",
+        "num_weight_load_threads",
+        "omni_kv_config",
+        "parallel_config",
+        "silence_ban_frames",
+        "subtalker_sampling_params",
+        "task_type",
+        "tokenizer_subdir",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +123,17 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
             engine_args["worker_cls"] = f"test.{worker_type}.Worker"
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", _resolve_test_worker)
+
+    class _TestConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class _TestWorker:
+        model_runner_cls = _TestConnectorRunner
+
+    for worker_type in ("ar", "generation"):
+        worker_module = types.ModuleType(f"test.{worker_type}")
+        worker_module.Worker = _TestWorker
+        monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
@@ -197,6 +252,100 @@ def _legacy_and_typed_stages(
     return legacy_stages, omni_config
 
 
+def test_llm_stage_engine_field_schema_tracks_upstream_engine_args():
+    upstream_engine_fields = frozenset(field.name for field in fields(EngineArgs))
+
+    assert _LLM_STAGE_ENGINE_FIELDS - upstream_engine_fields == _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS
+
+
+def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+        load_config=OmniStageLoadConfig(ignore_patterns=["*.bin"]),
+        cache_config=OmniStageCacheConfig(block_size=32, cache_dtype="fp8"),
+        scheduler_config=OmniStageSchedulerConfig(
+            prefill_schedule_interval=2,
+            policy="priority",
+        ),
+        parallel_config=OmniStageParallelConfig(
+            data_parallel_master_ip="10.0.0.1",
+            enable_dbo=True,
+        ),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert engine_args["ignore_patterns"] == ["*.bin"]
+    assert engine_args["block_size"] == 32
+    assert engine_args["kv_cache_dtype"] == "fp8"
+    assert engine_args["prefill_schedule_interval"] == 2
+    assert engine_args["scheduling_policy"] == "priority"
+    assert engine_args["data_parallel_address"] == "10.0.0.1"
+    assert engine_args["enable_dbo"] is True
+
+
+def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    inherited_defaults = {
+        "ignore_patterns",
+        "block_size",
+        "kv_cache_dtype",
+        "prefill_schedule_interval",
+        "scheduling_policy",
+        "data_parallel_address",
+        "data_parallel_rank",
+        "data_parallel_size_local",
+        "data_parallel_rpc_port",
+        "enable_dbo",
+    }
+    assert inherited_defaults.isdisjoint(engine_args)
+
+
+def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+        scheduler_config=OmniStageSchedulerConfig(scheduler_cls="test.CustomScheduler"),
+    )
+
+    with pytest.raises(ValueError, match=r"no EngineArgs projection: scheduler_cls"):
+        stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+
+@pytest.mark.parametrize("stage_id", [0, 1], ids=["ar", "generation"])
+def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_id):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    compilation_config = VllmCompilationConfig(backend="eager")
+    profiler_config = VllmProfilerConfig(profiler="cuda")
+    stage_prefix = f"stage_{stage_id}_"
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+        cli_overrides={
+            "model": model,
+            f"{stage_prefix}compilation_config": compilation_config,
+            f"{stage_prefix}profiler_config": profiler_config,
+        },
+    )
+
+    stage_config = omni_config.stage_by_id(stage_id)
+    typed_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
+
+    assert isinstance(stage_config.compilation_config, VllmCompilationConfig)
+    assert isinstance(typed_args["compilation_config"], VllmCompilationConfig)
+    assert typed_args["compilation_config"] is not stage_config.compilation_config
+    assert typed_args["compilation_config"].backend == "eager"
+
+    assert isinstance(stage_config.profiler_config, VllmProfilerConfig)
+    assert isinstance(typed_args["profiler_config"], VllmProfilerConfig)
+    assert typed_args["profiler_config"] is not stage_config.profiler_config
+    assert typed_args["profiler_config"].profiler == "cuda"
+
+
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
@@ -222,6 +371,13 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         assert {name: typed_args[name] for name in legacy_args} == legacy_args
 
     thinker_args = typed_args_by_stage[0]
+    inherited_vllm_fields = {
+        field.name
+        for config_cls in (VllmLoadConfig, VllmCacheConfig, VllmSchedulerConfig, VllmParallelConfig)
+        for field in fields(config_cls)
+    }
+    topology_projected_fields = {"scheduler_cls"}
+    assert (inherited_vllm_fields - _LLM_STAGE_ENGINE_FIELDS - topology_projected_fields).isdisjoint(thinker_args)
     assert thinker_args["model"] == str(tmp_path / "stage-model" / "ar-model")
     assert thinker_args["tokenizer"] == str(tmp_path / "stage-model" / "ar-tokenizer")
     assert thinker_args["stage_id"] == 0

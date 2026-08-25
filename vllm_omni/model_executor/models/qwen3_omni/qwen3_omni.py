@@ -20,12 +20,22 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsQuant,
+    SupportsRealtime,
+)
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
 )
-from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -39,6 +49,9 @@ from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    apply_outer_quant_config_mapping,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerDummyInputsBuilder,
     Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -86,6 +99,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     CustomProcessMixin,
     SupportsMRoPE,
     SupportsRealtime,
+    SupportsQuant,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -98,6 +112,24 @@ class Qwen3OmniMoeForConditionalGeneration(
     Usage:
         Set `model_stage` in vllm_config to one of: "thinker", "talker", "code2wav"
     """
+
+    # vLLM applies quantization-config name mapping before constructing this
+    # outer stage wrapper.  Expose the final module paths here so checkpoint
+    # ignore lists (for example, the BF16 MoE routers in compressed-tensors
+    # checkpoints) match the nested thinker/talker modules at construction
+    # time.  The keys intentionally omit a trailing dot so exact module names
+    # such as ``thinker.lm_head`` are mapped along with their parameters.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "thinker.lm_head": "thinker.language_model.lm_head",
+            "thinker.model": "thinker.language_model.model",
+            "talker.model": "talker.language_model.model",
+        }
+    )
+    packed_modules_mapping = Qwen3OmniMoeThinkerForConditionalGeneration.packed_modules_mapping
+
+    def _maybe_apply_model_mapping(self) -> None:
+        apply_outer_quant_config_mapping(self)
 
     realtime_max_tokens = 64
 

@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 import vllm.envs as envs
+from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
@@ -223,6 +225,7 @@ class OmniBase(PDDisaggregationMixin):
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
+        self.sampling_constraints_list = self._get_sampling_constraints_list(self.engine.stage_configs)
         if not self.output_modalities:
             self.output_modalities = [
                 self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
@@ -325,6 +328,7 @@ class OmniBase(PDDisaggregationMixin):
         sampling_params_list: Sequence[Any] | Any | None,
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
+        """Resolve request parameters; pipeline sampling constraints override caller values."""
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -339,7 +343,46 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got a single sampling params object")
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
+
+        if sampling_params_list is not None:
+            normalized = [
+                self._apply_sampling_constraints(params, constraints)
+                for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
+            ]
         return normalized
+
+    @staticmethod
+    def _get_sampling_constraints_list(stage_configs: Sequence[Any]) -> list[dict[str, Any]]:
+        """Extract each stage's required sampling settings from runtime configs."""
+        constraints_list = []
+        for stage_config in stage_configs:
+            constraints = getattr(stage_config, "sampling_constraints", {})
+            if not isinstance(constraints, Mapping):
+                constraints_list.append({})
+                continue
+            if OmegaConf.is_config(constraints):
+                constraints = OmegaConf.to_container(constraints, resolve=True)
+            constraints_list.append(dict(constraints))
+        return constraints_list
+
+    @staticmethod
+    def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
+        """Rebuild params with pipeline-required settings without mutating caller input."""
+        if not constraints:
+            return params
+        if isinstance(params, Mapping):
+            return {**params, **constraints}
+        if is_dataclass(params):
+            values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
+        elif struct_fields := getattr(params, "__struct_fields__", None):
+            values = {
+                name: getattr(params, name)
+                for name in struct_fields
+                if not name.startswith("_") and name != "output_text_buffer_length"
+            }
+        else:
+            raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
+        return type(params)(**{**values, **constraints})
 
     def _fire_failure_counter_if_alive(self, request_id: str) -> None:
         """Fire the abort/exception bucket of requests_success_total.

@@ -1,6 +1,6 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -14,6 +14,26 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
+_DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
+
+
+def resolve_video_num_frames(
+    num_frames: int | None,
+    *,
+    default_num_frames: int,
+    is_dummy_run: bool,
+) -> int:
+    """Resolve the shared image-model frame sentinel for a video pipeline.
+
+    ``OmniDiffusionSamplingParams`` defaults ``num_frames`` to one for image
+    models, so an omitted video API field reaches model code as ``1``. Video
+    pipelines with a different default must materialize it at their boundary.
+    Startup profiling intentionally requests one frame, however, and must stay
+    lightweight.
+    """
+    if num_frames is None or (num_frames == 1 and not is_dummy_run):
+        return default_num_frames
+    return num_frames
 
 
 @dataclass
@@ -90,4 +110,6 @@ class OmniDiffusionRequest:
 
     @classmethod
     def is_dummy_run_request_id(cls, request_id: str | None) -> bool:
-        return request_id == DUMMY_DIFFUSION_REQUEST_ID
+        return request_id == DUMMY_DIFFUSION_REQUEST_ID or (
+            isinstance(request_id, str) and request_id.startswith(_DUMMY_DIFFUSION_REQUEST_ID_PREFIX)
+        )

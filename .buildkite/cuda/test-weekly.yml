@@ -5,59 +5,104 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
-
-  - label: "Reliability Test - qwen3-omni"
-    timeout_in_minutes: 180
+  - label: "Simple · CPU Coverage Test"
+    key: weekly-simple-cpu-coverage
     depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    if: build.env("WEEKLY") == "1"
+    timeout_in_minutes: 60
     commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
-    mirror_hardwares: h100_2
-
-  - label: "Reliability Test - wan22"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
-    mirror_hardwares: h100_2
-
-  - label: "Reliability Test - hunyuan-image"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
-    mirror_hardwares: h100_4
-
-  - label: "Reliability Test - voxcpm2"
-    timeout_in_minutes: 180
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
-    commands:
-      - pytest -s -v tests/dfx/reliability/test_reliability_voxcpm2.py -m "slow"
+      - |
+        set +e
+        REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
+        pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
+        EXIT=$$?
+        gzip -9 -f "$${REPORT}"
+        buildkite-agent artifact upload "$${REPORT}.gz"
+        exit $$EXIT
     mirror_hardwares: l4_1
 
-  - group: "Reliability Test - Invalid parameters Test"
+  - group: "Reliability Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
 
-      - label: "Invalid parameters Test · H100"
+      - label: "Reliability Test · qwen3-omni"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
+        mirror_hardwares: h100_2
+
+      - label: "Reliability Test · wan22"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
+        mirror_hardwares: h100_2
+
+      - label: "Reliability Test · hunyuan-image"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
+        mirror_hardwares: h100_4
+
+      - label: "Reliability Test · Invalid parameters · H100"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
         mirror_hardwares: h100_2
 
-      - label: "Invalid parameters Test · L4"
+      - label: "Reliability Test · Invalid parameters · L4"
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
         mirror_hardwares: l4_1
 
-  - group: ":card_index_dividers: E2E Tests"
+  - group: "Perf Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+
+      - label: ":full_moon: Omni · Perf Test · vLLM Text"
+        key: weekly-omni-performance-vllm-text
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_2
+
+      - label: ":full_moon: Omni · Perf Test · Async Chunk · Random"
+        key: weekly-omni-performance-async-chunk-random
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and slow"
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_2
+
+      - label: ":full_moon: Omni · Perf Test · Multi-Replica"
+        key: weekly-omni-performance-multi-replicas
+        timeout_in_minutes: 180
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+        mirror_hardwares: h100_3
+
+  - group: ":card_index_dividers: E2E Tests"
+    depends_on: upload-weekly-pipeline
+    if: build.env("NON_CRITICAL") == "1"
     steps:
 
       - label: "Omni · L4"
@@ -83,7 +128,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: "TTS · L4"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 120
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -134,7 +179,7 @@ steps:
         mirror_hardwares: l4_4
 
       - label: "Diffusion · H100 · Single-GPU"
-        timeout_in_minutes: 120
+        timeout_in_minutes: 150
         commands:
           - >-
             pytest -sv

@@ -131,7 +131,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -688,7 +688,7 @@ for result in response.json()["results"]:
 |-----------|--------|---------|-------------|
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
-All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
+All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
 
 For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 

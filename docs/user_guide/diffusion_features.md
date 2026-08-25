@@ -124,12 +124,12 @@ The following tables show which models support each feature:
 | **FLUX.2-dev**           |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |          ✅           |       ❌        |        ❌         |
 | **GLM-Image**            |     ❌     |     ❌      |           ❌           |       ✅        |         ✅         |          ❌          |   ✅    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Hidream-I1-Full**        |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **HiDream-O1-Image**     |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **HunyuanImage3**        |     ❌     |     ✅      |           ❌           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ✅        |        ✅*        |
 | **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **MagiHuman**            |     ❌     |     ❌      |           ❌           |       ❓        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **MammothModa2(T2I)**    |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Ovis-Image**           |     ❌     |     ✅      |           ❌           |       ✅        |         ❌         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
@@ -162,20 +162,29 @@ The following tables show which models support each feature:
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
+| **SANA-Video-2B T2V I2V**   |     ❓     |     ❓      |           ❓           |       ❓        |         ❓         |         ❓         |   ❓    |             ❓             |          ❓           |       ❓        |        ❌         |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
+| **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+
+> Notes:
+> 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
+>    recurrence carries state across frames, so a rank cannot denoise a slice of
+>    the token sequence in isolation. Doing so would need a distributed scan or
+>    an all-gather before every GDN block. The remaining ❌ columns are simply
+>    unvalidated on this model, not known-broken.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
 
 **Frame Interpolation Support**
 
-- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni
+- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
 
 ### AudioGen
 

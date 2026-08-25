@@ -1,23 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Synthetic media generation and media/text utilities for tests."""
 
 import atexit
 import base64
 import concurrent.futures
-import gc
 import hashlib
 import io
 import logging
 import math
+import mimetypes
 import multiprocessing
 import os
 import random
 import re
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict, overload
 
 import numpy as np
 import soundfile as sf
@@ -391,8 +397,16 @@ def generate_synthetic_video(
     import cv2
     import imageio
 
+    class _BouncingBall(TypedDict):
+        x: float
+        y: float
+        vx: float
+        vy: float
+        radius: int
+        color_bgr: tuple[int, int, int]
+
     num_balls = random.randint(3, 8)
-    balls = []
+    balls: list[_BouncingBall] = []
     for _ in range(num_balls):
         radius = min(width, height) // 8
         if radius < 1:
@@ -404,7 +418,16 @@ def generate_synthetic_video(
         vx = speed * math.cos(angle)
         vy = speed * math.sin(angle)
         color_bgr = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
-        balls.append({"x": x, "y": y, "vx": vx, "vy": vy, "radius": radius, "color_bgr": color_bgr})
+        balls.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "vx": float(vx),
+                "vy": float(vy),
+                "radius": radius,
+                "color_bgr": color_bgr,
+            }
+        )
 
     video_frames = []
     for _ in range(num_frames):
@@ -524,27 +547,34 @@ _AUDIO_MIME_BY_SUFFIX = {
 }
 
 
-def get_asset_path(relative_path: str | os.PathLike) -> Path:
-    """Resolve a path under ``tests/assets/`` to its absolute on-disk location."""
-    return _TEST_ASSETS_ROOT / Path(relative_path)
+def _asset_mime_type(path: Path) -> str:
+    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower())
+    if mime is not None:
+        return mime
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
 
 
-def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
-    """Load a vendored test audio file under ``tests/assets/`` as a base64 data URL.
+@overload
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: Literal[False] = False) -> Path: ...
 
-    Used by tests that need real reference audio (e.g. voice cloning) without
-    relying on the server's ability to fetch external URLs at request time.
+
+@overload
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: Literal[True]) -> str: ...
+
+
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: bool = False) -> Path | str:
+    """Resolve a path under ``tests/assets/``.
+
+    When ``as_data_url`` is true, read the file and return a base64 data URL
+    suitable for embedding reference media in API requests without external URLs.
     """
-    path = get_asset_path(relative_path)
-    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+    path = _TEST_ASSETS_ROOT / Path(relative_path)
+    if not as_data_url:
+        return path
+
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def decode_b64_image(b64: str):
-    img = Image.open(io.BytesIO(base64.b64decode(b64)))
-    img.load()
-    return img
+    return f"data:{_asset_mime_type(path)};base64,{encoded}"
 
 
 def concat_audio(audio_val) -> np.ndarray:
@@ -657,6 +687,10 @@ def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
 @contextmanager
 def _serialize_whisper_model_download(model_size: str = "small"):
     """Serialize Whisper cache writes across processes (Linux/Unix), per model."""
+    if sys.platform == "win32":
+        yield
+        return
+
     import fcntl
 
     lock_path = Path.home() / ".cache" / "whisper" / f".{model_size}_model_download.lock"
@@ -670,59 +704,152 @@ def _serialize_whisper_model_download(model_size: str = "small"):
         f.close()
 
 
-def _whisper_transcribe_in_current_process(
-    output_path: str, model_size: str = "small", language: str | None = None
-) -> str:
-    import whisper
-
+def _select_whisper_device() -> str:
     device_index = None
     from vllm_omni.platforms import current_omni_platform
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
         # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0. Loading Whisper there, once per concurrent
-        # request, competes for VRAM and OOMs. Only borrow an accelerator
-        # when a spare device exists; otherwise validate on CPU.
+        # occupies device 0, and a Whisper model resident there competes with
+        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
+        # exists; otherwise validate on CPU.
         if n > 1:
             device_index = n - 1
 
-    if device_index is not None:
-        torch_device = current_omni_platform.get_torch_device(device_index)
-        current_omni_platform.set_device(torch_device)
-        device = str(torch_device)
-        use_accelerator = True
-    else:
-        use_accelerator = False
-        device = "cpu"
+    if device_index is None:
+        return "cpu"
 
-    with _serialize_whisper_model_download(model_size):
-        model = whisper.load_model(model_size, device=device)
-    try:
-        text = model.transcribe(
-            output_path,
-            temperature=0.0,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            # None keeps whisper's auto-detection. Do not default this to a
-            # language: callers include non-English audio tests.
-            language=language,
-        )["text"]
-    finally:
-        del model
-        gc.collect()
-        if use_accelerator:
-            current_omni_platform.synchronize()
-            current_omni_platform.empty_cache()
+    torch_device = current_omni_platform.get_torch_device(device_index)
+    current_omni_platform.set_device(torch_device)
+    return str(torch_device)
+
+
+# Populated in the transcription worker, not in the pytest process.
+_WHISPER_MODELS: dict[str, Any] = {}
+
+
+def _get_whisper_model(model_size: str) -> Any:
+    model = _WHISPER_MODELS.get(model_size)
+    if model is None:
+        import whisper
+
+        # The device is picked on first load and the model stays on it for the
+        # worker's lifetime: the current server or runner fixture instance, or
+        # the test module for callers that transcribe without those fixtures.
+        device = _select_whisper_device()
+        with _serialize_whisper_model_download(model_size):
+            model = whisper.load_model(model_size, device=device)
+        _WHISPER_MODELS[model_size] = model
+    return model
+
+
+def _whisper_transcribe_in_current_process(
+    output_path: str, model_size: str = "small", language: str | None = None
+) -> str:
+    model = _get_whisper_model(model_size)
+    text = model.transcribe(
+        output_path,
+        temperature=0.0,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        # None keeps whisper's auto-detection. Do not default this to a
+        # language: callers include non-English audio tests.
+        language=language,
+    )["text"]
     return text or ""
 
 
+# Serializes a whole submit->result->cleanup on the parent side, so at most one
+# call is ever in flight on the single-worker pool. The child already runs
+# transcriptions serially, so this costs no throughput; it lets a failed call
+# discard the worker without disrupting another caller's in-flight future.
+_TRANSCRIBER_CALL_LOCK = threading.Lock()
+# Guards the _TRANSCRIBER pointer itself.
+_TRANSCRIBER_LOCK = threading.Lock()
+_TRANSCRIBER: concurrent.futures.ProcessPoolExecutor | None = None
+
+
+def _get_transcriber() -> concurrent.futures.ProcessPoolExecutor:
+    global _TRANSCRIBER
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is None:
+            ctx = multiprocessing.get_context("spawn")
+            _TRANSCRIBER = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+        return _TRANSCRIBER
+
+
+def _discard_transcriber(executor: concurrent.futures.ProcessPoolExecutor) -> None:
+    """Drop ``executor``, but only while it is still the current one.
+
+    Identity-checked so a stale reference can never shut down a newer worker that
+    was installed after ``executor`` was replaced.
+    """
+    global _TRANSCRIBER
+    with _TRANSCRIBER_LOCK:
+        if _TRANSCRIBER is not executor:
+            return
+        _TRANSCRIBER = None
+    # Joining the worker can block; do it outside the lock.
+    executor.shutdown(wait=True)
+
+
+def release_audio_transcriber() -> None:
+    """Shut the transcription worker down, freeing the device memory its models hold.
+
+    Called when a server or runner fixture instance tears down, so that the next
+    one -- including the next parametrization inside the same test module -- does
+    not initialize its model while Whisper still occupies the device. A module
+    teardown fixture repeats it for tests that transcribe without those fixtures.
+
+    Takes the call lock, so it waits for any in-flight transcription to finish
+    rather than shutting the worker down underneath it.
+    """
+    global _TRANSCRIBER
+    with _TRANSCRIBER_CALL_LOCK:
+        with _TRANSCRIBER_LOCK:
+            executor, _TRANSCRIBER = _TRANSCRIBER, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+
 def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
-    """Convert an audio file to text in an isolated subprocess."""
-    ctx = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language)
-        return future.result()
+    """Convert an audio file to text in a reused, isolated subprocess.
+
+    The worker outlives the call so its Whisper model is loaded once rather than
+    once per transcription. The call lock serializes callers onto the single
+    worker (the child already transcribes serially, so this costs no throughput),
+    which lets a failed call tear the worker down without racing another caller.
+    The worker caches one model per size it is asked for, so a run that escalates
+    to a stronger ASR keeps both models resident until release.
+
+    Any failure discards the worker, restoring the failure isolation of the old
+    one-process-per-call design: a failure (a ``torch`` OOM, or a
+    ``KeyboardInterrupt``/``SystemExit`` transported through the future or
+    raised while ``result()`` blocks) propagates unchanged after the worker --
+    and its resident model -- is torn down, and a dead worker
+    (``BrokenProcessPool``) is additionally retried once.
+    """
+    with _TRANSCRIBER_CALL_LOCK:
+        for attempt in range(2):
+            executor = _get_transcriber()
+            try:
+                return executor.submit(
+                    _whisper_transcribe_in_current_process, output_path, model_size, language
+                ).result()
+            except BrokenProcessPool:
+                _discard_transcriber(executor)
+                if attempt == 1:
+                    raise
+            except BaseException:
+                # Any other failure -- a task exception (a torch OOM included), or
+                # a KeyboardInterrupt/SystemExit transported through the future or
+                # interrupting result() -- leaves the worker and its model
+                # resident; drop it so it cannot contaminate later calls, matching
+                # the old per-call teardown. Do not retry.
+                _discard_transcriber(executor)
+                raise
+    raise AssertionError("unreachable")
 
 
 def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", language: str | None = None) -> str:
@@ -742,11 +869,10 @@ __all__ = [
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",
-    "decode_b64_image",
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
     "get_asset_path",
-    "load_test_audio_data_url",
     "preprocess_text",
+    "release_audio_transcriber",
 ]

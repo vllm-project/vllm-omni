@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Strict MiniCPM-o 4.5 Realtime duplex E2E scenario harness.
 
 This script is intentionally scenario-based instead of a generic chat client.
@@ -55,16 +58,12 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     read_pcm16_wav,
     summarize_session_request_metrics,
 )
+from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    reference_audio_data_url as _ref_audio_data_url,
+)
 
 _url_with_model = build_realtime_url
 _read_wav_pcm16 = read_pcm16_wav
-
-
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
-        return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
 @dataclass
@@ -1351,6 +1350,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         try:
             await ws.send(json.dumps(_session_update_event(args)))
             await _wait_for(state, lambda: state.count("session.created") > 0, timeout_s=20, label="session.created")
+            start_barrier = getattr(args, "start_barrier", None)
+            if start_barrier is not None:
+                await start_barrier.wait()
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))

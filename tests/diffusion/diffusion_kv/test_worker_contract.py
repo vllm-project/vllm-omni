@@ -85,19 +85,15 @@ def test_new_request_data_carries_scheduler_allocation_atomically() -> None:
     assert new_req.diffusion_kv_metadata is metadata
 
 
-def test_paged_request_without_metadata_reaches_request_forward() -> None:
+def test_paged_request_without_metadata_fails_before_request_forward() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    expected_output = DiffusionOutput(output=None)
-    runner._execute_request_list = Mock(
-        return_value=SimpleNamespace(
-            runner_outputs=[SimpleNamespace(result=expected_output)],
-        )
-    )
+    runner._execute_request_list = Mock()
     req = SimpleNamespace(request_id="req-0")
 
-    assert runner.execute_model(req) is expected_output
+    with pytest.raises(ValueError, match="requires Diffusion KV metadata"):
+        runner.execute_model(req)
 
-    runner._execute_request_list.assert_called_once()
+    runner._execute_request_list.assert_not_called()
 
 
 def test_dense_request_rejects_metadata_before_request_forward() -> None:
@@ -141,18 +137,18 @@ def test_request_rpc_rejects_envelope_request_identity_mismatch() -> None:
     assert calls == []
 
 
-def test_batch_path_allows_missing_metadata_before_forward() -> None:
+def test_batch_path_rejects_missing_metadata_before_forward() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    expected_output = object()
-    runner._execute_request_list = Mock(return_value=expected_output)
+    runner._execute_request_list = Mock()
     new_req = NewRequestData(
         request_id="req-0",
         req=SimpleNamespace(request_id="req-0"),
     )
 
-    assert runner.execute_model_batch(make_scheduler_output(new_req), runner.od_config) is expected_output
+    with pytest.raises(ValueError, match="requires Diffusion KV metadata"):
+        runner.execute_model_batch(make_scheduler_output(new_req), runner.od_config)
 
-    runner._execute_request_list.assert_called_once()
+    runner._execute_request_list.assert_not_called()
 
 
 def test_batch_path_rejects_envelope_request_identity_mismatch() -> None:
@@ -170,7 +166,7 @@ def test_batch_path_rejects_envelope_request_identity_mismatch() -> None:
     runner._execute_request_list.assert_not_called()
 
 
-def test_step_path_allows_missing_metadata_before_step_support_check() -> None:
+def test_step_path_rejects_missing_metadata_before_step_support_check() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
     runner.pipeline = object()
     runner._supports_step_mode = Mock(return_value=False)
@@ -179,10 +175,10 @@ def test_step_path_allows_missing_metadata_before_step_support_check() -> None:
         req=SimpleNamespace(request_id="req-0"),
     )
 
-    with pytest.raises(ValueError, match="does not support step execution"):
+    with pytest.raises(ValueError, match="requires Diffusion KV metadata"):
         runner.execute_stepwise(make_scheduler_output(new_req))
 
-    runner._supports_step_mode.assert_called_once()
+    runner._supports_step_mode.assert_not_called()
 
 
 def test_step_path_rejects_envelope_request_identity_mismatch() -> None:
@@ -288,3 +284,42 @@ def test_dense_worker_call_does_not_extend_model_runner_signature() -> None:
     worker.execute_model(req, SimpleNamespace())
 
     assert calls == [(req, None)]
+
+
+def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    class ModelRunner:
+        def execute_model(self, req, **kwargs):
+            calls.append((req, kwargs))
+            return DiffusionOutput(output=None)
+
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = ModelRunner()
+    worker.lora_manager = None
+    worker._get_profiler = lambda: None
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank",
+        lambda: 1,
+    )
+    req_0 = SimpleNamespace(request_id="req-0")
+    req_1 = SimpleNamespace(request_id="req-1")
+    metadata_0 = make_metadata("req-0")
+    metadata_1 = make_metadata("req-1")
+    envelopes = [
+        NewRequestData(request_id="req-0", req=req_0, diffusion_kv_metadata=metadata_0),
+        NewRequestData(request_id="req-1", req=req_1, diffusion_kv_metadata=metadata_1),
+    ]
+
+    result = worker.execute_model(envelopes, SimpleNamespace())
+
+    assert calls == [
+        (
+            req_1,
+            {
+                "kv_prefetch_job": None,
+                "diffusion_kv_metadata": metadata_1,
+            },
+        )
+    ]
+    assert result["dp_rank"] == 1

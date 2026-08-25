@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for StageConfigFactory and related classes.
 """
@@ -1127,9 +1127,11 @@ class TestDeployConfigLoading:
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False
-        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 2048
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
         assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
-        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+        assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -1265,8 +1267,6 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -1304,6 +1304,7 @@ stages:
             ({"model_type": "step_audio_2"}, None, "step_audio_2"),
             (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
             (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
+            (None, {"_class_name": "WanDMDPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(
@@ -1659,6 +1660,7 @@ stages:
             ]
         }
         original_foo = fake_config["stages"][0]["foo"]
+        assert isinstance(original_foo, dict)
         original_b = original_foo["b"]
 
         with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
@@ -2111,6 +2113,28 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    def test_minicpmo_overlays_inherit_talker_sampling_params(self):
+        """Overlays must keep the base Talker codec Sampler knobs."""
+        for filename in (
+            "minicpmo_4_5_duplex.yaml",
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_8x4090_stage1_replicas.yaml",
+        ):
+            path = Path(get_deploy_config_path(filename))
+            if not path.exists():
+                pytest.skip(f"{filename} not found")
+            deploy = load_deploy_config(path)
+            sampling = deploy.stages[1].default_sampling_params
+            assert sampling is not None, f"{filename} stage 1 lost default_sampling_params"
+            assert sampling["temperature"] == 0.8, filename
+            # Upstream utils.TTSSamplingParams. min_tokens is not checked here:
+            # the duplex overlay drops it to 0 because the model budgets each
+            # generate_chunk itself.
+            assert sampling["top_k"] == 25, filename
+            assert sampling["top_p"] == 0.85, filename
+            assert sampling["repetition_penalty"] == 1.05, filename
+
     def test_ci_inherits_from_main(self):
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
         if not ci_path.exists():
@@ -2200,6 +2224,28 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+    def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        expected = {"custom_ops": ["+rotary_embedding"]}
+        assert cuda_stages[0].yaml_engine_args["compilation_config"] == expected
+        assert all("compilation_config" not in stage.yaml_engine_args for stage in cuda_stages[1:])
+
+        for platform in ("cpu", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(
+                load_deploy_config(deploy_path),
+                platform=platform,
+            )
+            config = deploy.stages[0].compilation_config or {}
+            assert "+rotary_embedding" not in config.get("custom_ops", [])
 
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -2707,22 +2753,23 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
-        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
-        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no
+        ``custom_process_next_stage_input_func``, and stage 1 does not set
+        ``requires_full_payload_input=True``. Stage 1 uses only
+        ``thinker2talker_token_only`` (sync_process_input_func).
         The dead ``thinker2talker`` (custom_process_input_func) was removed
         because ming_flash_omni has no async_chunk support and both functions
         called ``_build_talker_inputs`` identically.
-        Merge under either async_chunk mode must not re-introduce a
-        stage-0 full-payload hook."""
+        Merge under either async_chunk mode must not re-introduce either
+        full-payload transport gate."""
         pipeline = resolve_pipeline_config("ming_flash_omni")
         assert isinstance(pipeline, PipelineConfig)
 
         stage0, stage1 = pipeline.stages
         assert stage0.custom_process_next_stage_input_func is None, (
-            "ming_flash_omni stage 0 must not declare a full-payload producer "
-            "(connector path is not active for this arch)."
+            "ming_flash_omni stage 0 must not declare a full-payload producer hook."
         )
+        assert stage1.requires_full_payload_input is False
         assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
@@ -2809,13 +2856,14 @@ class TestObjectStorageConfigResolution:
         monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
 
         class Recorder:
+            def __init__(self) -> None:
+                self.pulls = pulls
+
             def set_files(self, files: list[tuple[str, str]]) -> None:
                 materialized_files.clear()
                 materialized_files.extend(files)
 
-        recorder = Recorder()
-        recorder.pulls = pulls
-        return recorder
+        return Recorder()
 
     def test_passthrough_for_non_uri(self, fake_object_storage):
         assert _materialize_object_storage_configs("org/model") == "org/model"

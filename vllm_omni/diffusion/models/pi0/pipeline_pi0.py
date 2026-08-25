@@ -22,15 +22,11 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.config.stage_config import (
-    PipelineConfig,
-    StageExecutionType,
-    StagePipelineConfig,
-)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi0.config import Pi0Config
 from vllm_omni.diffusion.models.pi0.modeling_pi0 import Pi0ForActionPrediction
 from vllm_omni.diffusion.models.pi0.processor_pi0 import build_model_inputs
+from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE as PI0_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -52,32 +48,6 @@ def get_pi0_post_process_func(od_config: OmniDiffusionConfig):
     """
     del od_config
     return _pi0_post_process
-
-
-# Single-stage diffusion topology for online OpenPI serving.
-#
-# π0 is one diffusion stage (robot observation -> action chunk via flow
-# matching). It is registered in ``OMNI_PIPELINES`` (rather than relying on the
-# default single-stage fallback) because π0 is *online-served* via
-# ``vllm serve --deploy-config pi0.yaml``; that path
-# (``OmniStagePipelineFactory._create_from_registry``) requires a registered
-# pipeline so the deploy yaml's ``policy_server_config`` reaches the OpenPI
-# websocket layer. Offline-only models (e.g. ``internvla_a1``) need no topology.
-PI0_PIPELINE = PipelineConfig(
-    model_type="pi0",
-    model_arch="Pi0Pipeline",
-    stages=(
-        StagePipelineConfig(
-            stage_id=0,
-            model_stage="diffusion",
-            execution_type=StageExecutionType.DIFFUSION,
-            input_sources=(),
-            final_output=True,
-            final_output_type="action",
-            model_arch="Pi0Pipeline",
-        ),
-    ),
-)
 
 
 class Pi0Pipeline(nn.Module):

@@ -39,4 +39,5 @@ vllm bench serve --omni \
     --num-prompts  5
 ```
 
-See [vllm bench serve](./bench/serve.md) for the full reference of all available arguments.
+See [vllm bench serve](./bench/serve.md) for serving benchmark arguments and
+dataset-specific examples, including OmniInteract native-duplex sessions.

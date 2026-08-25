@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -44,6 +44,8 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
+FASTWAN_DMD_TIMESTEPS = (1000.0, 757.0, 522.0)
+FASTWAN_DMD_SCHEDULER_SHIFT = 8.0
 
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
@@ -62,6 +64,30 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     raise ValueError(
         f"Unsupported Wan sample_solver: {sample_solver}. Expected one of: {sorted(WAN_SAMPLE_SOLVER_CHOICES)}"
     )
+
+
+def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
+    gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
+    has_gate_compress_weights = False
+
+    def tracked_weights():
+        nonlocal has_gate_compress_weights
+        for name, weight in weights:
+            if ".to_gate_compress." in name:
+                has_gate_compress_weights = True
+            yield name, weight
+
+    loaded_weights = AutoWeightsLoader(model).load_weights(tracked_weights())
+    setattr(model, "has_gate_compress_weights", has_gate_compress_weights)
+    if not has_gate_compress_weights:
+        for module in model.modules():
+            if isinstance(module, WanSelfAttention):
+                module.to_gate_compress = None
+
+    # Optional gate parameters are absent from public FullAttn/DMD checkpoints.
+    loaded_weights.update(gate_param_names)
+    return loaded_weights
 
 
 def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc") -> str:
@@ -314,6 +340,7 @@ class Wan22Pipeline(
 
         # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
         self.expand_timesteps = False
+        self.is_dmd = False
         self.has_transformer_2 = False
         if local_files_only:
             model_index_path = os.path.join(model, "model_index.json")
@@ -321,6 +348,7 @@ class Wan22Pipeline(
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
+                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
             # Check if this is a two-stage model (MoE with transformer_2)
             transformer_2_path = os.path.join(model, "transformer_2")
             self.has_transformer_2 = os.path.exists(transformer_2_path)
@@ -333,6 +361,7 @@ class Wan22Pipeline(
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
+                    self.is_dmd = model_index.get("_class_name") == "WanDMDPipeline"
                     # Check transformer_2 from model_index
                     transformer_2_info = model_index.get("transformer_2", [None, None])
                     self.has_transformer_2 = transformer_2_info[0] is not None
@@ -422,6 +451,10 @@ class Wan22Pipeline(
         else:
             self.transformer_2 = None
 
+        for transformer in (self.transformer, self.transformer_2):
+            if transformer is not None:
+                transformer.preserve_vsa_all_blocks = self.is_dmd
+
         # Store the active transformer config
         if load_transformer:
             self.transformer_config = self.transformer.config
@@ -430,8 +463,14 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
-        self._sample_solver = "unipc"
-        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        self._sample_solver = "euler" if self.is_dmd else "unipc"
+        self._flow_shift = (
+            FASTWAN_DMD_SCHEDULER_SHIFT
+            if self.is_dmd
+            else od_config.flow_shift
+            if od_config.flow_shift is not None
+            else 5.0
+        )
         self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
@@ -480,6 +519,7 @@ class Wan22Pipeline(
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -561,7 +601,20 @@ class Wan22Pipeline(
                     cfg_normalize=False,
                 )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_dmd:
+                    pred_clean = self.scheduler.predict_clean(noise_pred, latents, t).to(noise_pred.dtype)
+                    if step_idx + 1 < len(timesteps):
+                        noise = randn_tensor(
+                            latents.shape,
+                            generator=generator,
+                            device=latents.device,
+                            dtype=pred_clean.dtype,
+                        )
+                        latents = self.scheduler.add_noise(pred_clean, noise, timesteps[step_idx + 1])
+                    else:
+                        latents = pred_clean
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
 
         return latents
@@ -600,13 +653,21 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        if self.is_dmd:
+            # The checkpoint was distilled for these three transitions. Ignore
+            # request-level step counts, including the engine's 1-step warmup.
+            num_steps = len(FASTWAN_DMD_TIMESTEPS)
+        else:
+            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
-        guidance_low, guidance_high = resolve_wan_guidance_scales(common, default_guidance_scale=4.0)
+        guidance_low, guidance_high = resolve_wan_guidance_scales(
+            common,
+            default_guidance_scale=1.0 if self.is_dmd else 4.0,
+        )
 
         # record guidance for properties
         self._guidance_scale = guidance_low
@@ -685,17 +746,19 @@ class Wan22Pipeline(
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
-        first_request = req.requests[0]
-        sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
-        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+        if self.is_dmd:
+            timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
+        else:
+            first_request = req.requests[0]
+            sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
+            flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
+            if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+                self._sample_solver = sample_solver
+                self._flow_shift = flow_shift
 
-        # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
-        timesteps = self.scheduler.timesteps
+            self.scheduler.set_timesteps(num_steps, device=device)
+            timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
@@ -817,6 +880,7 @@ class Wan22Pipeline(
             attention_kwargs=attention_kwargs,
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
+            generator=generator,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -1003,9 +1067,7 @@ class Wan22Pipeline(
         return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)
 
     def check_inputs(
         self,
