@@ -50,9 +50,7 @@ def _default_process_engine_inputs(
         prompt = [prompt]
 
     mm_data = {
-        source_output.request_id: prompt_item.get("multi_modal_data")
-        if isinstance(prompt_item, Mapping)
-        else None
+        source_output.request_id: prompt_item.get("multi_modal_data") if isinstance(prompt_item, Mapping) else None
         for source_output, prompt_item in zip(source_outputs, prompt)
     }
 

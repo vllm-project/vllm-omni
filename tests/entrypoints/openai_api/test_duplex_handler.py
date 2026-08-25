@@ -1368,6 +1368,29 @@ def test_runtime_capabilities_rejects_invalid_optional_hook_signature():
         validate_serving_runtime_adapter(adapter)
 
 
+@pytest.mark.parametrize("chunk_period_ms", [500, 1000])
+def test_minicpmo_pcm_buffer_emits_configured_chunks_and_pads_short_final_tail(chunk_period_ms: int):
+    buffer = MiniCPMO45PcmAppendBuffer()
+    chunk = _native_audio_payload(samples=4800)
+    total_samples = 9600
+
+    first = buffer.append(chunk, chunk_period_ms=chunk_period_ms)
+    second = buffer.append(chunk, chunk_period_ms=chunk_period_ms)
+    final = buffer.commit(chunk_period_ms=chunk_period_ms)
+
+    emitted = [payload for payload in (first, second, final) if payload is not None]
+    chunk_samples = 16000 * chunk_period_ms // 1000
+    complete_samples = total_samples - (total_samples % chunk_samples)
+    assert [len(np.frombuffer(base64.b64decode(payload["audio"]), dtype="<f4")) for payload in emitted] == [
+        chunk_samples
+    ] * ((complete_samples // chunk_samples) + int(total_samples % chunk_samples != 0))
+
+    tail_samples = total_samples - complete_samples
+    final_audio = np.frombuffer(base64.b64decode(emitted[-1]["audio"]), dtype="<f4")
+    assert np.allclose(final_audio[:tail_samples], 0.05)
+    assert np.allclose(final_audio[tail_samples:], 0.0)
+
+
 def _native_realtime_session_update(
     session_id: str,
     *,
@@ -5543,6 +5566,55 @@ async def test_minicpmo_native_duplex_audio_append_does_not_retain_pending_audio
     cancelled = next(m for m in ws.sent if m.get("type") == "input.cancelled")
     assert cancelled["cancelled"] == {"text_chunks": 0, "audio_chunks": 0}
     assert cancelled["epoch"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_create_preserves_legacy_runtime_adapter_capabilities_signature():
+    session_states: dict[str, MiniCPMO45ServingSessionState] = {}
+    capabilities_calls: list[int] = []
+
+    def session_state(session_id: str) -> MiniCPMO45ServingSessionState:
+        return session_states.setdefault(session_id, MiniCPMO45ServingSessionState())
+
+    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        capabilities_calls.append(max_sessions)
+        return DuplexCapabilities.minicpmo45_native(max_sessions=max_sessions)
+
+    async def prepare_runtime_config(config, *, model_config):
+        del config, model_config
+        return {"streaming_audio_chunk_size": 25}
+
+    adapter = SimpleNamespace(
+        adapter_id="legacy-test-adapter",
+        session_states=session_states,
+        data_plane=_test_data_plane(),
+        clean_response_done_prefix="",
+        interrupted_tts_prefix="",
+        private_runtime_config_keys=frozenset(),
+        create_session_state=MiniCPMO45ServingSessionState,
+        session_state=session_state,
+        remove_session_state=session_states.pop,
+        is_enabled=lambda config: True,
+        capabilities=capabilities,
+        validate_client_extra_body=lambda extra_body: None,
+        prepare_runtime_config=prepare_runtime_config,
+        runtime_config_for_update=lambda config, current: dict(current),
+        data_plane_context=lambda **kwargs: MiniCPMO45DataPlaneContext(**kwargs),
+    )
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        serving_runtime_adapter=adapter,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-legacy-capabilities"))
+
+    handshake = await handler._open_session(ws, ws.send_json)
+
+    assert handshake is not None
+    assert handshake.session.runtime_config == {"streaming_audio_chunk_size": 25}
+    assert capabilities_calls == [1]
 
 
 @pytest.mark.asyncio

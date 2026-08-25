@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
@@ -641,7 +642,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return None
 
         timing_rows = [pending.pop(str(req_id), None) if isinstance(pending, dict) else None for req_id in req_ids]
-        if not any(timing_rows):
+        has_timing_rows = [timings is not None for timings in timing_rows]
+        if not any(has_timing_rows):
             return None
 
         # Synchronizing the last encoder event waits only for the measured
@@ -651,14 +653,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if timings:
                 timings[-1][1].synchronize()
 
-        latency_rows: list[torch.Tensor | None] = []
+        local_latency_ms: list[float] = []
         for timings in timing_rows:
             if not timings:
-                latency_rows.append(None)
+                local_latency_ms.append(0.0)
                 continue
-            latency_ms = sum(float(start.elapsed_time(end)) for start, end in timings)
-            latency_rows.append(torch.tensor([latency_ms], dtype=torch.float64))
+            local_latency_ms.append(sum(float(start.elapsed_time(end)) for start, end in timings))
+
+        # Every TP rank reduces the same request rows. A zero preserves a rank
+        # without local events while MAX reports the encoder critical path.
+        latency_ms = self._max_reduce_audio_encoder_latency_ms(local_latency_ms)
+        latency_rows = [
+            torch.tensor([value], dtype=torch.float64) if has_timings else None
+            for value, has_timings in zip(latency_ms, has_timing_rows, strict=True)
+        ]
         return {"meta": {"audio_encoder_latency_ms": latency_rows}}
+
+    @staticmethod
+    def _max_reduce_audio_encoder_latency_ms(local_latency_ms: list[float]) -> list[float]:
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return local_latency_ms
+
+        latency_tensor = torch.tensor(
+            local_latency_ms,
+            dtype=torch.float64,
+            device=current_omni_platform.get_torch_device(),
+        )
+        torch.distributed.all_reduce(
+            latency_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group.device_group,
+        )
+        return latency_tensor.cpu().tolist()
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":

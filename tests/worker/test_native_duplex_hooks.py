@@ -480,6 +480,35 @@ def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
     }
 
 
+def test_minicpmo_encoder_latency_uses_tp_critical_path(monkeypatch):
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni as minicpmo_module
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    tp_group = SimpleNamespace(world_size=4, device_group=object())
+    calls: list[tuple[torch.Tensor, object, object]] = []
+
+    def fake_all_reduce(tensor, *, op, group):
+        calls.append((tensor.clone(), op, group))
+        tensor.copy_(torch.tensor([19.5, 7.0], dtype=tensor.dtype))
+
+    monkeypatch.setattr(minicpmo_module, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        minicpmo_module,
+        "current_omni_platform",
+        SimpleNamespace(get_torch_device=lambda: torch.device("cpu")),
+    )
+
+    latency_ms = MiniCPMO45OmniForConditionalGeneration._max_reduce_audio_encoder_latency_ms([12.5, 0.0])
+
+    assert latency_ms == [19.5, 7.0]
+    assert calls[0][0].tolist() == [12.5, 0.0]
+    assert calls[0][1] == torch.distributed.ReduceOp.MAX
+    assert calls[0][2] is tp_group.device_group
+
+
 def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,

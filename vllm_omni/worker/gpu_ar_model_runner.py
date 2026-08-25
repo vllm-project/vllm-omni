@@ -819,6 +819,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return None
         _, client_payload = partition_flat_payload(flatten_payload(multimodal_outputs))
         return build_mm_cpu(client_payload) or None
+
     def _build_omni_pooler_payload(
         self,
         *,
