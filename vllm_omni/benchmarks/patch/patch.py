@@ -229,15 +229,19 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     setattr(rfi, "seed_tts_system_prompt", sys_prompt)
     setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
     setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
+    ex = sample.seed_tts_speech_extra
+    ref_audio = ex.get("ref_audio") if isinstance(ex, dict) else None
+    system_content = [{"type": "text", "text": sys_prompt}]
+    if isinstance(ref_audio, str) and ref_audio.strip():
+        system_content.append({"type": "audio_url", "audio_url": {"url": ref_audio}})
     setattr(
         rfi,
         "omni_chat_messages",
         [
-            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
         ],
     )
-    ex = sample.seed_tts_speech_extra
     if not ex:
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}

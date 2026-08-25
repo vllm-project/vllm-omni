@@ -125,6 +125,17 @@ def _coerce_int(value):
         return None
 
 
+def _request_intermediate_buffer(request: Any) -> Mapping[str, Any]:
+    runtime_buffer = getattr(request, "model_intermediate_buffer", None)
+    if isinstance(runtime_buffer, Mapping):
+        return runtime_buffer
+    runtime_buffer = getattr(request, "additional_information_cpu", None)
+    if isinstance(runtime_buffer, Mapping):
+        return runtime_buffer
+    legacy_buffer = getattr(request, "additional_information", None)
+    return legacy_buffer if isinstance(legacy_buffer, Mapping) else {}
+
+
 def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
@@ -340,15 +351,14 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        request_info = _request_intermediate_buffer(request)
+        codes_info = request_info.get("codes")
+        meta_info = request_info.get("meta")
+        raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
+        raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
+        ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+        if raw_ref_audio is not None:
+            ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -399,9 +409,7 @@ def tts2code2wav_full_payload(
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
-    request_info = getattr(request, "additional_information", None)
-    if not isinstance(request_info, Mapping):
-        request_info = {}
+    request_info = _request_intermediate_buffer(request)
     codes_info = request_info.get("codes")
     if not isinstance(codes_info, Mapping):
         codes_info = {}
@@ -678,6 +686,7 @@ def llm2tts(
     _streaming_context=None,
 ):
     """Build Talker conditioning for ordinary and full-duplex streaming."""
+    del requires_multimodal_data  # Kept in the shared stage-input hook signature.
     if not source_outputs:
         raise ValueError("source_outputs cannot be empty")
 
@@ -690,7 +699,22 @@ def llm2tts(
     multi_modal_data = {}
     for llm_output, p in zip(llm_outputs, prompt):
         if isinstance(p, dict):
-            multi_modal_data[llm_output.request_id] = p.get("multi_modal_data", None)
+            request_multi_modal_data = p.get("multi_modal_data")
+            additional_information = p.get("additional_information") or {}
+            request_side_inputs = (
+                additional_information.get("request_side_inputs") if isinstance(additional_information, dict) else None
+            )
+            if not isinstance(request_side_inputs, dict) and isinstance(additional_information, dict):
+                request_side_inputs = additional_information.get("deferred_multi_modal_data")
+            if isinstance(request_side_inputs, dict):
+                if isinstance(request_multi_modal_data, dict):
+                    request_multi_modal_data = {
+                        **request_multi_modal_data,
+                        **request_side_inputs,
+                    }
+                else:
+                    request_multi_modal_data = request_side_inputs
+            multi_modal_data[llm_output.request_id] = request_multi_modal_data
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
 
@@ -962,11 +986,10 @@ def llm2tts(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,
                 model_intermediate_buffer=model_intermediate_buffer,
-                multi_modal_data=(
-                    multi_modal_data[llm_output.request_id]
-                    if requires_multimodal_data and multi_modal_data.get(llm_output.request_id) is not None
-                    else None
-                ),
+                # The Talker consumes only the structured handoff above.  Raw
+                # request media is bridge-side input and must not be profiled
+                # or reprocessed as Talker multimodal model input.
+                multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
         )
