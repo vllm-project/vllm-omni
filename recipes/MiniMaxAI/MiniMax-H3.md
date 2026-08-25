@@ -860,6 +860,43 @@ fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The five requested sigma points produce the four denoiser evaluations expected
 by the Turbo artifact.
 
+### FlashGen native LoRA
+
+The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
+declares its distilled sigma schedule in safetensors metadata:
+
+```text
+Beidouqixing/minimax-h3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+export FLASHGEN_DIR=/path/to/minimax-h3-flashgen-lora
+export FLASHGEN_FILE=minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+hf download Beidouqixing/minimax-h3-4step-lora-flashgen "${FLASHGEN_FILE}" --local-dir "${FLASHGEN_DIR}"
+export FLASHGEN_LORA="${FLASHGEN_DIR}/${FLASHGEN_FILE}"
+```
+
+Start from a non-offloaded FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${FLASHGEN_LORA}"`.
+Each request must use T2VA and the distilled interval-count contract:
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":5.2}' \
+-F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
+```
+
+This path rejects Ref2VA, model-level/layerwise offload, and checkpoints that
+already pin `base_schedule` in `model_index.json`. The adapter metadata carries
+`base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
+denoiser evaluations, not five sigma points.
+
+Ascend NPU validation (259/259 binding, Base/LoRA SHA256 toggling) is documented
+in [`docs/upstream/npu_native_lora_validation.md`](../../docs/upstream/npu_native_lora_validation.md)
+with helper script [`scripts/npu_validate_native_lora.sh`](../../scripts/npu_validate_native_lora.sh).
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
