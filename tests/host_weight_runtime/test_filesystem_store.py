@@ -389,6 +389,24 @@ def test_build_lookup_share_one_published_backing_and_lease_blocks_cleanup(tmp_p
     assert store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM).status is StoreStatus.MISS
 
 
+def test_publication_hardens_artifact_after_atomic_rename(tmp_path: Path) -> None:
+    identity = _identity()
+    store = _make_store(tmp_path / "store")
+
+    built = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+
+    assert built.status is StoreStatus.BUILT
+    assert built.lease is not None
+    built.lease.close()
+    artifact_dir = store.artifacts_dir / identity.key
+    assert artifact_dir.stat().st_mode & 0o777 == 0o555
+
+
 def test_concurrent_lease_close_waits_for_resource_teardown(tmp_path: Path) -> None:
     identity = _identity()
     store = _make_store(tmp_path / "store")

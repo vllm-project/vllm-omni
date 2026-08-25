@@ -64,7 +64,7 @@ class MingTTSAdapter(ARTTSAdapter):
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, _ = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
         prompt = server._build_ming_dense_prompt(
             request,
