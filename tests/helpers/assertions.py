@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Assertion and response validation helpers for tests."""
 
+import base64
 import io
 import json
 import math
@@ -14,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import DiffusionResponse
+    from tests.helpers.client import DiffusionResponse
 
 import av
 import numpy as np
@@ -24,7 +28,6 @@ from PIL import Image
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
-    decode_b64_image,
     preprocess_text,
 )
 
@@ -171,7 +174,7 @@ def _short_transcript_contains_expected(transcript: str, expected: str) -> bool:
 def assert_image_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate image diffusion response.
@@ -243,14 +246,15 @@ def assert_images_generations_response(
         assert isinstance(item, dict), "Image generation data entries must be objects"
         b64_json = item.get("b64_json")
         assert isinstance(b64_json, str) and b64_json, "Image generation response is missing b64_json"
-        image = decode_b64_image(b64_json)
+        image = Image.open(io.BytesIO(base64.b64decode(b64_json)))
+        image.load()
         assert_image_valid(image, width=width, height=height)
 
 
 def assert_video_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate video diffusion response.
@@ -319,7 +323,7 @@ def assert_video_first_frame_matches(
 def assert_audio_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate audio diffusion response.
@@ -634,7 +638,7 @@ def _response_has_audio_output(response: Any) -> bool:
     return bool(audio_data)
 
 
-def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str | None) -> bool:
     if run_level not in {"advanced_model", "full_model"}:
         return False
     modalities = request_config.get("modalities", ["text", "audio"])
@@ -656,7 +660,7 @@ def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_l
     return "text" in modalities
 
 
-def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str | None) -> bool:
     if run_level not in {"advanced_model", "full_model"}:
         return False
     if request_config.get("response_format") == "pcm":
@@ -667,7 +671,7 @@ def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run
 def _resolve_audio_transcript(
     response: Any,
     request_config: dict[str, Any],
-    run_level: str,
+    run_level: str | None,
     *,
     speech_api: bool,
 ) -> str | None:
@@ -842,28 +846,13 @@ def _assert_transcript_matches(
     )
 
 
-def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
-    """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
+def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str | None = None) -> None:
+    """Validate speech API results from :class:`~tests.helpers.client.OmniResponse`.
 
-    When ``request_config`` carries ``status_code`` and/or ``err_message``, the
-    request is expected to be rejected: assert it failed and that the HTTP status
-    / error text match. Otherwise the normal success-path checks run.
+    Success-path checks only. Negative / contract cases belong on
+    :meth:`~tests.helpers.client.OnlineOmniClient.send_audio_speech_http_request`
+    with :func:`assert_http_error`.
     """
-    expected_status = request_config.get("status_code")
-    expected_err = request_config.get("err_message")
-    if expected_status is not None or expected_err is not None:
-        assert not response.success, "Expected an error response, but the request succeeded."
-        if expected_status is not None:
-            allowed = expected_status if isinstance(expected_status, (list, tuple)) else (expected_status,)
-            assert response.status_code in allowed, f"Expected HTTP status in {allowed}, got {response.status_code}"
-        if expected_err is not None:
-            alternatives = expected_err if isinstance(expected_err, (list, tuple)) else (expected_err,)
-            error_text = response.error_message or ""
-            assert any(alt in error_text for alt in alternatives), (
-                f"Expected one of {alternatives} in error text, got: {error_text!r}"
-            )
-        return
-
     assert response.success, "The request failed."
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
@@ -910,7 +899,9 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         )
 
 
-def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(
+    response: "DiffusionResponse", request_config: dict[str, Any], run_level: str | None = None
+):
     assert response.success, "The request failed."
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
@@ -976,9 +967,9 @@ def assert_http_error(
     err_message: str | tuple[str, ...] | list[str] | None = None,
     websocket_json_message: bool = False,
 ) -> dict[str, Any] | None:
-    """Validate a raw-HTTP :class:`~tests.helpers.runtime.HttpResponse`-like object.
+    """Validate a raw-HTTP :class:`~tests.helpers.client.HttpResponse`-like object.
 
-    Used by :class:`~tests.helpers.runtime.OpenAIClientHandler` ``send_*_http_request`` helpers when
+    Used by :class:`~tests.helpers.client.OnlineOmniClient` ``send_*_http_request`` helpers when
     ``request_config`` contains optional ``err_code`` and/or ``err_message``.
 
     When ``websocket_json_message=True``, only ``json_body`` is checked (first JSON WebSocket text frame).

@@ -14,6 +14,7 @@ import torch
 import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
+import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
@@ -821,6 +822,31 @@ class TestWorkerProcRpcRankStatus:
         assert status["error_type"] == "RuntimeError"
         assert status["bool_result"] is None
         assert "local boom" in status["traceback"]
+
+    def test_execute_rpc_collect_exception_releases_traceback_and_device_cache(self, monkeypatch):
+        proc = self._make_worker_proc()
+        original = RuntimeError("local boom")
+        proc.worker.execute_method = Mock(side_effect=original)
+        gc_collect = Mock()
+        mock_platform = Mock()
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(diffusion_worker_module.gc, "collect", gc_collect)
+        monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", mock_platform)
+
+        proc._execute_rpc(
+            {
+                "method": "add_lora",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "collect_rank_status": True,
+            }
+        )
+
+        assert original.__traceback__ is None
+        gc_collect.assert_called_once_with()
+        mock_platform.empty_cache.assert_called_once_with()
 
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()

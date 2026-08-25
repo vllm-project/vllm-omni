@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the following text-to-image models:
@@ -13,7 +16,7 @@ See docs/user_guide/diffusion_acceleration.md.
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -132,7 +135,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases("Qwen/Qwen-Image"),
     indirect=True,
 )
-def test_qwen_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test each diffusion feature with Qwen-Image (text-to-image), one feature per case."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
@@ -147,7 +150,7 @@ def test_qwen_image(omni_server: OmniServer, openai_client: OpenAIClientHandler)
             "seed": 42,
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -155,7 +158,7 @@ def test_qwen_image(omni_server: OmniServer, openai_client: OpenAIClientHandler)
     _get_diffusion_feature_cases("Qwen/Qwen-Image-2512"),
     indirect=True,
 )
-def test_qwen_image_2512(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_2512(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test each diffusion feature with Qwen-Image-2512 (text-to-image), one feature per case."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
@@ -170,4 +173,4 @@ def test_qwen_image_2512(omni_server: OmniServer, openai_client: OpenAIClientHan
             "seed": 42,
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

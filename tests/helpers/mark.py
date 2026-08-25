@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pytest marks and decorators for hardware / resource selection (CUDA, ROCm, …)."""
 
 from __future__ import annotations
@@ -182,10 +182,8 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
         cards = num_cards_dict[platform]
-        if platform in ("cuda", "rocm", "xpu"):
+        if platform in ("cuda", "rocm", "xpu", "musa"):
             marks = gpu_marks(res=resource, num_cards=cards)
-        elif platform == "musa":
-            marks = musa_marks(res=resource, num_cards=cards)
         elif platform == "npu":
             marks = npu_marks(res=resource, num_cards=cards)
         else:
