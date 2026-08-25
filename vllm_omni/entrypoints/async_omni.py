@@ -37,7 +37,6 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -1447,7 +1446,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
         return final_acks
 
