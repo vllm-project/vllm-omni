@@ -70,6 +70,13 @@ class ImageGenerationRequest(BaseModel):
         description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError("prompt must be a non-empty string")
+        return v
+
     @field_validator("size")
     @classmethod
     def validate_size(cls, v):
@@ -98,6 +105,13 @@ class ImageGenerationRequest(BaseModel):
     def validate_layers(cls, v):
         """Validate the layers parameter for layered image models."""
         return validate_layered_layers(v)
+
+    @field_validator("negative_prompt", "system_prompt")
+    @classmethod
+    def validate_optional_string_fields(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("field must be a non-empty string or null")
+        return v
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
@@ -144,7 +158,7 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=0, le=4294967295, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
@@ -171,6 +185,14 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
+
+    @field_validator("output_format")
+    @classmethod
+    def validate_output_format(cls, v):
+        valid = {"png", "jpeg", "webp"}
+        if v is not None and v not in valid:
+            raise ValueError(f"output_format must be one of {sorted(valid)}, got: '{v}'")
+        return v
 
 
 class ImageData(BaseModel):
