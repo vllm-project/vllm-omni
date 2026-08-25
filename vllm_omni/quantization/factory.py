@@ -470,10 +470,14 @@ def resolve_quant_config_from_disk(
         )
         return build_quant_config(qc_method, **qc_kwargs)
 
-    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
-    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    # AutoRound MXFP checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline MXFP4/MXFP8 path is
+    # selected according to the checkpoint's bit width.
     if qc_kwargs.get("data_type") == "mx_fp":
-        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
+        logger.info(
+            "config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP%d.",
+            qc_kwargs.get("bits", getattr(quant_config, "weight_bits", 0)),
+        )
         return build_quant_config(qc_method, **qc_kwargs)
 
     if (

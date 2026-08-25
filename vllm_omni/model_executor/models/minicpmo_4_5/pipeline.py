@@ -80,6 +80,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             model_arch="MiniCPMO45Code2Wav",
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )
