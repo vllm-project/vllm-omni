@@ -193,7 +193,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
 
-    assert captured["args"][1] is None
+    assert len(captured["args"]) == 2
     assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
     assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"

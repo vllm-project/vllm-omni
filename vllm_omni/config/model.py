@@ -129,6 +129,9 @@ class OmniModelConfig(ModelConfig):
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder applied
+    # worker-side before IPC. Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -138,11 +141,17 @@ class OmniModelConfig(ModelConfig):
         }
     )
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    # Key names (not values) of the stage's default sampling ``extra_args``.
+    # Engine-core code runs before any request arrives, so this is the only
+    # place it can learn which request-shaping conventions a stage uses (e.g.
+    # ``cfg_role`` for classifier-free-guidance request pairs).
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     @property
     def registry(self):

@@ -9,6 +9,11 @@
 #   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
 #   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
 #   a3_npu_2    — ascend-a3, resource_class npu-2
+#
+# The ``l4_*`` presets run under the ``docker`` plugin, which does not put
+# ``buildkite-agent`` on PATH inside the container the way the ``kubernetes``
+# presets do, so they set ``mount-buildkite-agent: true``; without it any step
+# calling ``buildkite-agent`` (artifact upload, annotate, meta-data) fails there.
 
 x-npu-k8s-plugins: &npu_k8s_plugins
   - kubernetes:
@@ -26,6 +31,7 @@ mirror_hardwares:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          mount-buildkite-agent: true
           shm-size: "8gb"
           environment:
             - HF_HOME=/fsx/hf_cache
@@ -41,6 +47,7 @@ mirror_hardwares:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          mount-buildkite-agent: true
           shm-size: "8gb"
           environment:
             - HF_HOME=/fsx/hf_cache

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model specific tests for CacheDiT enablement.
@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
+from vllm.distributed import parallel_state
 
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
@@ -36,7 +37,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_TRANSFORMERS = [
     DreamIdOmniModel,
-    LTX2VideoTransformer3DModel,
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,
@@ -60,6 +60,18 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
         cd_model_specific.register_custom_dit_enablers()
         assert cd_backend.CUSTOM_DIT_ENABLERS == expected_enablers
+
+
+@pytest.fixture()
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vLLM linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old = parallel_state._TP
+    parallel_state._TP = mock_tp
+    yield
+    parallel_state._TP = old
 
 
 def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
@@ -111,7 +123,9 @@ def test_cachedit_consumers_use_package_api():
 
             for module in modules:
                 if module == legacy_module or module.startswith(internal_prefix):
-                    invalid_imports.append(f"{source_path.relative_to(package_root)}:{node.lineno}: {module}")
+                    invalid_imports.append(
+                        f"{source_path.relative_to(package_root)}:{getattr(node, 'lineno', '?')}: {module}"
+                    )
 
     assert not invalid_imports, "Cache-DiT consumers must use the package API:\n" + "\n".join(invalid_imports)
 
@@ -122,6 +136,13 @@ def test_cache_dit_configs_have_separate_cfg(transformer_model):
     assert hasattr(transformer_model, "_cache_dit_adapter_config")
     assert isinstance(transformer_model._cache_dit_adapter_config, CacheDiTAdapterConfig)
     assert transformer_model._cache_dit_adapter_config.has_separate_cfg is True
+
+
+def test_ltx2_cache_dit_uses_one_forward_per_denoise_step():
+    """LTX batches all guidance passes into one Transformer invocation."""
+    adapter_config = LTX2VideoTransformer3DModel._cache_dit_adapter_config
+
+    assert adapter_config.has_separate_cfg is False
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")

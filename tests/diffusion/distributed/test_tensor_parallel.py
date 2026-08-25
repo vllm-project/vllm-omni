@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """DiT tensor-parallel parity and perf checks for diffusion models.
 
@@ -18,8 +18,8 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -49,10 +49,10 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 def _extract_single_image(outputs) -> Image.Image:
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
+    if not isinstance(first_output, OmniRequestOutput) or not first_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output
+    req_out = first_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

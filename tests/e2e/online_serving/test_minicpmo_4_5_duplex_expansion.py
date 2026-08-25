@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Nightly lifecycle coverage for the MiniCPM-o 4.5 native-duplex API."""
 
 from __future__ import annotations
@@ -31,11 +34,11 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None:
     args = multi_session_args(
         omni_server=omni_server,
         input_wav=validated_input_wav(),
-        ref_audio=resolve_ref_audio(model_prefix),
+        ref_audio=resolve_ref_audio(),
         output_dir=tmp_path / "admission_expiry",
         response_required=False,
     )
@@ -53,9 +56,13 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+# CUDA-only for now: this contract asserts the model speaks while the user is
+# still talking, which only holds when the duplex pipeline sustains real-time
+# throughput. The current NPU stack runs several times slower than real time,
+# so it never reaches a mid-stream decision point.
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
     input_wav = validated_soft_interrupt_wav()
     result = asyncio.run(
         run_soft_interrupt(
@@ -63,20 +70,15 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 url=realtime_url(omni_server),
                 model=omni_server.model,
                 input_wav=str(input_wav),
-                ref_audio=str(resolve_ref_audio(model_prefix)),
+                ref_audio=str(resolve_ref_audio()),
                 output_dir=str(tmp_path / "soft_interrupt"),
                 summary_output=None,
                 chunk_ms=200,
                 timeout_s=180.0,
                 require_audio=True,
                 no_realtime_pacing=False,
-                # Single-GPU co-location cannot reliably finish the fixture's
-                # two-response soft-interrupt handoff before the WAV ends.
-                # model-policy + deterministic sampling checks streaming audio
-                # lifecycle instead of the diagnostic two-response contract.
-                validation_mode="model-policy",
-                temperature=0.0,
-                min_responses=1,
+                validation_mode="response-required",
+                min_responses=2,
                 min_audio_deltas_per_response=2,
                 input_sha256=SOFT_INTERRUPT_SHA256,
                 expect_followup_response_substring=None,
@@ -88,5 +90,4 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
     assert result["error_count"] == 0
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
-    assert result["response_before_final_commit"] is True
-    assert result["enough_responses"] is True
+    assert result["followup_response_transcript_ok"] is True

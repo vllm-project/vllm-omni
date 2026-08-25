@@ -260,7 +260,15 @@ def tts2code2wav_async_chunk(
         return None
 
     if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
-        return None
+        # Emit an empty replacement snapshot so Code2Wav cannot replay the
+        # prior terminal audio when this control-only boundary arrives.
+        return OmniPayloadStruct(
+            meta=_MiniCPMO45MetaStruct(
+                is_segment_finished=torch.tensor(True, dtype=torch.bool),
+                replace_runtime_additional_information=True,
+            ),
+            request_id=request_id,
+        )
 
     state = container.get(_MINICPMO45_ASYNC_STATE)
     if not isinstance(state, dict):
@@ -373,6 +381,7 @@ def tts2code2wav_async_chunk(
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
+            replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
@@ -432,6 +441,7 @@ def tts2code2wav_full_payload(
             finished=finished,
             req_id=[request_id],
             ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
+            replace_runtime_additional_information=True,
             native_duplex_segment_text=(
                 str(meta_info["native_duplex_segment_text"])
                 if isinstance(meta_info.get("native_duplex_segment_text"), str)
@@ -945,6 +955,9 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
+            # Dummy ids only reserve scheduler slots; prefill overwrites the
+            # embeddings. Talker.sample() blanks the whole prompt out of the
+            # repetition penalty, so codec id 0 is not taxed from step one.
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length

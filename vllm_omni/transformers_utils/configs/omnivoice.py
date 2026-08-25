@@ -90,6 +90,8 @@ class OmniVoiceConfig(PretrainedConfig):
             "cuda_graph_capture_sizes",
             [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024],
         )
+        # TF32 matmuls: not bit-identical; opt-in (matches vLLM default-off), set OMNIVOICE_TF32=1 to enable.
+        self.enable_tf32 = getattr(self, "enable_tf32", os.environ.get("OMNIVOICE_TF32", "0") != "0")
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)

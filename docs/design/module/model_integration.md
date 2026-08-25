@@ -42,7 +42,7 @@ and execution behavior to stable runtime contracts.
 ### MODEL-INV-001: Registration is explicit
 
 **Rule:** A model integration MUST declare how its model class, loader, input
-processor, and stage configuration are selected.
+processor, and pipeline configuration are selected.
 
 ### MODEL-INV-002: Model code does not route stages
 

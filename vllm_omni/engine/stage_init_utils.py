@@ -14,12 +14,14 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -27,6 +29,14 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
 from vllm_omni.config.omni_config import (
+    _CACHE_STAGE_ENGINE_FIELD_MAP,
+    _DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP,
+    _DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP,
+    _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
+    _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
+    _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
+    _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
     VllmOmniDiffusionStageConfig,
 )
@@ -394,8 +404,19 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     final_output_type: str | None = stage_config.final_output_type
 
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
-    SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
+    # A pooling stage carries its task via default_pooling_params, set where the
+    # stage is declared.
+    default_pp = _to_dict(_get_attr_or_item(stage_config, "default_pooling_params", {}))
+    # A pooling stage is an LLM stage run with runner="pooling" (vLLM's
+    # is_pooling_model signal); pick params by that signal, not execution_type.
+    is_pooling = str(engine_args.get("runner", "")).lower() == "pooling"
+    default_params: OmniSamplingParams | PoolingParams
+    if stage_type == "diffusion":
+        default_params = OmniDiffusionSamplingParams(**default_sp)
+    elif is_pooling:
+        default_params = PoolingParams(**default_pp)
+    else:  # generative llm: ar / generation
+        default_params = SamplingParams(**default_sp)
 
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
@@ -427,7 +448,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_input_source=engine_input_source,
             final_output=final_output,
             final_output_type=final_output_type,
-            default_sampling_params=default_sampling_params,
+            default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
@@ -447,7 +468,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         engine_input_source=engine_input_source,
         final_output=final_output,
         final_output_type=final_output_type,
-        default_sampling_params=default_sampling_params,
+        default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
@@ -546,8 +567,13 @@ def split_devices_for_replicas(
     num_replicas: int,
     tp_size: int,
     stage_id: int,
-) -> list[str]:
+) -> list[str | None]:
     """Split a devices string into per-replica subsets.
+
+    The result always has one entry per replica, because callers index it by
+    replica id. When ``devices_str`` is ``None`` the stage declares no explicit
+    placement, so every replica gets ``None`` and inherits the launcher's
+    ``CUDA_VISIBLE_DEVICES``.
 
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
     Otherwise, two YAML shapes are accepted:
@@ -576,8 +602,14 @@ def split_devices_for_replicas(
     Any other length raises ``ValueError`` (the two modes are
     length-disjoint for ``num_replicas > 1``).
     """
-    if num_replicas <= 1 or devices_str is None:
-        return [devices_str] if devices_str is not None else [devices_str]
+    if devices_str is None:
+        # No explicit placement: hand back one empty slot per replica, matching
+        # ``get_headless_replica_devices``. Returning a single-element list here
+        # made callers index past the end for every replica after the first.
+        return [None] * max(1, num_replicas)
+
+    if num_replicas <= 1:
+        return [devices_str]
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
@@ -667,7 +699,7 @@ def compute_replica_layout(
             raise ValueError(f"num_replicas must be >= 0, got {num_replicas}")
         replicas_per_stage.append(num_replicas if allow_zero else max(1, num_replicas))
 
-    replica_devices_map: dict[int, list[str]] = {}
+    replica_devices_map: dict[int, list[str | None]] = {}
     for stage_id, stage_cfg in enumerate(stage_configs):
         num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:
@@ -768,18 +800,36 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
 def _project_omni_config_fields(
     config: Any,
     *,
+    field_map: Mapping[str, str] | None = None,
     exclude: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Copy defined typed config fields into backend adapter kwargs."""
     projected: dict[str, Any] = {}
     for config_field in fields(config):
         name = config_field.name
-        if name in exclude:
+        if name in exclude or (field_map is not None and name not in field_map):
             continue
         value = getattr(config, name)
         if value is not None:
-            projected[name] = copy.deepcopy(value)
+            projected[field_map.get(name, name) if field_map is not None else name] = copy.deepcopy(value)
     return projected
+
+
+def _project_upstream_config_fields(
+    config: Any,
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Project every explicit upstream input, including newly added fields."""
+    explicit_fields = getattr(config, "_omni_explicit_fields", frozenset())
+    unprojected_fields = explicit_fields - frozenset(field_map)
+    if unprojected_fields:
+        names = ", ".join(sorted(unprojected_fields))
+        raise ValueError(f"{type(config).__name__} has explicit field(s) with no EngineArgs projection: {names}")
+    return _project_omni_config_fields(
+        config,
+        field_map=field_map,
+        exclude=frozenset(field_map) - explicit_fields,
+    )
 
 
 def _project_omni_stage_engine_args(
@@ -797,9 +847,6 @@ def _project_omni_stage_engine_args(
             stage_config.model_config,
             frozenset({"default_sampling_params", "has_sampling_extra_args"}),
         ),
-        (stage_config.load_config, frozenset()),
-        (stage_config.cache_config, frozenset()),
-        (stage_config.scheduler_config, frozenset()),
         (
             stage_config.runtime_config,
             frozenset({"devices", "num_replicas", "env", "num_gpus"}),
@@ -811,6 +858,26 @@ def _project_omni_stage_engine_args(
                 exclude=excluded_fields,
             )
         )
+
+    if is_diffusion:
+        for config, field_map in (
+            (stage_config.load_config, _DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.cache_config, _DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.scheduler_config, _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP),
+        ):
+            engine_args.update(_project_omni_config_fields(config, field_map=field_map))
+    else:
+        for config, field_map in (
+            (stage_config.load_config, _LOAD_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.cache_config, _CACHE_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.scheduler_config, _SCHEDULER_STAGE_ENGINE_FIELD_MAP),
+        ):
+            engine_args.update(_project_upstream_config_fields(config, field_map))
+
+    for name in ("compilation_config", "profiler_config"):
+        value = getattr(stage_config, name)
+        if value is not None:
+            engine_args[name] = copy.deepcopy(value)
 
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
@@ -838,13 +905,14 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
             stage_config.parallel_config,
+            field_map={name: name for name in _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS},
             exclude=frozenset({"world_size"}),
         )
     else:
         engine_args.update(
-            _project_omni_config_fields(
+            _project_upstream_config_fields(
                 stage_config.parallel_config,
-                exclude=frozenset({"world_size"}),
+                _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
             )
         )
 
@@ -858,6 +926,20 @@ def _project_omni_stage_engine_args(
     return engine_args
 
 
+def _sampling_extra_args_keys(default_sampling_params: Any) -> tuple[str, ...]:
+    """Key names of a stage's default sampling ``extra_args``, sorted.
+
+    Only the keys travel into the engine config: engine-core code needs to know
+    which request-shaping conventions a stage uses (e.g. CFG request pairing)
+    before any request exists, while the values stay a serving-layer concern.
+    """
+    extra_args = _to_dict(default_sampling_params or {}).get("extra_args") or {}
+    try:
+        return tuple(sorted(str(key) for key in extra_args))
+    except TypeError:
+        return ()
+
+
 def _finalize_engine_args_dict(
     engine_args_dict: dict[str, Any],
     *,
@@ -867,6 +949,7 @@ def _finalize_engine_args_dict(
     stage_connector_spec: dict[str, Any] | None,
     cli_tokenizer: str | None,
     has_sampling_extra_args: bool,
+    sampling_extra_args_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
     pipeline_model_root = model
@@ -947,6 +1030,7 @@ def _finalize_engine_args_dict(
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
     engine_args_dict["has_sampling_extra_args"] = has_sampling_extra_args
+    engine_args_dict["sampling_extra_args_keys"] = sampling_extra_args_keys
 
     # TODO: Remove this after the performance regression is fixed
     # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
@@ -977,6 +1061,7 @@ def build_legacy_engine_args_dict(
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=bool(default_sp.get("extra_args")),
+        sampling_extra_args_keys=_sampling_extra_args_keys(default_sp),
     )
 
 
@@ -1023,6 +1108,7 @@ def build_engine_args_dict_from_omni_stage_config(
         stage_connector_spec=stage_connector_spec,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
+        sampling_extra_args_keys=_sampling_extra_args_keys(stage_config.model_config.default_sampling_params),
     )
 
 
@@ -1119,11 +1205,30 @@ def build_llm_stage_output_processor(
     )
 
 
+class _TokenOnlyRenderer(BaseRenderer):
+    """Renderer for stages that explicitly skip tokenizer initialization."""
+
+    def render_messages(self, messages, params):
+        raise ValueError(
+            "Chat messages are unavailable when skip_tokenizer_init=True; submit prompt_token_ids or prompt_embeds"
+        )
+
+
+def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
+    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+
+
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
+        input_processor = InputProcessor(
+            vllm_config=stage_vllm_config,
+            renderer=_build_token_only_renderer(stage_vllm_config),
+        )
+    else:
+        input_processor = InputProcessor(vllm_config=stage_vllm_config)
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
         renderer=input_processor.renderer,
@@ -1409,27 +1514,49 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    od_config.max_num_seqs = batch_size
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
-def maybe_apply_audex_cfg_patches(vllm_config: Any) -> None:
-    """Install the Audex CFG scheduler patches for CFG-configured engines.
+def _stage_declares_cfg_pairs(model_config: Any) -> bool:
+    """Whether this stage submits classifier-free-guidance request pairs.
+
+    Two independent declarations, because a model may own either side of the
+    mechanism without the other:
+
+    * a CFG logits processor is configured (blending implies pairing), or
+    * the stage's default sampling ``extra_args`` carry ``cfg_role``, which is
+      how a model declares paired requests without owning a logits processor.
+      Only the *key set* survives into the engine config (see
+      ``sampling_extra_args_keys``); the values stay in the serving layer.
+    """
+    processors = getattr(model_config, "logits_processors", None) or []
+    if any("CFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+        return True
+    return "cfg_role" in (getattr(model_config, "sampling_extra_args_keys", None) or ())
+
+
+def maybe_apply_cfg_scheduler_patches(vllm_config: Any) -> None:
+    """Install the CFG pairing scheduler patches for CFG-configured engines.
 
     Must run in the engine-core process BEFORE ``Scheduler`` is constructed:
     the patch wraps ``Scheduler.__init__`` to add the pair registry, so a
-    scheduler built earlier would never become pair-aware. Gated on the
-    engine's ``logits_processors`` so non-CFG stages stay untouched.
+    scheduler built earlier would never become pair-aware. Gated so non-CFG
+    stages stay untouched.
     """
     model_config = getattr(vllm_config, "model_config", None)
-    processors = getattr(model_config, "logits_processors", None) or []
-    if not any("AudexCFGLogitsProcessor" in getattr(proc, "__name__", str(proc)) for proc in processors):
+    if model_config is None or not _stage_declares_cfg_pairs(model_config):
         return
 
-    from vllm_omni.model_executor.models.audex.cfg import apply_cfg_patches
+    from vllm_omni.model_executor.models.common.cfg_pairing import apply_cfg_patches
 
     apply_cfg_patches()
 
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if not getattr(Scheduler.schedule, "_audex_cfg_patched", False):
-        raise RuntimeError("Audex CFG scheduler patches failed to install before Scheduler construction")
+    if not getattr(Scheduler.schedule, "_cfg_pairing_patched", False):
+        raise RuntimeError("CFG pairing scheduler patches failed to install before Scheduler construction")
+
+
+# Name kept for callers written against the Audex-only gate.
+maybe_apply_audex_cfg_patches = maybe_apply_cfg_scheduler_patches

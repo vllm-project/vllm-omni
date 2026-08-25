@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 import vllm.envs as envs
+from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -64,6 +67,14 @@ def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
 
 def omni_snapshot_download(model_id: str) -> str:
     if os.path.exists(model_id):
+        return model_id
+
+    # Object-storage models must remain URIs until each stage constructs its
+    # ModelConfig. vLLM then materializes only config/tokenizer files locally
+    # and keeps the URI in model_weights for Run:AI streaming. Treating the URI
+    # as a Hugging Face repo here either fails validation or downloads through
+    # the wrong backend before the stage processes are created.
+    if is_runai_obj_uri(model_id):
         return model_id
 
     # TODO: this is just a workaround for quickly use modelscope, we should support
@@ -214,6 +225,7 @@ class OmniBase(PDDisaggregationMixin):
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
+        self.sampling_constraints_list = self._get_sampling_constraints_list(self.engine.stage_configs)
         if not self.output_modalities:
             self.output_modalities = [
                 self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
@@ -316,6 +328,7 @@ class OmniBase(PDDisaggregationMixin):
         sampling_params_list: Sequence[Any] | Any | None,
         allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
+        """Resolve request parameters; pipeline sampling constraints override caller values."""
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
             # Set the output kind to delta since no params were specified
@@ -330,7 +343,46 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got a single sampling params object")
         if len(normalized) != self.num_stages:
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
+
+        if sampling_params_list is not None:
+            normalized = [
+                self._apply_sampling_constraints(params, constraints)
+                for params, constraints in zip(normalized, self.sampling_constraints_list, strict=True)
+            ]
         return normalized
+
+    @staticmethod
+    def _get_sampling_constraints_list(stage_configs: Sequence[Any]) -> list[dict[str, Any]]:
+        """Extract each stage's required sampling settings from runtime configs."""
+        constraints_list = []
+        for stage_config in stage_configs:
+            constraints = getattr(stage_config, "sampling_constraints", {})
+            if not isinstance(constraints, Mapping):
+                constraints_list.append({})
+                continue
+            if OmegaConf.is_config(constraints):
+                constraints = OmegaConf.to_container(constraints, resolve=True)
+            constraints_list.append(dict(constraints))
+        return constraints_list
+
+    @staticmethod
+    def _apply_sampling_constraints(params: Any, constraints: Mapping[str, Any]) -> Any:
+        """Rebuild params with pipeline-required settings without mutating caller input."""
+        if not constraints:
+            return params
+        if isinstance(params, Mapping):
+            return {**params, **constraints}
+        if is_dataclass(params):
+            values = {field.name: getattr(params, field.name) for field in fields(params) if field.init}
+        elif struct_fields := getattr(params, "__struct_fields__", None):
+            values = {
+                name: getattr(params, name)
+                for name in struct_fields
+                if not name.startswith("_") and name != "output_text_buffer_length"
+            }
+        else:
+            raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
+        return type(params)(**{**values, **constraints})
 
     def _fire_failure_counter_if_alive(self, request_id: str) -> None:
         """Fire the abort/exception bucket of requests_success_total.
@@ -568,6 +620,7 @@ class OmniBase(PDDisaggregationMixin):
             msg_id = id(result)
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
+                metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
 
@@ -628,7 +681,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
@@ -653,19 +705,16 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
                 response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
-        return OmniRequestOutput(
+        # Generation content (outputs, prompt, images, trajectory_*, ...) is
+        # copied from engine_outputs onto the returned object by
+        # OmniRequestOutput.from_stage_output().
+        return OmniRequestOutput.from_stage_output(
+            engine_outputs,
             request_id=req_id or "",
             finished=finished,
             stage_id=stage_id,
             replica_id=result.replica_id,
             final_output_type=output_type,
-            request_output=engine_outputs,
-            images=images,
-            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
-            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
-            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
-            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
-            _custom_output=getattr(engine_outputs, "_custom_output", {}),
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,

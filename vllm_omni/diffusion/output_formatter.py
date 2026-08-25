@@ -138,6 +138,7 @@ def format_diffusion_outputs(
         ),
         "width": request.sampling_params.width,
         "height": request.sampling_params.height,
+        "num_inference_steps": request.sampling_params.num_inference_steps,
     }
 
     # Only the primary payload determines the response type. Some image models
