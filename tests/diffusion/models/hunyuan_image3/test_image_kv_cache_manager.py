@@ -19,8 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _TRANSFORMER_MODULE = "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer"
 
-NUM_HEADS = 4
-NUM_KV_HEADS = 2
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
 HEAD_DIM = 16
 IMAGE_TOKEN_LEN = 8
 SUFFIX_TOKEN_LEN = 3
@@ -35,8 +35,14 @@ SCALING = 1.0 / math.sqrt(HEAD_DIM)
 class MockAttention(nn.Module):
     def __init__(self, num_heads, head_size, causal=False, softmax_scale=None, num_kv_heads=None, **kwargs):
         super().__init__()
+        self.paged_kv_active = False
+        self.calls = []
+
+    def is_paged_kv_active(self):
+        return self.paged_kv_active
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        self.calls.append((query, key, value))
         return query
 
 
@@ -124,6 +130,37 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+@pytest.mark.parametrize(
+    ("paged_kv_active", "expected_kv_heads"),
+    [(False, NUM_HEADS), (True, NUM_KV_HEADS)],
+)
+def test_gqa_kv_stays_compressed_for_paged_attention(
+    paged_kv_active: bool,
+    expected_kv_heads: int,
+) -> None:
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = paged_kv_active
+    q_len = 3
+    key, value = _make_known_kv(q_len)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=q_len,
+        seq_len=q_len,
+        key_flat=key,
+        value_flat=value,
+        first_step=True,
+        num_image_tokens=0,
+        gen_timestep_scatter_index=_gen_timestep_index(1, 0),
+    )
+
+    _, key_input, value_input = mgr.attn.calls[-1]
+    expected_shape = (1, q_len, expected_kv_heads, HEAD_DIM)
+    assert key_input.shape == expected_shape
+    assert value_input.shape == expected_shape
 
 
 # ============================================================

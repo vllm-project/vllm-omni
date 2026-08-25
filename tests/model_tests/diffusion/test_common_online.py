@@ -24,7 +24,7 @@ from tests.model_tests.diffusion.task_runners import (
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
@@ -58,7 +58,7 @@ def test_online_on_supported_tasks(
             log_stats=server.log_stats,
         )
         for task_type in supported_tasks:
-            with subtests.test(msg=task_type):
+            with subtests.test(msg=task_type.value):
                 if task_type == DiffusionTasks.TEXT_TO_IMAGE:
                     run_and_validate_online_text_to_image_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:

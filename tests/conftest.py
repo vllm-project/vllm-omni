@@ -25,6 +25,7 @@ pytest_plugins = (
     "tests.helpers.fixtures.run_args",
     "tests.helpers.fixtures.runtime",
     "tests.helpers.fixtures.speaker_cache",
+    "tests.helpers.fixtures.xdist",
 )
 
 

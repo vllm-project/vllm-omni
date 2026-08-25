@@ -27,6 +27,37 @@ COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
 # pixel-frame budgets without instantiating the VAE.
 COSMOS3_VAE_TEMPORAL_COMPRESSION = 4
 
+VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "16,9": (320, 192),
+        "9,16": (192, 320),
+    },
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "704": {
+        "1,1": (960, 960),
+        "4,3": (1088, 832),
+        "3,4": (832, 1088),
+        "16,9": (1280, 704),
+        "9,16": (704, 1280),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
 ROBOLAB_DEFAULT_CONDITIONING_FPS = 15.0
 ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE = 32
 ROBOLAB_DEFAULT_IMAGE_HEIGHT = 540

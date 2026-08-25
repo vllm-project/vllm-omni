@@ -126,6 +126,9 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     _get_video_second_per_grid_t,
     _presampled_videos_hf_kwargs,
 )
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
@@ -1129,6 +1132,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     SupportsMRoPE,
     Qwen3OmniMoeConditionalGenerationMixin,
     SupportsTranscription,
+    Qwen3OmniNestedSupportsQuant,
 ):
     # PEFT stores the expert LoRA matrices with an explicit expert dimension.
     is_3d_moe_weight: bool = True

@@ -62,7 +62,12 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
-            sampling_constraints={"detokenize": False},
+            sampling_constraints={
+                "detokenize": False,
+                # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
+                # Same pattern as Qwen3 talker's stop_token_ids: [2150].
+                "stop_token_ids": [6561],
+            },
         ),
         StagePipelineConfig(
             stage_id=2,

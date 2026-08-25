@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -607,6 +610,12 @@ class OmniServeCommand(CLISubcommand):
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
         )
         omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-attention-config",
             "-dac",
             dest="diffusion_attention_config",
@@ -729,6 +738,28 @@ class OmniServeCommand(CLISubcommand):
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
         )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
@@ -823,7 +854,6 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",

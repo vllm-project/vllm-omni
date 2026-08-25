@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Integration tests for diffusion pipeline streaming output mode.
 
 Covers:
@@ -544,7 +544,11 @@ class TestSupportedPipelines:
 
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeDiffusersPipelineLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeDeviceMemoryProfiler)
-        monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            model_runner_module,
+            "enable_offload_backend",
+            lambda _config, pipeline, **_kwargs: (pipeline, None),
+        )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
 
         with pytest.raises(ValueError, match="NoStepPipeline"):

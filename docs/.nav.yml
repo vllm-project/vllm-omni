@@ -113,6 +113,7 @@ nav:
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
+        - Host Weight Runtime: design/feature/host_weight_runtime.md
         - Async Chunk: design/feature/async_chunk.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
@@ -169,6 +170,7 @@ nav:
         - Offloader: design/module/diffusion/offloader.md
       - Execution Platforms: design/module/execution_platforms.md
       - Cache Management: design/module/cache_management.md
+      - Host Weight Runtime: design/module/host_weight_runtime.md
       - Quantization: design/module/quantization.md
       - Observability: design/module/observability.md
       - Profiling: design/module/profiling.md

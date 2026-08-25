@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,6 +35,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
+    load_wan_weights_with_optional_gate,
     resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
@@ -1014,9 +1014,7 @@ class Wan22I2VPipeline(
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)
 
 
 # ---------------------------------------------------------------------------

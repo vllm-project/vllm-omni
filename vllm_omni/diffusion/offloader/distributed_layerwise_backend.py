@@ -30,6 +30,7 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
 )
+from vllm_omni.host_weight_runtime import HostWeightLease
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
@@ -902,6 +903,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self.host_weight_plan = host_weight_plan
+        self._host_weight_lease: HostWeightLease | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
 
     def load_resident_layers(self) -> None:
@@ -1405,6 +1407,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 buffer.data = buffer.data.to(self.device, non_blocking=True)
 
     def enable(self, pipeline: nn.Module) -> None:
+        """Enable DLO and make partial startup failures transactional."""
+        try:
+            self._enable(pipeline)
+        except BaseException:
+            try:
+                self.disable()
+            except BaseException:
+                logger.exception("DLO cleanup failed while handling an enable failure")
+            raise
+
+    def _enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
@@ -1443,16 +1456,33 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = self.host_weight_plan is not None
         self._using_rank_local_mmap = self._using_mmap and self.dp_size <= 1
         if self._using_mmap:
-            if self.host_weight_plan.backing_kind != "checkpoint_mmap":
+            if self.host_weight_plan.backing_kind == "host_weight_runtime":
+                carrier = self.host_weight_plan.lease_carrier
+                if carrier is None:
+                    raise RuntimeError("DLO received a Host Weight Runtime plan without a lease carrier")
+                self._host_weight_lease = carrier.take()
+                if self._host_weight_lease.closed:
+                    raise RuntimeError("DLO received a closed Host Weight Runtime lease")
+                # The final-layout restorer has already rebound the model to
+                # immutable host tensors.  Treat those tensors as mmap-like
+                # sources for the bounded two-slot rank-local staging path;
+                # do not reinitialize or rematerialize the restored model.
+                self._using_rank_local_mmap = True
+                logger.info(
+                    "DLO consuming final-layout Host Weight Runtime lease %s with bounded rank-local staging",
+                    self._host_weight_lease.provenance.resolution_id,
+                )
+            elif self.host_weight_plan.backing_kind == "checkpoint_mmap":
+                self._load_weights_via_mmap(
+                    pipeline,
+                    modules,
+                    self.host_weight_plan,
+                )
+            else:
                 raise ValueError(f"Unsupported DLO host-weight backing: {self.host_weight_plan.backing_kind}")
-            self._load_weights_via_mmap(
-                pipeline,
-                modules,
-                self.host_weight_plan,
-            )
             if self._using_rank_local_mmap:
                 logger.info(
-                    "DLO rank-local mmap storage enabled: checkpoint pages are "
+                    "DLO rank-local host storage enabled: source pages are "
                     "node-shared; each worker owns only two bounded host staging slots"
                 )
         else:
@@ -1722,12 +1752,19 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._cleanup_after_loading()
 
     def _release_mmap_handles(self) -> None:
-        """Release safetensors mmap file handles."""
+        """Release source handles and the transport-owned HWR lease."""
         self._mmap_transforms_by_tensor_id.clear()
         if hasattr(self, "_mmap_file_cache"):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache
             logger.info("Released safetensors mmap file handles")
+        lease = self._host_weight_lease
+        self._host_weight_lease = None
+        if lease is not None and not lease.closed:
+            lease.close()
+            logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
+        if self.host_weight_plan is not None and self.host_weight_plan.lease_carrier is not None:
+            self.host_weight_plan.lease_carrier.close()
 
     def _cleanup_after_loading(self) -> None:
         """Synchronize and release freed device/CPU memory after sharding."""
@@ -1743,7 +1780,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def disable(self) -> None:
-        if not self.enabled and not hasattr(self, "_mmap_file_cache"):
+        has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
+        has_carrier = (
+            self.host_weight_plan is not None
+            and self.host_weight_plan.lease_carrier is not None
+            and not self.host_weight_plan.lease_carrier.closed
+        )
+        has_partial_hooks = bool(
+            self._blocks
+            or self._all_hook_groups
+            or getattr(self, "_on_demand_handles", ())
+            or self._resident_layer_group is not None
+        )
+        if (
+            not self.enabled
+            and not hasattr(self, "_mmap_file_cache")
+            and not has_open_lease
+            and not has_carrier
+            and not has_partial_hooks
+        ):
             return
 
         if self._using_rank_local_mmap:
