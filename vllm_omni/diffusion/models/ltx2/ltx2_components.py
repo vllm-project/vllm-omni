@@ -69,6 +69,17 @@ _LTX_COMPONENT_SUBFOLDERS = (
 )
 logger = logging.getLogger(__name__)
 
+_LTX2_CHANNELS_LAST_3D_EXTRA = "ltx2_use_channels_last_3d"
+
+
+def _ltx2_use_channels_last_3d(od_config: Any) -> bool:
+    """Read the LTX2-only channels-last opt-in from model extras."""
+    extras = getattr(od_config, "extras", {}) or {}
+    enabled = extras.get(_LTX2_CHANNELS_LAST_3D_EXTRA, False)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{_LTX2_CHANNELS_LAST_3D_EXTRA} must be a bool, got {type(enabled)!r}")
+    return enabled
+
 
 @dataclass(frozen=True)
 class LTXComponentProfile:
@@ -604,6 +615,8 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
+    if _ltx2_use_channels_last_3d(od_config):
+        pipeline.vae.enable_channels_last_3d()
     pipeline.audio_vae = _load_component(
         AutoencoderKLLTX2Audio,
         model,

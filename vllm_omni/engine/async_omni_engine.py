@@ -1098,6 +1098,7 @@ class AsyncOmniEngine:
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": {
+                **(kwargs.get("extras") or {}),
                 "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
                 "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
             },

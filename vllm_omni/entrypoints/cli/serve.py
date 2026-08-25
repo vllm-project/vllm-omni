@@ -677,7 +677,6 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
-
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
             "--disable-multithread-weight-load",

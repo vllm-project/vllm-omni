@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import MethodType
 from typing import Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Video
+from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoCausalConv3d
 from diffusers.models.autoencoders.vae import DecoderOutput
+from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -17,6 +20,89 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 )
 
 logger = init_logger(__name__)
+
+
+# Adapted from https://github.com/sgl-project/sglang/pull/27431.
+def _weight_is_channels_last_3d(module: LTX2VideoCausalConv3d) -> bool:
+    weight = module.conv.weight
+    return (
+        weight.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and weight.is_contiguous(memory_format=torch.channels_last_3d)
+    )
+
+
+def _temporal_pad_channels_last_3d(
+    hidden_states: torch.Tensor,
+    *,
+    left: int,
+    right: int,
+) -> torch.Tensor:
+    """Replicate temporal edge frames directly into CL3D storage."""
+    batch, channels, frames, height, width = hidden_states.shape
+    padded = torch.empty(
+        (batch, channels, frames + left + right, height, width),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        memory_format=torch.channels_last_3d,
+    )
+    padded[:, :, left : left + frames].copy_(hidden_states)
+    if left:
+        padded[:, :, :left].copy_(hidden_states[:, :, :1])
+    if right:
+        padded[:, :, left + frames :].copy_(hidden_states[:, :, -1:])
+    return padded
+
+
+def _layout_preserving_causal_conv_forward(
+    module: LTX2VideoCausalConv3d,
+    hidden_states: torch.Tensor,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Diffusers LTX causal-conv math with a CL3D-preserving pad path."""
+    time_kernel_size = module.kernel_size[0]
+    use_channels_last_pad = hidden_states.dim() == 5 and _weight_is_channels_last_3d(module)
+
+    if use_channels_last_pad:
+        if causal:
+            left, right = time_kernel_size - 1, 0
+        else:
+            left = right = (time_kernel_size - 1) // 2
+        if left == 0 and right == 0:
+            hidden_states = hidden_states.contiguous(memory_format=torch.channels_last_3d)
+        else:
+            hidden_states = _temporal_pad_channels_last_3d(
+                hidden_states,
+                left=left,
+                right=right,
+            )
+    elif causal:
+        pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, time_kernel_size - 1, 1, 1))
+        hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+    else:
+        pad_size = (time_kernel_size - 1) // 2
+        pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, pad_size, 1, 1))
+        pad_right = hidden_states[:, :, -1:, :, :].repeat((1, 1, pad_size, 1, 1))
+        hidden_states = torch.concatenate([pad_left, hidden_states, pad_right], dim=2)
+
+    return module.conv(hidden_states)
+
+
+def _enable_channels_last_3d(model: nn.Module) -> tuple[int, int]:
+    """Convert LTX Conv3d weights and install layout-preserving causal pads."""
+    if not hasattr(torch, "channels_last_3d"):
+        return 0, 0
+
+    converted_convs = 0
+    patched_causal_convs = 0
+    for module in model.modules():
+        if isinstance(module, LTX2VideoCausalConv3d):
+            module.forward = MethodType(_layout_preserving_causal_conv_forward, module)
+            patched_causal_convs += 1
+        if isinstance(module, nn.Conv3d):
+            module.weight.data = module.weight.data.contiguous(memory_format=torch.channels_last_3d)
+            converted_convs += 1
+    return converted_convs, patched_causal_convs
 
 
 class LTX2VaeExecutor(DistributedVaeExecutor):
@@ -79,6 +165,16 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         model = super().from_pretrained(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def enable_channels_last_3d(self) -> None:
+        """Opt into the layout-preserving CL3D path for this video VAE."""
+        converted_convs, patched_causal_convs = _enable_channels_last_3d(self)
+        logger.info(
+            "LTX2 video VAE: converted %d Conv3d weights to channels_last_3d and "
+            "installed %d layout-preserving causal conv paths",
+            converted_convs,
+            patched_causal_convs,
+        )
 
     def init_distributed(self):
         self.distributed_executor = LTX2VaeExecutor()

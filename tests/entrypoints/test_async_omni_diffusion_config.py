@@ -20,6 +20,7 @@ def test_default_stage_config_includes_cache_backend():
             "cache_backend": "cache_dit",
             "cache_config": '{"Fn_compute_blocks": 2}',
             "vae_use_slicing": True,
+            "extras": {"ltx2_use_channels_last_3d": True},
             "ulysses_degree": 2,
         }
     )[0]
@@ -29,6 +30,7 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["cache_backend"] == "cache_dit"
     assert engine_args["cache_config"]["Fn_compute_blocks"] == 2
     assert engine_args["vae_use_slicing"] is True
+    assert engine_args["extras"]["ltx2_use_channels_last_3d"] is True
     assert engine_args["parallel_config"].ulysses_degree == 2
     assert engine_args["model_stage"] == "diffusion"
 

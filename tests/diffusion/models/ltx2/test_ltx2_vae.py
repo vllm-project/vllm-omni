@@ -11,6 +11,100 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class TestLTXChannelsLast3D:
+    @pytest.mark.parametrize(
+        ("extras", "expected"),
+        [({}, False), ({"ltx2_use_channels_last_3d": True}, True)],
+    )
+    def test_channels_last_opt_in_is_ltx2_model_extra(self, extras, expected):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_channels_last_3d
+
+        assert _ltx2_use_channels_last_3d(SimpleNamespace(extras=extras)) is expected
+
+    def test_channels_last_opt_in_rejects_non_boolean_model_extra(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_channels_last_3d
+
+        with pytest.raises(TypeError, match="ltx2_use_channels_last_3d"):
+            _ltx2_use_channels_last_3d(SimpleNamespace(extras={"ltx2_use_channels_last_3d": "true"}))
+
+    @pytest.mark.parametrize(
+        ("causal", "kernel_size"),
+        [
+            (True, 3),
+            (False, 3),
+            (True, (3, 1, 1)),
+            (True, 1),
+        ],
+    )
+    def test_layout_preserving_causal_conv_matches_original(self, causal, kernel_size):
+        from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoCausalConv3d
+
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+            _enable_channels_last_3d,
+            _weight_is_channels_last_3d,
+        )
+
+        torch.manual_seed(0)
+        conv = LTX2VideoCausalConv3d(4, 5, kernel_size).to(dtype=torch.float32).eval()
+        hidden_states = torch.randn(1, 4, 5, 6, 7, dtype=torch.float32)
+
+        # Pointwise Conv3d storage is valid in both contiguous formats because
+        # all spatial/temporal kernel dimensions are singleton.
+        if kernel_size != 1:
+            assert not _weight_is_channels_last_3d(conv)
+        with torch.no_grad():
+            expected = conv(hidden_states.clone(), causal=causal)
+
+        converted, patched = _enable_channels_last_3d(conv)
+
+        assert (converted, patched) == (1, 1)
+        assert _weight_is_channels_last_3d(conv)
+        with torch.no_grad():
+            actual = conv(hidden_states.clone(), causal=causal)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+    def test_temporal_pad_replicates_edges_in_channels_last_3d(self):
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+            _temporal_pad_channels_last_3d,
+        )
+
+        torch.manual_seed(0)
+        hidden_states = torch.randn(1, 4, 3, 2, 2, dtype=torch.float32)
+
+        actual = _temporal_pad_channels_last_3d(hidden_states, left=2, right=1)
+        expected = torch.cat(
+            [
+                hidden_states[:, :, :1].repeat(1, 1, 2, 1, 1),
+                hidden_states,
+                hidden_states[:, :, -1:],
+            ],
+            dim=2,
+        )
+
+        assert actual.is_contiguous(memory_format=torch.channels_last_3d)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_contiguous_weight_keeps_original_padding_path(self, monkeypatch):
+        from diffusers.models.autoencoders.autoencoder_kl_ltx2 import LTX2VideoCausalConv3d
+
+        import vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 as ltx2_vae
+
+        conv = LTX2VideoCausalConv3d(4, 5, 3).to(dtype=torch.float32).eval()
+        hidden_states = torch.randn(1, 4, 3, 2, 2, dtype=torch.float32)
+
+        def fail_channels_last_pad(*_args, **_kwargs):
+            raise AssertionError("contiguous weights must retain the original padding path")
+
+        monkeypatch.setattr(ltx2_vae, "_temporal_pad_channels_last_3d", fail_channels_last_pad)
+
+        with torch.no_grad():
+            expected = conv(hidden_states, causal=True)
+            actual = ltx2_vae._layout_preserving_causal_conv_forward(conv, hidden_states, causal=True)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 class TestLTXOutputRank:
     @pytest.mark.parametrize(
         ("distributed_vae_state", "expected_decode_calls"),
