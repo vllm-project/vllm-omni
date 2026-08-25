@@ -41,7 +41,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
@@ -391,11 +390,30 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def _apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run causal SDPA with the reference expanded-K/V GQA behavior."""
+    num_key_value_groups = query.shape[1] // key.shape[1]
+    if num_key_value_groups != 1:
+        key = key.repeat_interleave(num_key_value_groups, dim=1)
+        value = value.repeat_interleave(num_key_value_groups, dim=1)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        is_causal=True,
+    )
 
 
 def _apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
@@ -775,14 +793,6 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        self.attn = SDPAImpl(
-            num_heads=self.qkv_proj.local_num_heads,
-            head_size=self.head_dim,
-            causal=True,
-            softmax_scale=self.scaling,
-            num_kv_heads=self.qkv_proj.local_num_kv_heads,
-            prefix=f"{prefix}.attn",
-        )
 
     def forward(
         self,
@@ -807,15 +817,15 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             query = F.linear(hidden_states, q_weight)
             key = F.linear(hidden_states, k_weight)
             value = F.linear(hidden_states, v_weight)
-        query_states = self.q_norm(query.view(hidden_shape))
-        key_states = self.k_norm(key.view(hidden_shape))
-        value_states = value.view(hidden_shape)
+        query_states = self.q_norm(query.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(key.view(hidden_shape)).transpose(1, 2)
+        value_states = value.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output = self.attn.forward(query_states, key_states, value_states)
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = _scaled_dot_product_attention(query_states, key_states, value_states)
+        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 

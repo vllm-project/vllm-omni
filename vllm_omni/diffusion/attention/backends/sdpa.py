@@ -105,23 +105,21 @@ class SDPAImpl(AttentionImpl):
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        if enable_gqa:
+        # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
+        # cannot select a fused GQA kernel for the runtime shape/mask, expand
+        # K/V locally so it can use the better-supported equal-head path.
+        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
             if query.shape[1] % key.shape[1] != 0:
                 raise ValueError(
                     "GQA requires query heads to be a multiple of KV heads, "
                     f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
                 )
-
-        # Keep compressed K/V only when the current platform can dispatch a
-        # native GQA kernel for this SDPA call. Other platforms retain the
-        # existing explicit-expansion behavior.
-        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
             repeat_num = query.shape[1] // key.shape[1]
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
             enable_gqa = False
             logger.debug(
-                "SDPA cannot use a fused native-GQA kernel for this platform or shape; expanding K/V heads before SDPA."
+                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
             )
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
