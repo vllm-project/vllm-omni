@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import multiprocessing as mp
 import multiprocessing.connection
+import inspect
 import os
 import queue
 import threading
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
@@ -296,10 +298,40 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
-        # Without this, every worker inherits one Torch thread per core, so an
-        # N-GPU run oversubscribes the host by N x core_count. Honours a
-        # user-provided OMP_NUM_THREADS.
-        set_multiprocessing_worker_envs()
+        # Size the per-worker host thread budget from the worker count.
+        #
+        # Older vLLM's set_multiprocessing_worker_envs() takes no argument and, when
+        # OMP_NUM_THREADS is unset, forces OMP_NUM_THREADS=1 and torch.set_num_threads(1)
+        # regardless of how many workers there are ("Reducing Torch parallelism from N
+        # threads to 1"). The spawned diffusion worker inherits that environment, so its
+        # host-side Torch CPU ops run single-threaded. On a 1-GPU run there is no
+        # oversubscription to relieve, so the clamp only starves the GPU: on Cosmos-Dreams
+        # (1 GPU, 36 cores, 257 frames @ 720x1280) it cost 3.21 s of wall clock, of which
+        # nsys attributes 3.207 s to additional GPU idle, with byte-identical output.
+        #
+        # Size the host thread budget per diffusion worker. Older vLLM versions default
+        # OMP_NUM_THREADS to 1 when unset, which unnecessarily serializes host-side work
+        # for single-GPU diffusion. Newer vLLM versions accept local_world_size and do
+        # affinity/cgroup-aware sizing themselves. num_gpus is the right count here:
+        # _launch_workers() spawns exactly one DiffusionWorker per GPU.
+        try:
+            _params = inspect.signature(set_multiprocessing_worker_envs).parameters
+        except (TypeError, ValueError):  # C-implemented callable: assume the old API
+            _params = {}
+
+        if "local_world_size" in _params:
+            set_multiprocessing_worker_envs(num_gpus)
+        else:
+            if "OMP_NUM_THREADS" not in os.environ:
+                per_worker_threads = max(1, torch.get_num_threads() // max(1, num_gpus))
+                os.environ["OMP_NUM_THREADS"] = str(per_worker_threads)
+                logger.info(
+                    "Diffusion workers: OMP_NUM_THREADS=%d (%d Torch threads / %d worker(s))",
+                    per_worker_threads,
+                    torch.get_num_threads(),
+                    num_gpus,
+                )
+            set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
         processes = []
 
