@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 import importlib
 import time
 from collections import defaultdict, deque
@@ -10,6 +11,7 @@ from typing import Any
 import torch
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
@@ -119,6 +121,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return max(0, num_computed - num_placeholders)
 
     @staticmethod
+    def _snapshot_processor_request(request: Request) -> Request:
+        """Snapshot mutable processor inputs at save-queue admission time."""
+
+        def snapshot_container(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: snapshot_container(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [snapshot_container(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(snapshot_container(item) for item in value)
+            return value
+
+        snapshot = copy.copy(request)
+        for name in (
+            "additional_information",
+            "prompt_token_ids",
+        ):
+            if hasattr(request, name):
+                setattr(snapshot, name, snapshot_container(getattr(request, name)))
+
+        for private_name, public_name in (
+            ("_all_token_ids", "all_token_ids"),
+            ("_output_token_ids", "output_token_ids"),
+        ):
+            token_ids = getattr(request, private_name, None)
+            if isinstance(token_ids, list):
+                frozen_ids = token_ids.copy()
+                setattr(snapshot, private_name, frozen_ids)
+                setattr(snapshot, public_name, ConstantList(frozen_ids))
+        return snapshot
+
+    @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
@@ -169,6 +203,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
+        confirmed_num_computed_tokens: int | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -186,10 +221,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             multimodal_output: Per-request multimodal output dictionary
             request: Request object
             is_segment_finished: whether the segment of request is finished
+            confirmed_num_computed_tokens: committed token count captured
+                before a streaming transition can mutate ``request``
         """
         is_finished = request.is_finished() and not request.resumable
 
-        confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        if confirmed_num_computed_tokens is None:
+            confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
         # If the request is preempted, skip the already saved chunks.
         if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
@@ -204,11 +242,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
-            "request": request,
+            "request": (
+                self._snapshot_processor_request(request) if self.custom_process_next_stage_input_func else request
+            ),
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
         }
         self._pending_save_reqs.append(task)
+        if is_segment_finished:
+            # The queued FIFO item now owns the old segment. Start the next
+            # segment's deduplication watermark before the worker sends it.
+            self.requests_num_chunks_sent.pop(request.external_req_id, None)
         with self._save_cond:
             self._save_cond.notify()
 
@@ -425,7 +469,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:

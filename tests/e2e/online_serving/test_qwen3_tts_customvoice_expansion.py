@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -62,7 +62,7 @@ tts_server_params = [
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_001(omni_server, openai_client) -> None:
+def test_voice_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -84,7 +84,7 @@ def test_voice_001(omni_server, openai_client) -> None:
     # Retry once on assertion failures from transcript similarity / gender checks (flaky ASR or estimators).
     for attempt in range(2):
         try:
-            openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
+            online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
             break
         except AssertionError:
             if attempt == 0:
@@ -94,7 +94,7 @@ def test_voice_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_002(omni_server, openai_client) -> None:
+def test_voice_002(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -112,12 +112,12 @@ def test_voice_002(omni_server, openai_client) -> None:
         "voice": "Serena",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_003(omni_server, openai_client) -> None:
+def test_voice_003(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -135,12 +135,12 @@ def test_voice_003(omni_server, openai_client) -> None:
         "voice": "SERENA",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_language_001(omni_server, openai_client) -> None:
+def test_language_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -158,4 +158,4 @@ def test_language_001(omni_server, openai_client) -> None:
         "voice": "vivian",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
