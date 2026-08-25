@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -399,6 +399,39 @@ def test_serve_cli_forwards_dlo_transport_controls():
     assert engine_args["dlo_pin_failure_policy"] == "whole_block_fallback"
 
 
+def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--host-weight-runtime-mode",
+            "preferred",
+            "--host-weight-runtime-root",
+            "/var/cache/vllm-omni/hwr",
+            "--dlo-host-registration-limit-gib",
+            "80",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert explicit_kwargs["host_weight_runtime_mode"] == "preferred"
+    assert explicit_kwargs["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+    assert explicit_kwargs["dlo_host_registration_limit_gib"] == 80
+    assert engine_args["host_weight_runtime_mode"] == "preferred"
+    assert engine_args["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+    assert engine_args["dlo_host_registration_limit_gib"] == 80
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
@@ -437,7 +470,9 @@ def test_serve_cli_accepts_diffusion_attention_backend():
             "Qwen/Qwen-Image",
             "--omni",
             "--diffusion-attention-backend",
-            "FLASH_ATTN",
+            "FASTVIDEO_VSA",
+            "--fastvideo-vsa-topk",
+            "96",
         ]
     )
 
@@ -445,10 +480,12 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
     diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
 
-    assert args.diffusion_attention_backend == "FLASH_ATTN"
+    assert args.diffusion_attention_backend == "FASTVIDEO_VSA"
+    assert args.fastvideo_vsa_topk == 96
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
-    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+    assert diffusion_attention_config.default.backend == "FASTVIDEO_VSA"
+    assert diffusion_attention_config.default.backend_kwargs() == {"topk": 96}
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():

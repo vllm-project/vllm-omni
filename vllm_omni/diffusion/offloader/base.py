@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, validate_dlo_host_registration_options
 
 from .chunked_transport import TransportBackendKind
 
@@ -64,6 +64,9 @@ class OffloadConfig:
     weight_shard_rank: int = 0
     weight_shard_group: Any | None = None
     weight_shard_cpu_group: Any | None = None
+    # Optional per-worker ceiling for registering an HWR mmap. Zero means no
+    # additional ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -134,6 +137,12 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
+            enable_dlo=enable_distributed_layerwise_offload,
+            use_allgather=dlo_use_allgather,
+            hwr_mode=getattr(od_config, "host_weight_runtime_mode", "disabled"),
+        )
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
         if dlo_resident_layers and dlo_use_allgather:
@@ -151,26 +160,19 @@ class OffloadConfig:
                 "the backend will select mmap or standard-loader host storage"
             )
 
-        # HSDP + DLO/AllGather is supported: ownership is split structurally.
-        # The repeated DiT blocks are resolved before HSDP wrapping and handed
-        # to the chunk engine, and those same tensors are added to FSDP's
-        # ignored_params so fully_shard never touches them. Every parameter
-        # therefore has exactly one owner (FSDP *or* the chunk engine), which
-        # is what previously made double-sharding possible.
+        # HSDP already shards parameters into DTensors. Running distributed
+        # layerwise offload with AllGather on top would shard each local tensor
+        # again and produce incorrect reconstruction. Keep this combination
+        # rejected; HSDP with rank-local DLO remains supported.
+        if enable_distributed_layerwise_offload and use_hsdp and dlo_use_allgather:
+            raise ValueError(
+                "Distributed layerwise offload with AllGather is incompatible with "
+                "HSDP: HSDP parameters are already sharded DTensors, and the offloader "
+                "would double-shard them. Use --dlo-no-use-allgather (standard-loader "
+                "rank-local weights) or disable HSDP."
+            )
 
-        # Explicit fully-shard (FS) axis for the chunked weight transport.
-        # This is deliberately NOT dp_size: under HSDP the replicate axis
-        # serves independent requests, so it must never take part in a weight
-        # collective. Only the fully-shard degree does.
         weight_shard_size = dp_size
-        if use_hsdp and dlo_use_allgather:
-            hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if parallel_config else -1
-            if not hsdp_shard_size or hsdp_shard_size <= 0:
-                raise ValueError(
-                    "Distributed layerwise offload with AllGather under HSDP requires a "
-                    f"positive parallel_config.hsdp_shard_size, got {hsdp_shard_size}."
-                )
-            weight_shard_size = int(hsdp_shard_size)
 
         chunk_size_mb = int(getattr(od_config, "dlo_chunk_size_mb", 64))
         if chunk_size_mb <= 0:
@@ -206,6 +208,7 @@ class OffloadConfig:
             dlo_pin_failure_policy=dlo_pin_failure_policy,
             dlo_transport_backend=dlo_transport_backend,
             weight_shard_size=weight_shard_size,
+            dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
         )
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 
@@ -57,6 +57,11 @@ _DIFFUSION_MODELS = {
         "OvisImagePipeline",
     ),
     "WanPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
+    ),
+    "WanDMDPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
         "Wan22Pipeline",
@@ -286,6 +291,16 @@ _DIFFUSION_MODELS = {
         "pipeline_lingbot_video",
         "LingBotVideoPipeline",
     ),
+    "SanaVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video",
+        "SanaVideoPipeline",
+    ),
+    "SanaImageToVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video_i2v",
+        "SanaImageToVideoPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -459,6 +474,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
     try:
         sp_size = od_config.parallel_config.sequence_parallel_size
+        assert sp_size is not None
         if sp_size <= 1:
             return
 
@@ -539,6 +555,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
@@ -579,6 +596,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
+    "SanaVideoPipeline": "get_sana_video_post_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
@@ -612,6 +631,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
+    "WanDMDPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
@@ -623,6 +643,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
@@ -703,6 +724,7 @@ def register_diffusion_model(
 
 def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
     """Load and return a process function from the appropriate module."""
+    assert od_config.model_class_name is not None
     mod_folder, mod_relname, _ = _DIFFUSION_MODELS[od_config.model_class_name]
     if mod_relname == "":
         # Full module path (registered via register_diffusion_model)

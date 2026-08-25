@@ -36,6 +36,7 @@ from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
@@ -817,13 +818,35 @@ class Orchestrator:
         )
 
     async def _handle_abort(self, msg: AbortRequestMessage) -> None:
-        """Handle an abort message from the main thread."""
+        """Handle an abort message from the main thread.
+
+        When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
+        stage aborts, binding release, and request cleanup complete so the
+        caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+        """
         request_ids = msg.request_ids
-        # _cleanup_request_ids is CFG-aware: it expands aborted parents to
-        # their companions and fails a deferred parent whose companion is
-        # aborted before its output arrived.
-        await self._cleanup_request_ids(list(request_ids), abort=True)
-        logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+        error: str | None = None
+        try:
+            # _cleanup_request_ids is CFG-aware: it expands aborted parents to
+            # their companions and fails a deferred parent whose companion is
+            # aborted before its output arrived.
+            await self._cleanup_request_ids(list(request_ids), abort=True)
+            logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+        except Exception as exc:
+            error = str(exc)
+            logger.exception("[Orchestrator] Abort failed for request(s) %s", request_ids)
+            if msg.rpc_id is None:
+                raise
+        if msg.rpc_id is not None:
+            # Always emit a result when rpc_id is set so CorrelatedRpcClient
+            # waiters are unblocked even on failure.
+            await self.rpc_async_queue.put(
+                AbortResultMessage(
+                    rpc_id=msg.rpc_id,
+                    success=error is None,
+                    error=error,
+                )
+            )
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""

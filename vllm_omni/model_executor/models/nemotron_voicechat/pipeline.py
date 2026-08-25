@@ -80,6 +80,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": False},
+            requires_full_payload_input=True,
         ),
     ),
 )

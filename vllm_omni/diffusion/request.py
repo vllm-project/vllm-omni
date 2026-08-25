@@ -1,6 +1,6 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -15,6 +15,25 @@ if TYPE_CHECKING:
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 _DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
+
+
+def resolve_video_num_frames(
+    num_frames: int | None,
+    *,
+    default_num_frames: int,
+    is_dummy_run: bool,
+) -> int:
+    """Resolve the shared image-model frame sentinel for a video pipeline.
+
+    ``OmniDiffusionSamplingParams`` defaults ``num_frames`` to one for image
+    models, so an omitted video API field reaches model code as ``1``. Video
+    pipelines with a different default must materialize it at their boundary.
+    Startup profiling intentionally requests one frame, however, and must stay
+    lightweight.
+    """
+    if num_frames is None or (num_frames == 1 and not is_dummy_run):
+        return default_num_frames
+    return num_frames
 
 
 @dataclass
