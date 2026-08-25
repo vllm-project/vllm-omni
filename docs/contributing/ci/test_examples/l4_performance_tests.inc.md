@@ -5,7 +5,7 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
 | Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
-| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
+| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Diffusion | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, … |
 
@@ -20,7 +20,7 @@ Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-o
 
 #### Running perf cases
 
-Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects; for example, `test_qwen3_omni_async_chunk.json` uses `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects. For example, the nightly object in `test_qwen3_omni_async_chunk.json` declares both H100 and A3, while its `slow` weekly object is CUDA-only; there is no NPU weekly counterpart. Use `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
 
 ```JSON
 {
