@@ -114,16 +114,43 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_2
 
-      - label: "TTS · L4"
+      - label: "TTS · L4 · Shard %N/%t"
+        parallelism: 2
         timeout_in_minutes: 120
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
           - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
+            shard_id="$${BUILDKITE_PARALLEL_JOB:-0}"
+            shard_count="$${BUILDKITE_PARALLEL_JOB_COUNT:-1}"
+
+            set +e
+            collection_output=$$(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model")
+            collection_status=$$?
+            set -e
+            printf '%s\n' "$${collection_output}"
+            if (( collection_status != 0 )); then
+              echo "pytest collection failed with status $${collection_status}" >&2
+              exit "$${collection_status}"
+            fi
+
+            mapfile -t files < <(
+              printf '%s\n' "$${collection_output}" |
+                sed -n -E '/\.py::/ { s|::.*||; p; }' |
+                sort -u
+            )
+            if (( $${#files[@]} == 0 )); then
+              echo "pytest collection produced no TTS test files" >&2
+              exit 1
+            fi
+
             failed=0
-            for f in $(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model" | grep '\.py::' | sed -E 's|::.*||' | sort -u); do
-              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            for index in "$${!files[@]}"; do
+              if (( index % shard_count != shard_id )); then
+                continue
+              fi
+              pytest -s -v "$${files[index]}" -m "slow and L4 and tts" --run-level "full_model" || failed=1
             done
             exit $$failed
         mirror_hardwares: l4_1
