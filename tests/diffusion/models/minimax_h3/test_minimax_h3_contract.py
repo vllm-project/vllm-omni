@@ -3080,3 +3080,112 @@ def test_encoder_load_places_every_source_in_its_own_rows(tmp_path):
     }
     for source, rows in slices.items():
         assert torch.equal(rows, torch.full_like(rows, _SOURCE_FILL[source])), source
+
+
+def _pad_seq_len_batch(pad_seq_len):
+    """A t2va request that pins the packed length through ``extra_args``."""
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    extra_args = {"task": "t2va", "aspect_ratio": "16:9"}
+    if pad_seq_len is not None:
+        extra_args["pad_seq_len"] = pad_seq_len
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless",
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=None,
+        extra_args=extra_args,
+    )
+    return DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="pinned packed length",
+                sampling_params=sampling,
+                request_id="pad-seq-len",
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("pinned, expected", [(None, None), (54080, 54080)])
+def test_pad_seq_len_reaches_diffuse_from_extra_args(pinned, expected):
+    """The request field must arrive at ``diffuse``, not stop at validation."""
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+
+    pipeline.forward(_pad_seq_len_batch(pinned))
+
+    assert [call["pad_seq_len"] for call in diffuse_calls] == [expected]
+
+
+@pytest.mark.parametrize("task", ["t2va", "ref2va"])
+def test_pad_seq_len_reaches_the_packer_for_every_task_family(task, monkeypatch):
+    """``diffuse`` must hand the pin to whichever packer the task uses."""
+    import vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 as module
+
+    class _CapturedError(Exception):
+        pass
+
+    recorded = {}
+
+    def _capture(**kwargs):
+        recorded.update(kwargs)
+        raise _CapturedError
+
+    monkeypatch.setattr(module, "minimax_h3_packed_sequence", _capture)
+    monkeypatch.setattr(module, "minimax_h3_packed_sequence_ref2va_blocks", _capture)
+
+    pipeline = _distilled_pipeline([], {"fl2va": None, "ref2va": None})
+    pipeline._initial_noise = lambda **kwargs: (torch.zeros(1), torch.zeros(1))
+
+    with pytest.raises(_CapturedError):
+        pipeline._build_denoise_inputs(
+            task=task,
+            text_embeddings=torch.ones(7, 2),
+            text_tags=torch.ones(7, dtype=torch.long),
+            seed=0,
+            latent_t=2,
+            latent_h=4,
+            latent_w=6,
+            audio_t=3,
+            num_frames=5,
+            num_steps=2,
+            video_shift=12.0,
+            audio_shift=3.0,
+            base_schedule=None,
+            visual_condition=None,
+            visual_condition_shape=(1, 4, 6),
+            audio_condition=None,
+            ref_audio_t=1,
+            pad_seq_len=192,
+        )
+
+    assert recorded["seq_len"] == 192
+
+
+@pytest.mark.parametrize("value", [0, -64, 100, "128", True, 1.5, (1 << 20) + 64])
+def test_pad_seq_len_request_validation_rejects_bad_values(value):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError):
+        _resolve_pad_seq_len(value)
+
+
+def test_pad_seq_len_request_validation_accepts_aligned_values():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        MINIMAX_H3_MAX_PAD_SEQ_LEN,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+
+    assert _resolve_pad_seq_len(None) is None
+    assert _resolve_pad_seq_len(54080) == 54080
+    assert _resolve_pad_seq_len(MINIMAX_H3_MAX_PAD_SEQ_LEN) == MINIMAX_H3_MAX_PAD_SEQ_LEN
