@@ -727,6 +727,36 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
+    "parallel",
+    [
+        FinalLayoutParallelIdentity(),
+        FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=0),
+        FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=1),
+        FinalLayoutParallelIdentity(sequence_parallel_size=2, ulysses_degree=2),
+        FinalLayoutParallelIdentity(sequence_parallel_size=2, ring_degree=2),
+        FinalLayoutParallelIdentity(
+            tensor_parallel_size=2,
+            tensor_parallel_rank=1,
+            sequence_parallel_size=2,
+            ulysses_degree=2,
+        ),
+    ],
+)
+def test_parallel_identity_matrix_is_exact_for_tp_and_sp(tmp_path: Path, parallel: FinalLayoutParallelIdentity) -> None:
+    """TP rank/size and SP backend are identity coordinates for HWR artifacts."""
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    context = _identity(model, source, request=_request(parallel=parallel))
+    layout = context.identity.layout
+
+    assert layout.tensor_parallel_size == parallel.tensor_parallel_size
+    assert layout.tensor_parallel_rank == parallel.tensor_parallel_rank
+    assert layout.sequence_parallel_size == parallel.sequence_parallel_size
+    assert layout.sequence_parallel_backend == parallel.sequence_parallel_backend
+    assert "data_parallel" not in context.identity.layout.metadata.to_value().get("parallel", {})
+
+
+@pytest.mark.parametrize(
     ("semantic_request", "message"),
     [
         (_request(load_format="diffusers"), "load_format='default'"),

@@ -362,6 +362,35 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert engine_args["dlo_resident_layers"] == 20
 
 
+def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--host-weight-runtime-mode",
+            "preferred",
+            "--host-weight-runtime-root",
+            "/var/cache/vllm-omni/hwr",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert explicit_kwargs["host_weight_runtime_mode"] == "preferred"
+    assert explicit_kwargs["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+    assert engine_args["host_weight_runtime_mode"] == "preferred"
+    assert engine_args["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
