@@ -49,6 +49,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def needs_omni_connector(model_config: Any) -> bool:
+    """Whether a runner owns an input, output, or explicitly routed connector."""
+    return (
+        bool(getattr(model_config, "requires_full_payload_input", False))
+        or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
+        or get_stage_connector_role(model_config) is not None
+    )
+
+
 def _should_create_payload_connector(model_config: Any) -> bool:
     """Whether this stage owns runner payload transport for its edge.
 

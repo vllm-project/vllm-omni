@@ -73,8 +73,10 @@ def cuda_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.L4
     elif res == "H100":
         test_resource = pytest.mark.H100
+    elif res == "H800":
+        test_resource = pytest.mark.H800
     else:
-        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100")
+        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100, H800")
     marks = [test_resource, test_platform_detail]
     if num_cards == 1:
         return marks
@@ -137,7 +139,7 @@ def musa_marks(*, res: str, num_cards: int):
 
 def gpu_marks(*, res: str, num_cards: int):
     test_platform = pytest.mark.gpu
-    if res in ("L4", "H100"):
+    if res in ("L4", "H100", "H800"):
         return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
@@ -145,7 +147,7 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     if res == "S5000":
         return [test_platform] + musa_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325, B60, S5000")
+    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, H800, MI325, B60, S5000")
 
 
 def npu_marks(*, res: str, num_cards: int):

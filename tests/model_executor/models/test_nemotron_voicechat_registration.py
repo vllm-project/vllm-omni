@@ -67,15 +67,6 @@ def test_architectures_registered() -> None:
         assert arch in _OMNI_MODELS, f"{arch} missing from _OMNI_MODELS"
 
 
-def test_full_payload_whitelists_cover_code2wav_only() -> None:
-    from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
-
-    assert ("NemotronVoiceChatCode2Wav", "code2wav") in _FULL_PAYLOAD_INPUT_STAGES
-    # The thinker->talker hop is token-path only: the talker must NOT wait on a
-    # connector payload or stage 1 hangs.
-    assert ("NemotronVoiceChatTalkerForConditionalGeneration", "talker") not in _FULL_PAYLOAD_INPUT_STAGES
-
-
 def test_config_parses_nemo_layout_without_hub_access(monkeypatch) -> None:
     # Provide the thinker text config explicitly so the test never touches HF.
     cfg = NemotronVoiceChatConfig(

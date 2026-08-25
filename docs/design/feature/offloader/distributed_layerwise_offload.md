@@ -169,6 +169,31 @@ This mode means:
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
+### Component allocator-cache retention
+
+MiniMax-H3 DLO keeps one bounded PyTorch allocator cache across its staged
+encoder, DiT, and VAE component boundaries so allocations released by one
+component can be reused by the next. The DiT prefetch path and its two shared
+device buffers are unchanged.
+
+After a component is offloaded, cached-but-unallocated memory is retained only
+while it is at most 25% of device capacity and at least 5% of device capacity
+remains physically free. Crossing either bound releases the allocator cache.
+Missing allocator telemetry also releases it conservatively. Component or
+staging failure forces a release, and an out-of-memory allocation gets one
+retry after release. This is a component-local policy rather than a global
+`empty_cache` override, so the executor's unconditional shutdown cleanup is
+preserved.
+
+Retaining allocator blocks trades higher reserved and peak device memory for
+lower lifecycle latency. The benefit is device- and workload-dependent, and a
+smaller or externally loaded device may cross a bound and return to the
+ordinary per-component cache-release behavior. Current performance validation
+covers MiniMax-H3 no-AllGather DLO on CUDA. Other MiniMax-H3 DLO transfer
+topologies and platforms receive the same bounded policy but are not claimed
+performance targets; other DLO models remain unchanged unless they explicitly
+adopt it.
+
 ### Final-layout Host Weight Runtime consumer
 
 > **Status:** PR2 implementation. The representation-independent identity,
@@ -390,6 +415,8 @@ Current source-level validation includes:
   transforms without parameter-side flags;
 - resident-layer requests requiring no-AllGather;
 - DP request-wave validation for denoising-step compatibility;
+- bounded component allocator-cache retention, conservative/forced release,
+  OOM retry, and immutable encoder non-block staging;
 - sharding, double-buffer, AllGather-size, and heterogeneous-block regression
   tests.
 
