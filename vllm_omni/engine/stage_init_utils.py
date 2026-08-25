@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -1514,8 +1517,13 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    od_config.max_num_seqs = batch_size
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    # An explicit AsyncOmni-level diffusion_batch_size wins, but its default
+    # (1) must not clobber a max_num_seqs configured in the stage's deploy
+    # YAML: online serving has no way to pass diffusion_batch_size, so the
+    # YAML value is the only batching knob it has.
+    if batch_size > 1:
+        od_config.max_num_seqs = batch_size
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, od_config.max_num_seqs, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:

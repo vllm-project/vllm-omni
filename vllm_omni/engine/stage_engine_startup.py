@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Helpers for launching and handshaking omni engine cores."""
 
 from __future__ import annotations
@@ -1558,7 +1561,10 @@ def launch_diffusion_stage_replica(
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     od_config = build_diffusion_config(model, stage_config, metadata)
-    od_config.max_num_seqs = batch_size
+    # See initialize_diffusion_stage: the default batch_size (1) must not
+    # clobber a max_num_seqs configured in the stage's deploy YAML.
+    if batch_size > 1:
+        od_config.max_num_seqs = batch_size
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
