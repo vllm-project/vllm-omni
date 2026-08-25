@@ -700,14 +700,20 @@ class HunyuanImage3Pipeline(
                 continue
             values = [kwargs.get(key) for kwargs in per_row_kwargs]
             if key == "full_attn_spans" and values[0] is not None:
-                merged[key] = [
-                    self._shift_full_attn_spans(value[branch], prefix_len, max_prefix_len)
-                    for value, branch, prefix_len in zip(
-                        values,
-                        row_branches,
-                        prefix_lens or [None] * len(row_branches),
-                    )
-                ]
+                if self._uses_scheduler_paged_kv():
+                    # Paged rows retain request-local compact coordinates;
+                    # only the dense attention mask is padded across rows.
+                    merged[key] = [list(value[branch]) for value, branch in zip(values, row_branches, strict=True)]
+                else:
+                    merged[key] = [
+                        self._shift_full_attn_spans(value[branch], prefix_len, max_prefix_len)
+                        for value, branch, prefix_len in zip(
+                            values,
+                            row_branches,
+                            prefix_lens or [None] * len(row_branches),
+                            strict=True,
+                        )
+                    ]
                 continue
             merged[key] = self._merge_rows(
                 values,
