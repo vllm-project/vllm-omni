@@ -852,83 +852,6 @@ def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[s
     }
 
 
-DREAMZERO_DEFAULT_PROMPT = (
-    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
-)
-DREAMZERO_ACTION_HORIZON = 24
-DREAMZERO_ACTION_DIM = 8
-DREAMZERO_CAMERA_FILES = {
-    "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
-    "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
-    "observation/wrist_image_left": "wrist_image_left.mp4",
-}
-
-
-def _require_opencv() -> Any:
-    try:
-        import cv2
-    except ImportError as exc:  # pragma: no cover - optional e2e dependency
-        raise ModuleNotFoundError("DreamZero OpenPI test dependencies are missing: opencv-python") from exc
-    return cv2
-
-
-def load_dreamzero_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
-    cv2 = _require_opencv()
-    camera_frames: dict[str, np.ndarray] = {}
-    for camera_key, file_name in DREAMZERO_CAMERA_FILES.items():
-        video_path = video_dir / file_name
-        if not video_path.exists():
-            raise FileNotFoundError(f"Missing DreamZero test asset: {video_path}")
-        cap = cv2.VideoCapture(str(video_path))
-        frames = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-        if not frames:
-            raise RuntimeError(f"No frames loaded from {video_path}")
-        camera_frames[camera_key] = np.stack(frames, axis=0)
-    return camera_frames
-
-
-def build_dreamzero_demo_observations(
-    camera_frames: dict[str, np.ndarray],
-    *,
-    prompt: str,
-    session_id: str,
-    num_chunks: int = 2,
-) -> list[dict[str, Any]]:
-    if num_chunks < 1:
-        raise ValueError("num_chunks must be at least 1")
-
-    relative_offsets = [-23, -16, -8, 0]
-    total_frames = min(frames.shape[0] for frames in camera_frames.values())
-    frame_schedules = [[0]]
-    current_frame = 23
-    for _ in range(num_chunks - 1):
-        indices = [max(current_frame + offset, 0) for offset in relative_offsets]
-        if indices[-1] >= total_frames:
-            break
-        frame_schedules.append(indices)
-        current_frame += DREAMZERO_ACTION_HORIZON
-
-    observations: list[dict[str, Any]] = []
-    for frame_indices in frame_schedules:
-        obs: dict[str, Any] = {}
-        for camera_key, all_frames in camera_frames.items():
-            selected = all_frames[frame_indices]
-            obs[camera_key] = selected[0] if len(frame_indices) == 1 else selected
-        obs["observation/joint_position"] = np.zeros(7, dtype=np.float32)
-        obs["observation/cartesian_position"] = np.zeros(6, dtype=np.float32)
-        obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
-        obs["prompt"] = prompt
-        obs["session_id"] = session_id
-        observations.append(obs)
-    return observations
-
-
 class OpenPIWebSocketSession:
     """Persistent msgpack session for ``/v1/realtime/robot/openpi``."""
 
@@ -975,16 +898,6 @@ class OpenPIWebSocketSession:
 
     def get_server_metadata(self) -> dict[str, Any]:
         return dict(self._server_metadata)
-
-    def infer(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
-        response = self._send_operation("infer", obs)
-        if not isinstance(response, dict):
-            raise TypeError(f"Expected dict infer response, got {type(response)!r}")
-        return {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
-
-    def reset(self, reset_info: dict[str, Any] | None = None) -> str:
-        response = self._send_operation("reset", dict(reset_info or {}))
-        return str(response["status"])
 
     def close(self) -> None:
         self._conn.close()
@@ -1837,12 +1750,7 @@ class OpenAIClientHandler:
         - ``operations``: optional sequence of ``{"endpoint": "infer"|"reset", "payload": {...}}``.
         - ``run_default_policy_session``: when true and ``operations`` is omitted, run infer then reset
           using :func:`build_openpi_droid_observation`.
-        - ``run_dreamzero_policy_session``: when true and ``operations`` is omitted, run the DreamZero
-          infer/reset/infer sequence using :func:`build_dreamzero_demo_observations`.
-        - ``video_dir``: required for ``run_dreamzero_policy_session``.
-        - ``prompt``: language instruction for DreamZero observations (optional).
         - ``session_id``: used by the default policy session observation builder.
-        - ``num_chunks``: DreamZero chunk count (default ``2``).
         - ``timeout``: seconds to wait for each inbound msgpack frame (default ``120``).
         - ``ping_interval`` / ``ping_timeout``: forwarded to :func:`websockets.sync.client.connect`.
         """
@@ -1850,22 +1758,6 @@ class OpenAIClientHandler:
         operations_cfg = cfg.get("operations")
         if operations_cfg is not None:
             operations = [dict(op) for op in operations_cfg]
-        elif cfg.get("run_dreamzero_policy_session"):
-            video_dir = cfg.get("video_dir")
-            if video_dir is None:
-                raise ValueError("run_dreamzero_policy_session requires video_dir")
-            session_id = str(cfg.get("session_id", "dreamzero-smoke"))
-            prompt = str(cfg.get("prompt", DREAMZERO_DEFAULT_PROMPT))
-            num_chunks = int(cfg.get("num_chunks", 2))
-            observations = build_dreamzero_demo_observations(
-                load_dreamzero_camera_frames(Path(video_dir)),
-                prompt=prompt,
-                session_id=session_id,
-                num_chunks=num_chunks,
-            )
-            operations = [{"endpoint": "infer", "payload": obs} for obs in observations]
-            operations.append({"endpoint": "reset", "payload": {}})
-            operations.append({"endpoint": "infer", "payload": observations[0]})
         elif cfg.get("run_default_policy_session"):
             session_id = str(cfg.get("session_id", "gr00t-smoke"))
             operations = [
@@ -3445,12 +3337,6 @@ __all__ = [
     "WebSocketJsonResponse",
     "OpenPIWebSocketResponse",
     "build_openpi_droid_observation",
-    "build_dreamzero_demo_observations",
-    "DREAMZERO_ACTION_DIM",
-    "DREAMZERO_ACTION_HORIZON",
-    "DREAMZERO_CAMERA_FILES",
-    "load_dreamzero_camera_frames",
-    "OpenPIWebSocketSession",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",
