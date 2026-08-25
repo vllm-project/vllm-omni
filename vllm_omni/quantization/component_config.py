@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -129,7 +130,12 @@ class ComponentQuantizationConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         config = self.resolve(prefix)
         if config is None:
-            return None
+            # `None` in the component dict means "this component is
+            # unquantized" (per the class docstring's `"vae": None`
+            # example). vLLM's `LinearBase.__init__` treats a `None`
+            # return as "linear doesn't support this quant method" and
+            # raises; instead surface an explicit unquantized method.
+            return UnquantizedLinearMethod()
         return config.get_quant_method(layer, prefix)
 
     @classmethod

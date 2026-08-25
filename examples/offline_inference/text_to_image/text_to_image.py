@@ -31,6 +31,42 @@ from vllm_omni.model_extras import (
 from vllm_omni.platforms import current_omni_platform
 
 
+def _resolve_quantization_label(cli_quantization: str | None, model: str) -> str:
+    """Label that reflects what the engine will actually run, not just CLI args.
+
+    `--quantization` overrides whatever is on disk. Otherwise vllm-omni
+    auto-detects from `transformer/config.json["quantization_config"]`
+    (see `OmniDiffusionConfig._propagate_quantization_from_tf_config`).
+    Mirror that lookup so the printed banner doesn't say "None (BF16)"
+    for a checkpoint that's actually going to load quantized.
+    """
+    if cli_quantization:
+        return cli_quantization
+    try:
+        from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        cfg = get_hf_file_to_dict("transformer/config.json", model)
+    except Exception:
+        cfg = None
+    if isinstance(cfg, dict):
+        qc = cfg.get("quantization_config")
+        if isinstance(qc, dict):
+            method = qc.get("quant_method") or qc.get("method")
+            if method == "component" or (
+                method is None
+                and any(isinstance(v, dict) and (v.get("quant_method") or v.get("method")) for v in qc.values())
+            ):
+                default = qc.get("default")
+                if isinstance(default, dict):
+                    inner = default.get("quant_method") or default.get("method")
+                    if inner:
+                        return f"{inner} (per-component, from checkpoint)"
+                return "component (from checkpoint)"
+            if method:
+                return f"{method} (from checkpoint)"
+    return "None (BF16)"
+
+
 def is_nextstep_model(model_name: str) -> bool:
     """Check if the model is a NextStep model by reading its config."""
     from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -492,7 +528,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}")
-    print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
+    print(f"  Quantization: {_resolve_quantization_label(args.quantization, args.model)}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
