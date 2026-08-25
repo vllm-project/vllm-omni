@@ -16,6 +16,7 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -1231,6 +1232,33 @@ class StagePool:
                 exc_info=True,
             )
             return False
+
+    async def push_dit_load(self, snapshot: DitLoadSnapshot) -> None:
+        """Push DiT load snapshot to all live AR replicas via UTILITY ZMQ.
+
+        Called by ``Orchestrator._push_dit_load_to_ar`` after each
+        ``DitLoadState.update()`` / ``DitLoadState.remove()``. Uses the same
+        ZMQ UTILITY channel (``call_utility_async``) as other control-plane
+        RPCs, so it inherits the channel's transport (``ipc://`` colocated
+        or ``tcp://`` distributed) without extra socket management.
+        """
+        payload = dict(snapshot)
+        for replica_id in self.live_replica_ids():
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            call_utility = getattr(client, "call_utility_async", None)
+            if call_utility is None:
+                continue
+            try:
+                await call_utility("omni_update_dit_load", payload)
+            except Exception:
+                logger.warning(
+                    "[StagePool] push_dit_load failed for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
 
     # ---- Stage-local control plane ----
 

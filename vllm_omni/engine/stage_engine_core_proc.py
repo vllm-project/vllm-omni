@@ -61,6 +61,36 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 
+    def omni_update_dit_load(self, dit_load: dict) -> None:
+        """Receive DiT load snapshot via UTILITY ZMQ channel.
+
+        Called by ``EngineCore._handle_client_request`` when the Orchestrator
+        sends a UTILITY request with ``method_name="omni_update_dit_load"``.
+        vLLM's ``getattr(self, method_name)`` discovers this method via the
+        MRO (``StageEngineCoreProc`` -> ``EngineCoreProc`` -> ``EngineCore``),
+        so no vLLM patch is needed.
+
+        ``frozenset`` values (``waiting_ids`` / ``running_ids``) are decoded
+        as ``list`` after the msgspec ZMQ round-trip; convert them back so
+        ``DTPSScheduler._dit_phase`` can use set union for blind in-flight
+        de-duplication.
+
+        Defensive ``getattr(scheduler, "update_dit_load", None)`` so non-DTPS
+        deployments (no ``omni_dtps_config``) are unaffected.
+        """
+        if isinstance(dit_load, dict):
+            for key in ("waiting_ids", "running_ids"):
+                ids = dit_load.get(key)
+                if ids is not None and not isinstance(ids, frozenset):
+                    dit_load[key] = frozenset(ids)
+
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return
+        update_fn = getattr(scheduler, "update_dit_load", None)
+        if update_fn is not None:
+            update_fn(dit_load)
+
     @staticmethod
     def run_stage_core(
         *args: Any,

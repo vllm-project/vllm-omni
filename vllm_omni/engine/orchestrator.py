@@ -35,7 +35,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.dit_load_shared import DitLoadSharedState
 from vllm_omni.core.sched.dit_load_state import DitLoadState
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -430,6 +429,7 @@ class Orchestrator:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
+    _dit_load_state: DitLoadState | None = None
 
     def __init__(
         self,
@@ -450,8 +450,6 @@ class Orchestrator:
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
-        dit_load_state: DitLoadState | None = None,
-        dit_load_shared_state: DitLoadSharedState | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -527,11 +525,9 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
-        # The orchestrator writes per-replica (waiting, running) snapshots here every poll tick
-        # and evicts an entry when it detects the replica has exited
-        self._dit_load_state: DitLoadState | None = dit_load_state
-        # Cross-process shared-memory writer handle; the AR subprocess reads it by name.
-        self._dit_load_shared_state: DitLoadSharedState | None = dit_load_shared_state
+        # Aggregate DiT replica loads and push snapshots to the AR scheduler
+        # via UTILITY ZMQ. Internally maintained — no external injection.
+        self._dit_load_state: DitLoadState = DitLoadState()
         # Per-(stage_id, replica_id) last-poll timestamp, to throttle RPCs.
         self._dit_load_last_poll: dict[tuple[int, int], float] = {}
 
@@ -735,7 +731,7 @@ class Orchestrator:
                                     replica_id,
                                     exc_info=True,
                                 )
-                            self._refresh_dit_load_shared(self._dit_load_state)
+                            await self._push_dit_load_to_ar(self._dit_load_state)
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -1244,7 +1240,7 @@ class Orchestrator:
                     replica_id,
                     exc_info=True,
                 )
-            self._refresh_dit_load_shared(state)
+            await self._push_dit_load_to_ar(state)
             return
 
         load = await pool.poll_dit_load(replica_id)
@@ -1252,7 +1248,7 @@ class Orchestrator:
             return
         waiting, running, waiting_ids, running_ids = load
         try:
-            state.update(
+            changed = state.update(
                 stage_id,
                 replica_id,
                 waiting,
@@ -1269,8 +1265,10 @@ class Orchestrator:
             )
             return
 
-        self._refresh_dit_load_shared(state)
+        if changed:
+            await self._push_dit_load_to_ar(state)
 
+<<<<<<< HEAD
     def _refresh_dit_load_shared(self, state: DitLoadState) -> None:
         """Write the current aggregate snapshot into the cross-process shared buffer."""
         shm = self._dit_load_shared_state
@@ -1284,6 +1282,24 @@ class Orchestrator:
                 exc_info=True,
             )
 >>>>>>> cb711f05 ([Core] DTPS DiT-load-aware Type-Priority Scheduling)
+=======
+    async def _push_dit_load_to_ar(self, state: DitLoadState) -> None:
+        """Push the aggregate DiT-load snapshot to all AR stage replicas.
+
+        Called after each :meth:`DitLoadState.update` (when data changed)
+        and after :meth:`DitLoadState.remove`. The snapshot is sent over the
+        existing UTILITY ZMQ channel (``call_utility_async``) that the AR
+        stage replica already listens on, so no new socket is needed.
+        Colocated deployments use ``ipc://`` transport; distributed
+        deployments use ``tcp://`` — both handled transparently.
+        """
+        snapshot = state.snapshot()
+        for stage_id in range(self.num_stages):
+            pool = self.stage_pools[stage_id]
+            if pool.stage_type != "llm":
+                continue
+            await pool.push_dit_load(snapshot)
+>>>>>>> 41cf391b ([Core][DTPS] Refactor Orchestrator-to-AR DiT-load IPC from SHM to ZMQ UTILITY)
 
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""

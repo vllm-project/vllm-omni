@@ -21,6 +21,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.core.sched.dtps_scheduler import DTPSScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
@@ -242,6 +243,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 getattr(self.vllm_config.model_config, "stage_id", 0),
             )
             self._dtps = None
+
+    def update_dit_load(self, dit_load: DitLoadSnapshot) -> None:
+        """Receive DiT load snapshot from the Orchestrator.
+
+        Called by ``StageEngineCoreProc.omni_update_dit_load`` via vLLM's
+        UTILITY ZMQ dispatch (``getattr(self, method_name)``). Delegates to
+        ``DTPSScheduler.update_dit_load`` when DTPS is enabled; a no-op when
+        DTPS is disabled so non-AR+DiT deployments are unaffected.
+        """
+        if self._dtps is not None:
+            self._dtps.update_dit_load(dit_load)
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
         """True when this stage-zero-final request does not need downstream KV.

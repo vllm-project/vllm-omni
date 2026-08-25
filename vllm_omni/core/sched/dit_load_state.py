@@ -1,14 +1,12 @@
-"""cross-thread DiT-stage load state.
+"""DiT-stage load state aggregator (Orchestrator-side).
 
-``DitLoadState`` bridges the Orchestrator thread (which polls each DiT
-replica's scheduler queue every loop tick) with the cross-process shared
-buffer that the AR subprocess reads. The Orchestrator writes every poll cycle
-and evicts a replica's entry when it detects the replica has exited (via
-``check_health`` or a distributed unregister); there is no stale-timeout
-filter. Per-replica ``waiting``/``running`` request-id sets are aggregated into
-unions so the AR scheduler can de-duplicate its blind in-flight set. This
-object only exposes raw aggregates; ``DTPSScheduler`` owns the threshold and
-decides the idle/busy phase.
+``DitLoadState`` aggregates each DiT replica's scheduler queue depth
+(waiting / running counts + request-id sets) polled by the Orchestrator
+every loop tick. The aggregated snapshot is pushed to the AR scheduler
+via the UTILITY ZMQ channel. Per-replica ``waiting``/``running``
+request-id sets are unioned so the AR scheduler can de-duplicate its blind
+in-flight set. This object only exposes raw aggregates; ``DTPSScheduler``
+owns the threshold and decides the idle/busy phase.
 """
 
 from __future__ import annotations
@@ -43,7 +41,14 @@ class DitLoadState:
         running: int,
         waiting_ids: frozenset[str] | set[str] | list[str] | None = None,
         running_ids: frozenset[str] | set[str] | list[str] | None = None,
-    ) -> None:
+    ) -> bool:
+        """Update per-replica load data.
+
+        Returns ``True`` if the new data differs from the previously stored
+        data for this replica, ``False`` if it is unchanged. Callers can use
+        the return value to skip redundant downstream propagation when the
+        load snapshot has not changed.
+        """
         try:
             w = int(waiting)
         except (TypeError, ValueError):
@@ -59,8 +64,13 @@ class DitLoadState:
         w_ids = frozenset(waiting_ids) if waiting_ids else frozenset()
         r_ids = frozenset(running_ids) if running_ids else frozenset()
         key = (int(stage_id), int(replica_id))
+        new_entry = (w, r, w_ids, r_ids)
         with self._lock:
-            self._per_replica[key] = (w, r, w_ids, r_ids)
+            old_entry = self._per_replica.get(key)
+            if old_entry is not None and old_entry == new_entry:
+                return False
+            self._per_replica[key] = new_entry
+            return True
 
     def remove(self, stage_id: int, replica_id: int) -> None:
         key = (int(stage_id), int(replica_id))

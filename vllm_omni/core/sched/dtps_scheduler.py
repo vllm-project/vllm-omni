@@ -6,8 +6,9 @@ utilization by actively preventing DiT starvation, avoiding DiT queue overloads,
 guaranteeing that pure AR tasks never starve.
 
 [Dynamic 4-Tier Priority Logic]
-The scheduler reads the DiT stage's real-time queue depth via a lock-free (Seqlock) shared
-memory segment. It then categorizes tasks into four dynamic priority tiers per batch:
+The scheduler receives the DiT stage's real-time queue depth via a UTILITY
+ZMQ push from the Orchestrator. It then categorizes tasks into four dynamic
+priority tiers per batch:
 
   1. L0 (Highest: Starving AR): `ar_only` tasks that exceed the aging threshold. Anti-starvation
      strictly overrides all load-awareness logic.
@@ -32,10 +33,7 @@ from typing import Any, NamedTuple
 from vllm.logger import init_logger
 from vllm.v1.request import Request
 
-from vllm_omni.core.sched.dit_load_shared import (
-    _DIT_LOAD_SHM_NAME_KEY,
-    DitLoadSharedState,
-)
+from vllm_omni.core.sched.dit_load_state import DitLoadSnapshot
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
@@ -43,14 +41,12 @@ logger = init_logger(__name__)
 _DEFAULT_I2T_AGING_S = 500.0
 _DEFAULT_COT_TAG_KEY = "bot_task"
 _DEFAULT_DIT_LOAD_THRESHOLD = 0
-_DIT_INFLIGHT_MAX_MISS = 3
 _DIT_INFLIGHT_MAX_AGE_S = 1.0
 
 
 class _InflightEntry(NamedTuple):
     """One finished-AR-but-not-yet-in-DiT downstream request."""
 
-    miss: int
     added_mono: float
 
 
@@ -71,7 +67,6 @@ class DTPSScheduler:
         cot_tag_key: str = _DEFAULT_COT_TAG_KEY,
         cot_weight_table: dict[str, int] | None = None,
         dit_load_threshold: int = _DEFAULT_DIT_LOAD_THRESHOLD,
-        dit_load_shm_name: str | None = None,
     ) -> None:
         self.i2t_aging_s: float = i2t_aging_s
         self.cot_tag_key: str = cot_tag_key
@@ -79,19 +74,8 @@ class DTPSScheduler:
             self.dit_load_threshold: int = int(dit_load_threshold)
         except (TypeError, ValueError):
             self.dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
-        # Attach the cross-process DiT-load segment eagerly. The NAME was
-        # injected into omni_dtps_config before this subprocess was spawned, so
-        # the segment already exists;
-        self._dit_load: DitLoadSharedState | None = None
-        if dit_load_shm_name and self.dit_load_threshold > 0:
-            try:
-                self._dit_load = DitLoadSharedState.attach(dit_load_shm_name)
-            except Exception:
-                logger.debug(
-                    "[OmniDTPS] DitLoadSharedState.attach(%r) failed; dit stage will stay idle",
-                    dit_load_shm_name,
-                    exc_info=True,
-                )
+        # DiT-load snapshot pushed by the Orchestrator via UTILITY ZMQ.
+        self._dit_load_snapshot: DitLoadSnapshot | None = None
         if cot_weight_table is None:
             self.cot_weight_table: dict[str, int] = {}
         elif hasattr(cot_weight_table, "items"):
@@ -100,7 +84,6 @@ class DTPSScheduler:
             self.cot_weight_table = dict(cot_weight_table)
 
         self._dit_inflight_ids: dict[str, _InflightEntry] = {}
-        self._last_shm_seq: int = -1
         self._last_phase_stats: dict[str, int | bool] = {}
 
     @classmethod
@@ -137,15 +120,11 @@ class DTPSScheduler:
             )
             dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
 
-        # The SHM name is injected at runtime by StageRuntime before the AR subprocess is spawned.
-        dit_load_shm_name = cfg_get(_DIT_LOAD_SHM_NAME_KEY, None)
-
         return cls(
             i2t_aging_s=float(cfg_get("i2t_aging_s", _DEFAULT_I2T_AGING_S)),
             cot_tag_key=str(cfg_get("cot_tag_key", _DEFAULT_COT_TAG_KEY)),
             cot_weight_table=cot_weight_table,
             dit_load_threshold=dit_load_threshold,
-            dit_load_shm_name=dit_load_shm_name,
         )
 
     # ------------------------------------------------------------------ #
@@ -215,20 +194,30 @@ class DTPSScheduler:
                 proxy += int(self.cot_weight_table.get(cot_tag, 0))
         return proxy
 
+    def update_dit_load(self, snapshot: DitLoadSnapshot) -> None:
+        """Receive DiT load snapshot from the Orchestrator via UTILITY ZMQ.
+
+        Called by ``OmniARScheduler.update_dit_load``, which is invoked by
+        ``StageEngineCoreProc.omni_update_dit_load`` via vLLM's UTILITY
+        dispatch (``getattr(self, method_name)``). Runs on the same
+        EngineCore busy-loop thread as ``schedule()``, so no lock is needed.
+        """
+        self._dit_load_snapshot = snapshot
+
     def register_finished_downstream(self, request_id: str) -> None:
         """Record that a downstream (t2i/it2i) request just finished AR.
 
         Called from ``OmniARScheduler._free_request`` at the top of the KV-
-        transfer block (so only downstream requests register). The id lives in
-        ``_dit_inflight_ids`` until a DiT poll reports it (de-duped out) or it
-        times out (3 fresh misses / age cap). Idempotent: re-registering an id
-        already tracked does NOT reset its miss/age.
+        transfer block (so only downstream requests register). The id lives
+        in ``_dit_inflight_ids`` until a DiT poll reports it (de-duped out)
+        or it times out (age cap). Idempotent: re-registering an id already
+        tracked does NOT reset its age.
         """
         if self.dit_load_threshold <= 0:
             return
         if not request_id or request_id in self._dit_inflight_ids:
             return
-        self._dit_inflight_ids[request_id] = _InflightEntry(miss=0, added_mono=time.monotonic())
+        self._dit_inflight_ids[request_id] = _InflightEntry(added_mono=time.monotonic())
 
     def _dit_phase(self, inflight: int = 0) -> str:
         """Return the DiT-load phase: ``"idle"`` or ``"busy"``.
@@ -242,12 +231,9 @@ class DTPSScheduler:
         AR-running XOR in the blind set), so they sum cleanly.
 
         De-dup pass: any blind id that appears in DiT's reported waiting OR
-        running ids (union across all replicas) has reached DiT — drop it. Ids
-        that miss across ``_DIT_INFLIGHT_MAX_MISS`` fresh snapshots (DiT empty
-        -> straight to running, or aborted) are dropped, as is anything older
-        than ``_DIT_INFLIGHT_MAX_AGE_S`` (guards a dead DiT). Miss is counted
-        only on a FRESH snapshot (seq advanced + fresh=True); AR ticks are
-        µs-scale, so counting per-tick would evict a live id almost instantly.
+        running ids (union across all replicas) has reached DiT — drop it.
+        Anything older than ``_DIT_INFLIGHT_MAX_AGE_S`` is also dropped
+        (guards a dead DiT).
 
         Multi-replica: both inflight terms (running + blind) spread uniformly
         across ``n_reps`` DiT replicas, so only ~1/R of them land on the min
@@ -267,13 +253,9 @@ class DTPSScheduler:
         waiting_ids: frozenset[str] = frozenset()
         running_ids: frozenset[str] = frozenset()
         n_reps = 0
-        snap_seq = self._last_shm_seq
-        fresh = False
-        load = self._dit_load
-        if load is not None:
+        snap = self._dit_load_snapshot
+        if snap is not None:
             try:
-                read = load.snapshot()
-                snap = read.snapshot
                 reported_min = int(snap.get("min_waiting", 0))
                 max_waiting = int(snap.get("max_waiting", 0))
                 total_waiting = int(snap.get("total_waiting", 0))
@@ -285,19 +267,11 @@ class DTPSScheduler:
                 if isinstance(r_ids, frozenset):
                     running_ids = r_ids
                 n_reps = int(snap.get("num_replicas", 0))
-                snap_seq = int(read.seq)
-                fresh = bool(snap.get("fresh", False))
             except Exception:
                 logger.debug(
-                    "[OmniDTPS] DitLoadSharedState.snapshot() raised; using inflight only",
+                    "[OmniDTPS] reading dit_load_snapshot raised; using inflight only",
                     exc_info=True,
                 )
-
-        # A snapshot is "fresh for miss-counting" only if it advanced (new seq)
-        # AND carries live data. Counting misses on a stale (unchanged) snapshot
-        # would evict a live id in µs across AR ticks.
-        fresh_poll = fresh and snap_seq != self._last_shm_seq
-        self._last_shm_seq = snap_seq
 
         dit_ids = waiting_ids | running_ids
         now_mono = time.monotonic()
@@ -307,12 +281,6 @@ class DTPSScheduler:
                 del self._dit_inflight_ids[rid]
             elif now_mono - entry.added_mono > _DIT_INFLIGHT_MAX_AGE_S:
                 del self._dit_inflight_ids[rid]
-            elif fresh_poll:
-                miss = entry.miss + 1
-                if miss >= _DIT_INFLIGHT_MAX_MISS:
-                    del self._dit_inflight_ids[rid]
-                else:
-                    self._dit_inflight_ids[rid] = _InflightEntry(miss=miss, added_mono=entry.added_mono)
 
         inflight_blind = len(self._dit_inflight_ids)
         inflight_total = inflight_running + inflight_blind
@@ -334,7 +302,6 @@ class DTPSScheduler:
             "n_reps": n_reps,
             "inflight_reduced": inflight_reduced,
             "effective_min": effective_min,
-            "fresh_poll": fresh_poll,
         }
         return phase
 
