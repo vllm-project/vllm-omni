@@ -166,20 +166,15 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
-            from vllm.ir.ops import fused_add_rms_norm
-
-            return fused_add_rms_norm(
-                x,
-                residual,
-                self.weight.data,
-                self.variance_epsilon,
-            )
+            residual = residual + x
+            x = residual
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         out = x * torch.rsqrt(variance + self.variance_epsilon)
         out = self.weight.to(torch.float32) * out
-        return out.to(input_dtype)
+        out = out.to(input_dtype)
+        return (out, residual) if residual is not None else out
 
 
 class RMSNormVAE(CustomOp):

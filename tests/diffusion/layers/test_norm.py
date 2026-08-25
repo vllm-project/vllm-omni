@@ -344,19 +344,19 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
 
 
 def test_rmsnorm_matches_native_residual_contract():
-    """The vLLM IR op preserves fused residual-add and RMSNorm math."""
+    """The non-NPU path preserves separate residual-add and RMSNorm math."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     eps = 1e-6
     norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16)
     norm.weight.data.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0], dtype=torch.bfloat16))
     x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16)
-    residual = torch.tensor([[0.5, 1.0, -1.5, 2.0]], dtype=torch.bfloat16)
+    residual = torch.tensor([[0.00390625, 0.0078125, -0.0078125, 0.015625]], dtype=torch.bfloat16)
 
-    expected_fp32 = residual.float() + x.float()
-    expected_residual = expected_fp32.to(x.dtype)
+    expected_residual = residual + x
+    expected_fp32 = expected_residual.float()
     expected_output = expected_fp32 * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps)
-    expected_output = (expected_output.to(norm.weight.dtype) * norm.weight).to(x.dtype)
+    expected_output = (expected_output * norm.weight.float()).to(x.dtype)
     output, updated_residual = norm.forward_native(x, residual)
 
     torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
@@ -365,43 +365,34 @@ def test_rmsnorm_matches_native_residual_contract():
 
 @pytest.mark.parametrize(
     "forward_name",
-    ["forward_native", "forward_cuda", "forward_hip", "forward_musa", "forward_xpu"],
+    ["forward_cuda", "forward_hip", "forward_musa", "forward_xpu"],
 )
-def test_rmsnorm_non_npu_residual_uses_vllm_ir_op(
+def test_rmsnorm_non_npu_residual_delegates_to_native(
     monkeypatch: pytest.MonkeyPatch,
     forward_name: str,
 ):
-    """Non-NPU platforms delegate the residual path to the vLLM IR op."""
-    from vllm import ir
-
+    """Platform wrappers keep residual arithmetic in forward_native."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
-    captured: dict[str, object] = {}
-    fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
-    fused_residual = torch.randn(2, 4, dtype=torch.bfloat16)
-
-    def fused_add_rms_norm(
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ):
-        captured.update(x=x, residual=residual, weight=weight, epsilon=epsilon)
-        return fused_output, fused_residual
-
-    monkeypatch.setattr(ir.ops, "fused_add_rms_norm", fused_add_rms_norm)
     norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
     x = torch.randn(2, 4, dtype=torch.bfloat16)
-    residual = torch.randn(2, 4, dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    expected_output = torch.randn_like(x)
+    expected_residual = torch.randn_like(x)
+    captured: dict[str, object] = {}
+
+    def forward_native(native_x: torch.Tensor, native_residual: torch.Tensor | None = None):
+        captured.update(x=native_x, residual=native_residual)
+        return expected_output, expected_residual
+
+    monkeypatch.setattr(norm, "forward_native", forward_native)
 
     output, updated_residual = getattr(norm, forward_name)(x, residual)
 
-    assert output is fused_output
-    assert updated_residual is fused_residual
+    assert output is expected_output
+    assert updated_residual is expected_residual
     assert captured["x"] is x
     assert captured["residual"] is residual
-    assert captured["weight"].data_ptr() == norm.weight.data_ptr()
-    assert captured["epsilon"] == 1e-5
 
 
 def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):

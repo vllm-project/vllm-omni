@@ -885,6 +885,18 @@ def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
         patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
     ):
         attention = encoder_module.MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    # This CPU contract test only needs projection shapes and head reshaping.
+    # Avoid dispatching platform-specific norm and linear kernels (for example,
+    # rocm_unquantized_gemm when the test suite is collected on ROCm).
+    attention.q_norm = nn.Identity()
+    attention.k_norm = nn.Identity()
+    with torch.no_grad():
+        attention.qkv_proj.weight.zero_()
+    attention.o_proj = nn.Linear(
+        attention.qkv_proj.local_num_heads * attention.head_dim,
+        config.hidden_size,
+        bias=False,
+    )
     attn_call = {}
 
     def fake_attention(query, key, value):

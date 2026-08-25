@@ -36,7 +36,7 @@ def test_qwen3_vl_rmsnorm_uses_common_fused_rmsnorm_contract() -> None:
     torch.testing.assert_close(norm.forward_native(x), expected, atol=0, rtol=0)
 
 
-def test_qwen3_vl_decoder_uses_fused_post_attention_residual_contract() -> None:
+def test_qwen3_vl_decoder_preserves_post_attention_residual_contract() -> None:
     class ConstantAttention(nn.Module):
         def forward(self, hidden_states, position_embeddings):
             del position_embeddings
@@ -65,7 +65,12 @@ def test_qwen3_vl_decoder_uses_fused_post_attention_residual_contract() -> None:
     expected_residual = hidden_states + attention_output
     expected_normalized = RMSNorm.forward_native(layer.post_attention_layernorm, expected_residual)
 
-    output = layer(hidden_states, (torch.empty(0), torch.empty(0)))
+    with patch.object(
+        layer.post_attention_layernorm,
+        "forward",
+        wraps=layer.post_attention_layernorm.forward_native,
+    ):
+        output = layer(hidden_states, (torch.empty(0), torch.empty(0)))
 
     assert isinstance(layer.post_attention_layernorm, MiniMaxH3Qwen3VLRMSNorm)
     torch.testing.assert_close(output, expected_residual + expected_normalized)

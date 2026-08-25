@@ -15,22 +15,20 @@ pytestmark = [
 ]
 
 
-def test_rmsnorm_cuda_residual_matches_ir_contract() -> None:
+def test_rmsnorm_cuda_residual_matches_native_contract() -> None:
     eps = 1e-6
     device = torch.device(current_omni_platform.device_type)
+    torch.manual_seed(0)
     norm = RMSNorm(64, eps=eps, dtype=torch.bfloat16).to(device)
     x = torch.randn(2, 4, 64, device=device, dtype=torch.bfloat16)
     residual = torch.randn_like(x)
     x_before = x.clone()
     residual_before = residual.clone()
 
+    expected_output, expected_residual = norm.forward_native(x_before, residual_before)
     output, updated_residual = norm.forward_cuda(x, residual)
 
-    expected_fp32 = x_before.float() + residual_before.float()
-    expected_residual = expected_fp32.to(x.dtype)
-    expected_output = expected_fp32 * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps)
-    expected_output = (expected_output.to(norm.weight.dtype) * norm.weight).to(x.dtype)
-    torch.testing.assert_close(updated_residual, expected_residual, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
     torch.testing.assert_close(x, x_before, atol=0, rtol=0)
     torch.testing.assert_close(residual, residual_before, atol=0, rtol=0)
