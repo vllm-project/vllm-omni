@@ -110,6 +110,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        # Requests paused for a prefill-only iteration.
+        self._temporarily_unscheduled_req_ids: set[str] = set()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -150,6 +152,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _should_defer_waiting_admission(self) -> bool:
         return False
+
+    def _should_run_prefill_only_admission(self) -> bool:
+        """Whether this iteration should pause decode and admit prefills."""
+        return False
+
+    def _restore_temporarily_unscheduled_metadata(self, scheduler_output: SchedulerOutput) -> None:
+        """Attach async runner metadata when a paused request runs again."""
+        paused_req_ids = self._temporarily_unscheduled_req_ids
+        if not paused_req_ids:
+            return
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        resumed_req_ids = paused_req_ids.intersection(cached_reqs.req_ids)
+        for req_id in resumed_req_ids:
+            request = self.requests.get(req_id)
+            if request is not None:
+                cached_reqs.all_token_ids[req_id] = request._all_token_ids
+
+        paused_req_ids.difference_update(resumed_req_ids)
+        paused_req_ids.intersection_update(self.requests)
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -233,7 +255,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
 
         original_waiting = None
-        if self._should_defer_waiting_admission():
+        paused_running = None
+        if self._should_run_prefill_only_admission():
+            original_running = self.running
+            paused_running = [
+                request
+                for request in original_running
+                if self._get_confirmed_num_computed_tokens(request) >= request.num_prompt_tokens
+            ]
+            prefill_running = [request for request in original_running if request not in paused_running]
+
+            original_waiting = self.waiting
+            self.waiting = create_request_queue(self.policy)
+            free_slots = max(
+                0,
+                self.max_num_running_reqs - len(original_running) - getattr(self, "num_waiting_for_streaming_input", 0),
+            )
+            for _ in range(min(free_slots, len(original_waiting))):
+                self.waiting.add_request(original_waiting.pop_request())
+
+            self.running = prefill_running
+            self._temporarily_unscheduled_req_ids.update(request.request_id for request in paused_running)
+        elif self._should_defer_waiting_admission():
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
@@ -245,8 +288,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if deferred_waiting:
                     original_waiting.prepend_requests(deferred_waiting)
                 self.waiting = original_waiting
+            if paused_running is not None:
+                self.running = paused_running + self.running
             self._restore_omni_wait_queues()
 
+        self._restore_temporarily_unscheduled_metadata(scheduler_output)
         self._postprocess_omni_schedule_output(
             scheduler_output,
             include_cached_payloads=True,

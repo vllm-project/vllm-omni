@@ -207,6 +207,7 @@ def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
     assert "max_num_seqs: 8" in source
     assert "enable_unified_decode_graph: true" in source
     assert "unified_decode_graph_max_batch_size: 8" in source
+    assert "unified_decode_graph_prefill_interval: 0" in source
     assert "unified_decode_graph_pre_capture_sizes" not in source
     assert "enable_runner_assisted_unified_decode_graph" not in source
     assert "allow_unified_decode_graph_batch_attention" not in source
