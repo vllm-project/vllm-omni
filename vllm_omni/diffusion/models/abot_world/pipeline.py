@@ -17,7 +17,6 @@ import PIL.ImageOps
 import torch
 import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
-from huggingface_hub import snapshot_download
 from torch import nn
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -159,17 +158,14 @@ class _ABotARSessionState:
 
 
 def _resolve_local_model_path(model: str) -> str:
-    """Resolve an already-downloaded model ID without network access."""
+    """Require an already-downloaded local ABot checkpoint."""
 
-    if os.path.isdir(model):
-        return os.path.abspath(model)
-    try:
-        return snapshot_download(repo_id=model, local_files_only=True)
-    except Exception as exc:
+    if not os.path.isdir(model):
         raise FileNotFoundError(
-            f"ABot-World model {model!r} is not available in the local Hugging Face cache. "
-            "On an offline server, download the complete repository first and pass its local path."
-        ) from exc
+            f"ABot-World requires a local checkpoint directory, got {model!r}. "
+            "Download the complete repository first and pass its local path."
+        )
+    return os.path.abspath(model)
 
 
 def _validate_local_model_files(model_path: str) -> None:

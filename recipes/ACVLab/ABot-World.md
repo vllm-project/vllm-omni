@@ -1,13 +1,13 @@
 # ABot-World
 
-> Experimental: offline and realtime interactive world generation
+> Experimental: offline image-conditioned generation and in-process realtime interactive generation
 
 ## Summary
 
 - Vendor: ACVLab (Amap CV Lab)
 - Model: `acvlab/ABot-World-0-5B-LF`
 - Task: image-conditioned interactive world generation
-- Modes: offline trajectory replay and in-process realtime AR-Diffusion ticks
+- Modes: offline image-conditioned generation and experimental in-process realtime AR-Diffusion ticks
 - Hardware validated: NVIDIA A100 40GB
 - Maintainer: Community
 
@@ -44,6 +44,12 @@ FlashAttention paged-KV kernel requires this page size to be a multiple of 16.
 model execution.
 
 Raw frame counts must be `9 + 12k` (9, 21, 33, ..., 117), up to 117 frames.
+
+Camera-action trajectories are not currently supported through
+`Omni.generate()`. Camera actions are supported only by the experimental
+in-process realtime Session/Tick API, where controls are submitted
+incrementally through `ARDiffusionControlInput`. Offline trajectory input
+is planned as a follow-up.
 
 ## Realtime in-process generation
 

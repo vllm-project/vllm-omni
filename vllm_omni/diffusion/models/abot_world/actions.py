@@ -19,8 +19,6 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 ABOT_CAMERA_ACTION_SCHEMA = "abot.camera_actions.v1"
 _ACTION_ORDER = ("w", "a", "s", "d", "i", "j", "k", "l")
 _VALID_ACTIONS = frozenset(_ACTION_ORDER)
-_REFERENCE_HEIGHT = 480
-_REFERENCE_WIDTH = 832
 
 
 def _normalize_actions(value: object, *, field: str) -> tuple[str, ...]:
