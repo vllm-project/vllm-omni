@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -277,6 +279,17 @@ class BatchedToken2Wav(nn.Module):
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
+            _tjs_stop = int(os.environ.get("OMNI_TJS_STOP", "2"))
+            if _tjs_stop > 0 and step == _tjs_stop - 1 and step + 1 < self.n_timesteps:
+                _remaining = 1.0 - float(time[0])
+                x = x + _remaining * velocity
+                for _ in range(step + 1, self.n_timesteps):
+                    next_cnn.append(step_cnn)
+                    next_att.append(step_att)
+                if os.environ.get("OMNI_TJS_DEBUG", "0") == "1":
+                    print(f"[TJS] jump at step {step}: t={float(time[0]):.3f} "
+                          f"remaining={_remaining:.3f}", flush=True)
+                break
             x = x + dt * velocity
             time = time + dt
             if step + 1 < self.n_timesteps:
