@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -27,12 +27,13 @@ class AttentionBackend(ABC):
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
-        """Whether packed attention never reads attn_mask on this platform.
+        """Whether [real, pad] packed layouts can run without attn_mask.
 
         When True, models that pack a [real, pad] two-document layout and
-        carry cu_seqlens/max_seqlen in ``AttentionMetadata.extra`` may skip
-        constructing the padding mask entirely. Backends whose mask-free
-        behavior is platform-dependent must check current_omni_platform.
+        provide ``AttentionMetadata.packed_padding`` alongside the packed
+        cu_seqlens/max_seqlen metadata may skip constructing the padding mask
+        entirely. Backends whose mask-free behavior is platform-dependent must
+        check current_omni_platform.
         """
         return False
 
@@ -141,6 +142,21 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class PackedPaddingMetadata:
+    """Producer-validated mask-free view of padding in a [real, pad] packing.
+
+    The cumulative-length tensors are canonical two-element ``[0, length]``
+    views. Consumers may use them without reading device scalars because the
+    producer owns the packing.
+    """
+
+    q_length: int
+    kv_length: int
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+
+
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
@@ -187,6 +203,10 @@ class AttentionMetadata:
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
     video_layout: VideoTokenLayout | None = None
+
+    # Canonical mask-free view of structural suffix padding. Backends that do
+    # not advertise supports_packed_mask_free ignore it.
+    packed_padding: PackedPaddingMetadata | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

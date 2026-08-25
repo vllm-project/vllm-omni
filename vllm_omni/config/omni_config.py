@@ -404,6 +404,7 @@ class OmniStageModelConfig:
     # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    requires_full_payload_input: bool = False
 
 
 @_enforce_keyword_only_init
@@ -1611,6 +1612,7 @@ def _build_model_config(
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
+    kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
