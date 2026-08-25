@@ -2315,8 +2315,12 @@ class TestTransportBackendSelection:
 class TestGroupPersistentBackend:
     def test_stable_schedule_captured_once_then_replayed(self, monkeypatch):
         """A stable chunk schedule builds one NPUGraph and replays it after."""
+
         capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=True)
         backend = GroupPersistentBackend(capability)
+
+        calls = []
+        graph_pool = object()
 
         class FakeGraph:
             def __init__(self):
