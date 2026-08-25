@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+import torch_npu  # noqa: F401 — NPU stream/event/device ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -50,6 +53,202 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+
+
+# ---------------------------------------------------------------------------
+# NPU async omni output helpers — mirror the GPU async output pattern in
+# gpu_ar_model_runner.py. The KEY NPU-safe design is: all D2H copies happen
+# on the main thread's dedicated copy_stream (async), and the background
+# builder thread only waits on the recorded event and assembles the output
+# from already-CPU snapshots (pure CPU work). torch.cuda.set_device is NOT
+# redirected by vllm-ascend's torch.cuda wrapper, so the builder thread must
+# use torch.npu.set_device explicitly.
+# ---------------------------------------------------------------------------
+
+class _AsyncNPUCPUPayloadSnapshot:
+    """CPU payload snapshot with an NPU event for synchronisation."""
+
+    def __init__(
+        self,
+        payload: Any,
+        ready_event: torch.npu.Event | None,
+        npu_sources: list[torch.Tensor],
+    ) -> None:
+        self.payload = payload
+        self._ready_event = ready_event
+        self._npu_sources = npu_sources
+        self._waited = False
+
+    def wait(self) -> None:
+        if self._waited:
+            return
+        if self._ready_event is not None:
+            self._ready_event.synchronize()
+        self._npu_sources.clear()
+        self._waited = True
+
+
+def _clone_npu_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
+    """Deep-clone NPU tensors on the current stream.
+
+    The clone protects async output snapshots from graph output buffers
+    that may be reused by subsequent decode steps.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "npu":
+            cloned = value.detach().clone()
+            sources.append(cloned)
+            return cloned
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_npu_tensor_payload(v, sources) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_npu_tensor_payload(v, sources) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_npu_tensor_payload(v, sources) for v in value)
+    return value
+
+
+def _copy_npu_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
+    """Recursively copy NPU tensors to CPU (non-blocking)."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "npu":
+            return value
+        cpu = torch.empty_like(value, device="cpu", pin_memory=pin_memory)
+        cpu.copy_(value, non_blocking=True)
+        return cpu
+    if isinstance(value, dict):
+        return {k: _copy_npu_tensor_payload_to_cpu(v, pin_memory) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_npu_tensor_payload_to_cpu(v, pin_memory) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_npu_tensor_payload_to_cpu(v, pin_memory) for v in value)
+    return value
+
+
+def _snapshot_npu_tensor_payload_to_cpu_async(
+    value: Any,
+    *,
+    copy_stream: torch.npu.Stream,
+    pin_memory: bool,
+) -> _AsyncNPUCPUPayloadSnapshot:
+    """Clone NPU tensors and initiate async D2H copy on *copy_stream*."""
+    npu_sources: list[torch.Tensor] = []
+    cloned = _clone_npu_tensor_payload(value, npu_sources)
+    if not npu_sources:
+        return _AsyncNPUCPUPayloadSnapshot(cloned, None, npu_sources)
+
+    source_stream = torch.npu.current_stream()
+    ready_event = torch.npu.Event()
+    with torch.npu.stream(copy_stream):
+        copy_stream.wait_stream(source_stream)
+        cpu_payload = _copy_npu_tensor_payload_to_cpu(cloned, pin_memory)
+        ready_event.record(copy_stream)
+    return _AsyncNPUCPUPayloadSnapshot(cpu_payload, ready_event, npu_sources)
+
+
+# ---------------------------------------------------------------------------
+# NPU async omni model runner output — mirrors OmniAsyncGPUModelRunnerOutput
+# but NPU-safe: builder thread sets torch.npu device explicitly and only does
+# CPU assembly (the D2H snapshot was taken on the main thread's copy_stream).
+# ---------------------------------------------------------------------------
+
+class OmniAsyncNPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    """Async NPU output that builds the Omni payload on a background thread."""
+
+    def __init__(
+        self,
+        *,
+        model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        npu_device: torch.device | int | str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        sampled_token_ids = kwargs.pop("sampled_token_ids")
+        logprobs_tensors = kwargs.pop("logprobs_tensors")
+        invalid_req_indices = kwargs.pop("invalid_req_indices")
+        async_output_copy_stream = kwargs.pop("async_output_copy_stream")
+        vocab_size = kwargs.pop("vocab_size")
+        routed_experts = kwargs.pop("routed_experts", None)
+        kwargs.pop("check_ep_fault", False)
+        if kwargs:
+            raise TypeError(
+                f"Unexpected OmniAsyncNPUModelRunnerOutput kwargs: {sorted(kwargs)}"
+            )
+
+        self._model_runner_output = None
+        self._invalid_req_indices = invalid_req_indices
+
+        self.async_copy_ready_event = torch.npu.Event()
+        self._sampled_token_ids = sampled_token_ids
+        self.vocab_size = vocab_size
+        self._logprobs_tensors = logprobs_tensors
+        self._routed_experts = routed_experts
+        self._has_fault: torch.Tensor | None = None
+
+        default_stream = torch.npu.current_stream()
+        with torch.npu.stream(async_output_copy_stream):
+            async_output_copy_stream.wait_stream(default_stream)
+            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                "cpu", non_blocking=True
+            )
+            self._logprobs_tensors_cpu = (
+                self._logprobs_tensors.to_cpu_nonblocking()
+                if self._logprobs_tensors is not None
+                else None
+            )
+            self._routed_experts_cpu = (
+                self._routed_experts.to_cpu_nonblocking()
+                if self._routed_experts is not None
+                else None
+            )
+            self.async_copy_ready_event.record()
+
+        self._model_runner_output_builder = model_runner_output_builder
+        self._background_exception: BaseException | None = None
+        self._background_thread: threading.Thread | None = None
+        self._npu_device = npu_device
+        self._background_thread = threading.Thread(
+            target=self._build_output_in_background,
+            daemon=True,
+            name="omni-async-npu-output-builder",
+        )
+        self._background_thread.start()
+
+    def _build_model_runner_output_once(self) -> None:
+        if self._model_runner_output is not None:
+            return
+        with record_function_or_nullcontext("omni_async_npu_output:build"):
+            self._model_runner_output = self._model_runner_output_builder()
+        self._model_runner_output_builder = None
+
+    def _build_output_in_background(self) -> None:
+        try:
+            # torch.cuda.set_device is NOT redirected on NPU; use npu explicitly.
+            if self._npu_device is not None:
+                torch.npu.set_device(self._npu_device)
+            self._build_model_runner_output_once()
+        except BaseException as exc:  # noqa: BLE001 — re-raised by get_output().
+            self._background_exception = exc
+
+    def get_output(self) -> OmniModelRunnerOutput:
+        background_thread = getattr(self, "_background_thread", None)
+        if background_thread is not None:
+            background_thread.join()
+            self._background_thread = None
+            background_exception = getattr(self, "_background_exception", None)
+            if background_exception is not None:
+                raise background_exception
+        self._build_model_runner_output_once()
+        if self._model_runner_output is None:
+            raise RuntimeError("OmniAsyncNPUModelRunnerOutput: output was never built.")
+        if not hasattr(self, "_has_fault"):
+            self._has_fault = None
+        # super().get_output() synchronizes the sampled_token_ids copy event
+        # and finalizes token parsing on the model_runner_output.
+        with record_function_or_nullcontext(
+            "omni_async_npu_output:finalize_async_sampled_tokens"
+        ):
+            return super().get_output()
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -1056,6 +1255,226 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
 
         #  -------------------------------------- Omni-new -------------------------------------------------
+        # Snapshot per-request scheduling metadata on the main thread; the
+        # background builder thread must NOT read self.input_batch /
+        # self.query_start_loc (mutated by the next execute_model step).
+        num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
+        if num_scheduled_tokens_np is None:
+            req_ids = self.input_batch.req_ids
+            num_scheduled_tokens_np = np.array(
+                [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
+                dtype=np.int32,
+            )
+        query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
+
+        _use_async_omni = self._should_use_async_omni_output()
+        if _use_async_omni:
+            _copy_stream = self._get_or_create_omni_payload_copy_stream()
+            _hs_snap = _snapshot_npu_tensor_payload_to_cpu_async(
+                hidden_states, copy_stream=_copy_stream, pin_memory=True
+            )
+            _mm_snap = _snapshot_npu_tensor_payload_to_cpu_async(
+                multimodal_outputs, copy_stream=_copy_stream, pin_memory=True
+            )
+
+            def _build_omni_output() -> OmniModelRunnerOutput:
+                _hs_snap.wait()
+                _mm_snap.wait()
+                return self._build_omni_output_from_tensors(
+                    hidden_states=_hs_snap.payload,
+                    multimodal_outputs=_mm_snap.payload,
+                    scheduler_output=scheduler_output,
+                    req_ids_output_copy=req_ids_output_copy,
+                    req_id_to_index_output_copy=req_id_to_index_output_copy,
+                    valid_sampled_token_ids=valid_sampled_token_ids,
+                    logprobs_lists=logprobs_lists,
+                    prompt_logprobs_dict=prompt_logprobs_dict,
+                    kv_connector_output=kv_connector_output,
+                    ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+                    cudagraph_stats=cudagraph_stats,
+                    routed_experts_lists=routed_experts_lists,
+                    kv_extracted_req_ids=kv_extracted_req_ids,
+                    hidden_seq_len=hidden_seq_len,
+                    scheduled_seq_len=scheduled_seq_len,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                )
+
+            model_runner_output = None
+        else:
+            model_runner_output = self._build_omni_output_from_tensors(
+                hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
+                scheduler_output=scheduler_output,
+                req_ids_output_copy=req_ids_output_copy,
+                req_id_to_index_output_copy=req_id_to_index_output_copy,
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                logprobs_lists=logprobs_lists,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+                cudagraph_stats=cudagraph_stats,
+                routed_experts_lists=routed_experts_lists,
+                kv_extracted_req_ids=kv_extracted_req_ids,
+                hidden_seq_len=hidden_seq_len,
+                scheduled_seq_len=scheduled_seq_len,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                query_start_loc_cpu=query_start_loc_cpu,
+            )
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+        if not _use_async_omni:
+            if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
+                self._sync_device()
+                model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
+
+            if self.dynamic_eplb:
+                with record_function_or_nullcontext("EPLB update"):
+                    self.eplb_updator.forward_end()
+
+            if self.debugger is not None:
+                self.debugger.stop()
+                self.debugger.step()
+
+        if self.need_accepted_tokens:
+            assert self.sampling_done_event is not None
+            with (
+                record_function_or_nullcontext("async_state_update"),
+                torch.npu.stream(global_stream()),
+            ):
+                global_stream().wait_event(self.sampling_done_event)
+                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
+        # In async scheduling + PP, broadcast sampled token ids from the
+        # last PP rank so other PP ranks can receive them without going
+        # through the scheduler/engine IPC path.
+        if self.use_async_scheduling:
+            pp = get_pp_group()
+            if pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+
+        if not self.use_async_scheduling:
+            if _use_async_omni:
+                return _build_omni_output()
+            return model_runner_output
+
+        if _use_async_omni:
+            async_output = OmniAsyncNPUModelRunnerOutput(
+                model_runner_output_builder=_build_omni_output,
+                npu_device=self.device,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self._get_or_create_omni_payload_copy_stream(),
+                vocab_size=self.input_batch.vocab_size,
+            )
+        else:
+            async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+        self.input_batch.set_async_sampled_token_ids(
+            async_output.sampled_token_ids_cpu,
+            async_output.async_copy_ready_event,
+        )
+        return async_output
+
+    #  -------------------------------------- Omni-new -------------------------------------------------
+    # Async omni output helpers (NPU-safe): D2H snapshot on the main thread's
+    # copy_stream, output assembly on a background thread.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _model_omni_flag(model: Any, name: str, default: bool = False) -> bool:
+        return bool(getattr(model, name, default)) if model is not None else default
+
+    def _should_use_async_omni_output(self) -> bool:
+        """Gate async omni output: async scheduling + async_chunk, no prefix
+        cache / speculative decode / returned routed experts.
+
+        Default ON: overlaps the Omni output D2H + connector serialization
+        with the next scheduler step, improving TTFT/TTFP at single
+        concurrency. Opt out via VLLM_OMNI_NPU_ASYNC_OUTPUT=0.
+        """
+        if os.environ.get("VLLM_OMNI_NPU_ASYNC_OUTPUT", "").lower() in (
+            "0",
+            "false",
+            "no",
+        ):
+            return False
+        if not self.use_async_scheduling:
+            return False
+        if getattr(self, "omni_prefix_cache", None) is not None:
+            return False
+        if self.speculative_config is not None:
+            return False
+        model_config = getattr(self, "model_config", None)
+        if model_config is None:
+            model_config = getattr(
+                getattr(self, "vllm_config", None), "model_config", None
+            )
+        if not bool(getattr(model_config, "async_chunk", False)):
+            return False
+        if bool(getattr(model_config, "enable_return_routed_experts", False)):
+            return False
+        return True
+
+    def _get_or_create_omni_payload_copy_stream(self) -> torch.npu.Stream:
+        stream = getattr(self, "_omni_payload_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._omni_payload_copy_stream = stream
+        return stream
+
+    def _build_omni_async_snapshot_payload(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: Any,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"multimodal_outputs": multimodal_outputs}
+        if self._model_omni_flag(
+            getattr(self, "model", None),
+            "omni_pooler_payload_include_hidden",
+            default=True,
+        ):
+            payload["hidden_states"] = hidden_states
+        return payload
+
+    #  -------------------------------------- Omni-new -------------------------------------------------
+    def _build_omni_output_from_tensors(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: Any,
+        scheduler_output: SchedulerOutput,
+        req_ids_output_copy: list[str],
+        req_id_to_index_output_copy: dict[str, int],
+        valid_sampled_token_ids: list[list[int]],
+        logprobs_lists: Any,
+        prompt_logprobs_dict: dict[str, Any],
+        kv_connector_output: Any,
+        ec_connector_output: Any,
+        cudagraph_stats: Any,
+        routed_experts_lists: Any,
+        kv_extracted_req_ids: Any,
+        hidden_seq_len: int,
+        scheduled_seq_len: int,
+        num_scheduled_tokens_np: np.ndarray,
+        query_start_loc_cpu: Any,
+    ) -> OmniModelRunnerOutput:
+        """Assemble the Omni pooler payload + OmniModelRunnerOutput.
+
+        ``hidden_states`` / ``multimodal_outputs`` may be NPU or CPU tensors:
+        for the async path they are already-CPU snapshots (so the ``.to("cpu")``
+        calls below are no-ops), for the sync path they are live NPU tensors.
+        """
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
         sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
@@ -1081,16 +1500,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
-        num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
-        if num_scheduled_tokens_np is None:
-            req_ids = self.input_batch.req_ids
-            num_scheduled_tokens_np = np.array(
-                [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
-                dtype=np.int32,
-            )
-        query_start_loc_cpu = self.query_start_loc.cpu
-        if callable(query_start_loc_cpu):
-            query_start_loc_cpu = query_start_loc_cpu()
 
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
@@ -1155,14 +1564,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
-                        # Prefix cache enabled; all items have already been processed
-                        # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU.  Lists are kept as
-                        # passthrough data for consistent behavior in postprocess.
-                        # Recurse into nested dicts so list-valued sub-keys (e.g.
-                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
-                        # at the leaves; downstream flatten_payload then yields a
-                        # wire-clean dict[str, torch.Tensor].
                         def _unwrap_lists(v):
                             if isinstance(v, list):
                                 return v[idx] if idx < len(v) else v[0]
@@ -1209,12 +1610,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            # Non-async-chunk ships the full payload to the next stage via
-            # inter_stage_outputs (the NPU runner has no separate full-payload
-            # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
             pooler_inter, pooler_client = pooler_output, pooler_output
 
-        # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 for i, rid in enumerate(req_ids_output_copy):
@@ -1223,7 +1620,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-        multimodal_outputs = (
+        mmo = (
             inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
         )
         model_runner_output = OmniModelRunnerOutput(
@@ -1233,7 +1630,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=None,
-            multimodal_outputs=multimodal_outputs,
+            multimodal_outputs=mmo,
             inter_stage_outputs=inter_stage_outputs,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
@@ -1243,52 +1640,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model_runner_output.routed_experts = routed_experts_lists
         with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
             model_runner_output.omni_connector_output = self.get_omni_connector_output()
-        #  -------------------------------------- Omni-new -------------------------------------------------
-
-        if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
-            self._sync_device()
-            model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
-
-        if self.dynamic_eplb:
-            with record_function_or_nullcontext("EPLB update"):
-                self.eplb_updator.forward_end()
-
-        if self.debugger is not None:
-            self.debugger.stop()
-            self.debugger.step()
-
-        if self.need_accepted_tokens:
-            assert self.sampling_done_event is not None
-            with (
-                record_function_or_nullcontext("async_state_update"),
-                torch.npu.stream(global_stream()),
-            ):
-                global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
-
-        # In async scheduling + PP, broadcast sampled token ids from the
-        # last PP rank so other PP ranks can receive them without going
-        # through the scheduler/engine IPC path.
-        if self.use_async_scheduling:
-            pp = get_pp_group()
-            if pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
-
-        if not self.use_async_scheduling:
-            return model_runner_output
-        async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-        )
-        self.input_batch.set_async_sampled_token_ids(
-            async_output.sampled_token_ids_cpu,
-            async_output.async_copy_ready_event,
-        )
-        return async_output
+        return model_runner_output
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def _resolve_global_request_id(self, req_id: str) -> str:

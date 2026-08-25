@@ -201,6 +201,54 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         self.make_empty_intermediate_tensors = self.tts_model.make_empty_intermediate_tensors
 
+        # Perf: NPU-accelerated RMSNorm for Talker decode loop (RFC #5370).
+        # Each decode step calls RMSNorm 2× per layer; torch_npu.npu_rms_norm
+        # avoids the Python-level rsqrt/pow/mean and uses the CANN fused kernel.
+        # PPT reports ~30.7% single-step RMSNorm reduction for the Talker.
+        try:
+            import torch_npu
+            from vllm.model_executor.layers.layernorm import RMSNorm
+
+            _orig_forward_native = RMSNorm.forward_native
+
+            def _npu_forward_native(
+                rms_self: RMSNorm,
+                x: torch.Tensor,
+                residual: torch.Tensor | None = None,
+            ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+                weight = rms_self.weight.data if rms_self.has_weight else None
+                if residual is None:
+                    out, _ = torch_npu.npu_rms_norm(
+                        x, weight, rms_self.variance_epsilon
+                    )
+                    return out
+                out, _, residual_out = torch_npu.npu_add_rms_norm(
+                    x, residual, weight, rms_self.variance_epsilon
+                )
+                return out, residual_out
+
+            # Only patch the Talker's own LlamaModel RMSNorm instances,
+            # not the global class — keep other stages unaffected.
+            rmsnorm_count = 0
+            for module in self.tts_model.modules():
+                if isinstance(module, RMSNorm):
+                    module.forward_native = _npu_forward_native.__get__(
+                        module, RMSNorm
+                    )
+                    rmsnorm_count += 1
+            logger.info(
+                "Patched %s Talker RMSNorm layers with NPU fused kernel.",
+                rmsnorm_count,
+            )
+        except ImportError:
+            logger.warning("torch_npu not available; Talker RMSNorm runs native.")
+        except Exception as exc:
+            logger.warning(
+                "Failed to patch Talker RMSNorm with NPU kernel (%s); "
+                "falling back to native.",
+                exc,
+            )
+
     def _boundary_embeddings(self) -> torch.Tensor:
         """Embed the ``<text_eos><audio_bos>`` tail every condition ends with."""
         ids = torch.tensor(
