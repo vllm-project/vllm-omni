@@ -12,6 +12,7 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
+      token2wav_n_timesteps: 3
       codec_chunk_frames: 25
       codec_left_context_frames: 3
 
@@ -19,6 +20,7 @@ stages:
   - stage_id: 0
     # Four-way concurrency matches the single-GPU memory shares below;
     # larger batches make Code2Wav activations OOM on one H100.
+    # Ascend A3 has ~4x the KV-cache headroom; see platforms.npu below.
     max_num_seqs: 4
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
@@ -92,11 +94,20 @@ stages:
 platforms:
   npu:
     stages:
+      # A3 (64 GB per die) reports roughly 4x more KV-cache blocks than
+      # max_num_seqs: 4 requires. RTF is measured over the full chain,
+      # queueing included, so capping the scheduler at 4 while the benchmark
+      # drives 8 concurrent requests charges queueing time straight to RTF.
+      # Kept out of the base stages so the single-H100 path stays at 4.
       - stage_id: 0
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
+      - stage_id: 2
+        max_num_seqs: 8
