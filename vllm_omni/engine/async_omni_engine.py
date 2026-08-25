@@ -198,6 +198,7 @@ class AsyncOmniEngine:
             pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        self.duplex_use_openai = bool(pipeline_config and pipeline_config.duplex_use_openai)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session

@@ -69,7 +69,7 @@ class _ResolvedResponse:
     metadata: Any
 
 
-class FullDuplexRealtimeConnection:
+class OpenAIFullDuplexConnection:
     """Handle one OpenAI Realtime WebSocket session."""
 
     def __init__(

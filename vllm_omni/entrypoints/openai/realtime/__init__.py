@@ -1,5 +1,5 @@
 from vllm_omni.entrypoints.openai.realtime.connection import (
-    FullDuplexRealtimeConnection,
+    OpenAIFullDuplexConnection,
 )
 
-__all__ = ["FullDuplexRealtimeConnection"]
+__all__ = ["OpenAIFullDuplexConnection"]

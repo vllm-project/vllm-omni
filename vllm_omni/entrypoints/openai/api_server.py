@@ -127,7 +127,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime.connection import (
-    FullDuplexRealtimeConnection,
+    OpenAIFullDuplexConnection,
 )
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -1744,6 +1744,15 @@ async def streaming_video_output(websocket: WebSocket):
 async def realtime_websocket(websocket: WebSocket):
     """Handle an OpenAI-compatible Realtime API session."""
     state = websocket.app.state
+
+    if not getattr(state.engine_client, "duplex_use_openai", False):
+        serving_duplex = getattr(state, "openai_serving_duplex", None)
+        if serving_duplex is None:
+            await _reject_realtime_websocket(websocket, "The Realtime API is not available for this model")
+            return
+        await serving_duplex.handle_realtime_session(websocket)
+        return
+
     if not _supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
         await _reject_realtime_websocket(websocket, "The Realtime API is only supported for Qwen3-Omni")
         return
@@ -1754,7 +1763,7 @@ async def realtime_websocket(websocket: WebSocket):
         await _reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
         return
 
-    connection = FullDuplexRealtimeConnection(
+    connection = OpenAIFullDuplexConnection(
         websocket=websocket,
         engine=state.engine_client,
         model_name=model_name,

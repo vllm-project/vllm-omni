@@ -248,6 +248,9 @@ class PipelineConfig:
     # from the optional model extension because turn-commit-only deployments
     # do not require a model planner.
     duplex_control_enabled: bool = False
+    # Route this pipeline's duplex sessions through the OpenAI-compatible
+    # Realtime API (/v1/realtime) instead of the experimental fullduplex stack.
+    duplex_use_openai: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
