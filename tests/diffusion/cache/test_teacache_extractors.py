@@ -172,7 +172,6 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
         assert context.temb is not None
 
     @pytest.mark.cpu
-
     def test_invalid_module_raises_error(self):
         """Test that invalid module without transformer_blocks raises ValueError."""
         invalid_module = Mock()
@@ -740,8 +739,8 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         """Strict SP must not mix local TeaCache state with gathered block rows."""
         from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
         from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
-        from vllm_omni.diffusion.distributed import parallel_state
         from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+        from vllm_omni.diffusion.distributed import parallel_state
 
         seq_len = sample_inputs["x"].shape[1]
         local_len = seq_len // 2
