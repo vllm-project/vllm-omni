@@ -198,10 +198,10 @@ def test_wan_2_1_vace(omni_server: OmniServer, online_client: OnlineOmniClient):
 )
 def test_wan_2_1_vace_ref_hint_cache_hits(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """Exercise forecast50 past calibration and prove the model-region handler ran."""
-    openai_client.send_video_diffusion_request(
+    online_client.send_video_diffusion_request(
         {
             "model": MODEL,
             "form_data": {
