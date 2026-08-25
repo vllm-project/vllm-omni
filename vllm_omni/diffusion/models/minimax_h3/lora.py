@@ -257,9 +257,9 @@ _NATIVE_EXPECTED_TARGETS = frozenset(
     + ["final_layer.adaln_proj.linear"]
 )
 _NATIVE_TARGET_PATTERN = (
-    r"^(?:blocks\.\d+\.(?:attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2)|adaln_proj\.linear)"
-    r"|token_refiner\.blocks\.\d+\.(?:attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2))"
-    r"|final_layer\.adaln_proj\.linear)$"
+    r"^(?:transformer\.blocks\.\d+\.(?:attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2)|adaln_proj\.linear)"
+    r"|transformer\.token_refiner\.blocks\.\d+\.(?:attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2))"
+    r"|transformer\.final_layer\.adaln_proj\.linear)$"
 )
 _NATIVE_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_substr={
