@@ -112,13 +112,13 @@ pytest -q tests/diffusion/models/sensenova_u1/
   then proceeds on the in-tree config. Generation is unaffected.
 - The LoRA targets the generation tower only (`*_mot_gen`); understanding-tower weights are
   untouched.
-- Autoregressive decode (think and image-to-text) runs on a paged K/V cache under a captured
-  CUDA graph. It falls back to the ordinary cache when the device or the bundled
+- Autoregressive decode (think, text-to-text and image-to-text) runs on a paged K/V cache under
+  a captured CUDA graph. It falls back to the ordinary cache when the device or the bundled
   `flash_attn_varlen_func` cannot support it; set `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` to force
   that fallback.
-- The first request after startup costs about 1.3 s more than the steady state whether the paged
+- The first request after startup costs about 0.7 s more than the steady state whether the paged
   path is on or off. Measured on one A800 with the inductor, triton and vLLM compile caches all
-  cleared: 1.43 s above steady with the path on, 1.28 s with it off.
+  cleared: 711 ms above steady with the path on, 664 ms with it off.
 - Each request captures its own graphs, and a think request captures twice because the sequence
   grows past the 512 bucket: 150 ms for the first capture in a process and about 94 ms after
   that, so roughly 188 ms of every request rather than a one-off startup cost.
