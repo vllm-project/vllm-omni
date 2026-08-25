@@ -1,4 +1,4 @@
-"""Base worker class for vLLM-Omni with process-scoped GPU memory accounting."""
+"""Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
 
