@@ -1,0 +1,30 @@
+{
+  "environment": {
+    "hardware": "Ascend 910C",
+    "image": "quay.nju.edu.cn/ascend/vllm-omni:v0.25.0-a3",
+    "cann": "9.0.0"
+  },
+  "video_mme": {
+    "accuracy": 0.6959,
+    "baseline": 0.69,
+    "threshold": 0.67,
+    "status": "PASS"
+  },
+  "daily_omni": {
+    "accuracy": 0.7809,
+    "baseline": 0.795,
+    "threshold": 0.775,
+    "status": "PASS"
+  },
+  "seed_tts": {
+    "ttft_ms": 308,
+    "ttfp_ms": 1903,
+    "rtf": 0.45,
+    "wer": 0.0083,
+    "asv": null,
+    "status": "PASS"
+  },
+  "demo": {
+    "status": "PASS"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "note": "No optimization applied. Baseline is near hardware limit on Ascend 910C.",
+  "video_mme": {
+    "accuracy": 0.6959,
+    "status": "PASS"
+  },
+  "daily_omni": {
+    "accuracy": 0.7809,
+    "status": "PASS"
+  },
+  "seed_tts": {
+    "ttft_ms": 308,
+    "ttfp_ms": 1903,
+    "rtf": 0.45,
+    "wer": 0.0083,
+    "asv": null,
+    "status": "PASS"
+  }
+}

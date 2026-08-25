@@ -476,7 +476,7 @@ class VideoMMEDataset(BenchmarkDataset):
             raise ImportError("pandas is required to load Video-MME parquet") from e
         if not path.is_file():
             raise FileNotFoundError(f"Video-MME parquet not found: {path}")
-        df = pd.read_parquet(path)
+        df = pd.read_parquet(path, engine='fastparquet')
         self._set_rows([row.to_dict() for _, row in df.iterrows()])
 
     def _load_from_huggingface(self) -> None:
