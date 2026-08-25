@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,15 +15,32 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _assert_isolated_import_succeeds(script: str) -> None:
+    # These tests validate Python import/package boundaries and do not use a
+    # GPU. Other tests in the combined entrypoints/engine suite may temporarily
+    # configure only one of the CUDA/ROCm visibility variables. Do not let an
+    # unrelated, inconsistent device-selection environment prevent the child
+    # interpreter from reaching the boundary assertion.
+    env = os.environ.copy()
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    env.pop("HIP_VISIBLE_DEVICES", None)
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,
+        env=env,
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_isolated_import_ignores_conflicting_gpu_visibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Import-boundary checks must not depend on GPU state leaked by prior tests."""
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+
+    _assert_isolated_import_succeeds("import vllm_omni.outputs")
 
 
 def test_stable_engine_imports_do_not_load_experimental_duplex() -> None:

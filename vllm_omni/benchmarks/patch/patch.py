@@ -12,8 +12,9 @@ import traceback
 import uuid
 import wave
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -38,7 +39,13 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
+    DailyOmniDataset,
+    DailyOmniSampleRequest,
+    daily_omni_local_qa_json,
+    daily_omni_local_videos_dir,
+    resolve_daily_omni_local_root,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -282,6 +289,26 @@ def get_samples(args, tokenizer):
         if isinstance(qa_json, str):
             qa_json = qa_json.strip() or None
 
+        # A local mirror of the dataset repo (plain directory or HF hub cache dir) is used
+        # directly: no Hub round-trip, so offline / air-gapped runs work without extra flags.
+        local_root: Path | None = None
+        if qa_json is None:
+            local_root = resolve_daily_omni_local_root(getattr(args, "dataset_path", None)) or (
+                resolve_daily_omni_local_root(getattr(args, "hf_name", None))
+            )
+            if local_root is not None:
+                local_qa = daily_omni_local_qa_json(local_root)
+                if local_qa is not None:
+                    qa_json = str(local_qa)
+                    if video_dir is None:
+                        video_dir = daily_omni_local_videos_dir(local_root)
+                    logger.info("Using local Daily-Omni mirror: root=%s", local_root)
+                else:
+                    logger.info(
+                        "Local Daily-Omni path %s has no qa.json; loading it with `datasets` instead",
+                        local_root,
+                    )
+
         if qa_json is not None:
             logger.info(
                 "Loading Daily-Omni dataset: qa_json=%s, video_dir=%s (Hub not used for QA)",
@@ -304,7 +331,8 @@ def get_samples(args, tokenizer):
             repo_id = _daily_omni_repo_from_args(args)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
-                    repo_id = _DEFAULT_DAILY_OMNI_REPO
+                    # Prefer an on-disk copy over the Hub id so offline runs keep working.
+                    repo_id = str(local_root) if local_root is not None else _DEFAULT_DAILY_OMNI_REPO
             elif repo_id is None:
                 raise ValueError(
                     "Daily-Omni with --dataset-name hf requires "
@@ -1542,6 +1570,7 @@ async def benchmark(
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
+    probe_request_rate: float = 0.0,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -1687,6 +1716,31 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
 
+    # Ported from upstream vLLM v0.27.0 (vllm/benchmarks/serve.py), which added
+    # the probe_request_rate background probe; this file is the patched copy of
+    # that module and tracks its upstream base.
+    probe_outputs: list[MixRequestFuncOutput] = []
+    probe_stop = asyncio.Event()
+
+    async def probe_loop():
+        probe_input = replace(
+            test_input,
+            prompt="Hi",
+            prompt_len=1,
+            output_len=1,
+            multi_modal_content=None,
+            chat_messages=None,
+        )
+        interval = 1 / probe_request_rate
+        while not probe_stop.is_set():
+            probe_outputs.append(await request_func(request_func_input=probe_input, session=session))
+            await asyncio.sleep(interval)
+
+    probe_task: asyncio.Task | None = None
+    if probe_request_rate > 0:
+        print(f"Probe request rate: {probe_request_rate} req/s")
+        probe_task = asyncio.create_task(probe_loop())
+
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
 
@@ -1751,6 +1805,10 @@ async def benchmark(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if probe_task is not None:
+        probe_stop.set()
+        await probe_task
 
     if pbar is not None:
         pbar.close()
@@ -1819,11 +1877,19 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
-    duplex_request_metrics = [metric for output in outputs for metric in (output.duplex_request_metrics or [])]
+    # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
+    # RequestFuncOutput objects without the Mix duplex fields; read them
+    # tolerantly or the whole benchmark result is discarded ("fallback to
+    # template", completed=0) after every request already succeeded.
+    duplex_request_metrics = [
+        metric for output in outputs for metric in (getattr(output, "duplex_request_metrics", None) or [])
+    ]
     if duplex_request_metrics:
         result["duplex_request_metrics"] = duplex_request_metrics
     duplex_session_metrics = [
-        output.duplex_session_metrics for output in outputs if output.duplex_session_metrics is not None
+        session_metrics
+        for output in outputs
+        if (session_metrics := getattr(output, "duplex_session_metrics", None)) is not None
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics

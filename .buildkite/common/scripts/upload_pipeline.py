@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Render and optionally upload Buildkite pipeline YAML with diff-aware logic.
 
 Bootstrap mode (``bootstrap-upload-steps.yml``):
@@ -58,11 +59,12 @@ BOOTSTRAP_UPLOAD_IF_KEYS = {
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
 
-CUDA_NIGHTLY_ONLY = (
-    '(build.pull_request.labels includes "nightly-test") || (build.branch == "main" && build.env("NIGHTLY") == "1")'
-)
-NPU_NIGHTLY_ONLY = (
-    '(build.branch == "main" && build.env("NIGHTLY") == "1") || '
+# Bootstrap Buildkite ``if`` expressions.
+# ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
+# ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
+NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
+NIGHTLY_LABEL_IF = (
+    f"({NIGHTLY_MAIN_IF}) || "
     '(build.branch != "main" && ('
     'build.pull_request.labels includes "nightly-test" || '
     'build.pull_request.labels includes "omni-test" || '
@@ -71,6 +73,19 @@ NPU_NIGHTLY_ONLY = (
     'build.pull_request.labels includes "diffusion-x2v-test"'
     "))"
 )
+WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
+WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
+WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
+READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
+MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
+MERGE_MAIN_IF = (
+    'build.branch == "main" && build.env("NIGHTLY") != "1" && '
+    'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
+)
+READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
+MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
+BOOTSTRAP_DISABLED_IF = "false"
+BOOTSTRAP_ENABLED_IF = "true"
 
 
 # --- Logging ---
@@ -102,74 +117,47 @@ def _format_bootstrap_if(expr: str) -> str:
 
 
 def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
-    disabled = "false"
-    nightly_main = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
-    nightly_only = NPU_NIGHTLY_ONLY if platform == "npu" else CUDA_NIGHTLY_ONLY
-
     if platform == "npu":
-        ready_pr = (
-            'build.branch != "main" && ('
-            'build.pull_request.labels includes "npu-test" || '
-            'build.pull_request.labels includes "ready"'
-            ")"
-        )
-        nightly_label_if = nightly_only
-        weekly_label_if = disabled
-        merge_base = disabled
+        ready_upload = READY_LABEL_IF
+        merge_upload = BOOTSTRAP_DISABLED_IF
+        weekly_label_if = BOOTSTRAP_DISABLED_IF
     else:
-        ready_pr = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-        merge_main = 'build.branch == "main" && build.env("NIGHTLY") != "1" && build.env("WEEKLY") != "1"'
-        merge_pr = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-        nightly_label_if = (
-            '(build.branch == "main" && build.env("NIGHTLY") == "1") || '
-            '(build.branch != "main" && ('
-            'build.pull_request.labels includes "nightly-test" || '
-            'build.pull_request.labels includes "omni-test" || '
-            'build.pull_request.labels includes "tts-test" || '
-            'build.pull_request.labels includes "diffusion-x2iat-test" || '
-            'build.pull_request.labels includes "diffusion-x2v-test"'
-            "))"
-        )
-        weekly_label_if = (
-            '(build.branch == "main" && build.env("WEEKLY") == "1") || '
-            '(build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-        )
-        merge_base = f"({nightly_main}) || (({merge_main}) || ({merge_pr}))"
-
-    ready_base = f"({nightly_main}) || ({ready_pr})"
-    weekly_main = 'build.branch == "main" && build.env("WEEKLY") == "1"'
+        ready_upload = READY_UPLOAD_IF
+        merge_upload = MERGE_UPLOAD_IF
+        weekly_label_if = WEEKLY_LABEL_IF
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4 + L2/L3 (--e2e); WEEKLY=1 still runs L5.
-        image_expr = f"({nightly_main}) || ({weekly_main})" if platform == "cuda" else nightly_main
-        ready_expr = nightly_main
-        merge_expr = nightly_main if platform == "cuda" else disabled
-        nightly_expr = nightly_main
-        weekly_expr = weekly_main if platform == "cuda" else disabled
+        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
+        # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
+        image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
+        ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_MAIN_IF
+        weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
 
-        ready_expr = ready_base if l2_enabled else disabled
-        merge_expr = merge_base if l3_enabled else disabled
-        nightly_expr = nightly_label_if
-        weekly_expr = weekly_label_if if platform == "cuda" else disabled
+        ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
+        merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_LABEL_IF
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
-        image_parts = [f"({nightly_label_if})"]
+        image_parts = [f"({NIGHTLY_LABEL_IF})"]
         if platform == "cuda":
             image_parts.append(f"({weekly_label_if})")
         if l2_enabled:
-            image_parts.insert(0, f"({ready_base})")
+            image_parts.insert(0, f"({ready_upload})")
         if l3_enabled:
-            image_parts.insert(1 if l2_enabled else 0, f"({merge_base})")
+            image_parts.insert(1 if l2_enabled else 0, f"({merge_upload})")
         image_expr = " || ".join(image_parts)
     else:
-        image_expr = "true"
-        ready_expr = ready_base
-        merge_expr = merge_base if platform == "cuda" else disabled
-        nightly_expr = nightly_label_if
-        weekly_expr = weekly_label_if if platform == "cuda" else disabled
+        image_expr = BOOTSTRAP_ENABLED_IF
+        ready_expr = ready_upload
+        merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_LABEL_IF
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
     return {
         "image": _format_bootstrap_if(image_expr),

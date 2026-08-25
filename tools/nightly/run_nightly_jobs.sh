@@ -43,7 +43,7 @@
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v --run-level full_model tests/dfx/stability/scripts/test_stability_*.py
-#     model_type: omni → qwen3_omni; tts → qwen3_tts + voxcpm2; diffusion → qwen_image + wan22 + hunyuan_image; all → all six
+#     model_type: omni → qwen3_omni; tts → qwen3_tts; diffusion → qwen_image + wan22 + hunyuan_image; all → all five
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
@@ -588,7 +588,6 @@ def _write_job_timeouts_manifest(jobs_dir: Path, job_timeouts: dict[str, int]) -
 STABILITY_CASES: list[tuple[str, str, tuple[str, ...]]] = [
     ("stability_qwen3_omni", "tests/dfx/stability/scripts/test_stability_qwen3_omni.py", ("omni",)),
     ("stability_qwen3_tts", "tests/dfx/stability/scripts/test_stability_qwen3_tts.py", ("tts",)),
-    ("stability_voxcpm2", "tests/dfx/stability/scripts/test_stability_voxcpm2.py", ("tts",)),
     ("stability_qwen_image", "tests/dfx/stability/scripts/test_stability_qwen_image.py", ("diffusion",)),
     ("stability_wan22", "tests/dfx/stability/scripts/test_stability_wan22.py", ("diffusion",)),
     ("stability_hunyuan_image", "tests/dfx/stability/scripts/test_stability_hunyuan_image.py", ("diffusion",)),

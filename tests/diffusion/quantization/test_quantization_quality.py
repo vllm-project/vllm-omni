@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Quantization quality gate for diffusion models.
 
@@ -53,6 +53,7 @@ _BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
 
 if _BENCH_MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules[_BENCH_MODULE_NAME] = _mod
     _spec.loader.exec_module(_mod)
@@ -93,7 +94,7 @@ class QualityTestConfig:
             return self.quantized_model
         return self.model or ""
 
-    def quantization_ref(self) -> str | None:
+    def quantization_ref(self) -> str | dict[str, object] | None:
         if self.quantized_model is not None:
             return None
         return self.quantization
@@ -310,7 +311,7 @@ def _generate_image(omni, config: QualityTestConfig):
     first = outputs[0]
     if hasattr(first, "images") and first.images:
         return first.images[0], peak_mem
-    inner = first.request_output
+    inner = first
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images[0], peak_mem
     raise ValueError("Could not extract image from output.")
@@ -341,15 +342,15 @@ def _generate_video(omni, config: QualityTestConfig):
     )
 
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
-    first = outputs[0]
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        inner = first.request_output[0]
-        if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
-            frames = inner.images[0] if inner.images else None
-        else:
-            frames = inner
-    elif hasattr(first, "images") and first.images:
-        frames = first.images[0]
+    if isinstance(outputs, list) and isinstance(outputs[0], OmniRequestOutput):
+        first = outputs[0]
+    elif isinstance(outputs, OmniRequestOutput):
+        first = outputs
+    else:
+        raise ValueError("Could not extract video frames from output.")
+
+    if hasattr(first, "images"):
+        frames = first.images[0] if first.images else None
     else:
         raise ValueError("Could not extract video frames from output.")
 
@@ -444,11 +445,11 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
     image = Image.new("RGB", (2, 2))
     inner = OmniRequestOutput.from_diffusion(request_id="req", images=[image])
-    outer = OmniRequestOutput(
+    outer = OmniRequestOutput.from_stage_output(
+        inner,
         request_id="req",
         stage_id=0,
         final_output_type="image",
-        request_output=inner,
         finished=True,
     )
 
@@ -500,6 +501,8 @@ def _quality_param(c: QualityTestConfig):
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
         )
+    if c.id == "fp8_ltx2":
+        marks.append(pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/6245"))
     return pytest.param(c, id=c.id, marks=marks)
 
 
@@ -515,8 +518,14 @@ def test_quantization_quality(config: QualityTestConfig):
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
 
+    # Run both arms eager: LPIPS must measure quantization only. With compile
+    # on, a compiler failure in one arm (e.g. inductor's CantSplit on fp8 FLUX)
+    # silently drops that arm to eager while the other stays compiled, and the
+    # metric then includes compile-state differences (fp8_ltx2 rose from ~0.09
+    # to 0.1291 that way in build 2954). Mirrors
+    # vllm_omni/quantization/tools/compare_diffusion_trajectory_similarity.py.
     # --- BF16 baseline ---
-    bl_kwargs: dict = {"model": config.baseline_ref()}
+    bl_kwargs: dict = {"model": config.baseline_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         bl_kwargs["enable_cpu_offload"] = True
     omni_bl = Omni(**bl_kwargs)
@@ -528,7 +537,7 @@ def test_quantization_quality(config: QualityTestConfig):
 
     # --- Quantized ---
     quantization = config.quantization_ref()
-    qt_kwargs: dict = {"model": config.quantized_ref()}
+    qt_kwargs: dict = {"model": config.quantized_ref(), "enforce_eager": True}
     if config.enable_cpu_offload:
         qt_kwargs["enable_cpu_offload"] = True
     if quantization is None:

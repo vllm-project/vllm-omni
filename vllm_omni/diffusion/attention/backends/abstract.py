@@ -15,6 +15,11 @@ class AttentionBackend(ABC):
 
     accept_output_buffer: bool = False
     supports_piecewise_spans: bool = False
+    # A backend that supports this capability can consume the opaque paged-KV
+    # context prepared by the diffusion Worker data plane.  Keeping the
+    # capability on the backend class prevents a paged request from silently
+    # falling back to dense attention on an incompatible implementation.
+    supports_paged_kv: bool = False
     # The backend can represent a contiguous valid K/V prefix by slicing the
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
@@ -28,6 +33,23 @@ class AttentionBackend(ABC):
         carry cu_seqlens/max_seqlen in ``AttentionMetadata.extra`` may skip
         constructing the padding mask entirely. Backends whose mask-free
         behavior is platform-dependent must check current_omni_platform.
+        """
+        return False
+
+    @classmethod
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        """Whether this backend keeps N-document packed boundaries isolated.
+
+        When True, the backend consumes ``AttentionMetadata.extra`` cu_seqlens
+        as a genuine block-diagonal attention plan (a dedicated varlen kernel,
+        not a padding-mask rebuild), so a caller may pack multiple real
+        requests into one forward without attention crossing document
+        boundaries. When False, callers packing more than one real document
+        must run one forward per document; otherwise a backend that only
+        supports a ``[real, pad]`` two-document contract, or that ignores
+        cu_seqlens outright, will silently attend across request boundaries.
+        Backends whose kernel selection is platform-dependent must consult
+        ``current_omni_platform``.
         """
         return False
 
@@ -80,6 +102,19 @@ class AttentionBackend(ABC):
     def supports_head_size(cls, head_size: int) -> bool:
         supported_head_sizes = cls.get_supported_head_sizes()
         return (not supported_head_sizes) or head_size in supported_head_sizes
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        """Whether this backend reads K/V pages by the runtime block stride.
+
+        Returning ``True`` means the physical cache layout has ``num_blocks``
+        as its outer stride, so native vLLM may safely use page-size padding
+        when it unifies cache layouts across layers. Dense diffusion backends
+        conservatively keep the default ``False``; a paged backend should
+        override this only when its kernel actually follows that layout.
+        """
+
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +242,18 @@ class AttentionImpl(ABC, Generic[T]):
             return self.forward_musa(query, key, value, attn_metadata)
         else:
             raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
+
+    def forward_paged(self, paged_kv_context: Any) -> torch.Tensor:
+        """Execute one Worker-prepared paged-KV attention call.
+
+        The context is intentionally opaque to the common attention layer.
+        Backends opt in by setting ``supports_paged_kv`` on their backend
+        class and implementing this method.  Dense callers continue to use
+        ``forward`` unchanged.
+        """
+
+        del paged_kv_context
+        raise NotImplementedError(f"{type(self).__name__} does not support paged KV attention")
 
     def forward_cuda(
         self,

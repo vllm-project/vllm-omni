@@ -94,6 +94,16 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # Only these EngineCore helpers may skip collective_rpc_async. A generic
+    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
+        {
+            "pause_scheduler",
+            "resume_scheduler",
+            "sleep",
+            "wake_up",
+        }
+    )
 
     def __init__(
         self,
@@ -1214,6 +1224,7 @@ class StagePool:
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1222,6 +1233,14 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    result = client_method(*args, **kwargs)
+                    if timeout is not None:
+                        return await asyncio.wait_for(result, timeout=timeout)
+                    return await result
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,

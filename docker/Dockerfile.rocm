@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.26.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.27.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.
@@ -10,7 +10,7 @@ FROM ${BASE_IMAGE} AS base
 #    we should swap over to use stable release ASAP.
 #    We should avoid relying on custom commits.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=v0.26.0
+ARG VLLM_VERSION_OR_COMMIT_HASH=v0.27.0
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
@@ -79,9 +79,16 @@ RUN printf '%s\n' \
     '    os._exit(_exit_code)' \
     > ${COMMON_WORKDIR}/vllm-omni/conftest.py
 
+# Some optional dependencies pull in the CPU ONNX Runtime distribution. The
+# CPU and ROCm wheels own the same import path and cannot coexist, so remove
+# the CPU wheel and reinstall the ROCm wheel after dependency resolution.
 RUN cd ${COMMON_WORKDIR}/vllm-omni && \
     uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
         --no-cache-dir ".[dev]" --no-build-isolation && \
+    python3 -m pip uninstall -y onnxruntime && \
+    python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "onnxruntime-rocm>=1.22.2" && \
+    python3 -c "import importlib.metadata as m; import onnxruntime as ort; assert 'ROCMExecutionProvider' in ort.get_available_providers(), ort.get_available_providers(); assert m.version('onnxruntime-rocm'); assert not any(d.metadata['Name'] == 'onnxruntime' for d in m.distributions())" && \
     python3 -c "from torchcodec.decoders import VideoDecoder"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python

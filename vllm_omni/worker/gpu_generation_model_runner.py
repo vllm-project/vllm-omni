@@ -69,6 +69,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
+            # nemotron_voicechat: code2wav (stage 2) consumes the talker's
+            # full-payload code stacks.
+            "NemotronVoiceChatCode2Wav",
         }
         if (
             getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
@@ -164,10 +167,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
-            if scheduler_output.total_num_scheduled_tokens <= 0:
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -176,7 +175,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self._execute_mm_encoder(scheduler_output)
                     return self.attach_omni_connector_output(make_empty_encoder_model_runner_output(scheduler_output))
 
-            if not num_scheduled_tokens:
+            # OMNI: keep this block in lock-step with the same block in
+            # GPUARModelRunner.execute_model.
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if num_scheduled_tokens <= 0:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
@@ -436,16 +438,29 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # pooler_output is no longer used for multimodal data.
         per_req_payloads: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
-            assert multimodal_outputs_raw.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
+            # One row per request. The old asserts (`shape[0] == 1` AND
+            # `shape[0] == num_reqs`) jointly forced num_reqs == 1, silently
+            # rejecting batched steps the generation scheduler does admit.
+            num_reqs = self.input_batch.num_reqs
+            if multimodal_outputs_raw.shape[0] != num_reqs:
+                raise ValueError(
+                    f"Multimodal output tensor has leading dim {multimodal_outputs_raw.shape[0]} "
+                    f"but the batch has {num_reqs} requests (one row per request; "
+                    "to return multiple tensors per request, use a dict)."
+                )
+            for i in range(num_reqs):
                 per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
-            assert len(multimodal_outputs_raw) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
+            # One entry per request. The old `len == 1` assert did not check
+            # num_reqs, so a batched step built a length-1 payload list that
+            # misaligned with `req_ids` downstream.
+            num_reqs = self.input_batch.num_reqs
+            if len(multimodal_outputs_raw) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list has length {len(multimodal_outputs_raw)} "
+                    f"but the batch has {num_reqs} requests (one entry per request; "
+                    "to return multiple lists per request, use a dict)."
+                )
             for out in multimodal_outputs_raw:
                 per_req_payloads.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
@@ -577,6 +592,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -790,13 +806,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()
+            elif getattr(getattr(self, "model", None), "has_preprocess", False):
+                # Capture CUDA graph with inputs_embeds path so replay reads
+                # from the same buffer that _preprocess writes into.
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
-            # Some generation-stage models (e.g. MammothModa2DiTPipeline) require
-            # model-specific runtime information (such as image size and conditioning
-            # embeddings) even during the dummy profiling run that vLLM uses to
+            # Some generation-stage models require model-specific runtime
+            # information (such as image size and conditioning embeddings)
+            # even during the dummy profiling run that vLLM uses to
             # estimate KV-cache capacity.  get_dummy_runtime_additional_information
             # provides placeholder values of the correct shape so that the profiling
             # run does not raise an error due to missing inputs.
@@ -836,6 +857,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
+                # Never randomize generation-stage dummy ids: they are
+                # structured payloads (e.g. packed RVQ codec codes that get
+                # code_offset added before embedding), so vocab-uniform random
+                # ids index past the codebook tables — CUDA device-side assert
+                # in code2wav warmup. The expert-balance rationale behind
+                # randomize_inputs targets text-MoE models, which generation
+                # stages are not. The kwarg stays accepted for vLLM API compat.
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
                     attn_metadata,

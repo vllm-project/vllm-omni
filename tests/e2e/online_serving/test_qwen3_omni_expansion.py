@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-Omni model.
 """
@@ -139,7 +139,7 @@ def get_max_batch_size(size_type="few"):
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text
     Output Modal: audio
@@ -156,12 +156,12 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_text_to_text_audio_001(omni_server, openai_client) -> None:
+def test_text_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text
     Output Modal: text, audio
@@ -176,12 +176,12 @@ def test_text_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_video_to_text_001(omni_server, openai_client) -> None:
+def test_text_video_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: long synthetic video (120s @ 30fps, LONG_VIDEO_FRAMES frames)
     Output Modal: text
@@ -200,12 +200,12 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
+def test_text_audio_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text, audio
     Output Modal: text, audio
@@ -223,12 +223,12 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_text_audio_to_text_audio_002(omni_server, openai_client) -> None:
+def test_text_audio_to_text_audio_002(omni_server, online_client) -> None:
     """
     Input Modal: text, long-duration audio (~LONG_AUDIO_DURATION_SEC s WAV)
     Output Modal: text, audio
@@ -248,12 +248,12 @@ def test_text_audio_to_text_audio_002(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
+def test_text_image_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text, image
     Output Modal: text, audio
@@ -272,12 +272,12 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
+def test_large_image_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text, high-resolution image (1080p-class JPEG)
     Output Modal: text, audio
@@ -300,12 +300,12 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
+def test_text_video_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text, video
     Output Modal: text, audio
@@ -325,13 +325,13 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @pytest.mark.skip(reason="There is a known issue with shape mismatch error.")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params + test_token_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text, audio, image, video
     Output Modal: text, audio
@@ -355,12 +355,12 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "stream": True,
         "key_words": {"audio": AUDIO_KEY, "image": IMAGE_KEY, "video": VIDEO_KEY},
     }
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_in_video_001(omni_server, openai_client) -> None:
+def test_audio_in_video_001(omni_server, online_client) -> None:
     """
     Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
     Output Modal: text, audio
@@ -381,12 +381,12 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "use_audio_in_video": True,
         "key_words": {"video": VIDEO_KEY},
     }
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_in_video_002(omni_server, openai_client) -> None:
+def test_audio_in_video_002(omni_server, online_client) -> None:
     """
     Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
     Output Modal: text, audio
@@ -408,12 +408,12 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_client) -> None:
+def test_audio_in_video_default_loader_sampling_regression(omni_server, online_client) -> None:
     """
     Regression: ``use_audio_in_video`` with default video loader sampling (no
     ``media_io_kwargs.video.fps``) after a prior request that pinned fps.
@@ -438,7 +438,7 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
     }
 
     # Prime mm-cache with explicit loader fps (historical failure mode).
-    openai_client.send_omni_request(
+    online_client.send_omni_request(
         {
             **base_config,
             "extra_body": {"media_io_kwargs": {"video": {"fps": 1, "num_frames": 128}}},
@@ -446,17 +446,37 @@ def test_audio_in_video_default_loader_sampling_regression(omni_server, openai_c
     )
 
     # Default loader sampling: must succeed without explicit media_io fps.
-    openai_client.send_omni_request(dict(base_config))
+    online_client.send_omni_request(dict(base_config))
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_one_word_prompt_001(omni_server, openai_client) -> None:
-    """
+def test_one_word_prompt_001(omni_server, online_client) -> None:
+    """Catastrophic-regression gate on one-word pronunciation.
+
+    Whether a one-word answer is pronounced intelligibly is sampled, not guaranteed: the
+    talker runs at temperature 0.9 (the upstream default, see qwen3_omni_moe.yaml stage 1),
+    so asserting it per request gates on a random variable, which is what the old 10-retry
+    loop was compensating for.
+
+    Sends a fixed 40 requests and requires at least 29 to transcribe as the expected
+    word. 85.6% is a predeclared minimum acceptable success probability, taken from a
+    measured HF reference run (77/90); vLLM-Omni itself measured 92.2%. Assuming 40
+    independent Bernoulli trials, >=29/40 has a nominal rejection probability of 0.9%
+    at p=.856, with 92.9% power at p=.60 and 55.9% at p=.70.
+
+    Those are conditional on p, not a measured false-failure rate for this CI: 77/90 is
+    one point estimate (Wilson 76.8%-91.4%), and at the low end of that interval the gate
+    would reject about 20% of runs. Pinning down a real rate would take repeated
+    report-only runs on the target hardware.
+
+    A drop to 70% is caught only about half the time, so this is a smoke gate for gross
+    pipeline breakage, not a quality tracker -- resolving moderate drift needs ~80+
+    samples and belongs in an accuracy benchmark. See #5395.
+
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
     Input Setting: stream=True
-    Datasets: single request
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -474,22 +494,18 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "transcript_language": "en",
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
-    _similarity_assert_msg = "The audio content is not same as the text"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    # The judge runs per request so mismatches can be counted, which also transcribes
+    # concurrently where the previous request_num=5 path judged serially -- worth watching
+    # on tighter cards, since each judge loads whisper on the same device as the talker and
+    # code2wav stages.
+    online_client.send_omni_request(
+        request_config, request_num=40, min_successes=29, max_concurrency=get_max_batch_size()
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_speaker_001(omni_server, openai_client) -> None:
+def test_speaker_001(omni_server, online_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
@@ -509,12 +525,12 @@ def test_speaker_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_speaker_002(omni_server, openai_client) -> None:
+def test_speaker_002(omni_server, online_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
@@ -539,7 +555,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
     _max_retries = 10
     for attempt in range(_max_retries):
         try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+            online_client.send_omni_request(request_config, request_num=get_max_batch_size())
             break
         except AssertionError as e:
             if _gender_assert_substr not in str(e) or attempt == _max_retries - 1:
@@ -549,7 +565,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_speaker_003(omni_server, openai_client) -> None:
+def test_speaker_003(omni_server, online_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
@@ -569,12 +585,12 @@ def test_speaker_003(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_language_001(omni_server, openai_client) -> None:
+def test_language_001(omni_server, online_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
     Output Modal: text, audio (default ``modalities``); ``key_words`` only assert on text.
@@ -593,12 +609,12 @@ def test_language_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["北京"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
+def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
     """
     Input Modal: text only (long-form generation prompt).
     Output Modal: text, audio (default ``modalities``);
@@ -611,7 +627,7 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     )
 
     request_config = {"model": omni_server.model, "messages": messages, "stream": True}
-    responses = openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    responses = online_client.send_omni_request(request_config, request_num=get_max_batch_size())
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
     assert word_count >= 200, f"Expected at least 200 words in long output, got {word_count}"

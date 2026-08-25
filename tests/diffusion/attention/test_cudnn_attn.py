@@ -5,11 +5,54 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionImpl
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
+
+
+@pytest.mark.parametrize(
+    ("query_sequence_length", "key_sequence_length", "expected_backend"),
+    [
+        (1, 1, SDPBackend.MATH),
+        (8, 1, SDPBackend.MATH),
+        (1, 8, SDPBackend.MATH),
+        (8, 8, SDPBackend.CUDNN_ATTENTION),
+    ],
+)
+def test_cudnn_routes_single_token_attention_to_math(
+    monkeypatch, query_sequence_length, key_sequence_length, expected_backend
+):
+    selected_backends = []
+
+    def fake_sdpa_kernel(backends):
+        selected_backends.append(backends)
+        return nullcontext()
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.cudnn_attn.sdpa_kernel",
+        fake_sdpa_kernel,
+    )
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        lambda query, _key, _value, **_kwargs: query,
+    )
+    impl = CuDNNAttentionImpl(
+        num_heads=2,
+        head_size=4,
+        softmax_scale=0.5,
+    )
+    query = torch.randn(1, query_sequence_length, 2, 4)
+    key = torch.randn(1, key_sequence_length, 2, 4)
+    value = torch.randn_like(key)
+
+    output = impl.forward_cuda(query, key, value)
+
+    assert output.shape == query.shape
+    assert selected_backends == [[expected_backend]]
 
 
 def test_cudnn_slices_valid_kv_prefix_without_padding_mask(monkeypatch):

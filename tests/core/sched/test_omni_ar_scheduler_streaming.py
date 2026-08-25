@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for Omni AR streaming-session async placeholder handling."""
 
@@ -33,6 +33,9 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
     sched.skipped_waiting = set()
+    sched._free_request_blocks = MagicMock()
+    sched.encoder_cache_manager = MagicMock()
+    sched._inflight_prefills = set()
     return sched
 
 
@@ -61,6 +64,9 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    handle_stopped=None,
+    chunk_transfer_adapter=None,
+    inter_stage_output=None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -72,11 +78,14 @@ def _run_resumable_segment_stop(
         return [42], True
 
     sched._update_request_with_output.side_effect = stop_request
-    sched._handle_stopped_request.return_value = session_finished
     # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
     # MagicMock iterates empty and fails to unpack at the call site.
     sched._free_request.return_value = (None, None)
-    sched.chunk_transfer_adapter = None
+    if handle_stopped is None:
+        sched._handle_stopped_request.return_value = session_finished
+    else:
+        sched._handle_stopped_request.side_effect = handle_stopped
+    sched.chunk_transfer_adapter = chunk_transfer_adapter
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -102,6 +111,7 @@ def _run_resumable_segment_stop(
     model_runner_output.cudagraph_stats = None
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
+    model_runner_output.inter_stage_outputs = [inter_stage_output] if inter_stage_output is not None else None
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
@@ -155,6 +165,41 @@ def test_update_from_output_settles_in_flight_tokens() -> None:
     _run_resumable_segment_stop(session)
 
     assert session.num_in_flight_tokens == 0
+
+
+def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> None:
+    """The old segment's transfer must not observe the next segment's reset.
+
+    A queued streaming update can replace the same mutable Request while the
+    stop output is still being handled. The connector needs the confirmed
+    token count from before that replacement to avoid dropping the boundary.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = 26
+    adapter = MagicMock()
+    adapter._confirmed_num_computed_tokens.return_value = 26
+    inter_stage_output = {"codes": {"audio": [7]}}
+
+    def replace_with_next_segment(request: Request) -> bool:
+        request.num_computed_tokens = 0
+        request.status = RequestStatus.WAITING
+        return False
+
+    _run_resumable_segment_stop(
+        session,
+        handle_stopped=replace_with_next_segment,
+        chunk_transfer_adapter=adapter,
+        inter_stage_output=inter_stage_output,
+    )
+
+    adapter.save_async.assert_called_once_with(
+        inter_stage_output,
+        session,
+        True,
+        confirmed_num_computed_tokens=26,
+    )
 
 
 def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
@@ -276,29 +321,33 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
         "meta": {"turn_eos_token_id": 99},
     }
     assert session.status == RequestStatus.WAITING
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
-def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None:
+def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
+    session = _make_request()
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=False,
         segment_finished_requests=set(),
+        requests_num_chunks_sent={session.external_req_id: 59},
     )
-    session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 59
     session._all_token_ids.clear()
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 59
     session.num_computed_tokens = 59
+    session.num_in_flight_tokens = 2
     update = _make_update([0] * 10)
     update.additional_information = None
     update.model_intermediate_buffer = {
         "ids": {"tts": list(range(8))},
         "hidden_states": {"tts": [[0.0]] * 8},
         "meta": {
-            "replace_streaming_prompt": True,
             "next_stage_prompt_len": 10,
+            "replace_streaming_prompt": True,
         },
     }
 
@@ -308,6 +357,42 @@ def test_model_intermediate_streaming_payload_replaces_computed_prompt() -> None
     assert list(session._all_token_ids) == [0] * 10
     assert session.num_prompt_tokens == 10
     assert session.num_computed_tokens == 0
+    assert session.num_stale_output_tokens == 2
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
+    sched = _make_scheduler(stage_id=1)
+    session = _make_request()
+    session.external_req_id = "external-ar-streaming-test"
+    session.num_in_flight_tokens = 2
+    # _update_request_as_session() may have already fenced this frame before
+    # the connector marks the explicit replacement ready.
+    session.num_stale_output_tokens = 2
+    session.num_output_placeholders = 2
+    session.spec_token_ids = [-1, -1]
+    sched.requests = {session.request_id: session}
+    sched._inflight_prefills.add(session)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        replaced_streaming_prompt_ids={session.request_id},
+        requests_with_ready_chunks={session.request_id},
+        requests_num_chunks_sent={session.external_req_id: 4090},
+    )
+
+    sched._reset_ready_async_chunk_replacements()
+    sched._reset_ready_async_chunk_replacements()
+
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+    assert session not in sched._inflight_prefills
+    assert session.num_stale_output_tokens == 2
+    assert session.num_output_placeholders == 0
+    assert session.spec_token_ids == []
+    assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
+    assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {session.request_id}
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}

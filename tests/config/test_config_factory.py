@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
 import warnings
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +14,8 @@ import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config import config_factory as config_factory_module
+from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -34,9 +35,8 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
-    strip_parent_engine_args,
 )
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, EngineArgs, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -56,6 +56,7 @@ def clear_config_factory_caches():
     yield
     StageConfigFactory.get_hf_config.cache_clear()
     StageConfigFactory.try_infer_model_type.cache_clear()
+    _materialize_object_storage_configs.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -475,7 +476,7 @@ class TestStageConfigFactory:
         cli_overrides = {
             "gpu_memory_utilization": 0.9,
             "model": "some_model",  # Internal
-            "stage_configs_path": "/path",  # Internal
+            "deploy_config": "/path",  # Internal
             "batch_timeout": 10,  # Internal
         }
 
@@ -483,7 +484,7 @@ class TestStageConfigFactory:
 
         assert overrides["gpu_memory_utilization"] == 0.9
         assert "model" not in overrides
-        assert "stage_configs_path" not in overrides
+        assert "deploy_config" not in overrides
         assert "batch_timeout" not in overrides
 
     def test_per_stage_override_excludes_internal_keys(self):
@@ -524,49 +525,6 @@ class TestStageResolutionHelpers:
         assert overrides["gpu_memory_utilization"] == 0.9
         assert "model" not in overrides
         assert "parallel_config" not in overrides
-
-    def test_strip_parent_engine_args_reports_only_surprising_parent_overrides(self):
-        parent_fields = {f.name: f for f in fields(EngineArgs)}
-        filtered, overridden = strip_parent_engine_args(
-            {
-                "model": "some/model",
-                "stage_configs_path": "/tmp/stages.yaml",
-                "tensor_parallel_size": 4,
-                "worker_extension_cls": "some.Extension",
-                "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
-            },
-            parent_fields=parent_fields,
-            keep_keys={"worker_extension_cls"},
-            strip_keys={"stage_configs_path"},
-            no_warn_keys={"model"},
-        )
-
-        assert filtered == {
-            "worker_extension_cls": "some.Extension",
-            "custom_pipeline_args": {"pipeline_class": "demo.Pipeline"},
-        }
-        assert overridden == ["tensor_parallel_size"]
-
-    def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
-        parent_fields = {f.name: f for f in fields(EngineArgs)}
-        filtered, overridden = strip_parent_engine_args(
-            {
-                "model": "some/model",
-                "stage_configs_path": "/tmp/stages.yaml",
-                "allowed_local_media_path": "/data/qwentts",
-                "allowed_media_domains": ["example.com"],
-            },
-            parent_fields=parent_fields,
-            keep_keys={"allowed_local_media_path", "allowed_media_domains"},
-            strip_keys={"stage_configs_path"},
-            no_warn_keys={"model"},
-        )
-
-        assert filtered == {
-            "allowed_local_media_path": "/data/qwentts",
-            "allowed_media_domains": ["example.com"],
-        }
-        assert overridden == []
 
 
 class TestPipelineDiscovery:
@@ -1144,6 +1102,13 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_rejects_legacy_stage_args_schema(self, tmp_path):
+        deploy_path = tmp_path / "legacy.yaml"
+        deploy_path.write_text("stage_args:\n  - stage_id: 0\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
+            load_deploy_config(deploy_path)
+
     def test_load_minicpmo_duplex_deploy_config(self):
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5_duplex.yaml"))
 
@@ -1162,9 +1127,11 @@ class TestDeployConfigLoading:
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False
-        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 2048
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
         assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
-        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+        assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -1300,8 +1267,6 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
-            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
-            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -1339,6 +1304,7 @@ stages:
             ({"model_type": "step_audio_2"}, None, "step_audio_2"),
             (None, {"_class_name": "HunyuanVideo15Pipeline"}, "hunyuan_video_15"),
             (None, {"_class_name": "WanPipeline"}, "wan2_2_ti2v"),
+            (None, {"_class_name": "WanDMDPipeline"}, "wan2_2_ti2v"),
         ],
     )
     def test_migrated_models_are_discovered_without_explicit_deploy(
@@ -1419,7 +1385,8 @@ stages:
         assert async_stages[1].custom_process_input_func is None
 
     def test_no_bundled_legacy_stage_config_yamls(self):
-        stage_config_dir = Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
+        repo_root = Path(__file__).resolve().parents[2]
+        stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"
         assert not list(stage_config_dir.glob("*.yaml"))
 
     def test_merge_pipeline_deploy(self):
@@ -1693,6 +1660,7 @@ stages:
             ]
         }
         original_foo = fake_config["stages"][0]["foo"]
+        assert isinstance(original_foo, dict)
         original_b = original_foo["b"]
 
         with patch("vllm_omni.config.stage_config.resolve_deploy_yaml", return_value=fake_config):
@@ -2145,6 +2113,28 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    def test_minicpmo_overlays_inherit_talker_sampling_params(self):
+        """Overlays must keep the base Talker codec Sampler knobs."""
+        for filename in (
+            "minicpmo_4_5_duplex.yaml",
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_8x4090_stage1_replicas.yaml",
+        ):
+            path = Path(get_deploy_config_path(filename))
+            if not path.exists():
+                pytest.skip(f"{filename} not found")
+            deploy = load_deploy_config(path)
+            sampling = deploy.stages[1].default_sampling_params
+            assert sampling is not None, f"{filename} stage 1 lost default_sampling_params"
+            assert sampling["temperature"] == 0.8, filename
+            # Upstream utils.TTSSamplingParams. min_tokens is not checked here:
+            # the duplex overlay drops it to 0 because the model budgets each
+            # generate_chunk itself.
+            assert sampling["top_k"] == 25, filename
+            assert sampling["top_p"] == 0.85, filename
+            assert sampling["repetition_penalty"] == 1.05, filename
+
     def test_ci_inherits_from_main(self):
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
         if not ci_path.exists():
@@ -2235,6 +2225,28 @@ class TestPlatformOverrides:
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
 
+    def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        expected = {"custom_ops": ["+rotary_embedding"]}
+        assert cuda_stages[0].yaml_engine_args["compilation_config"] == expected
+        assert all("compilation_config" not in stage.yaml_engine_args for stage in cuda_stages[1:])
+
+        for platform in ("cpu", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(
+                load_deploy_config(deploy_path),
+                platform=platform,
+            )
+            config = deploy.stages[0].compilation_config or {}
+            assert "+rotary_embedding" not in config.get("custom_ops", [])
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
@@ -2275,6 +2287,16 @@ class TestPlatformOverrides:
         assert deploy.stages[0].devices == "0,1"
         # Stage 2 unaffected fields stay at base
         assert deploy.stages[2].enforce_eager is False
+
+    def test_qwen2_5_omni_xpu_uses_eager_ar_stages(self):
+        deploy_path = Path(get_deploy_config_path("qwen2_5_omni.yaml"))
+
+        deploy = load_deploy_config(deploy_path)
+        deploy = _apply_platform_overrides(deploy, platform="xpu")
+
+        assert deploy.stages[0].enforce_eager is True
+        assert deploy.stages[1].enforce_eager is True
+        assert deploy.stages[2].enforce_eager is True
 
     def test_xpu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
@@ -2799,3 +2821,90 @@ class TestPipelineConfigResolvers:
             pass
 
         assert resolver(NotTheRightHfConfig()) is None
+
+
+class TestObjectStorageConfigResolution:
+    """Object-storage URIs must be materialized locally before any HF-style reads.
+
+    Regression coverage for review on the Run:AI PR: ``get_config`` and the
+    config.json/model_index.json fallbacks crashed with ``HFValidationError``
+    for ``s3://`` URIs, and the name-match fallback scanned the whole URI, so
+    a bucket named after another pipeline could hijack pipeline selection.
+    """
+
+    @pytest.fixture
+    def fake_object_storage(self, monkeypatch, tmp_path):
+        """Replace ObjectStorageModel with a fake that "pulls" into a tmp dir.
+
+        Returns a recorder: calls to the returned callable write files into
+        the materialized directory, and ``recorder.pulls`` records every
+        ``pull_files`` invocation.
+        """
+        pulls: list[tuple[str, list[str] | None, list[str] | None]] = []
+        materialized_files: list[tuple[str, str]] = []
+
+        class FakeObjectStorageModel:
+            def __init__(self, url: str):
+                self.dir = str(tmp_path)
+
+            def pull_files(self, model_path, allow_pattern=None, ignore_pattern=None):
+                pulls.append((model_path, allow_pattern, ignore_pattern))
+                for name, content in materialized_files:
+                    (tmp_path / name).write_text(content)
+
+        monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
+
+        class Recorder:
+            def __init__(self) -> None:
+                self.pulls = pulls
+
+            def set_files(self, files: list[tuple[str, str]]) -> None:
+                materialized_files.clear()
+                materialized_files.extend(files)
+
+        return Recorder()
+
+    def test_passthrough_for_non_uri(self, fake_object_storage):
+        assert _materialize_object_storage_configs("org/model") == "org/model"
+        assert _materialize_object_storage_configs("/local/model") == "/local/model"
+        assert fake_object_storage.pulls == []
+
+    def test_materialize_pulls_configs_once_per_uri(self, fake_object_storage):
+        uri = "s3://bucket/model"
+
+        first = _materialize_object_storage_configs(uri)
+        second = _materialize_object_storage_configs(uri)
+
+        assert first == second
+        assert len(fake_object_storage.pulls) == 1
+        pulled_uri, allow_pattern, ignore_pattern = fake_object_storage.pulls[0]
+        assert pulled_uri == uri
+        assert "*.json" in allow_pattern
+        assert ignore_pattern is None
+
+    def test_try_infer_model_type_reads_materialized_config(self, fake_object_storage):
+        """A misleading bucket name must not beat the real config.json content."""
+        fake_object_storage.set_files(
+            [
+                (
+                    "config.json",
+                    '{"model_type": "qwen3_omni_moe", "architectures": ["Qwen3OmniMoeForConditionalGeneration"]}',
+                )
+            ]
+        )
+        uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
+
+        model = StageConfigFactory.try_infer_model_type(model=uri, trust_remote_code=False)
+
+        assert model == "qwen3_omni_moe"
+        assert fake_object_storage.pulls  # materialization happened
+
+    def test_name_match_fallback_scans_basename_only(self, fake_object_storage):
+        # Empty config.json (CosyVoice3 style) forces the name-match fallback.
+        fake_object_storage.set_files([("config.json", "{}")])
+
+        deceptive = "s3://qwen3-tts-models/plain-checkpoint"
+        assert StageConfigFactory.try_infer_model_type(model=deceptive, trust_remote_code=False) is None
+
+        matching = "s3://any-bucket/my-cosyvoice3-model"
+        assert StageConfigFactory.try_infer_model_type(model=matching, trust_remote_code=False) == "cosyvoice3"

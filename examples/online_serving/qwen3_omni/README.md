@@ -513,7 +513,7 @@ The script supports the following arguments:
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-If you have custom stage configs file:
+If you have a custom deploy config file:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
