@@ -133,79 +133,6 @@ time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
 only changes CPU MP4 response encoding; it does not change DiT execution or
 stage 0.
 
-#### Event-loop scheduling
-
-Complete non-streaming raw MP4 encoding runs in a dedicated single-worker
-executor instead of the API server's asyncio event loop. This covers the
-background artifact produced by `/v1/videos`, the raw MP4 response from
-`/v1/videos/sync`, and both the direct-planar and legacy fallback routes. The
-existing base64 response handler also uses the executor, but it currently has
-no HTTP route. Streaming fMP4 output keeps its existing incremental path. The
-executor is configured internally at service startup; there is no CLI option
-or request parameter.
-
-One response is admitted to native encoding at a time. Additional request
-coroutines wait before executor submission, so native encoding work does not
-accumulate in the executor queue. Waiting requests can still retain their
-generated artifacts, and the design does not impose a global request-memory
-bound.
-
-Cancellation or a synchronous endpoint timeout cannot stop work that has
-already entered the native codec. That work retains the encoding slot until it
-finishes. During service shutdown, background video jobs are cancelled and
-awaited before the executor rejects pending submissions, cancels work that has
-not started, and waits for the active encode to complete.
-
-The startup log records `execution=dedicated_executor`,
-`scope=non_streaming_mp4`, `paths=raw_mp4,base64_handler`, and
-`max_active_encodes=1`.
-Per-response encoding logs record `queue_inclusive=true` and the execution
-mode, so their duration includes time waiting for the slot.
-
-A fixed-input CPU benchmark used a 124-frame H3 dump at 1344x768 with stereo
-32 kHz audio, one warmup, and five formal runs per side on CPUs 72-95. Moving
-the encode reduced the median maximum event-loop heartbeat gap from 4766.558 ms
-to 10.033 ms (-99.79%) and its p99 from 4623.715 ms to 5.160 ms (-99.89%).
-The outputs were byte-identical; encode wall time and process CPU time remained
-diagnostic rather than acceptance metrics.
-
-**Measured A2 service validation (2026-08-24)** compared base commit
-`d150a4fde77d15d466102323a4048b0a8631d74c` with candidate commit
-`b10656285122b463a2bb868fdac35e9cb8cf7969`. Both used MiniMax-H3
-`FL2VA`/`t2va` on one Atlas A2 host with 8x Ascend 910B4-1 NPUs, the eight-NPU
-command above with `MODEL=$MODEL_ROOT/FL2VA`, and
-`MINDIE_SD_FA_TYPE=ascend_laser_attention`. The API process was pinned to CPUs
-72-95 with the default NUMA memory policy. Each side discarded one 5-second
-warmup, then ran three 5-second requests, one at a time, at 1344x768 and 24 fps
-with `seed=1101`, `flow_shift=12`, `audio_flow_shift=3.0`, 50 requested steps,
-and 49 DiT forwards. The fixed prompt was: "In a snowy blue-purple forest, Ori
-carefully walks past a sleeping giant; footsteps crunch in the snow while the
-creature breathes and softly snorts."
-
-| Formal median (`n=3`) | Base | Candidate | Change |
-| --- | ---: | ---: | ---: |
-| Maximum `/health` response during each request | 4.350 s | 0.185 s | -95.74% |
-| MP4 encoding | 4726.080 ms | 4816.380 ms | +1.91% |
-| Stage 0 | 158465.635 ms | 160077.244 ms | +1.02% |
-| Server E2E | 163.138 s | 164.909 s | +1.09% |
-
-All six formal outputs were byte-identical, with SHA-256
-`246100788ea4a839a3b0dc1a7a33405dd9b1f6252b6f6889cf8c70682f73c351`,
-and passed full decode as 124-frame H.264 1344x768 video at 24 fps with AAC
-stereo audio at 32 kHz. No rank failure, OOM, collective timeout, NaN/Inf, or
-backend fallback occurred. At 1-second sampling, the per-device formal peak HBM
-values for NPU 0-7 were `[28803, 29477, 29477, 32448, 29564, 29563, 29563,
-31030]` MB for Base and `[28803, 29475, 30943, 31166, 29564, 29562, 29561,
-29563]` MB for the candidate.
-
-The validated stack was driver 25.5.2, firmware 7.8.0.7.220, CANN 9.0.1,
-Python 3.12.13, PyTorch 2.10.0+cpu, torch_npu 2.10.0.post2, vLLM
-0.26.0+empty, vLLM-Ascend 0.19.1rc2.dev1251+g905bbf372, MindIE-SD 3.0.0,
-PyAV 18.0.0, and ffmpeg/ffprobe 4.4.2. The `/health` result measures event-loop
-responsiveness. MP4, Stage 0, and E2E changes are diagnostic variation rather
-than encoding or generation acceleration. The mechanism is model- and
-platform-neutral, but it has not yet been tested on other deployments.
-
 ### Optional optimizations
 
 Two independent optimizations may be enabled on top of the configuration
@@ -284,6 +211,7 @@ exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
 kernel's fp16 workspace cannot overflow on outlier activations. Measured
 speedup numbers will be added here.
 
+
 ## HTTP API examples
 
 The request format is identical to the GPU recipe; see
@@ -303,7 +231,7 @@ PyTorch 2.10.0+cpu, and torch_npu 2.10.0.post2, using the multi-NPU
 configuration above:
 
 | Workload | Configuration |
-| -------- | ------------- |
+|----------|---------------|
 | T2VA, 209 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
 | Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
 
