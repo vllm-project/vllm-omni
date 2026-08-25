@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import struct
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
@@ -14,28 +15,87 @@ from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model
 ACTION_SCHEMA_VERSION = 3
 NORMALIZER_SCHEMA_VERSION = 1
 AGIBOT_RAW_ACTION_DIM = 29
+YAM_RAW_ACTION_DIM = 20
 CAMERA_RAW_ACTION_DIM = 9
 MODEL_ACTION_DIM = 64
 ACTION_TOKENS_PER_FRAME = 4
 NUM_EMBODIMENT_DOMAINS = 32
 AGIBOT_DOMAIN_ID = 15
+YAM_DOMAIN_ID = 16
 CAMERA_DOMAIN_ID = 2
 RANGE_FLOOR = 1e-8
-LAYOUT_ID = "agibot_backward_framewise_rot6d_v1"
+AGIBOT_LAYOUT_ID = "agibot_backward_framewise_rot6d_v1"
+# Backward-compatible alias for callers that imported the original AgiBot-only constant.
+LAYOUT_ID = AGIBOT_LAYOUT_ID
+YAM_LAYOUT_ID = "legacy_yam_fk_backward_framewise_rot6d_v1"
 CAMERA_LAYOUT_ID = "camera_pose_backward_framewise_rot6d_v1"
 ACTION_NORMALIZERS_RELATIVE_DIR = "projects/cosmos3/cosmos3/datasets/action/normalizers"
+LEGACY_YAM_NORMALIZERS_RELATIVE_DIR = "projects/cosmos3/cosmos3/datasets/action/legacy/normalizers"
 SHARED_AGIBOT_STATS = "agibot_backward_framewise_rot6d.json"
 LEGACY_GEAR_STATS = "agibot_gear_gripper_backward_framewise_rot6d.json"
+ABC_YAM_STATS = "abc_yam_backward_framewise_rot6d.json"
+MOLMOACT2_YAM_STATS = "molmoact2_yam_backward_framewise_rot6d.json"
+XDOF_YAM_STATS = "xdof_yam_backward_framewise_rot6d.json"
 
-_SUPPORTED_DATASETS: dict[str, tuple[str, frozenset[str]]] = {
-    "AgiBotWorldBetaDataset": ("agibotworld", frozenset({SHARED_AGIBOT_STATS})),
-    "AgibotGEARGripperDataset": (
-        "agibot_gear_gripper",
-        frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
+
+@dataclass(frozen=True)
+class _DatasetContractSpec:
+    embodiment: str
+    domain_id: int
+    raw_action_dim: int
+    layout_id: str
+    normalizers_relative_dir: str
+    allowed_stats_filenames: frozenset[str]
+
+
+_SUPPORTED_DATASETS: dict[str, _DatasetContractSpec] = {
+    "AgiBotWorldBetaDataset": _DatasetContractSpec(
+        embodiment="agibotworld",
+        domain_id=AGIBOT_DOMAIN_ID,
+        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
+        layout_id=AGIBOT_LAYOUT_ID,
+        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS}),
     ),
-    "AgibotGEARGripperExtDataset": (
-        "agibot_gear_gripper_ext",
-        frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
+    "AgibotGEARGripperDataset": _DatasetContractSpec(
+        embodiment="agibot_gear_gripper",
+        domain_id=AGIBOT_DOMAIN_ID,
+        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
+        layout_id=AGIBOT_LAYOUT_ID,
+        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
+    ),
+    "AgibotGEARGripperExtDataset": _DatasetContractSpec(
+        embodiment="agibot_gear_gripper_ext",
+        domain_id=AGIBOT_DOMAIN_ID,
+        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
+        layout_id=AGIBOT_LAYOUT_ID,
+        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
+    ),
+    "ABCYAMLeRobotDataset": _DatasetContractSpec(
+        embodiment="abc_yam",
+        domain_id=YAM_DOMAIN_ID,
+        raw_action_dim=YAM_RAW_ACTION_DIM,
+        layout_id=YAM_LAYOUT_ID,
+        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({ABC_YAM_STATS}),
+    ),
+    "MolmoAct2YAMDataset": _DatasetContractSpec(
+        embodiment="molmoact2_yam",
+        domain_id=YAM_DOMAIN_ID,
+        raw_action_dim=YAM_RAW_ACTION_DIM,
+        layout_id=YAM_LAYOUT_ID,
+        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({MOLMOACT2_YAM_STATS}),
+    ),
+    "XDOFYAMDataset": _DatasetContractSpec(
+        embodiment="xdof_yam",
+        domain_id=YAM_DOMAIN_ID,
+        raw_action_dim=YAM_RAW_ACTION_DIM,
+        layout_id=YAM_LAYOUT_ID,
+        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
+        allowed_stats_filenames=frozenset({XDOF_YAM_STATS}),
     ),
 }
 
@@ -89,6 +149,7 @@ class ActionLayoutField(_StrictModel):
 class ActionLayout(_StrictModel):
     id: Literal[
         "agibot_backward_framewise_rot6d_v1",
+        "legacy_yam_fk_backward_framewise_rot6d_v1",
         "camera_pose_backward_framewise_rot6d_v1",
     ]
     pose_convention: Literal["backward_framewise"]
@@ -98,7 +159,7 @@ class ActionLayout(_StrictModel):
 
     @model_validator(mode="after")
     def validate_target_layout(self) -> ActionLayout:
-        if self.id == LAYOUT_ID:
+        if self.id == AGIBOT_LAYOUT_ID:
             expected = (
                 ("head_translation", 0, 3, "meter", None, None, None),
                 ("head_rotation", 3, 6, "dimensionless", "rot6d_columns", None, None),
@@ -108,6 +169,15 @@ class ActionLayout(_StrictModel):
                 ("left_translation", 19, 3, "meter", None, None, None),
                 ("left_rotation", 22, 6, "dimensionless", "rot6d_columns", None, None),
                 ("left_gripper", 28, 1, "open_fraction", None, 0.0, 1.0),
+            )
+        elif self.id == YAM_LAYOUT_ID:
+            expected = (
+                ("left_translation", 0, 3, "meter", None, None, None),
+                ("left_rotation", 3, 6, "dimensionless", "rot6d_columns", None, None),
+                ("left_gripper", 9, 1, "open_fraction", None, 0.0, 1.0),
+                ("right_translation", 10, 3, "meter", None, None, None),
+                ("right_rotation", 13, 6, "dimensionless", "rot6d_columns", None, None),
+                ("right_gripper", 19, 1, "open_fraction", None, 0.0, 1.0),
             )
         else:
             expected = (
@@ -177,9 +247,9 @@ class SourceProvenance(_StrictModel):
     @model_validator(mode="after")
     def validate_artifact_paths(self) -> SourceProvenance:
         allowed_paths = {
-            f"{ACTION_NORMALIZERS_RELATIVE_DIR}/{filename}"
-            for _, filenames in _SUPPORTED_DATASETS.values()
-            for filename in filenames
+            f"{spec.normalizers_relative_dir}/{filename}"
+            for spec in _SUPPORTED_DATASETS.values()
+            for filename in spec.allowed_stats_filenames
         }
         if self.path not in allowed_paths:
             raise ValueError(f"Cosmos-Dreams normalizer source path is not a supported target artifact: {self.path!r}.")
@@ -203,11 +273,17 @@ class ResolvedDatasetDescriptor(_StrictModel):
         "AgiBotWorldBetaDataset",
         "AgibotGEARGripperDataset",
         "AgibotGEARGripperExtDataset",
+        "ABCYAMLeRobotDataset",
+        "MolmoAct2YAMDataset",
+        "XDOFYAMDataset",
     ]
     embodiment: Literal[
         "agibotworld",
         "agibot_gear_gripper",
         "agibot_gear_gripper_ext",
+        "abc_yam",
+        "molmoact2_yam",
+        "xdof_yam",
     ]
     method: Literal["quantile_rot"]
     apply_forward_clamp: Literal[False]
@@ -216,12 +292,15 @@ class ResolvedDatasetDescriptor(_StrictModel):
     stats_filename: Literal[
         "agibot_backward_framewise_rot6d.json",
         "agibot_gear_gripper_backward_framewise_rot6d.json",
+        "abc_yam_backward_framewise_rot6d.json",
+        "molmoact2_yam_backward_framewise_rot6d.json",
+        "xdof_yam_backward_framewise_rot6d.json",
     ]
 
     @model_validator(mode="after")
     def validate_association(self) -> ResolvedDatasetDescriptor:
-        expected_embodiment, allowed_stats = _SUPPORTED_DATASETS[self.dataset_class]
-        if self.embodiment != expected_embodiment or self.stats_filename not in allowed_stats:
+        spec = _SUPPORTED_DATASETS[self.dataset_class]
+        if self.embodiment != spec.embodiment or self.stats_filename not in spec.allowed_stats_filenames:
             raise ValueError(
                 "Cosmos-Dreams training dataset descriptor has an invalid class/embodiment/statistics association."
             )
@@ -284,9 +363,10 @@ class QuantileRotNormalizerContract(_StrictModel):
 
     @model_validator(mode="after")
     def verify_transform_hash(self) -> QuantileRotNormalizerContract:
-        if len(self.transform.offset) != AGIBOT_RAW_ACTION_DIM:
+        if len(self.transform.offset) not in {AGIBOT_RAW_ACTION_DIM, YAM_RAW_ACTION_DIM}:
             raise ValueError(
-                "Cosmos-Dreams quantile_rot offset/scale lengths must equal raw_action_dim=29, "
+                "Cosmos-Dreams quantile_rot offset/scale lengths must equal a supported raw_action_dim "
+                f"({YAM_RAW_ACTION_DIM} or {AGIBOT_RAW_ACTION_DIM}), "
                 f"got {len(self.transform.offset)} and {len(self.transform.scale)}."
             )
         expected = canonical_sha256(self.behavioral_payload())
@@ -361,16 +441,18 @@ class CosmosDreamsEmbodimentContract(_StrictModel):
     """Per-embodiment raw action semantics for schema v3."""
 
     domain_id: StrictInt = Field(ge=0, lt=NUM_EMBODIMENT_DOMAINS)
-    raw_action_dim: Literal[9, 29]
+    raw_action_dim: Literal[9, 20, 29]
     layout: ActionLayout
     normalizer: ActionNormalizerContract
 
     @model_validator(mode="after")
     def verify_layout_family(self) -> CosmosDreamsEmbodimentContract:
-        camera_variant = self.layout.id == CAMERA_LAYOUT_ID
-        expected_domain_id = CAMERA_DOMAIN_ID if camera_variant else AGIBOT_DOMAIN_ID
-        expected_raw_action_dim = CAMERA_RAW_ACTION_DIM if camera_variant else AGIBOT_RAW_ACTION_DIM
-        expected_normalizer_type = PoseScaleNormalizerContract if camera_variant else QuantileRotNormalizerContract
+        layout_specs = {
+            AGIBOT_LAYOUT_ID: (AGIBOT_DOMAIN_ID, AGIBOT_RAW_ACTION_DIM, QuantileRotNormalizerContract),
+            YAM_LAYOUT_ID: (YAM_DOMAIN_ID, YAM_RAW_ACTION_DIM, QuantileRotNormalizerContract),
+            CAMERA_LAYOUT_ID: (CAMERA_DOMAIN_ID, CAMERA_RAW_ACTION_DIM, PoseScaleNormalizerContract),
+        }
+        expected_domain_id, expected_raw_action_dim, expected_normalizer_type = layout_specs[self.layout.id]
         if self.domain_id != expected_domain_id:
             raise ValueError(
                 f"Cosmos-Dreams layout {self.layout.id!r} requires domain_id={expected_domain_id}, "
@@ -382,8 +464,13 @@ class CosmosDreamsEmbodimentContract(_StrictModel):
                 f"got {self.raw_action_dim}."
             )
         if not isinstance(self.normalizer, expected_normalizer_type):
-            expected_method = "pose_scale" if camera_variant else "quantile_rot"
+            expected_method = "pose_scale" if self.layout.id == CAMERA_LAYOUT_ID else "quantile_rot"
             raise ValueError(f"Cosmos-Dreams layout {self.layout.id!r} requires method={expected_method!r}.")
+        if len(self.normalizer.transform.offset) != expected_raw_action_dim:
+            raise ValueError(
+                f"Cosmos-Dreams layout {self.layout.id!r} requires normalizer dimension "
+                f"{expected_raw_action_dim}, got {len(self.normalizer.transform.offset)}."
+            )
         return self
 
 
@@ -467,8 +554,11 @@ class CosmosDreamsActionSchema(_StrictModel):
         repository_revisions: set[str] = set()
         for embodiment, contract in self.embodiments.items():
             descriptor = descriptor_by_embodiment[embodiment]
-            camera_variant = isinstance(descriptor, CameraResolvedDatasetDescriptor)
-            if camera_variant != (contract.layout.id == CAMERA_LAYOUT_ID):
+            if isinstance(descriptor, CameraResolvedDatasetDescriptor):
+                expected_layout_id = CAMERA_LAYOUT_ID
+            else:
+                expected_layout_id = _SUPPORTED_DATASETS[descriptor.dataset_class].layout_id
+            if contract.layout.id != expected_layout_id:
                 raise ValueError(
                     f"Cosmos-Dreams embodiment {embodiment!r} layout disagrees with its dataset descriptor."
                 )
@@ -484,8 +574,9 @@ class CosmosDreamsActionSchema(_StrictModel):
                 if normalizer.source.repository_revision != normalizer.training_config.repository_revision:
                     raise ValueError(f"Cosmos-Dreams normalizer {embodiment!r} mixes source and training revisions.")
                 if not isinstance(descriptor, ResolvedDatasetDescriptor):
-                    raise ValueError("Cosmos-Dreams quantile_rot normalizer requires an AgiBot dataset descriptor.")
-                expected_source_path = f"{ACTION_NORMALIZERS_RELATIVE_DIR}/{descriptor.stats_filename}"
+                    raise ValueError("Cosmos-Dreams quantile_rot normalizer requires an action dataset descriptor.")
+                spec = _SUPPORTED_DATASETS[descriptor.dataset_class]
+                expected_source_path = f"{spec.normalizers_relative_dir}/{descriptor.stats_filename}"
                 if normalizer.source.path != expected_source_path:
                     raise ValueError(
                         f"Cosmos-Dreams normalizer {embodiment!r} source does not match its resolved dataset config."

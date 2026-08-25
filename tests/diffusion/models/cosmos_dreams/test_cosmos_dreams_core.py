@@ -11,6 +11,7 @@ import torch
 
 from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
     CosmosDreamsActionSchema,
+    QuantileRotNormalizerContract,
     canonical_sha256,
     float32_value,
 )
@@ -110,6 +111,49 @@ def _camera_action_layout() -> dict[str, Any]:
     }
 
 
+def _yam_action_layout() -> dict[str, Any]:
+    return {
+        "id": "legacy_yam_fk_backward_framewise_rot6d_v1",
+        "pose_convention": "backward_framewise",
+        "delta_equation": "T_i^-1 @ T_{i+1}",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+            {"name": "left_translation", "offset": 0, "size": 3, "unit": "meter"},
+            {
+                "name": "left_rotation",
+                "offset": 3,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
+            },
+            {
+                "name": "left_gripper",
+                "offset": 9,
+                "size": 1,
+                "unit": "open_fraction",
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            },
+            {"name": "right_translation", "offset": 10, "size": 3, "unit": "meter"},
+            {
+                "name": "right_rotation",
+                "offset": 13,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
+            },
+            {
+                "name": "right_gripper",
+                "offset": 19,
+                "size": 1,
+                "unit": "open_fraction",
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            },
+        ],
+    }
+
+
 def _action_schema_payload() -> dict[str, Any]:
     offset = [float32_value((index - 14) / 100.0) for index in range(29)]
     training_config_excerpt = {
@@ -190,6 +234,94 @@ def _action_schema_payload() -> dict[str, Any]:
                     "domain_id": 15,
                     "raw_action_dim": 29,
                     "layout": schema["embodiments"]["agibotworld"]["layout"],
+                    "normalizer_sha256": normalizer["transform_sha256"],
+                }
+            },
+            "padding": schema["padding"],
+        }
+    )
+    return schema
+
+
+def _yam_action_schema_payload(dataset_class: str, embodiment: str, stats_filename: str) -> dict[str, Any]:
+    training_config_excerpt = {
+        "datasets": [
+            {
+                "dataset_class": dataset_class,
+                "embodiment": embodiment,
+                "method": "quantile_rot",
+                "apply_forward_clamp": False,
+                "pose_convention": "backward_framewise",
+                "rotation_format": "rot6d",
+                "stats_filename": stats_filename,
+            }
+        ],
+        "experiment": f"legacy_{embodiment}",
+    }
+    normalizer: dict[str, Any] = {
+        "schema_version": 1,
+        "method": "quantile_rot",
+        "transform": {
+            "type": "affine",
+            "offset": [float32_value((index - 10) / 100.0) for index in range(20)],
+            "scale": [1.0] * 20,
+            "forward_clamp": False,
+        },
+        "derivation": {
+            "statistics_block": "global_raw",
+            "low_key": "q01",
+            "high_key": "q99",
+            "range_floor": float32_value(1e-8),
+        },
+        "source": {
+            "path": f"projects/cosmos3/cosmos3/datasets/action/legacy/normalizers/{stats_filename}",
+            "artifact_path": f"cosmos_dreams_action_sources/{'b' * 64}.json",
+            "sha256": "b" * 64,
+            "repository_revision": "d" * 40,
+        },
+        "training_config": {
+            "experiment": training_config_excerpt["experiment"],
+            "resolved_sha256": canonical_sha256(training_config_excerpt),
+            "repository_revision": "d" * 40,
+        },
+    }
+    normalizer["transform_sha256"] = canonical_sha256(
+        {
+            "schema_version": normalizer["schema_version"],
+            "method": normalizer["method"],
+            "transform": normalizer["transform"],
+            "derivation": normalizer["derivation"],
+        }
+    )
+    schema: dict[str, Any] = {
+        "schema_version": 3,
+        "action_tokens_per_frame": 4,
+        "model_action_dim": 64,
+        "num_embodiment_domains": 32,
+        "default_embodiment": embodiment,
+        "embodiments": {
+            embodiment: {
+                "domain_id": 16,
+                "raw_action_dim": 20,
+                "layout": _yam_action_layout(),
+                "normalizer": normalizer,
+            }
+        },
+        "padding": {"stage": "after_normalization", "value": 0.0},
+        "training_config_excerpt": training_config_excerpt,
+    }
+    schema["contract_sha256"] = canonical_sha256(
+        {
+            "schema_version": schema["schema_version"],
+            "action_tokens_per_frame": schema["action_tokens_per_frame"],
+            "model_action_dim": schema["model_action_dim"],
+            "num_embodiment_domains": schema["num_embodiment_domains"],
+            "default_embodiment": schema["default_embodiment"],
+            "embodiments": {
+                embodiment: {
+                    "domain_id": 16,
+                    "raw_action_dim": 20,
+                    "layout": schema["embodiments"][embodiment]["layout"],
                     "normalizer_sha256": normalizer["transform_sha256"],
                 }
             },
@@ -608,6 +740,63 @@ def test_camera_action_contract_rejects_tampered_scale_semantics() -> None:
         CosmosDreamsActionSchema.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("dataset_class", "embodiment", "stats_filename"),
+    [
+        ("ABCYAMLeRobotDataset", "abc_yam", "abc_yam_backward_framewise_rot6d.json"),
+        ("MolmoAct2YAMDataset", "molmoact2_yam", "molmoact2_yam_backward_framewise_rot6d.json"),
+        ("XDOFYAMDataset", "xdof_yam", "xdof_yam_backward_framewise_rot6d.json"),
+    ],
+)
+def test_legacy_yam_action_contract_accepts_exported_checkpoint_format(
+    dataset_class: str,
+    embodiment: str,
+    stats_filename: str,
+) -> None:
+    schema = CosmosDreamsActionSchema.model_validate(
+        _yam_action_schema_payload(dataset_class, embodiment, stats_filename)
+    )
+
+    assert schema.resolve_embodiment(embodiment, 16) == embodiment
+    assert schema.raw_action_dim_for(embodiment) == 20
+    assert schema.layout_for(embodiment).id == "legacy_yam_fk_backward_framewise_rot6d_v1"
+    normalizer = schema.normalizer_for(embodiment)
+    assert isinstance(normalizer, QuantileRotNormalizerContract)
+    assert len(normalizer.transform.offset) == 20
+    assert normalizer.source.path == (f"projects/cosmos3/cosmos3/datasets/action/legacy/normalizers/{stats_filename}")
+
+
+def test_legacy_yam_action_contract_rejects_crossed_or_tampered_semantics() -> None:
+    payload = _yam_action_schema_payload(
+        "ABCYAMLeRobotDataset",
+        "abc_yam",
+        "abc_yam_backward_framewise_rot6d.json",
+    )
+    payload["embodiments"]["abc_yam"]["raw_action_dim"] = 29
+    with pytest.raises(ValueError, match="requires raw_action_dim=20"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _yam_action_schema_payload(
+        "ABCYAMLeRobotDataset",
+        "abc_yam",
+        "abc_yam_backward_framewise_rot6d.json",
+    )
+    payload["training_config_excerpt"]["datasets"][0]["stats_filename"] = "xdof_yam_backward_framewise_rot6d.json"
+    with pytest.raises(ValueError, match="invalid class/embodiment/statistics association"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _yam_action_schema_payload(
+        "ABCYAMLeRobotDataset",
+        "abc_yam",
+        "abc_yam_backward_framewise_rot6d.json",
+    )
+    payload["embodiments"]["abc_yam"]["normalizer"]["source"]["path"] = (
+        "projects/cosmos3/cosmos3/datasets/action/legacy/normalizers/xdof_yam_backward_framewise_rot6d.json"
+    )
+    with pytest.raises(ValueError, match="source does not match"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+
 def test_mixed_action_contract_dispatches_per_embodiment_semantics() -> None:
     schema = CosmosDreamsActionSchema.model_validate(_mixed_action_schema_payload())
 
@@ -903,6 +1092,47 @@ def test_pipeline_normalizes_camera_pose_and_uses_artifact_default_domain() -> N
         normalized,
         torch.tensor([[10.0, 20.0, 30.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]),
     )
+
+
+def test_pipeline_normalizes_legacy_yam_actions_before_padding_to_model_width() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    action_schema = CosmosDreamsActionSchema.model_validate(
+        _yam_action_schema_payload(
+            "ABCYAMLeRobotDataset",
+            "abc_yam",
+            "abc_yam_backward_framewise_rot6d.json",
+        )
+    )
+    normalizer = ActionAffineNormalizer.from_contract(action_schema.normalizers["abc_yam"])
+    raw = torch.tensor([normalizer.offset], dtype=torch.float64)
+    stub = SimpleNamespace(
+        action_normalizers={"abc_yam": normalizer},
+        manifest=CosmosDreamsManifest(action_schema=action_schema),
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        _get_sp_param=lambda _sp, key, default: raw if key == "action" else default,
+    )
+
+    result = CosmosDreamsPipeline._prepare_raw_action(
+        stub,
+        SimpleNamespace(),
+        embodiment="abc_yam",
+    )
+
+    assert result is not None
+    assert result.shape == (1, 64)
+    assert result.dtype == torch.float16
+    torch.testing.assert_close(result, torch.zeros_like(result))
+    with pytest.raises(ValueError, match="abc_yam.*requires raw action dimension 20"):
+        CosmosDreamsPipeline._prepare_raw_action(
+            stub,
+            SimpleNamespace(),
+            embodiment="abc_yam",
+            action_value=torch.zeros(1, 29),
+        )
 
 
 def test_pipeline_resolves_mixed_embodiment_before_checking_raw_width() -> None:

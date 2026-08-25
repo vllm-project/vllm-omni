@@ -17,6 +17,13 @@ headers and per-shard SHA-256 hashes.
 
 Raw DCP is intentionally not accepted by Stage 2.
 
+Schema-v3 artifacts may also contain the frozen pre-unification YAM datasets
+exported by imaginaire4: `abc_yam`, `molmoact2_yam`, and `xdof_yam`. vLLM-Omni
+validates their 20D left-arm/right-arm layout, domain 16, and separate legacy
+normalizer sources before serving them. The unified `yam_dataset` classes have
+different coordinate semantics and are not interchangeable with these legacy
+contracts.
+
 From the `imaginaire4` checkout, materialize the checkpoint locally and copy
 `packages/cosmos3/cosmos3/scripts/cosmos_dreams_manifest.example.json` to a
 working manifest. Compute the hash over the same local `model/` directory that

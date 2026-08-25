@@ -10,6 +10,9 @@ exported raw dimension, layout, and normalizer before being padded to 64
 dimensions. Mixed-layout checkpoints select the entry through `domain_name` or
 a unique `domain_id`; when neither is supplied, the artifact's declared default
 is used. Supply `domain_name` when several normalizers share one domain ID.
+For checkpoints containing multiple legacy YAM datasets, select `abc_yam`,
+`molmoact2_yam`, or `xdof_yam` by name because all three use domain 16 while
+retaining distinct normalizers.
 
 ```bash
 python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
