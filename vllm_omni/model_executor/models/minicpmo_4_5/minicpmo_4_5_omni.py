@@ -133,6 +133,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         self._language_model_names = ["model"]
         self.prefer_model_sampler = self.model_stage in {"llm", "tts"}
+        # The Talker samples over 2-wide stop logits and keeps its own codec
+        # history; the duplex LLM sampler is the only stage reading vLLM's
+        # decoded-token history.
+        self.model_sampler_needs_output_token_ids = self.model_stage != "tts"
         # Both AR stages require model-specific embeddings.  The Thinker uses
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning

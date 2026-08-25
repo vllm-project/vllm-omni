@@ -886,7 +886,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                if getattr(self.model, "model_sampler_needs_output_token_ids", True) or not getattr(
+                    sampling_metadata, "no_penalties", False
+                ):
+                    prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                else:
+                    # Rebuilding decoded-token history costs a D2H sync + full
+                    # list copies per step; skip it for model samplers that
+                    # declare they never read it (unless penalties need it).
+                    prepared_sampling_metadata = sampling_metadata
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
