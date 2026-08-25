@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.abot_world.pipeline import ABotWorldCausalPipeline
 from vllm_omni.diffusion.models.abot_world.transformer import (
     ABotSimpleAdapter,
     ABotWorldCausalTransformer3DModel,
@@ -69,3 +73,32 @@ def test_official_generator_prefix_is_normalized() -> None:
 
     assert "blocks.0.norm3.weight" in loaded
     assert torch.equal(model.blocks[0].norm3.weight, weight)
+
+
+def test_realtime_vae_decode_keeps_state_across_chunks() -> None:
+    class Decoder:
+        def __call__(self, hidden_states, *, feat_cache, feat_idx, first_chunk):
+            history = feat_cache[0] or 0
+            feat_cache[0] = history + 1
+            feat_idx[0] += 1
+            frames = 1 if first_chunk else 4
+            return hidden_states.new_full((*hidden_states.shape[:2], frames, *hidden_states.shape[3:]), history / 10)
+
+    vae = SimpleNamespace(
+        _cached_conv_counts={"decoder": 1},
+        _execution_context=nullcontext,
+        config=SimpleNamespace(patch_size=None),
+        decoder=Decoder(),
+        post_quant_conv=lambda value: value,
+    )
+    pipeline = SimpleNamespace(vae=vae)
+    chunk = torch.zeros(1, 1, 3, 2, 2)
+
+    first, cache = ABotWorldCausalPipeline._decode_realtime_chunk(pipeline, chunk, None)
+    continued, _ = ABotWorldCausalPipeline._decode_realtime_chunk(pipeline, chunk, cache)
+    restarted, _ = ABotWorldCausalPipeline._decode_realtime_chunk(pipeline, chunk, None)
+
+    assert first.shape[2] == restarted.shape[2] == 9
+    assert continued.shape[2] == 12
+    assert continued[:, :, 0].eq(0.3).all()
+    assert restarted[:, :, 0].eq(0).all()

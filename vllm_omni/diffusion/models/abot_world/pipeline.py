@@ -16,6 +16,7 @@ import PIL.Image
 import PIL.ImageOps
 import torch
 import torch.nn.functional as F
+from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
@@ -155,6 +156,7 @@ class _ABotARSessionState:
     generator_state: torch.Tensor | None = None
     first_frame_latent: torch.Tensor | None = None
     current_actions: tuple[tuple[str, ...], ...] | None = None
+    vae_decode_cache: list[torch.Tensor | str | None] | None = None
 
 
 def _resolve_local_model_path(model: str) -> str:
@@ -881,6 +883,37 @@ class ABotWorldCausalPipeline(
         std = torch.as_tensor(std_val, device=ref.device, dtype=ref.dtype).view(*shape)
         return mean, std
 
+    def _decode_realtime_chunk(
+        self,
+        latents: torch.Tensor,
+        cache: list[torch.Tensor | str | None] | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor | str | None]]:
+        """Decode one ABot chunk while keeping causal VAE state in the session."""
+        if latents.ndim != 5 or latents.shape[0] != 1:
+            raise ValueError("ABot realtime VAE decode requires a 5D batch-size-1 latent.")
+
+        first_chunk = cache is None
+        if cache is None:
+            cache = [None] * self.vae._cached_conv_counts["decoder"]
+
+        decoded = []
+        with self.vae._execution_context():
+            hidden_states = self.vae.post_quant_conv(latents)
+            for frame_index in range(hidden_states.shape[2]):
+                decoded.append(
+                    self.vae.decoder(
+                        hidden_states[:, :, frame_index : frame_index + 1],
+                        feat_cache=cache,
+                        feat_idx=[0],
+                        first_chunk=first_chunk and frame_index == 0,
+                    )
+                )
+
+        video = torch.cat(decoded, dim=2)
+        if self.vae.config.patch_size is not None:
+            video = unpatchify(video, patch_size=self.vae.config.patch_size)
+        return video.clamp(-1.0, 1.0), cache
+
     def _encode_first_frame(
         self, image: PIL.Image.Image | torch.Tensor, height: int, width: int, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -1235,13 +1268,24 @@ class ABotWorldCausalPipeline(
 
         if tick is not None:
             assert session_state is not None
+            _validate_latent_tensor(
+                generated_latents,
+                expected_channels=int(self.vae.config.z_dim),
+                source="ABot transformer",
+            )
+            mean, std = self._vae_latent_stats(generated_latents)
+            vae_latents = (generated_latents * std + mean).to(dtype=self.vae.dtype)
+            frames, session_state.vae_decode_cache = self._decode_realtime_chunk(
+                vae_latents,
+                session_state.vae_decode_cache,
+            )
             session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
             session_state.current_actions = inputs.camera_actions
             session_state.next_chunk_index += 1
 
             output = {
-                "payload": {"latents": generated_latents},
+                "payload": {"latents": generated_latents, "frames": frames},
                 "metadata": {"ar_diffusion": ARDiffusionChunkMetadata.from_tick(tick).to_dict()},
             }
         elif inputs.output_type == "latent":
