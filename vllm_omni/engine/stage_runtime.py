@@ -52,13 +52,14 @@ from vllm_omni.engine.stage_init_utils import (
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
-    extract_stage_metadata,
+    extract_legacy_stage_metadata,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -128,6 +129,7 @@ class StageRuntime:
         async_chunk: bool,
         tokenizer: str | None = None,
         parallel_stage_init: bool = False,
+        log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -141,6 +143,7 @@ class StageRuntime:
         # (see VllmOmniOrchestratorConfig.parallel_stage_init). Default False
         # keeps the legacy per-device LOCK_EX serialization.
         self._parallel_stage_init = parallel_stage_init
+        self._log_stats = log_stats
         self._num_stages = len(stage_configs)
 
         # Populated by initialize()
@@ -341,13 +344,17 @@ class StageRuntime:
         self,
         omni_transfer_config: Any,
         replicas_per_stage: Sequence[int],
-        replica_devices_map: Mapping[int, Sequence[str]],
+        replica_devices_map: Mapping[int, Sequence[str | None]],
     ) -> list[LogicalStageInitPlan]:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
+        # RFC #4021 transition boundary: stage planning still relies on legacy
+        # StageConfig.runtime and StageConfig.engine_args for replica and engine
+        # setup. Keep metadata extraction on the legacy path until the
+        # coordinated stage-init cutover.
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_stage_metadata(stage_cfg)
+            base_metadata = extract_legacy_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -371,6 +378,9 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
+                # The stable adapter entry point still receives the same
+                # legacy stage object as replica planning. Its implementation
+                # switches only at the coordinated RFC #4021 cutover.
                 engine_args_dict = build_engine_args_dict(
                     stage_cfg,
                     self._model,
@@ -399,11 +409,10 @@ class StageRuntime:
                 if stage_idx in replica_devices_map:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
-                replica_metadata = extract_stage_metadata(replica_cfg)
+                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
-
                 replicas.append(
                     ReplicaInitPlan(
                         replica_id=replica_id,
@@ -661,7 +670,7 @@ class StageRuntime:
             launch_cm = launch_stage_replica(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
-                log_stats=False,
+                log_stats=self._log_stats,
                 stage_id=plan.metadata.stage_id,
                 replica_id=plan.replica_id,
                 stage_config=plan.stage_cfg,
@@ -680,9 +689,14 @@ class StageRuntime:
             #     the READY-wait (__exit__) outside the lock so replicas init
             #     concurrently, coordinated by the child SH/EX device locks.
             if self._parallel_stage_init:
+                # The per-stage runtime.env overlay mutates os.environ
+                # (process-global), so it must be applied under the launch lock
+                # and only needs to cover the spawn (__enter__) — children
+                # inherit the env at spawn time; the READY-wait needs no env.
                 g2_start = time.perf_counter()
                 with self._replica_launch_lock:
-                    resources = launch_cm.__enter__()
+                    with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+                        resources = launch_cm.__enter__()
                 g2_spawned = time.perf_counter()
                 launch_cm.__exit__(None, None, None)
                 logger.debug(
@@ -693,7 +707,7 @@ class StageRuntime:
                 )
             else:
                 g2_start = time.perf_counter()
-                with self._replica_launch_lock:
+                with self._replica_launch_lock, stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                     g2_locked = time.perf_counter()
                     with launch_cm as resources:
                         pass
@@ -712,6 +726,7 @@ class StageRuntime:
             stage_client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
+                log_stats=self._log_stats,
                 metadata=plan.metadata,
                 client_addresses=self._client_addresses_from_zmq(resources.addresses),
                 engine_manager=resources.manager,
@@ -757,7 +772,10 @@ class StageRuntime:
         client = None
         resources = None
         try:
-            with self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg):
+            with (
+                stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
+                self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg),
+            ):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
@@ -822,7 +840,11 @@ class StageRuntime:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
-                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(
+                    plan,
+                    stage_vllm_config,
+                    log_stats=self._log_stats,
+                )
 
             stage_pools.append(
                 StagePool(
@@ -860,10 +882,11 @@ class DistStageRuntime(StageRuntime):
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
-        tokenizer: str | None = None,
         single_stage_id_filter: int | None,
         omni_master_address: str,
         omni_master_port: int,
+        tokenizer: str | None = None,
+        log_stats: bool = False,
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
@@ -879,6 +902,7 @@ class DistStageRuntime(StageRuntime):
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
+            log_stats=log_stats,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -989,8 +1013,10 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
+        # Remote diffusion registration still transports the legacy mapping
+        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
         metadata = (
-            extract_stage_metadata(OmegaConf.create(registered_stage_cfg))
+            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
             if plan.metadata.stage_type == "diffusion"
             else copy.deepcopy(plan.metadata)
         )
@@ -1169,6 +1195,7 @@ class DistStageRuntime(StageRuntime):
             client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=vllm_config,
                 executor_class=ctx.executor_class,
+                log_stats=self._log_stats,
                 metadata=metadata,
                 client_addresses=client_addresses,
                 engine_manager=resources.manager,
@@ -1208,6 +1235,7 @@ def create_stage_runtime(
     omni_heartbeat_timeout: float = 30.0,
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
+    log_stats: bool = False,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1222,6 +1250,7 @@ def create_stage_runtime(
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
+            log_stats=log_stats,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1239,4 +1268,5 @@ def create_stage_runtime(
         async_chunk=async_chunk,
         tokenizer=tokenizer,
         parallel_stage_init=parallel_stage_init,
+        log_stats=log_stats,
     )

@@ -3,7 +3,6 @@
 """Hook mechanism for model forward interception."""
 
 from vllm_omni.diffusion.hooks.base import (
-    BaseState,
     HookRegistry,
     ModelHook,
     StateManager,
@@ -12,14 +11,11 @@ from vllm_omni.diffusion.hooks.sequence_parallel import (
     SequenceParallelGatherHook,
     SequenceParallelSplitHook,
     apply_sequence_parallel,
-    disable_sequence_parallel_for_model,
-    enable_sequence_parallel_for_model,
     remove_sequence_parallel,
 )
 
 __all__ = [
     # Base hooks
-    "BaseState",
     "StateManager",
     "ModelHook",
     "HookRegistry",
@@ -28,6 +24,4 @@ __all__ = [
     "SequenceParallelGatherHook",
     "apply_sequence_parallel",
     "remove_sequence_parallel",
-    "enable_sequence_parallel_for_model",
-    "disable_sequence_parallel_for_model",
 ]

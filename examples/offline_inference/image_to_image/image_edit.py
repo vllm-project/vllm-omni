@@ -96,7 +96,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -451,14 +451,6 @@ def main():
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-    )
-
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -489,7 +481,11 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
@@ -620,10 +616,13 @@ def main():
         images = getattr(output, "images", None)
         if images:
             break
-        req_out = getattr(output, "request_output", None)
+        req_out = output
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break
+
+    if not images:
+        images = extract_images_from_outputs(outputs)
 
     if not images:
         raise ValueError("No images found in request_output")

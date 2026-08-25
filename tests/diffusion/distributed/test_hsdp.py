@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities."""
 
 import gc
-import os
-import socket
 
 import pytest
 import torch
@@ -12,6 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
@@ -37,35 +36,17 @@ class _PackedModel(nn.Module):
         self.root_weight = nn.Parameter(torch.ones(2))
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture(scope="module")
 def cpu_process_group():
     if dist.is_initialized():
         yield
         return
 
-    master_port = _find_free_port()
-    os.environ.update(
-        {
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(master_port),
-        }
-    )
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
     try:
         yield
     finally:
         dist.destroy_process_group()
-        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"):
-            os.environ.pop(key, None)
         gc.collect()
 
 
@@ -234,7 +215,7 @@ class TestDiffusionParallelConfigHSDP:
 
     def test_hsdp_cannot_use_with_tp(self):
         """Test that HSDP and Tensor Parallelism cannot be used together."""
-        with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+        with pytest.raises(ValueError, match="not compatible with TP"):
             DiffusionParallelConfig(
                 tensor_parallel_size=2,
                 use_hsdp=True,
@@ -243,7 +224,7 @@ class TestDiffusionParallelConfigHSDP:
 
     def test_hsdp_cannot_use_with_dp(self):
         """Test that HSDP and Data Parallelism cannot be used together."""
-        with pytest.raises(ValueError, match="cannot be used with TP or DP"):
+        with pytest.raises(ValueError, match="not compatible with DP"):
             DiffusionParallelConfig(
                 data_parallel_size=2,
                 use_hsdp=True,
@@ -262,158 +243,6 @@ class TestDiffusionParallelConfigHSDP:
         assert config.use_hsdp is True
         assert config.hsdp_replicate_size == 2
         assert config.hsdp_shard_size == 2  # auto: 4 // 2
-
-
-class TestStandaloneHSDPDetection:
-    """Tests for standalone HSDP detection and dit_parallel_size calculation.
-
-    These tests verify the logic used in initialize_model_parallel() to detect
-    standalone HSDP mode and calculate effective parallel sizes.
-
-    Standalone HSDP is when all non-HSDP parallelism dimensions are 1.
-    """
-
-    @staticmethod
-    def compute_standalone_hsdp_params(
-        data_parallel_size: int = 1,
-        cfg_parallel_size: int = 1,
-        sequence_parallel_size: int = 1,
-        pipeline_parallel_size: int = 1,
-        tensor_parallel_size: int = 1,
-        fully_shard_degree: int = 1,
-        hsdp_replicate_size: int = 1,
-    ) -> dict:
-        """Compute standalone HSDP detection parameters.
-
-        This mirrors the logic in initialize_model_parallel().
-        """
-        dit_parallel_size = (
-            data_parallel_size
-            * cfg_parallel_size
-            * sequence_parallel_size
-            * pipeline_parallel_size
-            * tensor_parallel_size
-        )
-
-        # Check for standalone HSDP: all non-HSDP parallelism dimensions are 1
-        is_standalone_hsdp = dit_parallel_size == 1 and fully_shard_degree > 1
-
-        # For standalone HSDP: use (fully_shard_degree * hsdp_replicate_size)
-        if is_standalone_hsdp:
-            effective_dit_parallel_size = fully_shard_degree * hsdp_replicate_size
-        else:
-            effective_dit_parallel_size = dit_parallel_size
-
-        effective_dp_size = (fully_shard_degree * hsdp_replicate_size) if is_standalone_hsdp else data_parallel_size
-
-        return {
-            "original_dit_parallel_size": dit_parallel_size,
-            "is_standalone_hsdp": is_standalone_hsdp,
-            "effective_dit_parallel_size": effective_dit_parallel_size,
-            "effective_dp_size": effective_dp_size,
-        }
-
-    def test_standalone_hsdp_basic(self):
-        """Test basic standalone HSDP detection (shard_size=4, replicate=1)."""
-        result = self.compute_standalone_hsdp_params(
-            fully_shard_degree=4,
-            hsdp_replicate_size=1,
-        )
-        assert result["original_dit_parallel_size"] == 1
-        assert result["is_standalone_hsdp"] is True
-        assert result["effective_dit_parallel_size"] == 4
-        assert result["effective_dp_size"] == 4
-
-    def test_standalone_hsdp_with_replicate(self):
-        """Test standalone HSDP with replication (shard_size=4, replicate=2)."""
-        result = self.compute_standalone_hsdp_params(
-            fully_shard_degree=4,
-            hsdp_replicate_size=2,
-        )
-        assert result["original_dit_parallel_size"] == 1
-        assert result["is_standalone_hsdp"] is True
-        assert result["effective_dit_parallel_size"] == 8  # 4 * 2
-        assert result["effective_dp_size"] == 8
-
-    def test_combined_hsdp_sp_not_standalone(self):
-        """Test HSDP combined with SP is NOT detected as standalone.
-
-        This is a regression test for the bug where the condition
-        `dit_parallel_size == fully_shard_degree` incorrectly matched
-        combined modes like SP=4 + HSDP=4.
-        """
-        result = self.compute_standalone_hsdp_params(
-            sequence_parallel_size=4,
-            fully_shard_degree=4,
-            hsdp_replicate_size=1,
-        )
-        assert result["original_dit_parallel_size"] == 4
-        assert result["is_standalone_hsdp"] is False
-        # Should NOT override dp_size for combined mode
-        assert result["effective_dp_size"] == 1  # original data_parallel_size
-
-    def test_combined_hsdp_cfg_not_standalone(self):
-        """Test HSDP combined with CFG is NOT detected as standalone."""
-        result = self.compute_standalone_hsdp_params(
-            cfg_parallel_size=2,
-            fully_shard_degree=4,
-            hsdp_replicate_size=1,
-        )
-        assert result["original_dit_parallel_size"] == 2
-        assert result["is_standalone_hsdp"] is False
-        assert result["effective_dp_size"] == 1
-
-    def test_combined_hsdp_pp_not_standalone(self):
-        """Test HSDP combined with PP is NOT detected as standalone."""
-        result = self.compute_standalone_hsdp_params(
-            pipeline_parallel_size=2,
-            fully_shard_degree=4,
-            hsdp_replicate_size=1,
-        )
-        assert result["original_dit_parallel_size"] == 2
-        assert result["is_standalone_hsdp"] is False
-        assert result["effective_dp_size"] == 1
-
-    def test_no_hsdp_not_standalone(self):
-        """Test that no HSDP (fully_shard_degree=1) is NOT standalone."""
-        result = self.compute_standalone_hsdp_params(
-            fully_shard_degree=1,
-        )
-        assert result["original_dit_parallel_size"] == 1
-        assert result["is_standalone_hsdp"] is False
-        assert result["effective_dp_size"] == 1
-
-    def test_combined_multiple_parallelism_not_standalone(self):
-        """Test HSDP combined with multiple parallelism is NOT standalone."""
-        result = self.compute_standalone_hsdp_params(
-            sequence_parallel_size=2,
-            cfg_parallel_size=2,
-            fully_shard_degree=4,
-            hsdp_replicate_size=1,
-        )
-        assert result["original_dit_parallel_size"] == 4  # 2 * 2
-        assert result["is_standalone_hsdp"] is False
-        assert result["effective_dp_size"] == 1
-
-    def test_standalone_hsdp_large_shard(self):
-        """Test standalone HSDP with large shard size."""
-        result = self.compute_standalone_hsdp_params(
-            fully_shard_degree=8,
-            hsdp_replicate_size=1,
-        )
-        assert result["is_standalone_hsdp"] is True
-        assert result["effective_dit_parallel_size"] == 8
-        assert result["effective_dp_size"] == 8
-
-    def test_standalone_hsdp_large_replicate(self):
-        """Test standalone HSDP with large replicate size."""
-        result = self.compute_standalone_hsdp_params(
-            fully_shard_degree=4,
-            hsdp_replicate_size=4,
-        )
-        assert result["is_standalone_hsdp"] is True
-        assert result["effective_dit_parallel_size"] == 16  # 4 * 4
-        assert result["effective_dp_size"] == 16
 
 
 class TestHSDPShardConditions:

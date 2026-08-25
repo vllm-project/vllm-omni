@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Analogous to test_common_offline, but for server tests. Validates the full
 online serving stack (CLI arg parsing, subprocess, API routing, response
@@ -6,7 +9,7 @@ encoding) using tiny models.
 
 import pytest
 
-from tests.helpers.runtime import OmniServer, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OnlineOmniClient
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
 from tests.model_tests.diffusion.config_types import (
     DiffusionAccs,
@@ -15,14 +18,16 @@ from tests.model_tests.diffusion.config_types import (
 )
 from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
 from tests.model_tests.diffusion.task_runners import (
+    run_and_validate_online_determinism,
     run_and_validate_online_image_to_image_request,
-    run_and_validate_online_text_to_image_determinism,
-    run_and_validate_online_text_to_image_multi_output,
+    run_and_validate_online_image_to_video_request,
+    run_and_validate_online_multi_output,
     run_and_validate_online_text_to_image_request,
+    run_and_validate_online_text_to_video_request,
 )
 
 # NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
@@ -48,7 +53,7 @@ def test_online_on_supported_tasks(
         # TODO: We may want to revisit run_level validation here,
         # because checks for things like image size etc should not
         # depend on whether or not the weights are real or random
-        client = OpenAIClientHandler(
+        client = OnlineOmniClient(
             host=server.host,
             port=server.port,
             api_key="EMPTY",
@@ -56,11 +61,15 @@ def test_online_on_supported_tasks(
             log_stats=server.log_stats,
         )
         for task_type in supported_tasks:
-            with subtests.test(msg=task_type):
+            with subtests.test(msg=task_type.value):
                 if task_type == DiffusionTasks.TEXT_TO_IMAGE:
                     run_and_validate_online_text_to_image_request(server, client)
                 elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
                     run_and_validate_online_image_to_image_request(server, client)
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_online_text_to_video_request(server, client)
+                elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
+                    run_and_validate_online_image_to_video_request(server, client)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 
@@ -68,8 +77,10 @@ def test_online_on_supported_tasks(
         # since checking it on every extra acceleration configuration is redundant
         # (see case_filtering).
         if check_determinism:
-            with subtests.test(msg="determinism"):
-                run_and_validate_online_text_to_image_determinism(server, client)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"determinism[{task_type}]"):
+                    run_and_validate_online_determinism(server, client, task_type)
         if check_multioutput:
-            with subtests.test(msg="multi_output"):
-                run_and_validate_online_text_to_image_multi_output(server, client)
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"multi_output[{task_type}]"):
+                    run_and_validate_online_multi_output(server, client, task_type)

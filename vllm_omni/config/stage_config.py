@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage configuration system for vLLM-Omni."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import re
 import warnings
@@ -56,7 +55,7 @@ def build_stage_runtime_overrides(
     ``internal_keys`` defaults to the union of
     ``arg_utils.internal_blacklist_keys()`` and ``arg_utils.SHARED_FIELDS``
     so that neither orchestrator-only fields nor shared-pipeline fields
-    (``model`` / ``stage_configs_path`` / ``log_stats`` / ``stage_id``) leak
+    (``model`` / ``log_stats`` / ``stage_id``) leak
     into a stage's per-stage runtime overrides — the orchestrator sets those
     uniformly for every stage, they are not per-stage knobs. Callers can
     pass an explicit set for tests or specialized flows.
@@ -90,46 +89,6 @@ def build_stage_runtime_overrides(
     return result
 
 
-def strip_parent_engine_args(
-    kwargs: dict[str, Any],
-    *,
-    parent_fields: dict[str, dataclasses.Field],
-    keep_keys: set[str] | frozenset[str] = frozenset(),
-    strip_keys: set[str] | frozenset[str] = frozenset(),
-    no_warn_keys: set[str] | frozenset[str] = frozenset(),
-) -> tuple[dict[str, Any], list[str]]:
-    """Strip parent ``EngineArgs`` fields before merging into stage YAML."""
-    overridden: list[str] = []
-    result: dict[str, Any] = {}
-
-    for key, value in kwargs.items():
-        if key in strip_keys:
-            continue
-
-        if key not in parent_fields or key in keep_keys:
-            result[key] = value
-            continue
-
-        field_def = parent_fields[key]
-        if field_def.default is not dataclasses.MISSING:
-            default = field_def.default
-        elif field_def.default_factory is not dataclasses.MISSING:
-            default = field_def.default_factory()
-        else:
-            default = dataclasses.MISSING
-
-        if default is dataclasses.MISSING or value is None:
-            continue
-
-        if dataclasses.is_dataclass(default) and not isinstance(default, type):
-            default = asdict(default)
-
-        if value != default and key not in no_warn_keys:
-            overridden.append(key)
-
-    return result, sorted(overridden)
-
-
 def _apply_diffusion_parallel_runtime_overrides(
     engine_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
@@ -149,14 +108,17 @@ def _apply_diffusion_parallel_runtime_overrides(
             continue
         if parallel_config_dict is None:
             parallel_config_dict = {}
-        if key in ("ulysses_degree", "ring_degree"):
+        if key in ("ulysses_degree", "ring_degree", "allgather_degree"):
             degree_overridden = True
         parallel_config_dict[key] = runtime_overrides.pop(key)
 
     if parallel_config_dict is not None and degree_overridden and not sequence_parallel_explicit:
         ulysses_degree = parallel_config_dict.get("ulysses_degree") or 1
         ring_degree = parallel_config_dict.get("ring_degree") or 1
-        parallel_config_dict["sequence_parallel_size"] = ulysses_degree * ring_degree
+        allgather_degree = parallel_config_dict.get("allgather_degree") or 1
+        parallel_config_dict["sequence_parallel_size"] = (
+            allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+        )
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
@@ -220,6 +182,9 @@ class StagePipelineConfig:
     hf_config_name: str | None = None
     engine_output_type: str | None = None
     model_arch: str | None = None
+    # The model keeps per-request execution state while awaiting the next
+    # async chunk, so the parked request continues to consume model capacity.
+    retains_state_across_chunks: bool = False
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -269,7 +234,17 @@ class PipelineConfig:
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
+    diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    duplex_runtime_extension: str | None = None
+    # Optional model-owned Serving adapter loaded only when the Realtime duplex
+    # endpoint is enabled. Generic OpenAI modules must not select a model.
+    duplex_serving_adapter: str | None = None
+    # Explicitly enable the stable duplex control mechanism. This is separate
+    # from the optional model extension because turn-commit-only deployments
+    # do not require a model planner.
+    duplex_control_enabled: bool = False
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
@@ -325,7 +300,9 @@ class StageDeployConfig:
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
+    default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
 
     # === Generic stage engine fields ===
     # Parallelism, scheduler, and memory-capacity controls.
@@ -341,6 +318,9 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+    # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
+    # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
+    mamba_ssm_cache_dtype: str | None = None
 
     # Generic compilation, profiling, tokenizer/config parsing, and model
     # loading controls.
@@ -357,10 +337,12 @@ class StageDeployConfig:
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
+    text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
@@ -368,13 +350,20 @@ class StageDeployConfig:
     # Diffusion model loading and adapter construction.
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: str | list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: dict[str, Any] | None = None
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
     diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
+    fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     enable_cache_dit_summary: bool | None = None
@@ -394,6 +383,11 @@ class StageDeployConfig:
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
+    enable_distributed_layerwise_offload: bool | None = None
+    dlo_use_allgather: bool | None = None
+    dlo_resident_layers: int | None = None
+    host_weight_runtime_mode: str | None = None
+    host_weight_runtime_root: str | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
@@ -404,6 +398,38 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DuplexSessionRuntimeConfig:
+    """Server-owned lifecycle and per-session buffering limits."""
+
+    idle_ttl_s: float | None = 300.0
+    disconnect_grace_s: float = 30.0
+    reaper_interval_s: float = 5.0
+    resume_replay_ttl_s: float = 60.0
+    resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
+    max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
+    max_pending_turns_per_session: int = 4
+    max_sessions: int = 1
+    completed_append_cache_size: int = 256
+
+    def __post_init__(self) -> None:
+        positive = {
+            "disconnect_grace_s": self.disconnect_grace_s,
+            "reaper_interval_s": self.reaper_interval_s,
+            "resume_replay_ttl_s": self.resume_replay_ttl_s,
+            "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
+            "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
+            "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_sessions": self.max_sessions,
+            "completed_append_cache_size": self.completed_append_cache_size,
+        }
+        if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
+            raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"duplex_session.{name} must be positive")
 
 
 @dataclass
@@ -419,8 +445,10 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    session_mode: str = "turn"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -449,6 +477,7 @@ _STAGE_RESERVED_KEYS = frozenset(
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
+        "default_pooling_params",
         "engine_extras",
         "engine_args",
         "runtime",
@@ -502,11 +531,20 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
+    kwargs["default_pooling_params"] = stage_data.get("default_pooling_params")
     kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
-_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
+_DEEP_MERGE_KEYS = frozenset(
+    {
+        "default_sampling_params",
+        "default_pooling_params",
+        "subtalker_sampling_params",
+        "engine_extras",
+        "engine_args",
+    }
+)
 
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
@@ -605,12 +643,19 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
+    if "stage_args" in raw_dict:
+        raise ValueError(
+            f"Deploy config {path} uses the removed `stage_args` schema; "
+            "define topology in PipelineConfig and deployment overrides under `stages`."
+        )
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "session_mode": raw_dict.get("session_mode", "turn"),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
+        "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -770,7 +815,8 @@ def _build_engine_args(
     per-stage StageDeployConfig overrides take precedence when present (e.g.
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
-    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
+    engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
@@ -801,6 +847,11 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if deploy.session_mode == "duplex":
+        # The engine admission limit is also the authoritative capacity for
+        # model-owned streaming state. Propagate it to every stage instead of
+        # making individual models duplicate the value in connector extras.
+        engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
@@ -818,6 +869,8 @@ def _build_extras(
     sampling.update(ps.sampling_constraints)
     if sampling:
         extras["default_sampling_params"] = sampling
+    if ds is not None and ds.default_pooling_params:
+        extras["default_pooling_params"] = dict(ds.default_pooling_params)
     if ds is not None and ds.output_connectors:
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
@@ -876,6 +929,10 @@ def merge_pipeline_deploy(
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
         input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        # Downstream stages may share a multimodal wrapper class without owning
+        # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
+        if not ps.requires_multimodal_data:
+            engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
             engine_args.get("async_scheduling", True),
@@ -896,6 +953,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
@@ -905,6 +963,7 @@ def merge_pipeline_deploy(
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
+                sampling_constraints=dict(ps.sampling_constraints),
                 yaml_engine_args=engine_args,
                 yaml_runtime=runtime,
                 yaml_extras=extras,
@@ -922,6 +981,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
@@ -931,6 +991,7 @@ class StageConfig:
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
     is_comprehension: bool = False
+    sampling_constraints: dict[str, Any] = field(default_factory=dict)
     yaml_engine_args: dict[str, Any] = field(default_factory=dict)
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
@@ -984,12 +1045,14 @@ class StageConfig:
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
             "stage_type": StageType(self.stage_type).value,
+            "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
             "engine_input_source": self.input_sources,  # Legacy field name
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
             "is_comprehension": self.is_comprehension,
+            "sampling_constraints": dict(self.sampling_constraints),
         }
 
         if self.custom_process_input_func:

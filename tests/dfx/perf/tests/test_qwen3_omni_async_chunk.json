@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "npu": "A3"
           },
           "num_cards": 2
         }
@@ -43,27 +44,22 @@
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            135.4379,
-            187.0896,
-            400,
-            435.675,
-            724.6836
-          ],
-          "mean_e2el_ms": [
-            17619.9851,
-            34811.8335,
-            43656.9501,
-            56657.1548,
-            85097.6016
-          ],
-          "mean_audio_rtf": [
-            0.1279,
-            0.2238,
-            0.2735,
-            0.3712,
-            0.5634
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              11701.3818,
+              27510.3956,
+              31907.9613,
+              42173.9832,
+              63970.0751
+            ],
+            "mean_audio_rtf": [
+              0.1175,
+              0.1647,
+              0.2003,
+              0.2726,
+              0.4195
+            ]
+          }
         }
       },
       {
@@ -90,15 +86,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            340.329
-          ],
-          "mean_e2el_ms": [
-            4305.477
-          ],
-          "mean_audio_rtf": [
-            0.1305
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              3646.797
+            ],
+            "mean_audio_rtf": [
+              0.1098
+            ]
+          }
         }
       },
       {
@@ -127,15 +122,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            220.0909
-          ],
-          "mean_e2el_ms": [
-            5475.9565
-          ],
-          "mean_audio_rtf": [
-            0.1818
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              4059.0878
+            ],
+            "mean_audio_rtf": [
+              0.1335
+            ]
+          }
         }
       },
       {
@@ -166,15 +160,14 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-          "mean_ttft_ms": [
-            450.0155
-          ],
-          "mean_e2el_ms": [
-            8516.8316
-          ],
-          "mean_audio_rtf": [
-            0.2717
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              5639.5769
+            ],
+            "mean_audio_rtf": [
+              0.1798
+            ]
+          }
         }
       },
       {
@@ -205,20 +198,15 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            78.4278,
-            195.8037,
-            333.7318,
-            561.805,
-            1038.043
-          ],
-          "mean_e2el_ms": [
-            4288.3029,
-            7429.9429,
-            9451.6184,
-            12607.5292,
-            18153.2547
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              4354.8945,
+              7672.4248,
+              9861.1687,
+              13086.8865,
+              18716.709
+            ]
+          }
         }
       },
       {
@@ -250,12 +238,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            275.3875
-          ],
-          "mean_e2el_ms": [
-            730.6995
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              756.8415
+            ]
+          }
         }
       },
       {
@@ -289,12 +276,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            166.2201
-          ],
-          "mean_e2el_ms": [
-            673.5789
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              694.9777
+            ]
+          }
         }
       },
       {
@@ -330,12 +316,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            357.7781
-          ],
-          "mean_e2el_ms": [
-            953.3493
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              1006.1663
+            ]
+          }
         }
       }
     ]

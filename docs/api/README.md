@@ -62,7 +62,6 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
@@ -115,10 +114,6 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
 - [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
-- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
 - [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
 - [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 
@@ -131,7 +126,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
-- [vllm_omni.diffusion.worker.utils.DiffusionRequestState][]
+- [vllm_omni.diffusion.worker.utils.StepRequestState][]
 - [vllm_omni.diffusion.worker.utils.RunnerOutput][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]

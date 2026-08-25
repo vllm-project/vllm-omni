@@ -6,6 +6,8 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.stage_utils import _map_device_list, resolve_stage_physical_devices, set_stage_devices
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_dummy_torch(call_log):
     class _Props:

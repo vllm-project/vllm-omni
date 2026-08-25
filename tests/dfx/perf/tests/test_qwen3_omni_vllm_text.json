@@ -10,7 +10,7 @@
           "num_cards": 2
         }
       },
-      "full_model",
+      "slow",
       "omni"
     ],
     "server_params": {
@@ -51,20 +51,15 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            69.1276,
-            255.1882,
-            310.639,
-            422.0337,
-            532.0582
-          ],
-          "mean_e2el_ms": [
-            4382.7211,
-            7510.3815,
-            9440.4854,
-            12553.0186,
-            16932.6065
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              4619.0068,
+              7868.3523,
+              9760.6175,
+              13422.3491,
+              18007.6918
+            ]
+          }
         }
       },
       {
@@ -97,12 +92,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            26.3381
-          ],
-          "mean_e2el_ms": [
-            485.2436
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              491.2534
+            ]
+          }
         }
       },
       {
@@ -137,12 +131,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            26.4517
-          ],
-          "mean_e2el_ms": [
-            517.2017
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              524.5321
+            ]
+          }
         }
       },
       {
@@ -179,12 +172,11 @@
         },
         "percentile-metrics": "ttft,tpot,itl,e2el",
         "baseline": {
-          "mean_ttft_ms": [
-            27.6972
-          ],
-          "mean_e2el_ms": [
-            561.3684
-          ]
+          "H100": {
+            "mean_e2el_ms": [
+              559.6674
+            ]
+          }
         }
       }
     ]

@@ -147,6 +147,130 @@ def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyP
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
+    """A layer opts out of quantization under the prefix its module was built with.
+
+    MiniMax H3 stores qkv as one checkpoint tensor, so the fused name is the
+    only handle a user has on it.
+    """
+    from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    config = build_quant_config("int8", ignored_layers=["blocks.0.attn.qkv_proj"])
+    layer = mocker.Mock(spec=LinearBase)
+
+    assert isinstance(config.get_quant_method(layer, "blocks.0.attn.qkv_proj"), UnquantizedLinearMethod)
+    assert isinstance(config.get_quant_method(layer, "blocks.1.attn.qkv_proj"), NPUInt8OnlineLinearMethod)
+    assert isinstance(config.get_quant_method(layer, "blocks.0.mlp.fc1"), NPUInt8OnlineLinearMethod)
+
+
+class TestNPUQuantMatmulShapeFallback:
+    """npu_quant_matmul rejects wide outputs, so those layers stay unquantized.
+
+    The limit applies to the per-rank shard, which is what the kernel sees. The
+    same layer can therefore be quantized at a higher TP degree.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_tp(self, mocker):
+        # The fallback delegates to UnquantizedLinearMethod, which reads the TP
+        # group; stand one in so the shape gating can be tested without a
+        # distributed init.
+        mock_group = mocker.Mock()
+        mock_group.rank_in_group = 0
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+    @pytest.fixture
+    def quant_config(self):
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+        return DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+
+    def create_weights(self, method, layer, output_partition_sizes):
+        # Narrow input dim: the fallback path allocates for real, and only the
+        # output dimension is under test.
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=output_partition_sizes,
+            input_size=8,
+            output_size=sum(output_partition_sizes),
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda param, loaded_weight, *args, **kwargs: None,
+        )
+
+    @pytest.mark.parametrize(
+        "method_name",
+        ["NPUInt8LinearMethod", "NPUInt8OnlineLinearMethod"],
+    )
+    def test_over_wide_layer_falls_back_to_unquantized(self, quant_config, method_name):
+        import vllm_omni.quantization.int8_config as int8_config
+
+        method = getattr(int8_config, method_name)(quant_config)
+        layer = Module()
+        layer.quant_method = method
+
+        self.create_weights(method, layer, [int8_config.NPU_QUANT_MATMUL_MAX_OUT_FEATURES + 1])
+
+        assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+        assert layer.weight.dtype == torch.bfloat16
+
+    def test_layer_within_the_limit_keeps_int8(self, quant_config):
+        from vllm_omni.quantization.int8_config import (
+            NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+            NPUInt8OnlineLinearMethod,
+        )
+
+        method = NPUInt8OnlineLinearMethod(quant_config)
+        layer = Module()
+        layer.quant_method = method
+
+        self.create_weights(method, layer, [NPU_QUANT_MATMUL_MAX_OUT_FEATURES])
+
+        assert layer.quant_method is method
+
+    def test_tensor_parallel_sharding_brings_a_wide_layer_back(self, quant_config):
+        from vllm_omni.quantization.int8_config import (
+            NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+            NPUInt8OnlineLinearMethod,
+        )
+
+        global_out_features = 4 * NPU_QUANT_MATMUL_MAX_OUT_FEATURES
+        method = NPUInt8OnlineLinearMethod(quant_config)
+        layer = Module()
+        layer.quant_method = method
+
+        self.create_weights(method, layer, [global_out_features // 4])
+
+        assert layer.quant_method is method
+
+
+class TestOffloadAfterQuant:
+    def test_only_methods_advertising_the_capability_are_asked(self):
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8OnlineLinearMethod
+
+        class MetaDeviceOnlyMethod:
+            """Stands in for upstream online FP8: lazy, but no offload hook."""
+
+            uses_meta_device = True
+
+        model = torch.nn.Sequential(Module(), Module())
+        lazy_int8 = NPUInt8OnlineLinearMethod(
+            DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+        )
+        model[0].quant_method = lazy_int8
+        model[1].quant_method = MetaDeviceOnlyMethod()
+
+        marked = DiffusersPipelineLoader._request_offload_after_quant(model)
+
+        assert marked == 1
+        assert lazy_int8._offload_after_quant
+
+
 class TestInt8LinearMethod:
     @pytest.fixture
     def mock_quant_config(self, mocker):

@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -22,7 +26,19 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
+    "IndexTTS25S2MelDecoder": "indextts2_5",
+    "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
+    # PersonaPlex ships an empty config.json, so create_model_config() must patch
+    # model_type=personaplex from the arch name or the staged pipeline can't load
+    # the HF config without manual overrides.
+    "PersonaPlexTalkerForConditionalGeneration": "personaplex",
+    "PersonaPlexCode2Wav": "personaplex",
+    # NemotronVoiceChat ships a NeMo-style config.json without model_type;
+    # create_model_config() patches model_type=nemotron_voicechat from the arch.
+    "NemotronVoiceChatThinkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -39,6 +55,7 @@ def _register_omni_hf_configs() -> None:
 
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
+            IndexTTS25Config,
         )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
@@ -47,6 +64,12 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
             MossTTSLocalConfig,
             MossTTSRealtimeConfig,
+        )
+        from vllm_omni.model_executor.models.nemotron_voicechat.configuration_nemotron_voicechat import (
+            NemotronVoiceChatConfig,
+        )
+        from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+            PersonaPlexConfig,
         )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
@@ -71,9 +94,12 @@ def _register_omni_hf_configs() -> None:
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
+        ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
+        ("personaplex", PersonaPlexConfig),
+        ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
@@ -95,10 +121,16 @@ def register_omni_models_to_vllm():
 
     _register_omni_hf_configs()
 
-    supported_archs = ModelRegistry.get_supported_archs()
+    # Unconditionally (re)register every omni arch into the upstream global
+    # ModelRegistry: vLLM 0.27 added some omni archs (e.g.
+    # Qwen3OmniMoeForConditionalGeneration) to its own registry, but resolves
+    # them to upstream classes that lack omni features (e.g.
+    # buffer_realtime_audio for the realtime endpoint). Registering here
+    # overwrites those entries with the vllm-omni classes, which is the
+    # behavior entrypoints resolving through the global registry rely on
+    # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-        if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+        ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
@@ -131,16 +163,14 @@ class OmniEngineArgs(EngineArgs):
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
-        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-            If not specified, will be inferred from model path.
+        task_type: Model-defined startup task type. Consumers validate the
+            supported values and decide whether it selects request behavior,
+            task-specific weights, or both.
         omni_master_address: TCP address that the OmniMasterServer (running
             inside AsyncOmniEngine) listens on for engine core registrations.
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
-        stage_configs_path: Optional path to a JSON/YAML file containing
-            stage configurations for the multi-stage pipeline. If None,
-            stage configs are resolved from the model's default configuration.
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
@@ -158,15 +188,22 @@ class OmniEngineArgs(EngineArgs):
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    # Engine admission is the single source of truth for per-stage pools of
+    # model-owned streaming state (codec, decoder, and similar resources).
+    duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    # Dotted path of a per-stage pooling-output decoder applied worker-side.
+    pooling_output_decoder: str | None = None
     task_type: str | None = None
     worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
     # in __post_init__ based on worker_type (ar/generation), so None is safe here.
@@ -174,6 +211,7 @@ class OmniEngineArgs(EngineArgs):
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
+    fa_deterministic: bool = False
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -195,11 +233,11 @@ class OmniEngineArgs(EngineArgs):
     omni_dp_size_local: int = 1
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = 30.0
-    stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -229,7 +267,15 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            return  # can't load config, let vLLM handle the error
+            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # Keep this exception model-scoped so other loader failures retain
+            # vLLM's normal error path.
+            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+                return
+            config_path = os.path.join(self.model, "config.json")
+            if os.path.lexists(config_path):
+                return
+            config_dict = {}
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
@@ -256,24 +302,26 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
         # Also inject model_type so AutoConfig can resolve the correct config
         # class for models with empty or missing config.json (e.g. CosyVoice3).
         if self.model_arch:
-            if self.hf_overrides is None:
-                self.hf_overrides = {}
-            if isinstance(self.hf_overrides, dict):
-                self.hf_overrides.setdefault("architectures", [self.model_arch])
-                if "model_type" not in self.hf_overrides:
+            if hf_overrides is None:
+                hf_overrides = {}
+                self.hf_overrides = hf_overrides
+            if isinstance(hf_overrides, dict):
+                hf_overrides.setdefault("architectures", [self.model_arch])
+                if "model_type" not in hf_overrides:
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
-                        self.hf_overrides.setdefault("model_type", model_type)
+                        hf_overrides.setdefault("model_type", model_type)
 
                 # Stage wrappers (e.g. Code2Wav) may need max_model_len larger
                 # than the base checkpoint's text max_position_embeddings.
                 if self.model_arch == "Qwen3TTSCode2Wav" and self.max_model_len is not None:
-                    self.hf_overrides.setdefault("talker_config", {}).setdefault(
+                    hf_overrides.setdefault("talker_config", {}).setdefault(
                         "max_position_embeddings", int(self.max_model_len)
                     )
 
@@ -289,20 +337,37 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
+        tokenizer = cast(str | None, getattr(self, "tokenizer", None))
+
+        # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
+        # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
+        # subfolder auto-detect below would wrongly pick up. The text tokenizer
+        # is the Nemotron backbone's, resolved from a local override or its
+        # HF id (cache-friendly).
+        if not tokenizer and self.model_arch in (
+            "NemotronVoiceChatThinkerForConditionalGeneration",
+            "NemotronVoiceChatTalkerForConditionalGeneration",
+            "NemotronVoiceChatCode2Wav",
+        ):
+            self.tokenizer = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+            tokenizer = self.tokenizer
+            logger.info("NemotronVoiceChat: using text tokenizer from %s", tokenizer)
+
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
-        if not self.tokenizer and self.model:
+        if not tokenizer and self.model:
             model_path = self.model
             if os.path.isdir(model_path) and not os.path.isfile(os.path.join(model_path, "tokenizer_config.json")):
                 for subfolder in sorted(os.listdir(model_path)):
                     candidate = os.path.join(model_path, subfolder)
                     if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
                         self.tokenizer = candidate
+                        tokenizer = candidate
                         logger.info("Auto-detected tokenizer at %s", candidate)
                         break
             elif not os.path.isdir(model_path):
-                subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
-                if subfolder:
+                tokenizer_subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch or "")
+                if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
                         from huggingface_hub import snapshot_download
@@ -310,15 +375,15 @@ class OmniEngineArgs(EngineArgs):
                         local_dir = snapshot_download(
                             model_path,
                             allow_patterns=[
-                                f"{subfolder}/tokenizer*",
-                                f"{subfolder}/tokenization_*",
-                                f"{subfolder}/special_tokens*",
-                                f"{subfolder}/vocab*",
-                                f"{subfolder}/merges*",
-                                f"{subfolder}/added_tokens*",
+                                f"{tokenizer_subfolder}/tokenizer*",
+                                f"{tokenizer_subfolder}/tokenization_*",
+                                f"{tokenizer_subfolder}/special_tokens*",
+                                f"{tokenizer_subfolder}/vocab*",
+                                f"{tokenizer_subfolder}/merges*",
+                                f"{tokenizer_subfolder}/added_tokens*",
                             ],
                         )
-                        candidate = os.path.join(local_dir, subfolder)
+                        candidate = os.path.join(local_dir, tokenizer_subfolder)
                         if os.path.isdir(candidate):
                             self.tokenizer = candidate
                             logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
@@ -341,18 +406,23 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
+            duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
+            silence_ban_frames=self.silence_ban_frames,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
         )
         return omni_config
 
@@ -393,7 +463,7 @@ class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
 # Fields in ``SHARED_FIELDS`` (e.g. ``model``, ``log_stats``) flow to BOTH
 # orchestrator and engine by design.
 #
-# Invariants enforced by ``tests/test_arg_utils.py``:
+# Invariants enforced by ``tests/engine/test_arg_utils_shared_fields.py``:
 #
 #   1. ``OrchestratorArgs`` ∩ ``OmniEngineArgs`` ⊆ ``SHARED_FIELDS``
 #   2. Every CLI flag is classifiable into one of the three buckets
@@ -427,7 +497,6 @@ class OrchestratorArgs:
     parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
-    shm_threshold_bytes: int = 65536
     batch_timeout: int = 10
 
     # === Cluster / Backend ===
@@ -435,7 +504,6 @@ class OrchestratorArgs:
     ray_address: str | None = None
 
     # === Config Files ===
-    stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
@@ -444,6 +512,11 @@ class OrchestratorArgs:
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
+
+    # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
+    forced_aligner: str | None = None
+    forced_aligner_config: str | None = None
+    forced_aligner_device: str | None = None
 
     # === Observability ===
     log_stats: bool = False
@@ -459,17 +532,24 @@ class OrchestratorArgs:
     num_gpus: int | None = None
     model_class_name: str | None = None
     diffusion_load_format: str | None = None
+    lora_path: list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
     diffusers_load_kwargs: str = "{}"
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
+    allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
@@ -480,6 +560,11 @@ class OrchestratorArgs:
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -488,6 +573,7 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
+    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
@@ -512,7 +598,6 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
-        "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
     }

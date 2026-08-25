@@ -46,6 +46,36 @@ def test_serve_parser_accepts_strategy_config() -> None:
     assert args.get_explicit_kwargs_dict()["strategy_config"] == "/tmp/strategy.yaml"
 
 
+def test_serve_parser_accepts_deploy_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--deploy-config", "/tmp/deploy.yaml"])
+
+    assert args.deploy_config == "/tmp/deploy.yaml"
+    assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
+
+
+def test_serve_parser_rejects_stage_configs_path() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--stage-configs-path", "/tmp/stages.yaml"])
+
+
+def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
+
+    assert args.cfg_parallel_size == 4
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
@@ -56,7 +86,6 @@ def _make_headless_args(**kwargs) -> TrackingNamespace:
         "omni_replica_address": None,
         "omni_dp_size_local": 1,
         "worker_backend": "multi_process",
-        "stage_configs_path": None,
         "deploy_config": None,
         "log_stats": False,
         "disable_log_stats": False,
@@ -144,6 +173,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     captured: dict = {}
 
     def _fake_resolve(*args, **kwargs):
+        captured["args"] = args
         captured.update(kwargs)
         # Return a stage that does NOT match stage_id=0 so run_headless stops
         # right after the resolver call (we only care about how it was called).
@@ -156,12 +186,15 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
 
     args = _make_headless_args(
         stage_id=0,
+        deploy_config="/tmp/deploy.yaml",
         strategy_config="/tmp/strategy.yaml",
         stage_overrides='{"0": {"devices": "0,1"}, "1": {"devices": "2"}}',
     )
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
 
+    assert len(captured["args"]) == 2
+    assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
     assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
 
@@ -222,6 +255,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    stage_cfg.engine_args["async_chunk"] = True
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
@@ -241,7 +275,10 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mock_connector_spec = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_spec",
+        return_value={},
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
@@ -277,6 +314,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["omni_stage_config"] is stage_cfg
     assert kwargs["replica_id"] is None
     assert "socket_ownership" not in kwargs
+    assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs
@@ -377,7 +415,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
@@ -457,7 +495,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")

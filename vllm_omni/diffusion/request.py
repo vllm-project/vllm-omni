@@ -1,13 +1,39 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
+_DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
+
+
+def resolve_video_num_frames(
+    num_frames: int | None,
+    *,
+    default_num_frames: int,
+    is_dummy_run: bool,
+) -> int:
+    """Resolve the shared image-model frame sentinel for a video pipeline.
+
+    ``OmniDiffusionSamplingParams`` defaults ``num_frames`` to one for image
+    models, so an omitted video API field reaches model code as ``1``. Video
+    pipelines with a different default must materialize it at their boundary.
+    Startup profiling intentionally requests one frame, however, and must stay
+    lightweight.
+    """
+    if num_frames is None or (num_frames == 1 and not is_dummy_run):
+        return default_num_frames
+    return num_frames
 
 
 @dataclass
@@ -28,7 +54,19 @@ class OmniDiffusionRequest:
     prompt: OmniPromptType
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
-    kv_sender_info: dict | None = None
+    kv_sender_info: dict[str, Any] | None = None
+    # Optional opaque, model-owned input prepared before Scheduler admission.
+    # Model code validates its concrete type when consuming it on the Worker.
+    prepared_layout: Any | None = None
+    # Scheduler-only native-compatible KV requests produced by model
+    # preprocessing.
+    # BaseScheduler takes ownership and clears this field before the request is
+    # sent to a Worker.
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] | None = None
+    # Optional model-specific condition structure used by request-batch admission.
+    # This is populated by a pipeline preprocessor before the request reaches
+    # the scheduler; ``None`` keeps the default behavior for other pipelines.
+    batch_compatibility_key: tuple[Any, ...] | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -40,12 +78,11 @@ class OmniDiffusionRequest:
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
-        # Detect whether user explicitly provided guidance_scale.
-        # The sentinel default is 0.0 (false-like); any truthy value means
-        # the caller set it intentionally.  We must resolve this BEFORE
-        # auto-filling guidance_scale_2, otherwise the sentinel leaks into
-        # guidance_scale_2.
-        if self.sampling_params.guidance_scale:
+        # Detect whether the caller explicitly provided guidance_scale before
+        # resolving the omitted value.  ``0.0`` is API-valid and must not be
+        # treated as omission because that would unexpectedly enable CFG in
+        # pipelines with a model-specific default above zero.
+        if self.sampling_params.guidance_scale is not None:
             self.sampling_params.guidance_scale_provided = True
         else:
             self.sampling_params.guidance_scale = 1.0
@@ -55,6 +92,13 @@ class OmniDiffusionRequest:
             not isinstance(self.prompt, str) and self.prompt.get("negative_prompt")
         ):
             self.sampling_params.do_classifier_free_guidance = True
+
+        # Detect whether the caller explicitly provided guidance_scale_2
+        # BEFORE auto-filling it. Pipelines with a model-specific second
+        # guidance default (e.g. Boogu image_guidance_scale=1.0) must be able
+        # to tell an explicit value apart from the guidance_scale fallback.
+        if self.sampling_params.guidance_scale_2 is not None:
+            self.sampling_params.guidance_scale_2_provided = True
 
         # Auto-fill guidance_scale_2 from the (now-resolved) guidance_scale
         # so downstream code always has a valid value.
@@ -66,4 +110,6 @@ class OmniDiffusionRequest:
 
     @classmethod
     def is_dummy_run_request_id(cls, request_id: str | None) -> bool:
-        return request_id == DUMMY_DIFFUSION_REQUEST_ID
+        return request_id == DUMMY_DIFFUSION_REQUEST_ID or (
+            isinstance(request_id, str) and request_id.startswith(_DUMMY_DIFFUSION_REQUEST_ID_PREFIX)
+        )

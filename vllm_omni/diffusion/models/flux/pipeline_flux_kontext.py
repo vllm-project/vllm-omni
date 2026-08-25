@@ -640,7 +640,14 @@ class FluxKontextPipeline(
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        guidance_scale = req.sampling_params.guidance_scale or guidance_scale
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
+        )
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
         true_cfg_scale = (
             req.sampling_params.true_cfg_scale if req.sampling_params.true_cfg_scale is not None else true_cfg_scale
         )

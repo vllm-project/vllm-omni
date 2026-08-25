@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Async Omni Engine for vLLM-Omni multi-stage runtime.
 
@@ -9,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import dataclasses
 import json
 import queue
 import threading
@@ -18,38 +20,47 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
 from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
-from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import strip_parent_engine_args
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.stage_config import (
+    DuplexSessionRuntimeConfig,
+    load_deploy_config,
+)
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import (
+    SHUTDOWN_ENQUEUE_TIMEOUT_S,
+    SHUTDOWN_JOIN_TIMEOUT_S,
+    apply_omni_final_stage_metadata,
+    enqueue_orchestrator_shutdown,
+    inject_global_id,
+    shutdown_runtime_after_orchestrator,
+    upgrade_to_omni_request,
+    weak_shutdown_async_omni_engine,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
     ErrorMessage,
-    ShutdownRequestMessage,
+    InteractionMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.engine.serialization import (
-    deserialize_additional_information,
-    serialize_additional_information,
-)
+from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
@@ -62,130 +73,18 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-
-
-# ============================================================================
-# Parent-EngineArgs field-routing contracts (consumed by
-# AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
-# ============================================================================
-
-# Fields that must survive the "equal to default → strip" filter because
-# diffusion stages need them even when equal to vllm's default value
-# (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
-_PARENT_ARGS_KEEP: frozenset[str] = frozenset(
-    {
-        "worker_extension_cls",
-        "allowed_local_media_path",
-        "allowed_media_domains",
-        # Legacy stage-config YAMLs may intentionally leave parallel or
-        # distributed knobs unspecified at the stage level and rely on
-        # top-level CLI values to fill them in during the per-stage merge.
-        # Keep these fields so stages that omit them can inherit CLI values,
-        # while stages with explicit YAML values still win because the legacy
-        # stage-config loader prefers stage-local engine args.
-        "tensor_parallel_size",
-    }
-)
-
-# Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
-# must never leak into per-stage EngineArgs (``stage_configs_path`` would
-# trigger the ``create_model_config`` guard).
-_PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
-
-
-# Fields always populated by callers (via ``from_cli_args`` / ``asdict``) so
-# their presence as an override is never a surprise — suppress the
-# "override ignored" warning for these.
-_PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
-
-
-def _inject_global_id(target: Any, request_id: str) -> None:
-    """Inject global_request_id into a prompt dict's additional_information."""
-    if isinstance(target, dict):
-        if "additional_information" not in target:
-            target["additional_information"] = {}
-        if target["additional_information"] is None:
-            target["additional_information"] = {}
-        if isinstance(target["additional_information"], dict):
-            target["additional_information"]["global_request_id"] = [str(request_id)]
-
-
-def _upgrade_to_omni_request(
-    request: EngineCoreRequest,
-    raw_prompt: Any,
-) -> EngineCoreRequest:
-    """Restore omni-only fields omitted by upstream InputProcessor."""
-    prompt_embeds = request.prompt_embeds
-    additional_information = None
-
-    if isinstance(raw_prompt, dict):
-        if prompt_embeds is None:
-            raw_prompt_embeds = raw_prompt.get("prompt_embeds")
-            if isinstance(raw_prompt_embeds, torch.Tensor):
-                prompt_embeds = raw_prompt_embeds
-        additional_information = serialize_additional_information(
-            raw_prompt.get("additional_information"),
-            log_prefix="AsyncOmniEngine",
-        )
-
-    if prompt_embeds is None and additional_information is None:
-        return request
-
-    return OmniEngineCoreRequest.from_request(
-        request,
-        prompt_embeds=prompt_embeds,
-        additional_information=additional_information,
-    )
-
-
-def _apply_omni_final_stage_metadata(
-    request: EngineCoreRequest,
-    final_stage_id: int,
-) -> EngineCoreRequest:
-    """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
-    merged: dict[str, Any] = {}
-    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
-        merged = deserialize_additional_information(request.additional_information)
-    merged["omni_final_stage_id"] = final_stage_id
-    payload = serialize_additional_information(merged)
-    return OmniEngineCoreRequest.from_request(
-        request,
-        additional_information=payload,
-    )
-
-
-def _weak_shutdown_async_omni_engine(
-    orchestrator_thread: threading.Thread | None,
-    request_queue: janus.Queue[EngineQueueMessage] | None,
-    output_queue: janus.Queue[EngineQueueMessage] | None,
-    rpc_output_queue: janus.Queue[EngineQueueMessage] | None,
-) -> None:
-    """Best-effort orchestrator cleanup for GC finalization."""
-    try:
-        if request_queue is not None:
-            request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-    except Exception:
-        pass
-
-    try:
-        if orchestrator_thread is not None and orchestrator_thread.is_alive():
-            orchestrator_thread.join()
-    except Exception:
-        pass
-
-    for q in (request_queue, output_queue, rpc_output_queue):
-        try:
-            if q is not None:
-                q.close()
-        except Exception:
-            pass
 
 
 class AsyncOmniEngine:
@@ -220,7 +119,7 @@ class AsyncOmniEngine:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
-        trust_remote_code: bool = False,
+        trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -282,17 +181,36 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get the pipeline endpoint
-        # restriction beforehand. TODO (Alex) make this cleaner and refactor
-        # stage config resolution to remove kwargs hacks.
+        # Stage resolution pops deploy_config, so get pipeline-wide settings beforehand.
         deploy_config_path = kwargs.get("deploy_config")
-        self.endpoint_restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
+        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
+        # specified" so stage-config resolution can defer to the deploy yaml's
+        # per-stage value (see ``with_trust_remote_code_override``). The
+        # restriction path below loads the top-level HF config via vLLM's
+        # ``get_config``, which needs a real bool, so collapse ``None`` to the
+        # default ``False`` here (#5495).
+        pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
+        self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
+        )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
+        )
+        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        self.duplex_session_config = DuplexSessionRuntimeConfig()
+        if deploy_config_path is not None:
+            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
-        kwargs["trust_remote_code"] = trust_remote_code
+        # Tri-state: None means "not specified" — the deploy yaml's per-stage
+        # trust_remote_code stays in effect. An explicit True/False here is a
+        # global override (precedence: caller > deploy yaml > default False);
+        # the merge rule lives in with_trust_remote_code_override.
+        kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
@@ -319,7 +237,8 @@ class AsyncOmniEngine:
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
-        self._rpc_lock = threading.Lock()
+        self._correlated_rpc_client: CorrelatedRpcClient | None = None
+        self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
@@ -338,15 +257,20 @@ class AsyncOmniEngine:
         )
         self.orchestrator_thread.start()
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
+        self._correlated_rpc_client = CorrelatedRpcClient(
+            self.request_queue.sync_q,
+            self.rpc_output_queue.sync_q,
+        )
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
             self,
-            _weak_shutdown_async_omni_engine,
+            weak_shutdown_async_omni_engine,
             self.orchestrator_thread,
             self.request_queue,
             self.output_queue,
             self.rpc_output_queue,
+            self._correlated_rpc_client,
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
@@ -361,8 +285,16 @@ class AsyncOmniEngine:
             from types import SimpleNamespace
 
             from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            self._diffusion_od_config_view = SimpleNamespace(model_class_name=resolve_model_class_name(self.model))
+            model_class_name = resolve_model_class_name(self.model)
+            metadata = get_diffusion_model_metadata(model_class_name)
+            self._diffusion_od_config_view = SimpleNamespace(
+                model_class_name=model_class_name,
+                supports_multimodal_inputs=metadata.supports_multimodal_inputs,
+                max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
+                supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+            )
         return self._diffusion_od_config_view
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
@@ -384,6 +316,7 @@ class AsyncOmniEngine:
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
+            log_stats=self._log_stats,
         )
         self._runtime.initialize()
 
@@ -440,6 +373,25 @@ class AsyncOmniEngine:
             pd_config = self._detect_pd_config()
 
             membership_controller = self._runtime.create_membership_controller()
+            duplex_runtime_extension = None
+            if self._duplex_control_enabled:
+                from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+                    load_duplex_runtime_extension,
+                    validate_duplex_runtime_extension,
+                )
+
+                duplex_runtime_extension = load_duplex_runtime_extension(
+                    getattr(self, "_duplex_runtime_extension_path", None)
+                )
+                if duplex_runtime_extension is not None:
+                    stage_clients = []
+                    for pool in self.stage_pools:
+                        assert pool.stage_client is not None
+                        stage_clients.append(pool.stage_client)
+                    validate_duplex_runtime_extension(
+                        duplex_runtime_extension,
+                        sampling_defaults=tuple(client.default_sampling_params for client in stage_clients),
+                    )
 
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
@@ -453,6 +405,9 @@ class AsyncOmniEngine:
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
+                duplex_runtime_extension=duplex_runtime_extension,
+                enable_duplex_control=self._duplex_control_enabled,
+                duplex_session_config=self.duplex_session_config,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -500,6 +455,13 @@ class AsyncOmniEngine:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                logger.warning(
+                    "[AsyncOmniEngine] Orchestrator startup timed out after %ss. "
+                    "Multi-stage deployments that initialize stages sequentially on one device "
+                    "or load checkpoints from slow storage may need larger --init-timeout and "
+                    "--stage-init-timeout values.",
+                    startup_timeout,
+                )
                 self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
@@ -551,6 +513,7 @@ class AsyncOmniEngine:
         if not isinstance(mm_data, dict) or not mm_data:
             return
 
+        from vllm.config.multimodal import _get_mm_hasher_algorithm
         from vllm.multimodal.hasher import MultiModalHasher
 
         existing_uuids = prompt.get("multi_modal_uuids")
@@ -577,6 +540,7 @@ class AsyncOmniEngine:
                     base_uuid = None
                 else:
                     base_uuid = MultiModalHasher.hash_kwargs(
+                        _get_mm_hasher_algorithm(),
                         model_id=model_id,
                         **{modality: item},
                     )
@@ -723,10 +687,10 @@ class AsyncOmniEngine:
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
-                _inject_global_id(prompt, request_id)
+                inject_global_id(prompt, request_id)
             elif isinstance(prompt, list):
                 for item in prompt:
-                    _inject_global_id(item, request_id)
+                    inject_global_id(item, request_id)
 
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
@@ -734,6 +698,7 @@ class AsyncOmniEngine:
             )
 
             # Full input processing (tokenization, multimodal, etc.)
+            assert self.input_processor is not None
             _t_preprocess = time.perf_counter()
             try:
                 request = self.input_processor.process_inputs(
@@ -756,7 +721,7 @@ class AsyncOmniEngine:
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
-            request = _upgrade_to_omni_request(request, prompt)
+            request = upgrade_to_omni_request(request, prompt)
 
             if reasoning_ended is not None:
                 request.reasoning_ended = reasoning_ended
@@ -768,7 +733,7 @@ class AsyncOmniEngine:
             # to match the key used in Orchestrator.request_states so that
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
-            request = _apply_omni_final_stage_metadata(request, final_stage_id)
+            request = apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Registration with stage 0's output processor is deferred to the
             # orchestrator thread (see Orchestrator._handle_add_request), which
@@ -792,23 +757,33 @@ class AsyncOmniEngine:
             enqueue_ts=time.perf_counter(),
         )
 
-    def _enqueue_cfg_companions(
+    def _build_cfg_companions(
         self,
         parent_id: str,
         original_prompt: Any,
         stage0_params: Any,
         sampling_params_list: list[Any],
-    ) -> None:
-        """Expand prompt into CFG companions, process through InputProcessor, and enqueue."""
-        try:
-            expanded = self.prompt_expand_func(original_prompt, stage0_params)
-        except Exception:
-            logger.exception("[AsyncOmniEngine] prompt_expand_func failed for req %s", parent_id)
-            return
+    ) -> list[AddCompanionRequestMessage]:
+        """Expand a prompt into its CFG companions, without enqueueing any.
 
+        Construction is separated from admission so a guided request is
+        all-or-nothing. A model whose guidance is mandatory cannot decode a
+        request whose companion never arrived: the pair never completes, the
+        request occupies scheduler and KV capacity for the scheduler's whole
+        hold budget, and then produces no audio. Raising here instead means the
+        caller learns immediately and nothing was admitted.
+
+        Raises:
+            Exception: Whatever prompt expansion or input processing raised.
+                The caller is expected to let it reach the client.
+        """
+        assert self.prompt_expand_func is not None
+        expanded = self.prompt_expand_func(original_prompt, stage0_params)
         if not expanded:
-            return
+            return []
 
+        companions: list[AddCompanionRequestMessage] = []
+        assert self.input_processor is not None
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
@@ -816,7 +791,7 @@ class AsyncOmniEngine:
             companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
 
             if isinstance(companion_prompt, dict):
-                _inject_global_id(companion_prompt, cid)
+                inject_global_id(companion_prompt, cid)
 
             request = self.input_processor.process_inputs(
                 request_id=cid,
@@ -824,12 +799,23 @@ class AsyncOmniEngine:
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
+            # Same restore the parent request gets: the upstream input
+            # processor drops omni-only prompt fields, so without this the
+            # companion reaches the worker with no additional_information at
+            # all. That is where ``global_request_id`` lives, and it is what
+            # was just injected above, so skipping it silently undoes the
+            # injection: the model sees the companion row with no id and
+            # cannot match it to its conditioned partner.
+            request = upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
+            # Companions are stage-0-final for ordinary downstream payloads,
+            # but diffusion still needs their CFG KV caches.
+            request = apply_omni_final_stage_metadata(request, 0, force_kv_transfer=True)
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
             # admission through StagePool.submit_initial(..., affinity_request_id=...).
-            self.request_queue.sync_q.put(
+            companions.append(
                 AddCompanionRequestMessage(
                     companion_id=cid,
                     parent_id=parent_id,
@@ -839,11 +825,35 @@ class AsyncOmniEngine:
                     sampling_params_list=companion_spl,
                 )
             )
+        return companions
+
+    def _enqueue_cfg_companions(
+        self,
+        parent_id: str,
+        original_prompt: Any,
+        stage0_params: Any,
+        sampling_params_list: list[Any],
+    ) -> None:
+        """Build and enqueue CFG companions, tolerating a build failure.
+
+        Kept for callers that admit the parent first and cannot roll it back.
+        Prefer building with :meth:`_build_cfg_companions` before the parent is
+        admitted, so the pair is atomic.
+        """
+        try:
+            companions = self._build_cfg_companions(parent_id, original_prompt, stage0_params, sampling_params_list)
+        except Exception:
+            logger.exception("[AsyncOmniEngine] CFG companion build failed for req %s", parent_id)
+            return
+        for companion in companions:
+            self.request_queue.sync_q.put(companion)
+        if not companions:
+            return
 
         logger.info(
             "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
             parent_id,
-            len(expanded),
+            len(companions),
         )
 
     @staticmethod
@@ -870,7 +880,7 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
-        if cache_backend in ("step_cache"):
+        if cache_backend == "step_cache":
             return {
                 "step_cache_dit_enabled": True,
                 "velocity_sim_thresholds": [0.95, 0.93],
@@ -973,21 +983,23 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            allgather_degree = normalized_kwargs.get("allgather_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
-            data_parallel_size = normalized_kwargs.get("data_parallel_size") or 1
+            data_parallel_size = normalized_kwargs.get("data_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
+            text_encoder_tp_size = normalized_kwargs.get("text_encoder_tp_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree
+                sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=pipeline_parallel_size,
@@ -997,14 +1009,21 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                allgather_degree=allgather_degree,
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,
+                text_encoder_tp_size=text_encoder_tp_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
             )
+
+        num_gpus = normalized_kwargs.get("num_gpus")
+        if num_gpus is not None:
+            num_gpus = int(num_gpus)
+            parallel_config.resolve_data_parallel_size(num_gpus)
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
@@ -1015,16 +1034,22 @@ class AsyncOmniEngine:
         if (
             kwargs.get("diffusion_attention_config") is not None
             or kwargs.get("diffusion_attention_backend") is not None
+            or kwargs.get("fastvideo_vsa_topk") is not None
         ):
             attention_config = parse_attention_config(
                 kwargs.get("diffusion_attention_config"),
                 attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
             )
 
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
+            # Default-stage construction bypasses the structured projection.
+            # Runner selection remains owned by the selected engine/platform.
+            "engine_backend": kwargs.get("engine_backend", "default"),
             "model_class_name": kwargs.get("model_class_name", None),
+            "task_type": kwargs.get("task_type", None),
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
@@ -1036,16 +1061,31 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
+            "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
+            "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
+            "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
+            "host_weight_runtime_root": kwargs.get("host_weight_runtime_root"),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
+            "diffusion_compile_granularity": (
+                "regional"
+                if kwargs.get("diffusion_compile_granularity") is None
+                else kwargs["diffusion_compile_granularity"]
+            ),
+            "diffusion_compile_dynamic": (
+                True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
+            ),
+            "fa_deterministic": bool(kwargs.get("fa_deterministic", False)),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+            "lora_path": kwargs.get("lora_path", None),
+            "lora_scale": kwargs.get("lora_scale", 1.0),
+            "lora_backend": kwargs.get("lora_backend", "peft"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
-            "distributed_executor_backend": (
-                "mp" if kwargs.get("distributed_executor_backend") is None else kwargs["distributed_executor_backend"]
-            ),
+            "distributed_executor_backend": kwargs.get("distributed_executor_backend"),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
             "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
             "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
@@ -1075,6 +1115,8 @@ class AsyncOmniEngine:
                 else {}
             ),
         }
+        if num_gpus is not None:
+            stage_engine_args["num_gpus"] = num_gpus
         # Only set dtype if it was already explicitly passed and normalized
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]
@@ -1094,6 +1136,7 @@ class AsyncOmniEngine:
                     "devices": devices,
                 },
                 "engine_args": stage_engine_args,
+                "engine_input_source": [],
                 "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
                 "final_output_type": final_output_type,
@@ -1101,40 +1144,6 @@ class AsyncOmniEngine:
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
-
-    @staticmethod
-    def _strip_single_engine_args(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Remove parent ``EngineArgs`` fields from *kwargs*.
-
-        When ``stage_configs_path`` is set, per-stage engine args are defined
-        in the YAML.  Top-level single-engine fields (``compilation_config``,
-        ``tensor_parallel_size``, …) must not leak into per-stage configs via
-        the ``base_engine_args`` merge in ``load_stage_configs_from_yaml`` —
-        they can cause type errors (e.g. ``compilation_config`` as a JSON
-        string rejected by ``VllmConfig``) or silently override YAML values.
-
-        Logs a warning for any parent field whose value differs from the
-        dataclass default, so users know their explicit overrides are ignored.
-        See the module-level ``_PARENT_ARGS_*`` constants for the routing
-        contracts this method enforces.
-        """
-        parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        result, overridden = strip_parent_engine_args(
-            kwargs,
-            parent_fields=parent_fields,
-            keep_keys=_PARENT_ARGS_KEEP,
-            strip_keys=_PARENT_ARGS_STRIP,
-            no_warn_keys=_PARENT_ARGS_NO_WARN,
-        )
-
-        if overridden:
-            logger.warning(
-                "stage_configs_path is set — the following top-level engine "
-                "args are ignored (per-stage YAML takes precedence): %s",
-                ", ".join(sorted(overridden)),
-            )
-
-        return result
 
     def _apply_strategy_lb_policy(self, derived: str | None, kwargs: dict[str, Any]) -> None:
         """Apply a strategy-derived ``omni_lb_policy`` to the engine.
@@ -1170,33 +1179,24 @@ class AsyncOmniEngine:
         model: str,
         kwargs: dict[str, Any],
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        stage_configs_path = kwargs.get("stage_configs_path", None)
+        for legacy_arg in ("stage_configs_path", "stage_configs"):
+            if legacy_arg in kwargs:
+                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        explicit_stage_configs = kwargs.pop("stage_configs", None)
-        if explicit_stage_configs is not None:
-            logger.warning(
-                "`stage_configs` is not part of the public API. "
-                "Ignoring it and resolving stages from stage_configs_path/model factory."
-            )
-
-        if stage_configs_path is not None:
-            base_kwargs = self._strip_single_engine_args(kwargs)
-        else:
-            base_kwargs = kwargs
 
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
-            stage_configs_path,
-            base_kwargs,
+            kwargs,
             trust_remote_code=trust_remote_code,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
@@ -1237,9 +1237,13 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                if kwargs.get("lora_backend") is not None:
+                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
+                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None
+                    or kwargs.get("fastvideo_vsa_topk") is not None
                 ):
                     has_stage_attention = (
                         hasattr(cfg.engine_args, "diffusion_attention_config")
@@ -1249,6 +1253,7 @@ class AsyncOmniEngine:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
+                            fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
                         )
                 quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:
@@ -1341,16 +1346,28 @@ class AsyncOmniEngine:
             reasoning_ended=reasoning_ended,
             resumable=resumable,
         )
-        self.request_queue.sync_q.put(msg)
-
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
+        # CFG companions are built before the parent is admitted, so the group
+        # is all-or-nothing: a build failure raises here, nothing is enqueued,
+        # and the caller sees the error. Admitting the parent first would leave
+        # an orphan holding scheduler and KV capacity that can never complete,
+        # because a model whose guidance is mandatory cannot decode a request
+        # whose companion never arrived.
+        companions: list[AddCompanionRequestMessage] = []
         if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.original_prompt
             effective_spl = msg.sampling_params_list
             stage0_params = effective_spl[0] if effective_spl else None
             if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
+                companions = self._build_cfg_companions(request_id, msg.original_prompt, stage0_params, effective_spl)
+
+        self.request_queue.sync_q.put(msg)
+        for companion in companions:
+            self.request_queue.sync_q.put(companion)
+        if companions:
+            logger.info(
+                "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
+                request_id,
+                len(companions),
+            )
 
     async def add_request_async(
         self,
@@ -1397,6 +1414,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1409,6 +1427,7 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
             message_type="streaming_update",
         )
@@ -1423,6 +1442,7 @@ class AsyncOmniEngine:
         final_stage_id: int = 0,
         final_output_stage_ids: Sequence[int] | None = None,
         arrival_time: float | None = None,
+        lora_request: Any = None,
         *,
         resumable: bool = True,
     ) -> None:
@@ -1435,7 +1455,270 @@ class AsyncOmniEngine:
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
             arrival_time=arrival_time,
+            lora_request=lora_request,
             resumable=resumable,
+        )
+
+    def open_duplex_session(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Open an engine-level duplex session."""
+        return self._get_duplex_control_client().open(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def open_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        session_mode: str = "duplex",
+        capabilities: dict[str, object] | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Async wrapper for opening an engine-level duplex session."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.open_duplex_session(
+                session_id,
+                session_mode=session_mode,
+                capabilities=capabilities,
+                session_config=session_config,
+                runtime_config=runtime_config,
+                fence=fence,
+                timeout=timeout,
+            ),
+        )
+
+    def append_duplex_input(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        operation_id: str | None = None,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Append input to an engine-level duplex session."""
+        return self._get_duplex_control_client().append(
+            session_id,
+            mode=mode,
+            payload=payload,
+            operation_id=operation_id,
+            final=final,
+            expected_epoch=expected_epoch,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    async def append_duplex_input_async(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        payload: object,
+        operation_id: str | None = None,
+        final: bool = False,
+        expected_epoch: int | None = None,
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Async wrapper for appending duplex input."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.append_duplex_input(
+                session_id,
+                mode=mode,
+                payload=payload,
+                operation_id=operation_id,
+                final=final,
+                expected_epoch=expected_epoch,
+                fence=fence,
+                timeout=timeout,
+            ),
+        )
+
+    def signal_duplex_turn(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Signal an engine-level duplex turn."""
+        return self._get_duplex_control_client().signal(
+            session_id,
+            event=event,
+            fence=fence,
+            next_fence=next_fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            timeout=timeout,
+        )
+
+    async def signal_duplex_turn_async(
+        self,
+        session_id: str,
+        *,
+        event: str,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Async wrapper for signaling a duplex turn."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.signal_duplex_turn(
+                session_id,
+                event=event,
+                fence=fence,
+                next_fence=next_fence,
+                session_config=session_config,
+                runtime_config=runtime_config,
+                timeout=timeout,
+            ),
+        )
+
+    def close_duplex_session(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Close an engine-level duplex session."""
+        return self._get_duplex_control_client().close(
+            session_id,
+            reason=reason,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    def touch_duplex_session(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return self._get_duplex_control_client().touch(
+            session_id,
+            fence=fence,
+            activity=activity,
+            timeout=timeout,
+        )
+
+    async def touch_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.touch_duplex_session(
+                session_id,
+                fence=fence,
+                activity=activity,
+                timeout=timeout,
+            ),
+        )
+
+    def resume_duplex_session(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return self._get_duplex_control_client().resume(
+            session_id,
+            fence=fence,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
+
+    async def resume_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.resume_duplex_session(
+                session_id,
+                fence=fence,
+                expected_lease_generation=expected_lease_generation,
+                timeout=timeout,
+            ),
+        )
+
+    def _get_duplex_control_client(self) -> DuplexControlClient:
+        from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
+
+        client = getattr(self, "_duplex_control_client", None)
+        if client is None:
+            transport = getattr(self, "_correlated_rpc_client", None)
+            if transport is None:
+                raise RuntimeError("correlated RPC client is not initialized")
+            client = DuplexControlClient(
+                transport,
+                control_id_factory=lambda: uuid.uuid4().hex,
+            )
+            self._duplex_control_client = client
+        return client
+
+    async def close_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        reason: str = "client_close",
+        fence: DuplexFence,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        """Async wrapper for closing an engine-level duplex session."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.close_duplex_session(session_id, reason=reason, fence=fence, timeout=timeout),
         )
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
@@ -1461,14 +1744,75 @@ class AsyncOmniEngine:
         return self.stage_metadata[stage_id]
 
     def abort(self, request_ids: list[str]) -> None:
-        """Send abort message to the Orchestrator."""
+        """Fire-and-forget abort: enqueue and return without waiting.
+
+        Prefer :meth:`abort_async` when the caller needs acknowledgment that
+        stage aborts, binding release, and orchestrator request cleanup finished.
+        """
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
-        """Async abort API."""
-        self.abort(request_ids)
+    async def abort_async(
+        self,
+        request_ids: list[str],
+        timeout: float | None = None,
+    ) -> None:
+        """Abort requests and wait for orchestrator acknowledgment.
+
+        Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the
+        :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
+        raises if the orchestrator reports failure or times out.
+        """
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+
+        rpc_id = uuid.uuid4().hex
+        msg = AbortRequestMessage(request_ids=request_ids, rpc_id=rpc_id)
+
+        def _wait() -> AbortResultMessage:
+            result_msg = transport.execute(
+                ("abort", rpc_id),
+                msg,
+                timeout=timeout,
+                timeout_message=f"abort timed out after {timeout} seconds",
+                block_on_submit=True,
+            )
+            if not isinstance(result_msg, AbortResultMessage):
+                raise RuntimeError(f"unexpected abort result type: {type(result_msg).__name__}")
+            return result_msg
+
+        loop = asyncio.get_running_loop()
+        result_msg = await loop.run_in_executor(None, _wait)
+        if not result_msg.success:
+            raise RuntimeError(result_msg.error or "abort failed")
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Send an interaction control message to the Orchestrator."""
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+
+        self.request_queue.sync_q.put_nowait(
+            InteractionMessage(
+                request_id=request_id,
+                interaction=interaction,
+            )
+        )
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Async interaction API."""
+        self.submit_interaction(request_id, interaction)
 
     def collective_rpc(
         self,
@@ -1493,36 +1837,19 @@ class AsyncOmniEngine:
             stage_ids=stage_ids,
         )
 
-        with self._rpc_lock:
-            self.request_queue.sync_q.put(msg)
-            deadline = None if timeout is None else time.monotonic() + timeout
-
-            while True:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                try:
-                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
-                except queue.Empty as exc:
-                    raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
-
-                if isinstance(result_msg, ErrorMessage):
-                    raise RuntimeError(result_msg.error)
-
-                if not isinstance(result_msg, CollectiveRPCResultMessage):
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping unexpected rpc queue message type=%s",
-                        getattr(result_msg, "type", type(result_msg).__name__),
-                    )
-                    continue
-
-                if result_msg.rpc_id != rpc_id:
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping mismatched rpc result rpc_id=%s expected=%s",
-                        result_msg.rpc_id,
-                        rpc_id,
-                    )
-                    continue
-
-                return list(result_msg.results)
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+        result_msg = transport.execute(
+            ("collective", rpc_id),
+            msg,
+            timeout=timeout,
+            timeout_message=f"collective_rpc timed out after {timeout} seconds",
+            block_on_submit=True,
+        )
+        if not isinstance(result_msg, CollectiveRPCResultMessage):
+            raise RuntimeError(f"unexpected collective RPC result type: {type(result_msg).__name__}")
+        return list(result_msg.results)
 
     async def collective_rpc_async(
         self,
@@ -1559,22 +1886,61 @@ class AsyncOmniEngine:
             finalizer.detach()
 
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
-        if self.request_queue is not None:
-            self.request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-        if self.is_alive():
-            self.orchestrator_thread.join()
+        request_queue_closed = False
+        shutdown_enqueued = enqueue_orchestrator_shutdown(
+            self.request_queue,
+            timeout=SHUTDOWN_ENQUEUE_TIMEOUT_S,
+        )
+        if self.request_queue is not None and not shutdown_enqueued:
+            logger.error(
+                "[AsyncOmniEngine] Failed to enqueue orchestrator shutdown; "
+                "closing the request queue to wake the request handler"
+            )
+            try:
+                self.request_queue.close()
+                request_queue_closed = True
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to close the request queue")
+
+        if self._correlated_rpc_client is not None:
+            try:
+                self._correlated_rpc_client.close()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to close correlated RPC client")
+
+        orchestrator_stopped = False
+        try:
+            if self.is_alive():
+                self.orchestrator_thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
+            orchestrator_stopped = not self.is_alive()
+            if not orchestrator_stopped:
+                logger.error(
+                    "[AsyncOmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
+                    SHUTDOWN_JOIN_TIMEOUT_S,
+                )
+        except Exception:
+            logger.exception("[AsyncOmniEngine] Failed to join Orchestrator thread")
 
         for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             try:
-                q.close()
+                if not (q is self.request_queue and request_queue_closed):
+                    q.close()
             except Exception:
                 pass
 
-        if hasattr(self, "_runtime") and self._runtime is not None:
+        if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:
                 self._runtime.shutdown()
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime")
+        elif hasattr(self, "_runtime") and self._runtime is not None:
+            logger.warning("[AsyncOmniEngine] Deferring StageRuntime shutdown until the Orchestrator exits")
+            threading.Thread(
+                target=shutdown_runtime_after_orchestrator,
+                args=(self.orchestrator_thread, self._runtime),
+                daemon=True,
+                name="omni-stage-runtime-shutdown",
+            ).start()
 
         # ── Release CuMem allocator memory pool ──────────────────────────────
         # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory

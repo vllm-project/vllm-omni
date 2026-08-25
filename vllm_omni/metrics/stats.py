@@ -44,7 +44,7 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
@@ -381,6 +381,7 @@ class OrchestratorAggregator:
         finished: bool,
         final_output_type: str | None,
         output_to_yield: Any | None,
+        event_cursor: int = 0,
     ) -> None:
         """Process and record stage metrics.
 
@@ -409,7 +410,7 @@ class OrchestratorAggregator:
                 return
 
             rid_key = str(req_id)
-            stage_snapshot = self._build_stage_metrics_snapshot(rid_key)
+            stage_snapshot = self._build_stage_metrics_snapshot(rid_key, event_cursor=event_cursor)
 
             # 3. Not finished yet — expose incremental per-stage snapshot for streaming clients.
             if not finished:
@@ -423,7 +424,11 @@ class OrchestratorAggregator:
             # token fields only for text stages (OpenAI-style completion token accounting).
             output_to_yield.metrics = {"stage_metrics": stage_snapshot}
             stage_event = next(
-                (evt for evt in reversed(self.stage_events.get(rid_key, [])) if evt.stage_id == stage_id),
+                (
+                    evt
+                    for evt in reversed(self.stage_events.get(rid_key, [])[event_cursor:])
+                    if evt.stage_id == stage_id
+                ),
                 None,
             )
             if stage_event is not None and stage_event.final_output_type == "text":
@@ -541,10 +546,18 @@ class OrchestratorAggregator:
         current[defs.TIME_PER_OUTPUT_UNIT_MS] = remaining_ms / float(output_count - 1) if output_count > 1 else 0.0
         return current
 
-    def _build_stage_metrics_snapshot(self, req_id: str) -> dict[str, dict[str, Any]]:
+    def stage_event_cursor(self, req_id: str) -> int:
+        return len(self.stage_events.get(str(req_id), ()))
+
+    def _build_stage_metrics_snapshot(
+        self,
+        req_id: str,
+        *,
+        event_cursor: int = 0,
+    ) -> dict[str, dict[str, Any]]:
         """Aggregate per-stage metrics for ``req_id`` (string key), for streaming/benchmark clients."""
         snapshot: dict[str, dict[str, Any]] = {}
-        for evt in self.stage_events.get(req_id, []):
+        for evt in self.stage_events.get(req_id, [])[event_cursor:]:
             sid = int(evt.stage_id) if evt.stage_id is not None else -1
             if sid < 0:
                 continue
@@ -566,7 +579,7 @@ class OrchestratorAggregator:
         if final_output_type is not None:
             stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
             else None
         )
@@ -631,8 +644,19 @@ class OrchestratorAggregator:
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
         if diffusion_metrics:
+            _MS_TO_S = {
+                "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+                "preprocess_time_ms": "preprocess_time_s",
+                "postprocess_time_ms": "postprocess_time_s",
+                "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
+            }
             for key, value in diffusion_metrics.items():
-                self.diffusion_metrics[req_id][key] += value
+                if value is None:
+                    continue
+                if key in _MS_TO_S:
+                    self.diffusion_metrics[req_id][_MS_TO_S[key]] = float(value) / 1000.0
+                else:
+                    self.diffusion_metrics[req_id][key] = value
 
     def on_forward(
         self,

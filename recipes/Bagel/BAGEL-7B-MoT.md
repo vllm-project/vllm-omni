@@ -6,7 +6,7 @@
 
 - Vendor: ByteDance Seed
 - Model: `ByteDance-Seed/BAGEL-7B-MoT`
-- Task: Text-to-image and image-to-image generation
+- Task: Text-to-image, image-to-image, text-to-text, and image-to-text
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
 
@@ -26,6 +26,8 @@ parameters through the pipeline-declared `extra_args` contract.
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
 - Related offline image-to-image example:
   [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py)
+- Related offline understanding example:
+  [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Related online example:
   [`examples/online_serving/text_to_image/openai_chat_client.py`](../../examples/online_serving/text_to_image/openai_chat_client.py)
 - Related online image-to-image example:
@@ -55,14 +57,14 @@ move the diffusion stage to a second GPU in a custom deploy config.
 #### Offline Commands
 
 Run text-to-image with the shared offline example from the repository root.
-Pick the topology with `--stage-configs-path` and forward BAGEL-specific
+Pick the topology with `--deploy-config` and forward BAGEL-specific
 generation parameters as a JSON object through `--extra-body`:
 
 ```bash
 # Two-stage (Thinker + DiT), shares one GPU by default
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
-  --stage-configs-path vllm_omni/deploy/bagel.yaml \
+  --deploy-config vllm_omni/deploy/bagel.yaml \
   --prompt "A beautiful sunset over mountains" \
   --height 1024 \
   --width 1024 \
@@ -77,7 +79,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 # Single-stage (DiT only, with internal LLM/ViT/VAE)
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
-  --stage-configs-path vllm_omni/deploy/bagel_single_stage.yaml \
+  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
   --prompt "A beautiful sunset over mountains" \
   --height 1024 \
   --width 1024 \
@@ -117,6 +119,25 @@ python examples/offline_inference/image_to_image/image_edit.py \
 The `--extra-args` JSON forwards BAGEL-specific parameters (e.g. `cfg_text_scale`,
 `cfg_img_scale`, `cfg_interval`, `cfg_renorm_type`) into
 `OmniDiffusionSamplingParams.extra_args` via the model-extras registry.
+
+Run text-to-text with the shared understanding example. BAGEL's default
+`bagel.yaml` deploy config is discovered from the checkpoint, so no model-specific
+example or explicit deploy config is required:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --prompt "Where is the capital of France?"
+```
+
+Add `--image` to run image-to-text with the same example:
+
+```bash
+python examples/offline_inference/x_to_text/x_to_text.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --image /path/to/input.jpg \
+  --prompt "Please describe this image in detail."
+```
 
 #### Online Commands
 
