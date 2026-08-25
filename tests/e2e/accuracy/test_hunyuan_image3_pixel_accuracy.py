@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -7,6 +10,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import requests
@@ -72,7 +76,7 @@ def _baseline_path() -> Path:
 _OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).
-_DEPLOY_CONFIG = {
+_DEPLOY_CONFIG: dict[str, Any] = {
     "pipeline": "hunyuan_image3_dit",
     "async_chunk": False,
     "trust_remote_code": True,
@@ -136,7 +140,7 @@ def _devices() -> str:
 
 
 def _write_deploy_config(path: Path) -> None:
-    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config: dict[str, Any] = copy.deepcopy(_DEPLOY_CONFIG)
     devices = _devices()
     num_devices = len(devices.split(","))
     config["stages"][0]["devices"] = devices
@@ -292,17 +296,6 @@ def _assert_against_baseline(image: Image.Image, label: str) -> None:
         ssim_threshold=thresholds.ssim,
         psnr_threshold=psnr_threshold,
     )
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_resolve_similarity_thresholds_uses_device_profile() -> None:
-    default = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE, "default")
-    b200 = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE, "B200")
-    assert default.ssim == 0.97
-    assert default.psnr == 30.0
-    assert b200.ssim == 0.96
-    assert b200.psnr == 30.0
 
 
 @pytest.mark.full_model

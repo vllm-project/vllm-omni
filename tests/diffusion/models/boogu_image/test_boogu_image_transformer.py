@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -57,6 +57,20 @@ def _force_default_gemm(monkeypatch):
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda: default_unquantized_gemm,
     )
+
+
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
 
 
 def _randomize_parameters(module: torch.nn.Module) -> None:
