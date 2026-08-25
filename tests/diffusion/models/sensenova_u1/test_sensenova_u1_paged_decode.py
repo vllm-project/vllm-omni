@@ -365,3 +365,44 @@ def test_text_decoding_uses_the_paged_context_too():
     prefix[0, 0, 5] = 1.0  # not EOS, so one step runs
     SenseNovaU1Pipeline._generate_text(host, prefix, past_key_values=None, t_idx=0)
     assert host.seen == [context], f"text decoding ran with decode={host.seen}"
+
+
+class _WarmupReq:
+    """The engine's dummy request, which carries the reserved id."""
+
+    def __init__(self, request_id):
+        self.request_id = request_id
+        self.prompts = [{"prompt": "", "modalities": ["image"]}]
+
+
+def test_the_dummy_warmup_request_drives_one_decode_step(monkeypatch):
+    """The dummy request is a text-to-image run with think off, so it exercises
+    the prefill shape and never the decode one. Without this hook whatever the
+    deploy config compiles for decode lands on the first real request."""
+    from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
+
+    calls: list[str] = []
+    host = object.__new__(SenseNovaU1Pipeline)
+    monkeypatch.setattr(host, "_warm_ar_decode", lambda: calls.append("warm"), raising=False)
+    monkeypatch.setattr(
+        SenseNovaU1Pipeline,
+        "_parse_request",
+        lambda self, req: (_ for _ in ()).throw(_StopForwardError()),
+        raising=False,
+    )
+
+    with pytest.raises(_StopForwardError):
+        SenseNovaU1Pipeline.forward(host, _WarmupReq(DUMMY_DIFFUSION_REQUEST_ID))
+    assert calls == ["warm"], "the dummy warmup request did not drive a decode step"
+
+    calls.clear()
+    with pytest.raises(_StopForwardError):
+        SenseNovaU1Pipeline.forward(host, _WarmupReq("a-real-request"))
+    assert calls == [], "a real request paid for the warmup"
+
+
+class _StopForwardError(Exception):
+    """Stops ``forward`` right after the warmup hook, so the test needs no model."""

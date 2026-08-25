@@ -1237,8 +1237,37 @@ class SenseNovaU1Pipeline(
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
+    @staticmethod
+    def _is_warmup_request(req) -> bool:
+        is_dummy_run = getattr(req, "is_dummy_run", None)
+        if callable(is_dummy_run):
+            return bool(is_dummy_run())
+        return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
+
+    def _warm_ar_decode(self) -> None:
+        """Run one single-token decode at startup so its compiled region is built.
+
+        The engine's dummy request is a text-to-image run with think off. It
+        exercises the prefill shape but never the decode one, so whatever the
+        deploy config compiles for decode lands on the first real request
+        instead of on readiness. Warmup is best effort and must not fail startup.
+        """
+        try:
+            lm = self.language_model
+            device = torch.device(self.device)
+            ids = torch.zeros(1, 2, dtype=torch.long, device=device)
+            idx = torch.zeros(3, 2, dtype=torch.long, device=device)
+            prefill = lm(input_ids=ids, indexes=idx, use_cache=True)
+            nxt = torch.zeros(1, 1, dtype=torch.long, device=device)
+            nidx = torch.tensor([[2], [0], [0]], dtype=torch.long, device=device)
+            lm(input_ids=nxt, indexes=nidx, past_key_values=prefill.past_key_values, use_cache=True)
+        except Exception as exc:  # pragma: no cover - warmup is best effort
+            logger.warning("Autoregressive decode warmup skipped: %s", exc)
+
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if self._is_warmup_request(req):
+            self._warm_ar_decode()
         p = self._parse_request(req)
 
         input_images = self._extract_input_images(p.first_prompt)
