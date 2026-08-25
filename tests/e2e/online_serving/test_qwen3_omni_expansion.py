@@ -137,7 +137,7 @@ def get_max_batch_size(size_type="few"):
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + reduced_token_params, indirect=True)
 def test_text_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text

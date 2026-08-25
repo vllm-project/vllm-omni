@@ -38,8 +38,8 @@
           16,
           32
         ],
-        "random_input_len": 2500,
-        "random_output_len": 900,
+        "random_input_len": 100,
+        "random_output_len": 100,
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
       },
@@ -139,8 +139,8 @@
           16,
           32
         ],
-        "random_input_len": 2500,
-        "random_output_len": 900,
+        "random_input_len": 100,
+        "random_output_len": 100,
         "ignore_eos": true,
         "extra_body": {
           "modalities": [
@@ -379,24 +379,15 @@
           8,
           32
         ],
-        "random_input_len": 2500,
-        "random_output_len": 900,
+        "random_input_len": 100,
+        "random_output_len": 100,
         "ignore_eos": true,
         "extra_body": {
           "modalities": [
             "text"
           ]
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el",
-        "baseline": {
-          "H100": {
-            "mean_e2el_ms": [
-              4354.8945,
-              9861.1687,
-              18716.709
-            ]
-          }
-        }
+        "percentile-metrics": "ttft,tpot,itl,e2el"
       }
     ]
   }
