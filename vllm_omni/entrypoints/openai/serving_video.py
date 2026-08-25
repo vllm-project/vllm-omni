@@ -190,6 +190,7 @@ class OmniOpenAIServingVideo:
         ):
             target_size = (vp.width, vp.height)
             image_items = input_image if isinstance(input_image, list) else [input_image]
+
             def _letterbox(image: Image.Image, size: tuple[int, int]) -> Image.Image:
                 # Scale to fit and pad instead of stretching: a plain resize to
                 # the output canvas distorts reference aspect ratios (e.g. a
@@ -205,8 +206,7 @@ class OmniOpenAIServingVideo:
                 return canvas
 
             resized_images = [
-                _letterbox(image, target_size) if image.size != target_size else image
-                for image in image_items
+                _letterbox(image, target_size) if image.size != target_size else image for image in image_items
             ]
             input_image = resized_images if isinstance(input_image, list) else resized_images[0]
         multi_modal_data: dict[str, Any] = {}
