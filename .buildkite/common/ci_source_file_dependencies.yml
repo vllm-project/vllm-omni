@@ -1,0 +1,149 @@
+# Uploader-only extra path-prefix presets for CUDA L2–L5 and NPU L4 test YAML.
+# Referenced as ``source_file_dependencies: omni_qwen3_omni`` (or a list of
+# keys) on a step; ``upload_pipeline.py`` expands the key(s), then **also**
+# appends ``tests/`` paths from the step's pytest / ``run_cov_split.sh``
+# commands. Do **not** list those pytest targets here.
+#
+# Naming: {domain}_{model}[_{variant}]
+# Shared L2/L3/L4/L5 jobs reuse one key (e.g. diffusion_wan22). ``_cov`` is only for
+# extra non-test inputs that the command does not mention (coverage pilot).
+#
+# YAML anchors below are nested lists; the loader flattens them.
+
+x-qwen3-tts-src: &qwen3_tts_src
+  - vllm_omni/model_executor/models/qwen3_tts/
+  - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/snake_activation.py
+  - vllm_omni/model_executor/models/common/alias_free_activation.py
+  - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+  - vllm_omni/deploy/qwen3_tts.yaml
+
+x-minicpmo-4-5-src: &minicpmo_4_5_src
+  - vllm_omni/model_executor/models/minicpmo_4_5/
+  - vllm_omni/model_executor/models/step_audio2/
+  - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
+  - vllm_omni/model_executor/models/cosyvoice3/utils.py
+  - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
+  - vllm_omni/deploy/minicpmo_4_5.yaml
+
+x-qwen3-omni-src: &qwen3_omni_src
+  - tests/helpers/runtime.py
+  - vllm_omni/entrypoints/openai/serving_chat.py
+  - vllm_omni/model_executor/models/qwen3_omni/
+  - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/snake_activation.py
+  - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
+  - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
+  - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
+  - vllm_omni/deploy/qwen3_omni_moe.yaml
+
+x-minicpmo-4-5-duplex-src: &minicpmo_4_5_duplex_src
+  - tests/assets/minicpmo_4_5/response_required_16k.wav
+  - tests/assets/minicpmo_4_5/soft_interrupt_16k.wav
+  - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
+  - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
+  - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+  - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+  - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+  - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+  - vllm_omni/experimental/fullduplex/
+  - vllm_omni/core/sched/
+  - vllm_omni/outputs/multimodal_accumulation.py
+  - vllm_omni/engine/stage_init_utils.py
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/engine/orchestrator.py
+  - vllm_omni/entrypoints/cli/serve.py
+  - vllm_omni/entrypoints/openai/api_server.py
+  - vllm_omni/entrypoints/openai/duplex_capability.py
+  - vllm_omni/config/stage_config.py
+  - *minicpmo_4_5_src
+
+
+source_file_dependencies:
+  diffusion_distributed_attention:
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/models/
+
+  custom_pipeline:
+    - tests/e2e/features/helpers/custom_pipeline.py
+    - vllm_omni/diffusion/
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+
+  rlhf_verl_omni:
+    - tests/e2e/features/helpers/verl_omni_server.py
+    - tests/e2e/features/helpers/custom_pipeline.py
+    - vllm_omni/diffusion/
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+
+  omni_qwen3_omni:
+    - *qwen3_omni_src
+
+  omni_minicpmo_4_5:
+    - *minicpmo_4_5_src
+
+  omni_minicpmo_4_5_duplex:
+    - *minicpmo_4_5_duplex_src
+
+  omni_minicpmo_4_5_perf:
+    - vllm_omni/deploy/minicpmo_4_5.yaml
+    - vllm_omni/model_executor/models/minicpmo_4_5/
+    - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
+
+  tts_qwen3_tts:
+    - *qwen3_tts_src
+
+  tts_qwen3_tts_cov:
+    - .buildkite/common/scripts/run_cov_split.sh
+    - pyproject.toml
+    - *qwen3_tts_src
+
+  diffusion_wan22:
+    - vllm_omni/diffusion/models/wan2_2/
+    - vllm_omni/diffusion/models/dmd2/
+
+  diffusion_cosmos3:
+    - vllm_omni/diffusion/models/cosmos3/
+    - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
+    - vllm_omni/experimental/world_models/
+    - vllm_omni/model_extras/cosmos3.py
+
+  diffusion_qwen_image:
+    - vllm_omni/diffusion/models/qwen_image/
+    - vllm_omni/diffusion/models/dmd2/
+    - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
+
+  diffusion_hunyuan_image3:
+    - vllm_omni/diffusion/models/hunyuan_image3/
+    - vllm_omni/model_executor/models/hunyuan_image3/
+    - vllm_omni/deploy/hunyuan_image3_dit.yaml
+
+  diffusion_hidream_o1:
+    - vllm_omni/diffusion/models/hidream_o1_image/
+    - vllm_omni/diffusion/models/hidream_image/
+
+  diffusion_minimax_h3:
+    - vllm_omni/diffusion/models/minimax_h3/
+
+  diffusion_hunyuan_video:
+    - vllm_omni/diffusion/models/hunyuan_video/
+    - vllm_omni/model_executor/models/hunyuan_video/
+
+  diffusion_x2i:
+    - vllm_omni/diffusion/models/
+
+  diffusion_offloader:
+    - vllm_omni/diffusion/offloader/
+
+  diffusion_quantization:
+    - vllm_omni/diffusion/quantization/
+
+  diffusion_stable_audio:
+    - vllm_omni/diffusion/models/stable_audio/

@@ -10,8 +10,12 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
-Test pipeline mode (e.g. test-merge.yml):
-  - Drop steps whose ``source_file_dependencies`` do not match changed files.
+Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
+  - Drop steps whose ``source_file_dependencies`` do not match changed files
+    (string/list keys from ci_source_file_dependencies.yml plus ``tests/``
+    paths extracted from the step commands, or inline path prefixes).
+    Filtering applies on **PR label** uploads only; ``main`` + env schedule
+    (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
   - Expand uploader-only ``mirror_hardwares: l4_1`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
 
@@ -25,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import re
 import subprocess
 import sys
 from functools import lru_cache
@@ -58,20 +64,14 @@ BOOTSTRAP_UPLOAD_IF_KEYS = {
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
+CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_dependencies.yml"
 
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
 # ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
 NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
 NIGHTLY_LABEL_IF = (
-    f"({NIGHTLY_MAIN_IF}) || "
-    '(build.branch != "main" && ('
-    'build.pull_request.labels includes "nightly-test" || '
-    'build.pull_request.labels includes "omni-test" || '
-    'build.pull_request.labels includes "tts-test" || '
-    'build.pull_request.labels includes "diffusion-x2iat-test" || '
-    'build.pull_request.labels includes "diffusion-x2v-test"'
-    "))"
+    f'({NIGHTLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
 )
 WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
@@ -217,7 +217,7 @@ def _render_bootstrap_pipeline(
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-# --- Test pipeline (test-ready.yml, test-merge.yml) ---
+# --- Test pipeline (test-ready.yml, test-merge.yml, test-nightly.yml) ---
 
 
 @lru_cache(maxsize=1)
@@ -231,6 +231,137 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
     if not isinstance(presets, dict):
         raise ValueError(f"mirror_hardwares must be a mapping in {CI_MIRROR_HARDWARES_PATH}")
     return presets
+
+
+def _flatten_dep_paths(value: Any, *, key: str) -> list[str]:
+    """Flatten YAML-anchor nested lists into a de-duplicated prefix list."""
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"empty path in source_file_dependencies[{key!r}]")
+        return [value]
+    if isinstance(value, list):
+        flattened: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            for path in _flatten_dep_paths(item, key=key):
+                if path not in seen:
+                    seen.add(path)
+                    flattened.append(path)
+        return flattened
+    raise ValueError(
+        f"source_file_dependencies[{key!r}] must be a list of path prefixes, got {type(value).__name__}",
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_source_file_dependencies() -> dict[str, list[str]]:
+    if not CI_SOURCE_FILE_DEPENDENCIES_PATH.is_file():
+        raise FileNotFoundError(
+            f"missing CI source_file_dependencies registry: {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+        )
+    doc = yaml.safe_load(CI_SOURCE_FILE_DEPENDENCIES_PATH.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"invalid CI source_file_dependencies registry: {CI_SOURCE_FILE_DEPENDENCIES_PATH}")
+    presets = doc.get("source_file_dependencies")
+    if not isinstance(presets, dict):
+        raise ValueError(f"source_file_dependencies must be a mapping in {CI_SOURCE_FILE_DEPENDENCIES_PATH}")
+    loaded: dict[str, list[str]] = {}
+    for key, value in presets.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(
+                f"source_file_dependencies keys must be non-empty strings in {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
+            )
+        loaded[key] = _flatten_dep_paths(value, key=key)
+    return loaded
+
+
+_REGISTRY_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _looks_like_registry_key(item: str) -> bool:
+    """Preset names are snake_case identifiers; path prefixes contain ``/`` or ``.``."""
+    return bool(_REGISTRY_KEY_RE.fullmatch(item))
+
+
+def _lookup_dep_key(key: str, step: dict[str, Any]) -> list[str]:
+    registry = _load_source_file_dependencies()
+    paths = registry.get(key)
+    if paths is None:
+        known = ", ".join(sorted(registry))
+        raise ValueError(
+            f"unknown source_file_dependencies {key!r} in step {_get_step_label(step)!r}; known: {known}",
+        )
+    return list(paths)
+
+
+_TEST_PATH_RE = re.compile(r"(?:^|[\s='\"])(?P<path>tests/[A-Za-z0-9_./\-]+)")
+
+
+def _collect_command_text(step: dict[str, Any]) -> str:
+    raw = step.get("commands", step.get("command"))
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        return "\n".join(str(item) for item in raw if item is not None)
+    return str(raw)
+
+
+def _extract_pytest_targets(step: dict[str, Any]) -> list[str]:
+    """Collect ``tests/`` paths from pytest / run_cov_split commands (not ``--ignore``)."""
+    text = _collect_command_text(step)
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _TEST_PATH_RE.finditer(text):
+        prelude = text[max(0, match.start("path") - 10) : match.start("path")]
+        if "--ignore" in prelude:
+            continue
+        path = match.group("path").split("::", 1)[0].rstrip("\\")
+        if path and path not in seen:
+            seen.add(path)
+            found.append(path)
+    return found
+
+
+def _dedupe_paths(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for path in group:
+            if path not in seen:
+                seen.add(path)
+                merged.append(path)
+    return merged
+
+
+def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
+    """Expand a registry key (or list of keys), then append pytest targets from commands."""
+    deps = step.get("source_file_dependencies")
+    if deps is None:
+        return None
+    prefixes: list[str]
+    if isinstance(deps, str):
+        prefixes = _lookup_dep_key(deps, step) if _looks_like_registry_key(deps) else [deps]
+    elif isinstance(deps, list):
+        if not all(isinstance(item, str) for item in deps):
+            raise ValueError(
+                f"source_file_dependencies must be a string key or list of strings in step {_get_step_label(step)!r}",
+            )
+        keyish = [_looks_like_registry_key(item) for item in deps]
+        if deps and all(keyish):
+            prefixes = _dedupe_paths(*(_lookup_dep_key(key, step) for key in deps))
+        elif any(keyish):
+            raise ValueError(
+                f"source_file_dependencies in step {_get_step_label(step)!r} mixes registry keys and path prefixes",
+            )
+        else:
+            prefixes = list(deps)
+    else:
+        raise ValueError(
+            f"source_file_dependencies must be a string key or list in step {_get_step_label(step)!r}",
+        )
+    return _dedupe_paths(_extract_pytest_targets(step), prefixes)
 
 
 def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any]:
@@ -285,11 +416,7 @@ def _process_test_steps(
             processed.append(step)
             continue
 
-        deps = step.get("source_file_dependencies")
-        if deps is not None and not isinstance(deps, list):
-            raise ValueError(
-                f"source_file_dependencies must be a list in step {_get_step_label(step)!r}",
-            )
+        deps = _resolve_source_file_dependencies(step)
         if changed_files is not None and deps is not None and not _match_source_file(changed_files, deps):
             _log(f"skip {_get_step_label(step)!r} (no changes under {deps})")
             continue
@@ -350,6 +477,26 @@ def _render_test_pipeline(
 # --- Entry (read file → bootstrap or test render → YAML string) ---
 
 
+def _changed_files_for_source_filter(
+    ctx,
+    *,
+    force_all: bool,
+    e2e_only: bool,
+) -> list[str] | None:
+    """Return the diff to filter against, or None to keep every step.
+
+    ``source_file_dependencies`` is label-only: scheduled ``main`` uploads
+    (NIGHTLY/WEEKLY/post-merge) run the full pipeline. ``--all`` / ``--e2e``
+    also disable filtering.
+    """
+    if force_all or e2e_only:
+        return None
+    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
+        _log("main branch: keep all jobs (source_file_dependencies is label-only)")
+        return None
+    return ctx.changed_files
+
+
 def _render_pipeline(
     path: Path,
     *,
@@ -367,10 +514,7 @@ def _render_pipeline(
 
     text = path.read_text(encoding="utf-8")
     ctx = resolve_ci_context_from_git()
-    if force_all or e2e_only:
-        changed_files = None
-    else:
-        changed_files = ctx.changed_files
+    changed_files = _changed_files_for_source_filter(ctx, force_all=force_all, e2e_only=e2e_only)
 
     doc = yaml.safe_load(text)
     if not isinstance(doc, dict):
