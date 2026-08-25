@@ -200,6 +200,22 @@ def tiny_longcat_image_builder() -> str:
     )
 
 
+def tiny_longcat_image_edit_builder() -> str:
+    return build_tiny_from_configs(
+        "LongCatImageEditPipeline",
+        "meituan-longcat/LongCat-Image-Edit",
+        transform={
+            "text_encoder": _shrink_qwen_text_encoder_config,
+            "transformer": partial(
+                _shrink_dit_rope_config,
+                num_single_layers=2,
+                default_axes_dims_rope=[16, 56, 56],
+                joint_attention_dim=64,
+            ),
+        },
+    )
+
+
 def tiny_flux_builder() -> str:
     return build_tiny_from_configs(
         "FluxPipeline",
