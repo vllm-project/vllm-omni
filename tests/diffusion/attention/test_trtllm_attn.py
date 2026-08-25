@@ -56,6 +56,119 @@ def test_quant_config_from_backend_kwargs():
     assert QuantConfig.from_backend_kwargs({"quant": {"dtype_qk": "fp8_e4m3"}}) == QuantConfig("fp8_e4m3", 1, 16)
     qc = QuantConfig.from_backend_kwargs({"quant": {"dtype_qk": "int8", "q_block_size": 4, "k_block_size": 16}})
     assert qc.enabled and (qc.dtype_qk, qc.q_block_size, qc.k_block_size) == ("int8", 4, 16)
+    prims = QuantConfig.from_backend_kwargs(
+        {
+            "quant": {
+                "dtype_qk": "fp8_e4m3",
+                "dtype_vo": "fp8_e4m3",
+                "flashinfer_backend": "cute-dsl-prims",
+                "q_scale": 0.5,
+                "k_scale": 0.25,
+                "v_scale": 0.125,
+            }
+        }
+    )
+    assert prims.use_sm120_prims
+    assert prims.configured_scales == (0.5, 0.25, 0.125)
+
+
+def test_sm120_prims_requires_explicit_fp8_qk_and_vo():
+    with pytest.raises(RuntimeError, match="dtype_qk and quant.dtype_vo"):
+        _impl(quant={"dtype_qk": "fp8_e4m3", "flashinfer_backend": "cute-dsl-prims"})
+    with pytest.raises(RuntimeError, match="does not support skip_softmax"):
+        _impl(
+            quant={
+                "dtype_qk": "fp8_e4m3",
+                "dtype_vo": "fp8_e4m3",
+                "flashinfer_backend": "cute-dsl-prims",
+            },
+            skip_softmax_threshold=0.1,
+        )
+
+
+def test_sm120_prims_scale_validation_and_calibration():
+    with pytest.raises(ValueError, match="q_scale"):
+        _impl(
+            quant={
+                "dtype_qk": "fp8_e4m3",
+                "dtype_vo": "fp8_e4m3",
+                "flashinfer_backend": "cute-dsl-prims",
+                "q_scale": 0,
+            }
+        )
+    impl = _impl(
+        quant={
+            "dtype_qk": "fp8_e4m3",
+            "dtype_vo": "fp8_e4m3",
+            "flashinfer_backend": "cute-dsl-prims",
+        }
+    )
+    first = impl._resolve_sm120_scales(
+        torch.tensor([1.0, -2.0]),
+        torch.tensor([3.0, -1.0]),
+        torch.tensor([4.0, -2.0]),
+    )
+    assert first == pytest.approx((2.0 / 224.0, 3.0 / 224.0, 4.0 / 224.0))
+    assert impl._resolve_sm120_scales(torch.tensor([100.0]), torch.tensor([100.0]), torch.tensor([100.0])) == first
+
+
+def test_sm120_prims_wrapper_is_planned_once_and_receives_scales(monkeypatch):
+    observed = {"plans": 0, "runs": 0}
+
+    class FakeWrapper:
+        def __init__(self, workspace, layout, backend):
+            observed.update(workspace=workspace, layout=layout, backend=backend)
+
+        def plan(self, qo, kv, hq, hkv, dim, **kwargs):
+            observed["plans"] += 1
+            observed.update(qo=qo.clone(), kv=kv.clone(), hq=hq, hkv=hkv, dim=dim, plan_kwargs=kwargs)
+
+        def run(self, q, k, v, *, out, q_scale, k_scale, v_scale):
+            observed["runs"] += 1
+            observed.update(dtypes=(q.dtype, k.dtype, v.dtype), scales=(q_scale, k_scale, v_scale))
+            out.zero_()
+            return out
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg, "_sm120_prims_wrapper_cls", lambda: FakeWrapper)
+    monkeypatch.setattr(TrtllmAttentionImpl, "_get_sm120_workspace", classmethod(lambda cls, device: torch.empty(1)))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+
+    impl = _impl(
+        quant={
+            "dtype_qk": "fp8_e4m3",
+            "dtype_vo": "fp8_e4m3",
+            "flashinfer_backend": "cute-dsl-prims",
+            "q_scale": 0.5,
+            "k_scale": 0.25,
+            "v_scale": 0.125,
+        }
+    )
+    q = torch.randn(1, 4, 8, 128, dtype=torch.bfloat16)
+    first = impl.forward_cuda(q, q, q)
+    second = impl.forward_cuda(q, q, q)
+
+    assert first.shape == q.shape and second.shape == q.shape
+    assert observed["layout"] == "NHD" and observed["backend"] == "cute-dsl-prims"
+    assert observed["plans"] == 1 and observed["runs"] == 2
+    assert observed["dtypes"] == (torch.float8_e4m3fn,) * 3
+    assert observed["scales"] == (0.5, 0.25, 0.125)
+    assert observed["qo"].tolist() == [0, 4]
+
+
+def test_sm120_prims_fails_fast_on_b300(monkeypatch):
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    impl = _impl(
+        quant={
+            "dtype_qk": "fp8_e4m3",
+            "dtype_vo": "fp8_e4m3",
+            "flashinfer_backend": "cute-dsl-prims",
+        }
+    )
+    q = torch.zeros(1, 4, 8, 128, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="B300/SM103"):
+        impl.forward_cuda(q, q, q)
 
 
 def test_quant_rejects_non_sage_dtype():
@@ -211,9 +324,10 @@ def test_masked_layer_raises():
 
 def test_packed_metadata_trims_padding_mask(monkeypatch):
     b, s, h, d = 1, 8, 8, 128
-    q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
-    mask = torch.tensor([[True, True, True, True, True, True, False, False]])
-    cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
+    with torch.inference_mode():
+        q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
+        mask = torch.tensor([[True, True, True, True, True, True, False, False]])
+        cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
     metadata = AttentionMetadata(
         attn_mask=mask,
         extra={

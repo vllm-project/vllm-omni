@@ -300,6 +300,46 @@ FA4 remains available by explicitly selecting the `FLASH_ATTN` backend:
 On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
 `Using CuTe FlashAttention-4 on Blackwell` before recording FA4 measurements.
 
+#### Experimental SM120 FP8 CuTe DSL prims
+
+RTX PRO 5000/6000 Blackwell (SM120) can opt into the experimental FlashInfer
+CuTe DSL kernel through `TRTLLM_ATTN`. Build the exact tested FlashInfer fork
+and revision first:
+
+```bash
+git clone --recursive https://github.com/Tom-Zheng/flashinfer.git
+cd flashinfer
+git checkout 4a2345906256da0849d7e1e4681db514ab9b800e
+python -m pip install -v '.[cu13]'
+python -m pytest -q tests/attention/test_sm120_prims_prefill_backend.py
+```
+
+Then select the kernel explicitly. Q/K/V are quantized to FP8 E4M3 and the
+kernel returns BF16/FP16. The short token-refiner attention remains dense:
+
+```bash
+--diffusion-attention-config '{
+  "default": {
+    "backend": "TRTLLM_ATTN",
+    "quant": {
+      "dtype_qk": "fp8_e4m3",
+      "dtype_vo": "fp8_e4m3",
+      "flashinfer_backend": "cute-dsl-prims"
+    }
+  },
+  "per_role": {
+    "minimax_h3.token_refiner": {"backend": "TRTLLM_ATTN"}
+  }
+}'
+```
+
+If `q_scale`, `k_scale`, and `v_scale` are omitted, each layer calibrates a
+scale once on its first call with 2x FP8 headroom. Warm up the same engine
+before measuring. For reproducible production measurements, copy validated
+per-model scales into the three optional quant fields. This path requires
+compute capability 12.0 and fails explicitly on B300/SM103; use dense
+`TRTLLM_ATTN` or `CUDNN_ATTN` for the B300 baseline.
+
 `TRTLLM_ATTN` additionally supports two **lossy** optimizations for the long main
 DiT attention sequence: SAGE attention quantization and Skip-Softmax Sparse
 Attention. SAGE quantizes Q/K to the configured dtype and V to FP8. This example uses

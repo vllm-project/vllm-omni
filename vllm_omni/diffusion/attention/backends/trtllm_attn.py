@@ -105,6 +105,36 @@ def _sage_quantize_fn():
         return None
 
 
+_SM120_PRIMS_BACKEND = "cute-dsl-prims"
+_SM120_PRIMS_DTYPE = "fp8_e4m3"
+_SM120_FP8_DTYPE = torch.float8_e4m3fn
+_SM120_FP8_MAX_WITH_HEADROOM = torch.finfo(_SM120_FP8_DTYPE).max / 2.0
+_SM120_WORKSPACE_BYTES = 16 << 20
+
+
+def _positive_optional_scale(value: float | None, name: str) -> float | None:
+    if value is None:
+        return None
+    scale = float(value)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+    return scale
+
+
+def _sm120_prims_wrapper_cls():
+    try:
+        from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+        from flashinfer.attention.cute_dsl.sm120_fmha import (  # noqa: F401
+            SM120PrimsBatchPrefillBackend,
+        )
+    except Exception as exc:
+        raise ImportError(
+            "TRTLLM_ATTN cute-dsl-prims requires the FlashInfer SM120 CuTe DSL "
+            "implementation from commit 4a2345906256 and its cutlass.experimental dependency"
+        ) from exc
+    return BatchPrefillWithRaggedKVCacheWrapper
+
+
 _QK_QUANT_DTYPES = {
     "int8": torch.int8,
     "fp8_e4m3": torch.float8_e4m3fn,
@@ -116,6 +146,11 @@ class QuantConfig:
     dtype_qk: str | None = None
     q_block_size: int = 1
     k_block_size: int = 16
+    dtype_vo: str | None = None
+    flashinfer_backend: str | None = None
+    q_scale: float | None = None
+    k_scale: float | None = None
+    v_scale: float | None = None
 
     @classmethod
     def from_backend_kwargs(cls, backend_kwargs: dict | None) -> "QuantConfig":
@@ -124,11 +159,24 @@ class QuantConfig:
             dtype_qk=q.get("dtype_qk"),
             q_block_size=int(q.get("q_block_size", 1) or 1),
             k_block_size=int(q.get("k_block_size", 16) or 16),
+            dtype_vo=q.get("dtype_vo"),
+            flashinfer_backend=q.get("flashinfer_backend"),
+            q_scale=_positive_optional_scale(q.get("q_scale"), "quant.q_scale"),
+            k_scale=_positive_optional_scale(q.get("k_scale"), "quant.k_scale"),
+            v_scale=_positive_optional_scale(q.get("v_scale"), "quant.v_scale"),
         )
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None
+        return self.dtype_qk is not None or self.dtype_vo is not None
+
+    @property
+    def use_sm120_prims(self) -> bool:
+        return self.flashinfer_backend == _SM120_PRIMS_BACKEND
+
+    @property
+    def configured_scales(self) -> tuple[float | None, float | None, float | None]:
+        return self.q_scale, self.k_scale, self.v_scale
 
     def quantize(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, quantize_fn):
         qk_quant_dtype = _QK_QUANT_DTYPES[self.dtype_qk]
@@ -169,6 +217,7 @@ class TrtllmAttentionBackend(AttentionBackend):
 
 class TrtllmAttentionImpl(AttentionImpl):
     _workspace: torch.Tensor | None = None
+    _sm120_workspaces: dict[tuple[str, int | None], torch.Tensor] = {}
 
     def __init__(
         self,
@@ -196,8 +245,23 @@ class TrtllmAttentionImpl(AttentionImpl):
         self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
         # Resolve the SAGE quantize fn once at init so the compiled forward path never calls the
         # lru_cache-wrapped getter (which triggers a Dynamo graph break every step).
+        self._sm120_wrapper = None
+        self._sm120_plan_key: tuple | None = None
+        self._sm120_resolved_scales: tuple[float, float, float] | None = None
+        self._sm120_uniform_indptr_cache: dict[tuple, torch.Tensor] = {}
         self._sage_quantize_fn = None
-        if self.quant.enabled:
+        if self.quant.use_sm120_prims:
+            if self.quant.dtype_qk != _SM120_PRIMS_DTYPE or self.quant.dtype_vo != _SM120_PRIMS_DTYPE:
+                raise RuntimeError(
+                    "TRTLLM_ATTN cute-dsl-prims requires quant.dtype_qk and quant.dtype_vo to both be 'fp8_e4m3'."
+                )
+            if self.skip.configured:
+                raise RuntimeError("TRTLLM_ATTN cute-dsl-prims does not support skip_softmax.")
+        elif self.quant.enabled:
+            if self.quant.dtype_vo is not None:
+                raise RuntimeError(
+                    "TRTLLM_ATTN quant.dtype_vo is only supported with quant.flashinfer_backend='cute-dsl-prims'."
+                )
             if self.quant.dtype_qk not in _QK_QUANT_DTYPES:
                 raise RuntimeError(
                     f"TRTLLM_ATTN quant (SAGE) supports dtype_qk in {sorted(_QK_QUANT_DTYPES)}, got "
@@ -249,6 +313,108 @@ class TrtllmAttentionImpl(AttentionImpl):
             ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
             cls._workspace = ws
         return ws
+
+    @classmethod
+    def _get_sm120_workspace(cls, device: torch.device) -> torch.Tensor:
+        key = (device.type, device.index)
+        workspace = cls._sm120_workspaces.get(key)
+        if workspace is None:
+            workspace = torch.empty(_SM120_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+            cls._sm120_workspaces[key] = workspace
+        return workspace
+
+    def _get_sm120_uniform_indptr(self, batch: int, length: int, device: torch.device) -> torch.Tensor:
+        key = (device.type, device.index, batch, length)
+        indptr = self._sm120_uniform_indptr_cache.get(key)
+        if indptr is None:
+            indptr = torch.arange(batch + 1, dtype=torch.int32, device=device).mul_(length)
+            self._sm120_uniform_indptr_cache[key] = indptr
+        return indptr
+
+    def _resolve_sm120_scales(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[float, float, float]:
+        if self._sm120_resolved_scales is not None:
+            return self._sm120_resolved_scales
+
+        configured = self.quant.configured_scales
+        if all(scale is not None for scale in configured):
+            self._sm120_resolved_scales = configured  # type: ignore[assignment]
+            return self._sm120_resolved_scales
+
+        maxima = torch.stack(tuple(t.detach().abs().amax().float() for t in (q, k, v))).cpu()
+        calibrated = tuple(
+            max(float(value) / _SM120_FP8_MAX_WITH_HEADROOM, torch.finfo(torch.float32).tiny)
+            for value in maxima.tolist()
+        )
+        self._sm120_resolved_scales = tuple(
+            static if static is not None else dynamic for static, dynamic in zip(configured, calibrated, strict=True)
+        )
+        logger.info(
+            "Calibrated TRTLLM_ATTN cute-dsl-prims scales for role %s: q=%g k=%g v=%g",
+            self.role,
+            *self._sm120_resolved_scales,
+        )
+        return self._sm120_resolved_scales
+
+    @staticmethod
+    def _quantize_sm120(value: torch.Tensor, scale: float) -> torch.Tensor:
+        scaled = value if scale == 1.0 else value / scale
+        return scaled.to(_SM120_FP8_DTYPE).contiguous()
+
+    def _run_sm120_prims(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_kv: torch.Tensor,
+        plan_key: tuple | None,
+    ) -> torch.Tensor:
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability != (12, 0):
+            raise RuntimeError(
+                "TRTLLM_ATTN cute-dsl-prims requires an SM120 GPU (compute capability 12.0); "
+                f"got {capability[0]}.{capability[1]}. B300/SM103 must use dense TRTLLM_ATTN or CUDNN_ATTN."
+            )
+        if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+            raise TypeError("TRTLLM_ATTN cute-dsl-prims expects matching FP16/BF16 Q/K/V activations.")
+        if q.shape[2] not in (32, 64, 128, 256) or k.shape[2] != q.shape[2] or v.shape != k.shape:
+            raise ValueError("TRTLLM_ATTN cute-dsl-prims requires matching Q/K/V head sizes in {32,64,128,256}.")
+        if q.shape[1] % k.shape[1]:
+            raise ValueError("TRTLLM_ATTN cute-dsl-prims requires num_q_heads divisible by num_kv_heads.")
+
+        if self._sm120_wrapper is None:
+            wrapper_cls = _sm120_prims_wrapper_cls()
+            self._sm120_wrapper = wrapper_cls(
+                self._get_sm120_workspace(q.device),
+                "NHD",
+                backend=_SM120_PRIMS_BACKEND,
+            )
+        if plan_key is None or plan_key != self._sm120_plan_key:
+            self._sm120_wrapper.plan(
+                cu_seq_lens_q,
+                cu_seq_lens_kv,
+                q.shape[1],
+                k.shape[1],
+                q.shape[2],
+                causal=self.causal,
+                q_data_type=_SM120_FP8_DTYPE,
+                kv_data_type=_SM120_FP8_DTYPE,
+                o_data_type=q.dtype,
+            )
+            self._sm120_plan_key = plan_key
+
+        q_scale, k_scale, v_scale = self._resolve_sm120_scales(q, k, v)
+        output = torch.empty_like(q)
+        self._sm120_wrapper.run(
+            self._quantize_sm120(q, q_scale),
+            self._quantize_sm120(k, k_scale),
+            self._quantize_sm120(v, v_scale),
+            out=output,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return output
 
     def forward_cuda(
         self,
@@ -341,13 +507,29 @@ class TrtllmAttentionImpl(AttentionImpl):
             seq_lens = (cu_seq_lens_kv[1:] - cu_seq_lens_kv[:-1]).to(dtype=torch.int32).contiguous()
             max_q_len = int(extra["max_seqlen_q"])
             max_kv_len = int(extra["max_seqlen_k"])
+            # Packed inference tensors have no version counter; re-plan dynamic indptrs.
+            sm120_plan_key = None
         else:
             batch = physical_batch
             seq_lens = torch.full((batch,), kv_len, dtype=torch.int32, device=device)
-            cu_seq_lens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
-            cu_seq_lens_kv = torch.arange(0, (batch + 1) * kv_len, step=kv_len, dtype=torch.int32, device=device)
+            if self.quant.use_sm120_prims:
+                cu_seq_lens_q = self._get_sm120_uniform_indptr(batch, q_len, device)
+                cu_seq_lens_kv = self._get_sm120_uniform_indptr(batch, kv_len, device)
+            else:
+                cu_seq_lens_q = torch.arange(0, (batch + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
+                cu_seq_lens_kv = torch.arange(0, (batch + 1) * kv_len, step=kv_len, dtype=torch.int32, device=device)
             max_q_len = q_len
             max_kv_len = kv_len
+            sm120_plan_key = ("uniform", batch, q_len, kv_len, tuple(q.shape), tuple(k.shape), q.dtype, self.causal)
+
+        if self.quant.use_sm120_prims:
+            out = self._run_sm120_prims(q, k, v, cu_seq_lens_q, cu_seq_lens_kv, sm120_plan_key)
+            if out.shape[0] != output_tokens:
+                padded_out = torch.zeros((output_tokens, num_q_heads, head_dim), dtype=out.dtype, device=out.device)
+                padded_out[: out.shape[0]] = out
+                out = padded_out
+            return out.reshape(physical_batch, q_len, num_q_heads, head_dim)
+
         workspace = self._get_workspace(device)
 
         bmm1_scale = self.softmax_scale

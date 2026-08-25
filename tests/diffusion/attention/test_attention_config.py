@@ -72,6 +72,23 @@ class TestAttentionSpec:
         assert bk["dtype_vo"] == "fp8_e4m3"
         assert bk["flashinfer_backend"] == "trtllm-gen"
 
+    def test_trtllm_sm120_prims_fields_passed_through(self):
+        bk = AttentionSpec(
+            backend="TRTLLM_ATTN",
+            quant={
+                "dtype_qk": "fp8_e4m3",
+                "dtype_vo": "fp8_e4m3",
+                "flashinfer_backend": "cute-dsl-prims",
+                "q_scale": 0.5,
+                "k_scale": 0.25,
+                "v_scale": 0.125,
+            },
+        ).backend_kwargs()["quant"]
+        assert bk["dtype_qk"] == "fp8_e4m3"
+        assert bk["dtype_vo"] == "fp8_e4m3"
+        assert bk["flashinfer_backend"] == "cute-dsl-prims"
+        assert (bk["q_scale"], bk["k_scale"], bk["v_scale"]) == (0.5, 0.25, 0.125)
+
     def test_quant_and_skip_softmax_coexist(self):
         bk = AttentionSpec(
             backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
@@ -84,6 +101,8 @@ class TestAttentionSpec:
             ({"backend": "TORCH_SDPA", "quant": {"dtype_qk": "int8"}}, "only supported by the TRTLLM_ATTN"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int4"}}, "quant.dtype_qk"),
             ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8", "k_block_size": 8}}, "quant.k_block_size"),
+            ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "fp8_e4m3", "q_scale": 0}}, "quant.q_scale"),
+            ({"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "fp8_e4m3", "v_scale": float("nan")}}, "quant.v_scale"),
         ],
     )
     def test_quant_validation_rejects(self, spec, match):
