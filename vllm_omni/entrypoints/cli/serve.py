@@ -186,6 +186,10 @@ class OmniServeCommand(CLISubcommand):
         if omni_heartbeat_timeout is not None and omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {omni_heartbeat_timeout}")
 
+        diffusion_batch_size = getattr(args, "diffusion_batch_size", 1)
+        if diffusion_batch_size < 1:
+            raise ValueError(f"--diffusion-batch-size must be >= 1, got {diffusion_batch_size}")
+
         # Skip validation for diffusion models as they have different requirements
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
@@ -344,6 +348,12 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=10,
             help="The timeout for the batch.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-batch-size",
+            type=int,
+            default=1,
+            help="Maximum number of diffusion requests scheduled in one model step.",
         )
         omni_config_group.add_argument(
             "--worker-backend",
