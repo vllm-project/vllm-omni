@@ -603,10 +603,6 @@ def test_sub_config_fields_match_structured_scopes():
         "ulysses_degree",
         "ring_degree",
         "allgather_degree",
-        "sp_strategy",
-        "sp_selector_profile",
-        "sp_selector_workload",
-        "sp_selector_allow_ring",
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
@@ -823,27 +819,6 @@ def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
 def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
     with pytest.raises(ValidationError):
         OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
-
-
-def test_diffusion_parallel_config_derives_world_size_for_auto_sp():
-    cfg = OmniStageDiffusionParallelConfig(
-        sp_strategy="auto",
-        sp_selector_profile="/tmp/profile.jsonl",
-        sp_selector_workload={"sp_degree": 4},
-    )
-
-    assert cfg.sequence_parallel_size == 4
-    assert cfg.world_size == 4
-
-
-def test_diffusion_parallel_config_rejects_auto_with_manual_degrees():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        OmniStageDiffusionParallelConfig(
-            ulysses_degree=2,
-            sp_strategy="auto",
-            sp_selector_profile="/tmp/profile.jsonl",
-            sp_selector_workload={"sp_degree": 2},
-        )
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():

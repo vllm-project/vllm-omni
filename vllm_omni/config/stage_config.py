@@ -120,19 +120,6 @@ def _apply_diffusion_parallel_runtime_overrides(
             allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
         )
 
-    if (
-        parallel_config_dict is not None
-        and parallel_config_dict.get("sp_strategy") == "auto"
-        and not sequence_parallel_explicit
-    ):
-        workload = parallel_config_dict.get("sp_selector_workload")
-        if not isinstance(workload, dict) or "sp_degree" not in workload:
-            raise ValueError("sp_strategy='auto' requires sp_selector_workload.sp_degree")
-        sp_degree = int(workload["sp_degree"])
-        if sp_degree <= 1:
-            raise ValueError("sp_selector_workload.sp_degree must be greater than one")
-        parallel_config_dict["sequence_parallel_size"] = sp_degree
-
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
 
@@ -351,10 +338,6 @@ class StageDeployConfig:
     ulysses_mode: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
-    sp_strategy: str | None = None
-    sp_selector_profile: str | None = None
-    sp_selector_workload: dict[str, Any] | None = None
-    sp_selector_allow_ring: bool | None = None
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None

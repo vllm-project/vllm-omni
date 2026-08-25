@@ -484,7 +484,6 @@ class PackedAttentionMoT(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
-            skip_sequence_parallel=True,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,

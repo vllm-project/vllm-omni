@@ -569,10 +569,6 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
-    sp_strategy: str = "manual"
-    sp_selector_profile: str | None = None
-    sp_selector_workload: dict[str, Any] | None = None
-    sp_selector_allow_ring: bool = False
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
@@ -585,23 +581,9 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
-        if self.sp_strategy not in {"manual", "auto"}:
-            raise ValueError("sp_strategy must be 'manual' or 'auto'")
-        if self.sp_strategy == "auto":
-            if not self.sp_selector_profile or not isinstance(self.sp_selector_workload, dict):
-                raise ValueError("sp_strategy='auto' requires sp_selector_profile and sp_selector_workload")
-            if self.ulysses_degree != 1 or self.ring_degree != 1 or self.allgather_degree != 1:
-                raise ValueError("sp_strategy='auto' cannot be combined with manual SP degrees")
-            try:
-                self.sequence_parallel_size = int(self.sp_selector_workload["sp_degree"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("sp_selector_workload.sp_degree must be a positive integer") from exc
-            if self.sequence_parallel_size <= 1:
-                raise ValueError("sp_selector_workload.sp_degree must be greater than one")
-        else:
-            self.sequence_parallel_size = (
-                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-            )
+        self.sequence_parallel_size = (
+            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
+        )
         if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
