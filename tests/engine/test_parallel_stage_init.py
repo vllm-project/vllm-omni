@@ -223,6 +223,38 @@ def test_check_admission_skips_unresolved_and_admits_diffusion_util():
     assert ledgers[0].kv_budget_bytes == int(cap * 0.3)
 
 
+def test_run_stage_admission_excludes_remote_replicas(monkeypatch):
+    """Remote replicas consume a remote node's memory — never the local ledger.
+
+    Remote LLM plans already carry runtime_cfg=None (resolver returns None),
+    but remote diffusion replicas keep their cfg + utilization, so without an
+    explicit launch_mode guard they would be counted against local devices.
+    """
+    import vllm_omni.engine.stage_admission as admission_mod
+
+    runtime = _runtime(parallel_stage_init=True)
+    runtime._init_visible_devices_baseline = None
+
+    local = _llm_replica(0, 0, "0", vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
+    remote_diff = _llm_replica(1, 0, "0")
+    remote_diff.launch_mode = "remote"
+    remote_diff.metadata.stage_type = "diffusion"
+    remote_diff.stage_vllm_config = None
+    remote_diff.stage_cfg.engine_args = {"gpu_memory_utilization": 0.3}
+
+    captured = {}
+
+    def _fake_check_admission(stage_plans, *, resolve_physical_devices, device_total_memory, **kw):
+        captured["resolve"] = resolve_physical_devices
+        return {}
+
+    monkeypatch.setattr(admission_mod, "check_admission", _fake_check_admission)
+    runtime._run_stage_admission([LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[local, remote_diff])])
+
+    assert captured["resolve"](local) == [0]
+    assert captured["resolve"](remote_diff) is None
+
+
 # --------------------------------------------------------------------------- #
 # B2: SH/EX device phase locks (real flock)
 # --------------------------------------------------------------------------- #

@@ -526,6 +526,13 @@ class StageRuntime:
         from vllm_omni.engine.stage_admission import check_admission
 
         def _resolve(replica: ReplicaInitPlan) -> list[int] | None:
+            if replica.launch_mode == "remote":
+                # Remote replicas consume a remote node's memory and the ledger
+                # is per-LOCAL-device. Remote LLM plans already carry
+                # runtime_cfg=None, but remote diffusion replicas keep their
+                # cfg — exclude both explicitly so they land in the
+                # operator-isolated skip list instead of the local ledger.
+                return None
             resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
             if not resolved:
                 return None
