@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Invalid inputs on Qwen3-Omni: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
 
 from __future__ import annotations
@@ -72,6 +72,9 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         body["top_logprobs"] = 5
     elif case_id == "speaker_unknown":
         body["speaker"] = "zz_invalid_qwen3_omni_chat_speaker_xyz"
+    elif case_id == "audio_format_unsupported":
+        body["modalities"] = ["text", "audio"]
+        body["audio"] = {"voice": "alloy", "format": "aac"}
     else:
         raise AssertionError(f"unknown chat completions invalid case_id {case_id!r}")
     return {"json": body, "timeout": 120}
@@ -134,6 +137,12 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             400,
             ("Invalid speaker", "Supported"),
             id="speaker_unknown_preset",
+        ),
+        pytest.param(
+            "audio_format_unsupported",
+            400,
+            ("Invalid audio format", "aac", "Supported formats"),
+            id="unsupported_audio_format",
         ),
     ],
 )
@@ -248,6 +257,7 @@ def test_realtime_invalid_requests(
     ws_error_code: str,
     err_message: str | tuple[str, ...],
 ) -> None:
+    send_frames: str | list[str]
     if send_frames_spec is _REALTIME_WS_MODEL_MISMATCH:
         send_frames = json.dumps(
             {

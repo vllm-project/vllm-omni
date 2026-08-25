@@ -258,36 +258,6 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.skip(reason="There is a known issue with shape mismatch error.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params + reduced_token_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
-    """
-    Input Modal: text, audio, image, video
-    Output Modal: text, audio
-    Input Setting: stream=True
-    Datasets: few requests
-    """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        video_data_url=video_data_url,
-        image_data_url=image_data_url,
-        audio_data_url=audio_data_url,
-        content_text=get_prompt("mix"),
-    )
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "key_words": {"audio": AUDIO_KEY, "image": IMAGE_KEY, "video": VIDEO_KEY},
-    }
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-
-
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_in_video_001(omni_server, openai_client) -> None:

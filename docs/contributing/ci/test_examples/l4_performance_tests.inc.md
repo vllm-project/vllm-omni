@@ -4,8 +4,8 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
-| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` in `mark`) |
-| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
+| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
+| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Diffusion | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, … |
 
@@ -20,7 +20,7 @@ Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-o
 
 #### Running perf cases
 
-Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bulk scan above and filter with pytest **`-m`** on each case's JSON `mark` (for example `pytest … run_benchmark.py -m "full_model and tts and H100"` or `-m "slow and omni and H100"` for weekly Omni configs).
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects; for example, `test_qwen3_omni_async_chunk.json` uses `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
 
 ```JSON
 {
@@ -75,7 +75,7 @@ Omit `mark` only for configs not meant to be filtered by `-m`. `server_type` is 
 
 Optional top-level field on each perf JSON **case object** (one per `test_name`). `run_benchmark.py` and `run_diffusion_benchmark.py` read it via `tests.dfx.conftest.resolve_pytest_marks` and attach the marks to the corresponding `pytest.param`, so you can filter locally with `-m`.
 
-When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, `diffusion`, or `local_model`.
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `slow`, `omni`, `tts`, `diffusion`, or `local_model`.
 
 Supported form:
 
@@ -142,11 +142,18 @@ Examples:
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
 
-# Single file (same as nightly CI Perf steps)
+# Single file (same selectors as the CI Perf steps)
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and not slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "npu"
 ```
 
 <!-- markdownlint-disable-next-line MD051 -->
