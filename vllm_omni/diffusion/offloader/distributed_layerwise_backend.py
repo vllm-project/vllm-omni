@@ -1702,9 +1702,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     "DLO weight shard degree does not match the resolved group: "
                     f"config={self.weight_shard_size}, group={coord.world_size}"
                 )
-            self.weight_shard_group = coord.device_group
+            # Weight AllGathers run from the prefetch worker while SP activation
+            # collectives run from the compute thread. Give DLO a companion
+            # communicator so their ordering cannot interleave on one HCCL group.
+            self.weight_shard_group = torch.distributed.new_group(
+                ranks=list(coord.ranks),
+                backend=torch.distributed.get_backend(coord.device_group),
+                use_local_synchronization=True,
+            )
             self.weight_shard_cpu_group = coord.cpu_group
             self.weight_shard_rank = coord.rank_in_group
+            self.weight_shard_ranks = tuple(coord.ranks)
             self._publish_weight_shard_config()
             logger.info(
                 "Distributed layerwise offload (non-HSDP): weight_shard_size=%d, rank_in_group=%d, group_ranks=%s",

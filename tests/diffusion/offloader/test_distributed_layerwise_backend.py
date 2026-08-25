@@ -1907,12 +1907,27 @@ class TestConfigValidation:
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(ps, "get_data_parallel_world_size", lambda: 4)
         monkeypatch.setattr(ps, "get_dp_group", lambda: coord)
+        dedicated = object()
+        captured: dict[str, object] = {}
+
+        def fake_new_group(ranks, backend=None, use_local_synchronization=False):
+            captured["ranks"] = list(ranks)
+            captured["backend"] = backend
+            captured["use_local_synchronization"] = use_local_synchronization
+            return dedicated
+
+        monkeypatch.setattr(dist, "new_group", fake_new_group)
+        monkeypatch.setattr(dist, "get_backend", lambda group: "hccl")
 
         backend._init_weight_shard_group()
 
-        assert backend.weight_shard_group is coord.device_group
+        assert backend.weight_shard_group is dedicated
+        assert captured["ranks"] == coord.ranks
+        assert captured["backend"] == "hccl"
+        assert captured["use_local_synchronization"] is True
         assert backend.weight_shard_cpu_group is coord.cpu_group
         assert backend.weight_shard_rank == 2
+        assert backend.weight_shard_ranks == tuple(coord.ranks)
         assert backend.config.weight_shard_size == 4
 
     def test_non_hsdp_sp_group_resolver_when_dp1(self, monkeypatch):
@@ -1933,12 +1948,27 @@ class TestConfigValidation:
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(ps, "get_data_parallel_world_size", lambda: 1)
         monkeypatch.setattr(ps, "get_sp_group", lambda: coord)
+        dedicated = object()
+        captured: dict[str, object] = {}
+
+        def fake_new_group(ranks, backend=None, use_local_synchronization=False):
+            captured["ranks"] = list(ranks)
+            captured["backend"] = backend
+            captured["use_local_synchronization"] = use_local_synchronization
+            return dedicated
+
+        monkeypatch.setattr(dist, "new_group", fake_new_group)
+        monkeypatch.setattr(dist, "get_backend", lambda group: "hccl")
 
         backend._init_weight_shard_group()
 
-        assert backend.weight_shard_group is coord.device_group
+        assert backend.weight_shard_group is dedicated
+        assert captured["ranks"] == coord.ranks
+        assert captured["backend"] == "hccl"
+        assert captured["use_local_synchronization"] is True
         assert backend.weight_shard_cpu_group is coord.cpu_group
         assert backend.weight_shard_rank == 1
+        assert backend.weight_shard_ranks == tuple(coord.ranks)
 
     def test_non_hsdp_resolver_rejects_group_size_mismatch(self, monkeypatch):
         """A resolved group whose size differs from the config degree fails fast."""
