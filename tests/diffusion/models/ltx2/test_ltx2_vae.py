@@ -3,12 +3,69 @@
 
 """Unit tests for LTX-2.3 VAE tiling and distributed decode behavior."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_ltx_bwe_vocoder_uses_fp32_autocast(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBWEVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((), dtype=torch.bfloat16))
+            self.bwe_generator = torch.nn.Identity()
+            self.input_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            return value.float()
+
+    autocast_calls = []
+
+    @contextmanager
+    def fake_autocast(*, device_type, dtype):
+        autocast_calls.append((device_type, dtype))
+        yield
+
+    monkeypatch.setattr(ltx_runtime.torch, "autocast", fake_autocast)
+    vocoder = FakeBWEVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.float32
+    assert output.dtype == torch.bfloat16
+    assert autocast_calls == [("cpu", torch.float32)]
+
+
+def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBaseVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            return value
+
+    monkeypatch.setattr(
+        ltx_runtime.torch,
+        "autocast",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("base vocoder must not use autocast")),
+    )
+    vocoder = FakeBaseVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.bfloat16
+    assert output.dtype == torch.bfloat16
 
 
 class TestLTXOutputRank:

@@ -10,6 +10,7 @@ adapter-capable while retaining their quantization and tensor-parallel paths.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -190,11 +191,11 @@ class _AdapterPiece(nn.Module):
             delta = tensor_model_parallel_all_reduce(delta)
         return delta
 
-    def weight_delta(self) -> torch.Tensor:
+    def weight_delta(self, strength: float = 1.0) -> torch.Tensor:
         """Materialize the rank-local BF16 weight delta used by official fusion."""
         if self.lora_a.numel() == 0 or self.lora_b.numel() == 0:
             raise RuntimeError(f"LTX phase adapter target {self.target.module!r} was not materialized.")
-        return torch.matmul(self.lora_b, self.lora_a)
+        return torch.matmul(self.lora_b * strength, self.lora_a)
 
 
 def _apply_unquantized_gemm_with_weight(
@@ -274,6 +275,7 @@ class _PhaseAdapterLinear(nn.Module):
         self.pieces = nn.ModuleList(pieces)
         self._pieces_by_target = {piece.target: piece for piece in pieces}
         self._enabled = False
+        self._strength = 1.0
 
     def load_target(self, target: AdapterTarget, lora_a: torch.Tensor, lora_b: torch.Tensor) -> None:
         try:
@@ -282,8 +284,9 @@ class _PhaseAdapterLinear(nn.Module):
             raise ValueError(f"Adapter target {target.module!r} is not installed on this layer.") from exc
         piece.load(lora_a, lora_b, device=_module_device(self.base_layer), dtype=self.adapter_dtype)
 
-    def set_enabled(self, enabled: bool) -> None:
+    def set_enabled(self, enabled: bool, *, strength: float = 1.0) -> None:
         self._enabled = enabled
+        self._strength = strength
 
     def _add_adapter_delta(self, input_: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         if not self._enabled:
@@ -291,7 +294,7 @@ class _PhaseAdapterLinear(nn.Module):
         if output.requires_grad:
             output = output.clone()
         for piece in self.pieces:
-            delta = piece.delta(input_).to(dtype=output.dtype)
+            delta = piece.delta(input_).mul_(self._strength).to(dtype=output.dtype)
             start = piece.layout.output_start
             output[..., start : start + piece.layout.b_output_size].add_(delta)
         return output
@@ -303,7 +306,7 @@ class _PhaseAdapterLinear(nn.Module):
         for piece in self.pieces:
             start = piece.layout.output_start
             base_slice = base_weight.narrow(0, start, piece.layout.b_output_size)
-            delta = piece.weight_delta()
+            delta = piece.weight_delta(self._strength)
             if delta.shape != base_slice.shape:
                 raise ValueError(
                     f"LTX layer-fused delta shape {tuple(delta.shape)} does not match base weight slice "
@@ -387,14 +390,22 @@ class LTXPhaseAdapterRuntime:
         self._materialized = True
         logger.info("Materialized %d LTX phase-adapter tensor pairs", len(self.manifest.targets))
 
-    def activate(self, adapter_slot: str | None) -> None:
+    def activate(self, adapter_slot: str | None, *, strength: float | None = None) -> None:
+        if adapter_slot is None:
+            if strength is not None:
+                raise ValueError("An LTX phase adapter strength requires an adapter slot.")
+            resolved_strength = 1.0
+        else:
+            resolved_strength = 1.0 if strength is None else float(strength)
+            if not math.isfinite(resolved_strength):
+                raise ValueError("An LTX phase adapter strength must be finite.")
         if adapter_slot is not None:
             if adapter_slot != LTX_DISTILLED_ADAPTER_SLOT:
                 raise ValueError(f"Unknown LTX phase adapter slot {adapter_slot!r}.")
             if not self._materialized:
                 raise RuntimeError("LTX phase adapter data must be materialized before activation.")
         for wrapper in self._wrappers.values():
-            wrapper.set_enabled(adapter_slot is not None)
+            wrapper.set_enabled(adapter_slot is not None, strength=resolved_strength)
 
 
 def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:

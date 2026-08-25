@@ -12,6 +12,7 @@
 | `LTX2DistilledTwoStagePipeline` | LTX-2 merged-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
 | `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
 | `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
+| `LTX2TwoStageHQPipeline` | LTX-2.3 Res2s HQ two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
 | `LTX2DistilledOneStagePipeline` | LTX-2.3 merged-distilled one-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers` |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.3 merged-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
 
@@ -28,7 +29,10 @@ image selects I2V. Both one-stage repositories declare this class, so
 the raw `Lightricks/LTX-2.3` safetensors repository is not directly loadable.
 
 `LTX2TwoStagePipeline` samples the regular model at half resolution, upsamples,
-then refines with the distilled LoRA. `LTX2DistilledOneStagePipeline` uses a
+then refines with the distilled LoRA. `LTX2TwoStageHQPipeline` is the LTX-2.3
+and LTX-2.5 HQ entry: it uses the Res2s second-order sampler in both stages and
+applies the distilled LoRA at strengths 0.25 and 0.5 respectively.
+`LTX2DistilledOneStagePipeline` uses a
 merged distilled Transformer without upsampling, while
 `LTX2DistilledTwoStagePipeline` uses it in both stages. All entries support
 T2V and I2V; select their class explicitly. The deprecated
@@ -84,13 +88,14 @@ default to `121`.
 
 ## Two-Stage Defaults
 
-| Parameter | Ordinary | Full-distilled |
-|---|---:|---:|
-| Final width × height | 1536 × 1024 | 1536 × 1024 |
-| Stage 1 width × height | 768 × 512 | 768 × 512 |
-| Frames / frame rate | 121 / 24 | 121 / 24 |
-| Stage 1 / Stage 2 steps | 40 (LTX-2) or 30 (LTX-2.3) / 3 | 8 / 3 |
-| Guidance | Stage 1 guided; Stage 2 positive-only | Fixed positive-only |
+| Parameter | Ordinary | HQ (LTX-2.3) | Full-distilled |
+|---|---:|---:|---:|
+| Final width × height | 1536 × 1024 | 1920 × 1088 | 1536 × 1024 |
+| Stage 1 width × height | 768 × 512 | 960 × 544 | 768 × 512 |
+| Frames / frame rate | 121 / 24 | 121 / 24 | 121 / 24 |
+| Stage 1 / Stage 2 steps | 40 (LTX-2) or 30 (LTX-2.3) / 3 | 15 / 3 | 8 / 3 |
+| Sampler | Euler / Euler | Res2s / Res2s | Euler / Euler |
+| Guidance | Stage 1 guided; Stage 2 positive-only | Stage 1 guided without STG; Stage 2 positive-only | Fixed positive-only |
 
 API dimensions are final dimensions and must be divisible by 64. All LTX
 requests require `num_frames = 8k+1`. Ordinary Stage 1 uses the LTX-2 or
@@ -100,6 +105,10 @@ sigmas and input latents.
 
 Ordinary two-stage uses layer-fused LoRA for an unquantized BF16 Transformer
 and automatically switches to dynamic LoRA when quantization is enabled.
+HQ uses the same execution modes, with LoRA strength 0.25 in Stage 1 and 0.5
+in Stage 2. Its Stage-1 sigma schedule is derived from the actual packed video
+token count. `stage_1_sigmas` and `stage_2_sigmas` may override either HQ
+phase; an omitted phase retains the official schedule.
 
 ## Serving
 
@@ -124,6 +133,11 @@ vllm serve diffusers/LTX-2.3-Distilled-Diffusers --omni \
 # Ordinary LTX-2.3 two-stage
 vllm serve diffusers/LTX-2.3-Diffusers --omni \
   --model-class-name LTX2TwoStagePipeline \
+  --enable-layerwise-offload \
+  --stage-init-timeout 600
+# LTX-2.3 Res2s HQ two-stage
+vllm serve diffusers/LTX-2.3-Diffusers --omni \
+  --model-class-name LTX2TwoStageHQPipeline \
   --enable-layerwise-offload \
   --stage-init-timeout 600
 ```
@@ -208,6 +222,10 @@ per denoise step: `cond`, `uncond`, `ptb` (STG), and `mod`
 | `1` | 4 | 100% | Single-rank fused guidance batch |
 | `2` | 2 | 100% | Recommended two-rank configuration |
 | `4` | 1 | 100% | One guidance pass per rank |
+
+HQ Stage 1 disables STG and therefore executes three passes: `cond`, `uncond`,
+and `mod`. CFG parallel sizes 1 or 3 are balanced for that path. HQ Stage 2 is
+positive-only.
 
 Other positive sizes are accepted. When the pass count is not divisible by
 `cfg_parallel_size`, ranks are padded to an equal number of execution slots

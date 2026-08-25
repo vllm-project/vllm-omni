@@ -16,6 +16,7 @@ from .ltx2_conditioning import LTXI2VConditioningMixin
 from .ltx2_recipes import (
     LTX2_DISTILLED_TWO_STAGE_RECIPE,
     LTX2_TWO_STAGE_RECIPE,
+    LTX23_TWO_STAGE_HQ_RECIPE,
 )
 from .ltx2_runtime import LTXRuntime
 
@@ -38,6 +39,14 @@ class LTX2TwoStagePipeline(_LTX2TwoStageBase):
     pipeline_kind = "two_stage"
     component_profile = LTX2_TWO_STAGE_COMPONENT_PROFILE
     pipeline_recipe = LTX2_TWO_STAGE_RECIPE
+
+
+class LTX2TwoStageHQPipeline(_LTX2TwoStageBase):
+    """LTX-2.3/2.5 high-quality two-stage T2V/I2V with Res2s."""
+
+    pipeline_kind = "two_stage_hq"
+    component_profile = LTX2_TWO_STAGE_COMPONENT_PROFILE
+    pipeline_recipe = LTX23_TWO_STAGE_HQ_RECIPE
 
 
 class LTX2DistilledTwoStagePipeline(_LTX2TwoStageBase):

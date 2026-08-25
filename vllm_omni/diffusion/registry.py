@@ -81,6 +81,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_two_stage",
         "LTX2TwoStagePipeline",
     ),
+    "LTX2TwoStageHQPipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2TwoStageHQPipeline",
+    ),
     "LTX2DistilledOneStagePipeline": (
         "ltx2",
         "pipeline_ltx2",
@@ -559,6 +564,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStageHQPipeline": "get_ltx2_post_process_func",
     "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledPipeline": "get_ltx2_post_process_func",

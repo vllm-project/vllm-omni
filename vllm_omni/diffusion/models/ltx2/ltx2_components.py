@@ -213,6 +213,8 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
     ("two_stage", "2"): LTX2_TWO_STAGE_COMPONENT_PROFILE,
     ("two_stage", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
     ("two_stage", "2.5"): LTX25_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage_hq", "2.3"): LTX23_TWO_STAGE_COMPONENT_PROFILE,
+    ("two_stage_hq", "2.5"): LTX25_TWO_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2"): LTX2_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2.3"): LTX23_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
     ("distilled_one_stage", "2.5"): LTX25_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
@@ -226,7 +228,7 @@ _COMPONENT_PROFILES: dict[tuple[str, str], LTXComponentProfile] = {
 
 def resolve_ltx_checkpoint_kind(pipeline_kind: str) -> LTXCheckpointKind | None:
     """Derive checkpoint requirements from the execution contract."""
-    if pipeline_kind in {"one_stage", "two_stage"}:
+    if pipeline_kind in {"one_stage", "two_stage", "two_stage_hq"}:
         return "regular"
     if pipeline_kind in {"distilled_one_stage", "distilled_two_stage"}:
         return "distilled"
@@ -637,14 +639,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
         if os.path.isfile(upsampler_config) or not local_files_only:
             try:
-                pipeline.latent_upsampler = _load_component(
-                    LTX2LatentUpsamplerModel,
-                    model,
-                    "latent_upsampler",
-                    local_files_only=local_files_only,
-                    dtype=dtype,
-                    revision=revision,
-                )
+                # Diffusers builds the rational-resampler kernel with Long
+                # tensors; constructing it under a CUDA default-device context
+                # attempts an unsupported Long addmm before weights are loaded.
+                with torch.device("cpu"):
+                    pipeline.latent_upsampler = _load_component(
+                        LTX2LatentUpsamplerModel,
+                        model,
+                        "latent_upsampler",
+                        local_files_only=local_files_only,
+                        dtype=dtype,
+                        revision=revision,
+                    )
             except (OSError, ValueError):
                 if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
                     raise

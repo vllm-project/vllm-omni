@@ -342,6 +342,28 @@ class LTXGuidanceExecutor:
         return velocity_from_x0(sample, guided_x0, sigma)
 
     @staticmethod
+    def _guide_modality_denoised(
+        sample: torch.Tensor,
+        splits: dict[str, torch.Tensor],
+        sigma: torch.Tensor,
+        guidance: LTXModalityGuidance,
+        *,
+        model_sigma: torch.Tensor | None = None,
+        rescale_token_count: int | None = None,
+    ) -> torch.Tensor:
+        """Combine velocity predictions directly into a guided x0 tensor."""
+        model_sigma = sigma if model_sigma is None else model_sigma
+        x0 = {name: x0_from_velocity(sample, value, model_sigma).contiguous() for name, value in splits.items()}
+        return combine_guided_x0(
+            cond=x0["cond"],
+            uncond_text=x0.get("uncond", 0.0),
+            uncond_perturbed=x0.get("ptb", 0.0),
+            uncond_modality=x0.get("mod", 0.0),
+            guidance=guidance,
+            rescale_token_count=rescale_token_count,
+        )
+
+    @staticmethod
     def _guide_modality(
         sample: torch.Tensor,
         splits: dict[str, torch.Tensor],
@@ -354,32 +376,106 @@ class LTXGuidanceExecutor:
     ) -> torch.Tensor:
         if preserve_positive_velocity and tuple(splits) == ("cond",):
             return splits["cond"]
-        model_sigma = sigma if model_sigma is None else model_sigma
-        # Official guidance reduces contiguous BSC tensors. The fused
-        # transformer output may be channel-major after splitting, which
-        # changes fp32 reduction order and can cross bf16 rounding bounds.
-        x0 = {name: x0_from_velocity(sample, value, model_sigma).contiguous() for name, value in splits.items()}
-        guided = combine_guided_x0(
-            cond=x0["cond"],
-            uncond_text=x0.get("uncond", 0.0),
-            uncond_perturbed=x0.get("ptb", 0.0),
-            uncond_modality=x0.get("mod", 0.0),
-            guidance=guidance,
+        guided = LTXGuidanceExecutor._guide_modality_denoised(
+            sample,
+            splits,
+            sigma,
+            guidance,
+            model_sigma=model_sigma,
             rescale_token_count=rescale_token_count,
         )
         return velocity_from_x0(sample, guided, sigma)
 
-    def predict_parallel_guidance(
+    @staticmethod
+    def _pass_contexts(
+        prompt: Any,
+        passes: tuple[LTXDenoisePass, ...],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        video_contexts: list[torch.Tensor] = []
+        audio_contexts: list[torch.Tensor] = []
+        for denoise_pass in passes:
+            video_context = (
+                prompt.negative_connector_prompt_embeds
+                if denoise_pass.negative_video_context
+                else prompt.positive_connector_prompt_embeds
+            )
+            audio_context = (
+                prompt.negative_connector_audio_prompt_embeds
+                if denoise_pass.negative_audio_context
+                else prompt.positive_connector_audio_prompt_embeds
+            )
+            if video_context is None or audio_context is None:
+                raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
+            video_contexts.append(video_context)
+            audio_contexts.append(audio_context)
+        return video_contexts, audio_contexts
+
+    def _execute_model_passes(
         self,
         pipeline: Any,
-        plan: LTXGuidancePlan,
-        index: int,
+        execution_plan: LTXGuidancePlan,
         timestep: torch.Tensor,
         state: LTXAVState,
         forward_ctx: LTXForwardContext,
         denoise_ctx: LTXDenoiseContext,
-        preserve_positive_velocity: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Execute one rank's guidance passes and return raw velocity slots."""
+        prompt = forward_ctx.prompt_context
+        video_contexts, audio_contexts = self._pass_contexts(prompt, execution_plan.passes)
+        pass_count = len(execution_plan.passes)
+        video_input = _repeat_batch(state.video, pass_count).to(prompt.positive_connector_prompt_embeds.dtype)
+        audio_input = _repeat_batch(state.audio, pass_count).to(prompt.positive_connector_audio_prompt_embeds.dtype)
+        attention_kwargs = dict(forward_ctx.attention_kwargs or {})
+        perturbations = build_perturbation_kwargs(execution_plan, state.video.shape[0], video_input)
+        if perturbations:
+            attention_kwargs["ltx_perturbation_kwargs"] = perturbations
+        kwargs = pipeline._build_transformer_kwargs(
+            forward_ctx,
+            denoise_ctx,
+            hidden_states=video_input,
+            audio_hidden_states=audio_input,
+            encoder_hidden_states=torch.cat(video_contexts),
+            audio_encoder_hidden_states=torch.cat(audio_contexts),
+            encoder_attention_mask=None,
+            audio_encoder_attention_mask=None,
+            ts=timestep.expand(video_input.shape[0]),
+            attention_kwargs=attention_kwargs,
+        )
+        with pipeline._transformer_cache_context("guided"):
+            video_velocity, audio_velocity = pipeline.transformer(**kwargs)
+        return video_velocity.chunk(pass_count), audio_velocity.chunk(pass_count)
+
+    def _execute_guidance_plan(
+        self,
+        pipeline: Any,
+        plan: LTXGuidancePlan,
+        timestep: torch.Tensor,
+        state: LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        video_slots, audio_slots = self._execute_model_passes(
+            pipeline,
+            plan,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
+        return (
+            dict(zip(plan.names, video_slots, strict=True)),
+            dict(zip(plan.names, audio_slots, strict=True)),
+        )
+
+    def _execute_parallel_guidance_plan(
+        self,
+        pipeline: Any,
+        plan: LTXGuidancePlan,
+        timestep: torch.Tensor,
+        state: LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         guidance_world_size = get_guidance_parallel_world_size()
         self.validate_guidance_world_size(plan, guidance_world_size)
         guidance_rank = get_guidance_parallel_rank()
@@ -396,50 +492,14 @@ class LTXGuidanceExecutor:
             plan.passes[0] if pass_index is None else plan.passes[pass_index] for pass_index in padded_pass_indices
         )
         local_plan = LTXGuidancePlan(spec=plan.spec, passes=local_passes)
-
-        prompt = forward_ctx.prompt_context
-        video_contexts: list[torch.Tensor] = []
-        audio_contexts: list[torch.Tensor] = []
-        for denoise_pass in local_passes:
-            video_context = (
-                prompt.negative_connector_prompt_embeds
-                if denoise_pass.negative_video_context
-                else prompt.positive_connector_prompt_embeds
-            )
-            audio_context = (
-                prompt.negative_connector_audio_prompt_embeds
-                if denoise_pass.negative_audio_context
-                else prompt.positive_connector_audio_prompt_embeds
-            )
-            if video_context is None or audio_context is None:
-                raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
-            video_contexts.append(video_context)
-            audio_contexts.append(audio_context)
-
-        video_input = _repeat_batch(state.video, model_pass_count).to(prompt.positive_connector_prompt_embeds.dtype)
-        audio_input = _repeat_batch(state.audio, model_pass_count).to(
-            prompt.positive_connector_audio_prompt_embeds.dtype
-        )
-        attention_kwargs = dict(forward_ctx.attention_kwargs or {})
-        perturbations = build_perturbation_kwargs(local_plan, state.video.shape[0], video_input)
-        if perturbations:
-            attention_kwargs["ltx_perturbation_kwargs"] = perturbations
-        kwargs = pipeline._build_transformer_kwargs(
+        local_video_slots, local_audio_slots = self._execute_model_passes(
+            pipeline,
+            local_plan,
+            timestep,
+            state,
             forward_ctx,
             denoise_ctx,
-            hidden_states=video_input,
-            audio_hidden_states=audio_input,
-            encoder_hidden_states=torch.cat(video_contexts),
-            audio_encoder_hidden_states=torch.cat(audio_contexts),
-            encoder_attention_mask=None,
-            audio_encoder_attention_mask=None,
-            ts=timestep.expand(video_input.shape[0]),
-            attention_kwargs=attention_kwargs,
         )
-        with pipeline._transformer_cache_context("guided"):
-            local_video, local_audio = pipeline.transformer(**kwargs)
-        local_video_slots = local_video.chunk(model_pass_count)
-        local_audio_slots = local_audio.chunk(model_pass_count)
 
         group = get_guidance_parallel_group()
         gathered_video_slots = [group.all_gather(value, separate_tensors=True) for value in local_video_slots]
@@ -452,6 +512,68 @@ class LTXGuidanceExecutor:
             slot_index = pass_index // guidance_world_size
             video_splits[denoise_pass.name] = gathered_video_slots[slot_index][owner_rank]
             audio_splits[denoise_pass.name] = gathered_audio_slots[slot_index][owner_rank]
+        return video_splits, audio_splits
+
+    def predict_parallel_denoised(
+        self,
+        pipeline: Any,
+        plan: LTXGuidancePlan,
+        index: int,
+        timestep: torch.Tensor,
+        state: LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+        *,
+        video_sigma: torch.Tensor,
+        audio_sigma: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run guidance-parallel prediction and return guided x0 tensors."""
+        del index
+        video_splits, audio_splits = self._execute_parallel_guidance_plan(
+            pipeline,
+            plan,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
+
+        return (
+            self._guide_modality_denoised(
+                state.video,
+                video_splits,
+                video_sigma,
+                plan.spec.video,
+                model_sigma=pipeline._video_guidance_model_sigma(video_sigma, denoise_ctx),
+            ),
+            self._guide_modality_denoised(
+                state.audio,
+                audio_splits,
+                audio_sigma,
+                plan.spec.audio,
+                rescale_token_count=forward_ctx.original_audio_num_frames,
+            ),
+        )
+
+    def predict_parallel_guidance(
+        self,
+        pipeline: Any,
+        plan: LTXGuidancePlan,
+        index: int,
+        timestep: torch.Tensor,
+        state: LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+        preserve_positive_velocity: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_splits, audio_splits = self._execute_parallel_guidance_plan(
+            pipeline,
+            plan,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
 
         video_sigma = pipeline.scheduler.sigmas[index]
         return (
@@ -469,6 +591,62 @@ class LTXGuidanceExecutor:
                 forward_ctx.audio_scheduler.sigmas[index],
                 plan.spec.audio,
                 preserve_positive_velocity=preserve_positive_velocity,
+                rescale_token_count=forward_ctx.original_audio_num_frames,
+            ),
+        )
+
+    def predict_denoised(
+        self,
+        pipeline: Any,
+        plan: LTXGuidancePlan,
+        index: int,
+        timestep: torch.Tensor,
+        state: LTXAVState,
+        forward_ctx: LTXForwardContext,
+        denoise_ctx: LTXDenoiseContext,
+        *,
+        video_sigma: torch.Tensor,
+        audio_sigma: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return guided video/audio x0 predictions at an explicit sigma."""
+        if forward_ctx.guidance_parallel_ready:
+            return self.predict_parallel_denoised(
+                pipeline,
+                plan,
+                index,
+                timestep,
+                state,
+                forward_ctx,
+                denoise_ctx,
+                video_sigma=video_sigma,
+                audio_sigma=audio_sigma,
+            )
+
+        video_splits, audio_splits = self._execute_guidance_plan(
+            pipeline,
+            plan,
+            timestep,
+            state,
+            forward_ctx,
+            denoise_ctx,
+        )
+
+        return (
+            self._guide_modality_denoised(
+                state.video,
+                video_splits,
+                video_sigma,
+                plan.spec.video,
+                model_sigma=pipeline._video_guidance_model_sigma(
+                    video_sigma,
+                    denoise_ctx,
+                ),
+            ),
+            self._guide_modality_denoised(
+                state.audio,
+                audio_splits,
+                audio_sigma,
+                plan.spec.audio,
                 rescale_token_count=forward_ctx.original_audio_num_frames,
             ),
         )
@@ -496,48 +674,14 @@ class LTXGuidanceExecutor:
                 preserve_positive_velocity=preserve_positive_velocity,
             )
 
-        prompt = forward_ctx.prompt_context
-        video_contexts: list[torch.Tensor] = []
-        audio_contexts: list[torch.Tensor] = []
-        for denoise_pass in plan.passes:
-            video_context = (
-                prompt.negative_connector_prompt_embeds
-                if denoise_pass.negative_video_context
-                else prompt.positive_connector_prompt_embeds
-            )
-            audio_context = (
-                prompt.negative_connector_audio_prompt_embeds
-                if denoise_pass.negative_audio_context
-                else prompt.positive_connector_audio_prompt_embeds
-            )
-            if video_context is None or audio_context is None:
-                raise ValueError("Negative prompt context is required when LTX CFG is enabled.")
-            video_contexts.append(video_context)
-            audio_contexts.append(audio_context)
-
-        pass_count = len(plan.passes)
-        video_input = _repeat_batch(state.video, pass_count).to(prompt.positive_connector_prompt_embeds.dtype)
-        audio_input = _repeat_batch(state.audio, pass_count).to(prompt.positive_connector_audio_prompt_embeds.dtype)
-        attention_kwargs = dict(forward_ctx.attention_kwargs or {})
-        perturbations = build_perturbation_kwargs(plan, state.video.shape[0], video_input)
-        if perturbations:
-            attention_kwargs["ltx_perturbation_kwargs"] = perturbations
-        kwargs = pipeline._build_transformer_kwargs(
+        video_splits, audio_splits = self._execute_guidance_plan(
+            pipeline,
+            plan,
+            timestep,
+            state,
             forward_ctx,
             denoise_ctx,
-            hidden_states=video_input,
-            audio_hidden_states=audio_input,
-            encoder_hidden_states=torch.cat(video_contexts),
-            audio_encoder_hidden_states=torch.cat(audio_contexts),
-            encoder_attention_mask=None,
-            audio_encoder_attention_mask=None,
-            ts=timestep.expand(video_input.shape[0]),
-            attention_kwargs=attention_kwargs,
         )
-        with pipeline._transformer_cache_context("guided"):
-            video_velocity, audio_velocity = pipeline.transformer(**kwargs)
-        video_splits = dict(zip(plan.names, video_velocity.chunk(pass_count), strict=True))
-        audio_splits = dict(zip(plan.names, audio_velocity.chunk(pass_count), strict=True))
 
         return (
             self._guide_modality(

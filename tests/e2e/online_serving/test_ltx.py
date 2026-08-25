@@ -71,6 +71,16 @@ def _cases():
             id="two_stage",
             marks=SINGLE_CARD_MARKS,
         ),
+        pytest.param(
+            _server(
+                BASE_MODEL,
+                "LTX2TwoStageHQPipeline",
+                "--enable-layerwise-offload",
+            ),
+            3,
+            id="two_stage_hq",
+            marks=SINGLE_CARD_MARKS,
+        ),
     ]
 
 

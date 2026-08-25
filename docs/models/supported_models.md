@@ -45,10 +45,12 @@ th {
 | `Wan22VACEPipeline` | Wan2.2-VACE | `Pyros13/Wan2.2-VACE-Fun-A14B-Diffusers` | ✅︎ |   |   |   | — |
 | `LTX2Pipeline` | LTX-2 / LTX-2.3 one-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | | — |
 | `LTX2TwoStagePipeline` | LTX-2 / LTX-2.3 ordinary two-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` + matching Lightricks LoRA and upsampler | ✅︎ | ✅︎ | | | — |
+| `LTX2TwoStageHQPipeline` | LTX-2.3 Res2s HQ two-stage T2V and I2V | `diffusers/LTX-2.3-Diffusers` + `Lightricks/LTX-2.3` LoRA and upsampler | ✅︎ | ✅︎ | | | — |
 | `LTX2DistilledOneStagePipeline` | LTX-2 / LTX-2.3 merged-distilled one-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled`, `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | | — |
 | `LTX2DistilledTwoStagePipeline` | LTX-2 / LTX-2.3 merged-distilled two-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled`, `diffusers/LTX-2.3-Distilled-Diffusers` + matching Lightricks upsampler | ✅︎ | ✅︎ | | | — |
 | `LTX2Pipeline` | LTX-2.5 Full/SFT one-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2TwoStagePipeline` | LTX-2.5 Full/SFT two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` + `Lightricks/LTX-2.5` LoRA | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
+| `LTX2TwoStageHQPipeline` | LTX-2.5 Res2s HQ two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` + `Lightricks/LTX-2.5` LoRA and upsampler | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledOneStagePipeline` | LTX-2.5 merged-distilled one-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.5 merged-distilled two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | | — |

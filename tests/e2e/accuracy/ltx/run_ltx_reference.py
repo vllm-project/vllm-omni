@@ -22,7 +22,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("official", "omni"), required=True)
     parser.add_argument(
         "--pipeline-kind",
-        choices=("one_stage", "distilled", "two_stage"),
+        choices=("one_stage", "distilled", "two_stage", "two_stage_hq"),
         default="one_stage",
     )
     parser.add_argument("--request", type=Path, required=True)
@@ -134,6 +134,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     from ltx_pipelines.distilled import DistilledPipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
     from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+    from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
     from ltx_pipelines.utils.args import ImageConditioningInput
     from ltx_pipelines.utils.types import OffloadMode
 
@@ -170,14 +171,22 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
                 sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
             )
         ]
-        pipeline = TI2VidTwoStagesPipeline(
-            checkpoint_path=checkpoint,
-            distilled_lora=distilled_lora,
-            spatial_upsampler_path=_require_path(args.spatial_upsampler, "spatial upsampler"),
-            gemma_root=gemma_root,
-            loras=(),
-            offload_mode=offload_mode,
-        )
+        two_stage_kwargs = {
+            "checkpoint_path": checkpoint,
+            "distilled_lora": distilled_lora,
+            "spatial_upsampler_path": _require_path(args.spatial_upsampler, "spatial upsampler"),
+            "gemma_root": gemma_root,
+            "loras": (),
+            "offload_mode": offload_mode,
+        }
+        if args.pipeline_kind == "two_stage_hq":
+            pipeline = TI2VidTwoStagesHQPipeline(
+                **two_stage_kwargs,
+                distilled_lora_strength_stage_1=0.25,
+                distilled_lora_strength_stage_2=0.5,
+            )
+        else:
+            pipeline = TI2VidTwoStagesPipeline(**two_stage_kwargs)
     _configure_official_sdpa(pipeline)
     image_path = request.get("image")
     images = (

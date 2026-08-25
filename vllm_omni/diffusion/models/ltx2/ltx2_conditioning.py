@@ -48,6 +48,23 @@ def _repeat_prompt_tensor_for_outputs(tensor: torch.Tensor, num_outputs: int) ->
     return tensor.repeat_interleave(num_outputs, dim=0)
 
 
+def restore_conditioned_video_latents(
+    value: torch.Tensor,
+    clean: torch.Tensor | None,
+    conditioning_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Restore packed I2V conditioning tokens using official fp32 blending."""
+    if clean is None or conditioning_mask is None:
+        return value
+    if value.shape != clean.shape or value.shape[:2] != conditioning_mask.shape:
+        raise ValueError(
+            "LTX conditioned video tensors must share packed batch/token dimensions: "
+            f"value={tuple(value.shape)}, clean={tuple(clean.shape)}, mask={tuple(conditioning_mask.shape)}."
+        )
+    mask = conditioning_mask.unsqueeze(-1).float()
+    return (value.float() * (1.0 - mask) + clean.float() * mask).to(value.dtype)
+
+
 def _preprocess_i2v_pil_images(
     images: PIL.Image.Image | list[PIL.Image.Image],
     *,

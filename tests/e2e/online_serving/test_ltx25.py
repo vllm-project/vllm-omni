@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Online serving smokes for all four canonical LTX-2.5 pipelines."""
+"""Online serving smokes for all five canonical LTX-2.5 pipelines."""
 
 import os
 
@@ -53,6 +53,7 @@ def _cases():
     return [
         pytest.param(_server("LTX2Pipeline"), 30, id="full_one_stage", marks=SINGLE_CARD_MARKS),
         pytest.param(_server("LTX2TwoStagePipeline"), 30, id="full_two_stage", marks=SINGLE_CARD_MARKS),
+        pytest.param(_server("LTX2TwoStageHQPipeline"), 3, id="full_two_stage_hq", marks=SINGLE_CARD_MARKS),
         pytest.param(_server("LTX2DistilledOneStagePipeline"), 8, id="distilled_one_stage", marks=SINGLE_CARD_MARKS),
         pytest.param(_server("LTX2DistilledTwoStagePipeline"), 8, id="distilled_two_stage", marks=SINGLE_CARD_MARKS),
     ]

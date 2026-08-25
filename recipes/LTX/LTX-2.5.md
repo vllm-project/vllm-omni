@@ -20,11 +20,18 @@ both model licenses and authenticate before first use.
 |---|---|---:|---:|
 | `LTX2Pipeline` | Full/SFT one-stage | 960x544 | 30 steps |
 | `LTX2TwoStagePipeline` | Full/SFT two-stage | 1920x1088 | 30 + 3 steps |
+| `LTX2TwoStageHQPipeline` | Full/SFT Res2s HQ two-stage | 1920x1088 | 15 + 3 steps |
 | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
 | `LTX2DistilledTwoStagePipeline` | Distilled two-stage | 1920x1088 | 8 + 3 steps |
 
-Both two-stage pipelines generate at half resolution, apply the official x2
-latent upsampler, and run a three-step refinement stage. Select the class with
+All three two-stage pipelines generate at half resolution, apply the official
+x2 latent upsampler, and run a three-step refinement stage.
+`LTX2TwoStagePipeline` uses the Full/SFT transformer with guided Stage 1 and
+applies the official distilled LoRA only for Stage 2.
+`LTX2TwoStageHQPipeline` uses Res2s in both stages, disables STG, and applies
+the LoRA at strength 0.25 in Stage 1 and 0.5 in Stage 2.
+`LTX2DistilledTwoStagePipeline` uses the positive-only merged-distilled
+transformer in both stages. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
 image selects I2V, while omitting it selects T2V.
 
@@ -43,9 +50,9 @@ Install matching vLLM and vLLM-Omni versions, and ensure `ffmpeg` and
 
 | GPU | Status | Recommended scope |
 |---|---|---|
-| NVIDIA B300 | Verified | All four canonical pipelines |
-| NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
-| NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
+| NVIDIA B300 | Verified | All five canonical pipelines |
+| NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All five canonical pipelines |
+| NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All five canonical pipelines |
 | NVIDIA H100 80 GB | FP8 recipe | Distilled one-stage at 960x544 |
 
 The 1920x1088 two-stage examples require about 114 GB of peak GPU memory.
@@ -116,6 +123,11 @@ python examples/offline_inference/image_to_video/image_to_video.py \
 ```
 
 LTX-2.5 uses the official CRF-18 first-frame conditioning path by default.
+
+For HQ, set `PIPELINE=LTX2TwoStageHQPipeline`, `WIDTH=1920`, `HEIGHT=1088`,
+and `STEPS=15`. Stage 1 derives its terminal-stretched sigma schedule from the
+packed video token count and both stages use Res2s. Pass `stage_1_sigmas`
+and/or `stage_2_sigmas` through `--extra-body` to override either schedule.
 
 ## Online serving
 

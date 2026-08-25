@@ -9,6 +9,7 @@ import copy
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
@@ -16,8 +17,14 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retri
 
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
+from .ltx2_conditioning import restore_conditioned_video_latents
 from .ltx2_guidance import euler_step_from_velocity
-from .ltx2_latents import LTXAVState, unpack_audio_latents, unpad_audio_latents
+from .ltx2_latents import LTXAVState, clear_audio_padding, unpack_audio_latents, unpad_audio_latents
+from .ltx2_res2s import (
+    LTXRes2sExecutor,
+    build_ltx2_res2s_sigmas,
+    normalized_res2s_audio_noise,
+)
 
 if TYPE_CHECKING:
     from .ltx2_conditioning import LTXPromptContext
@@ -66,6 +73,7 @@ class LTXDenoiseContext:
     audio_attention_mask: torch.Tensor | None = None
     conditioning_mask: torch.Tensor | None = None
     conditioning_mask_for_model: torch.Tensor | None = None
+    clean_video_latents: torch.Tensor | None = None
 
 
 @dataclass
@@ -328,6 +336,8 @@ def prepare_scheduler_stage(
     latent_height: int,
     latent_width: int,
     use_official_sigma_schedule: bool,
+    video_token_count: int | None = None,
+    use_latent_dependent_sigma_schedule: bool = False,
     image_conditioned: bool = False,
     sampler: str = "euler",
     generator: torch.Generator | list[torch.Generator] | None = None,
@@ -360,6 +370,25 @@ def prepare_scheduler_stage(
 
     if sigmas is None and timesteps is None and use_official_sigma_schedule:
         scheduler_sigmas = _official_ltx_sigmas(pipeline.scheduler, request_inputs.num_inference_steps, device)
+        timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
+        _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
+        return audio_scheduler, video_audio_step_adapter, timesteps_tensor
+
+    if sigmas is None and timesteps is None and use_latent_dependent_sigma_schedule:
+        if video_token_count is None:
+            raise ValueError("A latent-dependent LTX sigma schedule requires the packed video token count.")
+        config = pipeline.scheduler.config
+        terminal = config.get("shift_terminal")
+        scheduler_sigmas = build_ltx2_res2s_sigmas(
+            request_inputs.num_inference_steps,
+            video_token_count,
+            device=device,
+            base_seq_len=config.get("base_image_seq_len", 1024),
+            max_seq_len=config.get("max_image_seq_len", 4096),
+            base_shift=config.get("base_shift", 0.95),
+            max_shift=config.get("max_shift", 2.05),
+            terminal=0.1 if terminal is None else terminal,
+        )
         timesteps_tensor = _set_scheduler_sigmas(pipeline.scheduler, scheduler_sigmas)
         _set_scheduler_sigmas(audio_scheduler, scheduler_sigmas.clone())
         return audio_scheduler, video_audio_step_adapter, timesteps_tensor
@@ -496,6 +525,57 @@ def step_denoised_latents(
     )
 
 
+def run_res2s_phase(
+    pipeline: Any,
+    state: LTXAVState,
+    forward_ctx: LTXForwardContext,
+    denoise_ctx: LTXDenoiseContext,
+) -> LTXAVState:
+    """Run the official stochastic second-order sampler for one HQ phase."""
+
+    def predict_x0(current: LTXAVState, sigma: torch.Tensor) -> LTXAVState:
+        denoise_ctx.latents = current.video
+        denoise_ctx.audio_latents = current.audio
+        timestep_scale = pipeline.scheduler.config.get("num_train_timesteps", 1000)
+        timestep = sigma.to(device=current.video.device) * timestep_scale
+        video, audio = pipeline._predict_denoised_for_step(
+            0,
+            timestep,
+            current,
+            forward_ctx,
+            denoise_ctx,
+            video_sigma=sigma,
+            audio_sigma=sigma,
+        )
+        return LTXAVState(video=video, audio=audio)
+
+    def restore_video(value: torch.Tensor) -> torch.Tensor:
+        return restore_conditioned_video_latents(
+            value,
+            denoise_ctx.clean_video_latents,
+            denoise_ctx.conditioning_mask,
+        )
+
+    def restore_audio(value: torch.Tensor) -> torch.Tensor:
+        return clear_audio_padding(value, forward_ctx.original_audio_num_frames)
+
+    sigmas = pipeline.scheduler.sigmas
+    with pipeline.progress_bar(total=len(sigmas) - 1) as progress_bar:
+        return LTXRes2sExecutor.run(
+            state,
+            sigmas,
+            predict_x0,
+            restore_video=restore_video if denoise_ctx.conditioning_mask is not None else None,
+            restore_audio=restore_audio,
+            model_dtype=state.video.dtype,
+            audio_noise_fn=partial(
+                normalized_res2s_audio_noise,
+                logical_token_count=forward_ctx.original_audio_num_frames,
+            ),
+            on_step=progress_bar.update,
+        )
+
+
 class LTXPhaseExecutor:
     """Prepare and execute one LTX phase without owning model modules."""
 
@@ -553,7 +633,9 @@ class LTXPhaseExecutor:
             latent_num_frames=latent_num_frames,
             latent_height=latent_height,
             latent_width=latent_width,
+            video_token_count=latents.shape[1],
             use_official_sigma_schedule=phase_recipe.use_official_sigma_schedule,
+            use_latent_dependent_sigma_schedule=phase_recipe.use_latent_dependent_sigma_schedule,
             image_conditioned=conditioning_mask is not None,
             sampler=phase_recipe.sampler,
             generator=request_inputs.generator,
@@ -598,20 +680,25 @@ class LTXPhaseExecutor:
                 else None
             ),
             conditioning_mask=conditioning_mask,
+            clean_video_latents=latents.clone() if conditioning_mask is not None else None,
         )
         denoise_ctx = pipeline._prepare_denoise_context_for_guidance(forward_ctx, denoise_ctx)
-        state = LTXDenoiseExecutor.run(
-            pipeline,
-            LTXAVState(video=denoise_ctx.latents, audio=denoise_ctx.audio_latents),
-            forward_ctx.timesteps,
-            lambda index, timestep, state: pipeline._denoise_step(
-                index,
-                timestep,
-                state,
-                forward_ctx,
-                denoise_ctx,
-            ),
-        )
+        initial_state = LTXAVState(video=denoise_ctx.latents, audio=denoise_ctx.audio_latents)
+        if phase_recipe.sampler == "res2s":
+            state = run_res2s_phase(pipeline, initial_state, forward_ctx, denoise_ctx)
+        else:
+            state = LTXDenoiseExecutor.run(
+                pipeline,
+                initial_state,
+                forward_ctx.timesteps,
+                lambda index, timestep, state: pipeline._denoise_step(
+                    index,
+                    timestep,
+                    state,
+                    forward_ctx,
+                    denoise_ctx,
+                ),
+            )
         denoise_ctx.latents = state.video
         denoise_ctx.audio_latents = state.audio
         latents, audio_latents = pipeline._unpack_and_denormalize_stage(

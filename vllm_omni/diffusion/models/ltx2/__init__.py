@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_two_stage import (
     LTX2DistilledPipeline,
     LTX2DistilledTwoStagePipeline,
+    LTX2TwoStageHQPipeline,
     LTX2TwoStagePipeline,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
     "LTX2TwoStagePipeline",
+    "LTX2TwoStageHQPipeline",
     "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline",
     "get_ltx2_post_process_func",

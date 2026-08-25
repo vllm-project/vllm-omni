@@ -220,6 +220,14 @@ def test_ltx_phase_adapter_keeps_one_transformer_and_switches_a_fixed_slot(tmp_p
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[1.0, 1.0]]))
     runtime.activate(LTX_DISTILLED_ADAPTER_SLOT)
     torch.testing.assert_close(transformer.proj(x), torch.tensor([[10.0, 13.0]]))
+    runtime.activate(LTX_DISTILLED_ADAPTER_SLOT, strength=0.25)
+    torch.testing.assert_close(transformer.proj(x), torch.tensor([[3.25, 4.0]]))
+    runtime.activate(LTX_DISTILLED_ADAPTER_SLOT, strength=0.5)
+    torch.testing.assert_close(transformer.proj(x), torch.tensor([[5.5, 7.0]]))
+    with pytest.raises(ValueError, match="finite"):
+        runtime.activate(LTX_DISTILLED_ADAPTER_SLOT, strength=float("nan"))
+    with pytest.raises(ValueError, match="requires an adapter slot"):
+        runtime.activate(None, strength=0.25)
 
 
 def test_ltx_layer_fused_adapter_matches_official_bf16_weight_fusion():
@@ -253,6 +261,13 @@ def test_ltx_layer_fused_adapter_matches_official_bf16_weight_fusion():
     x = torch.tensor([[0.6015625, -0.703125, 0.8046875, -0.90625]], dtype=torch.bfloat16)
     expected = torch.nn.functional.linear(x, expected_weight, layer.bias)
 
+    assert torch.equal(wrapper(x), expected)
+    assert torch.equal(layer.weight, base_weight)
+
+    wrapper.set_enabled(True, strength=0.25)
+    expected_weight = torch.matmul(lora_b * 0.25, lora_a)
+    expected_weight.add_(base_weight)
+    expected = torch.nn.functional.linear(x, expected_weight, layer.bias)
     assert torch.equal(wrapper(x), expected)
     assert torch.equal(layer.weight, base_weight)
 

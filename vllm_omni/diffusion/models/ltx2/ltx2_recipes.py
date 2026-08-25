@@ -3,6 +3,7 @@
 
 """Declarative execution recipes for the LTX model family."""
 
+import math
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -43,17 +44,27 @@ class LTXPhaseRecipe:
     noise_scale: float = 0.0
     input_transform: Literal["initial", "spatial_upsample"] = "initial"
     adapter_slot: str | None = None
-    sampler: Literal["euler", "euler_ancestral"] = "euler"
+    adapter_strength: float | None = None
+    sampler: Literal["euler", "euler_ancestral", "res2s"] = "euler"
     allow_guidance_override: bool = True
     use_official_sigma_schedule: bool = True
+    use_latent_dependent_sigma_schedule: bool = False
 
     def __post_init__(self) -> None:
         if self.spatial_downscale < 1:
             raise ValueError("LTX phase spatial_downscale must be positive.")
         if self.sigmas is not None and len(self.sigmas) < 2:
             raise ValueError("An explicit LTX sigma schedule must contain at least two denoise sigmas.")
-        if self.sampler not in ("euler", "euler_ancestral"):
+        if (self.adapter_slot is None) != (self.adapter_strength is None):
+            raise ValueError("An LTX phase adapter slot and strength must be configured together.")
+        if self.adapter_strength is not None and not math.isfinite(self.adapter_strength):
+            raise ValueError("An LTX phase adapter strength must be finite.")
+        if self.sampler not in ("euler", "euler_ancestral", "res2s"):
             raise ValueError(f"Unsupported LTX sampler: {self.sampler!r}.")
+        if self.use_official_sigma_schedule and self.use_latent_dependent_sigma_schedule:
+            raise ValueError("An LTX phase cannot enable both official and latent-dependent sigma schedules.")
+        if self.sigmas is not None and self.use_latent_dependent_sigma_schedule:
+            raise ValueError("An LTX phase cannot combine explicit sigmas with a latent-dependent sigma schedule.")
 
     @property
     def num_inference_steps(self) -> int | None:
@@ -280,6 +291,7 @@ def _official_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipeli
                 noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
                 input_transform="spatial_upsample",
                 adapter_slot=LTX_DISTILLED_ADAPTER_SLOT,
+                adapter_strength=1.0,
                 allow_guidance_override=False,
                 use_official_sigma_schedule=False,
             ),
@@ -299,6 +311,65 @@ LTX23_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX23_ONE_STAGE_RECIPE)
 LTX25_TWO_STAGE_RECIPE = _official_two_stage_recipe(LTX25_FULL_RECIPE)
 
 
+def _hq_two_stage_recipe(one_stage_recipe: LTXPipelineRecipe) -> LTXPipelineRecipe:
+    """Build the official Res2s HQ topology for a regular LTX checkpoint."""
+    return LTXPipelineRecipe(
+        height=1088,
+        width=1920,
+        num_frames=one_stage_recipe.num_frames,
+        frame_rate=one_stage_recipe.frame_rate,
+        num_inference_steps=15,
+        negative_prompt=one_stage_recipe.negative_prompt,
+        phases=(
+            LTXPhaseRecipe(
+                name="generate_lowres",
+                guidance=LTXGuidanceSpec(
+                    video=LTXModalityGuidance(
+                        cfg_scale=3.0,
+                        stg_scale=0.0,
+                        modality_scale=3.0,
+                        rescale_scale=0.45,
+                    ),
+                    audio=LTXModalityGuidance(
+                        cfg_scale=7.0,
+                        stg_scale=0.0,
+                        modality_scale=3.0,
+                        rescale_scale=1.0,
+                    ),
+                ),
+                spatial_downscale=2,
+                noise_scale=1.0,
+                adapter_slot=LTX_DISTILLED_ADAPTER_SLOT,
+                adapter_strength=0.25,
+                sampler="res2s",
+                use_official_sigma_schedule=False,
+                use_latent_dependent_sigma_schedule=True,
+            ),
+            LTXPhaseRecipe(
+                name="refine",
+                guidance=LTXGuidanceSpec.positive_only(),
+                sigmas=LTX_STAGE_2_DISTILLED_SIGMAS,
+                noise_scale=LTX_STAGE_2_DISTILLED_SIGMAS[0],
+                input_transform="spatial_upsample",
+                adapter_slot=LTX_DISTILLED_ADAPTER_SLOT,
+                adapter_strength=0.5,
+                sampler="res2s",
+                allow_guidance_override=False,
+                use_official_sigma_schedule=False,
+            ),
+        ),
+        video_output_phase=1,
+        audio_output_phase=0,
+        allow_request_sigmas=False,
+        allow_request_phase_sigmas=True,
+        allow_request_latents=False,
+    )
+
+
+LTX23_TWO_STAGE_HQ_RECIPE = _hq_two_stage_recipe(LTX23_ONE_STAGE_RECIPE)
+LTX25_TWO_STAGE_HQ_RECIPE = _hq_two_stage_recipe(LTX25_FULL_RECIPE)
+
+
 _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("one_stage", "2"): LTX2_ONE_STAGE_RECIPE,
     ("one_stage", "2.3"): LTX23_ONE_STAGE_RECIPE,
@@ -306,6 +377,8 @@ _PIPELINE_RECIPES: dict[tuple[str, str], LTXPipelineRecipe] = {
     ("two_stage", "2"): LTX2_TWO_STAGE_RECIPE,
     ("two_stage", "2.3"): LTX23_TWO_STAGE_RECIPE,
     ("two_stage", "2.5"): LTX25_TWO_STAGE_RECIPE,
+    ("two_stage_hq", "2.3"): LTX23_TWO_STAGE_HQ_RECIPE,
+    ("two_stage_hq", "2.5"): LTX25_TWO_STAGE_HQ_RECIPE,
     ("distilled_one_stage", "2"): LTX2_DISTILLED_ONE_STAGE_RECIPE,
     ("distilled_one_stage", "2.3"): LTX23_DISTILLED_ONE_STAGE_RECIPE,
     ("distilled_one_stage", "2.5"): LTX25_DISTILLED_ONE_STAGE_RECIPE,
