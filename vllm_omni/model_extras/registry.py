@@ -47,6 +47,7 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -204,6 +205,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledPipeline",
             "LTX2DistilledTwoStagePipeline",
         )
+    },
+    "SanaVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "SanaImageToVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

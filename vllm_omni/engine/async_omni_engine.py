@@ -1059,6 +1059,8 @@ class AsyncOmniEngine:
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
+            "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
+            "host_weight_runtime_root": kwargs.get("host_weight_runtime_root"),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

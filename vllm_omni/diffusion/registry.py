@@ -286,6 +286,16 @@ _DIFFUSION_MODELS = {
         "pipeline_lingbot_video",
         "LingBotVideoPipeline",
     ),
+    "SanaVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video",
+        "SanaVideoPipeline",
+    ),
+    "SanaImageToVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video_i2v",
+        "SanaImageToVideoPipeline",
+    ),
     "OmniVoicePipeline": (
         "omnivoice",
         "pipeline_omnivoice",
@@ -576,6 +586,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
+    "SanaVideoPipeline": "get_sana_video_post_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
@@ -619,6 +631,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",

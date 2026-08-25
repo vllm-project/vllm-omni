@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -9,9 +9,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -335,6 +336,121 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_segment_boundary_starts_new_send_watermark_before_background_flush(build_adapter):
+    """A queued boundary owns the end of its deduplication generation.
+
+    The next segment can start before the save thread sends the old boundary.
+    Sending that old task later must not erase the new segment's watermark.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 26
+
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+        confirmed_num_computed_tokens=26,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    boundary_task = adapter._pending_save_reqs.popleft()
+    assert "ext-stream" not in adapter.requests_num_chunks_sent
+
+    request.num_computed_tokens = 3
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=False,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+    adapter._send_single_request(boundary_task)
+
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+
+def test_background_send_uses_enqueued_request_snapshot(build_adapter):
+    """A queued segment must not observe later in-place request mutations."""
+    adapter, _ = build_adapter(stage_id=1)
+    request = Request(
+        request_id="req-stream",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = "ext-stream"
+    ref_audio = torch.tensor([0.1, -0.1])
+    request.additional_information = {"codes": {"ref": ref_audio}, "meta": {"segment": "old"}}
+    request.append_output_token_ids([7])
+    seen_requests = []
+
+    def recording_processor(**kwargs):
+        queued = kwargs["request"]
+        seen_requests.append(
+            (
+                queued.additional_information["meta"]["segment"],
+                list(queued.prompt_token_ids),
+                list(queued.output_token_ids),
+                list(queued.all_token_ids),
+                queued.additional_information["codes"]["ref"] is ref_audio,
+            )
+        )
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "next"
+    request.prompt_token_ids.append(3)
+    request.append_output_token_ids([8])
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "later"
+    request.prompt_token_ids.append(4)
+    request.append_output_token_ids([9])
+
+    assert len(adapter._pending_save_reqs) == 2
+    first_task = adapter._pending_save_reqs.popleft()
+    second_task = adapter._pending_save_reqs.popleft()
+    assert first_task["request"].additional_information is not request.additional_information
+    assert first_task["request"].additional_information["meta"] is not request.additional_information["meta"]
+
+    adapter._send_single_request(first_task)
+    adapter._send_single_request(second_task)
+
+    assert seen_requests == [
+        ("old", [1, 2], [7], [1, 2, 7], True),
+        ("next", [1, 2, 3], [7, 8], [1, 2, 7, 8], True),
+    ]
+
+
+def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")
+    snapshot = mocker.patch.object(
+        adapter,
+        "_snapshot_processor_request",
+        side_effect=AssertionError("unexpected snapshot"),
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+
+    snapshot.assert_not_called()
+    assert adapter._pending_save_reqs.popleft()["request"] is request
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):

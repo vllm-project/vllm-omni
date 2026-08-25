@@ -821,6 +821,82 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+def _fake_packed_attention(
+    backend_name: str,
+    *,
+    prefix_kv_slicing: bool = False,
+    supports_multi_doc: bool = False,
+):
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        supports_prefix_kv_slicing = prefix_kv_slicing
+
+        @staticmethod
+        def get_name() -> str:
+            return backend_name
+
+        @classmethod
+        def supports_multi_doc_packed_varlen(cls) -> bool:
+            return supports_multi_doc
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    return attention
+
+
+def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
+    """A batch's valid rows are block-diagonal, so no prefix can describe them."""
+    attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=True)
+    q = torch.randn(12, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        # Two requests: rows + padding tail each.
+        cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=12,
+        num_requests=2,
+    )
+
+    assert attention.attention.metadata.attn_mask is None
+    assert attention.attention.metadata.extra["valid_kv_length"] == 12
+
+
+@pytest.mark.parametrize("backend_name", ["TORCH_SDPA", "FLASH_ATTN"])
+def test_packed_attention_rejects_backends_without_multi_doc_capability(backend_name):
+    """Backend names alone must not allow cross-request attention."""
+    attention = _fake_packed_attention(backend_name, supports_multi_doc=False)
+    q = torch.randn(12, 2, 4)
+
+    with pytest.raises(ValueError, match=backend_name):
+        attention._run_packed_attention(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+            max_seqlen=5,
+            packed_total=12,
+            num_requests=2,
+        )
+
+
 def test_reference_image_resize_contract():
     from PIL import Image
 

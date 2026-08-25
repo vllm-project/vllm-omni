@@ -100,6 +100,19 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return normalized
 
 
+def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+    """Validate HWR policy without touching the configured storage domain.
+
+    Filesystem locality and store construction belong to the eligible loader
+    path. Keeping this check purely structural is what lets disabled and
+    AllGather DLO configurations retain zero HWR interaction.
+    """
+    if mode not in {"disabled", "preferred", "required"}:
+        raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
+        raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
@@ -766,6 +779,11 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Final-layout Host Weight Runtime policy. The loader only activates this
+    # for eligible no-AllGather DLO; all other configurations preserve their
+    # existing loader/storage path.
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -1141,6 +1159,11 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

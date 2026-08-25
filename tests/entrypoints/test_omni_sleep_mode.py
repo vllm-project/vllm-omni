@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Omni sleep mode: entrypoint-level VRAM/ACK tests plus multi-stage e2e.
 
@@ -152,13 +152,13 @@ def _build_llm_stages() -> tuple[list[dict], list[dict]]:
 @pytest.fixture(scope="module", autouse=True)
 def _module_device_cleanup():
     """One device cleanup pass around the module (engines are class-scoped)."""
-    from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+    from tests.helpers.clean import cleanup_test_environment
 
     print("\n=== PRE-MODULE DEVICE CLEANUP (sleep_mode) ===")
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     yield
     print("\n=== POST-MODULE DEVICE CLEANUP (sleep_mode) ===")
-    run_post_test_cleanup()
+    cleanup_test_environment()
 
 
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
@@ -371,6 +371,8 @@ class TestOmniDiffusionSleepMode:
             # --- wake + VRAM restore to initial (±3 GiB) ---
             logger.info("Waking up (Reloading Weights)...")
             await diffusion_engine.wake_up(stage_ids=[0])
+            # AR stages keep the frontend admission gate held after wake.
+            await diffusion_engine.resume_generation(stage_ids=[0])
             await asyncio.sleep(2.0)
             gc.collect()
             get_vram_info(device_id)

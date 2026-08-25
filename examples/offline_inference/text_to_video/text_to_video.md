@@ -14,6 +14,8 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
 | `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480x832 | 81 | 50 | 6.0 | BF16 DiT + FP32 Wan VAE wrapper |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704x1280 | 81 | 50 | 6.0 | BF16 DiT + LTX-2 Video VAE wrapper |
 
 ## Local CLI Usage
 
@@ -150,6 +152,40 @@ python text_to_video.py \
   --flow-shift 5.0 \
   --output quick_test.mp4
 ```
+
+### SANA-Video-2B
+
+Select the native T2V pipeline explicitly:
+
+```bash
+python text_to_video.py \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --model-class-name SanaVideoPipeline \
+  --prompt "A cinematic tracking shot of a sailboat crossing the ocean at sunset." \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --extra-body '{"motion_score": 30}' \
+  --fps 16 \
+  --output sana_video_480p.mp4
+```
+
+For the 720p checkpoint, switch the model to
+`Efficient-Large-Model/SANA-Video_2B_720p_diffusers`, use
+`--height 704 --width 1280`, and write to a different output path. Both native
+checkpoint variants are supported. The Diffusers adapter T2V compatibility
+path is also validated at both resolutions through online serving.
+
+The native 480p path uses vLLM-Omni's `DistributedAutoencoderKLWan` wrapper;
+the native 720p path uses `DistributedAutoencoderKLLTX2Video`. Both wrappers
+retain their underlying Diffusers autoencoders. The pipeline intentionally
+uses Diffusers' checkpoint-compatible `DPMSolverMultistepScheduler`.
+
+For image-to-video, use the shared
+[`image_to_video.py`](../image_to_video/README.md#sana-video-2b) example with
+`--model-class-name SanaImageToVideoPipeline` and `--image <path>`.
 
 ### Cosmos3
 
