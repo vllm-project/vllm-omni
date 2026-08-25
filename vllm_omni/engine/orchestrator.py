@@ -49,7 +49,10 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    serialize_additional_information,
+    serialize_model_intermediate_buffer,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -154,7 +157,11 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
-        model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        model_intermediate_buffer=(
+            serialize_model_intermediate_buffer(model_intermediate_buffer)
+            if isinstance(model_intermediate_buffer, dict)
+            else None
+        ),
     )
 
 
@@ -1362,6 +1369,7 @@ class Orchestrator:
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)
         additional_information = None
+        model_intermediate_buffer = None
 
         if isinstance(raw_prompt, dict):
             if prompt_embeds is None:
@@ -1372,14 +1380,18 @@ class Orchestrator:
                 raw_prompt.get("additional_information"),
                 log_prefix="Orchestrator stage input",
             )
+            raw_buffer = raw_prompt.get("model_intermediate_buffer")
+            if isinstance(raw_buffer, dict):
+                model_intermediate_buffer = serialize_model_intermediate_buffer(raw_buffer)
 
-        if prompt_embeds is None and additional_information is None:
+        if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
             return request
 
         return OmniEngineCoreRequest.from_request(
             request,
             prompt_embeds=prompt_embeds,
             additional_information=additional_information,
+            model_intermediate_buffer=model_intermediate_buffer,
         )
 
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:

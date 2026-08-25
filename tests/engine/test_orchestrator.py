@@ -323,6 +323,88 @@ def _build_stage_pools(
     return pools
 
 
+def test_stage0_timeline_emits_first_nonempty_text_output_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    stage0 = FakeStageClient(final_output=True, final_output_type="text")
+    pool = StagePool(0, stage0, output_processor=FakeOutputProcessor())
+    pool._ultra_timeline_enabled = True
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_pool.emit_ultra_timeline_event",
+        lambda event, **kwargs: emitted.append((event, kwargs)),
+    )
+
+    pool.record_output_timestamps(
+        [_build_request_output("req-stage0", text="")],
+        output_ts=1.0,
+    )
+    pool.record_output_timestamps(
+        [_build_request_output("req-stage0", text="first")],
+        output_ts=2.0,
+    )
+    pool.record_output_timestamps(
+        [_build_request_output("req-stage0", text="second")],
+        output_ts=3.0,
+    )
+
+    assert emitted == [
+        (
+            "stage0_first_text_output",
+            {
+                "request_id": "req-stage0",
+                "stage": 0,
+                "stream": "host",
+            },
+        )
+    ]
+
+
+def test_stage0_timeline_default_path_does_not_emit(monkeypatch: pytest.MonkeyPatch) -> None:
+    stage0 = FakeStageClient(final_output=True, final_output_type="text")
+    pool = StagePool(0, stage0, output_processor=FakeOutputProcessor())
+    pool._ultra_timeline_enabled = False
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_pool.emit_ultra_timeline_event",
+        lambda *_args, **_kwargs: pytest.fail("default path emitted a timeline event"),
+    )
+
+    pool.record_output_timestamps(
+        [_build_request_output("req-default", text="first")],
+        output_ts=1.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage0_timeline_wraps_queue_and_engine_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    stage0 = FakeStageClient(final_output=True, final_output_type="text")
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, stage0, output_processor=processor)
+    pool._ultra_timeline_enabled = True
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_pool.emit_ultra_timeline_event",
+        lambda event, **kwargs: emitted.append((event, kwargs)),
+    )
+    req_state = SimpleNamespace(
+        sampling_params_list=[_sampling_params()],
+        pipeline_timings={"preprocess_ms": 1.25, "queue_wait_ms": 0.5},
+    )
+    request = SimpleNamespace(request_id="req-submit")
+
+    replica_id = await pool.submit_initial("req-submit", req_state, request)
+
+    assert replica_id == 0
+    assert [event for event, _ in emitted] == [
+        "stage0_queue_leave",
+        "stage0_submit_begin",
+        "stage0_submit_end",
+    ]
+    assert emitted[0][1]["details"] == {
+        "preprocess_ms": 1.25,
+        "queue_wait_ms": 0.5,
+    }
+    assert emitted[-1][1]["details"] == {"replica_id": 0}
+
+
 def _build_harness(
     stage_clients: list[object],
     *,

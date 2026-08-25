@@ -3,13 +3,18 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.benchmarks.ultra_timeline import emit_ultra_timeline_event
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.engine.tensor_envelope import (
+    build_inline_tensor_envelope,
+)
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -22,6 +27,12 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+_MINICPMO45_EARLY_SETUP_KEY = "code2wav_early_setup"
+_MINICPMO45_EARLY_SETUP_ENV = "VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP"
+_MINICPMO45_TENSOR_HANDOFF_ENV = "VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF"
+_MINICPMO45_INITIAL_CHUNK_KEY = "initial_codec_chunk_frames"
+_MINICPMO45_INITIAL_CHUNK_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
+_MINICPMO45_DEFAULT_INITIAL_CHUNK_FRAMES = 25
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -125,20 +136,131 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    if _MINICPMO45_INITIAL_CHUNK_KEY in config:
+        raw_initial = config[_MINICPMO45_INITIAL_CHUNK_KEY]
+        initial_source = _MINICPMO45_INITIAL_CHUNK_KEY
+    else:
+        raw_initial = os.environ.get(_MINICPMO45_INITIAL_CHUNK_ENV)
+        if raw_initial is None:
+            raw_initial = _MINICPMO45_DEFAULT_INITIAL_CHUNK_FRAMES
+        initial_source = _MINICPMO45_INITIAL_CHUNK_ENV
+    try:
+        if isinstance(raw_initial, bool):
+            raise TypeError
+        initial_chunk_frames = int(raw_initial)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid {initial_source}={raw_initial!r}; expected an integer frame count"
+        ) from exc
+    if _MINICPMO45_INITIAL_CHUNK_KEY not in config:
+        if initial_chunk_frames == 0:
+            # Environment-only rollback. An explicit connector value of zero
+            # remains invalid so deployment mistakes fail visibly.
+            initial_chunk_frames = chunk_frames
+    if chunk_frames <= 0 or left_context_frames < 0 or initial_chunk_frames <= 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
+            f"initial_codec_chunk_frames={initial_chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
-    return chunk_frames, left_context_frames
+    return chunk_frames, left_context_frames, min(initial_chunk_frames, chunk_frames)
+
+
+def _config_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _early_setup_enabled(transfer_manager: Any) -> bool:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    if _MINICPMO45_EARLY_SETUP_KEY in config:
+        return _config_bool(config[_MINICPMO45_EARLY_SETUP_KEY], True)
+    return _config_bool(os.environ.get(_MINICPMO45_EARLY_SETUP_ENV), True)
+
+
+def _tensor_handoff_enabled() -> bool:
+    raw_value = os.environ.get(_MINICPMO45_TENSOR_HANDOFF_ENV)
+    if raw_value is None:
+        return True
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_MINICPMO45_TENSOR_HANDOFF_ENV}={raw_value!r}; "
+        "expected one of 1/0, true/false, yes/no, or on/off"
+    )
+
+
+def _request_reference_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
+    request_info = getattr(request, "additional_information", None)
+    if not isinstance(request_info, Mapping):
+        return None, None
+    codes_info = request_info.get("codes")
+    meta_info = request_info.get("meta")
+    raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
+    raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
+    ref_audio = (
+        torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+        if raw_ref_audio is not None
+        else None
+    )
+    return ref_audio, _coerce_int(raw_ref_audio_sr)
+
+
+def _early_setup_payload(
+    *,
+    request_id: str,
+    chunk_seq: int,
+    cache_epoch: int,
+    request: Any,
+) -> OmniPayloadStruct:
+    ref_audio, ref_audio_sr = _request_reference_audio(request)
+    unfinished = torch.tensor(False, dtype=torch.bool)
+    return OmniPayloadStruct(
+        # One transport placeholder makes the generic generation scheduler
+        # run Stage 2. code_flat_numel=0 keeps it out of the codec stream.
+        codes=CodesStruct(
+            # Keep the placeholder non-zero: the generic receive gate treats
+            # a scalar zero tensor as false before Stage 2 can inspect the
+            # explicit code_flat_numel field.
+            audio=torch.tensor([_MINICPMO45_SILENCE_CODE], dtype=torch.long),
+            ref=ref_audio,
+        ),
+        meta=_MiniCPMO45MetaStruct(
+            request_id=request_id,
+            chunk_seq=chunk_seq,
+            cache_epoch=cache_epoch,
+            code_flat_numel=0,
+            codec_chunk_frames=0,
+            codec_left_context_frames=0,
+            left_context_size=0,
+            last_chunk=False,
+            stream_finished=unfinished,
+            finished=unfinished,
+            is_segment_finished=unfinished,
+            req_id=[request_id],
+            tts_is_last_chunk=False,
+            init_only=True,
+            ref_audio_sr=ref_audio_sr,
+        ),
+        request_id=request_id,
+    )
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -240,8 +362,11 @@ def tts2code2wav_async_chunk(
             "internal_id": internal_id,
             "cache_epoch": 0,
             "chunk_seq": 0,
+            "first_codec_token_recorded": False,
             "retired_internal_ids": set(),
             "last_terminal_turn": None,
+            "init_sent": False,
+            "ref_forwarded": False,
         }
         container[_MINICPMO45_STREAM_RECORD] = record
     elif internal_id in record["retired_internal_ids"]:
@@ -251,7 +376,10 @@ def tts2code2wav_async_chunk(
         record["internal_id"] = internal_id
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
+        record["first_codec_token_recorded"] = False
         record["last_terminal_turn"] = None
+        record["init_sent"] = False
+        record["ref_forwarded"] = False
         _drop_codec_state(transfer_manager, request_id)
 
     if _is_aborted(request):
@@ -275,7 +403,21 @@ def tts2code2wav_async_chunk(
         container[_MINICPMO45_ASYNC_STATE] = state
 
     pending = state["pending"]
-    pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    codec_delta = _extract_codec_delta(multimodal_output, request_id)
+    if codec_delta and not bool(record.get("first_codec_token_recorded", False)):
+        emit_ultra_timeline_event(
+            "first_codec_token",
+            request_id=request_id,
+            turn_id=duplex_turn_id,
+            stage=1,
+            chunk_id=int(record["chunk_seq"]),
+            stream="codec",
+            shape=(len(codec_delta),),
+            num_bytes=len(codec_delta) * 8,
+            details={"cache_epoch": int(record["cache_epoch"])},
+        )
+        record["first_codec_token_recorded"] = True
+    pending.extend(codec_delta)
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
     current_text_utf8 = (
         segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
@@ -289,16 +431,33 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, left_context_frames, initial_chunk_frames = _codec_config(transfer_manager)
+    effective_chunk_frames = initial_chunk_frames if int(state["codec_end"]) == 0 else chunk_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < effective_chunk_frames:
+        if (
+            codec_delta
+            and not native_duplex
+            and not bool(record.get("init_sent", False))
+            and int(state["codec_end"]) == 0
+            and _early_setup_enabled(transfer_manager)
+        ):
+            payload = _early_setup_payload(
+                request_id=request_id,
+                chunk_seq=int(record["chunk_seq"]),
+                cache_epoch=int(record["cache_epoch"]),
+                request=request,
+            )
+            record["init_sent"] = True
+            record["ref_forwarded"] = True
+            return payload
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else effective_chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -339,16 +498,9 @@ def tts2code2wav_async_chunk(
     record["chunk_seq"] = chunk_seq + 1
     ref_audio = None
     ref_audio_sr = None
-    if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        request_info = getattr(request, "additional_information", None)
-        if isinstance(request_info, Mapping):
-            codes_info = request_info.get("codes")
-            meta_info = request_info.get("meta")
-            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
-            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
-            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
-            if raw_ref_audio is not None:
-                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+    if int(record["cache_epoch"]) == 0 and chunk_seq == 0 and not bool(record.get("ref_forwarded", False)):
+        ref_audio, ref_audio_sr = _request_reference_audio(request)
+        record["ref_forwarded"] = True
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -373,6 +525,7 @@ def tts2code2wav_async_chunk(
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
+            init_only=False,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
@@ -381,6 +534,9 @@ def tts2code2wav_async_chunk(
         record["last_terminal_turn"] = duplex_turn_key
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
+        record["first_codec_token_recorded"] = False
+        record["init_sent"] = False
+        record["ref_forwarded"] = False
         _drop_codec_state(transfer_manager, request_id)
     return payload
 
@@ -395,7 +551,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, left_context_frames, _ = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
@@ -683,6 +839,7 @@ def llm2tts(
 
     llm_outputs = source_outputs
     tts_inputs = []
+    tensor_handoff_enabled = _tensor_handoff_enabled()
 
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -930,15 +1087,44 @@ def llm2tts(
             )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+            ref_payload = (
+                ref_waveform.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                if tensor_handoff_enabled
+                else _to_transport_list(ref_waveform)
+            )
+            set_ref_audio(model_intermediate_buffer, ref_payload, ref_sr)
+        hidden_envelope = None
+        if tts_hidden_slice is None:
+            handoff_hidden = None
+        elif tensor_handoff_enabled:
+            # The orchestrator currently receives Thinker outputs on host.
+            # Preserve a contiguous tensor through EngineCore serialization,
+            # avoiding the much larger nested Python list representation.
+            handoff_hidden = tts_hidden_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            duplex_info = model_intermediate_buffer.get("duplex")
+            duplex_info = duplex_info if isinstance(duplex_info, Mapping) else {}
+            hidden_envelope = build_inline_tensor_envelope(
+                handoff_hidden,
+                request_id=str(llm_output.request_id),
+                payload_path="hidden_states.tts",
+                session_id=duplex_info.get("session_id") if isinstance(duplex_info.get("session_id"), str) else None,
+                epoch=duplex_info.get("epoch") if isinstance(duplex_info.get("epoch"), int) else None,
+                chunk_id=duplex_info.get("turn_id") if isinstance(duplex_info.get("turn_id"), int) else 0,
+            )
+        else:
+            handoff_hidden = _to_transport_list(tts_hidden_slice)
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
                 continue
-        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        set_tts_handoff(
+            model_intermediate_buffer,
+            handoff_ids,
+            handoff_hidden,
+            hidden_envelope=hidden_envelope,
+        )
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 

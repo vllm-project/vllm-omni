@@ -11,6 +11,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "duplex_epoch",
         "duplex_turn_id",
         "llm_output_text_utf8",
+        "init_only",
         "segment_end",
         "tts_is_last_chunk",
         "turn_end",
@@ -90,3 +91,28 @@ def is_non_final_delta_audio_chunk(payload: MultimodalPayload, mm_type: str | No
     if str(mm_type or "").lower() != "audio" and "audio" not in payload:
         return False
     return _last_scalar_int(_payload_meta_value(payload, "tts_is_last_chunk")) == 0
+
+
+def is_internal_init_only_audio_chunk(payload: MultimodalPayload, mm_type: str | None) -> bool:
+    """Return whether a Code2Wav setup-only result must stay server-internal."""
+    if str(mm_type or "").lower() != "audio" and "audio" not in payload:
+        return False
+    if _last_scalar_int(_payload_meta_value(payload, "init_only")) != 1:
+        return False
+    audio = payload.get("audio")
+    if audio is None:
+        return True
+    if isinstance(audio, torch.Tensor):
+        return audio.numel() == 0
+    if isinstance(audio, list | tuple):
+        for value in audio:
+            if isinstance(value, torch.Tensor):
+                if value.numel() > 0:
+                    return False
+            elif hasattr(value, "__len__"):
+                if len(value) > 0:
+                    return False
+            elif value is not None:
+                return False
+        return True
+    return False

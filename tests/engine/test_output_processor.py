@@ -531,6 +531,33 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
     )
 
 
+def _init_only_engine_output():
+    output = _audio_engine_output(is_segment_finished=False, is_last_chunk=False)
+    output.multimodal_output = {
+        "model_outputs": torch.empty(0, dtype=torch.float32),
+        "sr": torch.tensor(24000, dtype=torch.int32),
+        "meta.init_only": torch.tensor([1], dtype=torch.int32),
+        "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+    }
+    return output
+
+
+def test_mm_only_init_only_chunk_is_not_published_and_request_stays_active(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    init = processor.process_outputs([_init_only_engine_output()])
+
+    assert init.request_outputs == []
+    assert "r" in processor.request_states
+    assert "audio" not in processor.request_states["r"].mm_accumulated
+    assert "meta.init_only" not in processor.request_states["r"].mm_accumulated
+
+    audio = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=False)])
+
+    assert len(audio.request_outputs) == 1
+    assert audio.request_outputs[0].finished is False
+
+
 def test_mm_only_segment_finish_retains_request_state_for_next_audio_chunk(monkeypatch):
     processor = _make_mm_only_output_processor(monkeypatch)
 

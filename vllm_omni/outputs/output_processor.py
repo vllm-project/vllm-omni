@@ -21,6 +21,7 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
     drain_delta_payload,
+    is_internal_init_only_audio_chunk,
     is_non_final_delta_audio_chunk,
     replace_snapshot_keys,
 )
@@ -562,6 +563,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 and req_state.output_kind == RequestOutputKind.DELTA
                 and is_non_final_delta_audio_chunk(req_state.mm_accumulated, req_state.mm_type)
             )
+            suppress_internal_init = is_internal_init_only_audio_chunk(
+                req_state.mm_accumulated,
+                req_state.mm_type,
+            )
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 None,  # pooling_output
@@ -570,10 +575,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 kv_transfer_params,
                 routed_experts,
             ):
-                if req_state.queue is not None:
-                    req_state.queue.put(request_output)
-                else:
-                    request_outputs.append(request_output)
+                if not suppress_internal_init:
+                    if req_state.queue is not None:
+                        req_state.queue.put(request_output)
+                    else:
+                        request_outputs.append(request_output)
 
             is_segment_finished = bool(getattr(eco, "is_segment_finished", False))
             if finish_reason is not None and not is_segment_finished and not is_non_final_audio_chunk:

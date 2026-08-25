@@ -4,6 +4,10 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from vllm_omni.benchmarks.ultra_timeline import (
+    emit_ultra_timeline_event,
+    ultra_timeline_enabled,
+)
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
@@ -58,6 +62,20 @@ def try_send_via_connector(
 
         # Send data via connector
         success, serialized_size, metadata = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
+        if ultra_timeline_enabled():
+            emit_ultra_timeline_event(
+                "connector_put",
+                request_id=str(req_id),
+                stage=stage_id,
+                stream="connector",
+                num_bytes=int(serialized_size or 0),
+                details={
+                    "from_stage": stage_id,
+                    "to_stage": next_stage_id,
+                    "success": bool(success),
+                    "elapsed_ms": (time.time() - t0) * 1000.0,
+                },
+            )
 
         if success:
             # Send lightweight notification via queue
@@ -93,6 +111,15 @@ def try_send_via_connector(
             return False
 
     except Exception as e:
+        if ultra_timeline_enabled():
+            emit_ultra_timeline_event(
+                "connector_put",
+                request_id=str(req_id),
+                stage=stage_id,
+                stream="connector",
+                error=e,
+                details={"from_stage": stage_id, "to_stage": next_stage_id, "success": False},
+            )
         logger.warning(
             "[Orchestrator] OmniConnector failed for req %s: %s; falling back to queue",
             req_id,
@@ -148,14 +175,48 @@ def try_recv_via_connector(
                     ein = payload_data.get("engine_inputs")
                     decode_ms = (_t_end - _t_start) * 1000.0
 
+                    if ultra_timeline_enabled():
+                        emit_ultra_timeline_event(
+                            "connector_get",
+                            request_id=str(rid),
+                            stage=stage_id,
+                            stream="connector",
+                            num_bytes=int(serialized_size or 0),
+                            details={
+                                "from_stage": from_stage,
+                                "to_stage": to_stage,
+                                "success": True,
+                                "elapsed_ms": decode_ms,
+                            },
+                        )
+
                     rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}
                     return ein, rx_metrics
                 else:
+                    if ultra_timeline_enabled():
+                        emit_ultra_timeline_event(
+                            "connector_get",
+                            request_id=str(rid),
+                            stage=stage_id,
+                            stream="connector",
+                            num_bytes=int(serialized_size or 0),
+                            error="empty_payload",
+                            details={"from_stage": from_stage, "to_stage": to_stage, "success": False},
+                        )
                     logger.error(
                         "[Stage-%s] Failed to get data from connector for request %s or payload is empty", stage_id, rid
                     )
                     return None, None
             except Exception as e:
+                if ultra_timeline_enabled():
+                    emit_ultra_timeline_event(
+                        "connector_get",
+                        request_id=str(rid),
+                        stage=stage_id,
+                        stream="connector",
+                        error=e,
+                        details={"from_stage": from_stage, "to_stage": to_stage, "success": False},
+                    )
                 logger.error("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
                 return None, None
         else:

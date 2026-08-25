@@ -16,6 +16,7 @@ from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
+    serialize_model_intermediate_buffer,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
 
@@ -57,7 +58,7 @@ def upgrade_to_omni_request(
         if isinstance(raw_info, dict):
             wire_payload = dict(raw_info)
         if isinstance(raw_buffer, dict):
-            model_intermediate_buffer = raw_buffer
+            model_intermediate_buffer = serialize_model_intermediate_buffer(raw_buffer)
         additional_information = serialize_additional_information(
             wire_payload,
             log_prefix="AsyncOmniEngine",

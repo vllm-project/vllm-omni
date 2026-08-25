@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,3 +195,69 @@ def test_hift_patch_reports_incompatible_layout(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(TypeError, match=r"m_source\.l_sin_gen\._f02sine"):
         module.patch_step_audio2_hift_for_npu(SimpleNamespace())
+
+
+def test_sdpa_context_preserves_token2wav_body_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    fake_attention_patch = types.ModuleType("vllm_omni.platforms.npu.models.cosyvoice2_dit_attn")
+    fake_attention_patch.apply_cosyvoice2_dit_attn_npu_patch = lambda: None
+
+    @contextmanager
+    def fake_math_context(*, require_available=False):
+        del require_available
+        yield
+
+    fake_attention_patch.npu_math_sdpa_context = fake_math_context
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.cosyvoice2_dit_attn",
+        fake_attention_patch,
+    )
+
+    with pytest.raises(RuntimeError, match="original graph failure"):
+        with module.npu_token2wav_sdpa_context():
+            raise RuntimeError("original graph failure")
+
+
+def test_sdpa_context_requires_math_for_npu_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    required = []
+    fake_attention_patch = types.ModuleType("vllm_omni.platforms.npu.models.cosyvoice2_dit_attn")
+    fake_attention_patch.apply_cosyvoice2_dit_attn_npu_patch = lambda: None
+
+    @contextmanager
+    def fake_math_context(*, require_available=False):
+        required.append(require_available)
+        yield
+
+    fake_attention_patch.npu_math_sdpa_context = fake_math_context
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.cosyvoice2_dit_attn",
+        fake_attention_patch,
+    )
+
+    with module.npu_token2wav_sdpa_context(require_math=True):
+        pass
+
+    assert required == [True]
+
+
+def test_sdpa_context_does_not_hide_patch_setup_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    fake_attention_patch = types.ModuleType("vllm_omni.platforms.npu.models.cosyvoice2_dit_attn")
+
+    def fail_patch():
+        raise RuntimeError("attention patch failed")
+
+    fake_attention_patch.apply_cosyvoice2_dit_attn_npu_patch = fail_patch
+    fake_attention_patch.npu_math_sdpa_context = contextmanager(lambda: iter((None,)))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.cosyvoice2_dit_attn",
+        fake_attention_patch,
+    )
+
+    with pytest.raises(RuntimeError, match="attention patch failed"):
+        with module.npu_token2wav_sdpa_context():
+            pass

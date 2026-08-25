@@ -30,6 +30,10 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.benchmarks.ultra_timeline import (
+    emit_ultra_timeline_event,
+    ultra_timeline_enabled,
+)
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
@@ -141,6 +145,7 @@ class AsyncOmniEngine:
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
     _enable_orch_monitor: bool = False
+    _ultra_timeline_enabled: bool = False
 
     def __init__(
         self,
@@ -172,6 +177,10 @@ class AsyncOmniEngine:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        # Read the opt-in once at process startup. The formal default-off path
+        # does not perform an environment lookup or open a timeline sink per
+        # request.
+        self._ultra_timeline_enabled = ultra_timeline_enabled()
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -683,6 +692,22 @@ class AsyncOmniEngine:
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+            timeline_enabled = bool(getattr(self, "_ultra_timeline_enabled", False))
+            emit_stage0_timeline = timeline_enabled and stage_type == "llm"
+            if emit_stage0_timeline:
+                prompt_mapping = prompt if isinstance(prompt, dict) else None
+                emit_ultra_timeline_event(
+                    "stage0_preprocess_begin",
+                    request_id=request_id,
+                    stage=0,
+                    stream="host",
+                    details={
+                        "prompt_type": type(prompt).__name__,
+                        "has_multi_modal_data": bool(
+                            prompt_mapping is not None and prompt_mapping.get("multi_modal_data") is not None
+                        ),
+                    },
+                )
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 inject_global_id(prompt, request_id)
@@ -711,11 +736,33 @@ class AsyncOmniEngine:
                     data_parallel_rank=data_parallel_rank,
                     resumable=resumable,
                 )
-            except Exception:
+            except Exception as exc:
+                if emit_stage0_timeline:
+                    emit_ultra_timeline_event(
+                        "stage0_preprocess_error",
+                        request_id=request_id,
+                        stage=0,
+                        stream="host",
+                        error=exc,
+                    )
                 if preselected_stage0_replica is not None and self.stage_pools:
                     self.stage_pools[0].release_binding(request_id)
                 raise
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
+            if emit_stage0_timeline:
+                prompt_token_ids = getattr(request, "prompt_token_ids", None)
+                mm_features = getattr(request, "mm_features", None)
+                emit_ultra_timeline_event(
+                    "stage0_preprocess_end",
+                    request_id=request_id,
+                    stage=0,
+                    stream="host",
+                    details={
+                        "preprocess_ms": _preprocess_ms,
+                        "prompt_tokens": len(prompt_token_ids) if prompt_token_ids is not None else 0,
+                        "has_mm_features": mm_features is not None,
+                    },
+                )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = upgrade_to_omni_request(request, prompt)
@@ -740,6 +787,19 @@ class AsyncOmniEngine:
                 output_prompt_text = original_prompt.get("prompt")
             prompt = request
 
+        enqueue_ts = time.perf_counter()
+        if bool(getattr(self, "_ultra_timeline_enabled", False)) and stage_type == "llm":
+            emit_ultra_timeline_event(
+                "stage0_queue_enter",
+                request_id=request_id,
+                stage=0,
+                stream="host",
+                details={
+                    "message_type": message_type,
+                    "preprocess_ms": _preprocess_ms,
+                },
+            )
+
         return StageSubmissionMessage(
             type=message_type,
             request_id=request_id,
@@ -751,7 +811,7 @@ class AsyncOmniEngine:
             final_output_stage_ids=list(final_output_stage_ids) if final_output_stage_ids is not None else None,
             preprocess_ms=_preprocess_ms,
             request_timestamp=request_timestamp,
-            enqueue_ts=time.perf_counter(),
+            enqueue_ts=enqueue_ts,
         )
 
     def _enqueue_cfg_companions(

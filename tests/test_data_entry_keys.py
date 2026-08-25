@@ -118,7 +118,7 @@ class TestValidatePayload:
     def test_valid_payload_passes(self):
         from vllm_omni.data_entry_keys import validate_payload
 
-        validate_payload({"meta": {"left_context_size": 5}})
+        validate_payload({"meta": {"left_context_size": 5, "init_only": True}})
 
     def test_context_in_error_message(self):
         from vllm_omni.data_entry_keys import validate_payload
@@ -333,7 +333,11 @@ class TestSerializeDeserializePayload:
 
     def test_finished_tensor_round_trip(self):
         original: OmniPayload = {
-            "meta": {"finished": torch.tensor(True, dtype=torch.bool), "left_context_size": 5},
+            "meta": {
+                "finished": torch.tensor(True, dtype=torch.bool),
+                "left_context_size": 5,
+                "init_only": True,
+            },
         }
         wire = serialize_payload(original)
         restored = deserialize_payload(wire)
@@ -341,6 +345,7 @@ class TestSerializeDeserializePayload:
         assert restored["meta"]["finished"].dtype == torch.bool
         assert restored["meta"]["finished"].item() is True
         assert restored["meta"]["left_context_size"] == 5
+        assert restored["meta"]["init_only"] is True
 
     def test_mixed_types_round_trip(self):
         original: OmniPayload = {

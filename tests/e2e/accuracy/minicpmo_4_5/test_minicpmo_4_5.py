@@ -42,7 +42,8 @@ _RESULT_DIR = Path(
 _MIN_DAILY_OMNI_ACCURACY = 0.78
 # MiniCPM-o 4.5 reports 70.4 on Video-MME (w/o subs); ~2pp margin like Daily-Omni.
 _MIN_VIDEOMME_ACCURACY = float(os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY", "0.68"))
-_MAX_SEED_TTS_MEAN_WER = 0.02
+_MAX_SEED_TTS_MEAN_WER = 0.0156
+_MIN_SEED_TTS_MEAN_SIM = 0.689
 # Full Seed-TTS zh split (seed-tts-eval/zh/meta.lst) is 2020 rows.
 _SEED_TTS_LOCALE = "zh"
 _SEED_TTS_NUM_PROMPTS = 2020
@@ -282,6 +283,8 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
             "--seed-tts-locale",
             _SEED_TTS_LOCALE,
             "--seed-extra-body-json",
@@ -314,6 +317,8 @@ def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
             "--seed-tts-locale",
             _SEED_TTS_LOCALE,
             "--seed-extra-body-json",

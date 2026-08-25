@@ -30,6 +30,7 @@ from vllm.v1.engine.utils import (
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.serialization import deserialize_model_intermediate_buffer
 from vllm_omni.engine.stage_init_utils import set_death_signal
 
 logger = init_logger(__name__)
@@ -55,6 +56,9 @@ class StageEngineCoreProc(EngineCoreProc):
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
+        scheduler_request.model_intermediate_buffer = deserialize_model_intermediate_buffer(
+            request.model_intermediate_buffer
+        )
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         return scheduler_request, current_wave
 

@@ -49,7 +49,8 @@ def test_extract_first_audio_ref_accepts_dict_stereo_audio() -> None:
     assert torch.allclose(waveform, torch.tensor([1.5, 3.5, 5.5]))
 
 
-def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
+def test_plain_chat_handoff_owns_talker_prompt_contract(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF", raising=False)
     prompt_ids = [101, 102]
     output_ids = [11, 12]
     latent = torch.arange(16, dtype=torch.float32).reshape(4, 4)
@@ -61,13 +62,23 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == output_ids
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[2:4])
+    assert isinstance(info["hidden_states"]["tts"], torch.Tensor)
+    assert torch.equal(info["hidden_states"]["tts"], latent[2:4])
+    envelope = info["meta"]["tensor_envelopes"]["hidden_states.tts"]
+    assert envelope["version"] == 1
+    assert envelope["request_id"] == "req-1"
+    assert envelope["shape"] == [2, 4]
+    assert envelope["handle"] == {
+        "kind": "inline_tensor",
+        "payload_path": "hidden_states.tts",
+    }
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 4
 
 
-def test_llm2tts_carries_request_ref_audio() -> None:
+def test_llm2tts_carries_request_ref_audio(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF", raising=False)
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(
         prompt_ids=[101, 9001],
@@ -88,9 +99,41 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     )[0]
 
     info = converted["model_intermediate_buffer"]
-    assert info["codes"]["ref"] == ref_waveform.tolist()
+    torch.testing.assert_close(info["codes"]["ref"], ref_waveform)
     assert info["meta"]["ref_audio_sr"] == 22050
     assert info["ids"]["tts"] == [11, 12]
+
+
+def test_llm2tts_legacy_list_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF", "0")
+    latent = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    ref_waveform = torch.tensor([0.1, 0.2, 0.3])
+
+    converted = llm2tts(
+        [_output(prompt_ids=[101, 102], output_ids=[11, 12], latent=latent)],
+        prompt=[{"multi_modal_data": {"audio": (ref_waveform, 22050)}}],
+    )[0]
+    info = converted["model_intermediate_buffer"]
+
+    assert info["hidden_states"]["tts"] == latent[2:4].tolist()
+    assert info["codes"]["ref"] == ref_waveform.tolist()
+    assert "tensor_envelopes" not in info["meta"]
+
+
+def test_llm2tts_rejects_invalid_tensor_handoff_switch(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF", "sometimes")
+
+    with pytest.raises(ValueError, match="VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF"):
+        llm2tts(
+            [
+                _output(
+                    prompt_ids=[101, 102],
+                    output_ids=[11, 12],
+                    latent=torch.arange(16, dtype=torch.float32).reshape(4, 4),
+                )
+            ],
+            prompt=[{}],
+        )
 
 
 def test_native_duplex_speak_segment_reaches_split_talker() -> None:

@@ -68,6 +68,10 @@ from vllm_omni.benchmarks.data_modules.videomme_dataset import (
     videomme_local_subtitle_dir,
     videomme_local_video_dir,
 )
+from vllm_omni.benchmarks.ultra_timeline import (
+    create_ultra_timeline_recorder,
+    ultra_timeline_enabled,
+)
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
     summarize_session_request_metrics,
@@ -99,6 +103,8 @@ def should_request_stage_metrics(args: Any) -> bool:
         return True
 
     backend = getattr(args, "backend", None)
+    if ultra_timeline_enabled() and backend in {"openai-chat-omni", "daily-omni"}:
+        return True
     if backend in _IMAGE_STAGE_METRICS_BACKENDS:
         return True
 
@@ -829,6 +835,20 @@ def _update_output_stage_metrics_from_payload(
         output.stage_metrics.update(stage_snapshot)
 
 
+def _timeline_stage_metrics_summary(metrics: dict[str, object]) -> dict[str, object]:
+    """Return payload-free metadata for an opt-in stage-metrics timeline event."""
+    summary: dict[str, object] = {"metric_keys": sorted(str(key) for key in metrics)[:32]}
+    if isinstance(stage_id := metrics.get("stage_id"), int):
+        summary["stage_id"] = stage_id
+    if isinstance(final_output_type := metrics.get("final_output_type"), str):
+        summary["final_output_type"] = final_output_type
+    if isinstance(stage_snapshot := metrics.get("stage_metrics"), dict):
+        summary["stage_ids"] = sorted(str(stage) for stage in stage_snapshot)[:32]
+    if isinstance(pipeline_timings := metrics.get("pipeline_timings"), dict):
+        summary["pipeline_timing_keys"] = sorted(str(key) for key in pipeline_timings)[:32]
+    return summary
+
+
 def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
@@ -952,6 +972,31 @@ async def async_request_openai_chat_omni_completions(
     }
     _update_headers_common(headers, request_func_input)
 
+    timeline_request_id = getattr(request_func_input, "request_id", None)
+    if timeline_request_id is not None:
+        timeline_request_id = str(timeline_request_id) or None
+    if ultra_timeline_enabled() and timeline_request_id is None:
+        timeline_request_id = f"benchmark-{uuid.uuid4().hex}"
+    timeline_turn_id = getattr(request_func_input, "turn_id", None)
+    request_extra_body = getattr(request_func_input, "extra_body", None)
+    if timeline_turn_id is None and isinstance(request_extra_body, dict):
+        timeline_turn_id = request_extra_body.get("turn_id")
+    timeline = create_ultra_timeline_recorder(
+        request_id=timeline_request_id,
+        turn_id=timeline_turn_id,
+    )
+    timeline_enabled = timeline.enabled
+    if timeline_enabled:
+        # This is an explicitly opt-in diagnostic response field.  It does not
+        # participate in the official benchmark aggregation.
+        payload[RETURN_STAGE_METRICS_FIELD] = True
+        timeline.emit(
+            "request_start",
+            stage="client",
+            stream="http",
+            details={"api_path": urlsplit(api_url).path},
+        )
+
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     max_retries = 3
@@ -959,6 +1004,10 @@ async def async_request_openai_chat_omni_completions(
     for attempt in range(max_retries + 1):
         # Reset per-attempt state so that retries do not mix partial
         # outputs or metrics from previous attempts.
+        first_text_token_recorded = False
+        first_audio_sse_recorded = False
+        first_decodable_pcm_recorded = False
+        non_wav_pcm_deferred_recorded = False
         generated_text = ""
         # For wav responses, accumulate decoded PCM bytes per chunk
         # to avoid repeated decode/concat.
@@ -966,6 +1015,9 @@ async def async_request_openai_chat_omni_completions(
         wav_audio_params: tuple[int, int, int] | None = None
         wav_inconsistent_chunk_count = 0
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
+        last_audio_chunk_id: int | None = None
+        last_audio_num_bytes: int | None = None
+        last_audio_was_decodable_pcm = False
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
         st = time.perf_counter()
@@ -993,6 +1045,13 @@ async def async_request_openai_chat_omni_completions(
         output.denoise_step_latency_ms = 0.0
         completion_tokens_seen = 0
         try:
+            if timeline_enabled:
+                timeline.emit(
+                    "request_sent",
+                    stage="client",
+                    stream="http",
+                    details={"attempt": attempt},
+                )
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     handler = StreamedResponseHandler()
@@ -1005,10 +1064,32 @@ async def async_request_openai_chat_omni_completions(
                         if not chunk_bytes:
                             continue
 
+                        fragment_chunk_id: int | None = None
+                        if timeline_enabled:
+                            fragment_chunk_id = timeline.next_chunk_id()
+                            timeline.emit(
+                                "sse_fragment_received",
+                                stage="client",
+                                chunk_id=fragment_chunk_id,
+                                stream="sse",
+                                payload=chunk_bytes,
+                                raw_kind="sse_fragment",
+                            )
                         messages = handler.add_chunk(chunk_bytes)
                         for message in messages:
                             if type(message) is bytes:
                                 message = message.decode("utf-8")
+                            message_chunk_id: int | None = None
+                            if timeline_enabled:
+                                message_chunk_id = timeline.next_chunk_id()
+                                timeline.emit(
+                                    "sse_message_received",
+                                    stage="client",
+                                    chunk_id=message_chunk_id,
+                                    stream="sse",
+                                    payload=message,
+                                    raw_kind="sse_message",
+                                )
                             # NOTE: SSE comments (often used as pings) start with
                             # a colon. These are not JSON data payload and should
                             # be skipped.
@@ -1020,6 +1101,18 @@ async def async_request_openai_chat_omni_completions(
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
                                 _update_output_stage_metrics_from_payload(output, data)
+                                if timeline_enabled and isinstance(stage_metrics := data.get("metrics"), dict):
+                                    stage_id = stage_metrics.get("stage_id")
+                                    timeline.emit(
+                                        "stage_metrics_observed",
+                                        stage=f"stage-{stage_id}" if isinstance(stage_id, int) else "server",
+                                        chunk_id=message_chunk_id,
+                                        stream="sse",
+                                        shape=[len(stage_metrics.get("stage_metrics", {}))]
+                                        if isinstance(stage_metrics.get("stage_metrics"), dict)
+                                        else None,
+                                        details=_timeline_stage_metrics_summary(stage_metrics),
+                                    )
                                 usage = data.get("usage")
                                 completion_tokens = None
                                 if isinstance(usage, dict):
@@ -1056,14 +1149,53 @@ async def async_request_openai_chat_omni_completions(
                                                 token_delta=token_delta,
                                                 most_recent_timestamp=most_recent_timestamp,
                                             )
+                                            if timeline_enabled and not first_text_token_recorded:
+                                                first_text_token_recorded = True
+                                                timeline.emit(
+                                                    "first_text_token",
+                                                    stage="stage-0",
+                                                    chunk_id=message_chunk_id,
+                                                    stream="sse",
+                                                    details={
+                                                        "attempt": attempt,
+                                                        "token_delta": token_delta,
+                                                    },
+                                                )
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
                                         audio_generate_time = timestamp - st
+                                        if timeline_enabled and not first_audio_sse_recorded:
+                                            first_audio_sse_recorded = True
+                                            timeline.emit(
+                                                "first_audio_sse",
+                                                stage="stage-2",
+                                                chunk_id=message_chunk_id,
+                                                stream="sse",
+                                                payload=content or "",
+                                                raw_kind="audio_sse",
+                                                details={"attempt": attempt},
+                                            )
                                         if content:
-                                            audio_bytes = base64.b64decode(content)
+                                            try:
+                                                audio_bytes = base64.b64decode(content)
+                                            except (TypeError, ValueError) as ex:
+                                                if timeline_enabled:
+                                                    timeline.emit(
+                                                        "audio_decode_error",
+                                                        stage="stage-2",
+                                                        chunk_id=message_chunk_id,
+                                                        stream="audio",
+                                                        payload=content,
+                                                        raw_kind="audio_base64",
+                                                        error=ex,
+                                                    )
+                                                raise
+                                            last_audio_chunk_id = message_chunk_id
+                                            last_audio_num_bytes = len(audio_bytes)
+                                            last_audio_was_decodable_pcm = False
                                             if response_format == "wav":
                                                 try:
                                                     with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
@@ -1078,13 +1210,70 @@ async def async_request_openai_chat_omni_completions(
                                                             wav_inconsistent_chunk_count += 1
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
+                                                            if timeline_enabled:
+                                                                timeline.emit(
+                                                                    "audio_decode_deferred",
+                                                                    stage="stage-2",
+                                                                    chunk_id=message_chunk_id,
+                                                                    stream="audio",
+                                                                    num_bytes=len(audio_bytes),
+                                                                    error="inconsistent_wav_params",
+                                                                )
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        pcm_bytes = wav_reader.readframes(wav_reader.getnframes())
+                                                        if not pcm_bytes:
+                                                            if timeline_enabled:
+                                                                timeline.emit(
+                                                                    "audio_decode_deferred",
+                                                                    stage="stage-2",
+                                                                    chunk_id=message_chunk_id,
+                                                                    stream="audio",
+                                                                    shape=[params[0], 0],
+                                                                    num_bytes=0,
+                                                                    error="empty_pcm",
+                                                                )
+                                                        else:
+                                                            wav_pcm_buffer.extend(pcm_bytes)
+                                                            last_audio_was_decodable_pcm = True
+                                                            if timeline_enabled and not first_decodable_pcm_recorded:
+                                                                first_decodable_pcm_recorded = True
+                                                                timeline.emit(
+                                                                    "first_nonempty_decodable_pcm",
+                                                                    stage="stage-2",
+                                                                    chunk_id=message_chunk_id,
+                                                                    stream="audio",
+                                                                    shape=[
+                                                                        params[0],
+                                                                        wav_reader.getnframes(),
+                                                                        params[1],
+                                                                        params[2],
+                                                                    ],
+                                                                    payload=pcm_bytes,
+                                                                    raw_kind="pcm",
+                                                                    details={"attempt": attempt},
+                                                                )
                                                 except Exception as ex:
+                                                    if timeline_enabled:
+                                                        timeline.emit(
+                                                            "audio_decode_error",
+                                                            stage="stage-2",
+                                                            chunk_id=message_chunk_id,
+                                                            stream="audio",
+                                                            num_bytes=len(audio_bytes),
+                                                            error=ex,
+                                                        )
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
+                                                if timeline_enabled and not non_wav_pcm_deferred_recorded:
+                                                    non_wav_pcm_deferred_recorded = True
+                                                    timeline.emit(
+                                                        "first_nonempty_decodable_pcm_deferred",
+                                                        stage="stage-2",
+                                                        chunk_id=message_chunk_id,
+                                                        stream="audio",
+                                                        num_bytes=len(audio_bytes),
+                                                        error=f"response_format={response_format}",
+                                                    )
                                                 audio_bytes_buffer.extend(audio_bytes)
                                     elif modality == "image":
                                         output.image_count += 1
@@ -1193,6 +1382,15 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
+                    if timeline_enabled and last_audio_chunk_id is not None:
+                        timeline.emit(
+                            "last_audio",
+                            stage="stage-2",
+                            chunk_id=last_audio_chunk_id,
+                            stream="audio",
+                            num_bytes=last_audio_num_bytes,
+                            details={"decodable_pcm": last_audio_was_decodable_pcm},
+                        )
                     output.success = True
                 else:
                     await _record_http_error(output, response, "openai-chat-omni")
@@ -1221,6 +1419,27 @@ async def async_request_openai_chat_omni_completions(
             output.error = traceback.format_exc()
             logger.error(f"ERROR: send request failed, reason is: {output.error}")
             break
+
+    if timeline_enabled:
+        if output.success:
+            timeline.emit(
+                "request_finished",
+                stage="client",
+                stream="http",
+                details={"attempt": attempt},
+            )
+        else:
+            timeline.emit(
+                "request_error",
+                stage="client",
+                stream="http",
+                error="request_failed",
+                details={
+                    "attempt": attempt,
+                    "error_present": bool(output.error),
+                },
+            )
+        timeline.close()
 
     if pbar:
         pbar.update(1)
@@ -1555,8 +1774,10 @@ async def async_request_openai_realtime_duplex(
                 )
                 await client.send({"type": "response.create"})
                 await wait_for(
-                    lambda: client.events.count("response.done") > done_before
-                    or len(client.events.errors()) > errors_before,
+                    lambda: (
+                        client.events.count("response.done") > done_before
+                        or len(client.events.errors()) > errors_before
+                    ),
                     timeout_s=180.0,
                     label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
                 )

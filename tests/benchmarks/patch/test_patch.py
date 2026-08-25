@@ -7,18 +7,24 @@ Unit tests for patch.py
 
 import asyncio
 import base64
+import io
 import json
 import time
+import wave
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _attach_seed_tts_to_request_func_input,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
+    should_request_stage_metrics,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
@@ -46,6 +52,49 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+class RetryableFailureResponse(MockResponse):
+    """Response that exposes partial SSE data before a retryable transport error."""
+
+    async def iter_any(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise aiohttp.ClientConnectionError("test retry")
+
+
+def test_seed_tts_chat_request_keeps_stage0_text_only() -> None:
+    sample = SeedTTSSampleRequest(
+        prompt="请朗读这句话",
+        prompt_len=6,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="seed-tts-cn-0",
+        seed_tts_speech_extra={
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "参考文本",
+        },
+        seed_tts_system_prompt="请忠实朗读用户文本。",
+    )
+    request_input = SimpleNamespace(extra_body=None, multi_modal_data=None)
+
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+
+    assert request_input.omni_chat_messages == [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "请忠实朗读用户文本。"}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "请朗读这句话"}],
+        },
+    ]
+    assert request_input.multi_modal_data is None
+    assert request_input.extra_body == {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+        "ref_text": "参考文本",
+    }
 
 
 @pytest.mark.asyncio
@@ -201,6 +250,17 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
 def create_sse_chunk(data_dict):
     """Helper to create SSE formatted chunk"""
     return f"data: {json.dumps(data_dict)}\n\n".encode()
+
+
+def create_wav_base64(pcm_bytes: bytes) -> str:
+    """Return a complete mono 24 kHz WAV chunk as a base64 SSE payload."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(24_000)
+        writer.writeframes(pcm_bytes)
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 # ============================================================================
@@ -947,6 +1007,195 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+def test_ultra_timeline_requests_stage_metrics_only_when_enabled(monkeypatch):
+    args = SimpleNamespace(backend="openai-chat-omni", print_stage=False, extra_body={})
+    monkeypatch.delenv("VLLM_OMNI_ULTRA_TIMELINE", raising=False)
+    assert should_request_stage_metrics(args) is False
+
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE", "1")
+    assert should_request_stage_metrics(args) is True
+
+
+@pytest.mark.asyncio
+async def test_ultra_timeline_is_default_off_and_preserves_chat_payload(mocker: MockerFixture, monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_OMNI_ULTRA_TIMELINE", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE_DIR", str(tmp_path / "timeline"))
+    stage_summary = mocker.patch("vllm_omni.benchmarks.patch.patch._timeline_stage_metrics_summary")
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="private prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+        extra_body={"modalities": ["text"]},
+        request_id="default-off",
+    )
+    mock_response = MockResponse(
+        200,
+        [
+            create_sse_chunk(
+                {
+                    "choices": [{"delta": {"content": "Hello"}}],
+                    "modality": "text",
+                    "metrics": {"stage_id": 0, "stage_metrics": {"0": {}}},
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    payload = mock_session.post.call_args.kwargs["json"]
+    assert payload["modalities"] == ["text"]
+    assert "return_stage_metrics" not in payload
+    stage_summary.assert_not_called()
+    assert not (tmp_path / "timeline").exists()
+
+
+@pytest.mark.asyncio
+async def test_ultra_timeline_records_valid_pcm_without_changing_legacy_audio_ttfp(
+    mocker: MockerFixture,
+    monkeypatch,
+    tmp_path,
+):
+    timeline_dir = tmp_path / "timeline"
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE", "1")
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE_DIR", str(timeline_dir))
+    monkeypatch.delenv("VLLM_OMNI_ULTRA_TIMELINE_CAPTURE_RAW", raising=False)
+    clock = iter(range(1, 100))
+    monkeypatch.setattr("vllm_omni.benchmarks.patch.patch.time.perf_counter", lambda: float(next(clock)))
+
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="private prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+        request_id="timeline-request",
+    )
+    pcm_bytes = b"\x01\x00" * 12
+    bad_wav = base64.b64encode(b"not-a-wav").decode()
+    good_wav = create_wav_base64(pcm_bytes)
+    text_payload = json.dumps(
+        {
+            "choices": [{"delta": {"content": "private text"}, "token_ids": [1]}],
+            "modality": "text",
+            "metrics": {"stage_id": 0, "stage_metrics": {"0": {"queue_wait_ms": 1.0}}},
+        }
+    ).encode()
+    mock_response = MockResponse(
+        200,
+        [
+            b"data: ",
+            text_payload + b"\n\n",
+            create_sse_chunk({"choices": [{"delta": {"content": ""}}], "modality": "audio"}),
+            create_sse_chunk({"choices": [{"delta": {"content": bad_wav}}], "modality": "audio"}),
+            create_sse_chunk({"choices": [{"delta": {"content": good_wav}}], "modality": "audio"}),
+            create_sse_chunk({"choices": [{"delta": {"content": ""}}], "modality": "audio"}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    # This remains the historical metric: it is set by the earlier empty audio
+    # SSE event, not delayed until the valid WAV packet.
+    assert output.audio_ttfp == 2.0
+    assert mock_session.post.call_args.kwargs["json"]["return_stage_metrics"] is True
+
+    event_path = next(timeline_dir.glob("events.*.jsonl"))
+    event_text = event_path.read_text(encoding="utf-8")
+    events = [json.loads(line) for line in event_text.splitlines()]
+    event_names = [event["event"] for event in events]
+    assert {
+        "request_start",
+        "request_sent",
+        "sse_fragment_received",
+        "sse_message_received",
+        "stage_metrics_observed",
+        "first_text_token",
+        "first_audio_sse",
+        "audio_decode_error",
+        "first_nonempty_decodable_pcm",
+        "last_audio",
+        "request_finished",
+    } <= set(event_names)
+    assert event_names.count("first_nonempty_decodable_pcm") == 1
+    assert event_names.index("first_audio_sse") < event_names.index("first_nonempty_decodable_pcm")
+    assert next(event for event in events if event["event"] == "first_audio_sse")["bytes"] == 0
+    assert next(event for event in events if event["event"] == "first_nonempty_decodable_pcm")["bytes"] == len(
+        pcm_bytes
+    )
+    last_audio = next(event for event in events if event["event"] == "last_audio")
+    assert last_audio["bytes"] == len(pcm_bytes)
+    assert last_audio["details"]["decodable_pcm"] is True
+    assert "private prompt" not in event_text
+    assert "private text" not in event_text
+    assert good_wav not in event_text
+    assert not (timeline_dir / "raw").exists()
+
+
+@pytest.mark.asyncio
+async def test_ultra_timeline_records_first_events_for_successful_retry(
+    mocker: MockerFixture,
+    monkeypatch,
+    tmp_path,
+):
+    timeline_dir = tmp_path / "timeline"
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE", "1")
+    monkeypatch.setenv("VLLM_OMNI_ULTRA_TIMELINE_DIR", str(timeline_dir))
+    mocker.patch("vllm_omni.benchmarks.patch.patch.asyncio.sleep", new=mocker.AsyncMock())
+
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="retry prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+        request_id="retry-request",
+    )
+    wav_chunk = create_wav_base64(b"\x01\x00" * 8)
+    partial_chunks = [
+        create_sse_chunk({"choices": [{"delta": {"content": "partial"}, "token_ids": [1]}], "modality": "text"}),
+        create_sse_chunk({"choices": [{"delta": {"content": wav_chunk}}], "modality": "audio"}),
+    ]
+    complete_chunks = [
+        create_sse_chunk({"choices": [{"delta": {"content": "retry"}, "token_ids": [2]}], "modality": "text"}),
+        create_sse_chunk({"choices": [{"delta": {"content": wav_chunk}}], "modality": "audio"}),
+        b"data: [DONE]\n\n",
+    ]
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(
+        side_effect=[
+            RetryableFailureResponse(200, partial_chunks),
+            MockResponse(200, complete_chunks),
+        ]
+    )
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.generated_text == "retry"
+    assert mock_session.post.call_count == 2
+    events = [
+        json.loads(line) for line in next(timeline_dir.glob("events.*.jsonl")).read_text(encoding="utf-8").splitlines()
+    ]
+    for event_name in ("first_text_token", "first_audio_sse", "first_nonempty_decodable_pcm"):
+        assert [event["details"]["attempt"] for event in events if event["event"] == event_name] == [0, 1]
+    assert [event for event in events if event["event"] == "last_audio"][0]["details"]["decodable_pcm"] is True
+    assert next(event for event in events if event["event"] == "request_finished")["details"]["attempt"] == 1
 
 
 if __name__ == "__main__":

@@ -131,6 +131,38 @@ def test_recv_success(mock_objects):
     mock_connector.get.assert_called_once_with("0", "1", "req_recv", metadata={"handle": "xyz"})
 
 
+def test_connector_adapter_emits_put_and_get_timeline_events(mock_objects, mocker: MockerFixture):
+    emit = mocker.patch("vllm_omni.distributed.omni_connectors.adapter.emit_ultra_timeline_event")
+    mocker.patch("vllm_omni.distributed.omni_connectors.adapter.ultra_timeline_enabled", return_value=True)
+    connector = mock_objects["connector"]
+    connector.put.return_value = (True, 100, {"handle": "xyz"})
+    connector.get.return_value = ({"engine_inputs": {"ids": [1]}}, 50)
+
+    assert try_send_via_connector(
+        connector=connector,
+        stage_id=0,
+        next_stage_id=1,
+        req_id="req-events",
+        next_inputs={"ids": [1]},
+        sampling_params={},
+        original_prompt="",
+        next_stage_queue_submit_fn=mock_objects["queue_fn"],
+        metrics=mock_objects["metrics"],
+    )
+    task = {
+        "request_id": "req-events",
+        "from_connector": True,
+        "from_stage": "0",
+        "connector_metadata": {"handle": "xyz"},
+    }
+    inputs, _ = try_recv_via_connector(task, {("0", "1"): connector}, stage_id=1)
+
+    assert inputs == {"ids": [1]}
+    assert [call.args[0] for call in emit.call_args_list] == ["connector_put", "connector_get"]
+    assert emit.call_args_list[0].kwargs["num_bytes"] == 100
+    assert emit.call_args_list[1].kwargs["num_bytes"] == 50
+
+
 def test_recv_no_connector():
     """Test recv fails when no connector exists for edge."""
     task = {"request_id": "req_missing", "from_connector": True, "from_stage": "0"}

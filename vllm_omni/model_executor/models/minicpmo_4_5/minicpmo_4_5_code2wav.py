@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -19,6 +20,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.benchmarks.ultra_timeline import (
+    emit_ultra_timeline_event,
+    ultra_timeline_enabled,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -28,6 +33,12 @@ from .batched_token2wav import (
 )
 
 logger = init_logger(__name__)
+
+_ALLOWED_TOKEN2WAV_N_TIMESTEPS = frozenset({6, 8, 10})
+_TRUE_CONFIG_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_CONFIG_VALUES = frozenset({"0", "false", "no", "off"})
+_CFM_STEPS_ENV = "VLLM_OMNI_MINICPMO45_CFM_STEPS"
+_FLOW_FP16_ENV = "VLLM_OMNI_MINICPMO45_FLOW_FP16"
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -41,6 +52,56 @@ def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return _scalar(value[0], default) if value else default
     return default if value is None else value
+
+
+def _parse_token2wav_n_timesteps(value: Any) -> int:
+    """Accept only the bounded CFM quality grid; reject implicit coercion."""
+    if type(value) is not int or value not in _ALLOWED_TOKEN2WAV_N_TIMESTEPS:
+        allowed = ", ".join(str(step) for step in sorted(_ALLOWED_TOKEN2WAV_N_TIMESTEPS))
+        raise ValueError(f"MiniCPM-o token2wav_n_timesteps must be an integer in {{{allowed}}}; got {value!r}")
+    return value
+
+
+def _parse_token2wav_float16(value: Any) -> bool:
+    """Parse the precision toggle without Python truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_CONFIG_VALUES:
+            return True
+        if normalized in _FALSE_CONFIG_VALUES:
+            return False
+    raise ValueError(
+        "MiniCPM-o token2wav_float16 must be a boolean, 0/1, or one of "
+        f"true/false, yes/no, on/off; got {value!r}"
+    )
+
+
+def _resolve_token2wav_n_timesteps(extra: Mapping[str, Any]) -> tuple[int, str]:
+    if "token2wav_n_timesteps" in extra:
+        return _parse_token2wav_n_timesteps(extra["token2wav_n_timesteps"]), "config"
+    raw = os.environ.get(_CFM_STEPS_ENV)
+    if raw is None:
+        return 10, "default"
+    normalized = raw.strip()
+    if normalized not in {"6", "8", "10"}:
+        raise ValueError(f"MiniCPM-o {_CFM_STEPS_ENV} must be one of 6, 8, 10; got {raw!r}")
+    return _parse_token2wav_n_timesteps(int(normalized)), "environment"
+
+
+def _resolve_token2wav_float16(extra: Mapping[str, Any]) -> tuple[bool, str]:
+    if "token2wav_float16" in extra:
+        return _parse_token2wav_float16(extra["token2wav_float16"]), "config"
+    raw = os.environ.get(_FLOW_FP16_ENV)
+    if raw is None:
+        return False, "default"
+    try:
+        return _parse_token2wav_float16(raw), "environment"
+    except ValueError as exc:
+        raise ValueError(f"MiniCPM-o {_FLOW_FP16_ENV} is invalid: {raw!r}") from exc
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -103,6 +164,7 @@ class _WorkItem:
     tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
+    init_only: bool
     has_payload: bool = True
 
 
@@ -129,12 +191,16 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
+        self._ultra_timeline_enabled = ultra_timeline_enabled()
+        self._timeline_pcm_seen: set[tuple[str, int]] = set()
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._token2wav_n_timesteps, self._token2wav_n_timesteps_source = _resolve_token2wav_n_timesteps(extra)
+        self._token2wav_float16, self._token2wav_float16_source = _resolve_token2wav_float16(extra)
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -183,6 +249,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _backend_timeline_context(self, request_ids: list[str]):
+        if self.backend is None or not self._ultra_timeline_enabled:
+            return nullcontext()
+        factory = getattr(self.backend, "timeline_context", None)
+        return factory(request_ids) if callable(factory) else nullcontext()
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -316,7 +388,17 @@ class MiniCPMO45Code2Wav(nn.Module):
                 counts=normalized,
                 total=int(flat.numel()),
             )
+        if len(normalized) == 1:
+            return [flat]
         return list(torch.split(flat, normalized))
+
+    @staticmethod
+    def _batch_codec_tokens(items: list[_WorkItem]) -> torch.Tensor:
+        if len(items) == 1:
+            # The decoder reads codec tokens without modifying them. Keep the
+            # singleton payload as a view instead of launching torch.stack.
+            return items[0].tokens.unsqueeze(0)
+        return torch.stack([item.tokens for item in items], dim=0)
 
     def _parse_item(
         self,
@@ -355,6 +437,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 tts_is_last_chunk=False,
                 segment_end=False,
                 turn_end=False,
+                init_only=False,
                 has_payload=False,
             )
         if not request_id:
@@ -370,6 +453,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
+        init_only = bool(_scalar(meta.get("init_only"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
@@ -379,6 +463,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             # explicit length is the authority, so do not decode that
             # placeholder as codec data.
             tokens = segment.new_empty(0, dtype=torch.long)
+        if init_only and (last_chunk or tokens.numel() != 0):
+            raise _batch_error(
+                "invalid_init_only_payload",
+                request_id=request_id,
+                last_chunk=last_chunk,
+                code_numel=int(tokens.numel()),
+            )
         previous = self._states.get(state_id)
         if previous is None:
             if chunk_seq != 0:
@@ -410,6 +501,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 request_id=request_id,
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
+            )
+        if init_only and previous is not None:
+            raise _batch_error(
+                "duplicate_init_only",
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                chunk_seq=chunk_seq,
             )
         prompt_cache_id, prompt_wav, runtime_prompt_key = self._resolve_prompt(
             state_id,
@@ -452,6 +550,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            init_only=init_only,
         )
 
     @staticmethod
@@ -551,15 +650,22 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
-        sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
+        init_items = [item for item in items if item.init_only]
+        sentinels = [item for item in items if not item.init_only and item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
-            item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
+            item
+            for item in items
+            if not item.init_only and not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
         compute_items = [item for item in items if item.tokens.numel() > 0]
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
+            if item.has_payload
+            and not item.init_only
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and item.tokens.numel() == 0
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
@@ -600,7 +706,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             }
         )
         initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
-        for item in segment_markers:
+        for item in [*init_items, *segment_markers]:
             if item.previous is None:
                 initial_marker_buckets.setdefault(
                     (item.prompt_cache_id, item.prompt_wav),
@@ -608,11 +714,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ).append(item)
         for bucket in initial_marker_buckets.values():
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
-                states = self.backend.setup_batch(features, len(bucket))
+                with self._backend_timeline_context([item.request_id for item in bucket]):
+                    features = self.backend.prepare_prompt(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                    )
+                    states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -633,7 +740,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             for item, state in zip(bucket, states, strict=True):
                 pending[item.state_id] = _RequestState(
                     cache_epoch=item.cache_epoch,
-                    chunk_seq=item.chunk_seq,
+                    # init_only is outside the codec stream. Keep the next real
+                    # chunk at sequence zero and do not advance any codec state.
+                    chunk_seq=-1 if item.init_only else item.chunk_seq,
                     prompt_cache_id=item.prompt_cache_id,
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
@@ -641,21 +750,22 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in buckets.values():
             batch_size = len(bucket)
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
-                if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
-                else:
-                    states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                audios, next_states = self.backend.decode_batch(
-                    tokens,
-                    features,
-                    states,
-                    last_chunk=bucket[0].last_chunk,
-                )
+                with self._backend_timeline_context([item.request_id for item in bucket]):
+                    features = self.backend.prepare_prompt(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                    )
+                    if bucket[0].previous is None:
+                        states = self.backend.setup_batch(features, batch_size)
+                    else:
+                        states = [item.previous.token2wav for item in bucket if item.previous is not None]
+                    tokens = self._batch_codec_tokens(bucket)
+                    audios, next_states = self.backend.decode_batch(
+                        tokens,
+                        features,
+                        states,
+                        last_chunk=bucket[0].last_chunk,
+                    )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -676,6 +786,38 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             for item, audio, next_state in zip(bucket, audios, next_states, strict=True):
                 outputs[item.output_index] = audio.reshape(-1).to(dtype=torch.float32)
+                if self._ultra_timeline_enabled:
+                    timeline_key = (item.state_id, item.cache_epoch)
+                    first_pcm = timeline_key not in self._timeline_pcm_seen
+                    emit_ultra_timeline_event(
+                        "first_pcm_ready" if first_pcm else "pcm_ready",
+                        request_id=item.request_id,
+                        turn_id=item.duplex_turn_id if item.duplex_turn_id >= 0 else None,
+                        stage=2,
+                        chunk_id=item.chunk_seq,
+                        stream="audio",
+                        shape=tuple(audio.shape),
+                        num_bytes=audio.numel() * audio.element_size(),
+                        details={
+                            "cache_epoch": item.cache_epoch,
+                            "last_chunk": item.last_chunk,
+                            "dtype": str(audio.dtype),
+                        },
+                    )
+                    self._timeline_pcm_seen.add(timeline_key)
+                    if item.last_chunk:
+                        emit_ultra_timeline_event(
+                            "last_audio_ready",
+                            request_id=item.request_id,
+                            turn_id=item.duplex_turn_id if item.duplex_turn_id >= 0 else None,
+                            stage=2,
+                            chunk_id=item.chunk_seq,
+                            stream="audio",
+                            shape=tuple(audio.shape),
+                            num_bytes=audio.numel() * audio.element_size(),
+                            details={"cache_epoch": item.cache_epoch, "dtype": str(audio.dtype)},
+                        )
+                        self._timeline_pcm_seen.discard(timeline_key)
                 pending[item.state_id] = (
                     None
                     if item.last_chunk
@@ -709,6 +851,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                "meta.init_only": [torch.tensor(item.init_only, dtype=torch.bool) for item in items],
             },
         )
 
@@ -716,6 +859,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._states.pop(state_id, None)
+            if self._ultra_timeline_enabled:
+                self._timeline_pcm_seen = {key for key in self._timeline_pcm_seen if key[0] != state_id}
             self._release_request_prompt(state_id)
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
@@ -753,7 +898,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             from stepaudio2.token2wav import Token2wav
 
-        extra = self._extra_config()
         model_root = self._resolve_model_root()
         prompt_path = Path(self._default_prompt_wav)
         if not prompt_path.is_file():
@@ -761,7 +905,20 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = self._token2wav_float16
+        use_npu_flow_autocast = use_float16 and current_omni_platform.is_npu()
+        # NPU Flow weights stay FP32 so an unavailable autocast API can fall
+        # back safely. CUDA retains the existing half-weight behavior.
+        use_half_weights = use_float16 and not use_npu_flow_autocast
+        if self._token2wav_n_timesteps != 10 or use_float16:
+            logger.warning(
+                "MiniCPM-o numerical lab enabled: cfm_steps=%d (%s), flow_fp16=%s (%s); "
+                "full Seed-TTS ASV/WER gates are required",
+                self._token2wav_n_timesteps,
+                self._token2wav_n_timesteps_source,
+                use_float16,
+                self._token2wav_float16_source,
+            )
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -770,9 +927,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(torch.float32)
             token2wav = Token2wav(
                 str(token2wav_path),
-                float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                float16=use_half_weights,
+                n_timesteps=self._token2wav_n_timesteps,
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            npu_flow_float16=use_npu_flow_autocast,
+        )

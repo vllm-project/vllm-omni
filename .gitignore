@@ -252,6 +252,9 @@ outputs/
 results/
 generated/
 output_*/
+# Local performance evidence and the default opt-in Ultra timeline sink.
+work/perf-evidence/
+ultra-timeline/
 
 # Configuration overrides
 configs/local.yaml

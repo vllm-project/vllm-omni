@@ -12,6 +12,10 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.benchmarks.ultra_timeline import (
+    emit_ultra_timeline_event,
+    ultra_timeline_enabled,
+)
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -111,6 +115,7 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        self._ultra_timeline_enabled = ultra_timeline_enabled()
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -911,8 +916,25 @@ class StagePool:
                 continue
             rid = str(request_id)
             self._output_timestamps_by_request.setdefault(rid, []).append(output_ts)
-            if self._has_non_empty_output(request_output):
+            has_non_empty_output = self._has_non_empty_output(request_output)
+            is_first_non_empty_output = (
+                has_non_empty_output
+                and rid not in self._non_empty_first_output_timestamps_by_request
+            )
+            if has_non_empty_output:
                 self._non_empty_first_output_timestamps_by_request.setdefault(rid, output_ts)
+            if (
+                is_first_non_empty_output
+                and self._ultra_timeline_enabled
+                and self.stage_id == 0
+                and getattr(self.stage_client, "final_output_type", None) == "text"
+            ):
+                emit_ultra_timeline_event(
+                    "stage0_first_text_output",
+                    request_id=rid,
+                    stage=0,
+                    stream="host",
+                )
             audio_frames, audio_sample_rate, _ = self._collect_audio_metrics(
                 [request_output],
                 use_default_sample_rate=False,
@@ -937,6 +959,21 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
+        emit_stage0_timeline = self._ultra_timeline_enabled and self.stage_id == 0 and self.stage_type == "llm"
+        if emit_stage0_timeline:
+            emit_ultra_timeline_event(
+                "stage0_queue_leave",
+                request_id=request_id,
+                stage=0,
+                stream="host",
+                details=dict(getattr(req_state, "pipeline_timings", {}) or {}),
+            )
+            emit_ultra_timeline_event(
+                "stage0_submit_begin",
+                request_id=request_id,
+                stage=0,
+                stream="host",
+            )
         # Convert plain vllm SamplingParams for single-stage diffusion models
         # that receive sampling params from the user/caller directly.
         if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
@@ -956,10 +993,22 @@ class StagePool:
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
-        )
+        try:
+            replica_id = await self._pick_or_select(
+                request_id,
+                affinity_request_id=affinity_request_id,
+            )
+        except Exception as exc:
+            if emit_stage0_timeline:
+                emit_ultra_timeline_event(
+                    "stage0_submit_error",
+                    request_id=request_id,
+                    stage=0,
+                    stream="host",
+                    error=exc,
+                    details={"phase": "admission"},
+                )
+            raise
         client = self.clients[replica_id]
         if client is None:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
@@ -971,13 +1020,31 @@ class StagePool:
                 request_index=0,
                 queue=None,
             )
-        except Exception:
+        except Exception as exc:
+            if emit_stage0_timeline:
+                emit_ultra_timeline_event(
+                    "stage0_submit_error",
+                    request_id=request_id,
+                    stage=0,
+                    stream="host",
+                    error=exc,
+                    details={"phase": "output_processor"},
+                )
             self.release_binding(request_id)
             raise
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
+        except Exception as exc:
+            if emit_stage0_timeline:
+                emit_ultra_timeline_event(
+                    "stage0_submit_error",
+                    request_id=request_id,
+                    stage=0,
+                    stream="host",
+                    error=exc,
+                    details={"phase": "engine_core"},
+                )
             self.release_binding(request_id)
             rollback = getattr(self.output_processor, "remove_request", None)
             if callable(rollback):
@@ -991,6 +1058,14 @@ class StagePool:
                         rollback_error,
                     )
             raise
+        if emit_stage0_timeline:
+            emit_ultra_timeline_event(
+                "stage0_submit_end",
+                request_id=request_id,
+                stage=0,
+                stream="host",
+                details={"replica_id": replica_id},
+            )
         return replica_id
 
     async def submit_update(

@@ -17,9 +17,19 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager():
+def _manager(
+    *,
+    early_setup: bool | None = False,
+    chunk_frames: int = 25,
+    initial_chunk_frames: int | None = 25,
+):
+    extra = {"codec_chunk_frames": chunk_frames, "codec_left_context_frames": 3}
+    if early_setup is not None:
+        extra["code2wav_early_setup"] = early_setup
+    if initial_chunk_frames is not None:
+        extra["initial_codec_chunk_frames"] = initial_chunk_frames
     return SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
+        connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
         put_req_chunk=defaultdict(int),
@@ -87,6 +97,201 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
         assert _codes(payload) == [4218, 4218, 4218, *range(25)]
         assert payload.meta.chunk_seq == 0
         assert payload.meta.code_flat_numel == 28
+
+
+@pytest.mark.parametrize("initial_chunk_frames", [8, 12, 16, 25])
+def test_first_chunk_uses_configured_threshold_then_returns_to_steady_size(
+    initial_chunk_frames: int,
+) -> None:
+    manager = _manager(initial_chunk_frames=initial_chunk_frames)
+    request = _request("req")
+
+    first = tts2code2wav_async_chunk(
+        manager,
+        _delta(*range(initial_chunk_frames)),
+        request,
+        False,
+    )
+    waiting = tts2code2wav_async_chunk(
+        manager,
+        _delta(*range(initial_chunk_frames, initial_chunk_frames + 24)),
+        request,
+        False,
+    )
+    steady = tts2code2wav_async_chunk(
+        manager,
+        _delta(initial_chunk_frames + 24),
+        request,
+        False,
+    )
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == initial_chunk_frames
+    assert first.meta.chunk_seq == 0
+    assert waiting is None
+    assert steady is not None
+    assert steady.meta.codec_chunk_frames == 25
+    assert steady.meta.chunk_seq == 1
+    assert _codes(steady)[:3] == list(range(initial_chunk_frames - 3, initial_chunk_frames))
+
+
+def test_initial_chunk_model_default_preserves_25_when_config_is_absent(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", raising=False)
+    manager = _manager(initial_chunk_frames=None)
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(24)), request, False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(24), request, False)
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 25
+
+
+def test_initial_chunk_explicit_config_wins_over_environment(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "8")
+    manager = _manager(initial_chunk_frames=12)
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(11)), _request("req"), False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(11), _request("req"), False)
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 12
+
+
+def test_initial_chunk_environment_selects_candidate_without_yaml(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "8")
+    manager = _manager(initial_chunk_frames=None)
+
+    first = tts2code2wav_async_chunk(
+        manager,
+        _delta(*range(8)),
+        _request("req"),
+        False,
+    )
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 8
+
+
+def test_initial_chunk_environment_zero_restores_steady_threshold(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "0")
+    manager = _manager(initial_chunk_frames=None)
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(24)), _request("req"), False) is None
+
+
+def test_initial_chunk_clamps_to_steady_size() -> None:
+    manager = _manager(chunk_frames=25, initial_chunk_frames=40)
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(24)), _request("req"), False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(24), _request("req"), False)
+
+    assert first is not None
+    assert first.meta.codec_chunk_frames == 25
+
+
+@pytest.mark.parametrize("source", ["config", "environment"])
+def test_initial_chunk_rejects_invalid_values(monkeypatch, source: str) -> None:
+    if source == "config":
+        manager = _manager(initial_chunk_frames=0)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "invalid")
+        manager = _manager(initial_chunk_frames=None)
+
+    with pytest.raises(ValueError, match="initial_codec_chunk_frames|INITIAL_CODEC_CHUNK_FRAMES"):
+        tts2code2wav_async_chunk(manager, _delta(1), _request("req"), False)
+
+
+def test_first_codec_timeline_event_is_emitted_once_per_stream(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.emit_ultra_timeline_event",
+        lambda event, **metadata: events.append((event, metadata)),
+    )
+    manager = _manager()
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(1), request, False) is None
+    assert tts2code2wav_async_chunk(manager, _delta(2), request, False) is None
+
+    assert [event for event, _ in events] == ["first_codec_token"]
+    assert events[0][1]["request_id"] == "req"
+    assert events[0][1]["stage"] == 1
+    assert events[0][1]["shape"] == (1,)
+
+
+def test_first_codec_token_sends_init_without_advancing_codec_stream(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", raising=False)
+    manager = _manager(early_setup=None)
+    request = _request("req")
+    request.additional_information = {
+        "codes": {"ref": [0.1, -0.1]},
+        "meta": {"ref_audio_sr": 16000},
+    }
+
+    init = tts2code2wav_async_chunk(manager, _delta(0), request, False)
+    waiting = tts2code2wav_async_chunk(manager, _delta(1), request, False)
+    first_audio = tts2code2wav_async_chunk(manager, _delta(*range(2, 25)), request, False)
+
+    assert init is not None
+    assert init.meta.init_only is True
+    assert init.meta.chunk_seq == 0
+    assert init.meta.code_flat_numel == 0
+    assert init.meta.codec_chunk_frames == 0
+    assert init.meta.last_chunk is False
+    assert _codes(init) == [4218]
+    assert init.codes.ref.tolist() == pytest.approx([0.1, -0.1])
+    assert init.meta.ref_audio_sr == 16000
+    assert waiting is None
+    assert first_audio is not None
+    assert first_audio.meta.init_only is False
+    assert first_audio.meta.chunk_seq == 0
+    assert first_audio.codes.ref is None
+    assert _codes(first_audio) == [4218, 4218, 4218, *range(25)]
+
+
+def test_early_setup_does_not_consume_small_first_chunk_offset(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", raising=False)
+    manager = _manager(early_setup=None, initial_chunk_frames=8)
+    request = _request("req")
+
+    init = tts2code2wav_async_chunk(manager, _delta(0), request, False)
+    first_audio = tts2code2wav_async_chunk(manager, _delta(*range(1, 8)), request, False)
+
+    assert init is not None
+    assert init.meta.init_only is True
+    assert init.meta.chunk_seq == 0
+    assert first_audio is not None
+    assert first_audio.meta.init_only is False
+    assert first_audio.meta.chunk_seq == 0
+    assert first_audio.meta.codec_chunk_frames == 8
+    assert _codes(first_audio) == [4218, 4218, 4218, *range(8)]
+
+
+def test_explicit_config_disables_early_setup_even_when_environment_enables(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", "1")
+
+    payload = tts2code2wav_async_chunk(
+        _manager(early_setup=False),
+        _delta(1),
+        _request("req"),
+        False,
+    )
+
+    assert payload is None
+
+
+def test_environment_can_disable_default_early_setup(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", "0")
+
+    payload = tts2code2wav_async_chunk(
+        _manager(early_setup=None),
+        _delta(1),
+        _request("req"),
+        False,
+    )
+
+    assert payload is None
 
 
 def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:

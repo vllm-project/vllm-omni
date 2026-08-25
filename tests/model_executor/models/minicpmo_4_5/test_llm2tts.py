@@ -148,7 +148,7 @@ class TestBasicShape:
         out = llm2tts([thinker_output], prompt=None)
 
         assert out[0]["prompt_token_ids"] == [0, 0, 0]
-        assert torch.equal(torch.tensor(out[0]["model_intermediate_buffer"]["hidden_states"]["tts"]), hidden[1:])
+        assert torch.equal(torch.as_tensor(out[0]["model_intermediate_buffer"]["hidden_states"]["tts"]), hidden[1:])
 
     def test_returns_one_entry_per_input(self) -> None:
         hidden = torch.zeros((3, _HIDDEN_DIM))
@@ -209,7 +209,7 @@ class TestBasicShape:
         buffer = result["model_intermediate_buffer"]
         assert result["prompt_token_ids"] == [0, 0, 0, 0]
         assert buffer["ids"]["tts"] == [20, 21]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:4])
+        assert torch.equal(torch.as_tensor(buffer["hidden_states"]["tts"]), hidden[2:4])
 
     def test_latent_in_multimodal_output_takes_precedence(self) -> None:
         # When both ``multimodal_output["latent"]`` and ``hidden_states`` are
@@ -233,7 +233,7 @@ class TestBasicShape:
         )
         buffer = result[0]["model_intermediate_buffer"]
         # latent (ones) won over hidden_states (zeros)
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), latent[3:4].to(torch.float32))
+        assert torch.equal(torch.as_tensor(buffer["hidden_states"]["tts"]), latent[3:4].to(torch.float32))
 
 
 class TestTtsRegionDetection:
@@ -267,7 +267,7 @@ class TestTtsRegionDetection:
         # 4.5 BOS at idx 2 -> slice starts at 3; EOS at idx 5 -> slice ends at 5.
         buffer, hidden = self._run([10, 11], [151703, 30, 31, 151704, 40])
         assert buffer["ids"]["tts"] == [30, 31]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
+        assert torch.equal(torch.as_tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
     def test_bos_without_eos_runs_to_end(self) -> None:
         # When BOS is found but EOS is missing (typical for an in-flight or
@@ -276,12 +276,12 @@ class TestTtsRegionDetection:
         # sequence: [10, 11, 151703, 30, 31]
         buffer, hidden = self._run([10, 11], [151703, 30, 31])
         assert buffer["ids"]["tts"] == [30, 31]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
+        assert torch.equal(torch.as_tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
     def test_plain_chat_without_tts_markers_uses_assistant_span(self) -> None:
         buffer, hidden = self._run([10, 11], [20, 21, 22])
         assert buffer["ids"]["tts"] == [20, 21, 22]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:5])
+        assert torch.equal(torch.as_tensor(buffer["hidden_states"]["tts"]), hidden[2:5])
 
 
 class TestPromptAndMultiModal:

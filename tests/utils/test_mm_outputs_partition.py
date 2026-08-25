@@ -69,3 +69,18 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter
+
+
+def test_partition_init_only_marker_with_client_audio_for_internal_suppression():
+    payload = {
+        "model_outputs": torch.empty(0),
+        "sr": torch.tensor(24000, dtype=torch.int32),
+        "meta.init_only": torch.tensor([1], dtype=torch.int32),
+        "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+    }
+
+    inter, client = partition_flat_payload(payload)
+
+    assert "meta.init_only" in inter
+    assert "meta.init_only" in client
+    assert client["model_outputs"].numel() == 0

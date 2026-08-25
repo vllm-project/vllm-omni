@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from vllm_omni.engine.tensor_envelope import (
+    TensorEnvelope,
+    install_tensor_envelope,
+    validate_inline_tensor_envelope,
+)
+
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
     """Structured keys carried through ``model_intermediate_buffer``.
@@ -64,12 +70,24 @@ def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: i
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
-def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+def set_tts_handoff(
+    buffer: dict[str, object],
+    token_ids: object | None,
+    hidden_states: object | None,
+    *,
+    hidden_envelope: TensorEnvelope | None = None,
+) -> None:
     """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids
     if hidden_states is not None:
         buffer.setdefault("hidden_states", {})["tts"] = hidden_states
+        if hidden_envelope is not None:
+            install_tensor_envelope(
+                buffer,
+                name="hidden_states.tts",
+                envelope=hidden_envelope,
+            )
 
 
 def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
@@ -78,9 +96,14 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
     hidden_info = info.get("hidden_states")
     token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
     hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    hidden_states = validate_inline_tensor_envelope(
+        info,
+        name="hidden_states.tts",
+        payload=info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+    )
     return (
         info.get("tts_token_ids") if token_ids is None else token_ids,
-        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+        hidden_states,
     )
 
 
