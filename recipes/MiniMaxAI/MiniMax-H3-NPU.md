@@ -148,7 +148,7 @@ every other flag unchanged:
 **INT8 online quantization** — add one flag to the server command above:
 
 ```bash
-  --quantization int8
+  --diffusion-quantization-config '{"transformer":{"method":"int8"}}'
 ```
 
 Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
