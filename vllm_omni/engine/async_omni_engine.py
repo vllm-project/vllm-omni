@@ -1049,6 +1049,7 @@ class AsyncOmniEngine:
             "dlo_chunk_size_mb": kwargs.get("dlo_chunk_size_mb", 64),
             "dlo_pin_budget_gb": kwargs.get("dlo_pin_budget_gb", None),
             "dlo_pin_failure_policy": kwargs.get("dlo_pin_failure_policy", "fail"),
+            "dlo_transport_backend": kwargs.get("dlo_transport_backend", "auto"),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

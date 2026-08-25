@@ -751,6 +751,14 @@ class OmniServeCommand(CLISubcommand):
             "load time; 'whole_block_fallback' degrades the engine to pageable "
             "whole-block transport.",
         )
+        omni_config_group.add_argument(
+            "--dlo-transport-backend",
+            choices=("auto", "group_persistent"),
+            default="auto",
+            help="DLO chunked transport backend (default: auto). 'auto' keeps the "
+            "reference H2D + AllGather chunk schedule; 'group_persistent' captures "
+            "the stable schedule into NPUGraphs and replays it (NPU only).",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

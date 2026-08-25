@@ -387,6 +387,7 @@ class StageDeployConfig:
     dlo_chunk_size_mb: int | None = None
     dlo_pin_budget_gb: float | None = None
     dlo_pin_failure_policy: str | None = None
+    dlo_transport_backend: str | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

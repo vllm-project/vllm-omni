@@ -551,6 +551,7 @@ class OrchestratorArgs:
     dlo_chunk_size_mb: int = 64
     dlo_pin_budget_gb: float | None = None
     dlo_pin_failure_policy: str = "fail"
+    dlo_transport_backend: str = "auto"
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

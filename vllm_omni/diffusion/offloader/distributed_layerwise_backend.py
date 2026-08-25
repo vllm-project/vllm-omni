@@ -50,6 +50,7 @@ from .chunked_transport import (
     PinBudget,
     PinFailurePolicy,
     TransferTicket,
+    TransportBackendKind,
     WeightLayout,
     build_part_manifest,
     is_chunk_transport_supported,
@@ -67,6 +68,16 @@ from .tensor_utils import (
     is_materialized_tensor,
     make_offload_placeholder,
     set_tensor_storage,
+)
+from .weight_transport_backend import (
+    ChunkCompletion,
+    ChunkEvents,
+    TransportCapability,
+    TransportSelection,
+    TransportStreams,
+    WeightTransportBackend,
+    create_transport_backend,
+    select_transport,
 )
 
 logger = init_logger(__name__)
@@ -129,6 +140,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank_local_mmap: bool = False,
         pin_memory: bool = True,
         tensor_transforms: dict[int, Any] | None = None,
+        data_transport_backend: WeightTransportBackend | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -137,6 +149,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.weight_shard_group = weight_shard_group
         self.weight_shard_size = weight_shard_size
         self.weight_shard_rank = weight_shard_rank
+
+        self.data_transport_backend = data_transport_backend
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -148,6 +162,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # loader supplied a checkpoint_mmap plan, otherwise a private pinned
         # copy via _shard_and_pin (the standard loader path).
         self.rank_local = prepared_host_part is None
+        if not self.rank_local and data_transport_backend is None:
+            # The sharded path drives every transfer through the configured
+            # transport backend; rank-local hooks never touch it.
+            raise RuntimeError("data_transport_backend is required")
         self.rank_local_mmap = rank_local_mmap
         self.pin_memory = pin_memory
         self.tensor_transforms = tensor_transforms or {}
@@ -749,64 +767,62 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=non_blocking)
                 evt.record(self.copy_stream)
         else:
-            shard_bufs = self.gpu_shard_buffers
-            assert len(shard_bufs) == 2, "DLO requires exactly two local chunk slots"
-            assert shard_bufs[0] is not None and shard_bufs[1] is not None, "chunk buffers not allocated"
-
             if non_blocking:
-                for _dtype, _cpu_shard in self.cpu_shards.items():
-                    if not _cpu_shard.is_pinned():
+                for dtype, cpu_source in self.cpu_shards.items():
+                    if cpu_source.numel() and not cpu_source.is_pinned():
                         raise RuntimeError(
-                            f"chunk H2D requires pinned Host shard for block {self.block_id} "
-                            f"dtype={_dtype}; tensor is not pinned. Async overlap is unsafe "
+                            f"chunk H2D requires pinned Host source for block {self.block_id} "
+                            f"dtype={dtype}; tensor is not pinned. Async overlap is unsafe "
                             "with pageable source — set dlo_pin_failure_policy=whole_block_fallback "
                             "to allow pageable fallback, or ensure pin_cpu_memory=True."
                         )
+
+            streams = TransportStreams(copy=self.copy_stream, communication=self.comm_stream)
+            self.data_transport_backend.begin_part(streams, self._output_slot_events[slot])
+            completions: list[ChunkCompletion] = []
+            shard_bufs = self.gpu_shard_buffers
 
             chunk_specs = [
                 (dtype_manifest.dtype, chunk)
                 for dtype_manifest in self.manifest.dtypes
                 for chunk in dtype_manifest.chunks
             ]
-
-            last_use = self._output_slot_events[slot]
-            if last_use is not None:
-                self.comm_stream.wait_event(last_use)
-
             for transfer_index, (dtype, chunk) in enumerate(chunk_specs):
                 input_slot = transfer_index % 2
-                reuse_event = self._chunk_slot_events[input_slot]
-                h2d_done = self._h2d_done_events[input_slot]
-                transport_done = self._transport_done_events[input_slot]
-                cpu_shard = self.cpu_shards[dtype]
+                cpu_source = self.cpu_shards[dtype]
+                source = cpu_source[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel]
 
-                # The prior AllGather must finish reading this input slot
-                # before the next H2D overwrites it.
-                if reuse_event is not None:
-                    self.copy_stream.wait_event(reuse_event)
-                with current_omni_platform.stream(self.copy_stream):
-                    with self._trace_range("h2d", chunk.chunk_id):
-                        local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
-                        local_input.copy_(
-                            cpu_shard[chunk.cpu_offset : chunk.cpu_offset + chunk.local_numel],
-                            non_blocking=non_blocking,
-                        )
-                    h2d_done.record(self.copy_stream)
+                local_input = None
+                if self.data_transport_backend.requires_local_input:
+                    if len(shard_bufs) != 2 or shard_bufs[0] is None or shard_bufs[1] is None:
+                        raise RuntimeError("selected transport backend requires two local chunk input buffers")
+                    local_input = shard_bufs[input_slot][dtype][: chunk.local_numel]
 
-                self.comm_stream.wait_event(h2d_done)
-                with current_omni_platform.stream(self.comm_stream):
-                    with self._trace_range("all_gather", chunk.chunk_id):
-                        output = gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel]
-                        torch.distributed.all_gather_into_tensor(
-                            output,
-                            local_input,
-                            group=self.weight_shard_group,
-                        )
-                    transport_done.record(self.comm_stream)
-                self._chunk_slot_events[input_slot] = transport_done
+                completion = self.data_transport_backend.submit_chunk(
+                    source=source,
+                    local_input=local_input,
+                    full_output=gpu_weights[dtype][chunk.full_offset : chunk.full_offset + chunk.padded_numel],
+                    chunk_meta=chunk,
+                    streams=streams,
+                    events=ChunkEvents(
+                        h2d_done=self._h2d_done_events[input_slot],
+                        transport_done=self._transport_done_events[input_slot],
+                        input_reusable=self._chunk_slot_events[input_slot],
+                    ),
+                    group=self.weight_shard_group,
+                    generation=self._request_generation,
+                    non_blocking=non_blocking,
+                    trace=lambda kind, chunk_id=chunk.chunk_id: self._trace_range(kind, chunk_id),
+                )
+                completions.append(completion)
+                if self.data_transport_backend.requires_local_input:
+                    self._chunk_slot_events[input_slot] = completion.event
 
-            with current_omni_platform.stream(self.comm_stream):
-                evt.record(self.comm_stream)
+            self.data_transport_backend.finalize_part(
+                completions,
+                ready_event=evt,
+                streams=streams,
+            )
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -1145,6 +1161,7 @@ def apply_distributed_block_hook(
     rank_local_mmap: bool = False,
     pin_memory: bool = True,
     tensor_transforms: dict[int, Any] | None = None,
+    data_transport_backend: WeightTransportBackend | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -1169,6 +1186,7 @@ def apply_distributed_block_hook(
         rank_local_mmap=rank_local_mmap,
         pin_memory=pin_memory,
         tensor_transforms=tensor_transforms,
+        data_transport_backend=data_transport_backend,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -1386,6 +1404,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # this), so we do not attempt a fallback.
         self.weight_shard_size: int = max(1, int(getattr(config, "weight_shard_size", 1) or 1))
         self.weight_shard_rank: int = int(getattr(config, "weight_shard_rank", 0) or 0)
+        self.weight_shard_ranks: tuple[int, ...] = tuple(range(self.weight_shard_size))
+        self.transport_capability: TransportCapability | None = None
+        self.transport_selection: TransportSelection | None = None
+        self.data_transport_backend: WeightTransportBackend | None = None
 
         self._blocks: list[list[nn.Module]] = []
         self._all_hook_groups: list[list[DistributedLayerwiseOffloadHook]] = []
@@ -1644,6 +1666,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self.weight_shard_group = None
             self.weight_shard_cpu_group = None
             self.weight_shard_rank = 0
+            self.weight_shard_ranks = (0,)
             self._publish_weight_shard_config()
             return
 
@@ -1720,6 +1743,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         row_start = global_rank - global_rank % shard
         self.weight_shard_group, self.weight_shard_cpu_group = row_groups[row_start]
         self.weight_shard_rank = global_rank % shard
+        self.weight_shard_ranks = tuple(range(row_start, row_start + shard))
         self._publish_weight_shard_config()
 
         logger.info(
@@ -1736,6 +1760,40 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.config.weight_shard_rank = self.weight_shard_rank
         self.config.weight_shard_group = self.weight_shard_group
         self.config.weight_shard_cpu_group = self.weight_shard_cpu_group
+
+    def _probe_transport_capability(self) -> TransportCapability:
+        """Probe only what the FS chunk-schedule backends rely on."""
+        native_persistent = bool(
+            self.device.type == "npu"
+            and hasattr(torch, "npu")
+            and hasattr(torch.npu, "NPUGraph")
+            and hasattr(torch.npu, "graph")
+        )
+        return TransportCapability(
+            world_size=self.weight_shard_size,
+            rank=self.weight_shard_rank,
+            global_ranks=self.weight_shard_ranks,
+            native_persistent=native_persistent,
+        )
+
+    def _configure_transport_backend(self) -> None:
+        self.transport_capability = self._probe_transport_capability()
+        requested_backend = TransportBackendKind(
+            getattr(self.config, "dlo_transport_backend", TransportBackendKind.AUTO.value)
+        )
+        self.transport_selection = select_transport(
+            requested_backend,
+            self.transport_capability,
+        )
+        self.data_transport_backend = create_transport_backend(
+            self.transport_selection,
+            self.transport_capability,
+        )
+        logger.info(
+            "DLO transport backend: requested=%s effective=%s",
+            requested_backend.value,
+            self.transport_selection.effective_backend.value,
+        )
 
     # ------------------------------------------------------------------ #
     #  Host plan and Host storage                                         #
@@ -2057,6 +2115,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self._request_active:
             raise RuntimeError("DLO request lifecycle ended without a matching begin")
         self._drain_transport()
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.reset_generation(self._request_generation)
         self._request_generation += 1
         self._request_active = False
 
@@ -2107,7 +2167,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 max_local_chunk[dtype] = max(max_local_chunk.get(dtype, 0), dtype_manifest.local_chunk_numel)
 
         full_output_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_padded.items())
-        local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
+        local_input_staging_bytes = 0
+        if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
+            local_input_staging_bytes = 2 * sum(numel * _dtype_size(dtype) for dtype, numel in max_local_chunk.items())
 
         submissions = 0
         submitted_chunks = 0
@@ -2126,6 +2188,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 releases += counters.releases
 
         parts = len(self._prepared_host_parts)
+        selection = self.transport_selection
+        capability = self.transport_capability
+        backend_counters = self.data_transport_backend.counters if self.data_transport_backend is not None else None
         return {
             "weight_shard_size": self.weight_shard_size,
             "parts": parts,
@@ -2141,6 +2206,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             "collective_workspace_bytes": None,
             "fallback_parts": fallback_parts,
             "fallback_ratio": (fallback_parts / parts) if parts else 0.0,
+            "transport_backend_requested": selection.requested_backend.value if selection is not None else None,
+            "transport_backend_effective": selection.effective_backend.value if selection is not None else None,
+            "transport_native_persistent": capability.native_persistent if capability is not None else False,
+            "backend_submitted_parts": backend_counters.submitted_parts if backend_counters is not None else 0,
+            "backend_submitted_chunks": backend_counters.submitted_chunks if backend_counters is not None else 0,
+            "backend_host_h2d_bytes": backend_counters.host_h2d_bytes if backend_counters is not None else 0,
+            "backend_fabric_bytes": backend_counters.fabric_bytes if backend_counters is not None else 0,
+            "backend_schedule_builds": backend_counters.schedule_builds if backend_counters is not None else 0,
+            "backend_schedule_replays": backend_counters.schedule_replays if backend_counters is not None else 0,
+            "backend_chunks": dict(backend_counters.backend_chunks) if backend_counters is not None else {},
             "request_generation": self._request_generation,
             "submissions": submissions,
             "submitted_chunks": submitted_chunks,
@@ -2154,6 +2229,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for hook in group:
                 if hook.transport is not None:
                     hook.transport.reset_counters()
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.reset_counters()
 
     # ------------------------------------------------------------------ #
     #  Ownership, hook construction, shared events                        #
@@ -2279,6 +2356,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Register one hook that transports *next_block* into a shared slot."""
         # Rank-local hooks collect their own host storage in initialize_hook;
         # the chunked AllGather path consumes the backend-prepared Host part.
+        if not self._using_rank_local and self.data_transport_backend is None:
+            raise RuntimeError("DLO data transport backend is not configured")
         prepared = None if self._using_rank_local else self._prepared_host_parts[id(next_block)]
         hook = apply_distributed_block_hook(
             module,
@@ -2302,6 +2381,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             rank_local_mmap=self._using_rank_local_mmap,
             pin_memory=self.config.pin_cpu_memory,
             tensor_transforms=self._mmap_transforms_by_tensor_id,
+            data_transport_backend=self.data_transport_backend,
         )
         if self._using_rank_local:
             # No manifest in rank-local mode; assign the ownership id directly.
@@ -2592,6 +2672,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Resolve the FS group that owns the weight shard dimension.
         if self.weight_shard_group is None:
             self._init_weight_shard_group()
+        self._configure_transport_backend()
 
         modules = ModuleDiscovery.discover(pipeline)
         if not modules.dits:
@@ -2811,7 +2892,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             prepared_manifests = [part["manifest"] for part in self._prepared_host_parts.values()]
             unified_buffers = self._allocate_shared_buffers(prepared_manifests)
             unified_chunk_buffers = None
-            if self.weight_shard_size > 1:
+            if self.data_transport_backend is not None and self.data_transport_backend.requires_local_input:
                 unified_chunk_buffers = self._allocate_shared_chunk_buffers(prepared_manifests)
             self._allocate_shared_events()
 
@@ -2921,6 +3002,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                         first_error = exc
                 hook.cpu_shards = {}  # drop pinned-memory references
                 hook.cpu_sources = {}  # drop retained mmap views
+
+        if self.data_transport_backend is not None:
+            self.data_transport_backend.close()
+            self.data_transport_backend = None
 
         for blocks in self._blocks:
             for block in blocks:

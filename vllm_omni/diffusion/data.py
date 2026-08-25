@@ -765,6 +765,9 @@ class OmniDiffusionConfig:
     dlo_chunk_size_mb: int = 64
     dlo_pin_budget_gb: float | None = None  # None = unlimited
     dlo_pin_failure_policy: str = "fail"  # "fail" | "whole_block_fallback"
+    # Chunked transport backend: "auto" keeps the reference schedule;
+    # "group_persistent" captures it into NPUGraphs and replays (NPU only).
+    dlo_transport_backend: str = "auto"
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

@@ -47,6 +47,13 @@ class WeightLayout(str, Enum):
     WHOLE_BLOCK = "whole_block"
 
 
+class TransportBackendKind(str, Enum):
+    AUTO = "auto"
+    REFERENCE = "reference"
+    GROUP_PERSISTENT = "group_persistent"
+    GROUP_SCATTER_AG = "group_scatter_ag"
+
+
 class PinFailurePolicy(str, Enum):
     FAIL = "fail"
     WHOLE_BLOCK_FALLBACK = "whole_block_fallback"
