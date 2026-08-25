@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 Qwen3-VL layer-50 text/vision encoder.
 
 The encoder is reimplemented on top of vLLM-style tensor-parallel building
@@ -42,6 +43,10 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.diffusion.offloader.module_residency import (
+    BoundedAllocatorCache,
+    PinnedModuleStager,
+)
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -1211,12 +1216,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not self.is_loaded:
             return
         if getattr(self, "_omni_layerwise_enabled", False):
-            for name, child in self.vision.named_children():
-                if name != "blocks":
-                    child.to(self.device_target)
-            for name, child in self.text_model.named_children():
-                if name != "layers":
-                    child.to(self.device_target)
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is None:
+                hooks = getattr(self, "_omni_layerwise_hooks", ())
+                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                stager = PinnedModuleStager(
+                    self._omni_non_block_modules(),
+                    self.device_target,
+                    pin_memory=pin_memory,
+                    cache_retention=getattr(self, "_omni_component_cache", None),
+                )
+                self._omni_non_block_stager = stager
+            stager.load()
             return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
@@ -1227,17 +1238,38 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:
                 hook.offload_layer()
-            for name, child in self.vision.named_children():
-                if name != "blocks":
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is not None:
+                stager.offload()
+            else:
+                # The initial DLO setup reaches this branch before the first
+                # load. These modules were constructed on CPU, so this is not
+                # a device-to-host rematerialization.
+                for child in self._omni_non_block_modules():
                     child.to("cpu")
-            for name, child in self.text_model.named_children():
-                if name != "layers":
-                    child.to("cpu")
-            torch.accelerator.empty_cache()
+                self._release_omni_component_cache()
             return
         self.vision.to("cpu")
         self.text_model.to("cpu")
         torch.accelerator.empty_cache()
+
+    def _omni_non_block_modules(self) -> list[nn.Module]:
+        modules = [child for name, child in self.vision.named_children() if name != "blocks"]
+        modules.extend(child for name, child in self.text_model.named_children() if name != "layers")
+        return modules
+
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        stager = getattr(self, "_omni_non_block_stager", None)
+        if stager is not None:
+            stager.set_cache_retention(cache)
+
+    def _release_omni_component_cache(self) -> None:
+        cache = getattr(self, "_omni_component_cache", None)
+        if cache is None:
+            torch.accelerator.empty_cache()
+        else:
+            cache.release_if_needed()
 
     def enable_omni_layerwise_offload(self, *, pin_memory: bool = True) -> None:
         """Stream the TP-local Qwen vision/text blocks for low-HBM serving.
