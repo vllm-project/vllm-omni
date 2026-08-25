@@ -171,6 +171,8 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 logger = init_logger(__name__)
 router = APIRouter()
 
+_VIDEO_TASK_CANCEL_TIMEOUT_S = 5.0
+
 MAX_UINT32_SEED = 2**32 - 1
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES = 50 * 1024 * 1024
@@ -610,7 +612,16 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
-            await VIDEO_TASKS.cancel_all()
+            try:
+                await asyncio.wait_for(
+                    VIDEO_TASKS.cancel_all(),
+                    timeout=_VIDEO_TASK_CANCEL_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out waiting for active video tasks to cancel after %.1f seconds; continuing server shutdown",
+                    _VIDEO_TASK_CANCEL_TIMEOUT_S,
+                )
             serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
             if serving_video is not None:
                 serving_video.shutdown()

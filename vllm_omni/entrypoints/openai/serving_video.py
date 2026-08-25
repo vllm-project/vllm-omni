@@ -141,8 +141,9 @@ class OmniOpenAIServingVideo:
     async def _run_video_response_encoding(
         self,
         closure: Callable[[], _VideoResponseEncodingResult],
-    ) -> _VideoResponseEncodingResult:
+    ) -> tuple[_VideoResponseEncodingResult, float]:
         """Run one complete non-streaming response encode off the event loop."""
+        started_at = time.perf_counter()
         await self._video_response_encoding_gate.acquire()
         loop = asyncio.get_running_loop()
         executor = self._video_response_encoding_executor
@@ -160,7 +161,9 @@ class OmniOpenAIServingVideo:
 
         native_future.add_done_callback(release_slot)
         wrapped_future = asyncio.wrap_future(native_future, loop=loop)
-        return cast(_VideoResponseEncodingResult, await wrapped_future)
+        result = cast(_VideoResponseEncodingResult, await wrapped_future)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        return result, elapsed_ms
 
     def shutdown(self) -> None:
         """Stop new response encodes and join the dedicated encoding thread."""
@@ -224,9 +227,6 @@ class OmniOpenAIServingVideo:
             model_name=model_name,
             stage_configs=stage_configs,
         )
-
-    def shutdown(self) -> None:
-        self._video_frame_converter.shutdown()
 
     async def _run_and_extract(
         self,
@@ -436,13 +436,11 @@ class OmniOpenAIServingVideo:
                 for idx, video in enumerate(artifacts.videos)
             ]
 
-        _t_encode_start = time.perf_counter()
-        video_data = await self._run_video_response_encoding(encode_video_batch)
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+        video_data, encode_ms = await self._run_video_response_encoding(encode_video_batch)
         logger.info(
             "Video response encoding (MP4+base64): %.2f ms "
             "queue_inclusive=true execution=dedicated_executor max_active_encodes=%d",
-            _t_encode_ms,
+            encode_ms,
             _VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
         )
         return VideoGenerationResponse(
@@ -496,13 +494,11 @@ class OmniOpenAIServingVideo:
                 frame_converter=self._video_frame_converter,
             )
 
-        _t_encode_start = time.perf_counter()
-        video_bytes = await self._run_video_response_encoding(encode_video)
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+        video_bytes, encode_ms = await self._run_video_response_encoding(encode_video)
         logger.info(
             "Video response encoding (MP4 bytes): %.2f ms "
             "queue_inclusive=true execution=dedicated_executor max_active_encodes=%d",
-            _t_encode_ms,
+            encode_ms,
             _VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
         )
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]

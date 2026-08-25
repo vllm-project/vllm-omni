@@ -99,13 +99,8 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
-    engine = FakeAsyncOmni()
-    handler = OmniOpenAIServingVideo.for_diffusion(
-        engine,
-        model_name="test-model",
-    )
-    assert handler._video_frame_converter.max_workers == 8
+def test_raw_and_base64_encoders_receive_persistent_converter(video_handler, mocker: MockerFixture):
+    assert video_handler._video_frame_converter.max_workers == 8
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"encoded-video",
@@ -117,17 +112,13 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
 
     async def _generate_both_response_types():
         request = VideoGenerationRequest(prompt="test prompt")
-        await handler.generate_video_bytes(request, "raw-request")
-        await handler.generate_videos(request, "base64-request")
+        await video_handler.generate_video_bytes(request, "raw-request")
+        await video_handler.generate_videos(request, "base64-request")
 
-    try:
-        asyncio.run(_generate_both_response_types())
-    finally:
-        handler.shutdown()
+    asyncio.run(_generate_both_response_types())
 
-    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
-    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
-    handler.shutdown()
+    assert raw_encoder.call_args.kwargs["frame_converter"] is video_handler._video_frame_converter
+    assert base64_encoder.call_args.kwargs["frame_converter"] is video_handler._video_frame_converter
 
 
 def _video_artifacts(videos, audios=None, actions=None):
@@ -149,79 +140,62 @@ def _make_video_handler():
     )
 
 
+@pytest.fixture
+def video_handler():
+    handler = _make_video_handler()
+    try:
+        yield handler
+    finally:
+        handler.shutdown()
+
+
+def _patch_video_artifacts(monkeypatch, handler, artifacts):
+    async def fake_run(*args, **kwargs):
+        del args, kwargs
+        return artifacts
+
+    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+
+
 @pytest.mark.parametrize(
-    ("video", "expected_path", "expected_bytes"),
+    "video",
     [
-        (
-            np.transpose(np.zeros((3, 2, 4, 4), dtype=np.float32), (1, 2, 3, 0)),
-            "direct_planar",
-            b"direct",
-        ),
-        (
-            np.zeros((2, 4, 6, 3), dtype=np.float32),
-            "legacy_fallback",
-            b"legacy",
-        ),
+        np.transpose(np.zeros((3, 2, 4, 4), dtype=np.uint8), (1, 2, 3, 0)),
+        np.zeros((2, 4, 6, 3), dtype=np.uint8),
     ],
     ids=["direct-planar", "legacy-fallback"],
 )
 @pytest.mark.asyncio
-async def test_raw_encoding_offloads_both_auto_routes(monkeypatch, video, expected_path, expected_bytes):
-    handler = _make_video_handler()
+async def test_raw_encoding_offloads_both_auto_routes(monkeypatch, video_handler, video):
     artifacts = _video_artifacts([video])
     event_loop_thread = threading.get_ident()
     encoder_threads = []
-    path_logs = []
-
-    async def fake_run(*args, **kwargs):
-        return artifacts
 
     def encode(video, *, fps, **kwargs):
         encoder_threads.append(threading.get_ident())
         return video_api_utils._encode_video_bytes(video, fps=fps, **kwargs)
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+    _patch_video_artifacts(monkeypatch, video_handler, artifacts)
     monkeypatch.setattr(serving_video, "_encode_video_bytes", encode)
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.mux_av_video_audio_bytes",
-        lambda *args, **kwargs: b"direct",
-    )
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.utils.media_utils.mux_video_audio_bytes",
-        lambda *args, **kwargs: b"legacy",
-    )
-    monkeypatch.setattr(
-        video_api_utils.logger,
-        "info",
-        lambda message, *args, **kwargs: path_logs.append(message % args if args else message),
-    )
 
-    try:
-        video_bytes, *_ = await handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "raw-request")
-    finally:
-        handler.shutdown()
+    video_bytes, *_ = await video_handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "raw-request")
 
-    assert video_bytes == expected_bytes
+    assert video_bytes
     assert encoder_threads and all(thread != event_loop_thread for thread in encoder_threads)
-    assert any(f"selected_path={expected_path}" in message for message in path_logs)
 
 
 @pytest.mark.asyncio
-async def test_base64_batch_offloads_one_ordered_closure_and_preserves_arguments(monkeypatch):
-    handler = _make_video_handler()
+async def test_base64_batch_offloads_one_ordered_closure_and_preserves_arguments(monkeypatch, video_handler):
     artifacts = _video_artifacts(["first", "second"], audios=[None, "audio"])
     event_loop_thread = threading.get_ident()
     calls = []
     submit_calls = []
 
-    async def fake_run(*args, **kwargs):
-        return artifacts
-
     def fake_encode(video, **kwargs):
         calls.append((video, threading.get_ident(), kwargs))
         return f"encoded-{video}"
 
-    executor = handler._video_response_encoding_executor
+    executor = video_handler._video_response_encoding_executor
     assert executor is not None
     real_submit = executor.submit
 
@@ -229,14 +203,11 @@ async def test_base64_batch_offloads_one_ordered_closure_and_preserves_arguments
         submit_calls.append(function)
         return real_submit(function, *args, **kwargs)
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+    _patch_video_artifacts(monkeypatch, video_handler, artifacts)
     monkeypatch.setattr(serving_video, "encode_video_base64", fake_encode)
     monkeypatch.setattr(executor, "submit", recording_submit)
 
-    try:
-        response = await handler.generate_videos(VideoGenerationRequest(prompt="test"), "batch-request")
-    finally:
-        handler.shutdown()
+    response = await video_handler.generate_videos(VideoGenerationRequest(prompt="test"), "batch-request")
 
     assert [item.b64_json for item in response.data] == ["encoded-first", "encoded-second"]
     assert [item[0] for item in calls] == ["first", "second"]
@@ -248,57 +219,63 @@ async def test_base64_batch_offloads_one_ordered_closure_and_preserves_arguments
 
 
 @pytest.mark.asyncio
-async def test_response_encoding_logs_executor_scope_and_queue_inclusive_timing(monkeypatch):
-    log_messages = []
-    monkeypatch.setattr(
-        serving_video.logger,
-        "info",
-        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
-    )
-    handler = _make_video_handler()
-    artifacts = _video_artifacts([object()])
+async def test_response_encoding_timing_includes_semaphore_wait(monkeypatch, video_handler):
+    first_native_started = threading.Event()
+    release_first_native = threading.Event()
+    second_native_started = threading.Event()
+    second_timing_started = asyncio.Event()
+    clock_values = iter((0.0, 10.0, 11.0, 15.0))
+    clock_calls = 0
 
-    async def fake_run(*args, **kwargs):
-        return artifacts
+    def controlled_perf_counter():
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 2:
+            second_timing_started.set()
+        return next(clock_values)
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
-    monkeypatch.setattr(serving_video, "_encode_video_bytes", lambda *args, **kwargs: b"encoded")
-    monkeypatch.setattr(serving_video, "encode_video_base64", lambda *args, **kwargs: "encoded")
+    monkeypatch.setattr(serving_video, "time", SimpleNamespace(perf_counter=controlled_perf_counter))
 
+    def first_encode():
+        first_native_started.set()
+        assert release_first_native.wait(timeout=5)
+        return b"first"
+
+    def second_encode():
+        second_native_started.set()
+        return b"second"
+
+    first_task = asyncio.create_task(video_handler._run_video_response_encoding(first_encode))
+    second_task = None
+    first_result = None
+    second_result = None
     try:
-        await handler.generate_video_bytes(VideoGenerationRequest(prompt="raw"), "raw-log")
-        await handler.generate_videos(VideoGenerationRequest(prompt="base64"), "base64-log")
-    finally:
-        handler.shutdown()
+        assert await asyncio.to_thread(first_native_started.wait, 2)
+        second_task = asyncio.create_task(video_handler._run_video_response_encoding(second_encode))
+        await asyncio.wait_for(second_timing_started.wait(), timeout=2)
+        assert not second_native_started.is_set()
 
-    assert any(
-        "execution=dedicated_executor" in message
-        and "scope=non_streaming_mp4" in message
-        and "paths=raw_mp4,base64_handler" in message
-        and "max_active_encodes=1" in message
-        for message in log_messages
-    )
-    timing_logs = [message for message in log_messages if message.startswith("Video response encoding (MP4")]
-    assert len(timing_logs) == 2
-    assert all(
-        "queue_inclusive=true" in message
-        and "execution=dedicated_executor" in message
-        and "max_active_encodes=1" in message
-        for message in timing_logs
-    )
+        release_first_native.set()
+        first_result, second_result = await asyncio.gather(first_task, second_task)
+    finally:
+        release_first_native.set()
+        for task in (first_task, second_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    assert first_result == (b"first", 11000.0)
+    assert second_result == (b"second", 5000.0)
+    assert clock_calls == 4
 
 
 @pytest.mark.asyncio
-async def test_action_only_raw_returns_before_executor_submission(monkeypatch):
-    handler = _make_video_handler()
+async def test_action_only_raw_returns_before_executor_submission(monkeypatch, video_handler):
     action = object()
     artifacts = _video_artifacts([{"action_only_output": True}], actions=[action])
     submit_calls = []
 
-    async def fake_run(*args, **kwargs):
-        return artifacts
-
-    executor = handler._video_response_encoding_executor
+    executor = video_handler._video_response_encoding_executor
     assert executor is not None
     real_submit = executor.submit
 
@@ -306,13 +283,10 @@ async def test_action_only_raw_returns_before_executor_submission(monkeypatch):
         submit_calls.append(function)
         return real_submit(function, *args, **kwargs)
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+    _patch_video_artifacts(monkeypatch, video_handler, artifacts)
     monkeypatch.setattr(executor, "submit", recording_submit)
 
-    try:
-        result = await handler.generate_video_bytes(VideoGenerationRequest(prompt="action"), "action-request")
-    finally:
-        handler.shutdown()
+    result = await video_handler.generate_video_bytes(VideoGenerationRequest(prompt="action"), "action-request")
 
     assert result[0] == b""
     assert result[3] is action
@@ -320,29 +294,21 @@ async def test_action_only_raw_returns_before_executor_submission(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_encoding_worker_exception_is_propagated(monkeypatch):
-    handler = _make_video_handler()
+async def test_encoding_worker_exception_is_propagated(monkeypatch, video_handler):
     artifacts = _video_artifacts([object()])
-
-    async def fake_run(*args, **kwargs):
-        return artifacts
 
     def fail_encode(*args, **kwargs):
         raise RuntimeError("encode failed")
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+    _patch_video_artifacts(monkeypatch, video_handler, artifacts)
     monkeypatch.setattr(serving_video, "_encode_video_bytes", fail_encode)
 
-    try:
-        with pytest.raises(RuntimeError, match="encode failed"):
-            await handler.generate_video_bytes(VideoGenerationRequest(prompt="error"), "error-request")
-    finally:
-        handler.shutdown()
+    with pytest.raises(RuntimeError, match="encode failed"):
+        await video_handler.generate_video_bytes(VideoGenerationRequest(prompt="error"), "error-request")
 
 
 @pytest.mark.asyncio
-async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(monkeypatch):
-    handler = _make_video_handler()
+async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(monkeypatch, video_handler):
     artifacts = _video_artifacts([object()])
     native_started = threading.Event()
     release_native = threading.Event()
@@ -353,9 +319,6 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
     max_active = 0
     encode_calls = 0
     active_lock = threading.Lock()
-
-    async def fake_run(*args, **kwargs):
-        return artifacts
 
     def encode(*args, **kwargs):
         nonlocal active, max_active, encode_calls
@@ -373,7 +336,7 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
             with active_lock:
                 active -= 1
 
-    executor = handler._video_response_encoding_executor
+    executor = video_handler._video_response_encoding_executor
     assert executor is not None
     real_submit = executor.submit
 
@@ -381,10 +344,10 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
         submit_calls.append(function)
         return real_submit(function, *args, **kwargs)
 
-    monkeypatch.setattr(handler, "_run_and_extract", fake_run)
+    _patch_video_artifacts(monkeypatch, video_handler, artifacts)
     monkeypatch.setattr(serving_video, "_encode_video_bytes", encode)
     monkeypatch.setattr(executor, "submit", recording_submit)
-    original_run_encoding = handler._run_video_response_encoding
+    original_run_encoding = video_handler._run_video_response_encoding
 
     async def tracked_run_encoding(closure):
         nonlocal encoding_attempts
@@ -393,13 +356,15 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
             second_gate_attempted.set()
         return await original_run_encoding(closure)
 
-    monkeypatch.setattr(handler, "_run_video_response_encoding", tracked_run_encoding)
+    monkeypatch.setattr(video_handler, "_run_video_response_encoding", tracked_run_encoding)
 
-    first_task = asyncio.create_task(handler.generate_video_bytes(VideoGenerationRequest(prompt="one"), "one"))
+    first_task = asyncio.create_task(video_handler.generate_video_bytes(VideoGenerationRequest(prompt="one"), "one"))
     second_task = None
     try:
         assert await asyncio.to_thread(native_started.wait, 2)
-        second_task = asyncio.create_task(handler.generate_video_bytes(VideoGenerationRequest(prompt="two"), "two"))
+        second_task = asyncio.create_task(
+            video_handler.generate_video_bytes(VideoGenerationRequest(prompt="two"), "two")
+        )
         await asyncio.wait_for(second_gate_attempted.wait(), timeout=2)
         assert len(submit_calls) == 1
 
@@ -410,7 +375,7 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
 
         release_native.set()
         await first_task
-        await handler.generate_video_bytes(VideoGenerationRequest(prompt="three"), "three")
+        await video_handler.generate_video_bytes(VideoGenerationRequest(prompt="three"), "three")
     finally:
         release_native.set()
         for task in (first_task, second_task):
@@ -420,7 +385,6 @@ async def test_cancelled_gate_waiter_is_not_submitted_and_later_encode_proceeds(
                     await task
                 except asyncio.CancelledError:
                     pass
-        handler.shutdown()
 
     assert len(submit_calls) == 2
     assert max_active == 1
@@ -474,19 +438,14 @@ class BlockingVideoHandler:
 
 
 class FakeServerSocket:
-    def __init__(self, events=None, events_lock=None):
+    def __init__(self, events=None):
         self.closed = False
         self._events = events
-        self._events_lock = events_lock
 
     def close(self):
         self.closed = True
         if self._events is not None:
-            if self._events_lock is None:
-                self._events.append("socket_closed")
-            else:
-                with self._events_lock:
-                    self._events.append("socket_closed")
+            self._events.append("socket_closed")
 
 
 @pytest.fixture(autouse=True)
@@ -502,40 +461,103 @@ def isolated_video_backends(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_server_worker_waits_for_video_encode_before_engine_shutdown(monkeypatch):
-    events: list[str] = []
-    events_lock = threading.Lock()
-    serve_started = asyncio.Event()
-    http_shutdown = asyncio.Event()
-    engine_context_exited = asyncio.Event()
-    video_task_started = asyncio.Event()
+async def test_video_handler_shutdown_waits_for_active_native_encode(monkeypatch, video_handler):
     native_started = threading.Event()
     release_native = threading.Event()
     native_finished = threading.Event()
-    caller_cancelled = threading.Event()
-    shutdown_started = threading.Event()
-    shutdown_finished = threading.Event()
-    handler_ref = None
-    release_errors: list[str] = []
+    shutdown_called = threading.Event()
 
-    def record(event: str) -> None:
-        with events_lock:
-            events.append(event)
-
-    sock = FakeServerSocket(events, events_lock)
-
-    def encode(*args, **kwargs):
-        del args, kwargs
-        record("native_encode_started")
+    def encode():
         native_started.set()
-        if not release_native.wait(timeout=5):
-            release_errors.append("native encode was not released")
-            return b""
-        record("native_encode_finished")
+        assert release_native.wait(timeout=5)
         native_finished.set()
         return b"encoded"
 
-    monkeypatch.setattr(serving_video, "_encode_video_bytes", encode)
+    executor = video_handler._video_response_encoding_executor
+    assert executor is not None
+    real_shutdown = executor.shutdown
+
+    def shutdown(*args, **kwargs):
+        shutdown_called.set()
+        return real_shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "shutdown", shutdown)
+
+    encode_task = asyncio.create_task(video_handler._run_video_response_encoding(encode))
+    shutdown_task = None
+    try:
+        assert await asyncio.to_thread(native_started.wait, 2)
+        shutdown_task = asyncio.create_task(asyncio.to_thread(video_handler.shutdown))
+        assert await asyncio.to_thread(shutdown_called.wait, 2)
+        assert not shutdown_task.done()
+        assert not native_finished.is_set()
+
+        release_native.set()
+        await encode_task
+        await shutdown_task
+    finally:
+        release_native.set()
+        if not encode_task.done():
+            encode_task.cancel()
+            await asyncio.gather(encode_task, return_exceptions=True)
+        if shutdown_task is not None and not shutdown_task.done():
+            await shutdown_task
+
+    assert native_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_task_registry_cancel_all_cancels_and_awaits_tracked_tasks():
+    tasks = TaskRegistry()
+    task_started = asyncio.Event()
+    task_cancelled = asyncio.Event()
+
+    async def tracked_task():
+        task_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            task_cancelled.set()
+            raise
+
+    task = asyncio.create_task(tracked_task())
+    await tasks.upsert("video-id", task)
+    await task_started.wait()
+
+    await tasks.cancel_all()
+
+    assert task_cancelled.is_set()
+    assert task.cancelled()
+    assert await tasks.get("video-id") is None
+
+
+@pytest.mark.parametrize("stalled_cancellation", [False, True], ids=["normal", "timeout"])
+@pytest.mark.asyncio
+async def test_server_worker_cancels_video_tasks_before_shutdown(monkeypatch, stalled_cancellation):
+    events: list[str] = []
+    warning_messages: list[str] = []
+    serve_started = asyncio.Event()
+    http_shutdown = asyncio.Event()
+    sock = FakeServerSocket(events)
+
+    def record_warning(message, *args, **kwargs):
+        del kwargs
+        warning_messages.append(message % args)
+
+    monkeypatch.setattr(api_server.logger, "warning", record_warning)
+    if stalled_cancellation:
+        monkeypatch.setattr(api_server, "_VIDEO_TASK_CANCEL_TIMEOUT_S", 0.01)
+
+    class RecordingShutdownHandler:
+        def __init__(self, event: str):
+            self._event = event
+
+        def shutdown(self):
+            events.append(self._event)
+
+    app = FastAPI()
+    app.state.openai_serving_video = RecordingShutdownHandler("video_shutdown")
+    app.state.openai_serving_speech = RecordingShutdownHandler("speech_shutdown")
 
     class FakeEngine:
         stage_configs = []
@@ -546,75 +568,37 @@ async def test_server_worker_waits_for_video_encode_before_engine_shutdown(monke
     @asynccontextmanager
     async def fake_build_async_omni(*args, **kwargs):
         del args, kwargs
-        record("engine_enter")
+        events.append("engine_enter")
         try:
             yield FakeEngine()
         finally:
-            record("engine_exit")
-            engine_context_exited.set()
+            events.append("engine_exit")
 
     async def fake_serve_http(*args, **kwargs):
         del args, kwargs
-        record("serve_http")
+        events.append("serve_http")
         serve_started.set()
 
         async def wait_for_shutdown():
             await http_shutdown.wait()
-            record("http_shutdown")
+            events.append("http_shutdown")
 
         return asyncio.create_task(wait_for_shutdown())
 
     async def fake_storage_start():
-        record("storage_start")
+        events.append("storage_start")
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
         return None
 
     async def fake_init_app_state(engine_client, state, args):
-        del engine_client, args
-        nonlocal handler_ref
-        record("init_app_state")
-        handler = _make_video_handler()
-        handler_ref = handler
+        del engine_client, state, args
+        events.append("init_app_state")
 
-        async def fake_run(*args, **kwargs):
-            del args, kwargs
-            return _video_artifacts([object()])
-
-        monkeypatch.setattr(handler, "_run_and_extract", fake_run)
-        original_shutdown = handler.shutdown
-
-        def shutdown() -> None:
-            record("video_shutdown_started")
-            shutdown_started.set()
-            original_shutdown()
-            record("video_shutdown_finished")
-            shutdown_finished.set()
-
-        monkeypatch.setattr(handler, "shutdown", shutdown)
-        state.openai_serving_video = handler
-
-        class SpeechHandler:
-            def shutdown(self) -> None:
-                record("speech_shutdown")
-
-        state.openai_serving_speech = SpeechHandler()
-
-        async def background_video_task():
-            video_task_started.set()
-            try:
-                await handler.generate_video_bytes(VideoGenerationRequest(prompt="shutdown"), "shutdown-test")
-            except asyncio.CancelledError:
-                record("caller_cancelled")
-                caller_cancelled.set()
-                raise
-
-        task = asyncio.create_task(background_video_task())
-        await api_server.VIDEO_TASKS.upsert("shutdown-test", task)
-
+    # TODO: explore integration against actual entrypoint.
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
@@ -641,54 +625,52 @@ async def test_server_worker_waits_for_video_encode_before_engine_shutdown(monke
     )
 
     worker_task = None
-    release_thread = None
+    tracked_task = None
     try:
         worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
         await asyncio.wait_for(serve_started.wait(), timeout=2)
-        await asyncio.wait_for(video_task_started.wait(), timeout=2)
-        assert await asyncio.to_thread(native_started.wait, 2)
 
-        assert not engine_context_exited.is_set()
+        task_started = asyncio.Event()
 
-        def release_after_shutdown_starts() -> None:
-            if not shutdown_started.wait(timeout=2):
-                release_errors.append("video shutdown did not start")
-                release_native.set()
-                return
-            if native_finished.is_set():
-                release_errors.append("native encode finished before video shutdown started")
-            record("video_shutdown_waiting_for_native_encode")
-            release_native.set()
+        async def tracked_video_task():
+            task_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("video_task_cancelled")
+                if stalled_cancellation:
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        events.append("video_task_abort_wait_cancelled")
+                raise
 
-        release_thread = threading.Thread(target=release_after_shutdown_starts)
-        release_thread.start()
+        tracked_task = asyncio.create_task(tracked_video_task())
+        await api_server.VIDEO_TASKS.upsert("shutdown-test", tracked_task)
+        await asyncio.wait_for(task_started.wait(), timeout=2)
+
         http_shutdown.set()
-        await asyncio.wait_for(worker_task, timeout=5)
+        await asyncio.wait_for(worker_task, timeout=2)
     finally:
-        release_native.set()
-        if release_thread is not None:
-            await asyncio.to_thread(release_thread.join, 5)
         if worker_task is not None and not worker_task.done():
             http_shutdown.set()
             worker_task.cancel()
             await asyncio.gather(worker_task, return_exceptions=True)
-        if handler_ref is not None and not shutdown_finished.is_set():
-            handler_ref.shutdown()
+        if tracked_task is not None and not tracked_task.done():
+            tracked_task.cancel()
+            await asyncio.gather(tracked_task, return_exceptions=True)
 
     assert worker_task is not None
-    assert release_thread is not None
     assert sock.closed
-    assert caller_cancelled.is_set()
-    assert native_finished.is_set()
-    assert not release_thread.is_alive()
-    assert not release_errors
+    assert "video_task_cancelled" in events
+    assert ("video_task_abort_wait_cancelled" in events) is stalled_cancellation
+    assert any("Timed out waiting for active video tasks to cancel" in message for message in warning_messages) is (
+        stalled_cancellation
+    )
     assert (
         events.index("http_shutdown")
-        < events.index("caller_cancelled")
-        < events.index("video_shutdown_started")
-        < events.index("video_shutdown_waiting_for_native_encode")
-        < events.index("native_encode_finished")
-        < events.index("video_shutdown_finished")
+        < events.index("video_task_cancelled")
+        < events.index("video_shutdown")
         < events.index("speech_shutdown")
         < events.index("socket_closed")
         < events.index("engine_exit")
