@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """Unit tests for the Omni serve CLI helpers."""
 
 from __future__ import annotations
@@ -77,55 +74,6 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
 
     assert args.cfg_parallel_size == 4
-
-
-def test_serve_parser_defaults_to_unconfigured_video_response_frame_conversion() -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    OmniServeCommand().subparser_init(subparsers)
-
-    args = parser.parse_args(["serve", "fake-model", "--omni"])
-
-    assert args.video_response_frame_conversion_workers is None
-    assert "video_response_frame_conversion_workers" not in args.get_explicit_kwargs_dict()
-
-
-@pytest.mark.parametrize("workers", [1, 2, 4, 8, 9, 32])
-def test_serve_parser_accepts_video_response_frame_conversion_workers(workers: int) -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    OmniServeCommand().subparser_init(subparsers)
-
-    args = parser.parse_args(
-        [
-            "serve",
-            "fake-model",
-            "--omni",
-            "--video-response-frame-conversion-workers",
-            str(workers),
-        ]
-    )
-
-    assert args.video_response_frame_conversion_workers == workers
-    assert args.get_explicit_kwargs_dict()["video_response_frame_conversion_workers"] == workers
-
-
-@pytest.mark.parametrize("workers", ["0", "-1", "1.0", "not-an-int"])
-def test_serve_parser_rejects_invalid_video_response_frame_conversion_workers(workers: str) -> None:
-    parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
-    OmniServeCommand().subparser_init(subparsers)
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            [
-                "serve",
-                "fake-model",
-                "--omni",
-                "--video-response-frame-conversion-workers",
-                workers,
-            ]
-        )
 
 
 def _make_headless_args(**kwargs) -> TrackingNamespace:

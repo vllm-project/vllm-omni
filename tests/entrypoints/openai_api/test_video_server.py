@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
 
-import argparse
 import asyncio
 import base64
 import io
@@ -40,7 +39,6 @@ from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -91,15 +89,13 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-@pytest.mark.parametrize("workers", [None, 8], ids=["omitted", "configured"])
-def test_raw_and_base64_encoders_receive_worker_configuration(mocker: MockerFixture, workers: int | None):
+def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
-    handler_kwargs = {} if workers is None else {"video_response_frame_conversion_workers": workers}
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
-        **handler_kwargs,
     )
+    assert handler._video_frame_converter.max_workers == 8
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"encoded-video",
@@ -116,75 +112,9 @@ def test_raw_and_base64_encoders_receive_worker_configuration(mocker: MockerFixt
 
     asyncio.run(_generate_both_response_types())
 
-    assert raw_encoder.call_args.kwargs["frame_conversion_workers"] == workers
-    assert base64_encoder.call_args.kwargs["frame_conversion_workers"] == workers
-
-
-@pytest.mark.parametrize(
-    ("workers", "mode", "requested_workers", "effective_workers"),
-    [
-        (None, "baseline_unconfigured", "unset", "1"),
-        (1, "configured_serial", "1", "1"),
-        (32, "configured_parallel", "32", "min(requested_workers, frame_count)"),
-    ],
-)
-def test_startup_log_describes_frame_conversion_configuration(
-    mocker: MockerFixture,
-    workers: int | None,
-    mode: str,
-    requested_workers: str,
-    effective_workers: str,
-) -> None:
-    startup_log = mocker.patch("vllm_omni.entrypoints.openai.serving_video.logger.info")
-
-    handler_kwargs = {} if workers is None else {"video_response_frame_conversion_workers": workers}
-    OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model", **handler_kwargs)
-
-    message, *args = startup_log.call_args.args
-    rendered_message = message % tuple(args)
-    assert f"mode={mode}" in rendered_message
-    assert f"requested_workers={requested_workers}" in rendered_message
-    assert "scope=non-streaming direct_planar MP4 response encoding" in rendered_message
-    assert f"effective_workers={effective_workers}" in rendered_message
-
-
-@pytest.mark.asyncio
-async def test_frame_conversion_workers_are_removed_before_async_omni_construction(monkeypatch):
-    captured = {}
-
-    class FakeEngine:
-        def shutdown(self):
-            captured["shutdown"] = True
-
-    def fake_async_omni(model, **kwargs):
-        captured["model"] = model
-        captured["kwargs"] = kwargs
-        return FakeEngine()
-
-    monkeypatch.setattr(api_server, "AsyncOmni", fake_async_omni)
-    args = TrackingNamespace(
-        unfiltered_ns=argparse.Namespace(
-            model="fake-model",
-            video_response_frame_conversion_workers=8,
-            some_engine_arg="kept",
-            disable_log_stats=False,
-            trust_remote_code=False,
-        ),
-        explicit_keys=frozenset(
-            {
-                "model",
-                "video_response_frame_conversion_workers",
-                "some_engine_arg",
-            }
-        ),
-    )
-
-    async with api_server.build_async_omni_from_stage_config(args) as engine:
-        assert isinstance(engine, FakeEngine)
-
-    assert captured["model"] == "fake-model"
-    assert captured["kwargs"] == {"some_engine_arg": "kept", "log_stats": True}
-    assert captured["shutdown"] is True
+    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    handler.shutdown()
 
 
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
@@ -1285,9 +1215,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
-        frame_conversion_workers=None,
+        frame_converter=None,
     ):
-        del video, fps, audio, video_codec_options, frame_conversion_workers
+        del video, fps, audio, video_codec_options, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

@@ -58,17 +58,6 @@ def _nonneg_finite_float(value: str) -> float:
     return parsed
 
 
-def _video_response_frame_conversion_workers(value: str) -> int:
-    """Argparse type for a positive CPU frame-conversion worker count."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(f"invalid worker count: {value!r}") from exc
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("worker count must be a positive integer")
-    return parsed
-
-
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -842,16 +831,6 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
-        )
-        omni_config_group.add_argument(
-            "--video-response-frame-conversion-workers",
-            type=_video_response_frame_conversion_workers,
-            default=None,
-            help=(
-                "Opt into configurable CPU planar-frame conversion for non-streaming MP4 responses with a "
-                "positive worker count. Omitting this option preserves baseline serial conversion; configured "
-                "worker counts are clamped to each request's frame count."
-            ),
         )
         # TTS-specific parameters
         omni_config_group.add_argument(

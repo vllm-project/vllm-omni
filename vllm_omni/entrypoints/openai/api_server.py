@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import base64
 import dataclasses
@@ -613,6 +613,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
+            if serving_video is not None:
+                serving_video.shutdown()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -717,10 +720,6 @@ async def build_async_omni_from_stage_config(
     try:
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
-        # Frame conversion is an API-process response policy, not an engine
-        # argument. Keep it out of AsyncOmni while passing it to the video
-        # handler in both pure and multistage modes.
-        kwargs.pop("video_response_frame_conversion_workers", None)
         kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
 
@@ -816,7 +815,6 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
-            video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", None),
         )
         state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
             engine_client=engine_client,
@@ -1181,7 +1179,6 @@ async def omni_init_app_state(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
-        video_response_frame_conversion_workers=getattr(args, "video_response_frame_conversion_workers", None),
     )
     state.openai_serving_realtime_robot = None
 
