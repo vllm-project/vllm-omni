@@ -115,6 +115,32 @@ shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
+For a serialized ModelOpt FP8 or NVFP4 checkpoint, an experimental
+mixed-precision schedule can use native W8A8/W4A4 in middle denoising steps
+and dense W8A16/W4A16 in the first and last steps:
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config \
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+```
+
+The nested object's presence enables the schedule; use an empty object for
+these defaults.
+This path currently requires tensor parallel size 1 and does not support HSDP
+or block-scaled FP8. It keeps one live quantized weight representation:
+scheduled FP8 requires serialized tensorwise scales and a canonical backend,
+while scheduled NVFP4 requires a supported CUTLASS-compatible native or
+FlashInfer layout. Its dequantization is a correctness baseline; no speedup is
+implied. Quantized reasoner weights use A16 by default; set
+`"reasoner":"native"` in the nested object to keep W8A8/W4A4.
+FP8 and NVFP4 are inferred independently from each ModelOpt linear method;
+BF16 linears are left unchanged. The schedule currently supports one active
+request per worker. Model-level and layer-wise offload are designed to work
+with this live-weight path but still require GPU validation. Distributed
+layer-wise offload and incompatible native weight layouts fail during loading.
+
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with

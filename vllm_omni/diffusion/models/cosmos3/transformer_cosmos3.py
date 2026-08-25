@@ -40,6 +40,11 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
 
+from .mixed_precision import (
+    Cosmos3MixedPrecisionConfig,
+    Cosmos3MixedPrecisionRuntime,
+)
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
@@ -134,6 +139,26 @@ def _od_config_get(od_config: Any, key: str, default: Any = None) -> Any:
             return found
     value = _tf_config_get(tf_model_config, key, None)
     return default if value is None else value
+
+
+def _validate_mixed_precision_runtime(
+    config: Cosmos3MixedPrecisionConfig | None,
+    od_config: OmniDiffusionConfig,
+) -> None:
+    if config is None:
+        return
+    if get_tensor_model_parallel_world_size() != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    if int(getattr(od_config, "max_num_seqs", 1)) != 1:
+        raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
+    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+        raise ValueError(
+            "Cosmos3 mixed precision does not support distributed layer-wise offload "
+            "because its direct loader bypasses ModelOpt post-load transformations"
+        )
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if bool(getattr(parallel_config, "use_hsdp", False)):
+        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
 
 
 def _as_bool(value: Any) -> bool:
@@ -1130,6 +1155,10 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        mixed_precision_config = Cosmos3MixedPrecisionConfig.from_additional_config(
+            getattr(od_config, "additional_config", None)
+        )
+        _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
         self.language_model = self._language_model_cls(
             hidden_size=self.hidden_size,
@@ -1188,6 +1217,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 for i in range(self.num_hidden_layers)
             ]
         )
+
+        self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
+        if mixed_precision_config is not None:
+            self.mixed_precision_runtime = Cosmos3MixedPrecisionRuntime(mixed_precision_config)
+            self.mixed_precision_runtime.install(self)
 
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
@@ -1855,3 +1889,11 @@ class Cosmos3VFMTransformer(nn.Module):
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
         self.time_embedder.to(torch.float32)
+
+    def set_mixed_precision_step(self, step_index: int, num_steps: int) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.set_step(step_index, num_steps)
+
+    def reset_mixed_precision(self) -> None:
+        if self.mixed_precision_runtime is not None:
+            self.mixed_precision_runtime.reset()

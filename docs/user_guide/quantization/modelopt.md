@@ -204,6 +204,49 @@ omni = Omni(
 | `--linear-backend cutlass` | str | auto | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
 | `--moe-backend cutlass` | str | auto | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints |
 
+## Cosmos3 Mixed-Precision Schedule
+
+The experimental Cosmos3 schedule can use the checkpoint-native quantized GEMM for middle denoising
+steps and dense 16-bit activation execution for selected first and last steps.
+The schedule supports serialized ModelOpt FP8 and NVFP4 checkpoints:
+
+| Detected weight format | Native middle steps | A16 boundary steps |
+|------------------------|---------------------|--------------------|
+| FP8 | W8A8 | W8A16 |
+| NVFP4 | W4A4 | W4A16 |
+
+The native and A16 paths share one quantized weight representation. The A16
+path dequantizes the live backend weight and calls `F.linear`; it does not keep
+a second checkpoint-weight snapshot. Scheduled FP8 currently requires
+serialized tensorwise scales and a backend that retains canonical FP8 weights.
+Scheduled NVFP4 requires a supported CUTLASS-compatible native or FlashInfer
+layout. SmoothQuant, Marlin-repacked FP8, and per-channel/per-token FP8
+schedules fail closed.
+
+The reasoner uses dense A16 execution by default when its weights are FP8 or
+NVFP4. Set the nested `reasoner` field to `native` to retain the checkpoint-native
+W8A8/W4A4 path. A BF16 reasoner remains BF16 in either mode. The schedule
+currently requires tensor parallel size 1 and one active request per worker,
+does not support HSDP, and does not support block-scaled FP8. Its live-weight
+design is compatible with model-level and standard layer-wise offload, but
+those paths still require GPU end-to-end validation. Distributed layer-wise
+offload is rejected because its direct loader bypasses ModelOpt post-load
+transformations.
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config \
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+```
+
+The presence of `cosmos3_mixed_precision` enables the schedule; an empty object
+uses the defaults shown above.
+The schedule uses vLLM's selected native backend and fails during loading if
+its live weight layout cannot support A16 dequantization.
+The runtime infers FP8 or NVFP4 independently for every ModelOpt linear method,
+so mixed checkpoints require no format selection. BF16 linears are untouched.
+
 ## Validation and Notes
 
 1. Compare the ModelOpt checkpoint against the BF16 baseline with the same
