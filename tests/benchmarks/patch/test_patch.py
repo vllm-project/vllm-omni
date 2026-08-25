@@ -16,13 +16,64 @@ from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
+    _attach_seed_tts_to_request_func_input,
     MixRequestFuncOutput,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
+    SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH,
+    SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH,
+    SEED_TTS_OFFICIAL_TTS_USER_PREFIX,
+    SeedTTSSampleRequest,
+)
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_seed_tts_zh_request_uses_official_audio_contract():
+    ref_audio = "data:audio/wav;base64,AAAA"
+    sample = SeedTTSSampleRequest(
+        prompt="目标文本",
+        prompt_len=2,
+        expected_output_len=64,
+        multi_modal_data=None,
+        request_id="seed-zh-0",
+        seed_tts_locale="zh",
+        seed_tts_speech_extra={"ref_audio": ref_audio, "ref_text": "参考"},
+        seed_tts_system_prompt=SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    )
+    rfi = SimpleNamespace(extra_body={})
+    _attach_seed_tts_to_request_func_input(sample, rfi)
+    content = rfi.omni_chat_messages[0]["content"]
+    assert [part["type"] for part in content] == ["text", "audio_url", "text"]
+    assert content[0]["text"] == SEED_TTS_OFFICIAL_VOICE_CLONE_PREFIX_ZH
+    assert content[1]["audio_url"]["url"] == ref_audio
+    assert content[2]["text"] == SEED_TTS_OFFICIAL_VOICE_CLONE_SUFFIX_ZH
+    assert rfi.extra_body["ref_audio"] == ref_audio
+    assert rfi.omni_chat_messages[1]["content"] == [
+        {"type": "text", "text": f"{SEED_TTS_OFFICIAL_TTS_USER_PREFIX} 目标文本"}
+    ]
+
+
+def test_seed_tts_missing_reference_keeps_text_only_system_message():
+    sample = SeedTTSSampleRequest(
+        prompt="target",
+        prompt_len=1,
+        expected_output_len=64,
+        multi_modal_data=None,
+        request_id="seed-zh-1",
+        seed_tts_locale="zh",
+        seed_tts_speech_extra=None,
+        seed_tts_system_prompt=SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    )
+    rfi = SimpleNamespace(extra_body=None)
+    _attach_seed_tts_to_request_func_input(sample, rfi)
+    assert rfi.omni_chat_messages[0]["content"] == [
+        {"type": "text", "text": SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT}
+    ]
 
 
 class MockResponse:

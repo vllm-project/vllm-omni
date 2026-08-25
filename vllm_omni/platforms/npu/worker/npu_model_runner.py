@@ -413,6 +413,26 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         for req_id, info in zip(self.input_batch.req_ids, infos):
             if not isinstance(info, dict):
                 continue
+            req_state = self.requests.get(req_id)
+            codes = info.get("codes")
+            if req_state is not None and isinstance(codes, dict) and codes.get("ref") is not None:
+                # The stage sender receives the scheduler request object, while
+                # NPU runtime state lives in model_intermediate_buffer. Mirror
+                # the first-chunk reference into request.additional_information
+                # so tts2code2wav can include it in the connector payload.
+                request_info = getattr(req_state, "additional_information", None)
+                request_info = dict(request_info) if isinstance(request_info, dict) else {}
+                request_codes = request_info.get("codes")
+                request_codes = dict(request_codes) if isinstance(request_codes, dict) else {}
+                request_codes["ref"] = codes["ref"]
+                request_info["codes"] = request_codes
+                meta = info.get("meta")
+                if isinstance(meta, dict) and meta.get("ref_audio_sr") is not None:
+                    request_meta = request_info.get("meta")
+                    request_meta = dict(request_meta) if isinstance(request_meta, dict) else {}
+                    request_meta["ref_audio_sr"] = meta["ref_audio_sr"]
+                    request_info["meta"] = request_meta
+                req_state.additional_information = request_info
             if info.get("request_id"):
                 continue
             meta = info.get("meta")

@@ -203,6 +203,83 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return True
         return False
 
+    @staticmethod
+    def _minicpmo45_ref_audio_uri(
+        request: Any,
+        messages: list[ChatCompletionMessageParam],
+    ) -> str | None:
+        """Find the official MiniCPM-o reference-audio request forms.
+
+        The benchmark sends ``extra_body.ref_audio`` while the official demo
+        puts an ``audio_url`` content part in the system message.  Both are
+        input data, not prompt/template controls; keep the value as a URI
+        until the existing MediaConnector materializes it below.
+        """
+        for source in (
+            getattr(request, "extra_body", None),
+            getattr(request, "model_extra", None),
+        ):
+            if isinstance(source, dict):
+                value = source.get("ref_audio")
+                if isinstance(value, str) and value:
+                    return value
+
+        value = getattr(request, "ref_audio", None)
+        if isinstance(value, str) and value:
+            return value
+
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in {
+                    "audio_url",
+                    "input_audio",
+                    "audio",
+                }:
+                    continue
+                audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
+                if isinstance(audio, dict):
+                    audio = audio.get("url") or audio.get("data")
+                if isinstance(audio, str) and audio:
+                    return audio
+        return None
+
+    async def _attach_minicpmo45_ref_audio(
+        self,
+        request: Any,
+        ref_audio_uri: str | None,
+        engine_prompt: dict[str, Any],
+    ) -> None:
+        """Materialize official ref-audio input for downstream TTS stages.
+
+        Stage 0 does not consume audio, so the renderer may legitimately omit
+        it from ``multi_modal_data``.  Preserve the existing deferred handoff
+        contract and add the supplied audio only when that handoff has not
+        already materialized it.
+        """
+        if not ref_audio_uri or not self._has_minicpmo45_stage():
+            return
+
+        additional_information = self._ensure_prompt_additional_information(engine_prompt)
+        deferred = additional_information.get("deferred_multi_modal_data")
+        if not isinstance(deferred, dict):
+            deferred = {}
+        if deferred.get("audio"):
+            return
+
+        media_connector = MediaConnector(
+            media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            allowed_local_media_path=getattr(self.model_config, "allowed_local_media_path", "") or "",
+            allowed_media_domains=getattr(self.model_config, "allowed_media_domains", None),
+        )
+        fetch_audio = getattr(media_connector, "fetch_audio_async", None)
+        if fetch_audio is None:
+            return
+        deferred["audio"] = [await fetch_audio(ref_audio_uri)]
+        additional_information["deferred_multi_modal_data"] = deferred
+
     def _fix_minicpmo45_audio_stream_output_kinds(
         self,
         sampling_params_list: list[Any],
@@ -772,6 +849,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
+        # Capture before the multimodal split strips audio parts from the
+        # stage-0 conversation.  The URI is materialized after rendering.
+        ref_audio_uri = self._minicpmo45_ref_audio_uri(request, messages)
         deferred_multi_modal_data: dict[str, Any] | None = None
         if self._needs_multistage_multimodal_split():
             messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
@@ -831,6 +911,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if deferred_multi_modal_data:
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
             prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
+
+        await self._attach_minicpmo45_ref_audio(request, ref_audio_uri, engine_prompt)
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())

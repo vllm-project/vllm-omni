@@ -507,6 +507,34 @@ class OmniConnectorModelRunnerMixin:
             return codes.get("audio")
         return None
 
+    @staticmethod
+    def _preserve_reference_audio(request: Any, payload: Any) -> None:
+        """Carry first-chunk reference audio across the async receive boundary.
+
+        Generation-mode connector payloads are consumed as prompt token ids,
+        while Code2Wav still needs the original ``codes.ref`` waveform.  Keep
+        that field on the request state as well as in the staged payload so a
+        scheduler refresh cannot replace it with token-only metadata.
+        """
+        if request is None or not isinstance(payload, dict):
+            return
+        codes = payload.get("codes")
+        if not isinstance(codes, dict) or codes.get("ref") is None:
+            return
+        info = getattr(request, "additional_information", None)
+        info = dict(info) if isinstance(info, dict) else {}
+        info_codes = info.get("codes")
+        info_codes = dict(info_codes) if isinstance(info_codes, dict) else {}
+        info_codes["ref"] = codes["ref"]
+        info["codes"] = info_codes
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and meta.get("ref_audio_sr") is not None:
+            info_meta = info.get("meta")
+            info_meta = dict(info_meta) if isinstance(info_meta, dict) else {}
+            info_meta["ref_audio_sr"] = meta["ref_audio_sr"]
+            info["meta"] = info_meta
+        request.additional_information = info
+
     @classmethod
     def _payload_is_consumable(cls, payload: OmniPayload | None) -> bool:
         """Return True when an async payload can drive a real forward step.
@@ -1766,6 +1794,11 @@ class OmniConnectorModelRunnerMixin:
                 sorted(payload_data.keys()),
                 self._payload_finished(payload_data),
             )
+
+        # Preserve voice-cloning input before generation-mode scheduling
+        # reduces the payload to codec token ids.
+        if self._model_mode != "ar":
+            self._preserve_reference_audio(self.requests.get(req_id), payload_data)
 
         self._get_req_chunk[req_id] += 1
 

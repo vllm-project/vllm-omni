@@ -1337,6 +1337,21 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache.pop(req_id, None)
         for req_id, payload in staged.items():
             self._update_intermediate_buffer(req_id, payload)
+            # Generation-mode connectors expose codec audio as prompt ids, but
+            # Code2Wav also needs the first-chunk reference waveform. The
+            # receiver mirrors it onto request.additional_information; merge
+            # that small metadata subset into the runner-owned buffer here on
+            # the model thread.
+            request = self.requests.get(req_id)
+            request_info = getattr(request, "additional_information", None)
+            if isinstance(request_info, dict):
+                codes = request_info.get("codes")
+                if isinstance(codes, dict) and codes.get("ref") is not None:
+                    update = {"codes": {"ref": codes["ref"]}}
+                    meta = request_info.get("meta")
+                    if isinstance(meta, dict) and meta.get("ref_audio_sr") is not None:
+                        update["meta"] = {"ref_audio_sr": meta["ref_audio_sr"]}
+                    self._update_intermediate_buffer(req_id, update)
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
