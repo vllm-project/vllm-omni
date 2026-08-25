@@ -310,12 +310,18 @@ class MiniCPMO45Code2Wav(nn.Module):
         normalized = [int(value) for value in counts]
         if any(value < 0 for value in normalized):
             raise _batch_error("negative_seq_token_count", counts=normalized)
-        if sum(normalized) != int(flat.numel()):
+        total = sum(normalized)
+        if total > int(flat.numel()):
             raise _batch_error(
                 "seq_token_count_mismatch",
                 counts=normalized,
                 total=int(flat.numel()),
             )
+        # Graph mode pads input_ids up to a captured batch size while
+        # seq_token_counts keeps the real per-request counts, so the tail
+        # belongs to no request and must be dropped rather than rejected.
+        # In eager mode total == numel and this slice is a no-op.
+        flat = flat[:total]
         return list(torch.split(flat, normalized))
 
     def _parse_item(
