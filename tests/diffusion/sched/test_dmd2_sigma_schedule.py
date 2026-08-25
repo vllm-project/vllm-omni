@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import pytest
 
 from vllm_omni.diffusion.sched import DMD2SigmaSchedule
@@ -50,3 +50,10 @@ def test_absent_metadata_key_means_undistilled_but_empty_is_malformed():
     assert DMD2SigmaSchedule.from_metadata({"base_schedule": [1.0, 0.5, 0.0]}).base_schedule == (1.0, 0.5, 0.0)
     with pytest.raises(ValueError):
         DMD2SigmaSchedule.from_metadata({"base_schedule": []})
+
+
+def test_safetensors_metadata_parses_comma_separated_schedule():
+    schedule = DMD2SigmaSchedule.from_safetensors_metadata({"base_schedule": "1.0,0.7,0.4,0.15,0.0"})
+
+    assert schedule is not None
+    assert schedule.num_inference_steps == 4
