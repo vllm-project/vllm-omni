@@ -172,6 +172,7 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
         assert context.temb is not None
 
     @pytest.mark.cpu
+
     def test_invalid_module_raises_error(self):
         """Test that invalid module without transformer_blocks raises ValueError."""
         invalid_module = Mock()
@@ -737,8 +738,9 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch,
     ):
         """Strict SP must not mix local TeaCache state with gathered block rows."""
-        from vllm_omni.diffusion.cache.teacache import extractors as extractors_module
+        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
         from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+        from vllm_omni.diffusion.distributed import parallel_state
         from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 
         seq_len = sample_inputs["x"].shape[1]
@@ -771,6 +773,21 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
                 assert tensor.shape == (local_len, video_width + audio_width)
                 return tensor
 
+        class _StrictSPGroup:
+            def __init__(self):
+                super().__init__()
+                self.local_decisions: list[int] = []
+                self.ops = []
+
+            def all_reduce(self, decision, op):
+                self.local_decisions.append(int(decision.item()))
+                self.ops.append(op)
+                # Simulate another rank requiring the second step to execute
+                # the collective block path even though this rank would cache.
+                if len(self.local_decisions) == 2:
+                    decision.fill_(1)
+                return decision
+
         class _StrictSPBlock(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -799,6 +816,7 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
 
         local_prepare = _StrictSPPrepare()
         gather = _StrictSPGather()
+        sp_group = _StrictSPGroup()
         block = _StrictSPBlock()
         minimax_h3_module.local_sp_prepare = local_prepare
         minimax_h3_module.sp_gather = gather
@@ -818,14 +836,15 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
             "prepare_rope_table",
             lambda *args, **kwargs: torch.zeros(local_len, 6, dtype=torch.float32),
         )
+        monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
 
-        original_indexed_scale_shift = extractors_module.indexed_scale_shift_
+        original_indexed_scale_shift = minimax_h3_modulation.indexed_scale_shift_
 
         def capture_indexed_scale_shift(hidden, shift, scale, indices):
             captured_modulation_indices.append(indices.clone())
             return original_indexed_scale_shift(hidden, shift, scale, indices)
 
-        monkeypatch.setattr(extractors_module, "indexed_scale_shift_", capture_indexed_scale_shift)
+        monkeypatch.setattr(minimax_h3_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
 
         local_img_pos = torch.tensor([0, 1])
         local_audio_pos = torch.tensor([2, 3])
@@ -859,19 +878,66 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         hook.initialize_hook(minimax_h3_module)
 
         hook.new_forward(minimax_h3_module, **inputs)
+        hook.new_forward(minimax_h3_module, **inputs)
         video_logits, audio_logits = hook.new_forward(minimax_h3_module, **inputs)
         state = hook.state_manager.get_state()
 
         assert state.previous_residual is not None
         assert state.previous_residual.shape == (local_len, hidden_size)
-        assert len(captured_modulation_indices) == 2
+        assert len(captured_modulation_indices) == 3
         assert all(torch.equal(indices, expected_local_indices) for indices in captured_modulation_indices)
-        assert len(local_prepare.global_indices) == 1
-        assert local_prepare.global_indices[0].shape == (seq_len,)
-        assert torch.equal(block.block_indices[0], expected_local_indices)
-        assert len(gather.inputs) == 2
+        assert sp_group.local_decisions == [1, 0, 0]
+        assert len(sp_group.ops) == 3
+        assert all(op == torch.distributed.ReduceOp.MAX for op in sp_group.ops)
+        assert len(local_prepare.global_indices) == 2
+        assert all(indices.shape == (seq_len,) for indices in local_prepare.global_indices)
+        assert len(block.block_indices) == 2
+        assert all(torch.equal(indices, expected_local_indices) for indices in block.block_indices)
+        assert len(gather.inputs) == 3
         assert video_logits.shape == (local_img_pos.numel(), video_width)
         assert audio_logits.shape == (local_audio_pos.numel(), audio_width)
+
+    @pytest.mark.cpu
+    def test_teacache_non_strict_sp_gathers_hidden_once(
+        self,
+        minimax_h3_module,
+        sample_inputs,
+        monkeypatch,
+    ):
+        """The non-strict SP cache path must not gather global hidden rows twice."""
+        from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+        from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+
+        class _Prepare(nn.Module):
+            def forward(self, hidden, rope_table, combined_indices):
+                return hidden, rope_table, combined_indices
+
+        class _Gather(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inputs: list[torch.Tensor] = []
+
+            def forward(self, tensor):
+                self.inputs.append(tensor.clone())
+                return tensor
+
+        seq_len = sample_inputs["x"].shape[1]
+        gather = _Gather()
+        minimax_h3_module.sp_prepare = _Prepare()
+        minimax_h3_module.sp_gather = gather
+        monkeypatch.setattr(minimax_h3_module, "_rope_local_span", lambda _seq_len: (0, seq_len))
+
+        hook = TeaCacheHook(
+            TeaCacheConfig(
+                transformer_type="MiniMaxH3DiTModel",
+                rel_l1_thresh=0.3,
+            )
+        )
+        hook.initialize_hook(minimax_h3_module)
+        hook.new_forward(minimax_h3_module, **sample_inputs)
+
+        assert len(gather.inputs) == 1
+        assert gather.inputs[0].shape == (seq_len, minimax_h3_module.hidden_size)
 
     def test_invalid_module_raises_error(self):
         """Test that invalid module without blocks raises ValueError."""

@@ -1374,6 +1374,20 @@ def extract_minimax_h3_context(
         state_combined_indices,
     )
 
+    def synchronize_cache_decision(local_should_compute: bool) -> bool:
+        if local_len == seq_len:
+            return local_should_compute
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        decision = torch.tensor(
+            int(local_should_compute),
+            dtype=torch.int32,
+            device=device,
+        )
+        get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
+        return bool(decision.item())
+
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         if local_len == seq_len:
             hidden, block_rope, block_combined = module.sp_prepare(
@@ -1407,7 +1421,6 @@ def extract_minimax_h3_context(
 
     def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if local_len == seq_len:
-            hidden = module.sp_gather(hidden)
             video_logits, audio_logits = module.final_layer(
                 hidden,
                 t_emb=t_emb,
@@ -1447,6 +1460,9 @@ def extract_minimax_h3_context(
         temb=t_emb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+        extra_states={
+            "synchronize_cache_decision": synchronize_cache_decision,
+        },
     )
 
 

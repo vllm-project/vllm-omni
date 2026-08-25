@@ -18,6 +18,7 @@ steps:
       - >-
         pytest -s -v
         tests/diffusion/layers/test_activation.py
+        tests/diffusion/layers/test_fused_qk_norm_rope_npu.py
         -m 'core_model and npu and A3'
         --run-level 'core_model'
 

@@ -8,7 +8,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
@@ -52,6 +54,7 @@ def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, t
     return q, k, q_weight, k_weight, rope_table
 
 
+@pytest.mark.cpu
 def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -101,6 +104,7 @@ def test_npu_qk_norm_rope_uses_torch_npu_fused_primitives_without_mindiesd(
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
 
 
+@pytest.mark.cpu
 def test_npu_qk_norm_rope_uses_mindiesd_and_normalizes_packed_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,3 +160,35 @@ def test_npu_qk_norm_rope_uses_mindiesd_and_normalizes_packed_layout(
     assert calls == {"rms_norm": 2, "mindiesd_rope": 2}
     torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+
+
+@hardware_test(res={"npu": "A3"}, num_cards=1)
+def test_fused_qk_norm_rope_npu_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the public Ascend dispatch with real torch_npu/MindIE operators."""
+    from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
+
+    q, k, q_weight, k_weight, rope_table = (tensor.to("npu") for tensor in _inputs())
+    calls = 0
+    original_npu_impl = fused._npu_qk_norm_rope
+
+    def capture_npu_impl(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_npu_impl(*args, **kwargs)
+
+    monkeypatch.setattr(fused, "_npu_qk_norm_rope", capture_npu_impl)
+    actual_q, actual_k = fused.fused_qk_norm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        rope_table,
+        _EPS,
+        head_dim=_HEAD_DIM,
+        rotary_dim=_ROTARY_DIM,
+    )
+    expected_q, expected_k = _reference(q, k, q_weight, k_weight, rope_table)
+
+    assert calls == 1
+    torch.testing.assert_close(actual_q, expected_q, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_k, expected_k, atol=2e-2, rtol=2e-2)
