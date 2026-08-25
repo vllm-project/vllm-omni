@@ -10,7 +10,7 @@ steps:
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
@@ -26,7 +26,7 @@ steps:
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_4
+        mirror_hardwares: a3_npu_2
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
