@@ -41,10 +41,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.distributed.omni_connectors.utils.config import (
-    get_stage_connector_role,
-    stage_sends_async_output,
-)
+from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
@@ -53,7 +50,10 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
+)
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
@@ -323,42 +323,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        # Worker-connector init is gated by a per-`model_arch` allowlist
-        # (covers both producer-side and consumer-side runners for the
-        # arches below).  Consumer-wait stages must be registered
-        # separately as `(model_arch, model_stage)` tuples in
-        # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
-        # forgetting that produces a Stage-1 hang on the consumer.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "CosyVoice3Model",
-            "NemotronDenseForCausalLM",
-            "NemotronHForCausalLM",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2TalkerForConditionalGeneration",
-            # nemotron_voicechat: the talker (stage 1) is the full-payload
-            # producer for code2wav (stage 2); the thinker (stage 0) only
-            # produces over the connector in async-chunk (streaming) mode.
-            "NemotronVoiceChatTalkerForConditionalGeneration",
-            "NemotronVoiceChatThinkerForConditionalGeneration",
-        }
-        # The stage-level ``model_arch`` override may be blank so the class
-        # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
-        # TTA/TTS thinker stages, which bind dense on the 2B and NemotronH on
-        # the 30B-A3B). Gate on the RESOLVED architectures, not only the raw
-        # override — otherwise a blank-override producer stage never creates
-        # its worker connector and the sync full-payload flush silently never
-        # runs (downstream stage starves on connector input).
-        stage_archs = set(getattr(self.model_config, "architectures", None) or ())
-        model_arch_override = getattr(self.model_config, "model_arch", None)
-        if model_arch_override:
-            stage_archs.add(model_arch_override)
-        if stage_archs & _OMNI_CONNECTOR_INIT_ARCHS or get_stage_connector_role(self.model_config) is not None:
+        # Connector init is derived from pipeline capabilities and active
+        # producer/KV/connector configuration. A stage needs it when it is:
+        # - a full-payload consumer, or
+        # - a producer (custom_process_next_stage_input_func is set, meaning
+        #   it sends inter-stage data to a downstream consumer via connector), or
+        # - explicitly configured with a connector role via stage_connector_config.
+        if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,

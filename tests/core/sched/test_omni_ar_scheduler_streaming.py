@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for Omni AR streaming-session async placeholder handling."""
 
@@ -86,6 +86,9 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    handle_stopped=None,
+    chunk_transfer_adapter=None,
+    inter_stage_output=None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -97,11 +100,14 @@ def _run_resumable_segment_stop(
         return [42], True
 
     sched._update_request_with_output.side_effect = stop_request
-    sched._handle_stopped_request.return_value = session_finished
     # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
     # MagicMock iterates empty and fails to unpack at the call site.
     sched._free_request.return_value = (None, None)
-    sched.chunk_transfer_adapter = None
+    if handle_stopped is None:
+        sched._handle_stopped_request.return_value = session_finished
+    else:
+        sched._handle_stopped_request.side_effect = handle_stopped
+    sched.chunk_transfer_adapter = chunk_transfer_adapter
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -127,6 +133,7 @@ def _run_resumable_segment_stop(
     model_runner_output.cudagraph_stats = None
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
+    model_runner_output.inter_stage_outputs = [inter_stage_output] if inter_stage_output is not None else None
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
@@ -180,6 +187,41 @@ def test_update_from_output_settles_in_flight_tokens() -> None:
     _run_resumable_segment_stop(session)
 
     assert session.num_in_flight_tokens == 0
+
+
+def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> None:
+    """The old segment's transfer must not observe the next segment's reset.
+
+    A queued streaming update can replace the same mutable Request while the
+    stop output is still being handled. The connector needs the confirmed
+    token count from before that replacement to avoid dropping the boundary.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = 26
+    adapter = MagicMock()
+    adapter._confirmed_num_computed_tokens.return_value = 26
+    inter_stage_output = {"codes": {"audio": [7]}}
+
+    def replace_with_next_segment(request: Request) -> bool:
+        request.num_computed_tokens = 0
+        request.status = RequestStatus.WAITING
+        return False
+
+    _run_resumable_segment_stop(
+        session,
+        handle_stopped=replace_with_next_segment,
+        chunk_transfer_adapter=adapter,
+        inter_stage_output=inter_stage_output,
+    )
+
+    adapter.save_async.assert_called_once_with(
+        inter_stage_output,
+        session,
+        True,
+        confirmed_num_computed_tokens=26,
+    )
 
 
 def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import concurrent.futures
 import contextlib
 import importlib
@@ -443,6 +446,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     plan.engine_args_dict = {}
 
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    runtime._init_visible_devices_baseline = "0"
     plan.metadata.runtime_cfg = {
         "devices": "0",
         "env": {runtime_env_var: "stage-value"},
@@ -470,7 +474,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     assert os.environ[runtime_env_var] == "parent-value"
 
 
-def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypatch):
+def test_initialize_diffusion_stage_forwards_batch_size_without_writing_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.engine.stage_init_utils as init_mod
 
@@ -502,7 +506,7 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         use_inline=True,
     )
 
-    assert od_config.max_num_seqs == 4
+    assert od_config.max_num_seqs == 1
     assert captured == {
         "model": "dummy-model",
         "config": od_config,
@@ -513,7 +517,7 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
     }
 
 
-def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch):
+def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_size(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
@@ -561,8 +565,82 @@ def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch
     )
 
     assert result is sentinel_client
-    assert od_config.max_num_seqs == 4
+    assert od_config.max_num_seqs == 1
     assert resources.manager is proc_manager
+
+
+def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    od_config = types.SimpleNamespace(max_num_seqs=8, step_execution=True)
+    monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(client_mod, "create_diffusion_client", lambda *args: object())
+    metadata = _make_diffusion_metadata(0)
+
+    init_mod.initialize_diffusion_stage(
+        0,
+        "dummy-model",
+        types.SimpleNamespace(),
+        metadata,
+        stage_init_timeout=12,
+        batch_size=4,
+        use_inline=True,
+    )
+
+    assert od_config.max_num_seqs == 8
+
+
+def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+
+    od_config = types.SimpleNamespace(
+        max_num_seqs=8,
+        step_execution=True,
+        parallel_config=types.SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(
+        startup_mod,
+        "register_stage_with_omni_master",
+        lambda **kwargs: types.SimpleNamespace(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+        ),
+    )
+    omni_master_server = types.SimpleNamespace(
+        address="127.0.0.1",
+        port=25000,
+        release_route_port_reservations=lambda *args, **kwargs: None,
+    )
+    proc_manager = types.SimpleNamespace(
+        addresses=types.SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        )
+    )
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", lambda **kwargs: proc_manager)
+    monkeypatch.setattr(
+        client_mod.StageDiffusionClient,
+        "from_addresses",
+        lambda metadata, **kwargs: object(),
+    )
+
+    startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=types.SimpleNamespace(),
+        metadata=types.SimpleNamespace(stage_id=0),
+        stage_init_timeout=12,
+        batch_size=4,
+        use_inline=False,
+        omni_master_server=omni_master_server,
+    )
+
+    assert od_config.max_num_seqs == 8
 
 
 def test_stage_runtime_initializes_stage_pools(monkeypatch):
@@ -663,11 +741,12 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
 
     monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
-    monkeypatch.setattr(
-        runtime_mod.StageEngineCoreClientBase,
-        "make_async_mp_client",
-        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
-    )
+
+    def _make_async_mp_client(**kwargs):
+        captured["client_log_stats"] = kwargs["log_stats"]
+        return stage_client
+
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _make_async_mp_client)
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
     assert captured["log_stats"] is True
@@ -889,7 +968,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
 
     def _initialize_stage_replicas(_stage_plans, _stage_init_timeout):
         exc = RuntimeError("replica launch failed")
-        exc._initialized_clients_by_stage = {0: [None, initialized_client]}
+        setattr(exc, "_initialized_clients_by_stage", {0: [None, initialized_client]})
         raise exc
 
     monkeypatch.setattr(runtime, "_initialize_stage_replicas", _initialize_stage_replicas)
