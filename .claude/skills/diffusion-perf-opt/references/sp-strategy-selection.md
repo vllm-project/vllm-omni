@@ -76,22 +76,25 @@ BAGEL GQA, `S=4096, H=32, H_kv=4, D=128`, `N=4`, 4x A800-SXM4 80 GB:
 
 Measured mean steady-state step latency:
 
-| strategy | measured | comm share implied by the model |
-|---|---:|---:|
-| AllGather-KV | **169.57 ms** | 30.2 ms |
-| Ulysses | 207.29 ms | 67.9 ms |
-| Ring | 244.77 ms | 105.4 ms |
+Two seeds per strategy; quality gate is mean DINOv2 drop <= 8% and worst
+single frame <= 15%.
 
-Raw Ring additionally failed the quality gate on this run; see the record for
-the per-variant quality numbers.
+| strategy | mean step | peak mem | DINOv2 mean | worst frame | comm implied by the model |
+|---|---:|---:|---:|---:|---:|
+| **AllGather-KV** | **169.57 ms** | 30,587 MiB | 5.8% | 9.2% | 30.2 ms |
+| Ulysses | 207.29 ms | 31,205 MiB | 5.3% | 9.0% | 67.9 ms |
+| Hybrid (Ulysses+Ring) | 231.69 ms | 31,119 MiB | 5.7% | 9.0% | — |
+| Ring (guarded) | 236.57 ms | 30,633 MiB | 5.7% | 8.8% | — |
+| Ring (raw) | 244.77 ms | 30,645 MiB | **14.6%** | **17.9%** | 105.4 ms |
+
+Raw Ring is the only row that fails the gate, and it fails on both metrics.
 
 Solving the two Ulysses/AllGather points for a common compute time gives
 139.4 ms of compute and a 33% communication share for Ulysses. Ring then falls
 out at 105.4 ms of communication for the same bytes AllGather moves in
 30.2 ms — a 3.5x penalty against `N-1 = 3` sequential hops. The closed form
 reproduces all three measurements, which is why the table above is a sanity
-anchor rather than a calibration input. Full table, including peak memory and
-quality, in `docs/diffusion_sp_strategy_bagel_gqa.md`.
+anchor rather than a calibration input.
 
 `examples/offline_inference/diffusion/sp_strategy_advisor.py` applies the rules
 above and prints the legal set with relative volumes, if you would rather run

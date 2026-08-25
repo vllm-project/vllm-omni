@@ -11,10 +11,16 @@ the recommendation, so the numbers behind the choice stay visible.
 The reasoning, its derivation and a hardware check are in
 ``.claude/skills/diffusion-perf-opt/references/sp-strategy-selection.md``.
 
-Example::
+Usage takes the three numbers the decision actually depends on::
 
-    python sp_strategy_advisor.py --seq-len 4096 --num-heads 32 \
-        --num-kv-heads 4 --sp-degree 4
+    python sp_strategy_advisor.py NUM_HEADS NUM_KV_HEADS SP_DEGREE
+    python sp_strategy_advisor.py 32 4 4
+    python sp_strategy_advisor.py 32 4 4 --causal
+    python sp_strategy_advisor.py 32 4 4 --seq-len 4095   # check divisibility
+
+``attention_mask`` and the KV-replicating Ulysses variant are parameters of
+:func:`recommend` rather than flags, since they describe an attention
+implementation rather than a deployment choice.
 """
 
 from __future__ import annotations
@@ -26,13 +32,18 @@ def legality(
     *,
     num_heads: int,
     num_kv_heads: int,
-    seq_len: int,
+    seq_len: int | None,
     sp_degree: int,
     causal: bool,
     attention_mask: bool,
     ulysses_replicates_kv: bool,
 ) -> dict[str, str | None]:
-    """Return ``{strategy: reason_it_cannot_run_or_None}``."""
+    """Return ``{strategy: reason_it_cannot_run_or_None}``.
+
+    ``seq_len`` may be ``None`` when the sequence is known to shard evenly; the
+    divisibility checks are then skipped rather than guessed at.
+    """
+    indivisible = seq_len is not None and seq_len % sp_degree
     reasons: dict[str, str | None] = {}
 
     if num_heads % sp_degree:
@@ -47,12 +58,12 @@ def legality(
 
     if causal:
         reasons["allgather_kv"] = "AllGather-KV does not support causal attention"
-    elif seq_len % sp_degree:
+    elif indivisible:
         reasons["allgather_kv"] = f"seq_len {seq_len} is not divisible by sp_degree {sp_degree}"
     else:
         reasons["allgather_kv"] = None
 
-    if seq_len % sp_degree:
+    if indivisible:
         reasons["ring"] = f"seq_len {seq_len} is not divisible by sp_degree {sp_degree}"
     elif attention_mask:
         reasons["ring"] = "Ring does not support attention masks"
@@ -62,8 +73,11 @@ def legality(
     return reasons
 
 
-def comm_volume(*, num_heads: int, num_kv_heads: int, seq_len: int, sp_degree: int) -> dict[str, float]:
+def comm_volume(*, num_heads: int, num_kv_heads: int, sp_degree: int, seq_len: int = 1) -> dict[str, float]:
     """Per-rank bytes moved off-rank, in units of ``batch * head_dim * dtype_bytes``.
+
+    Only the ratios between strategies matter, and those are independent of
+    ``seq_len``, so it defaults to 1 and is present for absolute figures.
 
     Ring moves the same K/V bytes as AllGather-KV but splits them into
     ``sp_degree - 1`` sequential hops, so equal volume does not mean equal time.
@@ -80,17 +94,17 @@ def comm_volume(*, num_heads: int, num_kv_heads: int, seq_len: int, sp_degree: i
 
 def recommend(
     *,
-    seq_len: int,
     num_heads: int,
     num_kv_heads: int,
     sp_degree: int,
+    seq_len: int | None = None,
     causal: bool = False,
     attention_mask: bool = False,
     ulysses_replicates_kv: bool = False,
 ) -> str:
     if num_heads % num_kv_heads:
         raise ValueError(f"num_heads {num_heads} must be divisible by num_kv_heads {num_kv_heads}")
-    if min(seq_len, num_heads, num_kv_heads, sp_degree) <= 0:
+    if min(num_heads, num_kv_heads, sp_degree) <= 0 or (seq_len is not None and seq_len <= 0):
         raise ValueError("all dimensions must be positive")
 
     reasons = legality(
@@ -102,10 +116,11 @@ def recommend(
         attention_mask=attention_mask,
         ulysses_replicates_kv=ulysses_replicates_kv,
     )
-    volumes = comm_volume(num_heads=num_heads, num_kv_heads=num_kv_heads, seq_len=seq_len, sp_degree=sp_degree)
+    volumes = comm_volume(num_heads=num_heads, num_kv_heads=num_kv_heads, sp_degree=sp_degree)
     legal = [name for name, reason in reasons.items() if reason is None]
 
-    lines = [f"shape: seq_len={seq_len} heads={num_heads} kv_heads={num_kv_heads} sp_degree={sp_degree}"]
+    shape = f"shape: heads={num_heads} kv_heads={num_kv_heads} sp_degree={sp_degree}"
+    lines = [shape if seq_len is None else f"{shape} seq_len={seq_len}"]
     lines.append(f"group size num_heads/num_kv_heads = {num_heads / num_kv_heads:g}")
     lines.append("")
     lines.append(f"{'strategy':<14}{'rel. volume':>12}  status")
@@ -153,19 +168,23 @@ def recommend(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--seq-len", type=int, required=True, help="Global, pre-sharding sequence length.")
-    parser.add_argument("--num-heads", type=int, required=True)
-    parser.add_argument("--num-kv-heads", type=int, required=True)
-    parser.add_argument("--sp-degree", type=int, required=True)
-    parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--attention-mask", action="store_true")
-    parser.add_argument(
-        "--ulysses-replicates-kv",
-        action="store_true",
-        help="Ulysses variant that replicates KV heads instead of splitting them.",
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("num_heads", type=int)
+    parser.add_argument("num_kv_heads", type=int)
+    parser.add_argument("sp_degree", type=int)
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Global, pre-sharding sequence length. Only affects the divisibility "
+        "checks; omit it if the sequence is known to shard evenly.",
+    )
+    parser.add_argument("--causal", action="store_true", help="Rules out AllGather-KV.")
     args = parser.parse_args()
+
     print(
         recommend(
             seq_len=args.seq_len,
@@ -173,8 +192,6 @@ def main() -> None:
             num_kv_heads=args.num_kv_heads,
             sp_degree=args.sp_degree,
             causal=args.causal,
-            attention_mask=args.attention_mask,
-            ulysses_replicates_kv=args.ulysses_replicates_kv,
         )
     )
 

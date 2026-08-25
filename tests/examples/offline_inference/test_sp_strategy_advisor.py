@@ -4,7 +4,7 @@ The advisor recommends a sequence-parallel attention strategy from the
 attention shape, so the rules it encodes are worth pinning: the legality
 constraints, the crossover between Ulysses and AllGather-KV, and the BAGEL
 shape whose recommendation was confirmed on hardware
-(docs/diffusion_sp_strategy_bagel_gqa.md).
+(.claude/skills/diffusion-perf-opt/references/sp-strategy-selection.md).
 """
 
 import sys
@@ -19,7 +19,7 @@ from sp_strategy_advisor import comm_volume, legality, recommend  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # seq_len=4096, 32 heads over 4 KV heads, sp_degree=4, non-causal.
-BAGEL = dict(seq_len=4096, num_heads=32, num_kv_heads=4, sp_degree=4)
+BAGEL = dict(num_heads=32, num_kv_heads=4, sp_degree=4, seq_len=4096)
 
 
 def test_bagel_shape_matches_the_hardware_result():
@@ -28,7 +28,7 @@ def test_bagel_shape_matches_the_hardware_result():
 
 
 def test_bagel_volume_ratio_is_the_closed_form():
-    volumes = comm_volume(**BAGEL)
+    volumes = comm_volume(num_heads=32, num_kv_heads=4, sp_degree=4)
     # A/U = N * H_kv / (H + H_kv) = 4*4/36
     assert volumes["allgather_kv"] / volumes["ulysses"] == pytest.approx(4 * 4 / 36)
     # Ring moves the same bytes as AllGather-KV; it loses on hops, not volume.
@@ -46,7 +46,7 @@ def test_bagel_volume_ratio_is_the_closed_form():
     ],
 )
 def test_crossover_follows_group_size_versus_sp_degree(num_heads, num_kv_heads, sp_degree, expected):
-    report = recommend(seq_len=4096, num_heads=num_heads, num_kv_heads=num_kv_heads, sp_degree=sp_degree)
+    report = recommend(num_heads=num_heads, num_kv_heads=num_kv_heads, sp_degree=sp_degree)
     assert f"recommended: {expected}" in report
 
 
@@ -91,16 +91,22 @@ def test_strict_ulysses_needs_kv_heads_divisible_by_sp_degree():
 
 def test_ring_is_only_recommended_when_it_is_the_only_legal_option():
     # Causal rules out AllGather-KV; an indivisible head count rules out Ulysses.
-    report = recommend(seq_len=4096, num_heads=30, num_kv_heads=6, sp_degree=4, causal=True)
+    report = recommend(num_heads=30, num_kv_heads=6, sp_degree=4, causal=True)
     assert "recommended: ring" in report
     assert "sequential hops" in report
 
 
 def test_no_legal_strategy_is_reported_rather_than_guessed():
-    report = recommend(seq_len=4095, num_heads=30, num_kv_heads=6, sp_degree=4, causal=True)
+    report = recommend(num_heads=30, num_kv_heads=6, sp_degree=4, seq_len=4095, causal=True)
     assert "No legal strategy" in report
+
+
+def test_seq_len_is_optional_and_skips_the_divisibility_checks():
+    report = recommend(num_heads=32, num_kv_heads=4, sp_degree=4)
+    assert "seq_len" not in report.splitlines()[0]
+    assert "not divisible" not in report
 
 
 def test_rejects_shapes_that_are_not_grouped_attention():
     with pytest.raises(ValueError, match="divisible"):
-        recommend(seq_len=4096, num_heads=32, num_kv_heads=5, sp_degree=4)
+        recommend(num_heads=32, num_kv_heads=5, sp_degree=4)
