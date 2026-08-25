@@ -49,6 +49,12 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
     ),
+    "SanaVideoPipeline": DiffusionModelTestOpts(
+        model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        builder=diff_model_builders.tiny_sana_video_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        check_multi_output=False,
+    ),
     "QwenImagePipeline": DiffusionModelTestOpts(
         model="Qwen/Qwen-Image",
         builder=diff_model_builders.tiny_qwen_image_builder,

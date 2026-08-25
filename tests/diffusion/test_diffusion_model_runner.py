@@ -900,9 +900,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
             del kwargs
             return SimpleNamespace(transformer=torch.nn.Identity())
 
-        def take_host_weight_plan(self):
-            return None
-
     class _DummyMemoryProfiler:
         consumed_memory = 0
 
@@ -944,8 +941,8 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
     monkeypatch.setattr(
         model_runner_module,
-        "get_offload_backend",
-        lambda od_config, device, host_weight_plan: None,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device: (pipeline, None),
     )
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
@@ -958,8 +955,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert dummy_cache_backend.enabled is False
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
     import vllm.config.vllm as vllm_config_module

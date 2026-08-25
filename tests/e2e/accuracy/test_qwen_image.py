@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -13,7 +16,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
@@ -149,7 +152,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -179,7 +182,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
@@ -211,7 +214,7 @@ def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -241,7 +244,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 @pytest.mark.benchmark

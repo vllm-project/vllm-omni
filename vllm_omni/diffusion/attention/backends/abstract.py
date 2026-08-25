@@ -36,6 +36,23 @@ class AttentionBackend(ABC):
         """
         return False
 
+    @classmethod
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        """Whether this backend keeps N-document packed boundaries isolated.
+
+        When True, the backend consumes ``AttentionMetadata.extra`` cu_seqlens
+        as a genuine block-diagonal attention plan (a dedicated varlen kernel,
+        not a padding-mask rebuild), so a caller may pack multiple real
+        requests into one forward without attention crossing document
+        boundaries. When False, callers packing more than one real document
+        must run one forward per document; otherwise a backend that only
+        supports a ``[real, pad]`` two-document contract, or that ignores
+        cu_seqlens outright, will silently attend across request boundaries.
+        Backends whose kernel selection is platform-dependent must consult
+        ``current_omni_platform``.
+        """
+        return False
+
     # ``OmniPlatformEnum`` values this backend runs on; None means unrestricted.
     # Platform resolution rejects an explicit selection outside this set, so a
     # hardware-specific backend fails before the model is built.
