@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for issue #5003: a per-stage world size that its assigned
 ``devices`` cannot satisfy must fail early in ``build_vllm_config`` with a clear
 message, rather than surfacing as an opaque worker-side ``local rank ... out of
@@ -17,14 +20,21 @@ from unittest import mock
 import pytest
 
 from vllm_omni.engine import stage_init_utils
-from vllm_omni.engine.stage_init_utils import _check_stage_device_layout, build_vllm_config
+from vllm_omni.engine.stage_init_utils import (
+    _check_stage_device_layout,
+    build_vllm_config,
+    compute_replica_layout,
+    get_stage_devices_per_replica,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _stage(stage_id, devices, num_replicas=1):
+def _stage(stage_id, devices, num_replicas=1, engine_args=None):
     return types.SimpleNamespace(
         stage_id=stage_id,
+        stage_type="llm",
+        engine_args=engine_args or {},
         runtime=types.SimpleNamespace(devices=devices, num_replicas=num_replicas),
     )
 
@@ -93,6 +103,75 @@ def test_replica_pool_layout_passes():
     """Pool mode: num_replicas=2 x tp=2 => 4 devices is a valid pool shape."""
     stage = _stage(0, devices="0,1,2,3", num_replicas=2)
     _check_stage_device_layout(stage, {"tensor_parallel_size": 2})
+
+
+def test_multinode_dp_uses_local_width_for_device_validation():
+    """One local DP engine needs one device even when global DP spans four nodes."""
+    stage = _stage(0, devices="0")
+    _check_stage_device_layout(
+        stage,
+        {
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 4,
+            "data_parallel_size_local": 1,
+            "pipeline_parallel_size": 1,
+        },
+    )
+
+
+def test_zero_local_dp_skips_local_device_validation():
+    """A head process with no local engines does not own a local device layout."""
+    stage = _stage(0, devices="0")
+    _check_stage_device_layout(
+        stage,
+        {
+            "tensor_parallel_size": 4,
+            "data_parallel_size": 4,
+            "data_parallel_size_local": 0,
+            "pipeline_parallel_size": 1,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("devices", "expected"),
+    [
+        ("0,1", ["0,1", "2,3"]),
+        ("0,1,2,3", ["0,1", "2,3"]),
+    ],
+)
+def test_replica_guard_and_splitter_share_local_world_size(devices, expected):
+    """PP and local DP contribute to the same per-replica size in both paths."""
+    engine_args = {
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 4,
+        "data_parallel_size_local": 1,
+        "pipeline_parallel_size": 2,
+    }
+    stage = _stage(0, devices=devices, num_replicas=2, engine_args=engine_args)
+
+    _check_stage_device_layout(stage, engine_args)
+    assert get_stage_devices_per_replica(stage) == 2
+    _, replica_devices_map = compute_replica_layout([stage])
+    assert replica_devices_map == {0: expected}
+
+
+def test_non_tp_layout_error_uses_generic_guidance():
+    """A PP mismatch must not be reported as a top-level TP broadcast."""
+    stage = _stage(0, devices="0")
+    with pytest.raises(ValueError) as excinfo:
+        _check_stage_device_layout(
+            stage,
+            {
+                "tensor_parallel_size": 1,
+                "data_parallel_size": 1,
+                "pipeline_parallel_size": 2,
+            },
+        )
+
+    msg = str(excinfo.value)
+    assert "local world size" in msg
+    assert "top-level --tensor-parallel-size" not in msg
 
 
 def test_build_vllm_config_fails_before_engine_config_on_mismatch():
