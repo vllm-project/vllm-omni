@@ -4,9 +4,9 @@ import json
 import logging
 import os
 import pathlib
-import re
 from typing import Any
 
+import regex as re
 import torch
 from vllm.triton_utils import tl, triton
 

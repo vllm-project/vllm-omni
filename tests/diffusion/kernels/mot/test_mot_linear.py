@@ -38,13 +38,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import (
     MoTQKVParallelLinear,
 )
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import (
     MoTRowParallelLinear,
 )
-from vllm_omni.diffusion.layers.mot.ops.mot_gemm import (
+from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import (
     get_best_mot_config,
 )
 

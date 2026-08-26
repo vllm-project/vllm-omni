@@ -43,7 +43,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
-from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)

@@ -10,7 +10,7 @@ Usage:
     python benchmarks/kernels/mot_linear_benchmarks.py \
         --model ByteDance-Seed/BAGEL-7B-MoT \
         --tp-size 1 --dtype w16a16 --tune \
-        --save-dir vllm_omni/diffusion/layers/mot/configs/
+        --save-dir vllm_omni/diffusion/models/bagel/mot/configs/
 
     # Auto-tune with local model path (offline clusters):
     python benchmarks/kernels/mot_linear_benchmarks.py \
@@ -43,7 +43,7 @@ from vllm.triton_utils import triton
 from vllm.utils.torch_utils import set_random_seed
 
 # NOTE: you should use the same naming syetem for the kernel to load properly
-from vllm_omni.diffusion.layers.mot.ops.mot_gemm import build_config_filename, get_device_name
+from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import build_config_filename, get_device_name
 
 # clear the triton cache from time to time, usaully no need to change
 _CACHE_CLEAR_INTERVAL_ENV = "VLLM_MOT_TUNE_CACHE_CLEAR_INTERVAL"
@@ -428,7 +428,7 @@ def benchmark_config(
     cache_flusher: torch.Tensor | None = None,
 ) -> float:
     """Run a MoT GEMM with the given tile config and return avg latency (us)."""
-    from vllm_omni.diffusion.layers.mot.ops.mot_gemm import invoke_mot_gemm
+    from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import invoke_mot_gemm
 
     text_indices, vae_indices, M = build_regular_indices(
         image_num=image_num,
@@ -553,7 +553,7 @@ class BenchmarkWorker:
         use_int8_w8a16: bool,
     ) -> tuple[dict[str, int], float]:
         set_random_seed(self.seed)
-        from vllm_omni.diffusion.layers.mot.ops.mot_gemm import (
+        from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import (
             get_best_mot_config,
         )
 

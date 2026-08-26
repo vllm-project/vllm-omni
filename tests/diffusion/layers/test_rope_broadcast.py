@@ -226,7 +226,7 @@ class TestRotaryEmbeddingNativeShapeRegression:
     def test_wan_forward_native_unchanged(self) -> None:
         """RotaryEmbeddingWan.forward_native still uses its own implementation
         (unflatten + stack + flatten) and should not crash with 3D cos/sin."""
-        from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+        from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWan
 
         rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
         B, S, H, D = 2, 16, 8, 64

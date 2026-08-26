@@ -3,7 +3,7 @@
 
 import sys
 
-from vllm_omni.diffusion.layers.norm import RMSNormVAE
+from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
 
 
 def patch_wan_rms_norm():

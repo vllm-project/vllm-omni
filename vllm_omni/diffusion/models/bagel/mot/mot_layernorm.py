@@ -68,7 +68,7 @@ class MoTRMSNorm(CustomOp):
             return ir.ops.rms_norm(x, self.weight.data, self.variance_epsilon)
 
         # gen mode – fused MoT Triton kernel
-        from vllm_omni.diffusion.layers.mot.ops.mot_rms_norm import (
+        from vllm_omni.diffusion.models.bagel.mot.ops.mot_rms_norm import (
             mot_rms_norm,
         )
 
