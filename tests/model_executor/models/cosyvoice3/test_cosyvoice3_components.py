@@ -669,18 +669,22 @@ def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
         spk_emb_dim=80,
         estimator=estimator,
     )
-    flow_model = CausalMaskedDiffWithDiT(
-        input_size=80,
-        output_size=80,
-        spk_embed_dim=192,
-        vocab_size=64,
-        input_frame_rate=25,
-        only_mask_loss=True,
-        token_mel_ratio=2,
-        pre_lookahead_len=1,
-        pre_lookahead_layer=PreLookaheadLayer(in_channels=80, channels=80, pre_lookahead_len=1),
-        decoder=decoder,
-    ).cuda().eval()
+    flow_model = (
+        CausalMaskedDiffWithDiT(
+            input_size=80,
+            output_size=80,
+            spk_embed_dim=192,
+            vocab_size=64,
+            input_frame_rate=25,
+            only_mask_loss=True,
+            token_mel_ratio=2,
+            pre_lookahead_len=1,
+            pre_lookahead_layer=PreLookaheadLayer(in_channels=80, channels=80, pre_lookahead_len=1),
+            decoder=decoder,
+        )
+        .cuda()
+        .eval()
+    )
 
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
