@@ -287,12 +287,29 @@ def test_recon3d_one_fim_per_view():
 
 
 def test_mixed_scaffold_conditions_via_img2img():
-    """mixed keeps today's image-only behavior via the img2img key (#1 folding out of scope)."""
+    """mixed = one bos/eos-wrapped segment + trailing bare bos opener.
+
+    Upstream never emits chat role words; ``<|im_start|>/<|im_end|>`` ARE its
+    bos/eos special tokens, wrapped exactly once per text segment, and caption
+    decoding starts from a freshly fed ``<|im_start|>`` (``prepare_start_tokens``).
+    So the scaffold must reproduce that layout — NOT open an assistant turn
+    (role words are OOD -> truncated captions) and NOT end at <|im_end|> with
+    no opener (sampling after EOS -> degenerate loops).
+    """
     img = Image.new("RGB", (32, 32))
     (p,) = _format_mixed_prompts(["caption it"], img)
     num_pads, num_fims = _assert_prompt_matches_mm_data(p)
     assert (num_pads, num_fims) == (0, 1)
     assert p["mode"] == "caption_generate"
+    assert p["modalities"] == ["img2img"]
+    assert p["prompt"].startswith(_FIM_MIDDLE)
+    # Exactly ONE wrapped segment, then a trailing bare <|im_start|> opener.
+    assert p["prompt"].endswith(f"{_IM_START}caption it{_IM_END}{_IM_START}")
+    assert p["prompt"].count(_IM_START) == 2
+    assert p["prompt"].count(_IM_END) == 1
+    # No role words / newlines / <image> placeholder: upstream never emits them.
+    for banned in ("user", "assistant", "\n", "<image>"):
+        assert banned not in p["prompt"]
 
 
 def test_think_text2text_wraps_with_vlm_system_prompt():
@@ -342,6 +359,12 @@ def test_processor_binds_single_image_generation_conditioning(tokenizer, info_ct
 def test_processor_binds_multi_view_camera_pose(tokenizer, info_ctx):
     imgs = [Image.new("RGB", (64, 64)) for _ in range(3)]
     (p,) = _format_multi_img2text_prompts(["estimate camera pose"], imgs)
+    _placeholders_bind_all_items(p, tokenizer, info_ctx)
+
+
+def test_processor_binds_mixed_caption_conditioning(tokenizer, info_ctx):
+    img = Image.new("RGB", (64, 64))
+    (p,) = _format_mixed_prompts(["briefly describe this image"], img)
     _placeholders_bind_all_items(p, tokenizer, info_ctx)
 
 

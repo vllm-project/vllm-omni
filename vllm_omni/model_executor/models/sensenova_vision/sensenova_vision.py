@@ -15,13 +15,57 @@ from collections.abc import Mapping
 import torch
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalKwargsItems
+from vllm.multimodal.parse import ImageEmbeddingItems, MultiModalDataItems
+from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 
 from vllm_omni.model_executor.models.bagel.bagel import (
+    Img2ImgProcessorItems,
     OmniBagelDummyInputsBuilder,
     OmniBagelForConditionalGeneration,
     OmniBagelMultiModalProcessor,
     OmniBagelProcessingInfo,
 )
+
+# Official SenseNova-Vision VAE image transform, transcribed from the upstream
+# ``ImageTransform(1024, 512, 16)`` (``sensenova_vision.py`` ``vae_transform``).
+# ``ImageTransform`` applies a ``MaxLongEdgeMinShortEdgeResize``: the long edge
+# is scaled down to at most ``max_size``, the short edge scaled up to at least
+# ``min_size``, and the result rounded to a multiple of ``stride``.
+#
+# For non-recon3d img2img/mixed modes the AR stage conditions the input
+# image through this transform and caches the result in
+# ``kv_metadata["image_shape"]``, so the DiT grid matches the official
+# pipeline instead of BAGEL's hardcoded short-edge floor of 256.  The same
+# dims feed both the AR model resize (``_resize_to_stride`` override) and the
+# processor's VAE placeholder sizing, keeping them in lockstep.
+SENSENOVA_VISION_VAE_MAX_SIZE = 1024
+SENSENOVA_VISION_VAE_MIN_SIZE = 512
+SENSENOVA_VISION_VAE_STRIDE = 16
+
+
+def _sensenova_vae_resize_dims(img_h: int, img_w: int) -> tuple[int, int]:
+    """Stride-aligned ``(new_h, new_w)`` for the SenseNova-Vision VAE transform.
+
+    Ports ``MaxLongEdgeMinShortEdgeResize`` with ``(max=1024, min=512, stride=16)``
+    so the AR VAE grid / `image_shape` matches the official pipeline.  Used by
+    both the AR model resize and the processor's placeholder sizing so they
+    never diverge.
+    """
+    stride = SENSENOVA_VISION_VAE_STRIDE
+    max_size = SENSENOVA_VISION_VAE_MAX_SIZE
+    min_size = SENSENOVA_VISION_VAE_MIN_SIZE
+
+    scale = min(max_size / max(img_h, img_w), 1.0)
+    scale = max(scale, min_size / min(img_h, img_w))
+    new_h = max(stride, int(round(img_h * scale / stride) * stride))
+    new_w = max(stride, int(round(img_w * scale / stride) * stride))
+    if max(new_h, new_w) > max_size:
+        scale = max_size / max(new_h, new_w)
+        new_h = max(stride, int(round(new_h * scale / stride) * stride))
+        new_w = max(stride, int(round(new_w * scale / stride) * stride))
+    return new_h, new_w
+
 
 # Per-task image target side for the generation output grid.  Recon3D decodes
 # ``num_views`` square views at this VAE side; the AR stage caches the same
@@ -64,10 +108,10 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
 
     Subclasses :class:`OmniBagelMultiModalProcessor` additively: it passes
     ``target_h``/``target_w`` through for the generation ``image`` modality so a
-    recon3 request can request the VAE target shape per view, and records
-    ``num_views`` for downstream sampling knobs.  Add-only — the base processor
-    is left registered for SenseNovaVision because the AR stage feeds it the
-    same BAGEL-compatible fields.
+    recon3 request can request the VAE target size per view, and recomputes the
+    ``img2img`` VAE placeholder count with the official
+    ``ImageTransform(1024, 512, 16)`` short-edge floor so it stays in lockstep
+    with the AR model's VAE latent grid.
     """
 
     def _mm_kwargs_for_bagel_img2img_hf(self, mm_kwargs):
@@ -76,9 +120,78 @@ class OmniSenseNovaVisionMultiModalProcessor(OmniBagelMultiModalProcessor):
         # preserved through to the ``image_shape`` used by the DiT stage.
         return dict(mm_kwargs)
 
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> list[PromptReplacement]:
+        """Build prompt replacements with the SenseNova-Vision VAE transform.
+
+        Mirrors :meth:`OmniBagelMultiModalProcessor._get_prompt_updates` but
+        sizes the ``<|fim_middle|>`` VAE placeholder run with the official
+        ``ImageTransform(1024, 512, 16)`` short-edge floor, matching the AR
+        model's encoded latent grid (``_resize_to_stride`` override).  The two
+        must agree or the placeholder token count will not equal the embedding
+        length.  Otherwise identical to the base implementation.
+        """
+        replacements = super()._get_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
+
+        replacements = list(replacements)
+        tokenizer = self.info.get_tokenizer()
+        img2img_token_id = tokenizer.get_vocab().get("<|fim_middle|>")
+        if img2img_token_id is None:
+            return replacements
+
+        hf_config = self.info.get_hf_config()
+        vit_config = hf_config.vit_config
+        image_size = vit_config.image_size
+        num_vit_patches = (image_size // vit_config.patch_size) ** 2
+
+        latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
+        downsample = hf_config.vae_config.get("downsample", 8)
+        latent_downsample = downsample * latent_patch_size
+
+        def get_img2img_replacement(item_idx: int):
+            h, w = image_size, image_size
+            if "img2img" in mm_items:
+                item = mm_items.get_items("img2img", (Img2ImgProcessorItems, ImageEmbeddingItems))
+                if hasattr(item, "get_image_size"):
+                    size = item.get_image_size(item_idx)
+                    h, w = size.height, size.width
+
+            new_h, new_w = _sensenova_vae_resize_dims(int(h), int(w))
+            num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
+            num_vae_total = num_vae_patches + 2
+            num_vit_total = num_vit_patches + 2
+            # +1 separator between VAE and ViT blocks so that
+            # extract_embeds_range() produces two distinct mm_prefix_range
+            # entries, preventing VAE tokens from attending to ViT.
+            total = num_vae_total + 1 + num_vit_total
+            tokens = [img2img_token_id] * total
+
+            embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
+            return PromptUpdateDetails(
+                full=tokens,
+                is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
+            )
+
+        # Replace the img2img placeholder update (by modality) with the
+        # resized version; keep everything else the base produced.
+        out: list[PromptReplacement] = []
+        for r in replacements:
+            if r.modality == "img2img":
+                r = PromptReplacement(
+                    modality="img2img",
+                    target=[img2img_token_id],
+                    replacement=get_img2img_replacement,
+                )
+            out.append(r)
+        return out
+
 
 @MULTIMODAL_REGISTRY.register_processor(
-    OmniBagelMultiModalProcessor,
+    OmniSenseNovaVisionMultiModalProcessor,
     info=OmniSenseNovaVisionProcessingInfo,
     dummy_inputs=OmniBagelDummyInputsBuilder,
 )
@@ -139,6 +252,25 @@ class OmniSenseNovaVisionForConditionalGeneration(OmniBagelForConditionalGenerat
         ``return_raw_latent`` when decoding images.
         """
         return None
+
+    def _resize_to_stride(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Resize img2img pixel values to the official SenseNova-Vision VAE grid.
+
+        Overrides the BAGEL base (whose short-edge floor is ``min(256, max)``)
+        with the official ``ImageTransform(1024, 512, 16)``: the long edge is
+        clamped to 1024 and the short edge pushed up to at least 512.  The
+        base ``_process_img2img_input`` calls this per image, so the resulting
+        ``image_shape`` cached in ``kv_metadata["image_shape"]`` lands the DiT
+        output at the official resolution (e.g. a (375, 500) input becomes
+        (368, 496) -> 512-aligned (512, 688)).
+        """
+        H, W = pixel_values.shape[2], pixel_values.shape[3]
+        new_H, new_W = _sensenova_vae_resize_dims(H, W)
+        if new_H != H or new_W != W:
+            pixel_values = torch.nn.functional.interpolate(
+                pixel_values, size=(new_H, new_W), mode="bicubic", align_corners=False
+            )
+        return pixel_values
 
     def _adjust_positions_for_img2img(
         self,

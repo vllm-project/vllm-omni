@@ -414,12 +414,30 @@ def _format_recon3d_prompts(prompts, images):
 
 
 def _format_mixed_prompts(prompts, image):
-    # caption_generate conditions on the image like edit/dense_perception;
-    # caption folding into the prompt text is upstream divergence #1 (out of
-    # scope), and modalities stay single-key img2img.
+    # caption_generate conditions on the image like edit/dense_perception
+    # (<|fim_middle|> VAE+ViT block, modalities single-key img2img), but the
+    # AR stage must decode a real caption that reaches EOS so the DiT is
+    # conditioned on a COMPLETE interleaved caption.
+    #
+    # Marker parity (verified against SenseNova-Vision upstream): upstream
+    # NEVER emits chat role words, and <|im_start|>/<|im_end|> ARE its bos/eos
+    # special tokens.  Every training/inference text segment carries exactly
+    # ONE pair ([bos]+ids+[eos], ``pack_sequence``/``prepare_prompts``), and
+    # caption decoding STARTS from a freshly fed bos: ``prepare_start_tokens``
+    # feeds [<|im_start|>] as the first decode step attending the whole
+    # context (``Bagel.generate_text``).  So the AR must sample from a trailing
+    # bare <|im_start|> opener:
+    #   [fim block] [<|im_start|>]{p}[<|im_end|>] [<|im_start|>] -> caption -> [<|im_end|>]
+    # Empirical GPU evidence for each variant: ending at [<|im_end|>] alone
+    # degenerates to dot-fills (sampling after EOS is off-distribution);
+    # a full "assistant" turn truncates early (role words are OOD); NO opener
+    # at all degenerates to token loops.  Role words/newlines stay out.
+    # Also strip the official ``<image>`` placeholder: upstream generate()
+    # splits questions on it before tokenization (never reaches the model);
+    # the image rides on multi_modal_data["img2img"] here.
     return [
         {
-            "prompt": f"{_FIM_MIDDLE}{_IM_START}{p}{_IM_END}",
+            "prompt": (f"{_FIM_MIDDLE}{_IM_START}{p.replace('<image>', '').strip()}{_IM_END}{_IM_START}"),
             "multi_modal_data": {"img2img": image},
             "modalities": ["img2img"],
             "mode": "caption_generate",
@@ -465,13 +483,27 @@ def _format_think_img2img_prompts(prompts, image):
 
 
 def _extract_text(req_output) -> str:
-    """Extract generated text from an OmniRequestOutput (lance end2end.py style)."""
+    """Extract generated text from an OmniRequestOutput (lance end2end.py style).
+
+    Diffusion-side outputs (mixed/dense_perception) surface text under
+    ``multimodal_output["text"]`` / ``metadata.text.text_output``; pure-AR
+    text modalities (img2text, text2text, dense_detection, dense_OCR,
+    multi-img2text) run entirely on the AR stage and carry the decoded text
+    on the vLLM completion output at ``outputs[0].text``.
+    """
     multimodal_output = getattr(req_output, "multimodal_output", {}) or {}
     metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
     text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
     text = (multimodal_output.get("text") if isinstance(multimodal_output, dict) else None) or (
         text_metadata.get("text_output") if isinstance(text_metadata, dict) else None
     )
+    if not text:
+        # AR-only text stages surface the decoded generation on the completion
+        # output rather than any multimodal payload.
+        outputs = getattr(req_output, "outputs", None) or []
+        if outputs:
+            first = outputs[0]
+            text = getattr(first, "text", None) or getattr(first, "cumulative_text", None)
     return text or getattr(req_output, "output", None) or getattr(req_output, "text", None)
 
 

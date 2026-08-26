@@ -300,7 +300,11 @@ def test_adjust_positions_handles_two_img2img_blocks_in_one_request(tokenizer):
     infos = [(num_vae, num_vit, 512, 512), (num_vae, num_vit, 512, 512)]
 
     stub = _PositionAdjustStub(infos, fim_id)
-    adjust = bagel_module.OmniBagelForConditionalGeneration._adjust_positions_for_img2img
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    adjust = OmniSenseNovaVisionForConditionalGeneration._adjust_positions_for_img2img
     out = adjust(stub, torch.arange(len(ids)), torch.tensor(ids))
     got = out.tolist()
 
@@ -348,7 +352,11 @@ def test_adjust_positions_single_block_unchanged(tokenizer):
     ids = [7, 8, 9] + block + [10, 11]
 
     stub = _PositionAdjustStub([(num_vae, num_vit, 512, 512)], fim_id)
-    adjust = bagel_module.OmniBagelForConditionalGeneration._adjust_positions_for_img2img
+    from vllm_omni.model_executor.models.sensenova_vision.sensenova_vision import (
+        OmniSenseNovaVisionForConditionalGeneration,
+    )
+
+    adjust = OmniSenseNovaVisionForConditionalGeneration._adjust_positions_for_img2img
     out = adjust(stub, torch.arange(len(ids)), torch.tensor(ids))
 
     m = 3
