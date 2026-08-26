@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the xDiT authors.
 #
 # This module is adapted from xDiT (https://github.com/xdit-project/xdit)
@@ -22,6 +23,9 @@ from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel
 
 logger = init_logger(__name__)
 
+PipeFusionBranchKey = Literal["inputs", "inputs_uncond"]
+PipeFusionCacheIdentity = tuple[str | None, int | None, PipeFusionBranchKey]
+
 _PF_RUNTIME: PipeFusionRuntime | None = None
 
 
@@ -39,16 +43,34 @@ class PipeFusionRuntime:
         self.pipeline_patch_idx = 0
         self.warmup_steps = 1
         self.split_dim: Literal["height", "temporal"] = "height"
-        self.cache_key: Literal["inputs", "inputs_uncond"] = "inputs"
+        self.request_id: str | None = None
+        self.sequence_id: int | None = 0
+        self.cache_key: PipeFusionBranchKey = "inputs"
         self.patch_idx_tensor = torch.tensor(0, dtype=torch.int32)
         self.warmup_cache_timestep: torch.Tensor | None = None
         self.update_warmup_cache = True
+
+    @property
+    def cache_identity(self) -> PipeFusionCacheIdentity:
+        return (self.request_id, self.sequence_id, self.cache_key)
 
     def set_input_parameters(self, latents: torch.Tensor, dtype):
         self._calc_patches_metadata(latents)
         self._reset_recv_buffer(dtype)
 
-    def set_cache_key(self, key: Literal["inputs", "inputs_uncond"]) -> None:
+    def set_request_context(self, request_id: str | None, sequence_id: int | None = 0) -> None:
+        if request_id is not None and (not isinstance(request_id, str) or not request_id):
+            raise ValueError("PipeFusion request_id must be a non-empty string or None.")
+        if sequence_id is not None and (not isinstance(sequence_id, int) or sequence_id < 0):
+            raise ValueError("PipeFusion sequence_id must be a non-negative integer or None.")
+        self.request_id = request_id
+        self.sequence_id = sequence_id
+
+    def clear_request_context(self) -> None:
+        self.request_id = None
+        self.sequence_id = 0
+
+    def set_cache_key(self, key: PipeFusionBranchKey) -> None:
         if key not in ("inputs", "inputs_uncond"):
             raise ValueError(f"Invalid PipeFusion cache key: {key!r}. Must be 'inputs' or 'inputs_uncond'.")
         self.cache_key = key
@@ -179,6 +201,6 @@ def get_pipefusion_runtime():
     return _PF_RUNTIME
 
 
-def set_pipefusion_cache_key_if_initialized(key: Literal["inputs", "inputs_uncond"]) -> None:
+def set_pipefusion_cache_key_if_initialized(key: PipeFusionBranchKey) -> None:
     if _PF_RUNTIME is not None:
         _PF_RUNTIME.set_cache_key(key)

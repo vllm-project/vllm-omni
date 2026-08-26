@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the xDiT authors.
 #
 # This module is adapted from xDiT (https://github.com/xdit-project/xdit)
 
 from abc import ABC, abstractmethod
 from functools import wraps
-from typing import Literal
 
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion_runtime import (
+    PipeFusionCacheIdentity,
     get_pipefusion_runtime,
     is_pipefusion_initialized,
 )
-
-PipeFusionCacheKey = Literal["inputs", "inputs_uncond"]
 
 
 class PipeFusionRotaryEmbeddingMixin(ABC):
@@ -110,14 +109,12 @@ class PipeFusionSelfAttentionMixin(ABC):
     In patch mode, maintains full K/V caches across patches so that
     each patch's query can attend to the full sequence.
 
-    Maintains separate KV caches for conditional ("inputs") and
-    unconditional ("inputs_uncond") predictions to prevent CFG
-    negative predictions from contaminating the conditional cache.
-    The active cache is selected from the PipeFusion runtime state so CFG
-    positive and negative branches do not share K/V buffers.
+    Maintains separate KV caches per request, sequence, and CFG branch
+    to prevent concurrent requests or CFG negative predictions from
+    contaminating another cache.
     """
 
-    _kv_caches: dict[PipeFusionCacheKey, tuple[torch.Tensor, torch.Tensor]]
+    _kv_caches: dict[PipeFusionCacheIdentity, tuple[torch.Tensor, torch.Tensor]]
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -145,10 +142,17 @@ class PipeFusionSelfAttentionMixin(ABC):
 
         attention.forward = pipefusion_forward
 
-    def pipefusion_reset_cache(self) -> None:
-        self._kv_caches = {}
+    def pipefusion_reset_cache(self, request_id: str | None = None, sequence_id: int | None = None) -> None:
+        if request_id is None and sequence_id is None:
+            self._kv_caches = {}
+            return
+        self._kv_caches = {
+            cache_identity: cache
+            for cache_identity, cache in self._kv_caches.items()
+            if cache_identity[0] != request_id or cache_identity[1] != sequence_id
+        }
 
-    def _get_kv_cache(self, cache_key: PipeFusionCacheKey) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_kv_cache(self, cache_key: PipeFusionCacheIdentity) -> tuple[torch.Tensor, torch.Tensor]:
         if cache_key not in self._kv_caches:
             raise RuntimeError(
                 f"PipeFusion KV cache for {cache_key!r} is missing. "
@@ -156,8 +160,8 @@ class PipeFusionSelfAttentionMixin(ABC):
             )
         return self._kv_caches[cache_key]
 
-    def _set_kv_cache(self, cache_key: PipeFusionCacheKey, k: torch.Tensor, v: torch.Tensor):
-        """Store the KV cache for the given correction key."""
+    def _set_kv_cache(self, cache_key: PipeFusionCacheIdentity, k: torch.Tensor, v: torch.Tensor):
+        """Store the KV cache for the given request/sequence/CFG identity."""
         self._kv_caches[cache_key] = (k, v)
 
     def _pipefusion_update_kv_cache(
@@ -171,9 +175,8 @@ class PipeFusionSelfAttentionMixin(ABC):
         In patch mode, inserts the current patch's K/V into the full cache
         and returns the full K/V. In non-patch mode, just stores K/V directly.
 
-        Uses the parent transformer's ``cache_key`` to select between
-        separate conditional / unconditional KV caches, preventing the CFG
-        negative prediction from overwriting the conditional cache.
+        Uses the PipeFusion runtime cache identity to select between
+        request, sequence, and CFG-branch K/V caches.
 
         The token sequence is flattened as [frames, height, width], so
         height-based patches are NOT contiguous in the flat sequence.
@@ -188,8 +191,9 @@ class PipeFusionSelfAttentionMixin(ABC):
             (full_key, full_value) for attention computation.
         """
         runtime = get_pipefusion_runtime()
+        cache_identity = runtime.cache_identity
         if runtime.patch_mode:
-            full_k, full_v = self._get_kv_cache(runtime.cache_key)
+            full_k, full_v = self._get_kv_cache(cache_identity)
             ppf = runtime.ppf
             pph = runtime.pph
             ppw = runtime.ppw
@@ -231,7 +235,7 @@ class PipeFusionSelfAttentionMixin(ABC):
             return full_k, full_v
         else:
             if runtime.update_warmup_cache:
-                self._set_kv_cache(runtime.cache_key, key, value)
+                self._set_kv_cache(cache_identity, key, value)
             return key, value
 
 
