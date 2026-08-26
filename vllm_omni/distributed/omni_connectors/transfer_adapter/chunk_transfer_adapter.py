@@ -378,6 +378,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        cleanup_req_id = task.get("connector_cleanup")
+        if cleanup_req_id is not None:
+            self._run_connector_cleanup(cleanup_req_id)
+            return
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
@@ -535,8 +539,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
 
-        Must only be called after the terminal chunk has actually been
-        sent (i.e. from ``_send_single_request``), not before.
+        Call only from the save_loop thread, never from the scheduler: this
+        drops the state an already-queued ``put()`` still reads. On a natural
+        finish that means after the terminal chunk is sent; an abort sends
+        none, so the sweep reclaims it once the queued puts have drained.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -569,6 +575,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             external_req_id = self.request_ids_mapping.get(request_id, request_id)
 
         self.cleanup_receiver(request_id)
+        self.cleanup_sender(external_req_id)
+
+    def _run_connector_cleanup(self, external_req_id: str) -> None:
+        """Unlink an aborted request's connector-side segments, then reclaim
+        its sender-side state.
+
+        Enqueued on the save queue by ``finish_requests`` rather than called
+        inline: that serializes it behind every ``put()`` already queued for
+        the request, so no chunk is written after its own sweep.
+
+        Never on the natural-finish path -- a finished request's terminal
+        chunk may still be unconsumed downstream. Only FINISHED_ABORTED /
+        FINISHED_ERROR have no consumer left, hence the ``finished_status``
+        gate in ``finish_requests``.
+        """
+        # Best-effort: a connector-specific failure must not skip the
+        # sender-state reclaim below, nor propagate into the save loop.
+        try:
+            self.connector.cleanup(external_req_id)
+        except Exception as e:
+            logger.warning(f"Connector cleanup failed for aborted request {external_req_id}: {e}")
         self.cleanup_sender(external_req_id)
 
     ########################################################################
@@ -958,7 +985,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for request in queue
         }
 
+        # Only abort/error leaves no downstream consumer; any other terminal
+        # status may still have an unconsumed terminal chunk in flight.
+        sweeps_connector = finished_status in (RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR)
+
         # First pass: collect requests to remove from queues
+        aborted_external_ids: set[str] = set()
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
             if request is None:
@@ -973,6 +1005,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
             if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
+            # Must be the id _send_single_request built the put keys from.
+            if sweeps_connector and request.external_req_id:
+                aborted_external_ids.add(request.external_req_id)
 
         request_ids = set(request_ids)
 
@@ -988,5 +1023,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         for req_id in request_ids:
             self.cleanup_receiver(req_id)
+
+        # Enqueued, not inline, so the sweep lands after any already-queued
+        # put() for the same request -- see _run_connector_cleanup.
+        if aborted_external_ids:
+            for external_req_id in aborted_external_ids:
+                self._pending_save_reqs.append({"connector_cleanup": external_req_id})
+            with self._save_cond:
+                self._save_cond.notify()
 
         return []

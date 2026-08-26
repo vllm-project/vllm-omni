@@ -65,21 +65,22 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
-        deserialized = False
+        consumed = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
+            # The segment is already unlinked and no retry can succeed, so
+            # the lock file must go even if deserialization then fails.
+            consumed = True
             obj = self.deserialize_obj(data_bytes)
-            result = (obj, int(shm_handle.get("size", 0)))
-            deserialized = True
-            return result
+            return obj, int(shm_handle.get("size", 0))
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            if deserialized:
+            if consumed:
                 try:
                     os.remove(lock_file)
                 except FileNotFoundError:
@@ -142,19 +143,37 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
-    def cleanup(self, request_id: str) -> None:
-        """Best-effort cleanup of unconsumed SHM segments for *request_id*.
+    @staticmethod
+    def _key_belongs_to(key: str, request_id: str) -> bool:
+        """Whether *key* is one of *request_id*'s own connector keys.
 
-        Matches pending keys where *request_id* appears as the full key,
-        as a ``_``-delimited prefix, or as a ``_``-delimited suffix.
-        If ``get()`` was never called, we unlink it here so /dev/shm
-        doesn't leak.
+        Shapes: ``{id}``, ``{id}_{stage}_{chunk}``,
+        ``{id}_{stage}_{chunk}_{from_rank}_{to_rank}``, and
+        ``omni_{from}_to_{to}_kv_cache_{id}``. Stage names may be non-numeric.
+
+        Structural rather than a bare prefix/suffix match: ``abc`` must not
+        unlink live ``abc_def`` segments, nor ``0`` chunk 0 of every request
+        in flight. Unlinking a live segment strands its consumer.
         """
-        stale = [
-            k
-            for k in self._pending_keys
-            if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
-        ]
+        if key == request_id:
+            return True
+        if key.endswith(f"_kv_cache_{request_id}"):
+            return True
+        prefix = f"{request_id}_"
+        if not key.startswith(prefix):
+            return False
+        fields = key[len(prefix) :].split("_")
+        # Two trailing fields for a chunk key, four for a rank-aware KV key.
+        return len(fields) in (2, 4) and fields[-1].isdecimal()
+
+    def cleanup(self, request_id: str) -> None:
+        """Best-effort unlink of *request_id*'s unconsumed segments + lock files.
+
+        An aborted request has no downstream consumer left to call ``get()``,
+        so without this sweep its segments hold /dev/shm until process exit.
+        """
+        # Snapshot: get() discards keys from the recv thread mid-iteration.
+        stale = [k for k in list(self._pending_keys) if self._key_belongs_to(k, request_id)]
         for key in stale:
             self._pending_keys.discard(key)
             try:
