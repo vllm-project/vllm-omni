@@ -636,8 +636,8 @@ class OmniSchedulerMixin:
             )
         }
 
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+        if chunk_transfer_adapter := getattr(self, "chunk_transfer_adapter", None):
+            chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         self._realign_request_status_to_queues(
             request_ids,

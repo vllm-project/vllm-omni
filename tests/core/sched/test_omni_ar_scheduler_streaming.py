@@ -252,6 +252,37 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
+def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
+    """Native duplex + async: the next unit is usually already queued when the
+    current one stops, so _handle_stopped_request applies the update and the
+    stop site below it fences the same in-flight decode a second time. An
+    accumulated residue outlives the drain and swallows the next unit's
+    listen/speak, which the client sees as silence until its timeout.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.append_output_token_ids([7])
+    session.num_computed_tokens = 4
+    session.num_output_placeholders = 1
+    # This step's frame (settled to 0 by update_from_output) plus one extra
+    # async decode still in flight.
+    session.num_in_flight_tokens = 2
+
+    sched = _make_scheduler(stage_id=0)
+    sched._enqueue_waiting_request = MagicMock()
+
+    def handle_stopped(request: Request) -> bool:
+        sched._update_request_as_session(request, _make_update([10, 20]))
+        return False
+
+    _run_resumable_segment_stop(session, handle_stopped=handle_stopped)
+
+    # Exactly the one unreported decode, so the drain reaches zero before the
+    # new segment's first frame arrives.
+    assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
+
+
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()

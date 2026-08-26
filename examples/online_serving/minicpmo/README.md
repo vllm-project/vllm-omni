@@ -37,7 +37,9 @@ profile admits at most four concurrent sequences per stage.
 | `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
-| `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
+
+Every profile sets `session_mode: duplex`, so native full-duplex is served
+from the same process as `/v1/chat/completions`.
 
 The split pipeline preserves native-duplex epoch/turn identity, segment text,
 turn completion, reference voice, and terminal-audio metadata through
@@ -55,8 +57,8 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
-checkpoint path. To start the experimental native duplex backend, use
-`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+checkpoint path. For native full-duplex, connect `/v1/realtime?duplex=1` on
+this same server.
 
 ### Per-stage overrides
 
@@ -145,7 +147,7 @@ assistant template, so it is not an apples-to-apples accuracy run.
 
 ## Run the Realtime duplex CLI demo
 
-After the duplex backend is running, stream one WAV through the Realtime
+After the server is running, stream one WAV through the Realtime
 WebSocket endpoint:
 
 ```bash

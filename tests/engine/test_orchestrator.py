@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +17,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -101,6 +105,13 @@ class OrchestratorFixture:
     queues: tuple[janus.Queue, ...]
     thread: threading.Thread
     result_future: concurrent.futures.Future[None]
+
+
+@dataclass
+class FakePromptRequest:
+    request_id: str
+    prompt_token_ids: list[int]
+    resumable: bool = True
 
 
 class FakeStageClient:
@@ -286,6 +297,20 @@ def _sampling_params(max_tokens: int = 4) -> SamplingParams:
 
 def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
+
+
+def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
+    return EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.STOP,
+            )
+        ],
+        timestamp=1.0,
+        finished_requests={request_id},
+    )
 
 
 def _build_request_output(
@@ -757,6 +782,148 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         assert output_msg.stage_id == 1
         assert output_msg.finished is True
         assert "req-async" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_without_processed_output_finishes_request(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id="req-stream-terminal",
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request.request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request.request_id))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg.request_id == request.request_id
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
+        assert output_msg.engine_outputs.finished is True
+        assert output_msg.engine_outputs.outputs[0].multimodal_output["audio"].numel() == 0
+        await _wait_for(lambda: request.request_id not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_data_then_raw_terminal_finishes_once(orchestrator_factory) -> None:
+    request_id = "req-stream-data-terminal"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    final_data = _build_request_output(
+        request_id,
+        token_ids=[20, 21],
+        finished=False,
+        text="last audio chunk",
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[
+            FakeOutputProcessor(),
+            FakeOutputProcessor(request_outputs=[final_data]),
+        ],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+
+        data_msg = await _get_output_message(orchestrator_fixture)
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+
+        assert data_msg.engine_outputs is final_data
+        assert data_msg.finished is False
+        assert terminal_msg.request_id == request_id
+        assert terminal_msg.stage_id == 1
+        assert terminal_msg.finished is True
+        assert terminal_msg.engine_outputs.finished is True
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orchestrator_factory) -> None:
+    request_id = "req-stream-processed-terminal"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processed_terminal = _build_request_output(
+        request_id,
+        token_ids=[20, 21],
+        finished=True,
+        text="last audio chunk",
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[
+            FakeOutputProcessor(),
+            FakeOutputProcessor(request_outputs=[processed_terminal]),
+        ],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id))
+
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+
+        assert terminal_msg.engine_outputs is processed_terminal
+        assert terminal_msg.finished is True
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -2061,6 +2228,28 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
 
     assert metrics.num_tokens_out == 3
     assert metrics.output_unit_count == 3
+
+
+def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
+    stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    pool = StagePool(
+        1,
+        [stage],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    output = SimpleNamespace(request_id="req-image", _custom_output={"image": "non-empty"})
+    pool.record_output_timestamps([output], output_ts=132.0)
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=130.0,
+        request_timestamp=120.0,
+        replica_id=0,
+    )
+
+    assert metrics.serving_time_to_first_output_ms == pytest.approx(12000.0)
+    assert metrics.image_time_to_first_output_ms == pytest.approx(2000.0)
 
 
 @pytest.mark.asyncio

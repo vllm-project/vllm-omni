@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E online tests for Qwen3-Omni /v1/realtime WebSocket (streaming PCM in, audio out).
 
@@ -37,6 +37,10 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
     "Translate into Chinese: Beijing is the Capital of China. It is the center of culture and politics"
+)
+ISSUE_6474_SYNTH_PHRASE_TEXT = (
+    "Can you tell me the current temperature and weather conditions in New York City? "
+    "What about Los Angeles? Please compare them in detail using at least eight complete sentences."
 )
 
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
@@ -100,6 +104,7 @@ async def _run_realtime_audio_roundtrip(
     *,
     chunk_ms: int = 100,
     send_delay_ms: int = 0,
+    completion_timeout_s: float = 600,
 ) -> dict:
     uri = f"ws://{host}:{port}/v1/realtime"
     incremental: list[bytes] = []
@@ -131,7 +136,7 @@ async def _run_realtime_audio_roundtrip(
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
 
         while True:
-            message = await asyncio.wait_for(ws.recv(), timeout=600)
+            message = await asyncio.wait_for(ws.recv(), timeout=completion_timeout_s)
             if isinstance(message, bytes):
                 continue
 
@@ -178,12 +183,16 @@ async def _run_realtime_audio_roundtrip(
     }
 
 
-def _synthetic_pcm16_input() -> bytes:
+def _synthetic_pcm16_input(
+    *,
+    phrase_text: str = REALTIME_SYNTH_PHRASE_TEXT,
+    duration_s: int = 10,
+) -> bytes:
     syn = generate_synthetic_audio(
-        10,
+        duration_s,
         1,
         sample_rate=16000,
-        phrase_text=REALTIME_SYNTH_PHRASE_TEXT,
+        phrase_text=phrase_text,
     )
     wav_bytes = base64.b64decode(syn["base64"])
     return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
@@ -259,6 +268,33 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_long_audio_response_completes_async_chunk(self, omni_server) -> None:
+        """Regression for #6474: long async-chunk audio must emit response.audio.done."""
+        issue_6474_pcm16 = _synthetic_pcm16_input(
+            phrase_text=ISSUE_6474_SYNTH_PHRASE_TEXT,
+        )
+        issue_6474_result = asyncio.run(
+            _run_realtime_audio_roundtrip(
+                omni_server.host,
+                omni_server.port,
+                omni_server.model,
+                issue_6474_pcm16,
+                chunk_ms=100,
+                send_delay_ms=SEND_DELAY_MS,
+                completion_timeout_s=180,
+            )
+        )
+
+        _assert_realtime_smoke(issue_6474_result)
+        output_duration_s = len(issue_6474_result["output_pcm"]) / (2 * issue_6474_result["output_sample_rate"])
+        assert output_duration_s > 5, (
+            f"Expected an issue-like audio response longer than 5 seconds, got {output_duration_s:.2f}s"
+        )
 
     @pytest.mark.advanced_model
     @pytest.mark.omni

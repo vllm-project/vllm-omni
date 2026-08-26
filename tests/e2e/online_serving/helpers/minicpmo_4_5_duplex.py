@@ -15,20 +15,10 @@ import pytest
 from huggingface_hub import snapshot_download
 
 from tests.helpers.runtime import OmniServerParams, get_model_prefix
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "openbmb/MiniCPM-o-4_5"
-DEPLOY_CONFIG = modify_stage_config(
-    get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
-    updates={
-        "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-        # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
-        # is left automatic so duplex matches the simplex deploy profiles.
-        "stages": {
-            1: {"max_model_len": 4096},
-        },
-    },
-)
+DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"

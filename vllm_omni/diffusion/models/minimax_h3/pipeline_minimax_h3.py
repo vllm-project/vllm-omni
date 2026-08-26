@@ -724,8 +724,6 @@ class MiniMaxH3Pipeline(
             offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
         if getattr(od_config, "enable_layerwise_offload", False):
             offload_modes.append("layerwise offload (--enable-layerwise-offload)")
-        if getattr(od_config, "enable_distributed_layerwise_offload", False):
-            offload_modes.append("distributed layerwise offload (--enable-distributed-layerwise-offload)")
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,

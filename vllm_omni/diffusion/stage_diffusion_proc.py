@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Subprocess entry point for the diffusion engine.
 
 StageDiffusionProc runs DiffusionEngine in a child process,
@@ -36,6 +39,7 @@ from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -361,6 +365,16 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
+                metrics = diffusion_exception_metrics(e)
+                if metrics:
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "metrics",
+                                "metrics": metrics,
+                            }
+                        )
+                    )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 status_code, error_type = client_error_metadata(e)
@@ -372,6 +386,7 @@ class StageDiffusionProc:
                             "error": str(e),
                             "status_code": status_code,
                             "error_type": error_type,
+                            "metrics": diffusion_exception_metrics(e),
                         }
                     )
                 )
@@ -426,9 +441,8 @@ class StageDiffusionProc:
 
                 elif msg_type == "abort":
                     for rid in msg.get("request_ids", []):
-                        task = tasks.pop(rid, None)
-                        if task:
-                            task.cancel()
+                        # Let the request task consume the terminal abort
+                        # output so it can publish the scheduler snapshot.
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
