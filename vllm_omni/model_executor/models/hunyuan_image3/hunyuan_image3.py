@@ -75,6 +75,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import (
     MultiModalDataItems,
+    MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -977,6 +978,21 @@ class HunyuanImage3Processor:
         return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
+class HunyuanImage3DataParser(MultiModalDataParser):
+    """HunyuanImage3 treats ``img2img`` input identically to ``image``."""
+
+    def _get_subparsers(self):
+        parsers = super()._get_subparsers()
+        parsers["img2img"] = self._parse_image_data
+        return parsers
+
+    def parse_mm_data(self, mm_data, **kwargs):
+        normalized = {}
+        for key, value in mm_data.items():
+            normalized["image" if key == "img2img" else key] = value
+        return super().parse_mm_data(normalized, **kwargs)
+
+
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
     """Processing information for HunyuanImage3 model."""
 
@@ -990,14 +1006,19 @@ class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
             **kwargs,
         )
 
+    def get_data_parser(self) -> HunyuanImage3DataParser:
+        return HunyuanImage3DataParser(
+            expected_hidden_size=self.get_hf_config().hidden_size,
+        )
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        return {"image": None, "img2img": 1}
 
 
 class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3ProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         """Generate dummy text with image placeholders."""
-        num_images = mm_counts.get("image", 0)
+        num_images = mm_counts.get("image", 0) + mm_counts.get("img2img", 0)
         return "<img>" * num_images
 
     def get_dummy_mm_data(
@@ -1006,7 +1027,7 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
-        num_images = mm_counts.get("image", 0)
+        num_images = mm_counts.get("image", 0) + mm_counts.get("img2img", 0)
 
         hf_config = self.info.get_hf_config()
         image_size = hf_config.image_base_size
@@ -1022,8 +1043,60 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
         }
 
 
+def _maybe_build_hunyuan_image3_it2i_prompt(
+    prompt: str,
+    num_images: int,
+    mm_kwargs: Mapping[str, object],
+) -> str:
+    """Add HunyuanImage3's reference-image placeholder for image edits."""
+    modalities = mm_kwargs.get("modalities") or []
+    if isinstance(modalities, str):
+        modalities = [modalities]
+    if "img2img" not in modalities or num_images <= 0 or "<img>" in prompt:
+        return prompt
+
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
+
+    return build_prompt(
+        prompt,
+        task="it2i",
+        bot_task=typing.cast(str | None, mm_kwargs.get("bot_task", "think")),
+        sys_type=typing.cast(
+            str | None,
+            mm_kwargs.get("use_system_prompt") or mm_kwargs.get("sys_type") or "en_unified",
+        ),
+        custom_system_prompt=typing.cast(str | None, mm_kwargs.get("system_prompt")),
+        num_images=num_images,
+    )
+
+
 class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3ProcessingInfo]):
     """Multimodal processor for HunyuanImage3 model."""
+
+    def _apply_hf_processor_main(
+        self,
+        prompt: str | list[int],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        *,
+        enable_hf_prompt_update: bool,
+    ) -> tuple[list[int], BatchFeature, bool]:
+        if isinstance(prompt, str):
+            mm_counts = mm_items.get_all_counts()
+            prompt = _maybe_build_hunyuan_image3_it2i_prompt(
+                prompt,
+                num_images=mm_counts.get("image", 0) + mm_counts.get("img2img", 0),
+                mm_kwargs=hf_processor_mm_kwargs,
+            )
+
+        return super()._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=enable_hf_prompt_update,
+        )
 
     def _call_hf_processor(
         self,

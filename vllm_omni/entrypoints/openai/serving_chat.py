@@ -2962,6 +2962,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         reference_images: list[Image.Image],
         gen_params: OmniDiffusionSamplingParams,
         tokenizer: Any = None,
+        request_id: str | None = None,
     ) -> tuple[OmniTextPrompt, list[Any]]:
         """Build the shared multistage generation prompt and stage params."""
         stage_configs = getattr(engine, "stage_configs", None) or []
@@ -3066,6 +3067,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_w"] = width
         if seed is not None and engine_prompt_data is not None:
             mm_processor_kwargs["vae_generator_seed"] = int(seed)
+        mm_processor_kwargs["modalities"] = modalities
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
@@ -3073,8 +3075,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Provide multi_modal_uuids so that newer vLLM versions can
             # validate multi_modal_data / multi_modal_uuids consistency.
             # Generate one uuid per image when the value is a list (multi-image inputs).
+            uuid_prefix = request_id or f"img-{uuid.uuid4().hex[:16]}"
             engine_prompt["multi_modal_uuids"] = {
-                k: [f"img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"img-{k}-0"]
+                k: [f"{uuid_prefix}-{k}-{i}" for i in range(len(v))]
+                if isinstance(v, list)
+                else [f"{uuid_prefix}-{k}-0"]
                 for k, v in engine_prompt_data.items()
             }
 
@@ -3293,6 +3298,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     reference_images=pil_images,
                     gen_params=gen_params,
                     tokenizer=tokenizer,
+                    request_id=request_id,
                 )
             else:
                 engine_prompt = gen_prompt
