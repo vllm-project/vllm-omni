@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 from torch.nn import functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
 logger = init_logger(__name__)
@@ -74,7 +75,7 @@ class ConditionalCFM(BASECFM):
                 shape: (batch_size, n_feats, mel_timesteps)
         """
 
-        with torch.profiler.record_function("cosyvoice3_cfm_noise_cache"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_noise_cache"):
             z = torch.randn_like(mu).to(mu.device).to(mu.dtype) * temperature
             cache_size = cache.shape[2]
             # fix prompt and overlap part mu and z
@@ -85,11 +86,11 @@ class ConditionalCFM(BASECFM):
             mu_cache = torch.concat([mu[:, :, :prompt_len], mu[:, :, -34:]], dim=2)
             cache = torch.stack([z_cache, mu_cache], dim=-1)
 
-        with torch.profiler.record_function("cosyvoice3_cfm_t_span"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_t_span"):
             t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
             if self.t_scheduler == "cosine":
                 t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        with torch.profiler.record_function(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
+        with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
@@ -119,7 +120,7 @@ class ConditionalCFM(BASECFM):
         batch_size = int(x.size(0))
         estimator_batch = 2 * batch_size
         estimator_dtype = spks.dtype if spks is not None else x.dtype
-        with torch.profiler.record_function("cosyvoice3_cfm_cfg_allocate_2b"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_allocate_2b"):
             x_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
             mask_in = torch.zeros([estimator_batch, 1, x.size(2)], device=x.device, dtype=estimator_dtype)
             mu_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
@@ -128,7 +129,7 @@ class ConditionalCFM(BASECFM):
             cond_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
         for step in range(1, len(t_span)):
             # Classifier-Free Guidance inference introduced in VoiceBox
-            with torch.profiler.record_function("cosyvoice3_cfm_cfg_prepare_2b"):
+            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_prepare_2b"):
                 x_in[:batch_size] = x
                 x_in[batch_size:] = x
                 mask_in[:batch_size] = mask
@@ -139,12 +140,12 @@ class ConditionalCFM(BASECFM):
                     spks_in[:batch_size] = spks
                 if cond is not None:
                     cond_in[:batch_size] = cond
-            with torch.profiler.record_function("cosyvoice3_cfm_forward_estimator"):
+            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_forward_estimator"):
                 dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-            with torch.profiler.record_function("cosyvoice3_cfm_cfg_combine"):
+            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                 dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
                 dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-            with torch.profiler.record_function("cosyvoice3_cfm_euler_update"):
+            with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_euler_update"):
                 x = x + dt * dphi_dt
                 t = t + dt
             sol.append(x)
@@ -227,7 +228,7 @@ class CausalConditionalCFM(ConditionalCFM):
                 shape: (batch_size, n_feats, mel_timesteps)
         """
 
-        with torch.profiler.record_function("cosyvoice3_cfm_noise_cache"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_noise_cache"):
             z = (
                 torch.randn(
                     (mu.size(0), mu.size(1), mu.size(2)),
@@ -238,13 +239,13 @@ class CausalConditionalCFM(ConditionalCFM):
             )
 
         # fix prompt and overlap part mu and z
-        with torch.profiler.record_function("cosyvoice3_cfm_t_span"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_t_span"):
             t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
 
             if self.t_scheduler == "cosine":
                 t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
-        with torch.profiler.record_function(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
+        with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
 
@@ -318,11 +319,11 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         finalize: bool = False,
         n_timesteps: int = 10,
     ):
-        with torch.profiler.record_function("cosyvoice3_cfm_speaker_embedding"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_speaker_embedding"):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
 
-        with torch.profiler.record_function("cosyvoice3_cfm_token_embedding_lookahead"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_token_embedding_lookahead"):
             # concat text and prompt_text
             codec_token_len = token_len
             token, total_token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + codec_token_len
@@ -336,11 +337,11 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                     token[:, : -self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len :]
                 )
 
-        with torch.profiler.record_function("cosyvoice3_cfm_repeat_to_mel_axis"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_repeat_to_mel_axis"):
             h = h.repeat_interleave(self.token_mel_ratio, dim=1)
 
         batch_size = int(token.shape[0])
-        with torch.profiler.record_function("cosyvoice3_cfm_cond_prompt_mel"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cond_prompt_mel"):
             mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
 
             # get conditions
@@ -362,7 +363,7 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             streaming=streaming,
         )
 
-        with torch.profiler.record_function("cosyvoice3_cfm_crop_prompt_mel"):
+        with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):
             feat = feat[:, :, mel_len1:]
             assert feat.shape[2] == mel_len2
         return feat.float(), None

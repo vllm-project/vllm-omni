@@ -11,7 +11,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
-import os
+from collections import Counter
+from typing import cast
 
 import numpy as np
 import torch
@@ -29,6 +30,10 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    cosyvoice3_batch_flow_debug,
+    cosyvoice3_batch_flow_profile,
+)
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
@@ -283,12 +288,17 @@ class CosyVoice3Code2Wav(nn.Module):
             )
             groups.setdefault(key, []).append((index, item))
 
-        if os.environ.get("COSYVOICE3_BATCH_FLOW_DEBUG", "0") not in ("0", "false", "False", ""):
+        if cosyvoice3_batch_flow_debug():
             group_summary = {key: len(group) for key, group in groups.items()}
+            group_size_distribution = Counter(group_summary.values())
+            batchable_items = sum(size for size in group_summary.values() if size > 1)
             logger.info(
-                "CosyVoice3 code2wav debug: forward_streaming_batch items=%d groups=%s",
+                "CosyVoice3 code2wav debug: forward_streaming_batch items=%d "
+                "groups=%s group_size_distribution=%s batchable_items=%d",
                 len(items),
                 group_summary,
+                dict(sorted(group_size_distribution.items())),
+                batchable_items,
             )
 
         for _key, group in groups.items():
@@ -334,7 +344,7 @@ class CosyVoice3Code2Wav(nn.Module):
             prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
 
-            with torch.profiler.record_function(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):
+            with cosyvoice3_batch_flow_profile(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):
                 feat = self._forward_mel(
                     token=tokens,
                     prompt_token=prompt_tokens,
@@ -364,7 +374,8 @@ class CosyVoice3Code2Wav(nn.Module):
                     finalize=finalize,
                 )
 
-        return [result for result in results if result is not None]
+        assert all(result is not None for result in results), "every streaming item must produce exactly one result"
+        return cast(list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]], results)
 
     @torch.inference_mode()
     def forward_streaming(

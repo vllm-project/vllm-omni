@@ -39,6 +39,10 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    cosyvoice3_batch_flow_debug,
+    cosyvoice3_batch_flow_enabled,
+)
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
@@ -86,15 +90,6 @@ def _campplus_onnx_providers() -> list[str]:
     if "MUSAExecutionProvider" in onnxruntime.get_available_providers():
         return ["MUSAExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
-
-
-def _cosyvoice3_batch_flow_enabled() -> bool:
-    """Enable Stage-1 flow-estimator batching for same-shape streaming chunks."""
-    return os.environ.get("COSYVOICE3_BATCH_FLOW", "1") not in ("0", "false", "False", "")
-
-
-def _cosyvoice3_batch_flow_debug() -> bool:
-    return os.environ.get("COSYVOICE3_BATCH_FLOW_DEBUG", "0") not in ("0", "false", "False", "")
 
 
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
@@ -1079,7 +1074,7 @@ class CosyVoice3Model(
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
             num_reqs = max(1, len(request_ids_list))
-            debug_batch_flow = _cosyvoice3_batch_flow_debug()
+            debug_batch_flow = cosyvoice3_batch_flow_debug()
             if debug_batch_flow:
                 logger.info(
                     "CosyVoice3 code2wav debug: forward num_reqs=%d seq_token_counts=%s flat_ids=%d",
@@ -1208,7 +1203,7 @@ class CosyVoice3Model(
                     )
                 if (
                     len(streaming_flow_items) > 1
-                    and _cosyvoice3_batch_flow_enabled()
+                    and cosyvoice3_batch_flow_enabled()
                     and hasattr(self.code2wav, "forward_streaming_batch")
                 ):
                     streaming_results = self.code2wav.forward_streaming_batch(

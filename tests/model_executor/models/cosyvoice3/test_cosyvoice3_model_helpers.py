@@ -390,7 +390,8 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     assert "rid-stream" not in model._stream_vocoder_cache_by_req
 
 
-def test_forward_batches_streaming_flow_items():
+def test_forward_batches_streaming_flow_items(monkeypatch):
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
     model = _make_code2wav_model()
     runtime_info = [
         {
