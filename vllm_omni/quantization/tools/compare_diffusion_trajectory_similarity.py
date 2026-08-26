@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Compare diffusion quantization quality with final output metrics.
 
 This tool runs a reference diffusion configuration and a candidate
@@ -221,14 +221,44 @@ def compute_uint8_image_metrics(lhs: Any, rhs: Any) -> dict[str, float]:
     return metrics
 
 
+def _frame_to_uint8_rgb(frame: Any) -> np.ndarray:
+    """Return an (H, W, 3) uint8 array for one generated frame.
+
+    t2i pipelines hand back PIL images, but t2v pipelines hand back raw
+    ``torch.Tensor``/``np.ndarray`` frames in [0, 1] (channels first or last),
+    so both have to be accepted here.
+    """
+    if hasattr(frame, "convert"):  # PIL.Image
+        return np.asarray(frame.convert("RGB"))
+
+    if isinstance(frame, torch.Tensor):
+        array = frame.detach().cpu().float().numpy()
+    else:
+        array = np.asarray(frame)
+
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    if array.ndim == 2:
+        array = array[..., None]
+
+    if not np.issubdtype(array.dtype, np.integer):
+        array = np.clip(array.astype(np.float32), 0.0, 1.0) * 255.0
+        array = array.round()
+    array = np.clip(array, 0, 255).astype(np.uint8)
+
+    if array.shape[-1] == 1:
+        array = np.repeat(array, 3, axis=-1)
+    return array[..., :3]
+
+
 def summarize_output_frame_metrics(reference_frames: list[Any], candidate_frames: list[Any]) -> dict[str, Any]:
     if len(reference_frames) != len(candidate_frames):
         raise ValueError(f"Output frame count mismatch: {len(reference_frames)} vs {len(candidate_frames)}")
     if not reference_frames:
         raise ValueError("No output frames available for comparison.")
 
-    ref_stack = np.stack([np.asarray(frame.convert("RGB")) for frame in reference_frames], axis=0)
-    cand_stack = np.stack([np.asarray(frame.convert("RGB")) for frame in candidate_frames], axis=0)
+    ref_stack = np.stack([_frame_to_uint8_rgb(frame) for frame in reference_frames], axis=0)
+    cand_stack = np.stack([_frame_to_uint8_rgb(frame) for frame in candidate_frames], axis=0)
 
     frame0_metrics = compute_uint8_image_metrics(ref_stack[0], cand_stack[0])
     mid_index = len(reference_frames) // 2
@@ -424,6 +454,22 @@ def _get_output_frames(result: Any) -> list[Any]:
     images = list(getattr(result, "images", []) or [])
     if len(images) == 1 and isinstance(images[0], list):
         return list(images[0])
+    if len(images) == 1 and not hasattr(images[0], "convert"):
+        # t2v pipelines return the whole clip as one (T, H, W, C) array or an
+        # extra-batched (1, T, H, W, C) one, rather than a list of PIL frames.
+        # Unroll it so every downstream metric is per-frame.
+        clip = images[0]
+        if isinstance(clip, torch.Tensor):
+            clip = clip.detach().cpu()
+        ndim = getattr(clip, "ndim", 0)
+        if ndim == 5:
+            clip = clip[0]
+            ndim = 4
+        if ndim == 4:
+            if clip.shape[0] in (1, 3, 4) and clip.shape[-1] not in (1, 3, 4):
+                # channels-first (C, T, H, W)
+                clip = clip.permute(1, 2, 3, 0) if isinstance(clip, torch.Tensor) else np.transpose(clip, (1, 2, 3, 0))
+            return list(clip)
     return images
 
 
@@ -436,13 +482,15 @@ def _save_outputs(result: Any, output_dir: Path, label: str, task: str, fps: int
     variant_dir.mkdir(parents=True, exist_ok=True)
     if task == "t2v":
         from diffusers.utils import export_to_video
+        from PIL import Image
 
+        rgb = [_frame_to_uint8_rgb(frame) for frame in frames]
         video_path = variant_dir / "video.mp4"
-        export_to_video(frames, str(video_path), fps=fps)
+        export_to_video([Image.fromarray(frame) for frame in rgb], str(video_path), fps=fps)
         saved.append(str(video_path))
-        for idx in (0, len(frames) // 2, len(frames) - 1):
+        for idx in (0, len(rgb) // 2, len(rgb) - 1):
             path = variant_dir / f"frame_{idx}.png"
-            frames[idx].save(path)
+            Image.fromarray(rgb[idx]).save(path)
             saved.append(str(path))
         return saved
     for idx, image in enumerate(frames):

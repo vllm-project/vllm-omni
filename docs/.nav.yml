@@ -53,6 +53,7 @@ nav:
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
+      - W4A8 on MI355X: user_guide/quantization/w4a8_rocm.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md

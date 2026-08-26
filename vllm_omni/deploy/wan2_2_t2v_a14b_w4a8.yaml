@@ -1,0 +1,25 @@
+# Wan2.2 T2V-A14B deploy with W4A8 quantization (MXFP4 weights, MXFP8 activations).
+#
+# Requires AMD MI355X (gfx950); see wan2_2_ti2v_w4a8.yaml for the hardware note.
+#
+# A14B is a dual-expert cascade: `transformer/` (high noise) and `transformer_2/`
+# (low noise) are selected by the timestep boundary. Both are quantized with this
+# same config, and both are resident at once — expect roughly double the load
+# time and peak host memory of TI2V-5B. The weights are ~14B x 2 in BF16 on disk
+# and are packed to MXFP4 one layer at a time as they load.
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    # W4A8 has only been validated at TP=1. A14B in BF16 normally wants TP>1 for
+    # capacity; at 4 bits it fits on one MI355X, which is the point of this config.
+    tensor_parallel_size: 1
+    enforce_eager: true
+    quantization: quark_w4a8
+    vae_use_tiling: true
+    default_sampling_params:
+      seed: 42

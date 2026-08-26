@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
@@ -125,6 +125,36 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4DualScaleMixedConfig(**kw)
 
 
+# Matches Quark's SVDQuantConfig default.
+_DEFAULT_SVD_RANK = 32
+
+
+def _build_quark_w4a8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for W4A8 MXFP4-weight / MXFP8-activation config (ROCm gfx950 only).
+
+    Routed through from_config() rather than __init__ so that checkpoint keys
+    that this scheme does not consume (e.g. quant_algo) are ignored instead of
+    raising TypeError.
+    """
+    from .quark_w4a8_config import DiffusionQuarkW4A8Config
+
+    return DiffusionQuarkW4A8Config.from_config(kw)
+
+
+def _build_quark_svdquant(**kw: Any) -> QuantizationConfig:
+    """W4A8 with the SVDQuant low-rank correction branch enabled by default.
+
+    Not an alias of quark_w4a8: it differs precisely in defaulting svd_rank, and
+    silently falling back to the plain variant when the name says svdquant would
+    be a quiet accuracy regression.
+    """
+    from .quark_w4a8_config import DiffusionQuarkW4A8Config
+
+    if kw.get("svd_rank") is None and kw.get("rank") is None:
+        kw = {**kw, "svd_rank": _DEFAULT_SVD_RANK}
+    return DiffusionQuarkW4A8Config.from_config(kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -145,6 +175,11 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
+    # "quark_w4a8" is canonical; "quark-w4a8" normalizes onto it. Deliberately
+    # not claiming the bare "svdquant" name, which upstream vLLM PR #3830 uses
+    # for Nunchaku.
+    "quark_w4a8": _build_quark_w4a8,
+    "quark_svdquant": _build_quark_svdquant,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,

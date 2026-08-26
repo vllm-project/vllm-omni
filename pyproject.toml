@@ -273,6 +273,7 @@ markers = [
     "L4: [hardware-resource] Tests that require L4 GPU",
     "B200: [hardware-resource] Tests that require B200 GPU",
     "MI325: [hardware-resource] Tests that require MI325 GPU (AMD/ROCm)",
+    "MI355: [hardware-resource] Tests that require MI355 GPU (AMD/ROCm, gfx950)",
     "B60: [hardware-resource] Tests that require Intel Arc Pro B60 XPU",
     "S5000: [hardware-resource] Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: [hardware-resource] Tests that require A2 NPU",
