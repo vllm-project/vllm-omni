@@ -139,7 +139,12 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(
+    minimum: int = 1,
+    *,
+    runtime_prompt_cache_size: int = 4,
+    setup_cache_size: int = 1,
+):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
@@ -148,16 +153,26 @@ def _config(minimum: int = 1):
                     "code2wav_min_batch_size": minimum,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
+                    "token2wav_runtime_prompt_cache_size": runtime_prompt_cache_size,
+                    "token2wav_setup_cache_size": setup_cache_size,
                 }
             },
         )
     )
 
 
-def _model():
+def _model(*, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
     token2wav = _FakeToken2Wav()
-    backend = BatchedToken2Wav(token2wav)
-    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    backend = BatchedToken2Wav(
+        token2wav,
+        setup_cache_size=setup_cache_size,
+    )
+    model = MiniCPMO45Code2Wav(
+        vllm_config=_config(
+            runtime_prompt_cache_size=runtime_prompt_cache_size,
+            setup_cache_size=setup_cache_size,
+        )
+    )
     model.backend = backend
     return model, token2wav
 
@@ -263,6 +278,55 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_setup_cache_reuses_read_only_state_for_the_same_exact_batch():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=2)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    first = adapter.setup_batch(prompt, 1)
+    encoder_calls = list(token2wav.flow.encoder.calls)
+    snapshots = {name: tensor.clone() for name, tensor in {**first[0].flow_cache, **first[0].hift_cache}.items()}
+    second = adapter.setup_batch(prompt, 1)
+
+    assert first is not second
+    assert first[0] is second[0]
+    assert token2wav.flow.encoder.calls == encoder_calls
+
+    adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        second,
+        last_chunk=False,
+    )
+    for name, expected in snapshots.items():
+        cache = first[0].flow_cache if name in first[0].flow_cache else first[0].hift_cache
+        torch.testing.assert_close(cache[name], expected)
+
+
+def test_setup_cache_keys_batch_size_and_evicts_least_recent_entry():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    adapter.setup_batch(prompt, 1)
+    adapter.setup_batch(prompt, 2)
+    adapter.setup_batch(prompt, 1)
+
+    assert token2wav.flow.encoder.calls == [1, 2, 1]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 1)]
+
+
+def test_evict_prompt_clears_features_and_setup_state():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=2)
+    first = adapter.prepare_prompt("first", "/fake/first.wav")
+    adapter.setup_batch(first, 1)
+
+    adapter.evict_prompt("first", "/fake/first.wav")
+    assert ("first", "/fake/first.wav") not in adapter._prompt_features
+    assert all(key[0] != first.cache_key for key in adapter._setup_cache)
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
@@ -397,7 +461,7 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    model, _ = _model()
+    model, _ = _model(runtime_prompt_cache_size=0)
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
     first = _info("voice-a", 0, [10, 11])
@@ -453,8 +517,8 @@ def test_runtime_prompt_write_failure_does_not_publish_partial_file(tmp_path, mo
 
 def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    first_model, _ = _model()
-    second_model, _ = _model()
+    first_model, _ = _model(runtime_prompt_cache_size=0)
+    second_model, _ = _model(runtime_prompt_cache_size=0)
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
     def runtime_ref_info(request_id: str):
@@ -482,6 +546,86 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
 
     second_model.on_requests_finished(["internal-b"])
     assert not second_path.exists()
+
+
+def test_runtime_prompt_and_setup_are_reused_across_sequential_requests(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, token2wav = _model(runtime_prompt_cache_size=2, setup_cache_size=1)
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def runtime_ref_info(request_id: str):
+        info = _info(request_id, 0, [10, 11])
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    first = _forward(
+        model,
+        [runtime_ref_info("voice-a")],
+        request_ids=["internal-a"],
+    )
+    prompt_key = model._request_prompt_keys["internal-a"]
+    prompt_path = Path(model._runtime_prompts[prompt_key].path)
+    model.on_requests_finished(["internal-a"])
+    encoder_calls = len(token2wav.flow.encoder.calls)
+
+    second = _forward(
+        model,
+        [runtime_ref_info("voice-b")],
+        request_ids=["internal-b"],
+    )
+
+    assert token2wav.prompt_calls == 1
+    # A setup miss and a decode each call the encoder; a setup hit only decodes.
+    assert len(token2wav.flow.encoder.calls) == encoder_calls + 1
+    torch.testing.assert_close(
+        first.multimodal_outputs["model_outputs"][0],
+        second.multimodal_outputs["model_outputs"][0],
+    )
+    assert model._request_prompt_keys["internal-b"] == prompt_key
+    model.on_requests_finished(["internal-b"])
+    assert prompt_path.is_file()
+    assert model._runtime_prompts[prompt_key].owners == set()
+
+
+def test_runtime_prompt_lru_evicts_only_unowned_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model(runtime_prompt_cache_size=1, setup_cache_size=2)
+
+    def runtime_ref_info(request_id: str, reference: torch.Tensor):
+        info = _info(request_id, 0, [10, 11])
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    _forward(
+        model,
+        [runtime_ref_info("voice-a", torch.tensor([0.0, 0.1, 0.0]))],
+        request_ids=["internal-a"],
+    )
+    first_key = model._request_prompt_keys["internal-a"]
+    first_prompt = model._runtime_prompts[first_key]
+    first_path = Path(first_prompt.path)
+
+    _forward(
+        model,
+        [runtime_ref_info("voice-b", torch.tensor([0.0, 0.2, 0.0]))],
+        request_ids=["internal-b"],
+    )
+    second_key = model._request_prompt_keys["internal-b"]
+    assert set(model._runtime_prompts) == {first_key, second_key}
+
+    model.on_requests_finished(["internal-a"])
+    assert first_key not in model._runtime_prompts
+    assert not first_path.exists()
+    assert (first_prompt.cache_id, first_prompt.path) not in model.backend._prompt_features
+    assert all(key[0] != (first_prompt.cache_id, first_prompt.path) for key in model.backend._setup_cache)
+
+    model.on_requests_finished(["internal-b"])
+    assert list(model._runtime_prompts) == [second_key]
+    assert model._runtime_prompts[second_key].owners == set()
 
 
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
@@ -707,7 +851,7 @@ def test_cleanup_uses_generation_runner_internal_request_ids():
 
 
 def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
-    model, _ = _model()
+    model, _ = _model(runtime_prompt_cache_size=0)
     first = _info("voice-a", 0, [1, 2])
     first["codes"]["ref"] = torch.linspace(-0.1, 0.1, 160)
     segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)

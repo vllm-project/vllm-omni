@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # Retain reusable prompt features and one prompt-conditioned CFM state.
+      token2wav_runtime_prompt_cache_size: 4
+      token2wav_setup_cache_size: 1
 
 stages:
   - stage_id: 0
