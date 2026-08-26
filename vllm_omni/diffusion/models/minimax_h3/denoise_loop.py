@@ -20,6 +20,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -258,7 +259,11 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
-    positive.prepare_rope_table(model)
+    # Keep CUDA/CPU on the reference path: its accuracy CI compares the
+    # generated video against the official artifact. The table reuse is an
+    # Ascend-specific performance optimization and must not alter that path.
+    if current_omni_platform.is_npu():
+        positive.prepare_rope_table(model)
     video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,

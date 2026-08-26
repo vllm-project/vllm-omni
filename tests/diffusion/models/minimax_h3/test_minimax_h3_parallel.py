@@ -138,11 +138,14 @@ def test_h3_prepared_rope_table_is_rank_local_and_validated(monkeypatch):
         model._validate_prepared_rope_table(actual[:1], local_len=2, device=torch.device("cpu"))
 
 
-def test_denoise_branch_prepares_rope_table_once_per_run():
+def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
         MiniMaxH3DenoiseBranch,
         minimax_h3_denoise_loop,
     )
+
+    monkeypatch.setattr(denoise_loop.current_omni_platform, "is_npu", lambda: True)
 
     packed = {
         "seq_len": torch.tensor(3),
