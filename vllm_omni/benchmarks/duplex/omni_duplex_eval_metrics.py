@@ -18,9 +18,9 @@ PROTOCOL_PIN = "962cec448ac37a377ffb963b476778777d11d346"
 
 
 def temporal_window(sentence_start: float, sentence_end: float, video_duration: float) -> tuple[float, float] | None:
-    start = max(0.0, float(sentence_start) - 2.0)
-    end = max(start + 0.5, float(sentence_end) - 2.0)
-    return (start, end) if end <= float(video_duration) and end - start >= 0.5 else None
+    start = float(sentence_start) - 2.0
+    end = float(sentence_end) - 2.0
+    return (start, end) if start >= 0.0 and end <= float(video_duration) and end - start >= 0.5 else None
 
 
 def reminder_window(start_time: float, window_size: float = 10.0) -> tuple[float, float]:
