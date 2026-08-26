@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base pipeline class for Diffusion models with shared CFG functionality.
@@ -17,6 +17,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.diffusion.forward_context import use_cfg_branch_id
 
 logger = init_logger(__name__)
 
@@ -105,6 +106,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             logic and set self.scheduler to a composite scheduler.
         """
         if do_true_cfg:
+            if negative_kwargs is None:
+                raise ValueError("negative_kwargs is required when do_true_cfg is True")
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
 
@@ -138,8 +141,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                with use_cfg_branch_id(0):
+                    positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
+                with use_cfg_branch_id(1):
+                    negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -154,7 +159,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**positive_kwargs)
+            with use_cfg_branch_id(0):
+                pred = self.predict_noise(**positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
@@ -268,15 +274,17 @@ class CFGParallelMixin(metaclass=ABCMeta):
             else:
                 # Sequential: run all N branches on single device
                 preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
-                for kw in branches_kwargs:
-                    pred = _wrap(self.predict_noise(**kw))
+                for bid, kw in enumerate(branches_kwargs):
+                    with use_cfg_branch_id(bid):
+                        pred = _wrap(self.predict_noise(**kw))
                     if output_slice is not None:
                         pred = _slice_pred(pred, output_slice)
                     preds.append(_unwrap(pred))
                 return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**branches_kwargs[0])
+            with use_cfg_branch_id(0):
+                pred = self.predict_noise(**branches_kwargs[0])
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
@@ -307,10 +315,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
         my_branch_ids = assignments[cfg_rank]
         max_per_rank = max(len(a) for a in assignments)
 
-        # Run assigned branches
+        # Run assigned branches. Tag by branch id.
         my_preds: list[tuple[torch.Tensor, ...]] = []
         for bid in my_branch_ids:
-            pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
+            with use_cfg_branch_id(bid):
+                pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
             if output_slice is not None:
                 pred = _slice_pred(pred, output_slice)
             my_preds.append(pred)
@@ -395,7 +404,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             Non-last Pipeline Parallel stages return `IntermediateTensors`
             instead of final noise tensors wrapped in a tuple.
         """
-        result = self.transformer(*args, **kwargs)
+        result = self.transformer(*args, **kwargs)  # type: ignore
         return result if isinstance(result, IntermediateTensors) else result[0]
 
     def diffuse(

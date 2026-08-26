@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for CFG (Classifier-Free Guidance) parallel functionality.
 
 CPU tests mock the CFG process group and validate mixin logic without GPUs.
@@ -10,6 +10,7 @@ real multi-GPU CFG parallel under fixed seeds.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 _L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
@@ -345,6 +347,7 @@ def _run_multi_branch_cfg_parallel_mock(
         branch_preds=branch_preds,
     )
 
+    assignments = _dispatch_branches(len(branches_kwargs), cfg_world_size)
     outputs: list[torch.Tensor] = []
     for cfg_rank in range(cfg_world_size):
         fake_group = FakeMultiBranchCfgGroup(
@@ -353,13 +356,15 @@ def _run_multi_branch_cfg_parallel_mock(
             slots_per_rank=slots_per_rank,
         )
         _patch_cfg_state(monkeypatch, world_size=cfg_world_size, rank=cfg_rank, fake_group=fake_group)
-        with torch.no_grad():
+        assigned = assignments[cfg_rank]
+        with set_forward_context(), torch.no_grad(), _record_cfg_branch_ids(pipeline) as branch_ids:
             output = pipeline.predict_noise_with_multi_branch_cfg(
                 do_true_cfg=True,
                 true_cfg_scale=true_cfg_scale,
                 branches_kwargs=branches_kwargs,
                 cfg_normalize=cfg_normalize,
             )
+        assert branch_ids == (assigned if assigned else [None])
         assert output is not None
         outputs.append(output)
 
@@ -386,6 +391,23 @@ def _build_pipeline_on_device(
     pipeline.transformer = pipeline.transformer.to(device=device, dtype=dtype)
     pipeline.transformer.eval()
     return pipeline
+
+
+@contextmanager
+def _record_cfg_branch_ids(pipeline: CFGParallelMixin):
+    """Record ForwardContext.cfg_branch_id for each predict_noise call."""
+    seen: list[int | None] = []
+    original = pipeline.predict_noise
+
+    def _predict_noise(*args: Any, **kwargs: Any):
+        seen.append(get_forward_context().cfg_branch_id if is_forward_context_available() else None)
+        return original(*args, **kwargs)
+
+    pipeline.predict_noise = _predict_noise  # type: ignore[method-assign]
+    try:
+        yield seen
+    finally:
+        del pipeline.predict_noise
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +446,7 @@ def test_predict_noise_with_cfg(
         rank=0,
         fake_group=FakeCfgGroup(world_size=1, rank_in_group=0, rank_tensors=[]),
     )
-    with torch.no_grad():
+    with set_forward_context(), torch.no_grad(), _record_cfg_branch_ids(pipeline) as branch_ids:
         baseline = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
             true_cfg_scale=7.5,
@@ -433,6 +455,7 @@ def test_predict_noise_with_cfg(
             cfg_normalize=cfg_normalize,
             kwargs=extra_kwargs,
         )
+    assert branch_ids == [0, 1]
 
     parallel = _run_two_branch_cfg_parallel_mock(
         pipeline,
@@ -470,7 +493,7 @@ def test_predict_noise_without_cfg():
         input_seed=123,
     )
 
-    with torch.no_grad():
+    with set_forward_context(), torch.no_grad(), _record_cfg_branch_ids(pipeline) as branch_ids:
         noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=False,
             true_cfg_scale=7.5,
@@ -478,6 +501,7 @@ def test_predict_noise_without_cfg():
             negative_kwargs=None,
             cfg_normalize=False,
         )
+    assert branch_ids == [0]
 
     assert noise_pred is not None
     assert noise_pred.shape == (1, 4, 16, 16)
@@ -488,7 +512,7 @@ def test_predict_noise_without_cfg():
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     "cfg_parallel_size,n_branches",
-    [(2, 2), (2, 3), (3, 3), (2, 4)],
+    [(2, 2), (2, 3), (3, 2), (3, 3), (2, 4)],
 )
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
@@ -526,13 +550,14 @@ def test_predict_noise_with_multi_branch_cfg(
         rank=0,
         fake_group=FakeCfgGroup(world_size=1, rank_in_group=0, rank_tensors=[]),
     )
-    with torch.no_grad():
+    with set_forward_context(), torch.no_grad(), _record_cfg_branch_ids(pipeline) as branch_ids:
         baseline = pipeline.predict_noise_with_multi_branch_cfg(
             do_true_cfg=True,
             true_cfg_scale=cfg_scale,
             branches_kwargs=branches_kwargs,
             cfg_normalize=cfg_normalize,
         )
+    assert branch_ids == list(range(n_branches))
 
     parallel = _run_multi_branch_cfg_parallel_mock(
         pipeline,
@@ -578,13 +603,14 @@ def test_multi_branch_without_cfg():
         input_seed=123,
     )
 
-    with torch.no_grad():
+    with set_forward_context(), torch.no_grad(), _record_cfg_branch_ids(pipeline) as branch_ids:
         noise_pred = pipeline.predict_noise_with_multi_branch_cfg(
             do_true_cfg=False,
             true_cfg_scale=5.0,
             branches_kwargs=branches_kwargs,
             cfg_normalize=False,
         )
+    assert branch_ids == [0]
 
     assert noise_pred is not None
     assert noise_pred.shape == (1, 4, 16, 16)

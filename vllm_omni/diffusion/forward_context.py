@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -36,6 +39,10 @@ class ForwardContext:
     denoise_timestep: float | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Active CFG branch id for the current predict_noise / DiT forward.
+    # Set by CFG dispatch (or model denoise loops) so caches like TeaCache can
+    # keep independent state per branch without assuming module layout.
+    cfg_branch_id: int | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -285,3 +292,17 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.ref_latent = ref_latent
+
+
+@contextmanager
+def use_cfg_branch_id(branch_id: int | None):
+    """Temporarily tag the current forward with a CFG branch id."""
+    if _forward_context is None:
+        yield
+        return
+    prev = _forward_context.cfg_branch_id
+    _forward_context.cfg_branch_id = branch_id
+    try:
+        yield
+    finally:
+        _forward_context.cfg_branch_id = prev
