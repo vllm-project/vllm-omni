@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end test for ``piecewise_attn`` (CPU).
 
 Verify that running attention in segments (causal outside full-attn spans,
@@ -98,9 +98,12 @@ def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
     query = torch.arange(12 * 2 * 4, dtype=torch.float32).reshape(12, 2, 4)
     key = query + 100
     value = query + 200
-    calls = []
+    calls: list[object] = []
 
-    def run_segment(segment_query, segment_key, segment_value, segment_batch):
+    output_buffer = torch.empty_like(query)
+
+    def run_segment(segment_query, segment_key, segment_value, segment_batch, segment_output_buffer):
+        assert segment_output_buffer is None
         calls.append(
             (
                 [segment.mode for segment in segment_batch.row_segments],
@@ -119,14 +122,107 @@ def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
         plan,
         plan.segments,
         run_segment,
+        output_buffer=output_buffer,
     )
 
+    assert output is output_buffer
     torch.testing.assert_close(output, query)
+    assert all(segment.query_range is None for segment in plan.segments)
+    assert not plan.segments_cover_query_contiguously
     assert calls == [
         (["causal", "causal"], [2, 4], [0, 1, 6, 7]),
         (["full", "full"], [5, 7], [2, 3, 4, 8, 9, 10]),
         (["causal", "causal"], [6, 8], [5, 11]),
     ]
+
+
+def test_paged_piecewise_runner_slices_contiguous_segments():
+    plan = build_paged_piecewise_plan(
+        [[(2, 5)]],
+        query_offsets=[0],
+        query_lens=[6],
+        seq_lens=[6],
+        device=DEVICE,
+    )
+    query = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4)
+    key = query + 100
+    value = query + 200
+    expected_ranges = [(0, 2), (2, 5), (5, 6)]
+    calls: list[tuple[int, int]] = []
+
+    def run_segment(segment_query, segment_key, segment_value, _segment_batch, segment_output_buffer):
+        assert segment_output_buffer is None
+        expected_range = expected_ranges[len(calls)]
+        start, end = expected_range
+        calls.append(expected_range)
+        assert segment_query.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
+        assert segment_key.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+        assert segment_value.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+        torch.testing.assert_close(segment_query, query[start:end])
+        return segment_query
+
+    output = run_paged_piecewise_plan(query, key, value, plan, plan.segments, run_segment)
+
+    assert calls == expected_ranges
+    assert [segment.query_range for segment in plan.segments] == expected_ranges
+    assert plan.segments_cover_query_contiguously
+    torch.testing.assert_close(output, query)
+
+
+def test_paged_piecewise_runner_writes_contiguous_segments_into_output_buffer():
+    plan = build_paged_piecewise_plan(
+        [[(2, 5)]],
+        query_offsets=[0],
+        query_lens=[6],
+        seq_lens=[6],
+        device=DEVICE,
+    )
+    query = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4)
+    output_buffer = torch.empty(6, 2, 3)
+    targets = []
+
+    def run_segment(segment_query, _key, _value, _metadata, segment_output_buffer):
+        assert segment_output_buffer is not None
+        assert segment_output_buffer.untyped_storage().data_ptr() == output_buffer.untyped_storage().data_ptr()
+        targets.append(segment_output_buffer)
+        return segment_output_buffer.copy_(segment_query[..., :3])
+
+    output = run_paged_piecewise_plan(
+        query,
+        query,
+        query,
+        plan,
+        plan.segments,
+        run_segment,
+        output_buffer=output_buffer,
+    )
+
+    assert output is output_buffer
+    assert [target.shape[0] for target in targets] == [2, 3, 1]
+    torch.testing.assert_close(output, query[..., :3])
+
+
+def test_paged_piecewise_runner_returns_single_full_segment_directly():
+    plan = build_paged_piecewise_plan(
+        [[]],
+        query_offsets=[0],
+        query_lens=[6],
+        seq_lens=[6],
+        device=DEVICE,
+    )
+    query = torch.randn(6, 2, 4)
+    runner_output = query + 1
+
+    output = run_paged_piecewise_plan(
+        query,
+        query,
+        query,
+        plan,
+        plan.segments,
+        lambda *_args: runner_output,
+    )
+
+    assert output is runner_output
 
 
 def test_paged_piecewise_runner_uses_runner_output_shape():

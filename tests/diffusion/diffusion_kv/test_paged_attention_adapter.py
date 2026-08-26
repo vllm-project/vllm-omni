@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -283,48 +283,6 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][3] is events[0][2]
 
 
-def test_omni_paged_backend_imports_dense_prefix_before_current_write(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, block_tables, layer, _ = _make_adapter(monkeypatch)
-    batch = adapter.prepare_batch(
-        [
-            DiffusionPagedAttentionRow(
-                request_id="req-0",
-                sequence_id=0,
-                query_len=3,
-                seq_len=7,
-                kv_start_pos=4,
-                imported_prefix_len=4,
-            )
-        ]
-    )
-    query = torch.randn(1, 3, 2, 4)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    prefix_key = torch.randn(1, 4, 2, 4)
-    prefix_value = torch.randn_like(prefix_key)
-    metadata = SimpleNamespace(
-        full_attn_spans=None,
-        paged_kv_prefix_key=prefix_key,
-        paged_kv_prefix_value=prefix_value,
-        extra={},
-    )
-
-    with adapter.activate(batch):
-        context = adapter.prepare_layer_context("layer-0", query, key, value, omni_attn_metadata=metadata)
-        output = _run_omni_paged_backend(context)
-
-    assert torch.equal(output, query)
-    assert [call[2].tolist() for call in block_tables.slot_calls] == [[0, 1, 2, 3], [4, 5, 6]]
-    assert layer.native_events == ["update", "update", "forward"]
-    assert torch.equal(layer.updates[0][0], prefix_key.reshape(4, 2, 4))
-    assert torch.equal(layer.updates[0][1], prefix_value.reshape(4, 2, 4))
-    assert layer.updates[0][2].tolist() == [0, 1, 2, 3]
-    assert torch.equal(layer.updates[1][0], key.reshape(3, 2, 4))
-    assert layer.updates[1][2].tolist() == [4, 5, 6]
-
-
 def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, _ = _make_adapter(monkeypatch, num_heads=32, num_kv_heads=8)
     batch = adapter.prepare_batch(
@@ -393,6 +351,13 @@ def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: p
     assert [metadata.query_start_loc_cpu.tolist() for metadata in segment_metadata] == [[0, 1], [0, 2], [0, 1]]
     assert [metadata.positions.tolist() for metadata in segment_metadata] == [[0], [1, 2], [3]]
     assert [metadata.slot_mappings.tolist() for metadata in segment_metadata] == [[[0]], [[1, 2]], [[3]]]
+    for event in events[1:]:
+        build_kwargs = event[1]
+        assert build_kwargs["positions"].untyped_storage().data_ptr() == batch.positions.untyped_storage().data_ptr()
+        assert (
+            build_kwargs["slot_mappings"].untyped_storage().data_ptr()
+            == batch.slot_mappings.untyped_storage().data_ptr()
+        )
 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:

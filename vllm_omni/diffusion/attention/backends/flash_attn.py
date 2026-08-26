@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from functools import partial
@@ -267,19 +267,6 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        if paged_kv_context.imported_prefix_key is not None:
-            update_cache = getattr(native_impl, "do_kv_cache_update", None)
-            if not callable(update_cache):
-                raise NotImplementedError(
-                    f"Native paged backend {layer.attn_backend.get_name()!r} cannot import a dense KV prefix"
-                )
-            update_cache(
-                layer,
-                paged_kv_context.imported_prefix_key,
-                paged_kv_context.imported_prefix_value,
-                kv_cache,
-                paged_kv_context.imported_prefix_slot_mapping,
-            )
         if not layer.attn_backend.forward_includes_kv_cache_update:
             native_impl.do_kv_cache_update(
                 layer,
@@ -294,12 +281,14 @@ class FlashAttentionImpl(AttentionImpl):
             key: torch.Tensor,
             value: torch.Tensor,
             native_metadata,
+            output: torch.Tensor | None,
         ) -> torch.Tensor:
-            output = torch.empty(
-                (query.shape[0], layer.num_heads, layer.head_size_v),
-                dtype=query.dtype,
-                device=query.device,
-            )
+            if output is None:
+                output = torch.empty(
+                    (query.shape[0], layer.num_heads, layer.head_size_v),
+                    dtype=query.dtype,
+                    device=query.device,
+                )
             return native_impl.forward(
                 layer,
                 query,
@@ -311,6 +300,11 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if paged_kv_context.piecewise_plan is not None:
+            output = torch.empty(
+                (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
+                dtype=paged_kv_context.query.dtype,
+                device=paged_kv_context.query.device,
+            )
             output = run_paged_piecewise_plan(
                 paged_kv_context.query,
                 paged_kv_context.key_write,
@@ -318,6 +312,7 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.piecewise_plan,
                 paged_kv_context.piecewise_native_metadata,
                 run_native_attention,
+                output_buffer=output,
             )
         else:
             output = run_native_attention(
@@ -325,6 +320,7 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.key_write,
                 paged_kv_context.value_write,
                 paged_kv_context.native_metadata,
+                None,
             )
         return paged_kv_context.restore_output(output)
 
