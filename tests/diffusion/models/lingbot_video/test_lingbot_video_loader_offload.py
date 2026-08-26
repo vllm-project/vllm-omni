@@ -306,9 +306,9 @@ def _patch_tracked_vae_device(mocker, module):
     mocker.patch.object(
         module,
         "_module_device",
-        side_effect=lambda value: value.current_device
-        if isinstance(value, _DeviceTrackingVAE)
-        else original_module_device(value),
+        side_effect=lambda value: (
+            value.current_device if isinstance(value, _DeviceTrackingVAE) else original_module_device(value)
+        ),
     )
     mocker.patch.object(torch.accelerator, "empty_cache")
 

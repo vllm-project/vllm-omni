@@ -315,12 +315,12 @@ def test_refiner_offloads_vae_before_ti2v_text_condition():
     events = []
     pipeline._prepare_base_condition = lambda **kwargs: condition
     pipeline.diffuse = lambda **kwargs: torch.zeros(1, 1, 1, 2, 2)
-    pipeline._decode_latents_internal = lambda latents: (events.append("decode") or torch.ones(1, 3, 1, 16, 16))
-    pipeline._prepare_refiner_inputs = lambda **kwargs: (events.append("handoff") or refiner_inputs)
-    pipeline._offload_vae_for_denoise = lambda **kwargs: (events.append("offload:" + str(kwargs["enabled"])) or None)
+    pipeline._decode_latents_internal = lambda latents: events.append("decode") or torch.ones(1, 3, 1, 16, 16)
+    pipeline._prepare_refiner_inputs = lambda **kwargs: events.append("handoff") or refiner_inputs
+    pipeline._offload_vae_for_denoise = lambda **kwargs: events.append("offload:" + str(kwargs["enabled"])) or None
     pipeline._restore_vae_for_decode = lambda device: events.append("restore")
-    pipeline._prepare_refiner_condition = lambda **kwargs: (events.append("refiner_condition") or condition)
-    pipeline._diffuse_refiner = lambda **kwargs: (events.append("refiner_diffuse") or torch.ones(1, 1, 1, 2, 2))
+    pipeline._prepare_refiner_condition = lambda **kwargs: events.append("refiner_condition") or condition
+    pipeline._diffuse_refiner = lambda **kwargs: events.append("refiner_diffuse") or torch.ones(1, 1, 1, 2, 2)
 
     pipeline._generate(
         prompt="a robot",

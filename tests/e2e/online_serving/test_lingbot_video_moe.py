@@ -218,7 +218,7 @@ def test_hsdp_video_generation_modes_moe(omni_server: OmniServer, openai_client:
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_cache_dit_refiner_cases(MODEL), indirect=True)
-def test_cpu_offload_cache_dit_refiner_t2v_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_cpu_offload_cache_dit_refiner_t2v_moe(omni_server: OmniServer, online_client: OpenAIClientHandler) -> None:
     form_data = {
         "model": omni_server.model,
         "prompt": PROMPT,
@@ -232,7 +232,7 @@ def test_cpu_offload_cache_dit_refiner_t2v_moe(omni_server: OmniServer, openai_c
         "flow_shift": 3.0,
         "seed": 42,
     }
-    base_responses = openai_client.send_video_diffusion_request({"model": omni_server.model, "form_data": form_data})
+    base_responses = online_client.send_video_diffusion_request({"model": omni_server.model, "form_data": form_data})
     assert base_responses[0].stage_durations
     assert "LingBotVideoPipeline.diffuse" in base_responses[0].stage_durations
 
@@ -255,7 +255,7 @@ def test_cpu_offload_cache_dit_refiner_t2v_moe(omni_server: OmniServer, openai_c
             separators=(",", ":"),
         ),
     }
-    refiner_responses = openai_client.send_video_diffusion_request(
+    refiner_responses = online_client.send_video_diffusion_request(
         {"model": omni_server.model, "form_data": refiner_form_data}
     )
     assert refiner_responses[0].stage_durations
