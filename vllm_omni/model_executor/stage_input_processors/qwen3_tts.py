@@ -29,6 +29,17 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 logger = init_logger(__name__)
 
 
+def _empty_finished_payload(request_id: str) -> OmniPayloadStruct:
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=MetaStruct(
+            request_id=request_id,
+            left_context_size=0,
+            finished=torch.tensor(True, dtype=torch.bool),
+        ),
+    )
+
+
 def _qwen3_tts_degenerate_finished_payload():
     """Single-placeholder-frame finished payload for a degenerate talker take.
 
@@ -162,14 +173,7 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_payload(request_id)
         return None
 
     if ramp is not None:
@@ -179,17 +183,27 @@ def talker2code2wav_async_chunk(
         if not emit:
             return None
         if context_length == 0:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(
-                    request_id=request_id,
-                    left_context_size=0,
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-            )
+            return _empty_finished_payload(request_id)
     else:
-        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        chunk_index = int(transfer_manager.ramp_chunk_count.get(request_id, 0))
+        first_chunk = chunk_index <= 0
         use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+
+        if use_first_chunk:
+            emitted_frames = 0 if first_chunk else initial_chunk_size + (chunk_index - 1) * chunk_size
+        else:
+            emitted_frames = chunk_index * chunk_size
+        if finished and length <= emitted_frames:
+            # EOS is emitted on a separate talker step. If the preceding codec
+            # frame completed an exact chunk boundary, that chunk has already
+            # been sent; terminal must carry only an empty finish marker.
+            logger.debug(
+                "Qwen3-TTS terminal has no unsent codec frames: request=%s length=%d emitted=%d",
+                request_id,
+                length,
+                emitted_frames,
+            )
+            return _empty_finished_payload(request_id)
 
         if use_first_chunk and length <= initial_chunk_size:
             if not finished and length < initial_chunk_size:

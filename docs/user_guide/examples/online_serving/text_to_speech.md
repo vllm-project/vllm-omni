@@ -457,6 +457,7 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 - With async chunking, Qwen3-TTS Base voice cloning sends the full reference context in the first Code2Wav packet, then caches that prefix on the Code2Wav stage for follow-up chunks in the same request.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
 - Under vocoder-bound overload (single-stream `rtf_p99 ≥ 1` at the target concurrency), set `active_stream_window: 2` at the top of the deploy yaml to cap simultaneously active Stage 1 streams. Off by default; trades TTFP for streaming continuity. See [#3592](https://github.com/vllm-project/vllm-omni/pull/3592) for the mechanism and tradeoff numbers.
+- For a bounded active-stream deployment, `active_stream_policy: edf` can prioritize streams whose server-estimated playback buffer is closest to exhaustion. Configure it under the connector's `extra` block and use a `codec_chunk_ramp`; this is opt-in, estimates playback from server-side PCM emission (no client playback acknowledgements), and targets first-audio latency and continuity rather than single-request completion latency.
 
 ---
 

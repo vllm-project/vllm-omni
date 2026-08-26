@@ -3,9 +3,11 @@
 
 import copy
 import importlib
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -22,6 +24,13 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+@dataclass
+class _PlaybackDeadlineState:
+    first_seen_at: float
+    playback_deadline: float | None = None
+    emitted_audio_s: float = 0.0
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -44,25 +53,54 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        self.engine_output_type = getattr(model_config, "engine_output_type", None)
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
             model_max_num_seqs = self.scheduler_max_num_seqs
         self._active_window = min(active_stream_window, model_max_num_seqs) if active_stream_window > 0 else 0
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        raw_extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        )
+        extra = raw_extra if isinstance(raw_extra, dict) else {}
+        self._active_stream_policy = str(extra.get("active_stream_policy", "fifo")).strip().lower()
+        if self._active_stream_policy not in {"fifo", "edf"}:
+            raise ValueError(f"active_stream_policy must be 'fifo' or 'edf', got {self._active_stream_policy!r}")
+        if self._active_stream_policy == "edf" and self._active_window <= 0:
+            raise ValueError("active_stream_policy='edf' requires active_stream_window > 0")
+        self._playback_first_chunk_slo_s = float(extra.get("playback_deadline_first_chunk_ms", 100.0)) / 1000.0
+        self._playback_safety_margin_s = float(extra.get("playback_deadline_safety_margin_ms", 50.0)) / 1000.0
+        if not math.isfinite(self._playback_first_chunk_slo_s) or self._playback_first_chunk_slo_s <= 0:
+            raise ValueError("playback_deadline_first_chunk_ms must be positive")
+        if not math.isfinite(self._playback_safety_margin_s) or self._playback_safety_margin_s < 0:
+            raise ValueError("playback_deadline_safety_margin_ms must be non-negative")
+        self._playback_deadlines: dict[str, _PlaybackDeadlineState] = {}
         if self._active_window > 0:
             logger.info(
-                "Bounded active-stream window enabled: K=%d. "
+                "Bounded active-stream window enabled: K=%d policy=%s. "
                 "Multi-replica deployments require sticky per-stream routing across Stage 1 "
                 "replicas (each replica owns an independent active-set; without sticky routing, "
                 "a stream can be active on one replica and non-active on another and both will "
                 "race to evict it).",
                 self._active_window,
+                self._active_stream_policy,
             )
         self.connector = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
+        if self.playback_deadline_enabled and not extra.get("codec_chunk_ramp"):
+            initial_frames = int(extra.get("initial_codec_chunk_frames") or 0)
+            if 0 < initial_frames < 4:
+                logger.warning(
+                    "Playback EDF is enabled with initial_codec_chunk_frames=%d and no codec_chunk_ramp; "
+                    "the first audio buffer may be too short to avoid a chunk-0 underrun.",
+                    initial_frames,
+                )
         super().__init__(model_config)
-        self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -104,6 +142,51 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # becomes a client-visible error instead of parking forever.  Mirrors
         # OmniSchedulingCoordinator._waiting_since on the full-payload path.
         self._waiting_since: dict[str, float] = {}
+
+    @property
+    def playback_deadline_enabled(self) -> bool:
+        return (
+            self._active_stream_policy == "edf"
+            and self.model_mode == "generation"
+            and self.engine_output_type == "audio"
+        )
+
+    def record_audio_output(
+        self,
+        request_id: str,
+        audio_frames: int,
+        sample_rate: int,
+        *,
+        emitted_at: float | None = None,
+    ) -> None:
+        """Advance the server-estimated playback deadline after one PCM chunk."""
+        if not self.playback_deadline_enabled or audio_frames <= 0 or sample_rate <= 0:
+            return
+        now = time.monotonic() if emitted_at is None else float(emitted_at)
+        state = self._playback_deadlines.setdefault(request_id, _PlaybackDeadlineState(first_seen_at=now))
+        duration_s = float(audio_frames) / float(sample_rate)
+        state.emitted_audio_s += duration_s
+        # A late chunk restarts a starved player at its server emission time;
+        # otherwise append its duration to the buffered playback horizon.
+        playback_base = max(state.playback_deadline or now, now)
+        state.playback_deadline = playback_base + duration_s
+
+    def _playback_deadline_key(self, request: Request, order: int, now: float) -> tuple[int, float, float, int]:
+        state = self._playback_deadlines.setdefault(
+            request.request_id,
+            _PlaybackDeadlineState(first_seen_at=now),
+        )
+        if state.playback_deadline is None:
+            deadline = state.first_seen_at + self._playback_first_chunk_slo_s
+            protected_playback = False
+        else:
+            deadline = state.playback_deadline
+            protected_playback = deadline - now <= self._playback_safety_margin_s
+        # A stream whose buffered playback is close to exhaustion must not be
+        # preempted by a large backlog of overdue first-audio deadlines. Once
+        # established streams have enough headroom, ordinary EDF ordering lets
+        # new requests consume the available slots.
+        return (0 if protected_playback else 1), deadline, state.first_seen_at, order
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -508,6 +591,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self._active_streams.pop(request_id, None)
+        self._playback_deadlines.pop(request_id, None)
         self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -629,6 +713,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 waiting_queue.prepend_requests([request])
             return
 
+        if self.playback_deadline_enabled:
+            self._process_chunk_queue_legacy(
+                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            )
+            self._process_chunk_queue_legacy(
+                running_queue,
+                self.waiting_for_chunk_running_requests,
+                RequestStatus.RUNNING,
+                self._finished_load_reqs,
+            )
+            self._select_playback_deadline_streams(waiting_queue, running_queue)
+            return
+
         self._promote_active_streams(running_queue)
         self._promote_active_streams(waiting_queue)
         self._process_chunk_queue(
@@ -666,6 +763,45 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 continue
             # Iterating the existing queue preserves FIFO admission.
             self._active_streams[request_id] = request
+
+    def _select_playback_deadline_streams(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        """Select up to K ready chunks by server-estimated playback deadline."""
+        now = time.monotonic()
+        candidates = [
+            request
+            for request in (*running_queue, *list(waiting_queue))
+            if request.request_id in self.requests_with_ready_chunks
+        ]
+        ordered = sorted(
+            enumerate(candidates),
+            key=lambda item: self._playback_deadline_key(item[1], item[0], now),
+        )
+        selected = [request for _, request in ordered[: self._active_window]]
+        selected_ids = {request.request_id for request in selected}
+        self._active_streams = {request.request_id: request for request in selected}
+
+        for request in list(running_queue):
+            if request.request_id in self.requests_with_ready_chunks and request.request_id not in selected_ids:
+                running_queue.remove(request)
+                self._held_non_active.append(request)
+
+        held_waiting = []
+        for request in list(waiting_queue):
+            if request.request_id in self.requests_with_ready_chunks and request.request_id not in selected_ids:
+                waiting_queue.remove(request)
+                self.requests_origin_status[request.request_id] = RequestStatus.WAITING
+                self.waiting_for_chunk_waiting_requests.append(request)
+            elif request.request_id in selected_ids:
+                held_waiting.append(request)
+
+        # Keep selected running requests in EDF order so a tight token budget
+        # still admits the most urgent chunk first.
+        running_order = {request.request_id: index for index, request in enumerate(selected)}
+        running_queue.sort(key=lambda request: running_order.get(request.request_id, len(running_order)))
+        if len(held_waiting) > 1:
+            held_waiting.sort(key=lambda request: running_order[request.request_id])
+            waiting_queue.remove_requests(held_waiting)
+            waiting_queue.prepend_requests(held_waiting)
 
     def _ensure_active_stream(self, request: Request) -> bool:
         if self._active_window <= 0:

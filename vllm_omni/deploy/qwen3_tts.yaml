@@ -26,6 +26,14 @@ connectors:
       codec_left_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
+      # Optional Stage-1 EDF scheduler. Requires top-level
+      # active_stream_window > 0. It estimates each stream's playback deadline
+      # from actual PCM emitted by Code2Wav and reselects the K most urgent
+      # ready chunks at every scheduling turn. Use it with codec_chunk_ramp or
+      # an initial chunk large enough to cover the first follow-up decode.
+      # active_stream_policy: edf
+      # playback_deadline_first_chunk_ms: 100
+      # playback_deadline_safety_margin_ms: 250
       # Chunk ramp (opt-in): gradual size increase for first N chunks to
       # eliminate the IC→steady cliff (1→25). Uncomment to enable.
       # Each entry is the size of that chunk index; indices past the table

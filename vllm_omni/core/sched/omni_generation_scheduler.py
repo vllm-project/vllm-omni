@@ -27,6 +27,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.metrics import definitions as metric_defs
+from vllm_omni.metrics.utils import count_audio_frames
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -72,6 +74,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._enqueue_waiting_request(request)
             return False
         return super()._handle_stopped_request(request)
+
+    def _record_playback_deadline_output(self, request_id: str, multimodal_output: Any) -> None:
+        adapter = self.chunk_transfer_adapter
+        if adapter is None or not getattr(adapter, "playback_deadline_enabled", False):
+            return
+        audio_frames = count_audio_frames(multimodal_output)
+        sample_rate = metric_defs.resolve_audio_sample_rate(multimodal_output)
+        adapter.record_audio_output(request_id, audio_frames, sample_rate)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """One-shot generation fast path:
@@ -443,6 +453,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            if mm_output is not None:
+                self._record_playback_deadline_output(req_id, mm_output)
             status_before_stop = request.status
             finish_reason = None
             is_segment_finished = False

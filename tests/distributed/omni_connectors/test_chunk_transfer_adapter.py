@@ -114,6 +114,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         *,
         stage_id: int = 1,
         model_mode: str = "ar",
+        engine_output_type: str | None = None,
         max_num_seqs: int = 2,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
@@ -144,6 +145,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 
         model_config = SimpleNamespace(
             worker_type=model_mode,
+            engine_output_type=engine_output_type or ("audio" if model_mode == "generation" else None),
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
             stage_connector_config={
@@ -957,6 +959,218 @@ def test_fifo_promotion(build_adapter):
     # Promotion + chunk processing happen in the same call, so req-3 is
     # already WAITING_FOR_CHUNK by the time we check.
     assert reqs[2].status == RequestStatus.WAITING_FOR_CHUNK
+
+
+def test_edf_requires_active_window(build_adapter):
+    with pytest.raises(ValueError, match="requires active_stream_window"):
+        build_adapter(
+            stage_id=1,
+            model_mode="generation",
+            active_stream_window=0,
+            connector_extra={"active_stream_policy": "edf"},
+        )
+
+
+def test_edf_rejects_unknown_policy(build_adapter):
+    with pytest.raises(ValueError, match="active_stream_policy"):
+        build_adapter(
+            stage_id=1,
+            model_mode="generation",
+            active_stream_window=1,
+            connector_extra={"active_stream_policy": "unknown"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("playback_deadline_first_chunk_ms", float("nan"), "first_chunk"),
+        ("playback_deadline_safety_margin_ms", float("inf"), "safety_margin"),
+    ],
+)
+def test_edf_rejects_non_finite_timing_config(build_adapter, key, value, message):
+    with pytest.raises(ValueError, match=message):
+        build_adapter(
+            stage_id=1,
+            model_mode="generation",
+            active_stream_window=1,
+            connector_extra={"active_stream_policy": "edf", key: value},
+        )
+
+
+def test_edf_selects_earliest_playback_deadline(build_adapter, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic",
+        lambda: 100.0,
+    )
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        max_num_seqs=2,
+        active_stream_window=1,
+        connector_extra={"active_stream_policy": "edf"},
+    )
+    later = _req("later", RequestStatus.WAITING)
+    urgent = _req("urgent", RequestStatus.WAITING)
+    adapter.record_audio_output(later.request_id, 5, 1, emitted_at=100.0)
+    adapter.record_audio_output(urgent.request_id, 2, 1, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.update({later.request_id, urgent.request_id})
+    waiting_queue = DummyWaitingQueue([later, urgent])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [urgent.request_id]
+    assert waiting_queue == [urgent]
+    assert list(adapter.waiting_for_chunk_waiting_requests) == [later]
+
+
+def test_edf_balances_first_audio_against_playback_deadline(build_adapter, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic",
+        lambda: 100.0,
+    )
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        max_num_seqs=2,
+        active_stream_window=1,
+        connector_extra={
+            "active_stream_policy": "edf",
+            "playback_deadline_first_chunk_ms": 100,
+            "playback_deadline_safety_margin_ms": 0,
+        },
+    )
+    new_request = _req("new", RequestStatus.WAITING)
+    buffered = _req("buffered", RequestStatus.WAITING)
+    adapter.record_audio_output(buffered.request_id, 5, 1, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.update({new_request.request_id, buffered.request_id})
+    waiting_queue = DummyWaitingQueue([buffered, new_request])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [new_request.request_id]
+
+    adapter.cleanup_receiver(new_request.request_id)
+    adapter.restore_queues(waiting_queue, [])
+    starving = _req("starving", RequestStatus.WAITING)
+    adapter.record_audio_output(starving.request_id, 1, 1, emitted_at=98.0)
+    adapter.requests_with_ready_chunks.update({new_request.request_id, starving.request_id})
+    waiting_queue = DummyWaitingQueue([new_request, starving])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [starving.request_id]
+
+
+def test_edf_protects_near_underrun_stream_from_overdue_first_audio(build_adapter, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic",
+        lambda: 100.0,
+    )
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        max_num_seqs=2,
+        active_stream_window=1,
+        connector_extra={
+            "active_stream_policy": "edf",
+            "playback_deadline_first_chunk_ms": 100,
+            "playback_deadline_safety_margin_ms": 250,
+        },
+    )
+    overdue_startup = _req("startup", RequestStatus.WAITING)
+    near_underrun = _req("playing", RequestStatus.WAITING)
+    adapter._playback_deadline_key(overdue_startup, order=0, now=90.0)
+    adapter.record_audio_output(near_underrun.request_id, 100, 1000, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.update({overdue_startup.request_id, near_underrun.request_id})
+    waiting_queue = DummyWaitingQueue([overdue_startup, near_underrun])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [near_underrun.request_id]
+
+
+def test_edf_reselects_at_chunk_boundaries(build_adapter, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic",
+        lambda: 100.0,
+    )
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        max_num_seqs=2,
+        active_stream_window=1,
+        connector_extra={"active_stream_policy": "edf", "playback_deadline_safety_margin_ms": 0},
+    )
+    first = _req("first", RequestStatus.WAITING)
+    second = _req("second", RequestStatus.WAITING)
+    adapter.record_audio_output(first.request_id, 1, 1, emitted_at=100.0)
+    adapter.record_audio_output(second.request_id, 2, 1, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.update({first.request_id, second.request_id})
+    waiting_queue = DummyWaitingQueue([first, second])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+    assert list(adapter._active_streams) == [first.request_id]
+
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id=first.request_id)],
+        scheduled_cached_reqs=None,
+    )
+    adapter.postprocess_scheduler_output(scheduler_output)
+    adapter.restore_queues(waiting_queue, [])
+    adapter.record_audio_output(first.request_id, 5, 1, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.add(first.request_id)
+
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [second.request_id]
+
+
+def test_edf_k2_orders_ready_running_and_waiting_requests(build_adapter, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic",
+        lambda: 100.0,
+    )
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        max_num_seqs=4,
+        active_stream_window=2,
+        connector_extra={"active_stream_policy": "edf", "playback_deadline_safety_margin_ms": 0},
+    )
+    later_running = _req("later-running", RequestStatus.RUNNING)
+    urgent_waiting = _req("urgent-waiting", RequestStatus.WAITING)
+    middle_running = _req("middle-running", RequestStatus.RUNNING)
+    adapter.record_audio_output(later_running.request_id, 5, 1, emitted_at=100.0)
+    adapter.record_audio_output(urgent_waiting.request_id, 1, 1, emitted_at=100.0)
+    adapter.record_audio_output(middle_running.request_id, 2, 1, emitted_at=100.0)
+    adapter.requests_with_ready_chunks.update(
+        {later_running.request_id, urgent_waiting.request_id, middle_running.request_id}
+    )
+    waiting_queue = DummyWaitingQueue([urgent_waiting])
+    running_queue = [later_running, middle_running]
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == [urgent_waiting.request_id, middle_running.request_id]
+    assert waiting_queue == [urgent_waiting]
+    assert running_queue == [middle_running]
+    assert list(adapter._held_non_active) == [later_running]
+
+
+def test_edf_cleanup_drops_playback_state(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="generation",
+        active_stream_window=1,
+        connector_extra={"active_stream_policy": "edf"},
+    )
+    adapter.record_audio_output("req", 24000, 24000, emitted_at=100.0)
+    assert "req" in adapter._playback_deadlines
+
+    adapter.cleanup_receiver("req")
+
+    assert "req" not in adapter._playback_deadlines
 
 
 def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):

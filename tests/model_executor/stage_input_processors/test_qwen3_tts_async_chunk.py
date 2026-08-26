@@ -105,6 +105,122 @@ def test_flush_on_finish():
     assert len(p.codes.audio) == _Q * 24
 
 
+def _record_successful_chunk(tm, rid):
+    tm.put_req_chunk[rid] += 1
+    tm.ramp_chunk_count[rid] += 1
+
+
+def test_fixed_chunk_terminal_after_exact_initial_boundary_emits_no_audio():
+    tm = _tm(initial_chunk_frames=10)
+    rid = "fixed-exact-initial"
+
+    first = _call(tm, rid, n_frames=10, req_ic=10)
+    assert first is not None
+    _record_successful_chunk(tm, rid)
+
+    terminal = _call(tm, rid, n_frames=10, finished=True, req_ic=10)
+
+    assert terminal is not None
+    assert terminal.meta.finished.item() is True
+    assert terminal.codes.audio.numel() == 0
+
+
+def test_fixed_chunk_terminal_after_exact_steady_boundary_emits_no_audio():
+    tm = _tm(initial_chunk_frames=10)
+    rid = "fixed-exact-steady"
+
+    first = _call(tm, rid, n_frames=10, req_ic=10)
+    assert first is not None
+    _record_successful_chunk(tm, rid)
+    steady = _call(tm, rid, n_frames=35, req_ic=10)
+    assert steady is not None
+    _record_successful_chunk(tm, rid)
+
+    terminal = _call(tm, rid, n_frames=35, finished=True, req_ic=10)
+
+    assert terminal is not None
+    assert terminal.meta.finished.item() is True
+    assert terminal.codes.audio.numel() == 0
+
+
+def test_fixed_chunk_terminal_flushes_exact_boundary_not_previously_sent():
+    tm = _tm(initial_chunk_frames=10)
+    rid = "fixed-unsent-boundary"
+
+    first = _call(tm, rid, n_frames=10, req_ic=10)
+    assert first is not None
+    _record_successful_chunk(tm, rid)
+
+    terminal = _call(tm, rid, n_frames=35, finished=True, req_ic=10)
+
+    assert terminal is not None
+    assert terminal.meta.finished.item() is True
+    assert terminal.codes.audio.numel() == _Q * 25
+
+
+def test_fixed_chunk_without_initial_terminal_after_exact_boundary_emits_no_audio():
+    tm = _tm(chunk_frames=4, initial_chunk_frames=4)
+    rid = "fixed-no-initial-exact"
+
+    first = _call(tm, rid, n_frames=4, req_ic=4)
+    assert first is not None
+    _record_successful_chunk(tm, rid)
+    second = _call(tm, rid, n_frames=8, req_ic=4)
+    assert second is not None
+    _record_successful_chunk(tm, rid)
+
+    terminal = _call(tm, rid, n_frames=8, finished=True, req_ic=4)
+
+    assert terminal is not None
+    assert terminal.codes.audio.numel() == 0
+
+
+def test_fixed_chunk_terminal_after_exact_boundary_flushes_only_new_tail():
+    tm = _tm(initial_chunk_frames=10)
+    rid = "fixed-tail-after-boundary"
+
+    first = _call(tm, rid, n_frames=10, req_ic=10)
+    assert first is not None
+    _record_successful_chunk(tm, rid)
+    steady = _call(tm, rid, n_frames=35, req_ic=10)
+    assert steady is not None
+    _record_successful_chunk(tm, rid)
+
+    terminal = _call(tm, rid, n_frames=40, finished=True, req_ic=10)
+
+    assert terminal is not None
+    assert terminal.codes.audio.numel() == _Q * 5
+
+
+def test_fixed_chunk_stream_sends_every_codec_frame_exactly_once():
+    tm = _tm(chunk_frames=4, initial_chunk_frames=2)
+    rid = "fixed-unique"
+    frames = [[frame * 10 + quantizer for quantizer in range(_Q)] for frame in range(10)]
+    emitted = []
+
+    for length in (2, 6, 10):
+        tm.code_prompt_token_ids[rid] = frames[:length]
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.zeros((0,))}},
+            request=_req(rid, finished=False, initial_codec_chunk_frames=2),
+        )
+        assert payload is not None
+        emitted.extend(payload.codes.audio.reshape(_Q, -1).transpose(0, 1).tolist())
+        _record_successful_chunk(tm, rid)
+
+    terminal = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output=None,
+        request=_req(rid, finished=True, initial_codec_chunk_frames=2),
+        is_finished=True,
+    )
+
+    assert terminal is not None
+    assert terminal.codes.audio.numel() == 0
+    assert emitted == frames
+
+
 _CASES = [
     # ── IC boundary rule ──────────────────────────────────────────────
     # initial_codec_chunk_frames only controls the first emitted chunk.
