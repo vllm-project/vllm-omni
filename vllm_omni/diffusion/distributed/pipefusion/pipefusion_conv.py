@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the xDiT authors.
 #
 # This module is adapted from xDiT (https://github.com/xdit-project/xdit)
@@ -52,6 +53,12 @@ class PipeFusionConvMixin:
     def pipefusion_reset_cache(self) -> None:
         self.activation_cache = None
 
+    @staticmethod
+    def _as_3tuple(value) -> tuple[int, int, int]:
+        if isinstance(value, tuple):
+            return value
+        return (value, value, value)
+
     def pipefusion_conv3d_forward(self, x: torch.Tensor, dims: tuple[int, ...]) -> torch.Tensor:
         """
         Forward pass for Conv3d with PipeFusion patch support.
@@ -74,37 +81,76 @@ class PipeFusionConvMixin:
         patch_idx = runtime.pipeline_patch_idx
         start, end = runtime.pp_patches_start_end_idx[patch_idx]
         out_start, out_end = runtime.pp_patches_post_start_end_idx[patch_idx]
-        self.activation_cache[:, :, :, start:end, :] = x
-        return self._sliced_conv3d_forward(self.activation_cache, out_start, out_end)
+        if runtime.split_dim == "temporal":
+            self.activation_cache[:, :, start:end, :, :] = x
+        elif runtime.split_dim == "height":
+            self.activation_cache[:, :, :, start:end, :] = x
+        else:
+            raise ValueError(
+                f"Unsupported PipeFusion Conv3D split_dim={runtime.split_dim!r}; expected 'height' or 'temporal'."
+            )
+        return self._sliced_conv3d_forward(self.activation_cache, out_start, out_end, runtime.split_dim)
 
-    def _sliced_conv3d_forward(self, x: torch.Tensor, out_start: int, out_end: int) -> torch.Tensor:
+    def _sliced_conv3d_forward(
+        self,
+        x: torch.Tensor,
+        out_start: int,
+        out_end: int,
+        split_dim: str,
+    ) -> torch.Tensor:
         """
         Compute convolution on a slice of the input that produces output for [out_start:out_end].
 
         Args:
             x: Full input tensor with all patches cached.
             out_start, out_end: Output slice range (post-patch space).
+            split_dim: PipeFusion patch split dimension.
         """
-        b, c, t, h, w = x.shape
-        pad_t, pad_h, pad_w = self.padding
-        stride_h = self.stride[1] if isinstance(self.stride, tuple) else self.stride
+        _, _, t, h, _ = x.shape
+        pad_t, pad_h, pad_w = self._as_3tuple(self.padding)
+        stride_t, stride_h, _ = self._as_3tuple(self.stride)
+        kernel_t, kernel_h, _ = self._as_3tuple(self.kernel_size)
+        dilation_t, dilation_h, _ = self._as_3tuple(self.dilation)
+
+        if split_dim == "temporal":
+            split_axis = 2
+            full_extent = t
+            pad_along_split = pad_t
+            stride_along_split = stride_t
+            kernel_along_split = kernel_t
+            dilation_along_split = dilation_t
+        elif split_dim == "height":
+            split_axis = 3
+            full_extent = h
+            pad_along_split = pad_h
+            stride_along_split = stride_h
+            kernel_along_split = kernel_h
+            dilation_along_split = dilation_h
+        else:
+            raise ValueError(f"Unsupported PipeFusion Conv3D split_dim={split_dim!r}.")
 
         # Calculate input range needed to produce output [out_start:out_end]
         # For strided conv: out_pos = (in_pos + pad - kernel_size) // stride + 1
         # Inverse: in_pos = out_pos * stride - pad (approximately)
-        in_start = out_start * stride_h
-        in_end = (out_end - 1) * stride_h + self.kernel_size[1]  # Need full kernel for last output
+        effective_kernel = dilation_along_split * (kernel_along_split - 1) + 1
+        in_start = out_start * stride_along_split
+        in_end = (out_end - 1) * stride_along_split + effective_kernel  # Need full kernel for last output
 
         # Expand to include padding context from neighbors
-        h_begin = max(0, in_start - pad_h)
-        h_end = min(h, in_end + pad_h)
+        slice_begin = max(0, in_start - pad_along_split)
+        slice_end = min(full_extent, in_end + pad_along_split)
 
         # Determine padding needed at boundaries
-        pad_top = max(0, pad_h - in_start) if h_begin == 0 else 0
-        pad_bottom = max(0, in_end + pad_h - h) if h_end == h else 0
+        pad_before = max(0, pad_along_split - in_start) if slice_begin == 0 else 0
+        pad_after = max(0, in_end + pad_along_split - full_extent) if slice_end == full_extent else 0
 
-        sliced_input = x[:, :, :, h_begin:h_end, :]
-        padded_input = F.pad(sliced_input, (pad_w, pad_w, pad_top, pad_bottom, pad_t, pad_t), mode="constant")
+        if split_dim == "temporal":
+            sliced_input = x[:, :, slice_begin:slice_end, :, :]
+            padding = (pad_w, pad_w, pad_h, pad_h, pad_before, pad_after)
+        else:
+            sliced_input = x[:, :, :, slice_begin:slice_end, :]
+            padding = (pad_w, pad_w, pad_before, pad_after, pad_t, pad_t)
+        padded_input = F.pad(sliced_input, padding, mode="constant")
 
         output = F.conv3d(
             padded_input,
@@ -117,9 +163,9 @@ class PipeFusionConvMixin:
         )
 
         # Extract only the output rows we need (in case we computed extra)
-        expected_out_height = out_end - out_start
-        if output.shape[3] > expected_out_height:
-            output = output[:, :, :, :expected_out_height, :]
+        expected_out_extent = out_end - out_start
+        if output.shape[split_axis] > expected_out_extent:
+            output = output.narrow(split_axis, 0, expected_out_extent)
         return output
 
 
