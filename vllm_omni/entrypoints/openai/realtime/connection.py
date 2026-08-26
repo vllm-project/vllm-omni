@@ -189,59 +189,47 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     async def _handle_session_update(self, event: types.SessionUpdateEvent):
-        cfg = event.session
         s = self.session
-        event_id = event.event_id
-
-        if self._uses_mcp(cfg):
-            await self._send_unsupported_mcp(event_id)
-            return
-
-        if "model" in cfg.model_fields_set and cfg.model != self.model_name:
-            await self._send_error("The session model cannot be changed", "invalid_request_error", event_id=event_id)
-            return
-
-        unsupported = self._unsupported_audio_option(cfg.audio)
-        if unsupported is not None:
-            await self._send_error(f"{unsupported} is not supported", "unsupported_feature", event_id=event_id)
-            return
-
-        if cfg.audio is not None:
-            inp = cfg.audio.input
-            if inp is not None and not self._is_pcm24_format(getattr(inp, "format", None)):
-                await self._send_error(
-                    "Only 24 kHz PCM input audio is supported",
-                    "invalid_request_error",
-                    event_id=event_id,
-                )
-                return
-            if inp is not None and inp.turn_detection is not None:
-                td = inp.turn_detection
-                if td.type == "server_vad":
-                    await self._send_error(
-                        "server_vad is not supported; use null",
-                        "invalid_request_error",
-                        event_id=event_id,
-                    )
-                    return
-                if td.type == "semantic_vad":
-                    await self._send_error(
-                        "semantic_vad is not supported; use null",
-                        "invalid_request_error",
-                        event_id=event_id,
-                    )
-                    return
-
-            out = cfg.audio.output
-            if out is not None and not self._is_pcm24_format(getattr(out, "format", None)):
-                await self._send_error(
-                    "Only 24 kHz PCM output audio is supported",
-                    "invalid_request_error",
-                    event_id=event_id,
-                )
-                return
+        cfg = self._sanitize_session_config(event.session)
         s.config = merge_session_config(s.config, cfg)
         await self._send_session_updated()
+
+    def _sanitize_session_config(self, cfg: Any) -> types.RealtimeSessionCreateRequest:
+        """Drop any session.update fields this server doesn't support instead
+        of rejecting the whole update, so clients that always send their full
+        default config (transcription, noise reduction, server-side VAD, MCP
+        tools, ...) still get a working session rather than a hard error.
+        """
+        data = cfg.model_dump(exclude_unset=True)
+
+        if "model" in data and data["model"] != self.model_name:
+            data.pop("model")
+
+        if "tools" in data:
+            data["tools"] = [t for t in data["tools"] if (t or {}).get("type") != "mcp"]
+        if (data.get("tool_choice") or {}).get("type") == "mcp" if isinstance(data.get("tool_choice"), dict) else False:
+            data.pop("tool_choice")
+
+        audio = data.get("audio")
+        if audio is not None:
+            inp = audio.get("input")
+            if inp is not None:
+                inp.pop("transcription", None)
+                inp.pop("noise_reduction", None)
+                if not self._is_pcm24_format(inp.get("format")):
+                    inp.pop("format", None)
+                td = inp.get("turn_detection")
+                if isinstance(td, dict) and td.get("type") in ("server_vad", "semantic_vad"):
+                    inp["turn_detection"] = None
+
+            out = audio.get("output")
+            if out is not None:
+                if out.get("speed") not in (None, 1):
+                    out.pop("speed", None)
+                if not self._is_pcm24_format(out.get("format")):
+                    out.pop("format", None)
+
+        return types.RealtimeSessionCreateRequest.model_validate(data)
 
     @staticmethod
     def _unsupported_audio_option(audio: Any) -> str | None:
