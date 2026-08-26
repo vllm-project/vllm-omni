@@ -571,6 +571,7 @@ class OrchestratorArgs:
     dlo_resident_layers: int = 0
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = 0.0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

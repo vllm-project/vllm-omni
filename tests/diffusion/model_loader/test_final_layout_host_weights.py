@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,10 +26,12 @@ from vllm_omni.diffusion.model_loader.host_weights import (
     FinalLayoutRequest,
     FinalLayoutTensorRestorer,
     ImplementationIdentity,
+    NodeSourceDigestCache,
     PreparedWeightSource,
     WeightSourceKind,
     build_final_layout_identity,
 )
+from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.model_loader.host_weights.contracts import (
     FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
     FinalLayoutArtifactSpec,
@@ -380,6 +384,7 @@ def _identity(
     *,
     request: FinalLayoutRequest | None = None,
     policy: FinalLayoutTensorPolicy = FINAL_LAYOUT_BF16_POLICY,
+    source_digest_cache: NodeSourceDigestCache | None = None,
 ) -> FinalLayoutIdentityContext:
     transformer = model.get_submodule("transformer")
     return build_final_layout_identity(
@@ -388,6 +393,7 @@ def _identity(
         prepared_sources=(source,),
         request=request or _request(),
         policy=policy,
+        source_digest_cache=source_digest_cache,
     )
 
 
@@ -562,6 +568,131 @@ def test_source_identity_resolves_longest_prefix_and_rejects_ties(tmp_path: Path
     with pytest.raises(FinalLayoutContractError, match="equally specific") as exc_info:
         _multi_identity(model, (root_source, source_a, conflicting_a))
     assert exc_info.value.code is FinalLayoutContractCode.SOURCE_COVERAGE_INVALID
+
+
+def test_node_source_digest_cache_reuses_recovers_and_invalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    cache_root = tmp_path / "store"
+    calls = 0
+    original_sha256 = source_identity_module._sha256_file
+
+    def counted_sha256(path: Path, state: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
+    first = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    second = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+
+    assert second.identity == first.identity
+    assert calls == 1
+
+    cache_entry = next((cache_root / "source-digests-v1" / "entries").glob("*.json"))
+    cache_entry.write_text("not-json", encoding="utf-8")
+    recovered = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert recovered.identity == first.identity
+    assert calls == 2
+
+    cache_document = json.loads(cache_entry.read_text(encoding="utf-8"))
+    cache_document["content_id"] = f"sha256:{'0' * 64}"
+    cache_entry.write_text(json.dumps(cache_document), encoding="utf-8")
+    checksum_recovered = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert checksum_recovered.identity == first.identity
+    assert calls == 3
+
+    source.weight_files[0].write_bytes(b"changed-canonical-source-with-a-new-size")
+    changed = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert changed.identity != first.identity
+    assert calls == 4
+
+
+def test_source_identity_hashes_checkpoint_shards_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    second_file = source.resolved_root / "model-00002.safetensors"
+    second_file.write_bytes(b"second-checkpoint-shard")
+    source = dataclasses.replace(source, weight_files=(*source.weight_files, second_file))
+    barrier = threading.Barrier(2)
+    thread_ids: set[int] = set()
+    thread_ids_lock = threading.Lock()
+    original_sha256 = source_identity_module._sha256_file
+
+    def synchronized_sha256(path: Path, state: object) -> str:
+        with thread_ids_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait(timeout=5)
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", synchronized_sha256)
+    _identity(model, source)
+
+    assert len(thread_ids) == 2
+
+
+def test_source_digest_cache_lock_timeout_falls_back_to_direct_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+
+    def unavailable_lock(*_args: object, **_kwargs: object) -> object:
+        raise source_identity_module.FileLockTimeoutError("busy")
+
+    monkeypatch.setattr(source_identity_module, "FileLock", unavailable_lock)
+    context = _identity(model, source, source_digest_cache=cache)
+
+    assert context.identity.source.revision.startswith("content-")
+    assert not tuple(cache.entries.glob("*.json"))
+
+
+def test_source_digest_cache_directory_failure_falls_back_to_direct_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    original_mkdir = Path.mkdir
+
+    def failing_cache_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if "source-digests-v1" in path.parts:
+            raise OSError("injected cache directory failure")
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", failing_cache_mkdir)
+    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+    context = _identity(model, source, source_digest_cache=cache)
+
+    assert context.identity.source.revision.startswith("content-")
 
 
 def test_local_hex_named_symlink_target_is_content_hashed_across_startups(tmp_path: Path) -> None:

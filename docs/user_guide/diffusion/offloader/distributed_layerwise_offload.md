@@ -65,6 +65,7 @@ omni = Omni(
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
+| `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
 
 ## Host-weight loading
 
@@ -178,12 +179,48 @@ returning to `required`.
 
 On a cold start, the canonical loader remains authoritative and publishes a
 validated final-layout artifact for later workers. A warm start restores the
-DiT final tensors without ordinary DiT materialization, then DLO streams them
-through the same two bounded host staging slots. The artifact identity includes
-the TP rank/size and SP layout, so TP1, TP2 rank-local shards, and distinct SP
-layouts do not alias one another. Publication failure remains separate from a
-`preferred` serving startup; the next `required` startup provides the explicit
-artifact-availability check.
+DiT final tensors without ordinary DiT materialization. DLO then attempts to
+register the immutable mapping for direct H2D; if registration is unavailable,
+it streams through the same two bounded host staging slots. The artifact
+identity includes the TP rank/size and SP layout, so TP1, TP2 rank-local shards,
+and distinct SP layouts do not alias one another. Publication failure remains
+separate from a `preferred` serving startup; the next `required` startup
+provides the explicit artifact-availability check.
+
+For local canonical checkpoints, the first eligible worker may hash source
+shards to establish immutable identity. HWR caches those digests in the same
+node-local storage domain and validates file metadata before reuse, so later
+workers normally avoid repeating that read. Cold BF16 publication also hashes
+ordered payloads as they are written and overlaps payload durability work with
+later shards; this changes startup work only, not artifact contents or runtime
+H2D behavior.
+
+#### Registered direct H2D
+
+Registration is attempted automatically only for an eligible warm HWR hit when
+`pin_cpu_memory` is enabled. A successful path is:
+
+```text
+shared read-only HWR mmap -> existing rotating HBM block buffer -> GPU kernel
+```
+
+It removes the recurrent mmap-to-private-staging CPU copy and does not allocate
+the two host staging slots. It does not reduce the H2D payload or make GPU
+kernels access host memory directly.
+
+CUDA requires read-only host-registration capability for the immutable HWR
+mapping. Unsupported capability, a positive registration limit smaller than
+the complete page-aligned mapping, or a safely rolled-back registration error
+falls back to bounded staging. Programmatic configurations can set
+`pin_cpu_memory=False` to disable registration explicitly. A successful
+registration locks the complete mapped range in host memory for that worker's
+lifetime, so use
+`--dlo-host-registration-limit-gib` when an operator-enforced ceiling is
+required.
+
+Shutdown drains H2D work, releases hook/source references, unregisters every
+range, and only then closes the HWR lease. AllGather and direct checkpoint mmap
+retain their existing transfer paths.
 
 When HWR is disabled, DLO is disabled, or AllGather is enabled, the loader does
 not resolve HWR sources or construct its store.

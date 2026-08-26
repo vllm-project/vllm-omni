@@ -699,6 +699,7 @@ class _DiffusionConfigProjection:
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -756,6 +757,7 @@ class _DiffusionConfigProjection:
             TransformerConfig,
             build_attention_config,
             parse_kv_cache_skip_selector,
+            validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
@@ -837,6 +839,12 @@ class _DiffusionConfigProjection:
         validate_host_weight_runtime_options(
             mode=self.host_weight_runtime_mode,
             root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
         )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
