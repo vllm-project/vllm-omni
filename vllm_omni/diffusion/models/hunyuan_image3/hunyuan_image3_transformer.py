@@ -62,7 +62,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRow
+from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
+    DiffusionPagedAttentionAdapter,
+    DiffusionPagedAttentionRow,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
     get_cfg_group,
@@ -2116,7 +2119,7 @@ class HunyuanImage3Model(nn.Module):
     ):
         if not is_forward_context_available():
             return nullcontext()
-        runtime = get_forward_context().paged_kv_runtime
+        runtime = cast(DiffusionPagedAttentionAdapter | None, get_forward_context().paged_kv_runtime)
         if runtime is None:
             return nullcontext()
         if mode != "gen_image":
@@ -2629,7 +2632,6 @@ class HunyuanImage3Model(nn.Module):
                     shard_image_size=shard_image_size,
                     shard_padding_size=shard_padding_size,
                     uncond_cfg_prefill=uncond_cfg_prefill,
-                    ar_kv_reuse_len=ar_kv_reuse_len,
                     full_attn_spans=full_attn_spans,
                 )
 

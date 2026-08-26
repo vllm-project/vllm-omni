@@ -115,7 +115,6 @@ def _call_mgr(
     gen_timestep_scatter_index=None,
     position_ids=None,
     full_attn_spans=None,
-    ar_kv_reuse_len=0,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
@@ -133,7 +132,6 @@ def _call_mgr(
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
         full_attn_spans=full_attn_spans,
-        ar_kv_reuse_len=ar_kv_reuse_len,
     )
 
 
@@ -371,7 +369,6 @@ def test_cache_manager_rejects_dense_imported_prefix_for_paged_attention() -> No
                 first_step=True,
                 gen_timestep_scatter_index=torch.tensor([[0]]),
                 full_attn_spans=[[(4, 7)]],
-                ar_kv_reuse_len=prefix_len,
             )
 
 

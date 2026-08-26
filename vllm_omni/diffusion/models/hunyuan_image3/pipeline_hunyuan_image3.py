@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 import logging
@@ -20,6 +20,7 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_segments
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -1853,13 +1854,33 @@ class HunyuanImage3Pipeline(
         if state.latents is None:
             raise ValueError(f"Missing Hunyuan latents for request {state.request_id}.")
         model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+        first_step = state.step_index == 0
+        paged_first_step_layout = None
+        if first_step and self._uses_scheduler_paged_kv():
+            attention_mask = model_kwargs.get("attention_mask")
+            if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 4:
+                raise ValueError(f"Missing Hunyuan attention mask for paged request {state.request_id}.")
+            query_len = int(attention_mask.shape[-2])
+            seq_len = int(attention_mask.shape[-1])
+            full_attn_spans = model_kwargs.get("full_attn_spans")
+            segment_modes = None
+            if isinstance(full_attn_spans, list):
+                segment_modes = tuple(
+                    tuple(segment.mode for segment in build_segments(row_spans, 0, query_len))
+                    for row_spans in full_attn_spans
+                )
+            # First-step rows are still represented by a uniform batched Q/K/V
+            # tensor. Keep layouts that would gain a different padding segment
+            # out of the same native piecewise batch.
+            paged_first_step_layout = (query_len, seq_len, segment_modes)
         return (
-            state.step_index == 0,
+            first_step,
             state.extra[_STEP_CFG_FACTOR],
             tuple(state.latents.shape[1:]),
             model_kwargs.get("num_image_tokens"),
             model_kwargs.get("ar_kv_reuse_len", 0),
             state.extra.get(_STEP_AR_KV) is not None,
+            paged_first_step_layout,
         )
 
     def _ensure_grouped_attention_backend_supported(self, num_states: int) -> None:

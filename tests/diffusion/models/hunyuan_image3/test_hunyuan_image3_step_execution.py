@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -277,6 +277,36 @@ def test_grouped_denoise_allows_scheduler_paged_attention_backend():
     pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_paged_first_step_groups_only_compatible_piecewise_layouts():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    short = _state("short", 0)
+    long = _state("long", 0)
+    compatible = _state("compatible", 0)
+    short.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 5, 5, dtype=torch.bool),
+            "full_attn_spans": [[(2, 5)]],
+        }
+    )
+    long.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 7, 7, dtype=torch.bool),
+            "full_attn_spans": [[(4, 7)]],
+        }
+    )
+    compatible.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 7, 7, dtype=torch.bool),
+            "full_attn_spans": [[(3, 7)]],
+        }
+    )
+
+    groups = pipeline._split_step_groups([short, long, compatible])
+
+    assert [[state.request_id for state in group] for group in groups] == [["short"], ["long", "compatible"]]
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
