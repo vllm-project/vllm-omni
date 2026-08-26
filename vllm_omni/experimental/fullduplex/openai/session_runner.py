@@ -28,6 +28,7 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     PcmAppendReservation,
+    ServingRuntimeConfigError,
     ServingRuntimeSessionState,
     payload_turn_id,
 )
@@ -357,6 +358,7 @@ class DuplexSessionRunnerMixin:
                         expected_epoch=append_epoch,
                     )
                     if append_ok:
+                        native.native_context_locked = True
                         if pcm_reservation is not None:
                             pcm_reservation.commit()
                             session.release_input_bytes(pcm_reservation.byte_count)
@@ -1072,10 +1074,21 @@ class DuplexSessionRunnerMixin:
                             if runtime_update_error is not None:
                                 await emit_event(runtime_update_error)
                                 continue
-                            candidate_runtime_config = self._runtime_config_for_session_update(
-                                session,
-                                candidate_config,
-                            )
+                            try:
+                                candidate_runtime_config = self._runtime_config_for_session_update(
+                                    session,
+                                    candidate_config,
+                                )
+                            except ServingRuntimeConfigError as exc:
+                                await emit_event(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "code": exc.code,
+                                        "error": str(exc),
+                                    }
+                                )
+                                continue
                             if not await self._signal_runtime_session(
                                 session,
                                 turn_event,

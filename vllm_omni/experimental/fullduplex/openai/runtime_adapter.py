@@ -14,6 +14,18 @@ class ServingRuntimeConfigError(ValueError):
         self.code = code
 
 
+def reject_changed_runtime_value(
+    new_value: object,
+    current_value: object,
+    *,
+    message: str,
+    code: str,
+    error_cls: type[ServingRuntimeConfigError] = ServingRuntimeConfigError,
+) -> None:
+    if new_value != current_value:
+        raise error_cls(message, code=code)
+
+
 class PcmAppendReservation(Protocol):
     operation_id: str
     payload: dict[str, object] | None
@@ -64,6 +76,7 @@ class ServingRuntimeSessionState(Protocol):
     audio_buffer: PcmAppendBuffer
     input_since_commit: bool
     speech_since_commit: bool
+    native_context_locked: bool
     committed_audio_payload: dict[str, object] | None
     committed_audio_operation_id: str | None
     committed_audio_reserved_bytes: int

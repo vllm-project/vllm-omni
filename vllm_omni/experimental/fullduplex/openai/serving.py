@@ -1156,6 +1156,18 @@ class OmniDuplexSessionHandler(
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
             return None
+        if (
+            candidate_config.instructions != session.config.instructions
+            and self._runtime_session_state(session).native_context_locked
+        ):
+            return {
+                "type": "error",
+                "session_id": session.session_id,
+                "code": "instructions_update_unsupported",
+                "error": "session.update cannot change instructions after the native duplex context is initialized",
+            }
+        if session.config.extra_body.get("minicpmo45_native_duplex") is not True:
+            return None
         if not self._config_requests_audio_output(candidate_config):
             return None
         if "ref_audio_data" in session.runtime_config:
@@ -1326,6 +1338,19 @@ class OmniDuplexSessionHandler(
                 "code": "ref_audio_update_unsupported",
                 "error": "session.update cannot change ref_audio after the native duplex runtime is open",
             }
+        extra_body_payload = payload.get("extra_body")
+        if isinstance(extra_body_payload, dict) and "minicpmo45_native_duplex" in extra_body_payload:
+            current_native_duplex = session.config.extra_body.get("minicpmo45_native_duplex")
+            if (
+                current_native_duplex is not None
+                and extra_body_payload["minicpmo45_native_duplex"] != current_native_duplex
+            ):
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "native_duplex_mode_update_unsupported",
+                    "error": "session.update cannot change minicpmo45_native_duplex after the session is created",
+                }
         if isinstance(payload.get("instructions"), str):
             session.config.instructions = str(payload["instructions"])
         elif "instructions" in payload and payload.get("instructions") is None:
