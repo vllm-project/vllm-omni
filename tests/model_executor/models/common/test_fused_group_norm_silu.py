@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for fused_group_norm_silu operator.
 
 Tests numeric correctness against PyTorch native implementation:
@@ -9,6 +12,10 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.common.ops import fused_group_norm_silu
+from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
+    _SPLIT_WAVES_ENV,
+    pick_split,
+)
 
 # Skip tests if CUDA not available
 pytestmark = [
@@ -332,6 +339,138 @@ def test_large_offset_small_variance(dtype):
         torch.testing.assert_close(fused_out, ref_out, rtol=0.05, atol=0.1)
     # fp16/bf16: perturbation is swallowed by the dtype — no meaningful close,
     # the no-NaN assertion above is the regression guard.
+
+
+# ---------------------------------------------------------------------------
+# Split reduction
+# ---------------------------------------------------------------------------
+# Above a size threshold each group's reduction is spread over several CTAs that
+# write partial statistics to a workspace, instead of one CTA owning the whole
+# group. Every case above this point is small enough to take the unsplit path,
+# so without these the split path would ship untested.
+
+
+def _split_of(x, num_groups=32):
+    """How many CTAs cooperate per group for this tensor on this device."""
+    return pick_split(x[0, 0].numel(), x.size(0), num_groups, x.device)[0]
+
+
+@pytest.mark.parametrize(
+    "channels, hw, dtype",
+    [
+        (128, (256, 256), torch.bfloat16),
+        (128, (128, 128), torch.float32),
+        (64, (512, 512), torch.bfloat16),
+    ],
+)
+def test_split_reduction_matches_eager(channels, hw, dtype):
+    """Correctness at sizes that actually trigger the split."""
+    torch.manual_seed(0)
+    x = torch.randn(1, channels, *hw, device="cuda", dtype=dtype)
+    weight = torch.randn(channels, device="cuda", dtype=dtype)
+    bias = torch.randn(channels, device="cuda", dtype=dtype)
+
+    assert _split_of(x) > 1, (
+        f"test premise: C={channels} {hw} should take the split path, got split=1. "
+        "If this fires on a very small GPU the shape needs raising, not the assert removing."
+    )
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    ref_out = F.silu(F.group_norm(x.float(), 32, weight.float(), bias.float(), 1e-6)).to(dtype)
+
+    rtol, atol = _tolerance(dtype)
+    torch.testing.assert_close(fused_out, ref_out, rtol=rtol, atol=atol)
+
+
+def test_split_reduction_ragged_tail():
+    """A spatial size that does not divide evenly into aligned chunks.
+
+    The last cooperating program gets a short slice (here 192 of 4096 positions),
+    which is the case that would silently drop or double-count elements if the
+    chunk bookkeeping were off by one.
+    """
+    torch.manual_seed(0)
+    C, H, W = 64, 96, 130  # 12480 spatial positions: 3 full chunks plus 192
+    x = torch.randn(1, C, H, W, device="cuda", dtype=torch.float32)
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+
+    assert _split_of(x) > 1, "test premise: this shape should take the split path"
+    assert (H * W) % 4096 != 0, "test premise: spatial size must not be chunk-aligned"
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    ref_out = F.silu(F.group_norm(x, 32, weight, bias, 1e-6))
+    torch.testing.assert_close(fused_out, ref_out, rtol=1e-5, atol=1e-6)
+
+
+def test_split_reduction_large_offset():
+    """``10000 +- 0.1`` again, but big enough to be split across CTAs.
+
+    Splitting adds a level to the reduction tree, so this is where a combine that
+    reconstructed ``E[x^2] - E[x]^2`` from the partials -- rather than summing
+    their M2s plus the between-partial spread -- would give itself away.
+    """
+    torch.manual_seed(0)
+    C, H, W = 64, 256, 256
+    x = torch.full((1, C, H, W), 10000.0, device="cuda", dtype=torch.float32)
+    x = x + torch.randn(1, C, H, W, device="cuda") * 0.1
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+
+    assert _split_of(x) > 1, "test premise: this shape should take the split path"
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    ref_out = F.silu(F.group_norm(x.double(), 32, weight.double(), bias.double(), 1e-6)).float()
+
+    assert not torch.isnan(fused_out).any(), "fused output must not contain NaN"
+    # Same floor as the unsplit case: at this offset fp32 storage of x alone
+    # costs ~0.02 of output error, which no reduction order can recover.
+    torch.testing.assert_close(fused_out, ref_out, rtol=0.05, atol=0.1)
+
+
+def test_split_is_a_perf_knob_only(monkeypatch):
+    """Forcing no split vs. a heavy split must agree to within fp32 noise.
+
+    Not bit-exactness: a different split sums the fp32 partials in a different
+    order. What this pins is that the split changes only how the work is laid
+    out, never what is computed.
+    """
+    torch.manual_seed(0)
+    C, H, W = 128, 128, 128
+    x = torch.randn(1, C, H, W, device="cuda", dtype=torch.float32)
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "0")
+    assert _split_of(x) == 1, "premise: waves=0 must disable the split"
+    unsplit = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
+    assert _split_of(x) > 1, "premise: waves=8 must enable the split"
+    heavily_split = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+
+    torch.testing.assert_close(heavily_split, unsplit, rtol=1e-4, atol=1e-5)
+
+
+def test_split_reduction_is_deterministic(monkeypatch):
+    """Repeated runs are bit-identical: the workspace is written, never reduced into.
+
+    Each partial slot has exactly one writer, so unlike an atomics-based split
+    there is no run-to-run ordering to vary.
+    """
+    torch.manual_seed(0)
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "4")
+    C, H, W = 128, 128, 128
+    x = torch.randn(1, C, H, W, device="cuda", dtype=torch.float32)
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+    assert _split_of(x) > 1, "test premise: this shape should take the split path"
+
+    first = fused_group_norm_silu(x, weight, bias, 32, 1e-6)  # also warms autotune
+    reference = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    assert torch.equal(first, reference), "autotune warm-up should have settled by the second call"
+    for _ in range(4):
+        assert torch.equal(fused_group_norm_silu(x, weight, bias, 32, 1e-6), reference)
 
 
 if __name__ == "__main__":
