@@ -402,6 +402,25 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run causal SDPA with the reference expanded-K/V GQA behavior."""
+    num_key_value_groups = query.shape[1] // key.shape[1]
+    if num_key_value_groups != 1:
+        key = key.repeat_interleave(num_key_value_groups, dim=1)
+        value = value.repeat_interleave(num_key_value_groups, dim=1)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        is_causal=True,
+    )
+
+
 def _apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Reorganize chunked [TTT...HHH...WWW] into interleaved [THWTHW...] layout."""
     freqs_t = freqs[0]
@@ -810,19 +829,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Expand GQA keys/values to the local query-head count so SDPA works
-        # uniformly across backends (mirrors the reference eager path).
-        num_key_value_groups = self.num_heads // self.num_kv_heads
-        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
-        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            dropout_p=0.0,
-            is_causal=True,
-        )
+        attn_output = _scaled_dot_product_attention(query_states, key_states, value_states)
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -907,10 +914,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states

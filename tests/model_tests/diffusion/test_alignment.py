@@ -57,7 +57,6 @@ EXCLUDED_MODELS = [
     "OmniGen2Pipeline",
     "HeliosPipeline",
     "HeliosPyramidPipeline",
-    "DreamIDOmniPipeline",
     "SenseNovaU1Pipeline",
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
@@ -71,7 +70,6 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
-    "MagiHumanPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
