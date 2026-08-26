@@ -40,11 +40,20 @@ class MageVLProcessingInfo(Qwen3VLProcessingInfo):
             raise
 
     def get_hf_processor(self, **kwargs: object) -> Any:
-        # Mage advertises a remote processor.  Its token expansion is identical
-        # to Qwen2/3-VL, so use the maintained vLLM processor implementation.
-        return self.ctx.get_hf_processor(
-            Qwen3VLProcessor,
-            use_fast=kwargs.pop("use_fast", True),
+        # Mage's processor config points at remote ``MageVLVideoProcessor``
+        # code that is not an AutoProcessor class.  Build the maintained
+        # Qwen3-VL processor from its concrete local components instead.
+        from transformers import AutoTokenizer, Qwen2VLImageProcessor, Qwen2VLVideoProcessor
+
+        model_path = self.ctx.model_config.model
+        image_processor = Qwen2VLImageProcessor.from_pretrained(model_path)
+        video_processor = Qwen2VLVideoProcessor.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+        return Qwen3VLProcessor(
+            image_processor=image_processor,
+            video_processor=video_processor,
+            tokenizer=tokenizer,
+            chat_template=getattr(tokenizer, "chat_template", None),
             **kwargs,
         )
 
