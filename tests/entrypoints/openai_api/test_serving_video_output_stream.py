@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
@@ -953,3 +954,51 @@ class TestStreamingVideoOutputPromptUpdate:
                 "transition_chunks": 2,
             },
         )
+
+
+class TestMediaTimePacing:
+    """`_build_pacer` decides whether a session runs on a release schedule."""
+
+    @staticmethod
+    def _request(**extra_params) -> VideoGenerationRequest:
+        return VideoGenerationRequest(
+            prompt="a person walking forward through a sunlit forest path",
+            extra_params=extra_params or None,
+        )
+
+    def test_sending_as_produced_is_the_default(self):
+        # Pacing changes when an existing client receives its bytes, so it is a
+        # decision the caller makes rather than something a version bump does.
+        assert OmniStreamingVideoOutputHandler._build_pacer(self._request(), 16.0) is None
+        assert OmniStreamingVideoOutputHandler._build_pacer(self._request(pace_to_media_time=False), 16.0) is None
+
+    def test_pacing_uses_the_stream_frame_rate(self):
+        pacer = OmniStreamingVideoOutputHandler._build_pacer(self._request(pace_to_media_time=True), 16.0)
+        assert pacer is not None
+        pacer.delay_before_release(16)
+        assert pacer.released_media_seconds == pytest.approx(1.0)
+
+    def test_lead_and_lag_come_from_the_request(self):
+        pacer = OmniStreamingVideoOutputHandler._build_pacer(
+            self._request(pace_to_media_time=True, pacing_lead_seconds=0.5, pacing_max_lag_seconds=None),
+            16.0,
+        )
+        assert pacer is not None
+        assert pacer._lead_seconds == pytest.approx(0.5)
+        assert pacer._max_lag_seconds is None
+
+    def test_a_bad_pacing_parameter_is_a_client_error(self):
+        # Not a 500: the value came from the request body.
+        with pytest.raises(HTTPException) as raised:
+            OmniStreamingVideoOutputHandler._build_pacer(
+                self._request(pace_to_media_time=True, pacing_lead_seconds="soon"),
+                16.0,
+            )
+        assert raised.value.status_code == HTTPStatus.BAD_REQUEST.value
+
+    def test_a_negative_lead_is_refused_rather_than_silently_clamped(self):
+        with pytest.raises(HTTPException):
+            OmniStreamingVideoOutputHandler._build_pacer(
+                self._request(pace_to_media_time=True, pacing_lead_seconds=-1.0),
+                16.0,
+            )
