@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # ruff: noqa: N803
 
@@ -14,22 +14,35 @@ Measured against eager ``F.silu(F.group_norm(...))`` on one L20X, bf16, 32
 groups: 1.1-1.5x at the DiT ResBlock's activation sizes, where both paths are
 dominated by launch overhead, and 2.2-2.9x at the VAE's decode-resolution
 activations, where the saved memory traffic is what pays.
+
+Large activations additionally take a split reduction so the work is spread over
+the whole device instead of ``B * num_groups`` CTAs; see
+:mod:`._group_norm_reduction` for why and how. On an A10G (80 SMs), bf16, batch
+1, that is worth 1.46-1.48x over the unsplit kernel at every level of the
+HunyuanImage3 decode ladder, and puts the 1024^2 activation at 498 GB/s -- the
+same rate a plain device-to-device copy of that footprint sustains, so the
+kernel is now at the streaming limit rather than short of it. Small activations
+keep the single-launch path, where the widened autotune space is what helps
+instead (1.25-1.36x on the 32x32 sizes, which the old fixed 4096-wide block
+served badly).
 """
 
 import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=1),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=6),
-    ],
-    key=["spatial_size", "C"],
+from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
+    SPLIT_REDUCTION_CONFIGS,
+    SPLIT_REDUCTION_KEY,
+    SPLIT_REDUCTION_PRUNE,
+    launch_partial_stats,
+    pick_split,
+    welford_combine,
+    welford_group_range,
 )
+
+
+@triton.autotune(configs=SPLIT_REDUCTION_CONFIGS, key=SPLIT_REDUCTION_KEY, prune_configs_by=SPLIT_REDUCTION_PRUNE)
 @triton.jit
 def _group_norm_silu_kernel(
     # Input/Output pointers
@@ -38,11 +51,17 @@ def _group_norm_silu_kernel(
     # Normalization parameters
     weight_ptr,
     bias_ptr,
+    # Partial-statistics workspace, unused (and passed as 0) when SPLIT == 1
+    ws_ptr,
     # Shape info; x is contiguous (N, C, spatial_size)
     C,
     spatial_size,
+    split_chunk,
     num_groups: tl.constexpr,
     eps: tl.constexpr,
+    # Split reduction
+    SPLIT: tl.constexpr,
+    SPLIT_POW2: tl.constexpr,
     # Block sizes
     BLOCK_SIZE: tl.constexpr,
     num_stages: tl.constexpr,
@@ -50,60 +69,45 @@ def _group_norm_silu_kernel(
     """
     Fused GroupNorm + SiLU kernel.
     Computes SiLU(GroupNorm(x)) in one kernel, avoiding intermediate tensors.
-    Mean and variance use a parallel Welford reduction (block-level register
-    reduction merged with the Chan formula), which avoids the catastrophic
-    cancellation of E[x^2] - E[x]^2 on large-offset inputs. x is read once for
-    the statistics and once for normalization (2 reads total).
-    One program handles each (batch, group) pair. Channels are processed serially,
-    while spatial positions are vectorized for diffusion workloads.
+    Mean and variance use a parallel Welford reduction, which avoids the
+    catastrophic cancellation of E[x^2] - E[x]^2 on large-offset inputs. x is read
+    once for the statistics and once for normalization (2 reads total).
     Moments are accumulated in fp32 to match PyTorch numerics.
+
+    ``SPLIT`` programs cooperate on each (batch, group) pair. At SPLIT == 1 one
+    program owns the whole group and computes its statistics inline, which is the
+    right shape when the activation is small enough that launch overhead
+    dominates. Above that, a preceding pass has already reduced each slice into
+    ``ws`` and this kernel only merges the partials before normalizing its own
+    slice -- the reason being that one CTA per group leaves most of the device
+    idle on decode-resolution activations.
     """
     pid = tl.program_id(0)
+    bg = pid // SPLIT
+    s = pid % SPLIT
 
     group_size = C // num_groups
-    n_idx = pid // num_groups
-    g_idx = pid % num_groups
+    n_idx = bg // num_groups
+    g_idx = bg % num_groups
 
-    # === Pass 1: Welford reduction over the whole group (fp32) ===
-    # Each block is reduced in registers (block mean, then centered M2), so the
-    # loaded values are reused instead of re-reading memory; blocks are merged
-    # with the Chan et al. parallel-Welford formula. This keeps both the mean and
-    # the variance accurate for inputs like ``10000 +- 0.1``, where the naive
-    # ``E[x^2] - E[x]^2`` cancels catastrophically, and reads x only once for the
-    # statistics (2 reads total including normalize).
-    n_total = tl.zeros([1], dtype=tl.float32)
-    mean_total = tl.zeros([1], dtype=tl.float32)
-    m2_total = tl.zeros([1], dtype=tl.float32)
+    # === Pass 1: group statistics (fp32) ===
+    # Triton resolves this constexpr branch at compile time, so only one of the
+    # two forms is ever emitted.
+    if SPLIT == 1:
+        lo = 0
+        hi = spatial_size
+        n_total, mean, m2_total = welford_group_range(
+            x_ptr, n_idx, g_idx, C, spatial_size, group_size, lo, hi, BLOCK_SIZE, num_stages
+        )
+    else:
+        lo = s * split_chunk
+        hi = tl.minimum(lo + split_chunk, spatial_size)
+        n_total, mean, m2_total = welford_combine(ws_ptr, bg, SPLIT, SPLIT_POW2)
 
-    for c_offset in range(group_size):
-        c_idx = g_idx * group_size + c_offset
-        base = n_idx * C * spatial_size + c_idx * spatial_size
-
-        for s_start in tl.range(0, spatial_size, BLOCK_SIZE, num_stages=num_stages):
-            offsets = s_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < spatial_size
-
-            x_val = tl.load(x_ptr + base + offsets, mask=mask, other=0.0)
-            x_val = x_val.to(tl.float32)
-
-            # block-level reduction in registers (no extra memory traffic)
-            n = tl.sum(tl.where(mask, 1.0, 0.0), axis=0)
-            bsum = tl.sum(x_val, axis=0)
-            bmean = bsum / n
-            bm2 = tl.sum(tl.where(mask, (x_val - bmean) * (x_val - bmean), 0.0), axis=0)
-
-            # Chan et al. merge into the running (n, mean, m2)
-            delta = bmean - mean_total
-            new_n = n_total + n
-            mean_total = mean_total + delta * (n / new_n)
-            m2_total = m2_total + bm2 + delta * delta * (n_total * n / new_n)
-            n_total = new_n
-
-    mean = mean_total
     var = m2_total / n_total
     rstd = 1.0 / tl.sqrt(var + eps)
 
-    # === Pass 2: normalize, apply affine, and SiLU ===
+    # === Pass 2: normalize this program's slice, apply affine, and SiLU ===
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
         base = n_idx * C * spatial_size + c_idx * spatial_size
@@ -111,9 +115,9 @@ def _group_norm_silu_kernel(
         weight_val = tl.load(weight_ptr + c_idx).to(tl.float32)
         bias_val = tl.load(bias_ptr + c_idx).to(tl.float32)
 
-        for s_start in tl.range(0, spatial_size, BLOCK_SIZE, num_stages=num_stages):
+        for s_start in tl.range(lo, hi, BLOCK_SIZE, num_stages=num_stages):
             offsets = s_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < spatial_size
+            mask = offsets < hi
 
             x_val = tl.load(x_ptr + base + offsets, mask=mask, other=0.0)
             x_val = x_val.to(tl.float32)
@@ -185,23 +189,32 @@ def fused_group_norm_silu(
         out_dtype = torch.float32
     out_flat = torch.empty_like(x_flat, dtype=out_dtype)
 
-    # Only B*num_groups programs are launched, which is well under the SM count
-    # for typical diffusion batches. A memory-bound kernel can still saturate
-    # HBM from few CTAs, but only with enough loads in flight, so widen the CTA
-    # for the large activations instead of leaving it at the 4-warp default.
+    # One program per (batch, group) pair would be B*num_groups CTAs -- 32 for a
+    # B=1 VAE decode, well under any modern SM count. Split the spatial axis so
+    # the largest activations get enough CTAs to saturate memory; small ones fall
+    # back to split=1, which is the original single-launch kernel.
+    split, split_chunk = pick_split(spatial_size, B, num_groups, x_flat.device)
 
-    # One program per (batch, group) pair.
-    grid = (B * num_groups,)
+    ws = 0
+    if split > 1:
+        ws = launch_partial_stats(x_flat, B, C, spatial_size, num_groups, split, split_chunk)
 
-    _group_norm_silu_kernel[grid](
+    _group_norm_silu_kernel[(B * num_groups * split,)](
         x_flat,
         out_flat,
         weight,
         bias,
+        ws,
         C,
         spatial_size,
+        split_chunk,
         num_groups=num_groups,
         eps=eps,
+        SPLIT=split,
+        SPLIT_POW2=1 << (split - 1).bit_length(),
     )
 
     return out_flat.reshape(orig_shape)
+
+
+__all__ = ["fused_group_norm_silu"]
