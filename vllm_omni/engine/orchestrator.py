@@ -57,8 +57,10 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
+from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -360,14 +362,15 @@ class Orchestrator:
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
+    _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
-        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
+        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
@@ -375,6 +378,7 @@ class Orchestrator:
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
+        prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
@@ -389,6 +393,8 @@ class Orchestrator:
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
         self.log_stats = log_stats
+        self._prom_metrics = prom_metrics
+        self._stage_replica_waiting: dict[tuple[int, int], int] = {}
         self._orch_monitor = create_orch_monitor(
             enabled=enable_orch_monitor,
             replica_sampler=self._sample_replica_metrics,
@@ -542,6 +548,7 @@ class Orchestrator:
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()
 
@@ -981,6 +988,16 @@ class Orchestrator:
                             if diffusion_output is None:
                                 continue
 
+                            output_metrics = getattr(diffusion_output, "metrics", None)
+                            if isinstance(output_metrics, dict):
+                                n_waiting = output_metrics.pop(metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY, None)
+                                if n_waiting is not None:
+                                    self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
+
+                            if diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID:
+                                idle = False
+                                continue
+
                             pool.record_output_timestamps([diffusion_output])
                             processed = [diffusion_output]
                         else:
@@ -990,6 +1007,18 @@ class Orchestrator:
 
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
+                                # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
+                                # async_chunk early-return so it lands in all modes.
+                                kv_params = getattr(eco, "kv_transfer_params", None)
+                                if (
+                                    self._prom_metrics is not None
+                                    and isinstance(kv_params, dict)
+                                    and (kv_wait_s := kv_params.get("kv_wait_s")) is not None
+                                ):
+                                    self._prom_metrics.observe_kv_wait(
+                                        kv_params.get("connector_type") or "unknown",
+                                        float(kv_wait_s),
+                                    )
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
                                 if req_state is None or not req_state.streaming.enabled:
                                     continue
@@ -1027,6 +1056,17 @@ class Orchestrator:
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
                                     engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
+                            _sched_stats = raw_outputs.scheduler_stats
+                            if (
+                                self._prom_metrics is not None
+                                and _sched_stats is not None
+                                and getattr(_sched_stats, "num_waiting_reqs", None) is not None
+                            ):
+                                self._update_stage_replica_waiting(
+                                    stage_id,
+                                    replica_id,
+                                    int(_sched_stats.num_waiting_reqs),
                                 )
                     except asyncio.CancelledError:
                         raise
@@ -1106,6 +1146,26 @@ class Orchestrator:
             close_duplex_sessions=True,
         )
 
+    def _update_stage_replica_waiting(self, stage_id: int, replica_id: int, n_waiting: int) -> None:
+        """Update one replica snapshot and expose the stage-wide total."""
+        self._stage_replica_waiting[(stage_id, replica_id)] = max(int(n_waiting), 0)
+        self._set_stage_waiting_total(stage_id)
+
+    def _remove_stage_replica_waiting(self, stage_id: int, replica_id: int) -> None:
+        """Drop a dead replica's snapshot and refresh the stage total."""
+        self._stage_replica_waiting.pop((stage_id, replica_id), None)
+        self._set_stage_waiting_total(stage_id)
+
+    def _set_stage_waiting_total(self, stage_id: int) -> None:
+        if self._prom_metrics is None:
+            return
+        total = sum(
+            n_waiting
+            for (snapshot_stage_id, _), n_waiting in self._stage_replica_waiting.items()
+            if snapshot_stage_id == stage_id
+        )
+        self._prom_metrics.set_stage_waiting_requests(stage_id, total)
+
     async def _handle_dead_replica(self, stage_id: int, replica_id: int, error: EngineDeadError) -> None:
         """Evict a dead stage replica and fail the requests stranded on it (#4285).
 
@@ -1124,6 +1184,7 @@ class Orchestrator:
             error,
         )
         pool.evict_replica(replica_id)
+        self._remove_stage_replica_waiting(stage_id, replica_id)
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
@@ -1178,6 +1239,35 @@ class Orchestrator:
             abort=True,
         )
 
+    async def _fail_request_client_error(
+        self,
+        req_id: str,
+        stage_id: int,
+        error: str,
+        *,
+        close_duplex_sessions: bool = False,
+    ) -> None:
+        """Fail one request with a non-fatal 400 (bad input, engine survives).
+
+        The non-fatal counterpart of `_fail_request_dead_stage`: emits a
+        client-error ErrorMessage (default `fatal=False`) so the engine keeps
+        serving, then releases the request's state across every stage pool.
+        """
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=error,
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                error_type=DEFAULT_CLIENT_ERROR_TYPE,
+                request_id=req_id,
+                stage_id=stage_id,
+            )
+        )
+        await self._cleanup_request_ids(
+            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            abort=True,
+            close_duplex_sessions=close_duplex_sessions,
+        )
+
     async def _dispatch_or_fail_request(
         self,
         dispatch: Callable[[], Awaitable[Any]],
@@ -1199,7 +1289,9 @@ class Orchestrator:
         StageUnavailableError (no live replica / evicted slot) or
         EngineDeadError (replica died mid-submit before the poll loop evicted
         it). Both mean "this request cannot be placed", not "the server is
-        broken": fail the request and keep serving (#4285). Unrelated errors
+        broken": fail the request and keep serving (#4285). An OverflowError
+        from encoding an out-of-range request value is likewise failed as a
+        client error (400) rather than killing the loop. Other unrelated errors
         propagate. Returns False when the request was failed.
 
         ``req_id`` is the request the failure is attributed to; ``dispatch_req_id``
@@ -1241,6 +1333,24 @@ class Orchestrator:
             await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
+            return False
+        except OverflowError as e:
+            # Catch overflow errors in the request payload to ensure that msgpack
+            # encoding can't kill the engine; instead, we just fail this request.
+            # The frontend should generally validate this as well, but this is needed
+            # in case we get values like seed > 2**64-1 from sampling params.
+            logger.warning(
+                "[Orchestrator] %s dispatch for req=%s hit an unserializable value on stage-%s: %s",
+                operation,
+                req_id,
+                stage_id,
+                e,
+            )
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                f"Request contains a value that cannot be serialized: {e}",
+            )
             return False
 
     # ---- Shared helpers ----
@@ -2343,21 +2453,11 @@ class Orchestrator:
                 "and none were provided; failing the request",
                 request_id,
             )
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    error=(
-                        "async_chunk requires prompt_token_ids on the stage-0 request; "
-                        "an embeds-only prompt cannot prewarm downstream stages"
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    error_type=DEFAULT_CLIENT_ERROR_TYPE,
-                    request_id=request_id,
-                    stage_id=0,
-                )
-            )
-            await self._cleanup_request_ids(
-                [request_id, *self._cfg_tracker.cleanup_parent(request_id)],
-                abort=True,
+            await self._fail_request_client_error(
+                request_id,
+                0,
+                "async_chunk requires prompt_token_ids on the stage-0 request; "
+                "an embeds-only prompt cannot prewarm downstream stages",
                 close_duplex_sessions=True,
             )
             return False

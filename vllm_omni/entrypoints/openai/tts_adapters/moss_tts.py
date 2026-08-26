@@ -91,7 +91,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         server = self.ctx.server
-        tts_params = await server._build_moss_tts_params(request)
+        tts_params = await server._build_moss_tts_params(request, has_inline_ref_audio=has_inline_ref_audio)
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:

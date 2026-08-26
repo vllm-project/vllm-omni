@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import namedtuple
 from types import SimpleNamespace
@@ -10,7 +10,7 @@ from diffusers import DiffusionPipeline  # pyright: ignore[reportPrivateImportUs
 from PIL import Image
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionParallelConfig,
@@ -651,7 +651,7 @@ class TestDiffusersBackendEndToEndExecution:
     def test_t2i_random_weights(
         self,
         omni_server: OmniServer,
-        openai_client: OpenAIClientHandler,
+        online_client: OnlineOmniClient,
     ):
         messages = dummy_messages_from_mix_data(content_text="a photo of an astronaut riding a horse on mars")
 
@@ -667,8 +667,10 @@ class TestDiffusersBackendEndToEndExecution:
             },
         }
 
-        response = openai_client.send_diffusion_request(request_config)
-        image: Image.Image = response[0].images[0]  # pyright: ignore[reportOptionalSubscript]
+        response = online_client.send_diffusion_request(request_config)
+        images = response[0].images
+        assert images is not None
+        image: Image.Image = images[0]
 
         # Request config has incomplete width/height, so internal assertion in `send_diffusion_request` is incomplete.
         assert image.size == (512, 512)

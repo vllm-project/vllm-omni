@@ -37,7 +37,6 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -646,12 +645,12 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="client_disconnect")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="stage_error")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
@@ -1116,6 +1115,7 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
+            self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
@@ -1447,7 +1447,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
         return final_acks
 

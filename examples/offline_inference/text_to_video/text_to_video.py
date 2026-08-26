@@ -114,12 +114,32 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "ltx23_output.mp4",
     },
+    "sana_480p": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 81,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 16,
+        "output": "sana_video_480p.mp4",
+    },
+    "sana_720p": {
+        "height": 704,
+        "width": 1280,
+        "num_frames": 81,
+        "num_inference_steps": 50,
+        "guidance_scale": 6.0,
+        "fps": 16,
+        "output": "sana_video_720p.mp4",
+    },
 }
 
 
 def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     model_lower = model.lower()
     class_lower = (model_class_name or "").lower()
+    if "sana-video" in model_lower or "sana_video" in model_lower or "sanavideo" in class_lower:
+        return _MODEL_PRESETS["sana_720p" if "720p" in model_lower else "sana_480p"]
     if "lingbot" in model_lower or "lingbotvideo" in class_lower:
         return _MODEL_PRESETS["lingbot"]
     if "ltx" in class_lower or "ltx" in model_lower:
