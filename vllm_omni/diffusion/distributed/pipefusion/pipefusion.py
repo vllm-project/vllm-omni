@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the xDiT authors.
 #
 # This module is adapted from xDiT (https://github.com/xdit-project/xdit)
@@ -85,7 +86,15 @@ class PipeFusionPipelineMixin(ABC):
                 def wrapped_forward(self, req: "OmniDiffusionRequest", *args: Any, **kwargs: Any) -> Any:
                     # capture the number of warm-up steps and split dimension
                     self._configure_pipefusion_run(req)
-                    return forward(self, req, *args, **kwargs)
+                    runtime.set_request_context(
+                        getattr(req, "request_id", None),
+                        getattr(req, "sequence_id", 0),
+                    )
+                    try:
+                        return forward(self, req, *args, **kwargs)
+                    finally:
+                        self._reset_pipefusion_caches()
+                        runtime.clear_request_context()
 
                 cls.forward = wrapped_forward
 
@@ -158,9 +167,13 @@ class PipeFusionPipelineMixin(ABC):
             )
 
     def _reset_pipefusion_caches(self) -> None:
+        runtime = get_pipefusion_runtime()
         for module in self.modules():
             if callable(reset_cache := getattr(module, "pipefusion_reset_cache", None)):
-                reset_cache()
+                if runtime.request_id is None:
+                    reset_cache()
+                else:
+                    reset_cache(runtime.request_id, runtime.sequence_id)
 
     @abstractmethod
     def prepare_model_kwargs(
