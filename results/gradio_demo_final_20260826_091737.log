@@ -1,0 +1,3 @@
+nohup: ignoring input
+/vllm-workspace/vllm-omni/examples/online_serving/minicpmo/gradio_demo.py:381: UserWarning: The parameters have been moved from the Blocks constructor to the launch() method in Gradio 6.0: css. Please pass these parameters to launch() instead.
+  with gr.Blocks(css=css, title="vLLM-Omni · MiniCPM-o Demo") as demo:
