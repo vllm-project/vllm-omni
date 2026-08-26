@@ -83,37 +83,11 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and full_model"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
         mirror_hardwares: h100_2
-
-      - label: ":full_moon: Omni · Perf Test · vLLM Text"
-        key: nightly-omni-performance-vllm-text
-        timeout_in_minutes: 180
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-        mirror_hardwares: h100_2
-
-      - label: ":full_moon: Omni · Perf Test · Multi-Replica"
-        key: nightly-omni-performance-multi-replicas
-        timeout_in_minutes: 180
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-        mirror_hardwares: h100_3
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         key: nightly-omni-performance-minicpmo-4-5
@@ -255,6 +229,12 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m full_model --run-level full_model
         mirror_hardwares: h100_4
 
+      - label: ":full_moon: HiDream-O1-Image · Accuracy Test"
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
+        mirror_hardwares: h100_2
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image"
         key: nightly-diffusion-x2iat-performance-qwen-image
         timeout_in_minutes: 180
@@ -395,7 +375,7 @@ steps:
       - label: ":full_moon: Diffusion · Quantization Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pip install "vllm-gguf-plugin>=0.0.3"
+          - pip install "vllm-gguf-plugin==0.0.4"
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_1
 
@@ -406,8 +386,6 @@ steps:
     depends_on:
       - nightly-omni-performance-no-async-chunk
       - nightly-omni-performance-async-chunk
-      - nightly-omni-performance-vllm-text
-      - nightly-omni-performance-multi-replicas
       - nightly-tts-performance
       - nightly-diffusion-x2iat-performance-qwen-image
       - nightly-diffusion-x2v-performance
@@ -419,8 +397,6 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-tts-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-no-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-async-chunk
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-vllm-text
-      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-multi-replicas
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance
       - python tools/nightly/generate_nightly_perf_excel.py

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -105,16 +108,16 @@ class FakeEngineClient:
         self.close_result = close_result
         self.opened: list[str] = []
         self.opened_fences: list[DuplexFence | None] = []
-        self.appended: list[tuple[str, str, object, bool]] = []
+        self.appended: list[tuple[str, str, Any, bool]] = []
         self.append_operation_ids: list[str | None] = []
         self.appended_fences: list[DuplexFence | None] = []
-        self.opened_configs: list[dict[str, object]] = []
-        self.opened_runtime_configs: list[dict[str, object]] = []
+        self.opened_configs: list[dict[str, Any]] = []
+        self.opened_runtime_configs: list[dict[str, Any]] = []
         self.signals: list[tuple[str, str]] = []
         self.signal_fences: list[DuplexFence | None] = []
         self.signal_next_fences: list[DuplexFence | None] = []
-        self.signal_session_configs: list[dict[str, object] | None] = []
-        self.signal_runtime_configs: list[dict[str, object] | None] = []
+        self.signal_session_configs: list[dict[str, Any] | None] = []
+        self.signal_runtime_configs: list[dict[str, Any] | None] = []
         self.closed: list[tuple[str, str]] = []
         self.touched: list[tuple[str, DuplexLeaseActivity]] = []
         self.touch_fences: list[DuplexFence] = []
@@ -136,7 +139,7 @@ class FakeEngineClient:
         runtime_config: dict[str, object] | None = None,
         timeout: float | None = None,
         fence: DuplexFence | None = None,
-    ) -> None:
+    ) -> Any:
         del timeout
         if self.fail_open:
             raise RuntimeError("open failed")
@@ -157,7 +160,7 @@ class FakeEngineClient:
         timeout: float | None = None,
         collect_outputs: bool = True,
         fence: DuplexFence | None = None,
-    ) -> None:
+    ) -> Any:
         del timeout, collect_outputs
         self.appended.append((session_id, mode, payload, final))
         self.append_operation_ids.append(operation_id)
@@ -191,7 +194,7 @@ class FakeEngineClient:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
-    ) -> None:
+    ) -> Any:
         del timeout
         if self.fail_signal or event in self.fail_signal_events:
             raise RuntimeError("signal failed")
@@ -209,7 +212,7 @@ class FakeEngineClient:
         reason: str = "client_close",
         timeout: float | None = None,
         fence: DuplexFence | None = None,
-    ) -> None:
+    ) -> Any:
         del timeout
         if self.fail_close:
             raise RuntimeError("close failed")
@@ -344,7 +347,7 @@ def _project_data_plane(
     result: object,
     *,
     session: DuplexSession | None = None,
-) -> list[dict[str, object]]:
+) -> list[dict[str, Any]]:
     return list(data_plane.project(result, context=_data_plane_context(session)))
 
 
@@ -4194,6 +4197,7 @@ async def test_realtime_resume_preserves_append_tail_order_across_connections():
         await asyncio.sleep(0.01)
     else:
         pytest.fail("resumable session did not open")
+    assert created is not None
     session = handler._registry.get("sid-resume-append-order")
     assert session is not None
     native_state = handler._minicpmo_session_state(session)
@@ -4323,6 +4327,7 @@ async def test_realtime_takeover_does_not_clear_new_attachment_pending_turns():
         await asyncio.sleep(0.001)
     else:
         pytest.fail("first attachment did not create the session")
+    assert created is not None
 
     second = TimedWebSocket(receive_timeout_s=1.0)
     second.put(
@@ -4386,6 +4391,7 @@ async def test_realtime_takeover_drops_input_queued_by_replaced_attachment():
         await asyncio.sleep(0.001)
     else:
         pytest.fail("first attachment did not create the session")
+    assert created is not None
 
     second = TimedWebSocket(receive_timeout_s=1.0)
     second.put(
@@ -5002,11 +5008,12 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
             *,
             mode: str,
             payload: object,
+            operation_id: str | None = None,
             final: bool = False,
             timeout: float | None = None,
             collect_outputs: bool = True,
             fence: DuplexFence | None = None,
-        ):
+        ) -> Any:
             self.append_started.set()
             try:
                 await self.release_append.wait()
@@ -5017,6 +5024,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
                 session_id,
                 mode=mode,
                 payload=payload,
+                operation_id=operation_id,
                 final=final,
                 timeout=timeout,
                 collect_outputs=collect_outputs,
@@ -5128,7 +5136,9 @@ async def test_duplex_handler_session_update_control_failure_rolls_back_config()
     error = next(m for m in ws.sent if m.get("type") == "error")
     assert error["code"] == "runtime_signal_failed"
     assert error["runtime_control"]["error_count"] == 1
-    assert engine.signal_session_configs[-1]["instructions"] == "must roll back"
+    signaled_config = engine.signal_session_configs[-1]
+    assert signaled_config is not None
+    assert signaled_config["instructions"] == "must roll back"
 
 
 @pytest.mark.asyncio
@@ -5429,7 +5439,7 @@ async def test_minicpmo_native_duplex_open_unsupported_fails_session_create():
 @pytest.mark.asyncio
 async def test_minicpmo_native_duplex_rejects_engine_without_fence_contract():
     class LegacyEngineClient(FakeEngineClient):
-        async def open_duplex_session_async(
+        async def open_duplex_session_async(  # type: ignore[override]
             self,
             session_id: str,
             *,
@@ -5437,7 +5447,7 @@ async def test_minicpmo_native_duplex_rejects_engine_without_fence_contract():
             capabilities: dict[str, object] | None = None,
             session_config: dict[str, object] | None = None,
             timeout: float | None = None,
-        ) -> None:
+        ) -> Any:
             return await super().open_duplex_session_async(
                 session_id,
                 session_mode=session_mode,
@@ -5534,6 +5544,9 @@ async def test_minicpmo_native_duplex_separates_public_and_runtime_config(monkey
     assert opened_runtime_config["duplex_stage_max_tokens"] == {"0": 20, "1": 8192}
     assert opened_runtime_config["duplex_stage_sampling_params"]["0"]["top_k"] == 20
     assert opened_runtime_config["duplex_stage_sampling_params"]["0"]["top_p"] == 0.8
+    # The Talker YAML carries upstream's min_new_token=50 for chat TTS; a duplex
+    # chunk is 26 codec samples, so check_stop would never release the request.
+    assert opened_runtime_config["duplex_stage_sampling_params"]["1"] == {"min_tokens": 0}
     assert base64.b64decode(opened_runtime_config["ref_audio_data"]) == struct.pack("<1600f", *([0.25] * 1600))
 
 

@@ -105,6 +105,10 @@ class TestPipelineTopology:
         assert talker.engine_output_type == "latent"
         # scope KV cache / mrope sizing to talker sub-config
         assert talker.hf_config_name == "tts_config"
+        assert talker.sampling_constraints == {
+            "detokenize": False,
+            "stop_token_ids": [6561],
+        }
         assert talker.custom_process_next_stage_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_full_payload"
         )

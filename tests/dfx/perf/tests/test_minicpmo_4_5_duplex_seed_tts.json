@@ -18,7 +18,7 @@
       "model": "openbmb/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
         "--trust-remote-code"
       ]
     },
@@ -35,6 +35,7 @@
           1
         ],
         "no_oversample": true,
+        "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "seed_tts_turns_per_session": 4,
@@ -45,6 +46,23 @@
         "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
+            "request_throughput": [
+              0.3038
+            ],
+            "mean_ttft_ms": [
+              139.997
+            ],
+            "mean_e2el_ms": [
+              3269.8807
+            ],
+            "mean_audio_ttfp_ms": [
+              456.073
+            ],
+            "mean_audio_rtf": [
+              0.2254
+            ]
+          },
+          "A3": {
             "request_throughput": [
               0.1594
             ],

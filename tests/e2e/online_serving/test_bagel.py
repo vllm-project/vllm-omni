@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end online serving test for Bagel text2img and img2img generation.
@@ -79,7 +79,7 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_bagel_text2img_online(omni_server, openai_client) -> None:
+def test_bagel_text2img_online(omni_server, online_client) -> None:
     """Test Bagel text2img via OpenAI-compatible chat completions API."""
     request_config = {
         "model": omni_server.model,
@@ -94,14 +94,14 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_bagel_img2img_online(omni_server, openai_client) -> None:
+def test_bagel_img2img_online(omni_server, online_client) -> None:
     """Test Bagel img2img via OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
@@ -119,4 +119,4 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

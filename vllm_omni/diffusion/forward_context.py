@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.ir
@@ -26,6 +26,11 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Active Worker-side paged KV adapter.  The adapter is installed only for
+    # the duration of a paged forward; dense forwards leave this as ``None``.
+    # Keep the field opaque here to avoid coupling the common context module to
+    # the diffusion_kv implementation.
+    paged_kv_adapter: Any | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
@@ -209,10 +214,45 @@ def set_forward_context(
                 yield
 
 
+@contextmanager
+def override_paged_kv_adapter(adapter: Any | None):
+    """Temporarily expose a Worker paged-KV adapter to Omni Attention.
+
+    This is deliberately a small context override instead of a second global
+    forward context.  The model runner owns the outer context and the adapter
+    only replaces one opaque field while its prepared native metadata is live.
+    """
+
+    if _forward_context is None:
+        # Unit-level adapter users can prepare/activate metadata without an
+        # Omni model forward context.  In that case there is nothing to
+        # override and the adapter's explicit ``forward`` API remains usable.
+        yield
+        return
+
+    previous = _forward_context.paged_kv_adapter
+    _forward_context.paged_kv_adapter = adapter
+    try:
+        yield
+    finally:
+        _forward_context.paged_kv_adapter = previous
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+def set_forward_context_denoise_timestep(timestep: float | None) -> None:
+    """Set the normalized (descending, 1 -> 0) denoise timestep.
+
+    Timestep-gated attention features read this; pipelines that drive their own
+    denoise loop can publish it directly instead of going through
+    :meth:`DenoiseProgressMixin.record_denoise_step`.
+    """
+    if _forward_context is not None:
+        _forward_context.denoise_timestep = None if timestep is None else float(timestep)
 
 
 class DenoiseProgressMixin:
