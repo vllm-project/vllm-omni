@@ -1061,6 +1061,7 @@ class AsyncOmniEngine:
             "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
             "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
             "host_weight_runtime_root": kwargs.get("host_weight_runtime_root"),
+            "dlo_host_registration_limit_gib": kwargs.get("dlo_host_registration_limit_gib", 0.0),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"

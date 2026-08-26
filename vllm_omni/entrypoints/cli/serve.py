@@ -760,6 +760,16 @@ class OmniServeCommand(CLISubcommand):
                 "the same persistent path for population and serving."
             ),
         )
+        omni_config_group.add_argument(
+            "--dlo-host-registration-limit-gib",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
+                "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
+                "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

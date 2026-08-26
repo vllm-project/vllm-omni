@@ -181,7 +181,7 @@ def test_diffusion_output_dict_tensors_round_trip_through_shm() -> None:
 
 
 def test_diffusion_output_tuple_tensors_round_trip_through_shm() -> None:
-    # LTX2 / DreamID return (video, audio) tuples as DiffusionOutput.output.
+    # LTX2 returns (video, audio) tuples as DiffusionOutput.output.
     video = torch.arange(300_000, dtype=torch.float32)
     audio = torch.arange(300_000, dtype=torch.float32) * 3
     output = DiffusionOutput(output=(video, audio))

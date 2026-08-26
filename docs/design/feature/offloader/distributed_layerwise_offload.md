@@ -169,18 +169,42 @@ This mode means:
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
+### Component allocator-cache retention
+
+MiniMax-H3 DLO keeps one bounded PyTorch allocator cache across its staged
+encoder, DiT, and VAE component boundaries so allocations released by one
+component can be reused by the next. The DiT prefetch path and its two shared
+device buffers are unchanged.
+
+After a component is offloaded, cached-but-unallocated memory is retained only
+while it is at most 25% of device capacity and at least 5% of device capacity
+remains physically free. Crossing either bound releases the allocator cache.
+Missing allocator telemetry also releases it conservatively. Component or
+staging failure forces a release, and an out-of-memory allocation gets one
+retry after release. This is a component-local policy rather than a global
+`empty_cache` override, so the executor's unconditional shutdown cleanup is
+preserved.
+
+Retaining allocator blocks trades higher reserved and peak device memory for
+lower lifecycle latency. The benefit is device- and workload-dependent, and a
+smaller or externally loaded device may cross a bound and return to the
+ordinary per-component cache-release behavior. Current performance validation
+covers MiniMax-H3 no-AllGather DLO on CUDA. Other MiniMax-H3 DLO transfer
+topologies and platforms receive the same bounded policy but are not claimed
+performance targets; other DLO models remain unchanged unless they explicitly
+adopt it.
+
 ### Final-layout Host Weight Runtime consumer
 
-> **Status:** PR2 implementation. The representation-independent identity,
-> producer, and restoration contracts landed in
-> [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445); this consumer
-> wires the final-layout BF16 path into eligible no-AllGather DLO.
+> **Status:** PR2 landed in
+> [PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486). PR3 adds
+> registered direct H2D plus generic HWR publication/source-digest
+> optimizations without changing AllGather behavior.
 
 Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
 only to no-AllGather DLO. Enable it with
 `--host-weight-runtime-mode preferred` (or `required`) and
-`--host-weight-runtime-root <node-local-root>`. Registration of shared mappings
-and direct asynchronous H2D remain a separate PR3 transport change.
+`--host-weight-runtime-root <node-local-root>`.
 
 The modes express operator fallback policy, not different artifact formats:
 
@@ -228,6 +252,44 @@ outcomes are authoritative:
 
 Checkpoint mmap remains an unchanged control path whenever final-layout HWR is
 not selected.
+
+Local source identity and publication avoid repeated full-payload passes while
+preserving the same semantic contract:
+
+- Canonical files without a trusted immutable Hub blob identity are hashed in
+  parallel. Their content IDs are cached per storage domain under the HWR root
+  and reused only when the path, inode, size, timestamps, symlink target, and
+  cache-record checksum still match. Corrupt entries are rebuilt; cache-lock or
+  cache-I/O failure falls back to hashing the canonical file directly.
+- Producers that emit payload bytes in canonical storage-key order may declare
+  `ordered=True`. The filesystem writer then computes file and tensor SHA256
+  values during the write and overlaps payload `fsync` with later producer
+  work. Producers without that guarantee retain unordered writes and use a
+  parallel readback checksum fallback.
+- Manifest and `READY` publication still wait for every payload `fsync` and
+  checksum to complete. These optimizations do not weaken artifact validation
+  or change lease ownership.
+
+#### Registered mmap transport
+
+After DLO takes an HWR lease, the no-AllGather backend may register the lease's
+complete immutable mapped ranges under the existing `pin_cpu_memory` policy.
+Registration is transport state: it does not change artifact identity, the
+store, tensor ownership, or H2D payload. On success, each tensor view copies
+directly into the existing rotating HBM block buffers and the two private host
+staging slots are not allocated.
+
+`--dlo-host-registration-limit-gib` is an optional per-worker preflight ceiling
+over page-aligned registered bytes. Zero adds no ceiling. A disabled pinned
+memory policy, unsupported platform/capability, over-budget mapping, or fully
+rolled-back registration error selects the existing two-slot staging path. A
+partial registration that cannot be rolled back aborts startup because closing
+the lease would unmap memory still owned by the platform.
+
+Direct checkpoint mmap remains unchanged and continues to use staging. It may
+require loader-owned per-block transforms, while the HWR artifact already
+contains final runtime bytes. DLO AllGather never receives an HWR final-layout
+lease and therefore never enters this registration path.
 
 #### Pre-service transaction boundary
 
@@ -292,6 +354,7 @@ loader owns
   -> backend takes once before asynchronous work
   -> backend drains pending H2D work
   -> backend releases hooks, staging, and model references
+  -> backend unregisters every mapped range
   -> backend closes lease
 ```
 
@@ -301,13 +364,15 @@ it. Once the backend takes ownership, only backend abort or teardown may drain
 work and close it.
 
 The implementation keeps the final-layout lease through backend setup and
-initial prefetch. The backend uses the existing two bounded rank-local staging
-slots for the immutable HWR tensors, and its transactional `enable()` cleanup
-removes partial hooks and closes the lease before reporting a setup failure.
-Preferred mode then uses the runner's fresh canonical retry; required mode
-propagates the failure.
+initial prefetch. Successful registration copies directly from immutable HWR
+views; otherwise the backend uses the existing two bounded rank-local staging
+slots. Transactional cleanup drains device work, removes source references,
+unregisters mappings, and only then closes the lease. An unregistration failure
+retains both registration and lease for retry/process teardown. Preferred mode
+then uses the runner's fresh canonical retry; required mode propagates the
+failure.
 
-#### PR2 promotion gates
+#### PR2 and PR3 promotion gates
 
 - Warm hit performs zero ordinary DiT materialization and zero producer calls.
 - Shared warm finalization changes neither restored bytes nor backing pointers.
@@ -319,6 +384,10 @@ propagates the failure.
 - Disabled mode and AllGather emit zero final-layout HWR interaction.
 - The lease carrier rejects duplicate take and serialization.
 - Backend setup or prefetch failure drains asynchronous work before lease close.
+- Registration is all-or-nothing; rollback/unregistration failure never closes
+  a mapping still owned by the platform.
+- Registered HWR transport bypasses host staging while preserving output and
+  H2D payload; unsupported registration retains the bounded staging path.
 - Compatible checkpoint mmap remains an unchanged benchmark and control path.
 - Prewarm uses one matching producer cohort per TP/SP topology and storage
   domain.
@@ -369,11 +438,12 @@ reconstructs those tensors with their recorded layouts. Other online methods
 must use `--dlo-no-use-allgather` or disable online quantization until their
 runtime layouts are validated.
 
-The Host Weight Runtime representation and publication contracts are merged;
-see [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414) and
-[PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445). The planned
-no-AllGather consumer above is the PR2 implementation; registration and direct
-asynchronous H2D remain a separate transport follow-up.
+The Host Weight Runtime representation, publication, and no-AllGather consumer
+contracts are merged; see
+[RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414),
+[PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445), and
+[PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486). Registered
+direct H2D is an optional transport layer over that merged lease contract.
 
 ## Validation coverage
 
@@ -386,10 +456,16 @@ Current source-level validation includes:
 - ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
   sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
+- ordered publication hashing, overlapped durability, unordered parallel
+  checksum fallback, and node-local source-digest reuse/invalidation;
 - rank-local mmap source retention, bounded two-slot staging, and adapter
   transforms without parameter-side flags;
+- read-only registration preflight, direct source-to-device copies, safe
+  fallback, partial rollback, retryable unregistration, and lease ordering;
 - resident-layer requests requiring no-AllGather;
 - DP request-wave validation for denoising-step compatibility;
+- bounded component allocator-cache retention, conservative/forced release,
+  OOM retry, and immutable encoder non-block staging;
 - sharding, double-buffer, AllGather-size, and heterogeneous-block regression
   tests.
 

@@ -391,6 +391,7 @@ class StageDeployConfig:
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

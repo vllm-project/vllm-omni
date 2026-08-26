@@ -268,6 +268,7 @@ markers = [
     # specified computation resources marks (auto-added)
     # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
     "H100: [hardware-resource] Tests that require H100 GPU",
+    "H800: [hardware-resource] Tests that require H800 GPU",
     "H200: [hardware-resource] Tests that require H200 GPU",
     "L4: [hardware-resource] Tests that require L4 GPU",
     "B200: [hardware-resource] Tests that require B200 GPU",
