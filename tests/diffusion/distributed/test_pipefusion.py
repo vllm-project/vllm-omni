@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU unit tests for PipeFusion.
 
 These tests intentionally avoid real distributed process groups. GPU-backed
@@ -84,9 +84,25 @@ class TestPipeFusionRuntime:
 
         runtime.set_cache_key("inputs_uncond")
         assert runtime.cache_key == "inputs_uncond"
+        assert runtime.cache_identity == (None, 0, "inputs_uncond")
 
         with pytest.raises(ValueError, match="Invalid PipeFusion cache key"):
             runtime.set_cache_key("bad-key")
+
+    def test_request_context_validates_request_and_sequence(self):
+        runtime = PipeFusionRuntime()
+
+        runtime.set_request_context("req-a", 3)
+        assert runtime.cache_identity == ("req-a", 3, "inputs")
+
+        runtime.clear_request_context()
+        assert runtime.cache_identity == (None, 0, "inputs")
+
+        with pytest.raises(ValueError, match="request_id must be a non-empty string"):
+            runtime.set_request_context("", 0)
+
+        with pytest.raises(ValueError, match="sequence_id must be a non-negative integer"):
+            runtime.set_request_context("req-a", -1)
 
     def test_height_split_patch_metadata_and_recv_buffer_reset(self, monkeypatch):
         runtime = PipeFusionRuntime()
@@ -357,6 +373,84 @@ class TestPipeFusionTransformerHelpers:
 
         with pytest.raises(RuntimeError, match="Run at least one warmup step"):
             attention._pipefusion_update_kv_cache(torch.ones(1, 1, 1, 1), torch.ones(1, 1, 1, 1))
+
+    def test_kv_cache_isolated_by_request_sequence_and_cfg_branch(self, monkeypatch):
+        runtime = PipeFusionRuntime()
+        runtime.patch_mode = False
+        runtime.split_dim = "temporal"
+        runtime.num_pipeline_patch = 2
+        runtime.ppf = 2
+        runtime.pph = 1
+        runtime.ppw = 1
+        _set_patch_idx(runtime, 0)
+        monkeypatch.setattr(pf_transformer, "get_pipefusion_runtime", lambda: runtime)
+
+        attention = DummyAttention()
+        attention.pipefusion_reset_cache()
+
+        runtime.set_request_context("req-a", 0)
+        runtime.set_cache_key("inputs")
+        req_a_seq0_key = torch.full((1, 2, 1, 1), 10.0)
+        req_a_seq0_value = req_a_seq0_key + 100
+        attention._pipefusion_update_kv_cache(req_a_seq0_key.clone(), req_a_seq0_value.clone())
+
+        runtime.set_request_context("req-a", 1)
+        req_a_seq1_key = torch.full((1, 2, 1, 1), 20.0)
+        req_a_seq1_value = req_a_seq1_key + 100
+        attention._pipefusion_update_kv_cache(req_a_seq1_key.clone(), req_a_seq1_value.clone())
+
+        runtime.set_request_context("req-a", 0)
+        runtime.set_cache_key("inputs_uncond")
+        req_a_uncond_key = torch.full((1, 2, 1, 1), 30.0)
+        req_a_uncond_value = req_a_uncond_key + 100
+        attention._pipefusion_update_kv_cache(req_a_uncond_key.clone(), req_a_uncond_value.clone())
+
+        assert set(attention._kv_caches) == {
+            ("req-a", 0, "inputs"),
+            ("req-a", 1, "inputs"),
+            ("req-a", 0, "inputs_uncond"),
+        }
+
+        runtime.patch_mode = True
+        runtime.set_request_context("req-b", 0)
+        runtime.set_cache_key("inputs")
+        with pytest.raises(RuntimeError, match=r"\('req-b', 0, 'inputs'\)"):
+            attention._pipefusion_update_kv_cache(torch.ones(1, 1, 1, 1), torch.ones(1, 1, 1, 1))
+
+        runtime.set_request_context("req-a", 1)
+        updated_key, updated_value = attention._pipefusion_update_kv_cache(
+            torch.full((1, 1, 1, 1), 200.0),
+            torch.full((1, 1, 1, 1), 300.0),
+        )
+        expected_key = req_a_seq1_key.clone()
+        expected_value = req_a_seq1_value.clone()
+        expected_key.narrow(1, 0, 1).fill_(200.0)
+        expected_value.narrow(1, 0, 1).fill_(300.0)
+        torch.testing.assert_close(updated_key, expected_key)
+        torch.testing.assert_close(updated_value, expected_value)
+
+    def test_kv_cache_reset_can_target_one_request_sequence(self, monkeypatch):
+        runtime = PipeFusionRuntime()
+        monkeypatch.setattr(pf_transformer, "get_pipefusion_runtime", lambda: runtime)
+
+        attention = DummyAttention()
+        attention.pipefusion_reset_cache()
+        for request_id, sequence_id, branch in [
+            ("req-a", 0, "inputs"),
+            ("req-a", 0, "inputs_uncond"),
+            ("req-a", 1, "inputs"),
+            ("req-b", 0, "inputs"),
+        ]:
+            runtime.set_request_context(request_id, sequence_id)
+            runtime.set_cache_key(branch)
+            attention._pipefusion_update_kv_cache(torch.ones(1, 1, 1, 1), torch.ones(1, 1, 1, 1))
+
+        attention.pipefusion_reset_cache("req-a", 0)
+
+        assert set(attention._kv_caches) == {
+            ("req-a", 1, "inputs"),
+            ("req-b", 0, "inputs"),
+        }
 
     def test_unpatchify_uses_patch_local_height(self, monkeypatch):
         runtime = PipeFusionRuntime()
