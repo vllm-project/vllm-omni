@@ -44,6 +44,7 @@ from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeConfigError,
     ServingRuntimeSessionState,
     load_serving_runtime_adapter,
+    runtime_capabilities,
     validate_serving_runtime_adapter,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
@@ -912,8 +913,10 @@ class OmniDuplexSessionHandler(
         session = self._registry.create(config=config, session_id=session_id)
         if use_native_runtime:
             session.replace_capabilities(
-                self._serving_runtime_adapter.capabilities(
+                runtime_capabilities(
+                    self._serving_runtime_adapter,
                     max_sessions=self._duplex_session_config.max_sessions,
+                    runtime_config=runtime_config,
                 )
             )
             session.replace_runtime_config(runtime_config)

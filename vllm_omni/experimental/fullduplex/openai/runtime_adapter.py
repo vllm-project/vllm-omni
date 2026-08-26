@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
 from importlib import import_module
 from typing import Any, Protocol
@@ -133,7 +134,11 @@ class ServingRuntimeAdapter(Protocol):
 
     def is_enabled(self, config: object) -> bool: ...
 
-    def capabilities(self, *, max_sessions: int) -> object: ...
+    def capabilities(
+        self,
+        *,
+        max_sessions: int,
+    ) -> object: ...
 
     def validate_client_extra_body(self, extra_body: object) -> None: ...
 
@@ -170,6 +175,40 @@ def load_serving_runtime_adapter(
     return validate_serving_runtime_adapter(adapter_type(encode_audio))
 
 
+_RUNTIME_CAPABILITIES_HOOK = "capabilities_with_runtime_config_v1"
+
+
+def runtime_capabilities(
+    adapter: ServingRuntimeAdapter,
+    *,
+    max_sessions: int,
+    runtime_config: Mapping[str, object],
+) -> object:
+    """Return adapter capabilities without widening the legacy call contract."""
+    hook = getattr(adapter, _RUNTIME_CAPABILITIES_HOOK, None)
+    if hook is None:
+        return adapter.capabilities(max_sessions=max_sessions)
+    if not callable(hook):
+        raise TypeError(f"Duplex serving runtime adapter {_RUNTIME_CAPABILITIES_HOOK} must be callable")
+    return hook(max_sessions=max_sessions, runtime_config=runtime_config)
+
+
+def _validate_runtime_capabilities_hook(adapter: object) -> None:
+    hook = getattr(adapter, _RUNTIME_CAPABILITIES_HOOK, None)
+    if hook is None:
+        return
+    if not callable(hook):
+        raise TypeError(f"Duplex serving runtime adapter {_RUNTIME_CAPABILITIES_HOOK} must be callable")
+    try:
+        inspect.signature(hook).bind(max_sessions=1, runtime_config={})
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "Duplex serving runtime adapter "
+            f"{_RUNTIME_CAPABILITIES_HOOK} must accept keyword arguments "
+            "max_sessions and runtime_config"
+        ) from exc
+
+
 def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
     required_methods = (
         "create_session_state",
@@ -185,6 +224,7 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
     missing = [name for name in required_methods if not callable(getattr(adapter, name, None))]
     if missing:
         raise TypeError(f"Duplex serving runtime adapter is missing callable method(s): {', '.join(missing)}")
+    _validate_runtime_capabilities_hook(adapter)
     if not isinstance(getattr(adapter, "adapter_id", None), str) or not adapter.adapter_id:
         raise TypeError("Duplex serving runtime adapter must declare adapter_id")
     if not isinstance(getattr(adapter, "session_states", None), MutableMapping):

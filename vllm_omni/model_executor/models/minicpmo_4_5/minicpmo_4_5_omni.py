@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
@@ -350,6 +351,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
+            helper._apply_streaming_runtime_config(state, runtime_config)
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
 
@@ -378,6 +380,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
         )
+        audio_encoder_cuda_timings = result.pop("_audio_encoder_cuda_timings", None)
+        request_id = kwargs.get("request_id")
+        if isinstance(request_id, str) and audio_encoder_cuda_timings:
+            pending = getattr(self, "_minicpmo45_pending_audio_encoder_timings", None)
+            if not isinstance(pending, dict):
+                pending = {}
+                self._minicpmo45_pending_audio_encoder_timings = pending
+            pending.setdefault(request_id, []).extend(audio_encoder_cuda_timings)
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
@@ -607,6 +617,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         ]
                         for key in sorted(special_keys)
                     }
+
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -624,6 +635,57 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
+
+    def flush_pending_metadata(self, req_ids: list[str]) -> dict[str, object] | None:
+        pending = getattr(self, "_minicpmo45_pending_audio_encoder_timings", None)
+        if self.model_stage != "llm":
+            return None
+
+        timing_rows = [pending.pop(str(req_id), None) if isinstance(pending, dict) else None for req_id in req_ids]
+        has_timing_rows = [timings is not None for timings in timing_rows]
+        if not any(has_timing_rows):
+            return None
+
+        # Synchronizing the last encoder event waits only for the measured
+        # encoder work. The subsequent LLM forward has already been enqueued on
+        # the same stream, so this does not add a device-wide synchronization.
+        for timings in timing_rows:
+            if timings:
+                timings[-1][1].synchronize()
+
+        local_latency_ms: list[float] = []
+        for timings in timing_rows:
+            if not timings:
+                local_latency_ms.append(0.0)
+                continue
+            local_latency_ms.append(sum(float(start.elapsed_time(end)) for start, end in timings))
+
+        # Every TP rank reduces the same request rows. A zero preserves a rank
+        # without local events while MAX reports the encoder critical path.
+        latency_ms = self._max_reduce_audio_encoder_latency_ms(local_latency_ms)
+        latency_rows = [
+            torch.tensor([value], dtype=torch.float64) if has_timings else None
+            for value, has_timings in zip(latency_ms, has_timing_rows, strict=True)
+        ]
+        return {"meta": {"audio_encoder_latency_ms": latency_rows}}
+
+    @staticmethod
+    def _max_reduce_audio_encoder_latency_ms(local_latency_ms: list[float]) -> list[float]:
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return local_latency_ms
+
+        latency_tensor = torch.tensor(
+            local_latency_ms,
+            dtype=torch.float64,
+            device=current_omni_platform.get_torch_device(),
+        )
+        torch.distributed.all_reduce(
+            latency_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=tp_group.device_group,
+        )
+        return latency_tensor.cpu().tolist()
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
@@ -647,6 +709,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 session_key = request_sessions.pop(request_id, None)
                 if session_key is not None and isinstance(sessions, dict):
                     sessions.pop(session_key, None)
+        pending_timings = getattr(self, "_minicpmo45_pending_audio_encoder_timings", None)
+        if isinstance(pending_timings, dict):
+            for request_id in finished_req_ids:
+                pending_timings.pop(request_id, None)
         forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
         if isinstance(forced_segments, set):
             finished = set(finished_req_ids)

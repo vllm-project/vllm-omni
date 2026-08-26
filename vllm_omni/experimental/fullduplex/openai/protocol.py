@@ -97,7 +97,14 @@ class DuplexCapabilities:
     target_barge_in_latency_ms: int | None = 1000
 
     @classmethod
-    def minicpmo45_native(cls, *, max_sessions: int = 1) -> DuplexCapabilities:
+    def minicpmo45_native(
+        cls,
+        *,
+        max_sessions: int = 1,
+        chunk_period_ms: int = 1000,
+    ) -> DuplexCapabilities:
+        if chunk_period_ms <= 0:
+            raise ValueError("MiniCPM-o native chunk_period_ms must be positive")
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
@@ -128,7 +135,7 @@ class DuplexCapabilities:
             input_modes=["append_audio_chunk"],
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
-            chunk_period_ms=1000,
+            chunk_period_ms=chunk_period_ms,
             target_barge_in_latency_ms=None,
         )
 

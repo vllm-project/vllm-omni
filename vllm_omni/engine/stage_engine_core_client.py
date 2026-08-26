@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import os
 import socket
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -48,7 +49,10 @@ def _default_process_engine_inputs(
     if not isinstance(prompt, list):
         prompt = [prompt]
 
-    mm_data = {so.request_id: p.get("multi_modal_data") for so, p in zip(source_outputs, prompt)}
+    mm_data = {
+        source_output.request_id: prompt_item.get("multi_modal_data") if isinstance(prompt_item, Mapping) else None
+        for source_output, prompt_item in zip(source_outputs, prompt)
+    }
 
     return [
         OmniTokensPrompt(

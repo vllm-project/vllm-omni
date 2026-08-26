@@ -23,6 +23,8 @@ class _MiniCPMO45Stage0SessionState:
     streaming_processor: Any | None = None
     audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     audio_chunk_idx: int = 0
+    streaming_audio_chunk_ms: int | None = None
+    streaming_audio_first_chunk_ms: int | None = None
     context_embeds: list[Any] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
@@ -65,6 +67,44 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _stage_runtime_ready(self) -> bool:
         return self.processor is not None and self.tokenizer is not None and self.thinker is not None
 
+    @staticmethod
+    def _apply_streaming_runtime_config(
+        state: _MiniCPMO45Stage0SessionState,
+        runtime_config: dict[str, Any],
+    ) -> None:
+        def positive_int(key: str, default: int) -> int:
+            try:
+                value = int(runtime_config.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return value if value > 0 else default
+
+        chunk_ms = positive_int(
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_MS,
+            MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_CHUNK_MS,
+        )
+        first_chunk_ms = positive_int(
+            MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_FIRST_CHUNK_MS,
+            chunk_ms + MiniCPMO45DuplexPolicy.FIRST_CHUNK_ALIGNMENT_MS,
+        )
+        state.streaming_audio_chunk_ms = chunk_ms
+        state.streaming_audio_first_chunk_ms = max(chunk_ms, first_chunk_ms)
+
+    def _session_chunk_ms(self, state: _MiniCPMO45Stage0SessionState | None) -> int:
+        if state is not None and state.streaming_audio_chunk_ms is not None:
+            return state.streaming_audio_chunk_ms
+        return int(self._stage_param("chunk_ms", MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_CHUNK_MS))
+
+    def _session_first_chunk_ms(self, state: _MiniCPMO45Stage0SessionState | None) -> int:
+        if state is not None and state.streaming_audio_first_chunk_ms is not None:
+            return state.streaming_audio_first_chunk_ms
+        return int(
+            self._stage_param(
+                "first_chunk_ms",
+                MiniCPMO45DuplexPolicy.DEFAULT_STREAMING_AUDIO_FIRST_CHUNK_MS,
+            )
+        )
+
     def _configure_streaming_processor(
         self,
         state: _MiniCPMO45Stage0SessionState | None = None,
@@ -86,8 +126,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         if callable(set_streaming_mode):
             set_streaming_mode(
                 mode="exact",
-                chunk_ms=int(self._stage_param("chunk_ms", 1000)),
-                first_chunk_ms=int(self._stage_param("first_chunk_ms", 1035)),
+                chunk_ms=self._session_chunk_ms(state),
+                first_chunk_ms=self._session_first_chunk_ms(state),
                 cnn_redundancy_ms=int(self._stage_param("cnn_redundancy_ms", 20)),
                 enable_sliding_window=True,
                 slide_trigger_seconds=30.0,
@@ -102,7 +142,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         configure_streaming = getattr(processor, "configure_streaming", None)
         if callable(configure_streaming):
             configure_streaming(
-                chunk_ms=int(self._stage_param("chunk_ms", 1000)),
+                chunk_ms=self._session_chunk_ms(state),
                 enable_sliding_window=True,
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
@@ -185,7 +225,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             if frame_blocks is None or len(frame_blocks) != len(video_frames):
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
-        chunk_size = self._streaming_chunk_size(processor)
+        chunk_size = self._streaming_chunk_size(processor, state=state)
         self._pad_first_audio_chunk_if_needed(state, processor)
         if len(state.audio_buffer) < chunk_size:
             return self._stage_prefill_result(
@@ -206,6 +246,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # pad again here: the first processor chunk is hop-aligned below 1035ms
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
+        audio_encoder_cuda_timings: list[tuple[Any, Any]] = []
         while True:
             if len(state.audio_buffer) < chunk_size:
                 break
@@ -219,15 +260,21 @@ class MiniCPMO45Stage0DuplexRuntime:
             ):
                 with suppress(Exception):
                     setattr(batch_feature, name, value)
+            audio_encoder_timing = self._start_cuda_timing()
             audio_embeds = self._stage_audio_embeddings(batch_feature, state=state)
+            if audio_encoder_timing is not None:
+                audio_encoder_timing[1].record()
             if audio_embeds is None:
                 if units_built == 0:
                     return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
                 break
+            if audio_encoder_timing is not None:
+                audio_encoder_cuda_timings.append(audio_encoder_timing)
             consumed_samples = self._consumed_audio_samples(
                 state.audio_chunk_idx,
                 chunk_size,
                 processor=processor,
+                state=state,
             )
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
@@ -263,7 +310,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
-            chunk_size = self._streaming_chunk_size(processor)
+            chunk_size = self._streaming_chunk_size(processor, state=state)
         if frame_blocks:
             # Each frame reserves one image block in the append plan. A frame
             # without a matching audio unit would desynchronize that plan.
@@ -294,6 +341,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runtime_impl": "scheduler_data_plane",
             }
         )
+        if audio_encoder_cuda_timings:
+            # The model wrapper consumes these events after the current forward.
+            # They never enter the request buffer or wire payload.
+            result["_audio_encoder_cuda_timings"] = audio_encoder_cuda_timings
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
@@ -301,8 +352,28 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
-            state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
+            state.prepared_result = {
+                k: v
+                for k, v in result.items()
+                if k not in {"inputs_embeds", "input_token_ids", "_audio_encoder_cuda_timings"}
+            }
         return result
+
+    def _start_cuda_timing(self) -> tuple[Any, Any] | None:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        try:
+            model_device = torch.device(self._model_device())
+        except (AttributeError, RuntimeError, TypeError):
+            return None
+        if model_device.type != "cuda":
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start, end
 
     @staticmethod
     def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, Any]:
@@ -357,12 +428,17 @@ class MiniCPMO45Stage0DuplexRuntime:
             pass
         return self.device
 
-    def _streaming_chunk_size(self, processor: Any | None = None) -> int:
+    def _streaming_chunk_size(
+        self,
+        processor: Any | None = None,
+        *,
+        state: _MiniCPMO45Stage0SessionState | None = None,
+    ) -> int:
         processor = processor or self.processor
         get_chunk = getattr(processor, "get_streaming_chunk_size", None)
         if callable(get_chunk):
             return int(get_chunk())
-        return 16000
+        return max(1, self._session_chunk_ms(state) * self._sample_rate(processor) // 1000)
 
     def _sample_rate(self, processor: Any | None = None) -> int:
         processor = processor or self.processor
@@ -373,11 +449,17 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
         )
 
-    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:
+    def _first_chunk_samples(
+        self,
+        default_chunk_size: int,
+        processor: Any | None = None,
+        *,
+        state: _MiniCPMO45Stage0SessionState | None = None,
+    ) -> int:
         processor = processor or self.processor
         if getattr(processor, "_streaming_mel_processor", None) is None:
             return default_chunk_size
-        return int(self._stage_param("first_chunk_ms", 1035) * self._sample_rate(processor) / 1000)
+        return self._session_first_chunk_ms(state) * self._sample_rate(processor) // 1000
 
     def _pad_first_audio_chunk_if_needed(
         self,
@@ -387,8 +469,9 @@ class MiniCPMO45Stage0DuplexRuntime:
         if state.audio_chunk_idx != 0 or len(state.audio_buffer) == 0:
             return
         first_chunk_samples = self._first_chunk_samples(
-            self._streaming_chunk_size(processor),
+            self._streaming_chunk_size(processor, state=state),
             processor,
+            state=state,
         )
         if len(state.audio_buffer) >= first_chunk_samples:
             return
@@ -411,17 +494,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         default_chunk_size: int,
         *,
         processor: Any | None = None,
+        state: _MiniCPMO45Stage0SessionState | None = None,
     ) -> int:
         processor = processor or self.processor
         if chunk_idx != 0:
-            chunk_ms = int(self._stage_param("chunk_ms", 1000))
+            chunk_ms = self._session_chunk_ms(state)
             return int(chunk_ms * self._sample_rate(processor) / 1000)
         mel_processor = getattr(processor, "_streaming_mel_processor", None)
         get_config = getattr(mel_processor, "get_config", None)
         if callable(get_config):
             cfg = get_config()
             if isinstance(cfg, dict):
-                consumed_ms = int(cfg.get("effective_first_chunk_ms", self._stage_param("first_chunk_ms", 1035)))
+                consumed_ms = int(cfg.get("effective_first_chunk_ms", self._session_first_chunk_ms(state)))
                 return int(consumed_ms * self._sample_rate(processor) / 1000)
         return default_chunk_size
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as BinasciiError
+from collections.abc import Mapping
 from typing import Any
 
 from vllm.sampling_params import SamplingParams
@@ -16,9 +17,10 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputDecision,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
-_DUPLEX_CHUNK_SAMPLES = 16000
-_DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
+_DUPLEX_CHUNK_SAMPLES = MiniCPMO45DuplexPolicy.CHUNK_SAMPLES
+_DUPLEX_SAMPLES_PER_AUDIO_TOKEN = MiniCPMO45DuplexPolicy.SAMPLES_PER_AUDIO_TOKEN
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
 # matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
 _DUPLEX_VISION_TOKENS_PER_FRAME = 66
@@ -46,27 +48,48 @@ def _duplex_pcm_sample_count(payload: object) -> int | None:
     return len(raw) // 4
 
 
-def duplex_payload_is_exact_chunks(payload: object) -> bool:
-    sample_count = _duplex_pcm_sample_count(payload)
-    return bool(sample_count) and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
+def _duplex_runtime_chunk_samples(runtime_config: object) -> int:
+    value = None
+    if isinstance(runtime_config, dict):
+        value = runtime_config.get(MiniCPMO45DuplexPolicy.RUNTIME_STREAMING_AUDIO_CHUNK_SAMPLES)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return _DUPLEX_CHUNK_SAMPLES
+    return parsed if parsed > 0 else _DUPLEX_CHUNK_SAMPLES
 
 
-def duplex_first_append_unit_count(payload: object) -> int | None:
+def duplex_payload_is_exact_chunks(payload: object, *, chunk_samples: int = _DUPLEX_CHUNK_SAMPLES) -> bool:
     sample_count = _duplex_pcm_sample_count(payload)
-    if not sample_count or sample_count % _DUPLEX_CHUNK_SAMPLES != 0:
+    return bool(sample_count) and sample_count % chunk_samples == 0
+
+
+def duplex_first_append_unit_count(
+    payload: object,
+    *,
+    chunk_samples: int = _DUPLEX_CHUNK_SAMPLES,
+) -> int | None:
+    sample_count = _duplex_pcm_sample_count(payload)
+    if not sample_count or sample_count % chunk_samples != 0:
         return None
-    return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
+    return max(1, sample_count // chunk_samples - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
+def duplex_scheduler_token_budget(
+    payload: object,
+    *,
+    default: int = 64,
+    chunk_samples: int = _DUPLEX_CHUNK_SAMPLES,
+) -> int:
     vision_tokens = _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
         return max(1, int(default)) + vision_tokens
     sample_count = max(1, sample_count)
-    if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
-        units = sample_count // _DUPLEX_CHUNK_SAMPLES
-        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN) + vision_tokens
+    if sample_count % chunk_samples == 0:
+        units = sample_count // chunk_samples
+        tokens_per_unit = 2 + chunk_samples // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN
+        return units * tokens_per_unit + vision_tokens
     return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
 
 
@@ -108,19 +131,24 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, Any]:
-    token_budget = duplex_scheduler_token_budget(payload)
+    chunk_samples = _duplex_runtime_chunk_samples(runtime_config)
+    tokens_per_unit = 2 + chunk_samples // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN
+    token_budget = duplex_scheduler_token_budget(payload, chunk_samples=chunk_samples)
     if seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
-        first_units = duplex_first_append_unit_count(payload)
+        first_units = duplex_first_append_unit_count(payload, chunk_samples=chunk_samples)
         if first_units is not None:
             token_budget = (
-                context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
+                context_reserve
+                + first_units * tokens_per_unit
+                - 1
+                + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
             )
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+    if seq > 1 and duplex_payload_is_exact_chunks(payload, chunk_samples=chunk_samples):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
-        token_budget += 12
+    if final and duplex_payload_is_exact_chunks(payload, chunk_samples=chunk_samples):
+        token_budget += tokens_per_unit
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -177,6 +205,25 @@ def _coerce_int(value: object) -> int | None:
         return None
 
 
+def _coerce_float(value: object) -> float | None:
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[-1]
+    if hasattr(value, "detach"):
+        try:
+            value = value.detach().cpu().reshape(-1)
+            if value.numel() == 0:
+                return None
+            value = value[-1].item()
+        except Exception:  # noqa: BLE001 - optional tensor metadata
+            return None
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _coerce_int_list(value: object) -> list[int]:
     if value is None:
         return []
@@ -197,13 +244,13 @@ def _first_completion(output: object) -> object | None:
 
 def _multimodal_output(output: object, completion: object | None) -> dict[str, Any]:
     metadata = getattr(output, "multimodal_output", None)
-    if isinstance(metadata, dict):
-        return metadata
+    if isinstance(metadata, Mapping):
+        return dict(metadata)
     metadata = getattr(completion, "multimodal_output", None) if completion is not None else None
-    return metadata if isinstance(metadata, dict) else {}
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
-def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
+def _special_token_ids(metadata: Mapping[str, Any]) -> dict[str, int]:
     sources: list[object] = [metadata.get("special_token_ids"), metadata.get("meta")]
     sources.append(
         {
@@ -214,13 +261,23 @@ def _special_token_ids(metadata: dict[str, Any]) -> dict[str, int]:
     )
     token_ids: dict[str, int] = {}
     for source in sources:
-        if not isinstance(source, dict):
+        if not isinstance(source, Mapping):
             continue
         for key, value in source.items():
+            if not isinstance(key, str) or not key.endswith("_token_id"):
+                continue
             token_id = _coerce_int(value)
-            if isinstance(key, str) and token_id is not None and token_id >= 0:
+            if token_id is not None and token_id >= 0:
                 token_ids[key] = token_id
     return token_ids
+
+
+def _audio_encoder_latency_ms(metadata: Mapping[str, Any]) -> float | None:
+    nested_meta = metadata.get("meta")
+    raw_latency = nested_meta.get("audio_encoder_latency_ms") if isinstance(nested_meta, Mapping) else None
+    if raw_latency is None:
+        raw_latency = metadata.get("meta.audio_encoder_latency_ms")
+    return _coerce_float(raw_latency)
 
 
 def _completion_token_ids(completion: object | None) -> list[int]:
@@ -311,7 +368,11 @@ class MiniCPMO45DuplexRuntimeExtension:
         segment_output_metadata: dict[str, Any],
         output: object,
     ) -> DuplexOutputDecision | None:
-        if stage_id >= final_stage_id or not segment_finished:
+        # A final append can finish the resumable request without preserving an
+        # ``is_segment_finished`` marker in the processed output. Its sampled
+        # listen token is still a Stage-0 control result and must not enter the
+        # text-to-codec stages.
+        if stage_id >= final_stage_id or not (segment_finished or bool(getattr(output, "finished", False))):
             return None
 
         completion = _first_completion(output)
@@ -328,6 +389,12 @@ class MiniCPMO45DuplexRuntimeExtension:
             return None
 
         metadata = dict(output_metadata)
+        audio_encoder_latency_ms = _audio_encoder_latency_ms(output_metadata)
+        if audio_encoder_latency_ms is None:
+            audio_encoder_latency_ms = _audio_encoder_latency_ms(segment_output_metadata)
+        if audio_encoder_latency_ms is not None:
+            metadata["audio_encoder_latency_ms"] = audio_encoder_latency_ms
+            metadata.pop("meta.audio_encoder_latency_ms", None)
         for key, value in special_token_ids.items():
             metadata.setdefault(f"meta.{key}", value)
         metadata.update(
