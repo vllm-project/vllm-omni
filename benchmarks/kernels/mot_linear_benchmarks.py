@@ -441,26 +441,29 @@ def benchmark_config(
     B_text_scale: torch.Tensor | None = None
     B_vae_scale: torch.Tensor | None = None
 
+    # NOTE: B is allocated as (N, K) row-major then transposed, to keep the
+    # same K-contiguous layout as the model side (MoT layers pass weight.t()
+    # to the kernel). Kernel performance is sensitive to this layout.
     if use_fp8_w8a8:
         fp8_dtype = current_platform.fp8_dtype()
         A = torch.randn(M, K, dtype=torch.float16, device="cuda").to(fp8_dtype)
-        B_text = torch.randn(K, N, dtype=torch.float16, device="cuda").to(fp8_dtype)
-        B_vae = torch.randn(K, N, dtype=torch.float16, device="cuda").to(fp8_dtype)
+        B_text = torch.randn(N, K, dtype=torch.float16, device="cuda").to(fp8_dtype).t()
+        B_vae = torch.randn(N, K, dtype=torch.float16, device="cuda").to(fp8_dtype).t()
         A_scale = torch.ones(M, dtype=torch.float32, device="cuda")
         B_text_scale = torch.ones(1, dtype=torch.float32, device="cuda")
         B_vae_scale = torch.ones(1, dtype=torch.float32, device="cuda")
         C = torch.empty(M, N, dtype=dtype, device="cuda")
     elif use_int8_w8a16:
         A = torch.randn(M, K, dtype=dtype, device="cuda")
-        B_text = torch.randint(-127, 127, (K, N), dtype=torch.int8, device="cuda")
-        B_vae = torch.randint(-127, 127, (K, N), dtype=torch.int8, device="cuda")
+        B_text = torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda").t()
+        B_vae = torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda").t()
         B_text_scale = torch.ones(N, dtype=torch.float32, device="cuda")
         B_vae_scale = torch.ones(N, dtype=torch.float32, device="cuda")
         C = torch.empty(M, N, dtype=dtype, device="cuda")
     else:
         A = torch.randn(M, K, dtype=dtype, device="cuda")
-        B_text = torch.randn(K, N, dtype=dtype, device="cuda")
-        B_vae = torch.randn(K, N, dtype=dtype, device="cuda")
+        B_text = torch.randn(N, K, dtype=dtype, device="cuda").t()
+        B_vae = torch.randn(N, K, dtype=dtype, device="cuda").t()
         C = torch.empty(M, N, dtype=dtype, device="cuda")
 
     def run():
@@ -549,6 +552,7 @@ class BenchmarkWorker:
         K: int,
         N: int,
         dtype: torch.dtype,
+        dtype_str: str,
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
     ) -> tuple[dict[str, int], float]:
@@ -558,7 +562,10 @@ class BenchmarkWorker:
         )
 
         M = get_exact_m(image_num, VAE_CHUNK_SIZE)
-        loaded_m_key, config = get_best_mot_config(M, N, K)
+        # dtype_str is the CLI --dtype value; it selects the per-dtype config
+        # file (device_name=...,dtype=<dtype_str>.json), so benchmark-only mode
+        # measures the config tuned for the dtype actually being benchmarked.
+        loaded_m_key, config = get_best_mot_config(M, N, K, dtype_str=dtype_str)
         if loaded_m_key == -1:
             print(
                 "  [config] WARNING: No tuned config found — "
@@ -938,6 +945,7 @@ def main(args: argparse.Namespace):
                         shape.K,
                         shape.N,
                         dtype,
+                        dtype_str,
                         use_fp8_w8a8,
                         use_int8_w8a16,
                     )
