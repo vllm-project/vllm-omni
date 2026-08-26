@@ -11,7 +11,15 @@ from typing import Any
 import pybase64 as base64
 import requests
 
-from benchmarks.accuracy.common import build_openai_url
+
+def _build_openai_url(base_url: str, api_path: str) -> str:
+    base = base_url.rstrip("/")
+    normalized_path = api_path if api_path.startswith("/") else f"/{api_path}"
+    if base.endswith(normalized_path):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}{normalized_path}"
+    return f"{base}/v1{normalized_path}"
 
 
 class DuplexJudge:
@@ -21,7 +29,7 @@ class DuplexJudge:
     def chat(self, content: Any, *, system: str | None = None, max_tokens: int = 1200) -> str:
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
         response = requests.post(
-            build_openai_url(self.base_url, "/chat/completions"),
+            _build_openai_url(self.base_url, "/chat/completions"),
             json={
                 "model": self.model,
                 "messages": messages,

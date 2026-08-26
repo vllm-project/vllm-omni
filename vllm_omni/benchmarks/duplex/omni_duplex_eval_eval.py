@@ -12,7 +12,7 @@ from typing import Any
 from .omni_duplex_eval_clock import normalize_response_items, validate_clock
 from .omni_duplex_eval_dataset import DuplexSample
 from .omni_duplex_eval_judge import DuplexJudge
-from .omni_duplex_eval_media import extract_jpeg, video_duration
+from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
 from .omni_duplex_eval_metrics import (
     PROTOCOL_PIN,
     build_content_prompt,
@@ -64,29 +64,57 @@ def evaluate_sample(
         "task_type": sample.task_type,
         "protocol_pin": PROTOCOL_PIN,
         "response_meta": meta,
+        "judge_model": getattr(judge, "model", None),
+        "judge_video_mode": judge_video_mode,
     }
     if sample.family == "rtd":
-        duration = sample.video_duration or (video_duration(sample.video) if sample.video else 0.0)
+        video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
+        duration = sample.video_duration or video_duration(video_path)
         temporal_rows = []
         for item in items:
             window = temporal_window(item["start"], item["end"], duration)
             if not window:
                 temporal_rows.append(
-                    {**item, "error": "No valid temporal window", "temporal_score": 0, "is_relevant": 0}
+                    {
+                        **item,
+                        "sentence_start": item["start"],
+                        "sentence_end": item["end"],
+                        "sentence_duration": max(0.0, item["end"] - item["start"]),
+                        "error": "No valid temporal window",
+                        "temporal_score": 0,
+                        "is_relevant": 0,
+                    }
                 )
                 continue
-            frames = [extract_jpeg(sample.video, timestamp=t) for t in _times(*window, fps=judge_fps)]
+            frames = [extract_jpeg(video_path, timestamp=t) for t in _times(*window, fps=judge_fps)]
             parsed = parse_judge_json(
                 judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames)
             )
-            temporal_rows.append({**item, "window_start": window[0], "window_end": window[1], **parsed})
+            temporal_rows.append(
+                {
+                    **item,
+                    "sentence_start": item["start"],
+                    "sentence_end": item["end"],
+                    "sentence_duration": max(0.0, item["end"] - item["start"]),
+                    "window_start": window[0],
+                    "window_end": window[1],
+                    "error": None,
+                    **parsed,
+                }
+            )
+        content_frames = None
+        if judge_video_mode == "frame-sample":
+            content_frames = [extract_jpeg(video_path, timestamp=t) for t in _content_frame_times(duration)]
         content = parse_judge_json(
             judge.content(
                 build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
-                sample.video,
+                video_path,
+                frames=content_frames,
                 mode=judge_video_mode,
             )
         )
+        if content_frames is not None:
+            content["frame_count"] = len(content_frames)
         result.update(
             {
                 "temporal": {"sentences": temporal_rows, "summary": summarize_temporal_results(temporal_rows)},
@@ -94,7 +122,9 @@ def evaluate_sample(
             }
         )
     else:
-        task = sample.task_type or "proactive_reminder"
+        if sample.task_type is None:
+            raise ValueError(f"missing proactive-reminder task type for split {sample.split!r}")
+        task = sample.task_type
         times = _reminder_times(sample)
         event_rows = []
         if task == "correction" or not times:
@@ -129,6 +159,18 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     return (
         [start + (end - start) / 2] if count == 1 else [start + i * (end - start) / (count - 1) for i in range(count)]
     )
+
+
+def _content_frame_times(duration: float) -> list[float]:
+    """Sample the full video at approximately one frame every three seconds."""
+    if duration <= 0:
+        return []
+    times = []
+    timestamp = 0.0
+    while timestamp < duration:
+        times.append(min(timestamp, max(0.0, duration - 0.01)))
+        timestamp += 3.0
+    return times
 
 
 def _reminder_times(sample: DuplexSample) -> list[float]:

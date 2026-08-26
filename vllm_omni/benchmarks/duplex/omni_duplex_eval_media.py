@@ -9,6 +9,7 @@ import subprocess
 import wave
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
 
@@ -16,6 +17,24 @@ from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM
 def _run_ffmpeg(args: list[str]) -> bytes:
     result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", *args], capture_output=True, check=True)
     return result.stdout
+
+
+def materialize_media(value: Any, output_dir: str | Path, stem: str, suffix: str) -> Path:
+    """Resolve common Hugging Face media values to a local file."""
+    if isinstance(value, str | Path):
+        return Path(value)
+    path = value.get("path") if isinstance(value, dict) else getattr(value, "path", None)
+    if path:
+        return Path(path)
+    payload = value.get("bytes") if isinstance(value, dict) else None
+    if payload is None and isinstance(value, bytes | bytearray):
+        payload = value
+    if payload is None:
+        raise ValueError(f"cannot materialize media value for {stem!r}")
+    destination = Path(output_dir) / f"{stem}{suffix}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(bytes(payload))
+    return destination
 
 
 def video_duration(path: str | Path) -> float:
@@ -65,14 +84,17 @@ def iter_jpegs(
 def read_audio_pcm16(path: str | Path) -> bytes:
     source = Path(path)
     if source.suffix.lower() == ".wav":
-        with wave.open(str(source), "rb") as wav_file:
-            if (
-                wav_file.getnchannels() != 1
-                or wav_file.getsampwidth() != 2
-                or wav_file.getframerate() != PCM16_SAMPLE_RATE
-            ):
-                raise ValueError("question_audio WAV must be mono PCM16 at 16 kHz")
-            return wav_file.readframes(wav_file.getnframes())
+        try:
+            with wave.open(str(source), "rb") as wav_file:
+                if (
+                    wav_file.getnchannels() == 1
+                    and wav_file.getsampwidth() == 2
+                    and wav_file.getframerate() == PCM16_SAMPLE_RATE
+                    and wav_file.getcomptype() == "NONE"
+                ):
+                    return wav_file.readframes(wav_file.getnframes())
+        except wave.Error:
+            pass
     return _run_ffmpeg(["-i", str(source), "-f", "s16le", "-ac", "1", "-ar", str(PCM16_SAMPLE_RATE), "pipe:1"])
 
 

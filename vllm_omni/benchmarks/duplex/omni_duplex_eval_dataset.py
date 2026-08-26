@@ -46,6 +46,18 @@ def canonical_task_type(value: str) -> str:
     return _TASK_ALIASES[key]
 
 
+def task_type_for_split(split: str) -> str:
+    """Match the task routing used by the official HF batch evaluator."""
+    key = str(split).strip().lower()
+    if "correction" in key:
+        return "correction"
+    if "post_event" in key:
+        return "post_event_reminder"
+    if key.startswith("pr"):
+        return "proactive_reminder"
+    raise ValueError(f"cannot infer proactive-reminder task from split {split!r}")
+
+
 def family_for_split(split: str, task_type: str | None = None) -> str:
     if split in RTD_SPLITS or str(split).upper().startswith("RTD"):
         return "rtd"
@@ -93,8 +105,8 @@ class DuplexSample:
         task_value = _value(row, "task_type", "task", "type")
         family = str(_value(row, "family", default="") or family_for_split(chosen_split, task_value))
         task = None
-        if family == "pr" and task_value:
-            task = canonical_task_type(str(task_value))
+        if family == "pr":
+            task = canonical_task_type(str(task_value)) if task_value else task_type_for_split(chosen_split)
         sample_id = str(_value(row, "id", "sample_id", "uid", "name", default=""))
         video = _value(row, "video", "video_path", "video_file")
         audio = _value(row, "question_audio", "audio", "question_wav")

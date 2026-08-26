@@ -41,6 +41,8 @@ def split_text(text: str) -> list[str]:
 
 def extract_timed_sentences(events: Iterable[dict[str, Any]], *, clock: str = "media") -> list[TimedSentence]:
     """Split output deltas while anchoring text to input ``audio_end_ms``."""
+    if clock != "media":
+        raise ValueError("only clock=media is supported")
     sentences: list[TimedSentence] = []
     pending = ""
     start: float | None = None
@@ -56,7 +58,8 @@ def extract_timed_sentences(events: Iterable[dict[str, Any]], *, clock: str = "m
         if timestamp is None:
             timestamp = event.get("_media_clock_ms", event.get("current_time_ms", 0.0))
         try:
-            now = float(timestamp) / 1000.0 if float(timestamp) > 1000 else float(timestamp)
+            # Every accepted event field is explicitly millisecond-valued.
+            now = float(timestamp) / 1000.0
         except (TypeError, ValueError):
             now = last or 0.0
         pending += delta
