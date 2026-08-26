@@ -294,6 +294,66 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
     assert request.lora_int_id not in pipeline._lora_sigma_schedules
 
 
+@pytest.mark.parametrize(
+    "offload_mode",
+    [
+        "model-level CPU offload (--enable-cpu-offload)",
+        "layerwise offload (--enable-layerwise-offload)",
+    ],
+)
+def test_h3_native_rejects_offload_modes(tmp_path, offload_mode):
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path)
+
+    with pytest.raises(ValueError, match="does not support"):
+        load_minimax_h3_native_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+            unsupported_offload_mode=offload_mode,
+        )
+
+
+def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
+    """DLO keeps LoRA A/B buffers resident, so native must not fail closed."""
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+    )
+    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._native_lora_adapter_ids = set()
+    pipeline._lora_sigma_schedules = {}
+    captured: dict[str, object] = {}
+    schedule = DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])
+
+    def load_native(**kwargs):
+        captured.update(kwargs)
+        return object(), object(), schedule
+
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_lora", load_native)
+
+    request = _request("flashgen")
+    loaded = pipeline._load_diffusion_lora_adapter(
+        lora_request=request,
+        lora_path="flashgen",
+        dtype=torch.bfloat16,
+    )
+
+    assert loaded is not None
+    assert captured["unsupported_offload_mode"] is None
+    assert request.lora_int_id in pipeline._native_lora_adapter_ids
+    assert pipeline._lora_sigma_schedules[request.lora_int_id] is schedule
+
+
 def test_h3_native_qkv_reorder_matches_base_loader_contract():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
 

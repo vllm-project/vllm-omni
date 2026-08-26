@@ -262,6 +262,12 @@ Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
 base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
 manager without modifying `DiffusionLoRAManager`.
 
+Both runtime adapters run with distributed layerwise offload, where the manager
+keeps the LoRA A/B buffers resident on the compute device while DLO streams the
+base blocks. Model-level CPU offload and standard layerwise offload are still
+rejected, because the dynamic LoRA tensors are neither parameters nor registered
+buffers and therefore do not participate in those weight lifecycles.
+
 ## See Also
 
 - [Text-to-Image Offline Example](../examples/offline_inference/text_to_image.md#lora) - Complete offline LoRA example

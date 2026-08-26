@@ -863,22 +863,26 @@ by the Turbo artifact.
 ### FlashGen native LoRA
 
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
-declares its distilled sigma schedule in safetensors metadata:
+declares its distilled sigma schedule in safetensors metadata. It is published on
+[ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
 
 ```text
-Beidouqixing/minimax-h3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+FlashGen/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
 ```
 
 Download only that file:
 
 ```bash
+python -m pip install modelscope
 export FLASHGEN_DIR=/path/to/minimax-h3-flashgen-lora
 export FLASHGEN_FILE=minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
-hf download Beidouqixing/minimax-h3-4step-lora-flashgen "${FLASHGEN_FILE}" --local-dir "${FLASHGEN_DIR}"
+modelscope download FlashGen/Minimax-H3-4step-lora-flashgen \
+  --local_dir "${FLASHGEN_DIR}" \
+  --include "${FLASHGEN_FILE}"
 export FLASHGEN_LORA="${FLASHGEN_DIR}/${FLASHGEN_FILE}"
 ```
 
-Start from a non-offloaded FL2VA server command and add
+Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${FLASHGEN_LORA}"`.
 Each request must use T2VA and the distilled interval-count contract:
 
@@ -888,14 +892,23 @@ Each request must use T2VA and the distilled interval-count contract:
 -F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
 ```
 
-This path rejects Ref2VA, model-level/layerwise offload, and checkpoints that
-already pin `base_schedule` in `model_index.json`. The adapter metadata carries
+This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+`model_index.json`. The adapter metadata carries
 `base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
 denoiser evaluations, not five sigma points.
 
-Ascend NPU validation (259/259 binding, Base/LoRA SHA256 toggling) is documented
-in [`docs/upstream/npu_native_lora_validation.md`](../../docs/upstream/npu_native_lora_validation.md)
-with helper script [`scripts/npu_validate_native_lora.sh`](../../scripts/npu_validate_native_lora.sh).
+DLO is supported on the same terms as the Turbo adapter: the request-switchable
+LoRA A/B buffers stay resident on the accelerator while DLO streams only the
+base blocks, so budget for that additional fixed HBM usage. The native artifact
+is rank 64 over 259 target modules and its packed `qkv_proj` and `fc1` layers
+keep slice-local A buffers, so the resident footprint exceeds the on-disk
+payload; measure it for your parallel layout rather than assuming the checkpoint
+size. Pure Ulysses replicates the adapter on every rank, while DiT tensor
+parallelism shards the B buffers. Model-level and standard layerwise offload
+remain unsupported.
+
+Ascend NPU validation (259/259 binding, Base/LoRA SHA256 toggling) uses
+[`scripts/npu_validate_native_lora.sh`](../../scripts/npu_validate_native_lora.sh).
 
 ## Key parameters
 
