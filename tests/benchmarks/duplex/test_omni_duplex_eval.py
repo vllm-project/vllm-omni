@@ -13,6 +13,13 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import (
     family_for_split,
     load_samples,
 )
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import (
+    PROTOCOL_PIN,
+    parse_judge_json,
+    reminder_window,
+    summarize_pr_results,
+    temporal_window,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,3 +42,15 @@ def test_response_aliases_and_clock_guard():
     with pytest.raises(ValueError, match="clock=invalid"):
         validate_clock({"clock": "invalid"})
     validate_clock({"clock": "invalid"}, allow_invalid=True)
+
+
+def test_protocol_windows_and_parsing():
+    assert PROTOCOL_PIN == "962cec448ac37a377ffb963b476778777d11d346"
+    assert temporal_window(4, 5, 10) == (2.0, 3.0)
+    assert temporal_window(1, 1.2, 10) is None
+    assert reminder_window(5) == (5.0, 15.0)
+    assert parse_judge_json('noise {"content_score": 2.345, "is_relevant": 1}') == {
+        "content_score": 2.35,
+        "is_relevant": 1,
+    }
+    assert summarize_pr_results([{"task_type": "correction", "all_success": 1}])["mean_all_success"] == 1.0

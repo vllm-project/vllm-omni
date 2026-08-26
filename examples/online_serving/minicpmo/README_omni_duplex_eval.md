@@ -1,8 +1,9 @@
 # Omni-DuplexEval
 
-This runner generates official-shaped response artifacts through the native
-MiniCPM-o duplex WebSocket. It does not change serving defaults or require the
-upstream benchmark checkout at runtime.
+This runner keeps generation and scoring separate: generation uses the native
+MiniCPM-o duplex WebSocket, while evaluation sends judge prompts to a local
+OpenAI-compatible vLLM-Omni chat server.  It does not change serving defaults
+or require the upstream benchmark checkout at runtime.
 
 ```bash
 python examples/online_serving/minicpmo/run_omni_duplex_eval.py generate \
@@ -11,7 +12,15 @@ python examples/online_serving/minicpmo/run_omni_duplex_eval.py generate \
   --dataset Hothan/Omni-DuplexEval --family all \
   --response-root /data/duplex/responses
 
+python examples/online_serving/minicpmo/run_omni_duplex_eval.py evaluate \
+  --dataset Hothan/Omni-DuplexEval --response-root /data/duplex/responses \
+  --score-root /data/duplex/scores --judge-base-url http://127.0.0.1:8000 \
+  --judge-model /models/Qwen2.5-VL-7B-Instruct --judge-video-mode video_url
+
+python examples/online_serving/minicpmo/run_omni_duplex_eval.py summarize \
+  --score-root /data/duplex/scores
 ```
 
-`--pace as-fast-as-possible` writes `clock=invalid`. Use `--limit 1` for a
-smoke test. Evaluation and summarization are added by the follow-up scoring PR.
+`--pace as-fast-as-possible` writes `clock=invalid`; evaluation rejects those
+artifacts unless `--allow-invalid-clock` is explicit.  Use `--limit 1` for a
+smoke test.  The protocol pin is recorded in every score artifact.
