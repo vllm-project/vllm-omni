@@ -35,6 +35,23 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+def test_startup_warmup_keeps_captured_graphs_for_real_requests():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        parallel_config=SimpleNamespace(data_parallel_size=1, sequence_parallel_size=1),
+    )
+    calls = []
+    engine._dummy_run = lambda: calls.append(("dummy", None))
+    engine.collective_rpc = lambda **kwargs: calls.append(("rpc", kwargs))
+    engine.close = lambda: None
+
+    engine.run_startup_warmup()
+
+    assert calls == [("dummy", None)]
+
+
 @dataclass
 class DiffusionSchedulerOutput:
     step_id: int

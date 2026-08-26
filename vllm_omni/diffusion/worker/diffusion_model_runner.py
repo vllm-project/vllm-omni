@@ -366,9 +366,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             device=self.device,
         )
 
-        # Apply torch.compile if not in eager mode
+        # Apply torch.compile if not in eager mode. LTX2 audio manual graphing
+        # owns this transformer's graphing path, so keep it mutually exclusive
+        # with the generic compiler-managed CUDA Graph path.
         if not self.od_config.enforce_eager:
-            if current_omni_platform.supports_torch_inductor():
+            audio_graph_runner = getattr(self.pipeline, "audio_graph_runner", None)
+            if audio_graph_runner is not None:
+                if current_omni_platform.supports_torch_inductor():
+                    setup_audio_compile = getattr(self.pipeline, "setup_audio_cuda_graph_compile", None)
+                    if callable(setup_audio_compile):
+                        setup_audio_compile()
+                    else:
+                        logger.warning(
+                            "Model runner: pipeline has an audio CUDA Graph runner but no "
+                            "setup_audio_cuda_graph_compile(); keeping its Transformer eager."
+                        )
+                else:
+                    logger.warning(
+                        "Model runner: Platform %s does not support torch inductor; "
+                        "the manual audio CUDA Graph will capture the eager Transformer.",
+                        current_omni_platform.get_torch_device(),
+                    )
+            elif current_omni_platform.supports_torch_inductor():
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
                         self.pipeline.setup_compile()

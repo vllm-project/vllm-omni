@@ -425,6 +425,7 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.re_init_pipeline(custom_args)
 
         # Verify cleanup was performed
+        mock_model_runner.release_captured_graphs.assert_called_once_with()
         mock_gc_collect.assert_called_once()
         mock_empty_cache.assert_called_once()
 

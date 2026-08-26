@@ -973,6 +973,7 @@ class DiffusionWorker:
         """Shutdown the worker and cleanup distributed environment."""
         try:
             if self.model_runner is not None:
+                self.model_runner.release_captured_graphs()
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
                 try:
                     offload_backend = getattr(self.model_runner, "offload_backend", None)
@@ -1006,6 +1007,7 @@ class CustomPipelineWorkerExtension:
 
         # Clean up old pipeline
         if self.model_runner.pipeline is not None:
+            self.model_runner.release_captured_graphs()
             del self.model_runner.pipeline
             gc.collect()
             torch.accelerator.empty_cache()

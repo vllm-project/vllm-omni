@@ -206,6 +206,9 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
 def test_from_pipeline_config_normalizes_stage_engine_extras_without_expanding_stage_deploy_config():
     assert not hasattr(StageDeployConfig, "model_config")
     assert not hasattr(StageDeployConfig, "parallel_config")
+    assert not hasattr(StageDeployConfig, "expected_model_version")
+    assert not hasattr(StageDeployConfig, "enable_ltx2_audio_cuda_graph")
+    assert not hasattr(StageDeployConfig, "ltx2_audio_cuda_graph_max_entries")
 
     stage = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2").stage_by_id(0)
 
@@ -636,7 +639,6 @@ def test_sub_config_fields_match_structured_scopes():
         "has_sampling_extra_args",
         "custom_voice_dir",
         "task_type",
-        "expected_model_version",
         "codec_frame_rate_hz",
         "enforce_eager",
         "max_cudagraph_capture_size",
@@ -1375,6 +1377,12 @@ def test_diffusion_config_field_classification_covers_current_fields():
         "distributed_executor_backend",
     } <= omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
+    assert "enable_ltx2_audio_cuda_graph" not in classified_fields
+    assert "ltx2_audio_cuda_graph_max_entries" not in classified_fields
+    assert "enable_ltx2_audio_cuda_graph" not in {f.name for f in fields(OmniDiffusionConfig)}
+    assert "ltx2_audio_cuda_graph_max_entries" not in {f.name for f in fields(OmniDiffusionConfig)}
+    assert "expected_model_version" not in classified_fields
+    assert "expected_model_version" not in {f.name for f in fields(OmniDiffusionConfig)}
 
 
 def test_diffusion_config_projection_keeps_mapping_quantization_config_serializable():
