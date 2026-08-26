@@ -497,16 +497,16 @@ class TestCodePredictorModelDtype:
 
     @pytest.mark.parametrize(
         ("device_type", "expect_fp32"),
-        [("cpu", False), ("npu", False), ("xpu", False), ("cuda", True)],
+        [("cpu", False), ("npu", False), ("xpu", True), ("musa", True), ("cuda", True)],
     )
-    def test_fp32_fallback_is_cuda_only(
+    def test_fp32_fallback_excludes_cpu_and_npu(
         self,
         mocker: MockerFixture,
         loaded_target_classes,
         device_type: str,
         expect_fp32: bool,
     ) -> None:
-        """The stability fallback must not change NPU activation dtype."""
+        """The stability fallback preserves accelerator behavior except on NPU."""
         _, _, _, code_predictor_model, _ = loaded_target_classes
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
 
@@ -586,25 +586,28 @@ class TestCodePredictorGraphReplay:
 
         predictor = object.__new__(code_predictor_wrapper)
         torch.nn.Module.__init__(predictor)
-        predictor._num_groups = 2
+        predictor._num_groups = 3
         predictor._model_dtype = torch.float32
         predictor._setup_compile = mocker.Mock()
         predictor._padded_bsz = mocker.Mock(side_effect=lambda bsz: bsz)
         predictor._ensure_buffers = mocker.Mock()
-        predictor._proj_buf = torch.zeros(1, 3, 4)
+        predictor._proj_buf = torch.zeros(1, 4, 4)
         predictor.small_to_mtp_projection = torch.nn.Identity()
-        regular_output = torch.zeros(1, 3, 4)
+        regular_output = torch.zeros(1, 4, 4)
         predictor._compiled_model_fwd = mocker.Mock(return_value=regular_output)
-        predictor._lm_heads_list = [torch.nn.Linear(4, 8, bias=False)]
-        predictor._codec_embeds_list = []
+        predictor._lm_heads_list = [
+            torch.nn.Linear(4, 8, bias=False),
+            torch.nn.Linear(4, 8, bias=False),
+        ]
+        predictor._codec_embeds_list = [torch.nn.Embedding(8, 4)]
         predictor._wrapper_config = code_predictor_wrapper_config(
             sampling_mode="per_call",
             return_proj_buf=False,
         )
         predictor._prefix_graphs_enabled = False
-        predictor._bucket_pos_ids = {1: torch.arange(3).unsqueeze(0)}
+        predictor._bucket_pos_ids = {1: torch.arange(4).unsqueeze(0)}
         graph = mocker.Mock()
-        graph_output = torch.zeros(1, 3, 4)
+        graph_output = torch.zeros(1, 4, 4)
         predictor._device_graphs = {1: (graph, graph_output)}
 
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
@@ -619,12 +622,13 @@ class TestCodePredictorGraphReplay:
             do_sample=False,
         )
 
-        assert result.shape == (1, 2)
+        assert result.shape == (1, 3)
+        npu_mock.is_current_stream_capturing.assert_called_once_with()
         if is_capturing:
             graph.replay.assert_not_called()
-            predictor._compiled_model_fwd.assert_called_once()
+            assert predictor._compiled_model_fwd.call_count == 2
         else:
-            graph.replay.assert_called_once_with()
+            assert graph.replay.call_count == 2
             predictor._compiled_model_fwd.assert_not_called()
 
 

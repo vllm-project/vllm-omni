@@ -438,11 +438,11 @@ class CodePredictorBaseModel(nn.Module):
         # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
         # layers already upcast internally; this extends the same
         # treatment to attention and MLP.
-        # This fallback targets CUDA GPUs without native bf16 support. Other
-        # backends keep the model dtype so backend-specific fused ops receive
-        # matching activation and weight dtypes.
+        # CPU autocast to float32 is unsupported, and Ascend fused operators
+        # require matching activation and weight dtypes. Preserve the existing
+        # stability fallback on the other accelerator backends.
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type == "cuda"
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type not in ("cpu", "npu")
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
@@ -1035,6 +1035,9 @@ class CodePredictorWrapper(nn.Module):
         model_fwd = self._compiled_model_fwd
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
+        # torch-npu cannot replay an inner NPUGraph while the outer talker_mtp
+        # graph is being captured. Capture state is constant for this forward.
+        is_npu_capturing = current_omni_platform.is_npu() and torch.npu.is_current_stream_capturing()
 
         # Zero the padded region of the buffer
         proj_buf[:padded_bsz].zero_()
@@ -1085,11 +1088,8 @@ class CodePredictorWrapper(nn.Module):
             # Use captured device graph if available, otherwise call compiled fn.
             device_graph_entry = self._device_graphs.get(graph_key)
 
-            # torch-npu cannot replay an inner NPUGraph while the outer
-            # talker_mtp graph is being captured. Let the outer graph record
-            # the regular forward during capture; normal inference still uses
-            # the inner graph replay fast path.
-            is_npu_capturing = current_omni_platform.is_npu() and torch.npu.is_current_stream_capturing()
+            # Let the outer graph record the regular forward during capture;
+            # normal inference still uses the inner graph replay fast path.
             if device_graph_entry is not None and not is_npu_capturing:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
