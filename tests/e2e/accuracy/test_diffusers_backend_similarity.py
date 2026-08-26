@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Run vLLM-Omni with diffusers backend, then run diffusers directly. Compare the output similarity.
@@ -39,11 +39,32 @@ from tests.e2e.accuracy.helpers import (
 from tests.e2e.accuracy.helpers import (
     run_ffmpeg_similarity as _run_ffmpeg_similarity,
 )
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OnlineOmniClient
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import (
+    CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS,
+)
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+
+def _set_matched_attention_backend(pipe: DiffusionPipeline) -> None:
+    """Walk the same backend chain the omni server's diffusers adapter walks.
+
+    The server side (--diffusion-load-format diffusers) resolves its attention
+    backend through the adapter's preference chain, skipping backends that are
+    unavailable on the image (e.g. the FA3 hub kernel has no build variant for
+    the image's torch — build 2953). The reference run must resolve to the
+    same backend or the similarity comparison measures kernel differences.
+    """
+    for backend in CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS:
+        try:
+            pipe.transformer.set_attention_backend(backend)
+            return
+        except Exception:
+            continue
+    pipe.transformer.set_attention_backend("native")
 
 
 PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
@@ -107,7 +128,7 @@ def _run_vllm_omni_wan22_i2v(
         "seed": SEED,
     }
     with OmniServer(model, server_args, env_dict=env_to_apply_ftfy_mock_in_subproc(), use_omni=True) as omni_server:
-        client = OpenAIClientHandler(
+        client = OnlineOmniClient(
             host=omni_server.host,
             port=omni_server.port,
             run_level="full_model",
@@ -118,16 +139,20 @@ def _run_vllm_omni_wan22_i2v(
             "image_reference": f"data:image/png;base64,{pil_to_base64(conditioning_image, 'png')}",
         }
         result = client.send_video_diffusion_request(request_config)[0]
-        video_bytes = result.videos[0]  # pyright: ignore[reportOptionalSubscript] # Guaranteed not None
+        videos = result.videos
+        assert videos is not None
+        video_bytes = videos[0]
         output_path.write_bytes(video_bytes)
-        return result.e2e_latency  # pyright: ignore[reportReturnType] # Guaranteed not None
+        latency = result.e2e_latency
+        assert latency is not None
+        return latency
 
 
 def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_image: Image.Image) -> float:
     from diffusers import WanImageToVideoPipeline  # pyright: ignore[reportPrivateImportUsage]
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     apply_ftfy_mock()
     pipe: WanImageToVideoPipeline | None = None
     try:
@@ -169,7 +194,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
@@ -227,7 +252,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -235,7 +260,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        _set_matched_attention_backend(pipe)
         _diffusers_dummy_run(pipe)
 
         latencies: list[float] = []
@@ -267,7 +292,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 @pytest.mark.benchmark

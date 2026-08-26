@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict batched codec-to-waveform stage for MiniCPM-o 4.5."""
 
 from __future__ import annotations
@@ -69,6 +69,17 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
 # OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
 # override). A step carrying only these has no producer payload at all.
 _RUNNER_STAMPED_KEYS = frozenset({"request_id", "req_id", "generated_len", "meta"})
+_PRODUCER_META_KEYS = frozenset(
+    {
+        "cache_epoch",
+        "chunk_seq",
+        "code_flat_numel",
+        "last_chunk",
+        "prompt_cache_id",
+        "prompt_wav",
+        "ref_audio_sr",
+    }
+)
 
 
 def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> bool:
@@ -77,9 +88,12 @@ def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> 
     Any real async-chunk payload brings producer metadata along, whether the
     transport delivers it nested under ``meta`` or as flattened ``meta.*`` keys.
     """
+    codes = info.get("codes")
+    if isinstance(codes, Mapping) and any(value is not None for value in codes.values()):
+        return True
     if any(key not in _RUNNER_STAMPED_KEYS for key in info):
         return True
-    return meta is not info and any(key not in _RUNNER_STAMPED_KEYS for key in meta)
+    return any(meta.get(key) is not None for key in _PRODUCER_META_KEYS)
 
 
 @dataclass(frozen=True)
@@ -121,11 +135,12 @@ class _WorkItem:
 
 
 class MiniCPMO45Code2Wav(nn.Module):
-    """LLM_GENERATION model that admits only true exact-shape GPU batches."""
+    """LLM_GENERATION model with request-owned state and compatible batching."""
 
     input_modalities = "audio"
     have_multimodal_outputs = True
     enable_update_additional_information = True
+    replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
     has_preprocess = False
@@ -150,9 +165,30 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._connector_config = {
+            "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
+            "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
+        }
+        if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
+            raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
+        raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
+        capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        self._hift_graph_config = {
+            "enabled": bool(extra.get("enable_hift_graph", False)),
+            "capture_batch_sizes": capture_batch_sizes,
+        }
+        self._cfm_graph_config = {
+            "enabled": bool(extra.get("enable_cfm_graph", False)),
+            "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+        }
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
+        if self._initial_batch_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
+        if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
 
@@ -451,12 +487,62 @@ class MiniCPMO45Code2Wav(nn.Module):
         return (
             item.prompt_cache_id,
             item.prompt_wav,
-            int(item.tokens.numel()),
             cache_signature,
-            item.last_chunk,
-            item.tts_is_last_chunk,
             item.cache_epoch,
         )
+
+    def _iter_limited_batches(
+        self,
+        buckets: Iterable[list[_WorkItem]],
+        *,
+        maximum: int,
+    ) -> Iterable[list[_WorkItem]]:
+        for bucket in buckets:
+            if not bucket:
+                continue
+            if not maximum:
+                yield bucket
+                continue
+            batch_count = (len(bucket) + maximum - 1) // maximum
+            if len(bucket) < batch_count * self._min_batch_size:
+                raise _batch_error(
+                    "initial_batch_partition_below_minimum",
+                    size=len(bucket),
+                    minimum=self._min_batch_size,
+                    maximum=maximum,
+                )
+            batch_size, larger_batches = divmod(len(bucket), batch_count)
+            start = 0
+            for batch_index in range(batch_count):
+                stop = start + batch_size + (batch_index < larger_batches)
+                yield bucket[start:stop]
+                start = stop
+
+    def _iter_decode_batches(
+        self,
+        buckets: Iterable[list[_WorkItem]],
+    ) -> Iterable[list[_WorkItem]]:
+        for bucket in buckets:
+            if not self._initial_batch_size:
+                yield bucket
+                continue
+            initial = [item for item in bucket if item.chunk_seq <= 1]
+            steady = [item for item in bucket if item.chunk_seq > 1]
+
+            undersized = [
+                {"wave": wave, "size": len(items)}
+                for wave, items in (("initial", initial), ("steady", steady))
+                if items and len(items) < self._min_batch_size
+            ]
+            if undersized:
+                raise _batch_error(
+                    "decode_wave_below_minimum",
+                    minimum=self._min_batch_size,
+                    waves=undersized,
+                )
+            yield from self._iter_limited_batches([initial], maximum=self._initial_batch_size)
+            if steady:
+                yield steady
 
     @torch.inference_mode()
     def forward(
@@ -593,7 +679,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                     (item.prompt_cache_id, item.prompt_wav),
                     [],
                 ).append(item)
-        for bucket in initial_marker_buckets.values():
+        for bucket in self._iter_limited_batches(
+            initial_marker_buckets.values(),
+            maximum=self._initial_batch_size,
+        ):
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -625,7 +714,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in buckets.values():
+        for bucket in self._iter_decode_batches(buckets.values()):
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(
@@ -636,13 +725,23 @@ class MiniCPMO45Code2Wav(nn.Module):
                     states = self.backend.setup_batch(features, batch_size)
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                audios, next_states = self.backend.decode_batch(
-                    tokens,
-                    features,
-                    states,
-                    last_chunk=bucket[0].last_chunk,
-                )
+                token_lengths = {int(item.tokens.numel()) for item in bucket}
+                last_chunk_values = {item.last_chunk for item in bucket}
+                if len(token_lengths) > 1 or len(last_chunk_values) > 1:
+                    audios, next_states = self.backend.decode_ragged_batch(
+                        [item.tokens for item in bucket],
+                        features,
+                        states,
+                        last_chunks=[item.last_chunk for item in bucket],
+                    )
+                else:
+                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
+                    audios, next_states = self.backend.decode_batch(
+                        tokens,
+                        features,
+                        states,
+                        last_chunk=bucket[0].last_chunk,
+                    )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -727,18 +826,16 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
+        # In-tree adapter over StepAudio2Token2WavCore on every platform. It
+        # matches the external `stepaudio2-minicpmo` Token2wav bit-for-bit on
+        # CUDA (same cosyvoice2 flow/DiT modules and weights) while dropping
+        # that package's hard-coded `.cuda()` calls, and auto-applies the
+        # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
+        # on NPU.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav as Token2wav,
+        )
         from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
         # Hub repo ids only need to become local directories once the vocoder
@@ -765,4 +862,33 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+
+        trt_stepper = None
+        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        # TensorRT is CUDA-only; other platforms ignore the toggle.
+        if use_trt and current_omni_platform.is_cuda():
+            from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
+
+            dtype_name = str(
+                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
+            ).lower()
+            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            max_batch = int(extra.get("token2wav_trt_max_batch", 16))
+            device = next(token2wav.flow.parameters()).device
+            trt_stepper = build_dit_trt_stepper(
+                token2wav.flow.decoder.estimator,
+                device=device,
+                dtype=trt_dtype,
+                max_batch=max_batch,
+            )
+            logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
+            token2wav.enable_trt_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            trt_stepper=trt_stepper,
+            connector_config=self._connector_config,
+            hift_graph_config=self._hift_graph_config,
+            cfm_graph_config=self._cfm_graph_config,
+            bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
+        )

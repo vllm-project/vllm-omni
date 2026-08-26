@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ import torch
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 
@@ -162,6 +164,21 @@ def _fake_platform_for_peak_memory():
     )
 
 
+def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
+    events = []
+    plain_pipeline = object()
+    request_scoped_pipeline = SimpleNamespace(
+        adopt_cache_dit_backend=lambda backend: events.append(backend),
+        is_cache_dit_enabled=lambda: True,
+    )
+    backend = object()
+
+    assert not model_runner_module.adopt_request_scoped_cache_dit(plain_pipeline, backend)
+    assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
+    assert model_runner_module.is_request_scoped_cache_dit_enabled(request_scoped_pipeline)
+    assert events == [backend]
+
+
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -176,6 +193,11 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+    )
+    runner.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
+        vllm_config=runner.vllm_config,
+        od_config=runner.od_config,
+        device=runner.device,
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
@@ -201,6 +223,25 @@ def _make_compile_runner(
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_update_states_carries_prepared_layout() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    request = _make_request()
+    prepared_layout = object()
+    request.prepared_layout = prepared_layout
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert new_request_ids == [request.request_id]
+    assert states[0].prepared_layout is prepared_layout
 
 
 @pytest.mark.core_model
@@ -307,7 +348,7 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
@@ -347,7 +388,7 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
+        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
     )
 
@@ -420,6 +461,33 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
 
 @pytest.mark.core_model
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("cache_dit_enabled", [False, True])
+def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monkeypatch, cache_dit_enabled):
+    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+    runner.pipeline.adopt_cache_dit_backend = lambda backend: None
+    runner.pipeline.is_cache_dit_enabled = lambda: cache_dit_enabled
+    req = _make_request()
+
+    cache_summary_calls = []
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(
+        model_runner_module,
+        "cache_summary",
+        lambda pipeline, details: cache_summary_calls.append((pipeline, details)),
+    )
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "ok"
+    assert cache_summary_calls == ([(runner.pipeline, True)] if cache_dit_enabled else [])
+
+
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_execute_model_passes_single_request_batch_to_non_admission_pipeline(monkeypatch):
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
@@ -449,6 +517,84 @@ def test_execute_model_accepts_bare_diffusion_output_from_single_request_pipelin
     assert output.output == "a prompt"
     assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
     assert runner.pipeline.last_req.num_reqs == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    request = _make_request()
+    runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
+    record_names = []
+    original_execute = runner._execute_request_list
+
+    def execute(*args, **kwargs):
+        record_names.append(kwargs["record_name"])
+        return original_execute(*args, **kwargs)
+
+    runner._execute_request_list = execute
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    reset_peak_memory_stats = Mock()
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "reset_peak_memory_stats",
+        reset_peak_memory_stats,
+    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    synchronize = Mock()
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
+
+    runner.profile_run([request])
+
+    assert runner.pipeline.forward_calls == 1
+    assert record_names == ["pipeline_memory_profile"]
+    runner._validate_diffusion_kv_metadata.assert_not_called()
+    reset_peak_memory_stats.assert_not_called()
+    synchronize.assert_called_once_with()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id = "profile-0"
+    requests[1].request_id = "profile-1"
+    for request in requests:
+        request.sampling_params.num_inference_steps = 1
+
+    observed_batch_rows = []
+    original_denoise_step = runner.pipeline.denoise_step
+
+    def denoise_step(input_batch, states):
+        observed_batch_rows.append((len(states), int(input_batch.latents.shape[0])))
+        return original_denoise_step(input_batch, states)
+
+    runner.pipeline.denoise_step = denoise_step
+    runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    reset_peak_memory_stats = Mock()
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "reset_peak_memory_stats",
+        reset_peak_memory_stats,
+    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    synchronize = Mock()
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
+
+    runner.profile_run(requests)
+
+    assert observed_batch_rows == [(2, 2)]
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+    runner._validate_diffusion_kv_metadata.assert_not_called()
+    reset_peak_memory_stats.assert_not_called()
+    synchronize.assert_called_once_with()
 
 
 class _BatchPipeline:
@@ -500,7 +646,11 @@ def _make_scheduler_output(num_reqs: int):
     reqs = [_make_request() for _ in range(num_reqs)]
     for i, req in enumerate(reqs):
         req.request_id = f"req-{i}"
-    return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(request_id=req.request_id, req=req, diffusion_kv_metadata=None) for req in reqs
+        ],
+    )
 
 
 @pytest.mark.core_model
@@ -714,7 +864,11 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda od_config, device: None)
+    monkeypatch.setattr(
+        model_runner_module,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device: (pipeline, None),
+    )
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
@@ -726,8 +880,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert dummy_cache_backend.enabled is False
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
     import vllm.config.vllm as vllm_config_module

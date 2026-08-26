@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Single-device baseline (two input images)",
@@ -34,10 +34,12 @@
         "num-input-images": 2,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.0721,
-          "latency_mean": 13.8398,
-          "peak_memory_mb_max": 57610.0,
-          "peak_memory_mb_mean": 57610.0
+          "H100": {
+            "throughput_qps": 0.0684,
+            "latency_mean": 14.6249,
+            "peak_memory_mb_max": 57632.0,
+            "peak_memory_mb_mean": 57632.0
+          }
         }
       },
       {
@@ -52,10 +54,12 @@
         "num-input-images": 2,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.0186,
-          "latency_mean": 53.6942,
-          "peak_memory_mb_max": 67790.0,
-          "peak_memory_mb_mean": 67790.0
+          "H100": {
+            "throughput_qps": 0.0177,
+            "latency_mean": 56.5285,
+            "peak_memory_mb_max": 67840.0,
+            "peak_memory_mb_mean": 67840.0
+          }
         }
       }
     ]
@@ -72,7 +76,7 @@
           "num_cards": 4
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Ulysses SP=2 + CFG=2 + VAE patch parallel=4",
@@ -100,10 +104,12 @@
         "num-input-images": 2,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.0538,
-          "latency_mean": 18.5591,
-          "peak_memory_mb_max": 56449.4286,
-          "peak_memory_mb_mean": 56449.4286
+          "H100": {
+            "throughput_qps": 0.0515,
+            "latency_mean": 19.4345,
+            "peak_memory_mb_max": 56348.0,
+            "peak_memory_mb_mean": 56348.0
+          }
         }
       }
     ]
@@ -119,7 +125,7 @@
           "num_cards": 4
         }
       },
-      "full_model",
+      "local_model",
       "diffusion"
     ],
     "description": "Ulysses SP=2 + CFG=2 + CacheDiT",
@@ -157,10 +163,12 @@
         "num-input-images": 2,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.2776,
-          "latency_mean": 3.5938,
-          "peak_memory_mb_max": 58113.7143,
-          "peak_memory_mb_mean": 58075.1429
+          "H100": {
+            "throughput_qps": 0.2479,
+            "latency_mean": 4.0389,
+            "peak_memory_mb_max": 57750.0,
+            "peak_memory_mb_mean": 57750.0
+          }
         }
       },
       {
@@ -175,10 +183,12 @@
         "num-input-images": 2,
         "enable-negative-prompt": true,
         "baseline": {
-          "throughput_qps": 0.1051,
-          "latency_mean": 9.4918,
-          "peak_memory_mb_max": 68107.4286,
-          "peak_memory_mb_mean": 68107.4286
+          "H100": {
+            "throughput_qps": 0.0948,
+            "latency_mean": 10.5462,
+            "peak_memory_mb_max": 67764.0,
+            "peak_memory_mb_mean": 67764.0
+          }
         }
       }
     ]

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Parse pytest commands from Buildkite test-ready.yml, test-merge.yml, test-nightly.yml,
-and test-weekly.yml; collect test cases (including parametrized) via pytest --collect-only -q
-and produce an HTML report.
+Parse pytest commands from Buildkite .buildkite/cuda/test-{ready,merge,nightly,weekly}.yml;
+collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.
 
 Leaf steps may live under ``group:`` blocks (nested ``steps``); those are flattened with the
 group title carried into the report.
@@ -30,7 +29,7 @@ import yaml
 
 # Repo root (parent of the directory containing this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-BUILDKITE_DIR = REPO_ROOT / ".buildkite"
+BUILDKITE_DIR = REPO_ROOT / ".buildkite" / "cuda"
 PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml", "test-weekly.yml"]
 
 
@@ -256,13 +255,34 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
         rel_dir = Path(target.rstrip("/"))
         dir_path = (repo_root / rel_dir).resolve()
         if dir_path.exists() and dir_path.is_dir():
-            return [str(dir_path)], target.replace("\\", "/").rstrip("/"), 120
+            return [str(dir_path)], target.replace("\\", "/").rstrip("/"), 300
 
     if not extra:
         raise RuntimeError(f"Failed to parse pytest sidecar args from line: {raw_line!r}")
     if not (repo_root / "tests").exists():
         raise FileNotFoundError("tests/ directory not found under repo root")
-    return ["tests/"], "tests/", 120
+    # Broad ``tests/`` collection loads many conftests; allow more time on busy CI agents.
+    return ["tests/"], "tests/", 300
+
+
+def _format_pytest_collect_failure(
+    path_args: list[str],
+    extra: list[str],
+    result: subprocess.CompletedProcess[str],
+) -> str:
+    """pytest often puts collection errors on stdout; include both streams + exit code."""
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    parts = [
+        f"pytest --collect-only failed for {path_args} with args {extra} (exit={result.returncode})",
+    ]
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    if not stderr and not stdout:
+        parts.append("(no stdout/stderr captured)")
+    return "\n".join(parts)
 
 
 def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]:
@@ -273,6 +293,8 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
     flags ``--ignore``, ``--test-config-file``, ``-m``, ``-k``, ``--run-level`` are taken from the
     full ``raw_line`` and appended to the same invocation so collection matches CI (perf scripts
     parametrize from ``--test-config-file`` at import time).
+
+    Pytest exit code 5 (no tests collected) is treated as an empty result, not a hard failure.
     """
     extra = _pytest_collect_sidecar_args(raw_line)
     path_args, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
@@ -286,8 +308,15 @@ def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]
         text=True,
         timeout=timeout_quiet,
     )
+    # 5 == no tests collected under the given -m/-k filters.
+    if result.returncode == 5:
+        print(
+            f"pytest --collect-only: no tests matched for {path_args} with args {extra}",
+            file=sys.stderr,
+        )
+        return []
     if result.returncode != 0:
-        raise RuntimeError(f"pytest --collect-only failed for {path_args} with args {extra}: {result.stderr.strip()}")
+        raise RuntimeError(_format_pytest_collect_failure(path_args, extra, result))
     print(f"pytest --collect-only success for {path_args} with args {extra}: {result.stdout.strip()}")
     return _parse_collect_only_stdout(result.stdout or "", stderr=result.stderr or "")
 
@@ -962,7 +991,7 @@ def main() -> None:
         "--buildkite-dir",
         type=Path,
         default=BUILDKITE_DIR,
-        help="Path to .buildkite directory",
+        help="Path to Buildkite CUDA pipeline directory (default: .buildkite/cuda)",
     )
     default_out = REPO_ROOT / "buildkite_testcase_statistics.html"
     parser.add_argument(
@@ -1023,7 +1052,12 @@ def main() -> None:
             names = []
             skipped_ids: set[str] = set()
             for target, raw in targets:
-                collected = collect_test_names(target, REPO_ROOT, raw)
+                try:
+                    collected = collect_test_names(target, REPO_ROOT, raw)
+                except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                    # Keep generating the report for other steps; surface the root cause.
+                    print(f"WARNING: collect failed for {module_key} target={target!r}: {exc}", file=sys.stderr)
+                    collected = []
                 skipped_ids.update(get_skip_status(target, raw, REPO_ROOT))
                 names.extend(collected)
             count = len(names) - len(skipped_ids)

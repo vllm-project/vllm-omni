@@ -15,6 +15,10 @@
 # so 4096 is the empirically-verified safe ceiling.
 pipeline: minicpmo_4_5
 async_chunk: true
+# Native full-duplex shares this profile with /v1/chat/completions. The default
+# duplex_session caps sessions at 1, matching Stage 0/1 max_num_seqs below.
+session_mode: duplex
+active_stream_window: 1
 
 trust_remote_code: true
 enable_prefix_caching: false
@@ -28,6 +32,13 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
+      enable_cfm_graph: true
+      cfm_max_graphs: 32
 
 stages:
   - stage_id: 0
@@ -38,6 +49,11 @@ stages:
     max_model_len: 4096
     max_num_batched_tokens: 4096
     devices: "0,1,2,3"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
     limit_mm_per_prompt:
       video: 1
     default_sampling_params:
@@ -57,15 +73,14 @@ stages:
     devices: "4"
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # vLLM samples the binary continue/stop row; codec sampling comes from
-    # the checkpoint's tts_config and currently uses a deterministic seed.
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      temperature: 0.8
+      top_p: 0.85
+      top_k: 25
+      # See minicpmo_4_5.yaml: the Talker rescores this over a 16-frame window.
+      repetition_penalty: 1.05
       min_tokens: 50
-      max_tokens: 2048
-      stop_token_ids: [1]
+      max_tokens: 4096
       seed: 42
       detokenize: false
 

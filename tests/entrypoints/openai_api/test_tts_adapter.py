@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the TTS serving adapter registry (RFC #4327).
 
 Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -11,9 +16,24 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     ARTTSAdapter,
     DiffusionTTSAdapter,
     all_tts_model_types,
+    detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
+from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
+    IndexTTS2Adapter,
+    IndexTTS25Adapter,
+    indextts2_conditioning_cache_salt,
+)
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
+    MossTTSAdapter,
+    MossTTSNanoAdapter,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.model_executor.models.indextts2 import prompt_utils
+from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+    INDEXTTS25_TOKENIZER_FILE,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -35,6 +55,8 @@ EXPECTED_MODEL_TYPES = {
     "higgs_audio_v3",
     "glm_tts",
     "step_audio2",
+    "indextts2",
+    "indextts2_5",
 }
 
 
@@ -63,12 +85,6 @@ def test_resolve_unknown_returns_none():
     assert resolve_adapter(None) is None
 
 
-def test_ming_flash_omni_not_migrated():
-    """ming_flash_omni is intentionally excluded from the adapter migration in
-    this PR; it stays on the legacy inline dispatch in serving_speech.py."""
-    assert resolve_adapter("ming_flash_omni_tts") is None
-
-
 def test_voxcpm2_resolves():
     """VoxCPM2 (the served ``latent_generator`` model) resolves cleanly.
 
@@ -85,9 +101,137 @@ def test_all_adapters_are_ar_or_diffusion():
         assert cls.backend in ("ar", "diffusion")
 
 
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
+    adapter = adapter_cls(SimpleNamespace(server=object()))
+    stage_defaults = [SimpleNamespace(max_tokens=4096)]
+
+    overridden = adapter.apply_sampling_overrides(
+        stage_defaults,
+        SimpleNamespace(max_new_tokens=512),
+    )
+
+    assert overridden[0].max_tokens == 512
+    assert stage_defaults[0].max_tokens == 4096
+
+
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
+
+
+def test_indextts_adapters_are_versioned():
+    assert resolve_adapter("indextts2") is IndexTTS2Adapter
+    assert resolve_adapter("indextts2_5") is IndexTTS25Adapter
+    assert IndexTTS25Adapter.stage_keys == frozenset({"indextts2_5_talker"})
+    assert detect_tts_model_type("indextts2_5_talker", None) == "indextts2_5"
+
+
+def test_indextts25_validates_explicit_language():
+    adapter = IndexTTS25Adapter(type("Context", (), {"server": object()})())
+
+    assert adapter._validate_extra_params({"lang": "ja"}) is None
+    assert "Unsupported IndexTTS 2.5 language" in adapter._validate_extra_params({"lang": "xx-invalid"})
+
+
+def _indextts25_adapter_and_request(*, speed: float):
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _validate_ref_audio_format=lambda ref_audio: None,
+    )
+    adapter = IndexTTS25Adapter(SimpleNamespace(server=server))
+    request = SimpleNamespace(
+        input="hello",
+        voice="alloy",
+        ref_audio=object(),
+        max_new_tokens=None,
+        extra_params=None,
+        speed=speed,
+    )
+    return adapter, request
+
+
+def test_indextts25_uses_native_speed_control_duration_factor():
+    adapter, fast_request = _indextts25_adapter_and_request(speed=2.0)
+    _, slow_request = _indextts25_adapter_and_request(speed=0.5)
+
+    assert adapter.native_speed_control is True
+    assert adapter.validate(fast_request) is None
+    assert adapter.validate(slow_request) is None
+    assert asyncio.run(adapter._build_params(fast_request))["duration_factor"] == [0.5]
+    assert asyncio.run(adapter._build_params(slow_request))["duration_factor"] == [2.0]
+
+
+@pytest.mark.parametrize("speed", [0.49, 2.01])
+def test_indextts25_rejects_out_of_range_native_speed(speed):
+    adapter, request = _indextts25_adapter_and_request(speed=speed)
+
+    assert adapter.validate(request) == "IndexTTS 2.5 speed must be between 0.5 and 2.0"
+
+
+def test_indextts25_speed_does_not_change_conditioning_cache_salt():
+    adapter, fast_request = _indextts25_adapter_and_request(speed=2.0)
+    _, slow_request = _indextts25_adapter_and_request(speed=0.5)
+    slow_request.ref_audio = fast_request.ref_audio
+
+    fast_params = asyncio.run(adapter._build_params(fast_request))
+    slow_params = asyncio.run(adapter._build_params(slow_request))
+
+    assert indextts2_conditioning_cache_salt(
+        fast_request,
+        fast_params,
+    ) == indextts2_conditioning_cache_salt(slow_request, slow_params)
+
+
+def test_indextts2_conditioning_cache_salt_changes_with_ref_audio_cache_key():
+    request = SimpleNamespace(input="hello", ref_audio="file:///data/spk.wav")
+    salt_a = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_aaa"]})
+    salt_b = indextts2_conditioning_cache_salt(request, {"ref_audio_cache_key": ["key_bbb"]})
+    assert salt_a != salt_b
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "expected_tokenizer_file"),
+    [
+        (SimpleNamespace(tokenizer_file="custom-tokenizer.tiktoken"), "custom-tokenizer.tiktoken"),
+        (SimpleNamespace(), INDEXTTS25_TOKENIZER_FILE),
+    ],
+)
+def test_indextts25_build_uses_configured_tokenizer_file(
+    monkeypatch,
+    hf_config,
+    expected_tokenizer_file,
+):
+    captured = {}
+
+    def fake_estimate(*args, **kwargs):
+        captured.update(kwargs)
+        return 4
+
+    async def fake_build_params(request):
+        return {"lang": ["en"], "text_normalization": [True]}
+
+    monkeypatch.setattr(
+        prompt_utils,
+        "estimate_indextts2_prefill_prompt_len",
+        fake_estimate,
+    )
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="/model",
+                hf_config=hf_config,
+            )
+        )
+    )
+    adapter = IndexTTS25Adapter(SimpleNamespace(server=server))
+    monkeypatch.setattr(adapter, "_build_params", fake_build_params)
+    request = SimpleNamespace(input="hello", ref_audio=None)
+
+    prepared = asyncio.run(adapter.build(request, [], False))
+
+    assert prepared.prompt["prompt_token_ids"] == [1] * 4
+    assert captured["tokenizer_file"] == expected_tokenizer_file
 
 
 def test_diffusion_adapter_extra_body_params_fallback():
@@ -98,6 +242,59 @@ def test_diffusion_adapter_extra_body_params_fallback():
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+def _higgs_v2_adapter() -> HiggsAudioV2Adapter:
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        uploaded_speakers={},
+    )
+    return HiggsAudioV2Adapter(SimpleNamespace(server=server))
+
+
+def _higgs_v2_request(**overrides: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "input": "Hello world.",
+        "ref_audio": None,
+        "ref_text": None,
+        "voice": None,
+        "x_vector_only_mode": None,
+        "speaker_embedding": None,
+        "instructions": None,
+        "task_type": None,
+        "language": None,
+        "speed": None,
+        "max_new_tokens": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides, err_substr",
+    [
+        pytest.param({"ref_audio": "data:audio/wav;base64,AA=="}, "ref_text", id="ref_audio_without_ref_text"),
+        pytest.param({"ref_text": "some transcript"}, "ref_audio", id="ref_text_without_ref_audio"),
+        pytest.param({"task_type": "Base"}, "task_type", id="task_type"),
+        pytest.param({"language": "Chinese"}, "language", id="language_override"),
+        pytest.param({"input": "[SPEAKER0] hi"}, "multi-speaker", id="multi_speaker_tag"),
+        pytest.param({"input": "   "}, "empty", id="input_whitespace_only"),
+    ],
+)
+def test_higgs_audio_v2_validate_rejects_out_of_scope_fields(overrides: dict[str, object], err_substr: str) -> None:
+    """Adapter-only policy checks formerly covered by invalid_param e2e on a live V2 server."""
+    adapter = _higgs_v2_adapter()
+    err = adapter.validate(_higgs_v2_request(**overrides))
+    assert err is not None
+    assert err_substr.lower() in err.lower()
+
+
+def test_higgs_audio_v2_validate_accepts_plain_text_and_paired_clone() -> None:
+    adapter = _higgs_v2_adapter()
+    assert adapter.validate(_higgs_v2_request()) is None
+    assert (
+        adapter.validate(_higgs_v2_request(ref_audio="data:audio/wav;base64,AA==", ref_text="some transcript")) is None
+    )
 
 
 if __name__ == "__main__":

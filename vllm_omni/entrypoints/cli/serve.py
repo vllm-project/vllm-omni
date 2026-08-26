@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -7,6 +10,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 
 import argparse
 import json
+import math
 import os
 import signal
 from types import FrameType
@@ -41,6 +45,17 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+def _nonneg_finite_float(value: str) -> float:
+    """Argparse type for finite, non-negative floats (rejects nan/inf)."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite non-negative number, got {value!r}")
+    return parsed
 
 
 def _ensure_vllm_platform():
@@ -152,6 +167,13 @@ class OmniServeCommand(CLISubcommand):
                     "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
+        lora_backend = getattr(args, "lora_backend", None)
+        lora_path = getattr(args, "lora_path", None)
+        if lora_backend == "distill" and not lora_path:
+            raise ValueError("--lora-backend distill requires --lora-path")
+        if (lora_backend or "peft") == "peft" and isinstance(lora_path, list) and len(lora_path) > 1:
+            raise ValueError("--lora-backend peft accepts only one startup LoRA path")
+
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
         omni_lb_policy = getattr(args, "omni_lb_policy", None)
         if omni_lb_policy is not None:
@@ -213,13 +235,13 @@ class OmniServeCommand(CLISubcommand):
             "--task-type",
             type=str,
             default=None,
-            choices=["CustomVoice", "VoiceDesign", "Base"],
-            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
-            "If not specified, will be inferred from model path.",
+            help="Model-defined startup task type. The selected model validates "
+            "supported values; for example, TTS models accept CustomVoice, "
+            "VoiceDesign, or Base, while diffusion models may use it to select "
+            "task-specific weights. If omitted, the model default is used.",
         )
-        # Forced aligner / word timestamps. --forced-aligner is the opt-in
-        # toggle; heavier knobs (gpu_memory_utilization, dtype, max_model_len)
-        # live in the deploy YAML passed via --forced-aligner-config.
+        # Forced aligner / word timestamps. Either flag opts in (--forced-aligner-config
+        # alone works when its YAML sets the model); heavier knobs live in that YAML.
         omni_config_group.add_argument(
             "--forced-aligner",
             type=str,
@@ -239,6 +261,13 @@ class OmniServeCommand(CLISubcommand):
                 "gpu_memory_utilization, dtype, max_model_len). The --forced-aligner "
                 "flag, when set, overrides the YAML model field."
             ),
+        )
+        omni_config_group.add_argument(
+            "--forced-aligner-device",
+            type=str,
+            default=None,
+            help="Device(s) for the forced-aligner stage (e.g. '2'). Defaults to "
+            "sharing an existing stage's GPU when unset.",
         )
         omni_config_group.add_argument(
             "--deploy-config",
@@ -415,6 +444,32 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--lora-path",
+            type=str,
+            nargs="+",
+            default=None,
+            help=(
+                "LoRA checkpoint path(s) loaded when the diffusion server starts. "
+                "The distill backend accepts one file per pipeline transformer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-backend",
+            type=str,
+            choices=["peft", "distill"],
+            default=None,
+            help=(
+                "Diffusion LoRA loading backend. 'distill' fuses checkpoint files "
+                "into the base model at server startup; 'peft' uses the adapter manager."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--lora-scale",
+            type=float,
+            default=None,
+            help="Scale for a startup PEFT LoRA. Distilled LoRAs are fused at their checkpoint scale.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-compile-granularity",
             choices=["regional", "full"],
             default=None,
@@ -431,6 +486,17 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Use dynamic shapes for the selected generic diffusion compile scope. "
                 "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--fa-deterministic",
+            dest="fa_deterministic",
+            action="store_true",
+            default=False,
+            help=(
+                "Request FlashAttention deterministic=True on the local FLASH_ATTN dense path. "
+                "Slower than the library default deterministic=False; intended for accuracy CI. "
+                "Serving default remains non-deterministic."
             ),
         )
         omni_config_group.add_argument(
@@ -544,6 +610,12 @@ class OmniServeCommand(CLISubcommand):
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
         )
         omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-attention-config",
             "-dac",
             dest="diffusion_attention_config",
@@ -587,7 +659,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
-            type=float,
+            type=_nonneg_finite_float,
             default=0.0,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
@@ -646,15 +718,57 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             default=True,
             help="Use shard + AllGather for weight reconstruction (default: True). "
-            "When disabled (--dlo-no-use-allgather), each rank loads full weights "
-            "via H2D only — no sharding, no AllGather, no concurrent request "
-            "requirement, but N× CPU memory.",
+            "When disabled (--dlo-no-use-allgather), each rank streams the "
+            "standard loader's rank-local tensors via H2D only — no additional "
+            "DP sharding, no AllGather, and no concurrent-request requirement.",
         )
         omni_config_group.add_argument(
             "--dlo-no-use-allgather",
             dest="dlo_use_allgather",
             action="store_false",
-            help="Disable AllGather: each rank loads full weights independently.",
+            help=(
+                "Disable AllGather and stream standard-loader rank-local weights "
+                "independently (including existing TP shards)."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-resident-layers",
+            type=int,
+            default=0,
+            help="Keep this many leading main-DiT blocks resident on the device "
+            "while distributed layerwise offload streams the remaining blocks.",
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-host-registration-limit-gib",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
+                "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
+                "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
@@ -750,13 +864,12 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)
@@ -872,8 +985,6 @@ def run_headless(args: TrackingNamespace) -> None:
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
-        # The serve CLI no longer accepts legacy stage_args YAMLs.
-        None,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.
@@ -924,6 +1035,9 @@ def run_headless(args: TrackingNamespace) -> None:
     # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
     # bracket each replica's spawn below with setup_stage_devices so they
     # don't all stack on cuda:0 (see ``per_replica_devices`` above).
+    # Headless startup still supplies the legacy OmegaConf stage shape through
+    # the stable adapter entry point. The implementation switches only when
+    # RFC #4021 threads structured stage configs through the launch plan.
     engine_args_dict = build_engine_args_dict(
         stage_cfg,
         model,

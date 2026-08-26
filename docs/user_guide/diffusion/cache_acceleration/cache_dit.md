@@ -6,6 +6,7 @@
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
+- [Request-Scoped Quality](#request-scoped-quality-minimax-h3)
 - [Acceleration Methods](#acceleration-methods)
 - [Configuration Parameters](#configuration-parameters)
 - [Best Practices](#best-practices)
@@ -139,6 +140,43 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --cache-backend cache_dit \
   --cache-config '{"Fn_compute_blocks": 1, "residual_diff_threshold": 0.12}'
 ```
+
+## Request-Scoped Quality (MiniMax H3)
+
+MiniMax H3 can switch Cache-DiT at the request boundary without enabling a
+cache backend at server startup. Add a quality field to an online request:
+
+```bash
+# Native reference path for this request.
+-F 'quality=lossless'
+
+# H3's conservative Cache-DiT profile for this request.
+-F 'quality=high'
+```
+
+For offline inference, set the same field on the sampling parameters:
+
+```python
+OmniDiffusionSamplingParams(
+    quality="high",
+    num_inference_steps=50,
+    extra_args={"task": "t2va", "duration": 5.0, "audio_flow_shift": 3.0},
+)
+```
+
+| Server startup | Request quality | Behavior |
+|---|---|---|
+| `--cache-backend cache_dit` | omitted | Use or restore the startup Cache-DiT profile |
+| `--cache-backend cache_dit` | `lossless` | Remove Cache-DiT hooks and run the reference path |
+| `--cache-backend cache_dit` | `high` | Use or install H3's conservative Cache-DiT profile |
+| no Cache-DiT | omitted or `lossless` | Run the reference path |
+| no Cache-DiT | `high` | Install H3's conservative Cache-DiT profile |
+
+The startup option is only needed when omitted-quality requests should use the
+server-configured Cache-DiT profile by default.
+
+See the [MiniMax H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
+for a complete request and measured trade-off.
 
 ---
 

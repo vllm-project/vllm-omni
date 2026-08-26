@@ -1,0 +1,86 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100",
+            "npu": "A3"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-realtime-tts",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          1
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "seed_tts_turns_per_session": 4,
+        "expected_duplex_audio_turns_per_session": 4,
+        "extra_body": {
+          "save_duplex_request_metrics": true
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "request_throughput": [
+              0.3038
+            ],
+            "mean_ttft_ms": [
+              139.997
+            ],
+            "mean_e2el_ms": [
+              3269.8807
+            ],
+            "mean_audio_ttfp_ms": [
+              456.073
+            ],
+            "mean_audio_rtf": [
+              0.2254
+            ]
+          },
+          "A3": {
+            "request_throughput": [
+              0.1594
+            ],
+            "mean_ttft_ms": [
+              274.164
+            ],
+            "mean_e2el_ms": [
+              6250.7696
+            ],
+            "mean_audio_ttfp_ms": [
+              994.422
+            ],
+            "mean_audio_rtf": [
+              0.46163
+            ]
+          }
+        }
+      }
+    ]
+  }
+]

@@ -36,7 +36,13 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
     assert MiniMaxH3DiTModel._layerwise_offload_blocks_attrs == ["blocks"]
     assert MiniMaxH3DiTModel._cache_dit_adapter_config.block_forward_patterns["blocks"] == ForwardPattern.Pattern_3
     assert not MiniMaxH3DiTModel._cache_dit_adapter_config.has_separate_cfg
-    assert set(MiniMaxH3DiTModel._sp_plan) == {"sp_prepare", "sp_gather"}
+    assert set(MiniMaxH3DiTModel._sp_plan) == {
+        "sp_prepare",
+        "local_sp_prepare",
+        "sp_gather",
+    }
+    assert set(MiniMaxH3DiTModel._sp_plan["sp_prepare"]) == {0, 1, 2}
+    assert set(MiniMaxH3DiTModel._sp_plan["local_sp_prepare"]) == {2}
 
     model = object.__new__(MiniMaxH3DiTModel)
     nn.Module.__init__(model)
@@ -59,6 +65,307 @@ def test_packed_attention_is_a_regional_compile_boundary():
     )
 
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
+
+
+def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
+    from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    attention = object.__new__(MiniMaxH3Attention)
+    nn.Module.__init__(attention)
+    attention.rot_dim = 96
+    attention.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
+    attention.rope._forward_method = attention.rope.forward_native
+
+    x = torch.randn(11, 3, 128, dtype=torch.bfloat16)
+    freqs_half = torch.randn(11, 48)
+    freqs = torch.cat((freqs_half, freqs_half), dim=-1)
+    actual = attention._apply_rope(x, freqs)
+
+    cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)
+    sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
+    x_rot = x[..., :96]
+    x1, x2 = x_rot.chunk(2, dim=-1)
+    expected_rot = x_rot * cos + torch.cat((-x2, x1), dim=-1) * sin
+    expected = torch.cat((expected_rot, x[..., 96:]), dim=-1)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual[..., 96:], x[..., 96:], atol=0, rtol=0)
+
+
+def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _build_rope_table,
+    )
+
+    local_freqs_half = torch.randn(2, 48)
+    local_freqs = torch.cat((local_freqs_half, local_freqs_half), dim=-1)
+
+    actual = _build_rope_table(local_freqs)
+    expected = torch.cat(
+        (torch.cos(local_freqs_half), torch.sin(local_freqs_half)),
+        dim=-1,
+    ).to(torch.bfloat16)
+
+    assert actual.shape == (2, 96)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_strict_sp_local_span_uses_rank_owned_rows(monkeypatch):
+    from vllm_omni.diffusion import forward_context
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_ulysses_mode", lambda **kwargs: "strict")
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 3)
+    monkeypatch.setattr(parallel_state, "get_ulysses_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_allgather_parallel_world_size", lambda: 1)
+
+    assert h3._sequence_parallel_local_span(16, hooks_applied=True) == (6, 2)
+
+
+@pytest.mark.parametrize(
+    ("hooks_applied", "mode", "seq_len", "ulysses", "ring", "allgather"),
+    [
+        (False, "strict", 16, 8, 1, 1),
+        (True, "advanced_uaa", 16, 8, 1, 1),
+        (True, "strict", 17, 8, 1, 1),
+        (True, "strict", 16, 4, 2, 1),
+        (True, "strict", 16, 1, 1, 8),
+    ],
+)
+def test_local_span_falls_back_when_local_embedding_is_unsafe(
+    monkeypatch,
+    hooks_applied,
+    mode,
+    seq_len,
+    ulysses,
+    ring,
+    allgather,
+):
+    from vllm_omni.diffusion import forward_context
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_ulysses_mode", lambda **kwargs: mode)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 3)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_ulysses_parallel_world_size",
+        lambda: ulysses,
+    )
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: ring)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_allgather_parallel_world_size",
+        lambda: allgather,
+    )
+
+    assert h3._sequence_parallel_local_span(seq_len, hooks_applied=hooks_applied) == (
+        0,
+        seq_len,
+    )
+
+
+def test_local_embedding_spans_reassemble_multimodal_rows():
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    class _IdentityProjection(nn.Module):
+        def forward(self, x):
+            return x, None
+
+    class _IdentityRefiner(nn.Module):
+        def forward(self, x, **kwargs):
+            return x
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.hidden_size = 2
+    model.video_patch_proj = _IdentityProjection()
+    model.audio_patch_proj = _IdentityProjection()
+    model.condition_proj = _IdentityProjection()
+    model.token_refiner = _IdentityRefiner()
+    model.time_embedder = nn.Identity()
+
+    seq_len = 16
+    x = torch.arange(seq_len * 2, dtype=torch.float32).reshape(1, seq_len, 2)
+    audio_x = x + 100
+    text = torch.tensor(
+        [[200.0, 201.0], [202.0, 203.0], [204.0, 205.0], [206.0, 207.0]],
+        dtype=torch.bfloat16,
+    )
+    common = {
+        "x": x,
+        "audio_x": audio_x,
+        "text_embeddings_selected": text,
+        "unique_timesteps": torch.tensor([0.2, 0.3]),
+        "img_pos": torch.tensor([1, 2, 6, 7, 11, 12]),
+        "audio_pos": torch.tensor([3, 4, 8, 9, 13, 14]),
+        "text_pos": torch.tensor([0, 5, 10, 15]),
+        "refiner_cu_seqlens": torch.tensor([0, 4, 4], dtype=torch.int32),
+        "refiner_max_seqlen": 4,
+        "seq_len": seq_len,
+        "device": torch.device("cpu"),
+        "local_span": (0, seq_len),
+    }
+
+    full, full_t_emb = model._embed(**common)
+    local_spans = []
+    for rank in range(8):
+        local_span = (rank * (seq_len // 8), seq_len // 8)
+        local, local_t_emb = model._embed(
+            **{
+                **common,
+                "local_span": local_span,
+            }
+        )
+        assert local.shape == (2, 2)
+        torch.testing.assert_close(local_t_emb, full_t_emb)
+        local_spans.append(local)
+
+    torch.testing.assert_close(torch.cat(local_spans), full, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "local_projection",
+    [False, True],
+    ids=["fallback", "strict-local"],
+)
+def test_sp_output_boundary_preserves_logits_and_minimizes_gather(
+    monkeypatch,
+    local_projection,
+):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    class _StaticRope(nn.Module):
+        input_rows = None
+
+        def forward(self, position_ids):
+            self.input_rows = position_ids.shape[1]
+            return torch.zeros(position_ids.shape[1], 6)
+
+    class _Prepare(nn.Module):
+        def __init__(self, shard):
+            super().__init__()
+            self.shard = shard
+
+        def forward(self, hidden, rope, combined):
+            local_len = hidden.shape[0] // 2 if self.shard else hidden.shape[0]
+            return hidden[:local_len], rope[:local_len], combined[:local_len]
+
+    class _Gather(nn.Module):
+        def __init__(self, remote_rows, replace):
+            super().__init__()
+            self.remote_rows = remote_rows
+            self.replace = replace
+            self.input_width = None
+
+        def forward(self, tensor):
+            self.input_width = tensor.shape[-1]
+            if self.replace:
+                return self.remote_rows
+            return torch.cat((tensor, self.remote_rows), dim=0)
+
+    class _FinalLayer(nn.Module):
+        def forward(self, hidden, *, t_emb, inverse_indices):
+            del t_emb
+            inverse = inverse_indices.to(torch.float32).unsqueeze(-1)
+            return (
+                hidden[:, :2].to(torch.float32) + inverse,
+                hidden[:, 2:3].to(torch.float32) - inverse,
+            )
+
+    seq_len = 8
+    full_hidden = torch.arange(seq_len * 4, dtype=torch.bfloat16).reshape(seq_len, 4)
+    inverse_indices = torch.tensor([0, 1, 0, 1, 1, 0, 1, 0])
+    final_layer = _FinalLayer()
+    remote_video, remote_audio = final_layer(
+        full_hidden[seq_len // 2 :],
+        t_emb=torch.empty(0),
+        inverse_indices=inverse_indices[seq_len // 2 :],
+    )
+    if local_projection:
+        remote_rows = torch.cat((remote_video, remote_audio), dim=-1)
+    else:
+        remote_rows = full_hidden
+    gather = _Gather(remote_rows, replace=not local_projection)
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = h3.MiniMaxH3DiTArchConfig(
+        latents_dim=2,
+        audio_latents_dim=1,
+        patch_size=(1, 1, 1),
+    )
+    rope = _StaticRope()
+    model.rope = rope
+    model.sp_prepare = _Prepare(shard=True)
+    model.local_sp_prepare = _Prepare(shard=False)
+    model.sp_gather = gather
+    model.blocks = nn.ModuleList()
+    model.final_layer = final_layer
+    monkeypatch.setattr(
+        model,
+        "_embed",
+        lambda **kwargs: (
+            full_hidden[: seq_len // 2] if local_projection else full_hidden,
+            torch.tensor([[0.5]], dtype=torch.float32),
+        ),
+    )
+
+    def _local_span(*args, **kwargs):
+        del args, kwargs
+        return (0, seq_len // 2) if local_projection else (0, seq_len)
+
+    monkeypatch.setattr(
+        h3,
+        "_sequence_parallel_local_span",
+        _local_span,
+    )
+
+    img_pos = torch.tensor([0, 2, 4, 6])
+    audio_pos = torch.tensor([1, 3, 5, 7])
+    video, audio = model(
+        x=torch.zeros(1, seq_len, 2),
+        audio_x=torch.zeros(1, seq_len, 1),
+        img_position_ids=torch.zeros(1, seq_len, 3, dtype=torch.long),
+        unique_timesteps=torch.tensor([0.5]),
+        inverse_indices=inverse_indices,
+        update_mask=torch.ones(img_pos.numel()),
+        token_tags=torch.zeros(seq_len, dtype=torch.long),
+        prompt_embeds=torch.empty(0, 2),
+        img_pos_info={"position_ids": img_pos},
+        audio_pos_info={"position_ids": audio_pos},
+        text_pos_info={"position_ids": torch.empty(0, dtype=torch.long)},
+        img_pos_for_infer_output_info={"position_ids": img_pos},
+        packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, seq_len, seq_len], dtype=torch.int32),
+            "max_seqlen_q": seq_len,
+        },
+        refiner_packed_seq_params={
+            "cu_seqlens_q": torch.tensor([0, 0, 0], dtype=torch.int32),
+            "max_seqlen_q": 0,
+        },
+    )
+
+    expected_video, expected_audio = final_layer(
+        full_hidden,
+        t_emb=torch.empty(0),
+        inverse_indices=inverse_indices,
+    )
+    torch.testing.assert_close(video, expected_video.index_select(0, img_pos))
+    torch.testing.assert_close(audio, expected_audio.index_select(0, audio_pos))
+    expected_gather_width = 3 if local_projection else full_hidden.shape[-1]
+    expected_rope_rows = seq_len // 2 if local_projection else seq_len
+    assert gather.input_width == expected_gather_width
+    assert rope.input_rows == expected_rope_rows
 
 
 @pytest.mark.parametrize(

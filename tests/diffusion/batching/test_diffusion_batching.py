@@ -125,7 +125,7 @@ def _extract_images(output: OmniRequestOutput) -> list:
         return output.images
     # When the output comes from the orchestrator pipeline, images may be
     # nested inside request_output.
-    inner = getattr(output, "request_output", None)
+    inner = output
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images
     return []
@@ -260,7 +260,7 @@ async def compare_single_vs_parallel(
 ) -> None:
     """Run the same prompts sequentially then in parallel and print a comparison."""
 
-    omni = AsyncOmni(model=model, diffusion_batch_size=batch_size)
+    omni = AsyncOmni(model=model, max_num_seqs=batch_size, diffusion_batch_size=batch_size)
     try:
         await warmup(omni, WARMUP_PROMPTS)
         single_time = await run_single(omni, prompts)
@@ -288,7 +288,7 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
         await compare_single_vs_parallel(model, prompts, batch_size=batch_size)
         return
 
-    omni = AsyncOmni(model=model, diffusion_batch_size=batch_size)
+    omni = AsyncOmni(model=model, max_num_seqs=batch_size, diffusion_batch_size=batch_size)
     try:
         await warmup(omni, WARMUP_PROMPTS)
 
@@ -524,7 +524,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E2E diffusion concurrent benchmark / validation")
     parser.add_argument("--model", type=str, required=True, help="Model name or path")
     parser.add_argument("--num-prompts", type=int, default=8, help="Number of prompts to run")
-    parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Scheduler in-flight width (--max-num-seqs) and client diffusion_batch_size",
+    )
     parser.add_argument(
         "--mode",
         choices=["batch", "single", "compare", "validate"],

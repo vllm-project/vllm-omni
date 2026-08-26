@@ -139,29 +139,57 @@ class LayerwiseOffloadHook(ModelHook):
             weights_with_local = []
             for name, t in name2weights.items():
                 local_t = t.to_local() if hasattr(t, "to_local") else t
-                weights_with_local.append((name, t, local_t))
-            total_numel = sum(local.numel() for _, _, local in weights_with_local)
+                stride = local_t.stride()
+                storage_numel = (
+                    0
+                    if local_t.numel() == 0
+                    else 1 + sum((size - 1) * axis_stride for size, axis_stride in zip(local_t.shape, stride))
+                )
+                weights_with_local.append((name, t, local_t, storage_numel, stride))
+            total_numel = sum(storage_numel for _, _, _, storage_numel, _ in weights_with_local)
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
             current_offset = 0
-            for name, original_tensor, local_tensor in weights_with_local:
-                numel = local_tensor.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(local_tensor.flatten())
+            for (
+                name,
+                original_tensor,
+                local_tensor,
+                storage_numel,
+                stride,
+            ) in weights_with_local:
+                if local_tensor.is_contiguous():
+                    flat_storage = local_tensor.flatten()
+                else:
+                    # Cutlass FP8 weights use a transposed physical layout.
+                    # Preserve it across the flattened CPU staging buffer.
+                    flat_storage = torch.zeros(
+                        storage_numel,
+                        dtype=dtype,
+                        device=local_tensor.device,
+                    )
+                    physical_view = torch.as_strided(
+                        flat_storage,
+                        size=local_tensor.shape,
+                        stride=stride,
+                    )
+                    physical_view.copy_(local_tensor)
+                cpu_tensor[current_offset : current_offset + storage_numel].copy_(flat_storage)
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
                     {
                         "name": name,
                         "offset": current_offset,
-                        "numel": numel,
+                        "numel": storage_numel,
                         "shape": local_tensor.shape,
+                        "stride": stride,
                     }
                 )
 
                 LayerwiseOffloadHook._set_tensor_storage(
                     original_tensor, LayerwiseOffloadHook._make_offload_placeholder(original_tensor)
                 )
-                current_offset += numel
+                current_offset += storage_numel
 
             dtype_cpu_flattened_weights[dtype] = cpu_tensor
 
@@ -210,7 +238,11 @@ class LayerwiseOffloadHook(ModelHook):
 
                 LayerwiseOffloadHook._set_tensor_storage(
                     target_param_or_buf,
-                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
+                    torch.as_strided(
+                        gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]],
+                        size=metadata["shape"],
+                        stride=metadata["stride"],
+                    ),
                 )
 
         self._prefetch_done = evt

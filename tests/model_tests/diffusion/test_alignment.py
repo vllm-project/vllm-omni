@@ -21,32 +21,33 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # if you are adding a new model and see the tests below fail, please follow the pattern
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
-    "QwenImageEditPipeline",
-    "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
     "WanPipeline",
+    "WanDMDPipeline",
     "WanVACEPipeline",
+    "LTX2TwoStagePipeline",
+    "LTX2DistilledOneStagePipeline",
+    "LTX2DistilledTwoStagePipeline",
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
     "MiniMaxH3Pipeline",
+    "MiniMaxH3ModularPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
     "WanI2VDMD2Pipeline",
-    "LongCatImagePipeline",
+    "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
     "LancePipeline",
     "MingImagePipeline",
     "InternVLAA1Pipeline",
-    "LongCatImageEditPipeline",
     "StableDiffusion3Pipeline",
-    "FluxKontextPipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
@@ -56,24 +57,31 @@ EXCLUDED_MODELS = [
     "OmniGen2Pipeline",
     "HeliosPipeline",
     "HeliosPyramidPipeline",
-    "DreamIDOmniPipeline",
     "SenseNovaU1Pipeline",
-    "AudioXPipeline",
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
-    "MagiHumanPipeline",
+    # The common harness does not yet define an image-to-video task or supply
+    # an input image. SANA I2V is covered by
+    # tests/diffusion/models/sana_video/test_pipeline_sana_video.py and
+    # tests/e2e/online_serving/test_sana_video_expansion.py. SANA T2V is exercised through
+    # the common tiny-model setting in model_settings.py.
+    "SanaImageToVideoPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated contract tests and real-checkpoint E2E smoke instead.
+    "LingBotWorldCausalDMDPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamImagePipeline",
+    "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
-    "SoulXSingerPipeline",
-    "SoulXSingerSVCPipeline",
+    "Pi0Pipeline",
+    "SanaWmPipeline",
 ]
 
 

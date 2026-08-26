@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable Realtime WebSocket, PCM, and event helpers for MiniCPM-o demos."""
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from vllm_omni.metrics.definitions import compute_audio_rtf
+
 try:
     import websockets
     from websockets.exceptions import ConnectionClosed
@@ -26,6 +31,13 @@ PCM16_BYTES_PER_SAMPLE = 2
 
 def _rounded_ms(value: float) -> float:
     return round(float(value), 3)
+
+
+def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and (not nonnegative or parsed >= 0) else None
 
 
 def _interval_summary(values: list[float]) -> dict[str, float | int]:
@@ -43,6 +55,26 @@ def _interval_summary(values: list[float]) -> dict[str, float | int]:
         "p50": nearest_rank(0.50),
         "p95": nearest_rank(0.95),
         "max": clean[-1],
+    }
+
+
+def summarize_session_request_metrics(
+    request_metrics: list[dict[str, object]],
+    *,
+    session_id: str | None,
+) -> dict[str, object]:
+    """Average client-observed metrics across turns that emitted audio."""
+
+    def mean(metric: str, *, digits: int = 3) -> float | None:
+        values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
+        return round(sum(values) / len(values), digits) if values else None
+
+    return {
+        "session_id": session_id,
+        "audio_turn_count": len(request_metrics),
+        "mean_ttft_ms": mean("ttft_ms"),
+        "mean_ttfp_ms": mean("ttfp_ms"),
+        "mean_rtf": mean("rtf", digits=6),
     }
 
 
@@ -67,22 +99,55 @@ def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
 
 def build_realtime_url(
     url: str,
-    model: str,
+    model: str | None,
     *,
     autostart: bool | None = None,
+    native_duplex: bool | None = True,
     session_id: str | None = None,
 ) -> str:
     """Add the explicit native-duplex query parameters to a Realtime URL."""
     parts = urlsplit(url)
+    if parts.scheme in {"http", "https"}:
+        parts = parts._replace(scheme="ws" if parts.scheme == "http" else "wss")
+    if parts.scheme not in {"ws", "wss"} or not parts.netloc:
+        raise ValueError(f"Unsupported Realtime URL: {url!r}")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.setdefault("duplex", "1")
-    query.setdefault("model", model)
-    query.setdefault("minicpmo45_native_duplex", "1")
+    query["duplex"] = "1"
+    if model:
+        query["model"] = model
+    if native_duplex is not None:
+        query["minicpmo45_native_duplex"] = "1" if native_duplex else "0"
     if autostart is not None:
-        query.setdefault("autostart", "1" if autostart else "0")
+        query["autostart"] = "1" if autostart else "0"
     if session_id:
-        query.setdefault("session_id", session_id)
+        query["session_id"] = session_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def reference_audio_data_url(path: str | None) -> str | None:
+    """Encode a local reference WAV for a Realtime session update."""
+    if path is None:
+        return None
+    audio = Path(path).expanduser().resolve()
+    if not audio.is_file():
+        raise FileNotFoundError(f"Reference audio does not exist: {audio}")
+    return "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
+
+
+def chunk_period_ms(events: list[dict[str, object]], *, default: int = 1000) -> int:
+    """Read the negotiated native-duplex model-unit duration."""
+    for event in reversed(events):
+        session = event.get("session")
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        value = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return default
+
+
+def has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    return bool(unit_bytes and len(pcm16) % unit_bytes)
 
 
 def read_pcm16_wav(path: Path) -> bytes:
@@ -176,6 +241,20 @@ class RealtimeEventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
+    def response_text(self, response_id: str) -> str:
+        """Join all text/transcript deltas for one response identity."""
+        return "".join(
+            str(event.get("delta") or "")
+            for event in self.events
+            if self.response_id(event) == response_id
+            and event.get("type")
+            in {
+                "response.audio_transcript.delta",
+                "response.output_text.delta",
+                "response.text.delta",
+            }
+        )
+
     def errors(self) -> list[dict[str, object]]:
         return [event for event in self.events if event.get("type") == "error"]
 
@@ -205,10 +284,12 @@ class RealtimeEventCollector:
         after_s: float,
         input_committed_at_s: float | None = None,
         response_id: str | None = None,
+        measurement_origin: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
         stage0_metrics: dict[str, object] | None = None
         response_created_at_s: float | None = None
+        first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
         cumulative_audio_ms: list[float] = []
         for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
@@ -219,6 +300,18 @@ class RealtimeEventCollector:
                 continue
             if event.get("type") == "response.created" and response_created_at_s is None:
                 response_created_at_s = received_at_s
+            if (
+                event.get("type")
+                in {
+                    "response.audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
 
             stage_metrics = _event_stage_metrics(event)
             stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
@@ -242,15 +335,16 @@ class RealtimeEventCollector:
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (
-                [float(value) for value in raw_itls if isinstance(value, int | float)]
+                [parsed for value in raw_itls if (parsed := _finite_number(value, nonnegative=True)) is not None]
                 if isinstance(raw_itls, list)
                 else []
             )
             result["stage0_tokens"] = {
                 "source": "engine_stage_metrics",
-                "output_token_count": int(stage0_metrics.get("num_tokens_out") or 0),
-                "ttft_ms": float(stage0_metrics.get("vllm_ttft_ms") or 0.0),
-                "tpot_ms": float(stage0_metrics.get("vllm_tpot_ms") or 0.0),
+                "output_token_count": int(_finite_number(stage0_metrics.get("num_tokens_out"), nonnegative=True) or 0),
+                "ttft_ms": _finite_number(stage0_metrics.get("vllm_ttft_ms"), nonnegative=True) or 0.0,
+                "tpot_ms": _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True),
+                "itls_ms": itls,
                 "inter_token_interval_ms": _interval_summary(itls),
             }
 
@@ -283,21 +377,71 @@ class RealtimeEventCollector:
                 "chunk_duration_ms": _interval_summary(chunk_durations_ms),
                 "max_chunk_gap_ms": interval_summary["max"],
             }
+            request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
+            if request_started_at_s is not None:
+                audio_duration_ms = (
+                    max(cumulative_audio_ms)
+                    if cumulative_audio_ms
+                    else len(self.audio_bytes(response_id))
+                    * 1000.0
+                    / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
+                )
+                audio_generation_ms = max(
+                    0.0,
+                    (audio_received_at_s[-1] - request_started_at_s) * 1000.0,
+                )
+                result["request_metrics"] = {
+                    "source": "client_monotonic_receive",
+                    "measurement_origin": measurement_origin
+                    or {
+                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                    },
+                    "ttft_ms": (
+                        _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                        if first_text_received_at_s is not None
+                        else None
+                    ),
+                    "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
+                    "rtf": round(
+                        compute_audio_rtf(
+                            audio_generation_ms / 1000.0,
+                            audio_duration_ms / 1000.0,
+                        ),
+                        6,
+                    )
+                    if audio_duration_ms > 0
+                    else None,
+                    "audio_generation_ms": _rounded_ms(audio_generation_ms),
+                    "audio_duration_ms": _rounded_ms(audio_duration_ms),
+                }
         return result
 
 
 class RealtimeDuplexClient:
     """Small async client used by the user demo and reusable smoke probes."""
 
-    def __init__(self, url: str, *, max_size: int = 64 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        max_size: int = 64 * 1024 * 1024,
+        additional_headers: dict[str, str] | None = None,
+    ) -> None:
         self.url = url
         self.max_size = max_size
+        self.additional_headers = additional_headers
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RealtimeDuplexClient:
-        self._ws = await websockets.connect(self.url, max_size=self.max_size)
+        self._ws = await websockets.connect(
+            self.url,
+            max_size=self.max_size,
+            additional_headers=self.additional_headers,
+        )
         self._reader_task = asyncio.create_task(self._read_events())
         return self
 
@@ -326,15 +470,46 @@ class RealtimeDuplexClient:
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
 
+    def raise_if_reader_stopped(self) -> None:
+        """Fail a caller waiting on events after the WebSocket reader exits."""
+
+        task = self._reader_task
+        if task is None or not task.done():
+            return
+        if task.cancelled():
+            raise ConnectionError("Realtime WebSocket reader was cancelled")
+        error = task.exception()
+        if error is not None:
+            raise ConnectionError("Realtime WebSocket reader failed") from error
+        raise ConnectionError("Realtime WebSocket closed before the requested event arrived")
+
     async def configure(
         self,
         model: str,
         *,
         output_audio_format: str = "pcm16",
         ref_audio: str | None = None,
+        instructions: str | None = None,
+        initial_user_text: str | None = None,
+        native_duplex: bool = True,
+        auto_response: bool = True,
+        temperature: float | None = None,
+        extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
+        idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
+        session_extra_body = dict(extra_body or {})
+        if native_duplex:
+            session_extra_body.update(
+                {
+                    "auto_response": auto_response,
+                    "minicpmo45_native_duplex": True,
+                    "force_listen_count": 0,
+                }
+            )
+        else:
+            session_extra_body["minicpmo45_native_duplex"] = False
         session: dict[str, object] = {
             "model": model,
             "modalities": ["audio", "text"],
@@ -343,19 +518,32 @@ class RealtimeDuplexClient:
             "turn_detection": None,
             "overlap_policy": "listen_only",
             "playback_commit_policy": "ack_only",
-            "extra_body": {
-                "auto_response": True,
-                "minicpmo45_native_duplex": True,
-                "force_listen_count": 0,
-            },
+            "extra_body": session_extra_body,
         }
+        if temperature is not None:
+            session["temperature"] = float(temperature)
         if ref_audio is not None:
             session["ref_audio"] = ref_audio
+        if instructions is not None:
+            session["instructions"] = instructions
+        if initial_user_text is not None:
+            session_extra = session["extra_body"]
+            assert isinstance(session_extra, dict)
+            session_extra["duplex_initial_user_text"] = initial_user_text
         if session_id:
             session["session_id"] = session_id
+        if idle_timeout_s is not None:
+            session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
+
+        def session_created() -> bool:
+            if self.events.count("session.created") > 0:
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: self.events.count("session.created") > 0,
+            session_created,
             timeout_s=timeout_s,
             label="session.created",
         )
@@ -398,20 +586,31 @@ class RealtimeDuplexClient:
             if not pcm16:
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send(
-                {
-                    "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
-            )
+            await self.send_playback_ack(response_id, played_ms)
+
+    async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
+        await self.send(
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
+                "played_ms": played_ms,
+                "committed_ms": played_ms,
+            }
+        )
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
+        from_index = len(self.events.events)
         await self.send({"type": "session.close"})
+
+        def session_closed() -> bool:
+            if any(event.get("type") == "session.closed" for event in self.events.events[from_index:]):
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: self.events.count("session.closed") > 0,
+            session_closed,
             timeout_s=timeout_s,
             label="session.closed",
         )

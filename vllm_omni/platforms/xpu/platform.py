@@ -53,6 +53,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -101,8 +102,20 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def record_device_event(cls) -> torch.Event | None:
+        """Record an XPU event on the current stream to mark tensor readiness.
+
+        Deliberately a device-agnostic ``torch.Event`` rather than a
+        ``torch.xpu.Event``. The consumer (the async diffusion output thread)
+        waits with ``torch.Stream.wait_event`` on a generic ``torch.Stream``,
+        and that C-level binding silently no-ops for a ``torch.xpu.Event``
+        instead of enqueuing the dependency — the side stream then starts its
+        D2H copy while the compute stream is still writing the tensor, so the
+        host reads a partially-written image (garbage rows at the bottom of the
+        output). ``torch.Event`` dispatches through the accelerator hooks and
+        the wait is honored, which is the actual fix.
+        """
         try:
-            event = torch.xpu.Event()
+            event = torch.Event()
             event.record()
             return event
         except Exception:
@@ -129,12 +142,12 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         """Copied from upstream XPUPlatform with inductor-aware logic.
 
         When inductor is active (compiling) use native as the default;
-        otherwise prefer xpu_kernels where available.
+        otherwise prefer vllm_c where available.
         """
         from vllm.config.compilation import CompilationMode
 
         cc = vllm_config.compilation_config
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
-        default = ["native"] if using_inductor else ["xpu_kernels", "native"]
+        default = ["native"] if using_inductor else ["vllm_c", "native"]
 
         return IrOpPriorityConfig.with_default(default)

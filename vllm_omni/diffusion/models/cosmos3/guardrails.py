@@ -65,11 +65,10 @@ except ImportError:
         # ``model_config["guardrails"]`` is False.
         def __init__(self, *args, **kwargs):
             raise ValueError(
-                f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
+                f"The guardrails are enabled but not functional for {self.__class__}. This is most likely due to a"
+                f"missing cosmos-guardrail package. Please install cosmos-guardrail to be compliant with the "
                 "[NVIDIA Open Model License Agreement]"
-                "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
-                f"Please ensure that you are compliant with the license agreement."
-                f"Please install cosmos-guardrail package to enable safety checks."
+                "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)."
             )
 
 

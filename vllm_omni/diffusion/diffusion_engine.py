@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import inspect
+import os
 import queue
 import threading
 import time
@@ -17,18 +19,23 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import PIL.Image
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
+from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
+    get_dummy_run_num_image_inputs,
     image_color_format,
     supports_audio_output,
     supports_multimodal_input,
@@ -49,13 +56,61 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.utils import (
+    diffusion_scheduler_waiting_metrics,
+    extract_diffusion_denoise_ms,
+    extract_diffusion_vae_decode_ms,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+
+
+def _async_output_timeout() -> float:
+    """Seconds to wait for one step's background D2H/SHM copy.
+
+    The copy itself finishes in milliseconds, but it is queued behind the GPU
+    work for that step, so the wall-clock wait tracks step time — a single-GPU
+    box legitimately runs tens of seconds per step on large shapes. A tight
+    bound therefore does not catch a hung engine (worker death and a dead
+    result pump are surfaced by the worker monitor and ``check_health``); it
+    only aborts renders that are still making progress, throwing away the
+    denoise that already completed. The default matches
+    ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+
+    Resolved here rather than at import so a malformed value degrades to the
+    default instead of raising on the request path: this runs inside
+    ``step_streaming``/``add_req_and_wait_for_response``, where a typo in the
+    environment must not start failing generations.
+    """
+    raw = os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV)
+    if raw is None:
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: not a number. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning_once(
+            "Ignoring %s=%r: must be positive. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    return timeout
+
 
 __all__ = [
     "DiffusionEngine",
@@ -116,6 +171,16 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
+    parallel_config = getattr(od_config, "parallel_config", None)
+    dp_size = getattr(parallel_config, "data_parallel_size", 1)
+    return (
+        dp_size > 1
+        and getattr(od_config, "enable_distributed_layerwise_offload", False)
+        and getattr(od_config, "dlo_use_allgather", True)
+    )
+
+
 def _move_tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.cpu() if value.device.type != "cpu" else value
@@ -174,14 +239,55 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        # Set after the paged-KV profile request has gone through model-owned
+        # preprocessing. Real requests are admitted only within this measured
+        # activation envelope: (max execution sequences, max seq_len,
+        # max target_len).
+        self._diffusion_kv_profile_limits: tuple[int, int, int] | None = None
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
-        self._init_scheduler(od_config, scheduler)
-        self._init_runtime_state()
-        self._init_execute_fn()
-        self._log_execution_mode(od_config)
+        try:
+            profile_requests = self._prepare_diffusion_kv_profile_requests()
+            kv_control_plane = initialize_diffusion_kv_control_plane(
+                self.executor,
+                od_config,
+                profile_requests=profile_requests,
+            )
+            if kv_control_plane is None:
+                self._init_scheduler(od_config, scheduler)
+            else:
+                (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                ) = kv_control_plane
+                self._init_scheduler(
+                    od_config,
+                    scheduler,
+                    kv_cache_config,
+                    scheduler_block_size=scheduler_block_size,
+                    hash_block_size=hash_block_size,
+                    kv_vllm_config=kv_vllm_config,
+                )
+            self._init_runtime_state()
+            self._init_execute_fn()
+            self._log_execution_mode(od_config)
+        except Exception:
+            # close() cannot be used because runtime synchronization state may not exist yet.
+            scheduler_to_close = getattr(self, "scheduler", None)
+            if scheduler_to_close is not None:
+                try:
+                    scheduler_to_close.close()
+                except Exception:
+                    logger.exception("Failed to close Scheduler after DiffusionEngine initialization failed")
+            try:
+                self.executor.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down Executor after DiffusionEngine initialization failed")
+            raise
 
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
@@ -202,7 +308,7 @@ class DiffusionEngine:
             return DiffusionExecutionMode.STEP_BATCH
 
         self.supports_request_batch = supports_request_batch(od_config)
-        if not self.supports_request_batch and _max_num_seqs(od_config) > 1:
+        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
             raise ValueError(
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
                 "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
@@ -218,6 +324,11 @@ class DiffusionEngine:
         self,
         od_config: OmniDiffusionConfig,
         scheduler: BaseScheduler | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         if scheduler is not None:
             self.scheduler = scheduler
@@ -225,7 +336,16 @@ class DiffusionEngine:
             self.scheduler = StepScheduler()
         else:
             self.scheduler = RequestScheduler()
-        self.scheduler.initialize(od_config)
+        if kv_cache_config is None:
+            self.scheduler.initialize(od_config)
+        else:
+            self.scheduler.initialize(
+                od_config,
+                kv_cache_config=kv_cache_config,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                kv_vllm_config=kv_vllm_config,
+            )
 
     def _init_runtime_state(self) -> None:
         # DP multi-concurrency: allow batching dp_size requests so each
@@ -233,17 +353,10 @@ class DiffusionEngine:
         # for distributed layerwise offload (which shards weights and
         # needs all ranks active simultaneously).  Ordinary DP with a
         # non-batch pipeline should not schedule multiple requests.
-        dp_size = 1
-        if getattr(self.od_config, "parallel_config", None) is not None:
-            dp_size = getattr(self.od_config.parallel_config, "data_parallel_size", 1)
-        dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-        if dp_size > 1 and dist_offload:
+        dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
+        if _uses_dlo_dp_concurrency(self.od_config):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
-            # Set batch admission wait so concurrent requests accumulate
-            # before scheduling.  The scheduler reads this from od_config.
-            if getattr(self.od_config, "request_batch_max_wait_ms", 0) == 0:
-                self.od_config.request_batch_max_wait_ms = 500.0
             logger.info(
                 "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
                 dp_size,
@@ -267,6 +380,9 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # Copied onto the existing output metrics payload so queue monitoring
+        # reuses the normal diffusion result path without additional IPC.
+        self._scheduler_num_waiting_reqs = 0
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -307,22 +423,43 @@ class DiffusionEngine:
         diffusion_engine_start_time = time.perf_counter()
 
         preprocess_time = 0.0
-        if self.pre_process_func is not None:
-            preprocess_start_time = time.perf_counter()
-            request = self.pre_process_func(request)
+        has_preprocessor = getattr(self, "pre_process_func", None) is not None
+        preprocess_start_time = time.perf_counter() if has_preprocessor else None
+        request = self._prepare_request_for_admission(request)
+        if preprocess_start_time is not None:
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
-        generator = self.async_add_req_and_stream_response(request)
+        request_id = self._add_prepared_request(request)
+        generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
-                output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                timeout = _async_output_timeout()
+                try:
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+                except (TimeoutError, asyncio.TimeoutError):
+                    describe = getattr(self.executor, "describe_pending_state", None)
+                    logger.error(
+                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                        "to allow slower steps. Executor state: %s",
+                        timeout,
+                        _ASYNC_OUTPUT_TIMEOUT_ENV,
+                        describe(output.async_output_id) if describe else "unavailable",
+                    )
+                    raise
             postprocess_start_time = time.perf_counter()
-            formatted_outputs = self.postprocess_output(request, output)
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
+            try:
+                formatted_outputs = self.postprocess_output(request, output)
+            except Exception as exc:
+                # Preserve the latest scheduler snapshot across terminal
+                # abort/error paths, which do not produce formatted outputs.
+                setattr(exc, "diffusion_metrics", scheduler_metrics)
+                raise
             postprocess_time = time.perf_counter() - postprocess_start_time
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
@@ -334,14 +471,24 @@ class DiffusionEngine:
                 step_total_ms,
             )
             for request_output in formatted_outputs:
-                request_output.metrics.update(
-                    {
-                        "preprocess_time_ms": preprocess_time * 1000,
-                        "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                        "diffusion_engine_total_time_ms": step_total_ms,
-                        "postprocess_time_ms": postprocess_time * 1000,
-                    }
-                )
+                metrics_update = {
+                    "preprocess_time_ms": preprocess_time * 1000,
+                    "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "postprocess_time_ms": postprocess_time * 1000,
+                    **scheduler_metrics,
+                }
+                if request.scheduler_queue_wait_ms is not None:
+                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                vae_decode_ms = extract_diffusion_vae_decode_ms(output)
+                if vae_decode_ms is not None:
+                    metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                forward_ms = extract_diffusion_denoise_ms(output)
+                if forward_ms is not None:
+                    metrics_update["forward_time_ms"] = forward_ms
+                kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
+                if kv_recv_ms > 0:
+                    metrics_update["kv_recv_time_ms"] = kv_recv_ms
+                request_output.metrics.update(metrics_update)
             yield formatted_outputs
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
@@ -429,10 +576,10 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.supports_request_batch or self.dp_concurrent:
-                    self._wait_for_request_batch_admission_locked()
+                self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
+                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
@@ -464,53 +611,39 @@ class DiffusionEngine:
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
 
-    def _wait_for_request_batch_admission_locked(self) -> None:
-        """Wait for compatible requests to accumulate before scheduling a wave.
+    def _wait_for_admission_if_needed_locked(self) -> None:
+        """Apply scheduler admission policy while holding the engine condition.
 
         Caller must hold ``self._cv``.
         """
-        if self.step_execution or (not self.supports_request_batch and not self.dp_concurrent):
-            return
-
-        max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
-        if max_wait_s == 0:
-            return
-
-        max_batch = self.scheduler.max_num_running_reqs
-        waiting = self.scheduler.num_waiting_requests()
-        running = self.scheduler.num_running_requests()
-
-        if running > 0:
-            return
-
         start = time.monotonic()
-        deadline = start + max_wait_s
+        decision = self.scheduler.get_admission_wait_decision(
+            now=start,
+            dp_concurrent=self.dp_concurrent,
+        )
+        if not decision.should_wait:
+            return
+
         last_waiting = -1
         stable_since = start
-        # For dp_concurrent, use a longer stable window so all dp_size
-        # HTTP requests have time to land before scheduling.
-        if self.dp_concurrent:
-            stable_window_s = min(0.3, max_wait_s / 2.0)
-        else:
-            stable_window_s = min(0.05, max_wait_s / 5.0)
 
         while not self.stop_event.is_set():
             waiting = self.scheduler.num_waiting_requests()
             now = time.monotonic()
 
-            if waiting >= max_batch:
-                break
-            if waiting > 0 and (now - stable_since) >= stable_window_s:
-                break
-            if now >= deadline:
-                break
-
             if waiting > last_waiting:
                 stable_since = now
                 last_waiting = waiting
 
-            remaining = deadline - now
-            self._cv.wait(timeout=min(remaining, 0.002))
+            if self.scheduler.should_end_admission_wait(
+                decision,
+                now=now,
+                stable_since=stable_since,
+            ):
+                break
+
+            remaining = decision.deadline - now if decision.deadline is not None else 0.002
+            self._cv.wait(timeout=min(max(remaining, 0.0), 0.002))
 
         waited_ms = (time.monotonic() - start) * 1000.0
         final_waiting = self.scheduler.num_waiting_requests()
@@ -518,7 +651,7 @@ class DiffusionEngine:
             logger.info(
                 "[RequestBatch] admission wait done waiting=%d max_batch=%d waited_ms=%.1f",
                 final_waiting,
-                max_batch,
+                decision.max_batch,
                 waited_ms,
             )
 
@@ -574,12 +707,25 @@ class DiffusionEngine:
             if not task.future.done():
                 task.future.set_exception(exc)
 
+    def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
+        """Clear terminal Worker rows while Scheduler owns the allocations."""
+
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or not is_scheduler_paged_kv_mode(
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        ):
+            return
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if unique_request_ids:
+            self.executor.remove_diffusion_kv_requests(unique_request_ids)
+
     def _emit_finished_outputs(
         self,
         finished_ids: set[str],
         runner_output: BaseRunnerOutput | None = None,
         missing_result_error: str = "Diffusion execution finished without a final output",
     ) -> None:
+        self._remove_diffusion_kv_requests(finished_ids)
         for rid in finished_ids:
             if runner_output is not None:
                 _output = runner_output.get_request_output(rid)
@@ -598,6 +744,8 @@ class DiffusionEngine:
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             self._emit_finished_outputs(finished_ids, runner_output)
             return
+
+        self._remove_diffusion_kv_requests(finished_ids)
 
         delivered_finished_req_ids: set[str] = set()
 
@@ -686,7 +834,44 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
-    def add_request(self, request: OmniDiffusionRequest) -> str:
+    def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        """Run model-owned preprocessing once, before entering Engine locks."""
+
+        pre_process_func = getattr(self, "pre_process_func", None)
+        if pre_process_func is not None:
+            request = pre_process_func(request)
+        self._validate_diffusion_kv_profile_limits(request)
+        return request
+
+    def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
+        """Keep admitted paged-KV requests within the profiled activation shape."""
+
+        profile_limits = getattr(self, "_diffusion_kv_profile_limits", None)
+        if profile_limits is None:
+            return
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            return
+
+        request_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        if any(actual > profiled for actual, profiled in zip(request_limits, profile_limits, strict=True)):
+            request_sequences, request_seq_len, request_target_len = request_limits
+            profile_sequences, profile_seq_len, profile_target_len = profile_limits
+            raise ValueError(
+                f"Diffusion KV request {request.request_id!r} exceeds the startup memory-profile envelope: "
+                f"sequences={request_sequences} (profiled={profile_sequences}), "
+                f"max_seq_len={request_seq_len} (profiled={profile_seq_len}), "
+                f"max_target_len={request_target_len} (profiled={profile_target_len}). "
+                "Reduce the request shape or extend the model's paged-KV profile recipe."
+            )
+
+    def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
+        """Admit a request whose model-owned preprocessing is complete."""
+
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -696,6 +881,10 @@ class DiffusionEngine:
             self._cv.notify_all()
 
         return request_id
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        request = self._prepare_request_for_admission(request)
+        return self._add_prepared_request(request)
 
     async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
         with self._cv:
@@ -739,6 +928,7 @@ class DiffusionEngine:
         return final_output
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        request = self._prepare_request_for_admission(request)
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -750,6 +940,7 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
                     if target_request_id in sched_output.finished_req_ids:
+                        self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
@@ -779,6 +970,7 @@ class DiffusionEngine:
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
+                    self._remove_diffusion_kv_requests([target_request_id])
                     req_output = runner_output.get_request_output(target_request_id)
                     output = self._finalize_finished_request(
                         target_request_id,
@@ -787,7 +979,7 @@ class DiffusionEngine:
                     )
                     if output.async_output_id:
                         fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                        output = fut.result(timeout=_async_output_timeout())
                     return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -841,50 +1033,113 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        num_inference_steps = 1
-        height = 512
-        width = 512
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+    def _make_dummy_request(
+        self,
+        *,
+        height: int,
+        width: int,
+        guidance_scale: float,
+        num_image_inputs: int = 1,
+    ) -> OmniDiffusionRequest | None:
+        """Build a one-step model request for startup profiling or warmup."""
 
+        prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
-            # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
-            dummy_image = PIL.Image.new(color_format, (width, height))
-            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
+            images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
+            prompt.setdefault("multi_modal_data", {})["image"] = images[0] if len(images) == 1 else images
 
         if supports_audio_input:
             audio_sr = 16000
-            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
+            prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
         num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
         if num_frames <= 0:
-            logger.info("Skipping dummy warmup run (num_frames=0)")
-            return
-        req = OmniDiffusionRequest(
+            return None
+        return OmniDiffusionRequest(
             prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=1,
                 num_frames=num_frames,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
+                guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
+
+    def _prepare_diffusion_kv_profile_requests(self) -> list[OmniDiffusionRequest] | None:
+        """Prepare the per-rank request batch used to profile paged-KV headroom.
+
+        The profile executes directly on each Worker before the Scheduler and
+        its KV manager exist. It uses the maximum number of requests that one
+        rank can execute together. DLO+DP is the exception because each rank
+        executes one request from the collective wave.
+
+        Hunyuan is currently the only model integrated with
+        ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum advertised
+        reference-image count exercise its first-step activation peak.
+        Admission compares each preprocessed request's CFG count and tokenized
+        sequence/target shape with the resulting per-request profile envelope.
+        Future paged model integrations must extend this recipe for their
+        serving limits (for example, video frame count) rather than reusing it
+        silently.
+        """
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        ):
+            return None
+        request = self._make_dummy_request(
+            height=1024,
+            width=1024,
+            guidance_scale=5.0,
+            num_image_inputs=get_dummy_run_num_image_inputs(self.od_config.model_class_name),
+        )
+        if request is None:
+            raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
+        request = self._prepare_request_for_admission(request)
+        kv_requests = request.diffusion_kv_requests
+        if not kv_requests:
+            raise RuntimeError("paged_scheduler profile preprocessing must produce Diffusion KV requests")
+        self._diffusion_kv_profile_limits = (
+            len(kv_requests),
+            max(kv_request.seq_len for kv_request in kv_requests),
+            max(kv_request.target_len for kv_request in kv_requests),
+        )
+        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
+            self.od_config
+        )
+        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_requests: list[OmniDiffusionRequest] = []
+        for index in range(profile_batch_size):
+            profile_request = copy.copy(request)
+            profile_request.request_id = f"{DUMMY_DIFFUSION_REQUEST_ID}/kv-profile-{index}"
+            profile_request.sampling_params = copy.deepcopy(request.sampling_params)
+            # Preprocessing owns request geometry and prepared model inputs,
+            # but native KV requests remain Scheduler-only mutable state. The
+            # profile bypasses Scheduler admission and must not send them to
+            # the Worker.
+            profile_request.diffusion_kv_requests = None
+            profile_requests.append(profile_request)
+        return profile_requests
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        req = self._make_dummy_request(
+            height=512,
+            width=512,
+            guidance_scale=0.0,
+        )
+        if req is None:
+            logger.info("Skipping dummy warmup run (num_frames=0)")
+            return
         logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 
@@ -1067,8 +1322,11 @@ class DiffusionEngine:
 
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        request_ids = list(dict.fromkeys(request_ids))
 
-        for request_id in dict.fromkeys(request_ids):
+        self._remove_diffusion_kv_requests(request_ids)
+
+        for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
 
@@ -1099,5 +1357,8 @@ class DiffusionEngine:
 
         if runner_output is not None and runner_output.async_output_id is not None:
             return DiffusionOutput(async_output_id=runner_output.async_output_id)
+
+        if state.status == DiffusionRequestStatus.FINISHED_ERROR and state.error:
+            return DiffusionOutput(error=state.error)
 
         return DiffusionOutput(error=missing_result_error)

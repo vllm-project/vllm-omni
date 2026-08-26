@@ -1,11 +1,70 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pytest marks and decorators for hardware / resource selection (CUDA, ROCm, …)."""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from pathlib import Path
 
 import pytest
 from vllm.platforms import current_platform
 
-# Re-exported from tests.helpers.env (GPU wait + DeviceMemoryMonitor).
+# Marker description tag in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
+# Example: ``"H100: [hardware-resource] Tests that require H100 GPU"``.
+_HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_pyproject() -> dict:
+    path = _repo_root() / "pyproject.toml"
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python < 3.11
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+@lru_cache(maxsize=1)
+def get_hardware_mark_list() -> frozenset[str]:
+    """Return hardware SKU marker names from ``pyproject.toml``.
+
+    A marker is treated as a hardware resource marker when its description
+    contains the ``[hardware-resource]`` tag, e.g.::
+
+        "H100: [hardware-resource] Tests that require H100 GPU"
+    """
+    data = _load_pyproject()
+    entries = data.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("markers", [])
+    if not entries:
+        # Fallback when TOML parsing fails: scan tagged marker lines.
+        text = (_repo_root() / "pyproject.toml").read_text(encoding="utf-8")
+        return frozenset(
+            re.findall(
+                rf'^\s*"([A-Za-z0-9_]+)\s*:\s*{re.escape(_HARDWARE_RESOURCE_MARKER_TAG)}',
+                text,
+                flags=re.M,
+            )
+        )
+
+    names: set[str] = set()
+    for entry in entries:
+        text = str(entry)
+        if _HARDWARE_RESOURCE_MARKER_TAG not in text:
+            continue
+        name = text.split(":", 1)[0].strip()
+        if name:
+            names.add(name)
+    return frozenset(names)
 
 
 def cuda_marks(*, res: str, num_cards: int):
@@ -14,8 +73,10 @@ def cuda_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.L4
     elif res == "H100":
         test_resource = pytest.mark.H100
+    elif res == "H800":
+        test_resource = pytest.mark.H800
     else:
-        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100")
+        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100, H800")
     marks = [test_resource, test_platform_detail]
     if num_cards == 1:
         return marks
@@ -78,7 +139,7 @@ def musa_marks(*, res: str, num_cards: int):
 
 def gpu_marks(*, res: str, num_cards: int):
     test_platform = pytest.mark.gpu
-    if res in ("L4", "H100"):
+    if res in ("L4", "H100", "H800"):
         return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
@@ -86,7 +147,7 @@ def gpu_marks(*, res: str, num_cards: int):
         return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     if res == "S5000":
         return [test_platform] + musa_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, MI325, B60, S5000")
+    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, H800, MI325, B60, S5000")
 
 
 def npu_marks(*, res: str, num_cards: int):
@@ -121,10 +182,8 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
         cards = num_cards_dict[platform]
-        if platform in ("cuda", "rocm", "xpu"):
+        if platform in ("cuda", "rocm", "xpu", "musa"):
             marks = gpu_marks(res=resource, num_cards=cards)
-        elif platform == "musa":
-            marks = musa_marks(res=resource, num_cards=cards)
         elif platform == "npu":
             marks = npu_marks(res=resource, num_cards=cards)
         else:
