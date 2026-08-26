@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    StreamingSegmentState,
     _OrchestratorDuplexStagePort,
 )
 from vllm_omni.engine.stage_pool import StagePool
@@ -358,7 +359,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
         final_output_stage_ids={0},
     )
     req_state.streaming.enabled = True
-    req_state.streaming.segment_finished = True
+    req_state.streaming.segments[0] = StreamingSegmentState(finished=True)
     output = SimpleNamespace(
         request_id=req_state.request_id,
         finished=True,
