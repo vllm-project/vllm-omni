@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
 from types import SimpleNamespace
@@ -90,6 +91,7 @@ def test_streaming_update_resets_native_text_metrics_for_next_segment():
     assert state.native_text_stats.num_generation_tokens == 0
     assert state.native_text_stats.first_token_ts == 0.0
     assert state.native_text_stats.last_token_ts == 0.0
+    assert state.native_text_previous_segment_last_token_ts == 10.2
 
 
 def test_native_text_tpot_snapshot_matches_vllm_finished_metric_definition():
@@ -128,6 +130,82 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     )
 
     assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
+
+
+def test_native_text_metrics_include_cross_segment_itl(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+
+    def update_single_token(_output, timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 1
+        native_stats.first_token_ts = timestamp
+        native_stats.last_token_ts = timestamp
+        native_stats.first_token_latency = 0.01
+
+    iteration_stats.update_from_output.side_effect = update_single_token
+    processor._update_stats_from_output(
+        state,
+        SimpleNamespace(),
+        10.0,
+        iteration_stats,
+    )
+    first_segment = processor.pop_native_text_metrics("r")
+    assert first_segment["vllm_tpot_ms"] == 0.0
+    assert first_segment["vllm_itls_ms"] == []
+
+    state.apply_streaming_update(
+        SimpleNamespace(
+            final=False,
+            prompt=None,
+            prompt_token_ids=[],
+            arrival_time=10.01,
+        )
+    )
+    state.is_prefilling = True
+    processor._update_stats_from_output(
+        state,
+        SimpleNamespace(),
+        10.02,
+        iteration_stats,
+    )
+    second_segment = processor.pop_native_text_metrics("r")
+
+    assert second_segment["vllm_itls_ms"] == pytest.approx([20.0])
+    assert second_segment["vllm_tpot_ms"] == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize(
+    ("finished_tpot_s", "expected_tpot_ms"),
+    [(0.0, 19.0), (0.023, 23.0)],
+)
+def test_native_text_tpot_only_accepts_positive_finished_metric(
+    monkeypatch,
+    finished_tpot_s,
+    expected_tpot_ms,
+):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_finished", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {"r": {"vllm_tpot_ms": 19.0}}
+    state = _make_state(RequestOutputKind.DELTA)
+    iteration_stats = MagicMock()
+    iteration_stats.finished_requests = [
+        SimpleNamespace(
+            request_id="r",
+            mean_time_per_output_token=finished_tpot_s,
+        )
+    ]
+
+    processor._update_stats_from_finished(
+        state,
+        FinishReason.STOP,
+        iteration_stats,
+    )
+
+    assert processor.pop_native_text_metrics("r")["vllm_tpot_ms"] == expected_tpot_ms
 
 
 def test_delta_drains_output_modality_per_step():

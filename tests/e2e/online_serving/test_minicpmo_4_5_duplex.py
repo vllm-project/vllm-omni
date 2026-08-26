@@ -42,6 +42,7 @@ def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
         assert request["request_index"] == request_index
         assert isinstance(request["response_id"], str)
         assert request["ttft_ms"] is not None and request["ttft_ms"] >= 0
+        assert request["tpot_ms"] is not None and request["tpot_ms"] > 0
         assert request["ttfp_ms"] >= 0
         assert request["rtf"] is not None and request["rtf"] >= 0
         assert request["audio_generation_ms"] >= 0
@@ -53,6 +54,7 @@ def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
     assert isinstance(metrics["session_id"], str)
     assert metrics["audio_turn_count"] == expected_count
     assert metrics["mean_ttft_ms"] is not None and metrics["mean_ttft_ms"] >= 0
+    assert metrics["mean_tpot_ms"] is not None and metrics["mean_tpot_ms"] > 0
     assert metrics["mean_ttfp_ms"] is not None and metrics["mean_ttfp_ms"] >= 0
     assert metrics["mean_rtf"] is not None and metrics["mean_rtf"] >= 0
 

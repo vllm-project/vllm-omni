@@ -7069,9 +7069,11 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
     first_metrics = deltas[0]["vllm_omni"]["stage_metrics"]["0"]
     second_metrics = deltas[1]["vllm_omni"]["stage_metrics"]["0"]
     assert first_metrics["num_tokens_out"] == 4
+    assert first_metrics["vllm_tpot_ms"] == pytest.approx(10.5)
     assert second_metrics["num_tokens_out"] == 10
     assert second_metrics["vllm_ttft_ms"] == 50.0
     assert second_metrics["vllm_itls_ms"] == [10.0, 11.0, 12.0, 13.0, 14.0]
+    assert second_metrics["vllm_tpot_ms"] == pytest.approx(12.0)
 
     first_response_id = deltas[0]["response_id"]
     session.end_response()
@@ -7083,6 +7085,7 @@ async def test_continuous_response_metrics_accumulate_only_owned_model_units():
     assert third_metrics["num_tokens_out"] == 3
     assert third_metrics["vllm_ttft_ms"] == 90.0
     assert third_metrics["vllm_itls_ms"] == [15.0, 16.0]
+    assert third_metrics["vllm_tpot_ms"] == pytest.approx(15.5)
 
 
 @pytest.mark.asyncio

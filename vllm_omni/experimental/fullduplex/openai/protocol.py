@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -308,16 +311,21 @@ class DuplexSessionConfig:
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
-            if isinstance(extra.get("overlap_policy"), str):
-                config.overlap_policy = cls._normalize_overlap_policy(extra["overlap_policy"])
-            if isinstance(extra.get("overlap_short_ack_ms"), int | float):
-                config.overlap_short_ack_ms = max(0, int(extra["overlap_short_ack_ms"]))
-            if isinstance(extra.get("overlap_barge_in_ms"), int | float):
-                config.overlap_barge_in_ms = max(0, int(extra["overlap_barge_in_ms"]))
-            if isinstance(extra.get("overlap_silence_rms"), int | float):
-                config.overlap_silence_rms = max(0.0, float(extra["overlap_silence_rms"]))
-            if isinstance(extra.get("playback_commit_policy"), str):
-                config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
+            overlap_policy = extra.get("overlap_policy")
+            if isinstance(overlap_policy, str):
+                config.overlap_policy = cls._normalize_overlap_policy(overlap_policy)
+            overlap_short_ack_ms = extra.get("overlap_short_ack_ms")
+            if isinstance(overlap_short_ack_ms, int | float):
+                config.overlap_short_ack_ms = max(0, int(overlap_short_ack_ms))
+            overlap_barge_in_ms = extra.get("overlap_barge_in_ms")
+            if isinstance(overlap_barge_in_ms, int | float):
+                config.overlap_barge_in_ms = max(0, int(overlap_barge_in_ms))
+            overlap_silence_rms = extra.get("overlap_silence_rms")
+            if isinstance(overlap_silence_rms, int | float):
+                config.overlap_silence_rms = max(0.0, float(overlap_silence_rms))
+            playback_commit_policy = extra.get("playback_commit_policy")
+            if isinstance(playback_commit_policy, str):
+                config.playback_commit_policy = cls._normalize_playback_commit_policy(playback_commit_policy)
         return config
 
     @staticmethod
@@ -646,7 +654,7 @@ class DuplexSession:
             content = text
 
         self._input.commit_seq += 1
-        message = {"role": "user", "content": content}
+        message: dict[str, object] = {"role": "user", "content": content}
         self._conversation.messages.append(message)
         self._input.pending_text.clear()
         self._input.pending_audio.clear()
@@ -672,7 +680,7 @@ class DuplexSession:
         if transcript:
             input_audio_part["transcript"] = transcript
         self._input.commit_seq += 1
-        message = {"role": "user", "content": [input_audio_part]}
+        message: dict[str, object] = {"role": "user", "content": [input_audio_part]}
         if transcript:
             message["transcript"] = transcript
         self._conversation.messages.append(message)
@@ -776,7 +784,10 @@ class DuplexSession:
             for name in additive_fields:
                 value = raw_values.get(name)
                 if isinstance(value, int | float) and not isinstance(value, bool):
-                    current[name] = current.get(name, 0) + value
+                    current_value = current.get(name, 0)
+                    if not isinstance(current_value, int | float) or isinstance(current_value, bool):
+                        current_value = 0
+                    current[name] = current_value + value
             for name in first_positive_fields:
                 value = raw_values.get(name)
                 current_value = current.get(name)
@@ -790,7 +801,8 @@ class DuplexSession:
             for list_name, mean_name in interval_fields:
                 values = raw_values.get(list_name)
                 if isinstance(values, list):
-                    combined = list(current.get(list_name, []))
+                    existing_values = current.get(list_name)
+                    combined = list(existing_values) if isinstance(existing_values, list) else []
                     combined.extend(
                         value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
                     )
@@ -799,7 +811,10 @@ class DuplexSession:
 
             tpot_ms = raw_values.get("vllm_tpot_ms")
             token_count = raw_values.get("num_tokens_out")
-            if isinstance(tpot_ms, int | float) and tpot_ms > 0:
+            response_itls = current.get("vllm_itls_ms")
+            if isinstance(response_itls, list) and response_itls:
+                current["vllm_tpot_ms"] = current["vllm_itl_ms"]
+            elif isinstance(tpot_ms, int | float) and tpot_ms > 0:
                 weight = max(int(token_count) - 1, 1) if isinstance(token_count, int | float) else 1
                 self._response.stage_metric_tpot_weighted_ms[stage_id] = (
                     self._response.stage_metric_tpot_weighted_ms.get(stage_id, 0.0) + float(tpot_ms) * weight
@@ -917,7 +932,7 @@ class DuplexSession:
         preserve_request: bool = False,
     ) -> dict[str, object] | None:
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
-        message = None
+        message: dict[str, object] | None = None
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
@@ -1236,26 +1251,33 @@ class DuplexSession:
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
         }
-        if isinstance(self.config.extra_body.get("realtime_tools"), list):
-            payload["tools"] = self.config.extra_body["realtime_tools"]
-        if isinstance(self.config.extra_body.get("realtime_tool_choice"), str | dict):
-            payload["tool_choice"] = self.config.extra_body["realtime_tool_choice"]
-        if isinstance(self.config.extra_body.get("realtime_metadata"), dict):
-            payload["metadata"] = dict(self.config.extra_body["realtime_metadata"])
-        if isinstance(self.config.extra_body.get("realtime_include"), list):
-            payload["include"] = list(self.config.extra_body["realtime_include"])
-        if isinstance(self.config.extra_body.get("realtime_prompt"), dict):
-            payload["prompt"] = dict(self.config.extra_body["realtime_prompt"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_transcription"), dict):
-            payload["input_audio_transcription"] = dict(self.config.extra_body["realtime_input_audio_transcription"])
-        if isinstance(self.config.extra_body.get("realtime_input_audio_noise_reduction"), dict):
-            payload["input_audio_noise_reduction"] = dict(
-                self.config.extra_body["realtime_input_audio_noise_reduction"]
-            )
-        if isinstance(self.config.extra_body.get("realtime_audio"), dict):
-            payload["audio"] = dict(self.config.extra_body["realtime_audio"])
-        if isinstance(self.config.extra_body.get("realtime_tracing"), str | dict):
-            payload["tracing"] = self.config.extra_body["realtime_tracing"]
+        realtime_tools = self.config.extra_body.get("realtime_tools")
+        if isinstance(realtime_tools, list):
+            payload["tools"] = realtime_tools
+        realtime_tool_choice = self.config.extra_body.get("realtime_tool_choice")
+        if isinstance(realtime_tool_choice, str | dict):
+            payload["tool_choice"] = realtime_tool_choice
+        realtime_metadata = self.config.extra_body.get("realtime_metadata")
+        if isinstance(realtime_metadata, dict):
+            payload["metadata"] = dict(realtime_metadata)
+        realtime_include = self.config.extra_body.get("realtime_include")
+        if isinstance(realtime_include, list):
+            payload["include"] = list(realtime_include)
+        realtime_prompt = self.config.extra_body.get("realtime_prompt")
+        if isinstance(realtime_prompt, dict):
+            payload["prompt"] = dict(realtime_prompt)
+        realtime_input_audio_transcription = self.config.extra_body.get("realtime_input_audio_transcription")
+        if isinstance(realtime_input_audio_transcription, dict):
+            payload["input_audio_transcription"] = dict(realtime_input_audio_transcription)
+        realtime_input_audio_noise_reduction = self.config.extra_body.get("realtime_input_audio_noise_reduction")
+        if isinstance(realtime_input_audio_noise_reduction, dict):
+            payload["input_audio_noise_reduction"] = dict(realtime_input_audio_noise_reduction)
+        realtime_audio = self.config.extra_body.get("realtime_audio")
+        if isinstance(realtime_audio, dict):
+            payload["audio"] = dict(realtime_audio)
+        realtime_tracing = self.config.extra_body.get("realtime_tracing")
+        if isinstance(realtime_tracing, str | dict):
+            payload["tracing"] = realtime_tracing
         raw_realtime_session = self.config.extra_body.get("realtime_session_payload")
         if isinstance(raw_realtime_session, dict):
             for key, value in raw_realtime_session.items():
@@ -1283,7 +1305,8 @@ class DuplexTurnController:
         elif event_type == DuplexTurnEventType.ASSISTANT_DONE.value:
             session.transition_turn(DuplexTurnState.IDLE)
         elif event_type == DuplexTurnEventType.PLAYBACK_ACK.value:
-            played_ms = int(payload.get("played_ms", 0) or 0)
+            raw_played_ms = payload.get("played_ms")
+            played_ms = int(raw_played_ms) if isinstance(raw_played_ms, int | float) else 0
             committed_ms = payload.get("committed_ms")
             session.acknowledge_playback(
                 played_ms,
