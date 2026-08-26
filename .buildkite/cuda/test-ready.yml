@@ -208,7 +208,6 @@ steps:
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
-          - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/models/step_audio2/

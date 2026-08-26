@@ -645,12 +645,12 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="client_disconnect")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="stage_error")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
@@ -1115,6 +1115,7 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
+            self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():

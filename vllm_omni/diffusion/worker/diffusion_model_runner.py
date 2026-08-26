@@ -539,6 +539,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 target_device=self._target_device if use_prefetch else getattr(self.pipeline, "device", None),
             )
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+        req.kv_recv_ms = kv_recv_ms
         logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
@@ -598,6 +599,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         reqs: list[OmniDiffusionRequest],
         outputs: list[DiffusionOutput],
     ) -> BatchRunnerOutput:
+        for i in range(len(reqs)):
+            # Carry the runner-measured KV-recv timing onto the output so the
+            # engine's step_streaming can surface it as diffusion_kv_load_s.
+            outputs[i].kv_recv_ms = reqs[i].kv_recv_ms
         return BatchRunnerOutput.from_list(
             [
                 RunnerOutput(
