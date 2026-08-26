@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for code predictor dtype alignment (fix for #2385).
 
@@ -41,6 +41,7 @@ _COMMON = os.path.join(_MODELS, "common")
 def _load_module(name: str, filename: str):
     path = os.path.abspath(os.path.join(_BASE, filename))
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod  # register before exec (needed for dataclasses etc.)
     spec.loader.exec_module(mod)
@@ -83,7 +84,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     vllm_parallel_mock = mocker.MagicMock()
     vllm_parallel_mock.VocabParallelEmbedding = torch.nn.Embedding
     custom_op_mock = types.ModuleType("vllm_omni.diffusion.layers.custom_op")
-    custom_op_mock.CustomOp = NativeCustomOp
+    setattr(custom_op_mock, "CustomOp", NativeCustomOp)
 
     return {
         "vllm_omni": mocker.MagicMock(),
@@ -119,6 +120,7 @@ def _load_target_classes(mocker: MockerFixture):
     common_spec = importlib.util.spec_from_file_location(
         "vllm_omni.model_executor.models.common.qwen3_code_predictor", common_cp_path
     )
+    assert common_spec is not None and common_spec.loader is not None
     common_cp_mod = importlib.util.module_from_spec(common_spec)
     sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"] = common_cp_mod
     common_spec.loader.exec_module(common_cp_mod)
@@ -493,6 +495,53 @@ class TestCodePredictorPerRowGenerators:
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
 
+    @pytest.mark.parametrize(
+        ("device_type", "expect_fp32"),
+        [("cpu", False), ("npu", False), ("xpu", False), ("cuda", True)],
+    )
+    def test_fp32_fallback_is_cuda_only(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        device_type: str,
+        expect_fp32: bool,
+    ) -> None:
+        """The stability fallback must not change NPU activation dtype."""
+        _, _, _, code_predictor_model, _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+
+        inputs = mocker.MagicMock()
+        inputs.dtype = torch.float16
+        inputs.device.type = device_type
+        fp32_inputs = mocker.MagicMock()
+        fp32_inputs.device.type = device_type
+        inputs.float.return_value = fp32_inputs
+        model = object.__new__(code_predictor_model)
+        torch.nn.Module.__init__(model)
+        model.rotary_emb = mocker.Mock(return_value=None)
+        model.layers = []
+        model.norm = mocker.Mock(side_effect=lambda hidden_states: hidden_states)
+        autocast = mocker.patch.object(
+            common_mod.torch.amp,
+            "autocast",
+            return_value=mocker.MagicMock(
+                __enter__=mocker.Mock(),
+                __exit__=mocker.Mock(return_value=False),
+            ),
+        )
+
+        code_predictor_model.forward(model, inputs, mocker.MagicMock())
+
+        if expect_fp32:
+            inputs.float.assert_called_once_with()
+        else:
+            inputs.float.assert_not_called()
+        autocast.assert_called_once_with(
+            device_type,
+            enabled=expect_fp32,
+            dtype=torch.float32,
+        )
+
     def test_model_forward_float16(self, loaded_target_classes) -> None:
         """Inner model forward should work in float16."""
         _, _, _, code_predictor_model, _ = loaded_target_classes
@@ -520,6 +569,63 @@ class TestCodePredictorModelDtype:
         output = model(inputs, pos_ids)
         assert output.dtype == torch.float32
         assert output.shape == (bsz, seq_len, 32)
+
+
+class TestCodePredictorGraphReplay:
+    """Test nested device graph handling for the shared code predictor."""
+
+    @pytest.mark.parametrize("is_capturing", [False, True])
+    def test_npu_outer_capture_skips_inner_graph_replay(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        is_capturing: bool,
+    ) -> None:
+        _, _, code_predictor_wrapper, _, code_predictor_wrapper_config = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+
+        predictor = object.__new__(code_predictor_wrapper)
+        torch.nn.Module.__init__(predictor)
+        predictor._num_groups = 2
+        predictor._model_dtype = torch.float32
+        predictor._setup_compile = mocker.Mock()
+        predictor._padded_bsz = mocker.Mock(side_effect=lambda bsz: bsz)
+        predictor._ensure_buffers = mocker.Mock()
+        predictor._proj_buf = torch.zeros(1, 3, 4)
+        predictor.small_to_mtp_projection = torch.nn.Identity()
+        regular_output = torch.zeros(1, 3, 4)
+        predictor._compiled_model_fwd = mocker.Mock(return_value=regular_output)
+        predictor._lm_heads_list = [torch.nn.Linear(4, 8, bias=False)]
+        predictor._codec_embeds_list = []
+        predictor._wrapper_config = code_predictor_wrapper_config(
+            sampling_mode="per_call",
+            return_proj_buf=False,
+        )
+        predictor._prefix_graphs_enabled = False
+        predictor._bucket_pos_ids = {1: torch.arange(3).unsqueeze(0)}
+        graph = mocker.Mock()
+        graph_output = torch.zeros(1, 3, 4)
+        predictor._device_graphs = {1: (graph, graph_output)}
+
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+        npu_mock = mocker.MagicMock()
+        npu_mock.is_current_stream_capturing.return_value = is_capturing
+        mocker.patch.object(common_mod.torch, "npu", npu_mock, create=True)
+
+        result = predictor(
+            layer0_code=torch.zeros(1, dtype=torch.long),
+            layer0_embed=torch.zeros(1, 4),
+            last_talker_hidden=torch.zeros(1, 4),
+            do_sample=False,
+        )
+
+        assert result.shape == (1, 2)
+        if is_capturing:
+            graph.replay.assert_not_called()
+            predictor._compiled_model_fwd.assert_called_once()
+        else:
+            graph.replay.assert_called_once_with()
+            predictor._compiled_model_fwd.assert_not_called()
 
 
 class TestCodePredictorWrapperConfig:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
 
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
@@ -435,10 +438,11 @@ class CodePredictorBaseModel(nn.Module):
         # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
         # layers already upcast internally; this extends the same
         # treatment to attention and MLP.
-        # autocast to float32 is unsupported on CPU; skip fp32 upcast there
-        # (CPU uses full-precision intermediates internally).
+        # This fallback targets CUDA GPUs without native bf16 support. Other
+        # backends keep the model dtype so backend-specific fused ops receive
+        # matching activation and weight dtypes.
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type == "cuda"
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
@@ -1081,7 +1085,12 @@ class CodePredictorWrapper(nn.Module):
             # Use captured device graph if available, otherwise call compiled fn.
             device_graph_entry = self._device_graphs.get(graph_key)
 
-            if device_graph_entry is not None:
+            # torch-npu cannot replay an inner NPUGraph while the outer
+            # talker_mtp graph is being captured. Let the outer graph record
+            # the regular forward during capture; normal inference still uses
+            # the inner graph replay fast path.
+            is_npu_capturing = current_omni_platform.is_npu() and torch.npu.is_current_stream_capturing()
+            if device_graph_entry is not None and not is_npu_capturing:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
