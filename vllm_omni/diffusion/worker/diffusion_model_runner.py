@@ -953,6 +953,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         interrupted: bool = False,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
+        if isinstance(input_batch.latents, list):
+            input_batch.latents = [state.latents for state in states if state.latents is not None]
+            self.input_batch = input_batch
+            scatter_latents(states, input_batch)
+            for state in states:
+                if interrupted or state.denoise_completed:
+                    self.state_cache.pop(state.req_id, None)
+            return
+
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -1084,12 +1093,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 else:
                     offset = 0
-                    for req in states:
+                    for req_idx, req in enumerate(states):
                         row_num = req.latents.shape[0]
                         try:
-                            self.pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if isinstance(noise_pred, list):
+                                req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
+                            else:
+                                req_noise_pred = (
+                                    noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
+                            self.pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
@@ -1138,7 +1151,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 )
                             )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if isinstance(noise_pred, list):
+                        expected = len(states)
+                        if len(noise_pred) != expected:
+                            raise ValueError(
+                                f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
+                            )
+                    elif noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."

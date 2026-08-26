@@ -79,7 +79,6 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-
 # ResBlock is platform-dispatched in the layers package __init__: CUDA gets
 # fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
 # PyTorch block. UNetDown and UNetUp below instantiate whichever one this
@@ -87,6 +86,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
+from vllm_omni.diffusion.models.hunyuan_image3.mixfusion import MixFusionSequencePlan
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 from vllm_omni.platforms import current_omni_platform
 
@@ -1069,6 +1069,175 @@ class ImageKVCacheManager(nn.Module):
         )
         return key, value
 
+    @staticmethod
+    def _select_mixfusion_image_span(spans: list[tuple[int, int]], chunk_size: int) -> tuple[int, int]:
+        for start, stop in reversed(spans):
+            if stop - start == chunk_size:
+                return start, stop
+        return spans[-1]
+
+    @staticmethod
+    def _mixfusion_query_span(
+        key_span: tuple[int, int],
+        seq_len: int,
+        q_len: int,
+        chunk_size: int,
+    ) -> tuple[int, int]:
+        query_start = key_span[0] - max(seq_len - q_len, 0)
+        query_stop = query_start + chunk_size
+        if query_start < 0 or query_stop > q_len:
+            raise ValueError(
+                f"Invalid MixFusion query span {(query_start, query_stop)} for q_len={q_len}, "
+                f"seq_len={seq_len}, key_span={key_span}."
+            )
+        return query_start, query_stop
+
+    @staticmethod
+    def _recover_mixfusion_spans(
+        spans: list[tuple[int, int]],
+        chunk_span: tuple[int, int],
+        original_seq_len: int,
+    ) -> list[tuple[int, int]]:
+        chunk_start, chunk_stop = chunk_span
+        delta = original_seq_len - (chunk_stop - chunk_start)
+        recovered_spans = []
+        chunk_span_recovered = False
+        for start, stop in spans:
+            if start == chunk_start and stop == chunk_stop:
+                recovered_spans.append((chunk_start, chunk_start + original_seq_len))
+                chunk_span_recovered = True
+            elif stop <= chunk_start:
+                recovered_spans.append((start, stop))
+            elif start >= chunk_stop:
+                recovered_spans.append((start + delta, stop + delta))
+            else:
+                raise ValueError(f"MixFusion cannot recover overlapping attention span {(start, stop)}.")
+
+        if not chunk_span_recovered:
+            raise ValueError(f"MixFusion did not find chunk span {chunk_span} in full-attention spans {spans}.")
+        return recovered_spans
+
+    @staticmethod
+    def _recover_mixfusion_attention_mask(
+        attention_mask: torch.Tensor,
+        row_map: list[tuple[int, int]],
+        col_map: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        col_indices = [col_idx for _, col_idx in col_map]
+        rows = []
+        for sample_idx, row_idx in row_map:
+            row = attention_mask[sample_idx : sample_idx + 1, :, row_idx : row_idx + 1, :]
+            rows.append(torch.cat([row[..., col_idx : col_idx + 1] for col_idx in col_indices], dim=-1))
+        return torch.cat(rows, dim=-2)
+
+    def _mixfusion_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mixfusion_attention_mask_buckets: dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor],
+        full_attn_spans: list[list[tuple[int, int]]],
+        plan: MixFusionSequencePlan,
+        seq_len: int,
+    ) -> torch.Tensor:
+        bs, q_len = query.shape[:2]
+        cfg_factor = bs // plan.chunk_count
+        if bs % plan.chunk_count != 0:
+            raise ValueError(f"MixFusion batch size {bs} is not divisible by chunk count {plan.chunk_count}.")
+
+        output = torch.empty_like(query)
+        buckets: dict[tuple[int, int, tuple[tuple[int, int], ...]], list[dict[str, Any]]] = {}
+
+        for cfg_idx in range(cfg_factor):
+            cfg_base = cfg_idx * plan.chunk_count
+            for layout in plan.layouts:
+                sample_indices = [cfg_base + layout.chunk_start + i for i in range(layout.chunk_count)]
+                first_sample = sample_indices[0]
+                if not full_attn_spans[first_sample]:
+                    raise ValueError("MixFusion requires image full-attention spans for each chunk.")
+
+                key_image_start, key_image_stop = self._select_mixfusion_image_span(
+                    full_attn_spans[first_sample],
+                    plan.chunk_size,
+                )
+                query_image_start, query_image_stop = self._mixfusion_query_span(
+                    (key_image_start, key_image_stop),
+                    seq_len,
+                    q_len,
+                    plan.chunk_size,
+                )
+
+                q_parts = [query[first_sample, :query_image_start]]
+                k_parts = [key[first_sample, :key_image_start]]
+                v_parts = [value[first_sample, :key_image_start]]
+
+                for sample_idx in sample_indices:
+                    q_parts.append(query[sample_idx, query_image_start:query_image_stop])
+                    k_parts.append(key[sample_idx, key_image_start:key_image_stop])
+                    v_parts.append(value[sample_idx, key_image_start:key_image_stop])
+
+                q_parts.append(query[first_sample, query_image_stop:])
+                k_parts.append(key[first_sample, key_image_stop:])
+                v_parts.append(value[first_sample, key_image_stop:])
+
+                q_full = torch.cat(q_parts, dim=0)
+                k_full = torch.cat(k_parts, dim=0)
+                v_full = torch.cat(v_parts, dim=0)
+                recovered_spans = self._recover_mixfusion_spans(
+                    full_attn_spans[first_sample],
+                    (key_image_start, key_image_stop),
+                    layout.seq_len,
+                )
+                bucket_key = (q_full.shape[0], k_full.shape[0], tuple(recovered_spans))
+                buckets.setdefault(bucket_key, []).append(
+                    {
+                        "q": q_full,
+                        "k": k_full,
+                        "v": v_full,
+                        "full_attn_spans": recovered_spans,
+                        "samples": sample_indices,
+                        "query_image_start": query_image_start,
+                        "query_image_stop": query_image_stop,
+                    }
+                )
+
+        for bucket_items in buckets.values():
+            q_bucket = torch.stack([item["q"] for item in bucket_items], dim=0)
+            k_bucket = torch.stack([item["k"] for item in bucket_items], dim=0)
+            v_bucket = torch.stack([item["v"] for item in bucket_items], dim=0)
+            bucket_key = (
+                q_bucket.shape[1],
+                k_bucket.shape[1],
+                tuple(bucket_items[0]["full_attn_spans"]),
+            )
+            attn_mask = mixfusion_attention_mask_buckets.get(bucket_key)
+            if attn_mask is None:
+                raise ValueError(f"Missing precomputed MixFusion attention mask bucket {bucket_key}.")
+            if attn_mask.shape[0] != len(bucket_items):
+                raise ValueError(
+                    f"MixFusion attention mask bucket {bucket_key} has batch {attn_mask.shape[0]}, "
+                    f"expected {len(bucket_items)}."
+                )
+            attn_metadata = AttentionMetadata(
+                attn_mask=attn_mask,
+                full_attn_spans=[item["full_attn_spans"] for item in bucket_items],
+            )
+            attn_bucket = self.attn(q_bucket, k_bucket, v_bucket, attn_metadata)
+
+            for item, attn_full in zip(bucket_items, attn_bucket, strict=True):
+                query_image_start = item["query_image_start"]
+                query_image_stop = item["query_image_stop"]
+                image_full_start = query_image_start
+                for chunk_idx, sample_idx in enumerate(item["samples"]):
+                    image_start = image_full_start + chunk_idx * plan.chunk_size
+                    image_stop = image_start + plan.chunk_size
+                    output[sample_idx, :query_image_start] = attn_full[:query_image_start]
+                    output[sample_idx, query_image_start:query_image_stop] = attn_full[image_start:image_stop]
+                    suffix_start = image_full_start + len(item["samples"]) * plan.chunk_size
+                    output[sample_idx, query_image_stop:] = attn_full[suffix_start:]
+
+        return output
+
     def forward(
         self,
         query: torch.Tensor,
@@ -1141,9 +1310,32 @@ class ImageKVCacheManager(nn.Module):
                 joint_text_key = repeat_kv(joint_text_key, repeat_num)
                 joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
-        attention_mask = attention_mask.contiguous()
-
         full_attn_spans = kwargs.get("full_attn_spans", None)
+        mixfusion_sequence_plan = kwargs.get("mixfusion_sequence_plan", None)
+        mixfusion_attention_masks = kwargs.get("mixfusion_attention_masks", None)
+
+        if mixfusion_sequence_plan is not None and self.sp_size <= 1 and not uncond_cfg_prefill:
+            if full_attn_spans is None:
+                raise ValueError("MixFusion requires full_attn_spans for attention sequence recovery.")
+            if mixfusion_attention_masks is None:
+                raise ValueError("MixFusion requires precomputed attention mask buckets.")
+            mask_stage = "first" if first_step else "later"
+            mixfusion_attention_mask_buckets = mixfusion_attention_masks.get(mask_stage)
+            if mixfusion_attention_mask_buckets is None:
+                raise ValueError(f"MixFusion missing precomputed {mask_stage} attention mask buckets.")
+            attn_output = self._mixfusion_attention(
+                query=query,
+                key=key,
+                value=value,
+                mixfusion_attention_mask_buckets=mixfusion_attention_mask_buckets,
+                full_attn_spans=full_attn_spans,
+                plan=mixfusion_sequence_plan,
+                seq_len=seq_len,
+            )
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+            return attn_output
+
+        attention_mask = attention_mask.contiguous()
 
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
@@ -2355,6 +2547,9 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        mixfusion_sequence_plan: MixFusionSequencePlan | None = None,
+        mixfusion_attention_masks: dict[str, dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]]
+        | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 
@@ -2463,6 +2658,8 @@ class HunyuanImage3Model(nn.Module):
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 full_attn_spans=full_attn_spans,
+                mixfusion_sequence_plan=mixfusion_sequence_plan,
+                mixfusion_attention_masks=mixfusion_attention_masks,
             )
 
             hidden_states = layer_outputs[0]
@@ -2620,13 +2817,16 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
     def prepare_latents(self, batch_size, latent_channel, image_size, dtype, device, generator, latents=None):
         if self.latent_scale_factor is None:
-            latent_scale_factor = (1,) * len(image_size)
-        elif isinstance(self.latent_scale_factor, int):
-            latent_scale_factor = (self.latent_scale_factor,) * len(image_size)
-        elif isinstance(self.latent_scale_factor, tuple) or isinstance(self.latent_scale_factor, list):
-            assert len(self.latent_scale_factor) == len(image_size), (
-                "len(latent_scale_factor) should be the same as len(image_size)"
+            latent_ndim = (
+                len(image_size[0]) if image_size and isinstance(image_size[0], (list, tuple)) else len(image_size)
             )
+            latent_scale_factor = (1,) * latent_ndim
+        elif isinstance(self.latent_scale_factor, int):
+            latent_ndim = (
+                len(image_size[0]) if image_size and isinstance(image_size[0], (list, tuple)) else len(image_size)
+            )
+            latent_scale_factor = (self.latent_scale_factor,) * latent_ndim
+        elif isinstance(self.latent_scale_factor, tuple) or isinstance(self.latent_scale_factor, list):
             latent_scale_factor = self.latent_scale_factor
         else:
             raise ValueError(
@@ -2634,11 +2834,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 f"but got {self.latent_scale_factor}"
             )
 
-        latents_shape = (
-            batch_size,
-            latent_channel,
-            *[int(s) // f for s, f in zip(image_size, latent_scale_factor)],
-        )
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -2646,14 +2841,40 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             )
 
         if latents is None:
-            latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
+            if image_size and isinstance(image_size[0], (list, tuple)):
+                latents = []
+                for i, sample_image_size in enumerate(image_size):
+                    sample_generator = generator[i] if isinstance(generator, list) else generator
+                    sample_latents_shape = (
+                        1,
+                        latent_channel,
+                        *[int(s) // f for s, f in zip(sample_image_size, latent_scale_factor)],
+                    )
+                    latents.append(
+                        randn_tensor(sample_latents_shape, generator=sample_generator, device=device, dtype=dtype)
+                    )
+                if len({latent.shape[-2:] for latent in latents}) == 1:
+                    latents = torch.cat(latents, dim=0)
+            else:
+                latents_shape = (
+                    batch_size,
+                    latent_channel,
+                    *[int(s) // f for s, f in zip(image_size, latent_scale_factor)],
+                )
+                latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
         else:
-            latents = latents.to(device)
+            if isinstance(latents, list):
+                latents = [latent.to(device=device, dtype=dtype) for latent in latents]
+            else:
+                latents = latents.to(device)
 
         # Check existence to make it compatible with FlowMatchEulerDiscreteScheduler
         if hasattr(self.scheduler, "init_noise_sigma"):
             # scale the initial noise by the standard deviation required by the scheduler
-            latents = latents * self.scheduler.init_noise_sigma
+            if isinstance(latents, list):
+                latents = [latent * self.scheduler.init_noise_sigma for latent in latents]
+            else:
+                latents = latents * self.scheduler.init_noise_sigma
 
         return latents
 
@@ -2951,6 +3172,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         model_kwargs: dict[str, Any] | None = None,
+        mixfusion_image_sizes: list[tuple[int, int]] | None = None,
+        mixfusion_generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
     ):
         r"""
@@ -3034,14 +3257,21 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # Prepare latent variables
         latents = self.prepare_latents(
-            batch_size=batch_size,
+            batch_size=len(mixfusion_image_sizes) if mixfusion_image_sizes is not None else batch_size,
             latent_channel=self.model.config.vae["latent_channels"],
-            image_size=image_size,
+            image_size=mixfusion_image_sizes if mixfusion_image_sizes is not None else image_size,
             dtype=torch.bfloat16,
             device=device,
-            generator=generator,
+            generator=mixfusion_generator if mixfusion_image_sizes is not None else generator,
             latents=latents,
         )
+        if mixfusion_image_sizes is not None:
+            if get_sequence_parallel_world_size() > 1:
+                raise ValueError("MixFusion mixed-resolution patch batching is not compatible with sequence parallel.")
+            if cfg_parallel_ready:
+                raise ValueError("MixFusion mixed-resolution patch batching is not compatible with CFG parallel.")
+            if not isinstance(latents, list):
+                raise ValueError("MixFusion expected heterogeneous latent tensors.")
 
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(self.scheduler.step, {"generator": generator})
@@ -3079,7 +3309,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         seq_lens = [seq_len] * b
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
-        model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+        model_kwargs["attention_mask"] = attention_mask.to(device)
 
         # Attempt to reuse KV cache from the AR stage.
         # Note: the reusable KV length may differ between positive and negative prompts.
@@ -3089,6 +3319,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # Store ar_kv_reuse_len in model_kwargs for use in forward method (SP mode)
         model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
+        if model_kwargs.get("mixfusion_sequence_plan") is not None:
+            model_kwargs["mixfusion_attention_masks"] = {
+                "first": self.model._build_mixfusion_attention_mask_buckets(
+                    model_kwargs["attention_mask"],
+                    model_kwargs["full_attn_spans"],
+                    model_kwargs["mixfusion_sequence_plan"],
+                )
+            }
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -3106,14 +3344,17 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 set_forward_context_denoise_step_idx(i)
-                if cfg_parallel_ready:
+                if isinstance(latents, list):
+                    latent_model_input = latents
+                    t_expand = t.repeat(model_kwargs["position_ids"].shape[0])
+                elif cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
+                    t_expand = t.repeat(latent_model_input.shape[0])
                 else:
                     # Sequential CFG: double the batch
                     latent_model_input = torch.cat([latents] * cfg_factor)
-
-                t_expand = t.repeat(latent_model_input.shape[0])
+                    t_expand = t.repeat(latent_model_input.shape[0])
 
                 # ---- TeaCache: decide whether to compute or reuse ----
                 should_compute = True
@@ -3144,10 +3385,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
-                    pred = pred.to(dtype=torch.float32)
+                    if isinstance(pred, list):
+                        pred = [sample_pred.to(dtype=torch.float32) for sample_pred in pred]
+                    else:
+                        pred = pred.to(dtype=torch.float32)
 
                     if tea_cache_config is not None:
-                        tc_prev_pred = pred.clone()
+                        tc_prev_pred = (
+                            [sample_pred.clone() for sample_pred in pred] if isinstance(pred, list) else pred.clone()
+                        )
                 else:
                     # TeaCache fast path: reuse previous prediction
                     pred = tc_prev_pred
@@ -3158,11 +3404,39 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
                 elif self.do_classifier_free_guidance:
-                    pred_cond, pred_uncond = pred.chunk(2)
-                    pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
+                    if isinstance(pred, list):
+                        half = len(pred) // 2
+                        pred = [
+                            self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
+                            for pred_cond, pred_uncond in zip(pred[:half], pred[half:], strict=True)
+                        ]
+                    else:
+                        pred_cond, pred_uncond = pred.chunk(2)
+                        pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
 
                 # Scheduler step (all ranks compute locally in CFG parallel)
-                latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
+                if isinstance(latents, list):
+                    next_latents = []
+                    for request_idx, (sample_pred, sample_latent) in enumerate(zip(pred, latents, strict=True)):
+                        next_latent = self.scheduler.step(
+                            sample_pred,
+                            t,
+                            sample_latent,
+                            **_scheduler_step_extra_kwargs,
+                            return_dict=False,
+                        )[0]
+                        next_latents.append(next_latent)
+                        if request_idx != len(latents) - 1 and hasattr(self.scheduler, "_step_index"):
+                            self.scheduler._step_index -= 1
+                    latents = next_latents
+                else:
+                    latents = self.scheduler.step(
+                        pred,
+                        t,
+                        latents,
+                        **_scheduler_step_extra_kwargs,
+                        return_dict=False,
+                    )[0]
                 if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
@@ -3175,6 +3449,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+                    if model_kwargs.get("mixfusion_sequence_plan") is not None:
+                        mask_cache = model_kwargs.setdefault("mixfusion_attention_masks", {})
+                        if "later" not in mask_cache:
+                            mask_cache["later"] = self.model._build_mixfusion_attention_mask_buckets(
+                                model_kwargs["attention_mask"],
+                                model_kwargs["full_attn_spans"],
+                                model_kwargs["mixfusion_sequence_plan"],
+                            )
 
                 if tea_cache_config is not None:
                     tc_cnt += 1
@@ -3193,19 +3475,41 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
-            latents = latents / self.vae.config.scaling_factor
+            if isinstance(latents, list):
+                latents = [latent / self.vae.config.scaling_factor for latent in latents]
+            else:
+                latents = latents / self.vae.config.scaling_factor
         if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
-            latents = latents + self.vae.config.shift_factor
+            if isinstance(latents, list):
+                latents = [latent + self.vae.config.shift_factor for latent in latents]
+            else:
+                latents = latents + self.vae.config.shift_factor
 
         if hasattr(self.vae, "ffactor_temporal"):
-            latents = latents.unsqueeze(2)
+            if isinstance(latents, list):
+                latents = [latent.unsqueeze(2) for latent in latents]
+            else:
+                latents = latents.unsqueeze(2)
 
+        decode_generator = mixfusion_generator if mixfusion_image_sizes is not None else generator
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
-            image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+            if isinstance(latents, list):
+                decoded_images = []
+                for i, latent in enumerate(latents):
+                    sample_generator = decode_generator[i] if isinstance(decode_generator, list) else decode_generator
+                    decoded_images.append(self.vae.decode(latent, return_dict=False, generator=sample_generator)[0])
+                image = decoded_images
+            else:
+                image = self.vae.decode(latents, return_dict=False, generator=decode_generator)[0]
 
         if hasattr(self.vae, "ffactor_temporal"):
-            assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
-            image = image.squeeze(2)
+            if isinstance(image, list):
+                for decoded in image:
+                    assert decoded.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
+                image = [decoded.squeeze(2) for decoded in image]
+            else:
+                assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
+                image = image.squeeze(2)
 
         # Denormalize + PIL moved to engine post_process_func for overlap with next request.
 

@@ -337,14 +337,20 @@ def _prepare_padded_prompt_fields(
     return gathered_embeds, gathered_masks
 
 
+def _uses_ragged_latents(states: Sequence[StepRequestState]) -> bool:
+    return any(bool(state.extra.get("use_ragged_latents", False)) for state in states)
+
+
 def _prepare_latents(
     states: Sequence[StepRequestState],
     *,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | list[torch.Tensor]:
     latents_values = [state.latents for state in states]
     if any(latents is None for latents in latents_values):
         raise ValueError("All requests must have `latents` initialized.")
+    if _uses_ragged_latents(states):
+        return [latents for latents in latents_values if latents is not None]
     return _gather_tensor_rows(
         [latents for latents in latents_values if latents is not None],
         field_name="latents",
@@ -604,7 +610,7 @@ class InputBatch:
     idx_mapping: torch.Tensor
     idx_mapping_np: np.ndarray
 
-    latents: torch.Tensor
+    latents: torch.Tensor | list[torch.Tensor]
     timesteps: torch.Tensor
     prompt_embeds: torch.Tensor | None
     prompt_embeds_mask: torch.Tensor | None
@@ -619,6 +625,7 @@ class InputBatch:
     img_shapes: list | None = None
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
+    request_extras: list[dict[str, object]] | None = None
     states: Sequence[StepRequestState] = field(default_factory=tuple)
 
     # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
@@ -637,7 +644,8 @@ class InputBatch:
         self,
         selected_states: Sequence[StepRequestState],
     ) -> None:
-        self.latents = _prepare_latents(selected_states, out=self.latents)
+        latents_out = self.latents if isinstance(self.latents, torch.Tensor) else None
+        self.latents = _prepare_latents(selected_states, out=latents_out)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
 
     def _refresh_static_fields(
@@ -664,6 +672,7 @@ class InputBatch:
         self.txt_seq_lens = _prepare_seq_lens(states, "txt_seq_lens")
         self.negative_txt_seq_lens = _prepare_seq_lens(states, "negative_txt_seq_lens")
         self._prompt_update_versions = prompt_update_versions(states)
+        self.request_extras = [state.extra for state in states]
 
     def _repack_dynamic_fields(
         self,
@@ -687,7 +696,8 @@ class InputBatch:
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
         self.states = tuple(selected_states)
-        self.latents = _prepare_latents(selected_states, out=self.latents)
+        latents_out = self.latents if isinstance(self.latents, torch.Tensor) else None
+        self.latents = _prepare_latents(selected_states, out=latents_out)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
         self._refresh_static_fields(selected_states)
         self.__post_init__()
@@ -743,6 +753,7 @@ class InputBatch:
                 selected_states,
                 "negative_txt_seq_lens",
             ),
+            request_extras=[state.extra for state in selected_states],
             states=tuple(selected_states),
             _prompt_update_versions=prompt_update_versions(selected_states),
         )
@@ -758,12 +769,14 @@ def scatter_latents(
     driven entirely by ``input_batch.idx_mapping_np`` so the runner remains free
     to keep request states in its own persistent storage layout.
     """
-    _scatter_batch_tensor_by_mapping(
-        states,
-        input_batch.idx_mapping_np,
-        attr_name="latents",
-        value=input_batch.latents,
-    )
+    if isinstance(input_batch.latents, list):
+        for batch_idx, state_idx in enumerate(input_batch.idx_mapping_np.tolist()):
+            if state_idx < 0 or state_idx >= len(states):
+                raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
+            states[state_idx].latents = input_batch.latents[batch_idx]
+        return
+
+    _scatter_batch_tensor_by_mapping(states, input_batch.idx_mapping_np, attr_name="latents", value=input_batch.latents)
 
 
 # Alias: InputBatch is the step/tensor-level batch.

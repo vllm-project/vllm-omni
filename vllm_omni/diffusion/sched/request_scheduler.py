@@ -7,7 +7,7 @@ from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler, _apply_mixfusion_shape_relaxation
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -95,8 +95,14 @@ class RequestScheduler(BaseScheduler):
             or (decision.deadline is not None and now >= decision.deadline)
         )
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        return build_request_batch_sampling_params_key(request)
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey | None:
+        """Build a request-batch compatibility key from sampling parameters."""
+        key_kwargs = build_request_batch_sampling_params_key(request)
+        values = {f.name: getattr(key_kwargs, f.name) for f in fields(key_kwargs)}
+        values = _apply_mixfusion_shape_relaxation(request, values)
+        if values is None:
+            return None
+        return RequestBatchSamplingParamsKey(**values)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

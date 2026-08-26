@@ -41,6 +41,21 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 }
 
 
+def _apply_mixfusion_shape_relaxation(request: OmniDiffusionRequest, values: dict) -> dict | None:
+    sampling = request.sampling_params
+    extra_args = getattr(sampling, "extra_args", {}) or {}
+    if not bool(extra_args.get("enable_mixfusion", False)):
+        return values
+
+    if any(isinstance(prompt, dict) and prompt.get("additional_information") for prompt in request.prompts):
+        return None
+
+    values["height"] = None
+    values["width"] = None
+    values["resolution"] = None
+    return values
+
+
 class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers."""
 
@@ -420,14 +435,18 @@ class BaseScheduler(ABC):
 
     def _build_sampling_params_key(
         self, request: OmniDiffusionRequest
-    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
+    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None:  # return type loosened for subclassing
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        key_kwargs = _apply_mixfusion_shape_relaxation(request, key_kwargs)
+        if key_kwargs is None:
+            return None
         return StepBatchSamplingParamsKey(
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            **key_kwargs,
         )
 
 
