@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 step-wise execution (continuous batching) contract tests.
 
 These run on CPU against a stand-in DiT, so they cover the packing, the
@@ -31,6 +31,8 @@ class _SegmentMeanModel:
         x = kwargs["x"][0]
         audio_x = kwargs["audio_x"][0]
         bounds = kwargs["packed_seq_params"]["cu_seqlens_q"].tolist()
+        if kwargs["packed_seq_params"].get("num_requests", 1) > 1:
+            assert all(start < stop for start, stop in zip(bounds[:-1], bounds[1:]))
         img_pos = kwargs["img_pos_info"]["position_ids"]
         audio_pos = kwargs["audio_pos_info"]["position_ids"]
 
@@ -158,9 +160,9 @@ def test_batched_step_execution_matches_independent_requests():
 
     model = _SegmentMeanModel()
     specs = [
-        dict(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=6),
         # Exactly 64 packed rows exercises the no-padding-tail boundary case.
         dict(text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=7),
+        dict(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=6),
     ]
     # Different step counts, so the batch composition changes mid-flight.
     schedules = [(_sigmas(6, 12.0), _sigmas(6, 3.0)), (_sigmas(4, 12.0), _sigmas(4, 3.0))]
@@ -178,7 +180,7 @@ def test_batched_step_execution_matches_independent_requests():
     states = []
     for index, (spec, (sigmas_video, sigmas_audio)) in enumerate(zip(specs, schedules)):
         branch, video_rows, audio_rows = _make_branch(**spec)
-        if index == 1:
+        if index == 0:
             assert branch.used_len == branch.seq_len
         states.append(_make_state(f"req-{index}", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio))
 

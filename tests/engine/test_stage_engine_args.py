@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -122,6 +123,17 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
             engine_args["worker_cls"] = f"test.{worker_type}.Worker"
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", _resolve_test_worker)
+
+    class _TestConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class _TestWorker:
+        model_runner_cls = _TestConnectorRunner
+
+    for worker_type in ("ar", "generation"):
+        worker_module = types.ModuleType(f"test.{worker_type}")
+        worker_module.Worker = _TestWorker
+        monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
