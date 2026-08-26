@@ -48,9 +48,7 @@ Defined in `pyproject.toml`:
 | `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                                                               |
 | `A2`               | Tests that require A2 NPU *                                                                             |
 | `A3`               | Tests that require A3 NPU *                                                                             |
-| `distributed_cuda` | Tests that require multi cards on CUDA platform *                                                       |
-| `distributed_rocm` | Tests that require multi cards on ROCm platform  *                                                      |
-| `distributed_npu`  | Tests that require multi cards on NPU platform  *                                                       |
+| `cards_{n}`        | Tests that require *n* accelerator cards (`cards_1` … `cards_8`); auto-added from `num_cards` *         |
 | `skipif_cuda`      | Skip if the num of CUDA cards is less than the required *                                               |
 | `skipif_rocm`      | Skip if the num of ROCm cards is less than the required *                                               |
 | `skipif_npu`       | Skip if the num of NPU cards is less than the required *                                                |
@@ -58,7 +56,7 @@ Defined in `pyproject.toml`:
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
 | `local_model`      | Tests requiring local / non-HF-hub model weights                                                        |
 
-\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility).
+\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `pytest.mark.H100` / `pytest.mark.L4` (or other SKU names) by hand: `check-mark` rejects that so `cards_{n}` cannot be skipped.
 
 #### Example usage for markers
 
@@ -86,11 +84,10 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    @pytest.mark.cuda
    @pytest.mark.L4
    ```
-2. **Handles multi-card (distributed) scenarios**  
-   For tests requiring multiple cards, it automatically adds distributed markers such as `distributed_cuda`, `distributed_rocm`, or `distributed_npu`.
-   ```python
-   @pytest.mark.distributed_cuda(num_cards=num_cards)
-   ```
+2. **Handles card-count filtering**  
+   Adds a filterable marker `cards_{n}` (including `cards_1` when `num_cards` is omitted / 1). Use this with the SKU and platform, e.g. `-m "H100 and cards_4 and cuda"` vs `-m "H100 and cards_2 and cuda"`. Any multi-card CUDA test is `-m "cuda and not cards_1"`.
+
+   When `res` lists more than one platform **and** `num_cards` differs by platform, `@hardware_test` collects **one variant per platform** so those `cards_{n}` marks do not stack. `-m "H100 and cards_4 and cuda"` then selects only the CUDA/H100 4-card variant, not a ROCm 2-card sibling. The same count on every platform stays a single item.
 3. **Supports flexible card requirements**  
    Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
 
@@ -99,7 +96,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    Support for `skipif_rocm` and `skipif_npu` will be implemented later.
 
 5. **Works with pytest filtering**  
-   Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "distributed_cuda and L4"`).
+   Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
 
 ##### Example usage for decorator
 
@@ -119,11 +116,12 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
     ```
 - `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), XPU (B60), MUSA (S5000), NPU (A2/A3)
 - `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
-- Distributed markers (`distributed_cuda`, `distributed_rocm`, `distributed_npu`) are auto-added for multi-card cases
 - Filtering examples:
-    - CUDA only: `pytest -m "distributed_cuda and L4"`
-    - ROCm only: `pytest -m "distributed_rocm and MI325"`
-    - NPU only: `pytest -m "distributed_npu"`
+    - CUDA H100 4-card: `pytest -m "H100 and cards_4 and cuda"`
+    - CUDA H100 2-card: `pytest -m "H100 and cards_2 and cuda"`
+    - CUDA multi-card (any count): `pytest -m "L4 and not cards_1"`
+    - ROCm multi-card: `pytest -m "MI325 and not cards_1"`
+    - NPU multi-card: `pytest -m "npu and not cards_1"`
 
 #### Function: `hardware_marks`
 
@@ -181,7 +179,8 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        # ... existing markers ...
        "tpu: Tests that require TPU device",
        "TPU_V3: Tests that require TPU v3 hardware",
-       "distributed_tpu: Tests that require multiple TPU devices",
+       "cards_1: Tests that require 1 accelerator card",
+       "cards_2: Tests that require 2 accelerator cards",
    ]
    ```
 2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
@@ -196,12 +195,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
            raise ValueError(
                f"Invalid TPU resource type: {res}. Supported: TPU_V3")
 
-       if num_cards == 1:
-           return [test_platform, test_resource]
-       else:
-           test_distributed = pytest.mark.distributed_tpu(num_cards=num_cards)
-           # Optionally: add skipif_tpu when implemented
-           return [test_platform, test_resource, test_distributed]
+       return [test_platform, test_resource, _cards_mark(num_cards)]
    ```
 3. **Update `hardware_marks` to recognize your new platform**:
     In the relevant place (see the `hardware_marks` implementation), add:
@@ -225,7 +219,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
 - Add pytest markers for your new platform/resources  
 - Implement a marker function (`xxx_marks`)  
 - Plug into `hardware_marks`  
-- You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers, distribution, and isolation!
+- You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers and `cards_{n}` filtering.
 
 See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).
 

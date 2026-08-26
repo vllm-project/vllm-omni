@@ -14,6 +14,11 @@ from vllm.platforms import current_platform
 # Marker description tag in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
 # Example: ``"H100: [hardware-resource] Tests that require H100 GPU"``.
 _HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
+# ``cards_{n}`` markers registered in pyproject.toml for ``-m`` filtering by card count.
+_SUPPORTED_CARDS_MARKS = frozenset(range(1, 9))
+_SUPPORTED_PLATFORMS = ("cuda", "rocm", "xpu", "npu", "musa")
+# Indirect fixture used when ``@hardware_test`` splits one function into per-platform items.
+HARDWARE_PLATFORM_FIXTURE = "_omni_hardware_platform"
 
 
 def _repo_root() -> Path:
@@ -67,6 +72,19 @@ def get_hardware_mark_list() -> frozenset[str]:
     return frozenset(names)
 
 
+def _cards_mark(num_cards: int) -> pytest.MarkDecorator:
+    """Return ``cards_{n}`` so collection can filter with ``-m cards_2`` (etc.).
+
+    Multi-card selection is ``not cards_1`` (or an explicit ``cards_2`` / ``cards_4``).
+    """
+    if not isinstance(num_cards, int) or isinstance(num_cards, bool) or num_cards < 1:
+        raise ValueError(f"num_cards must be a positive int, got {num_cards!r}")
+    if num_cards not in _SUPPORTED_CARDS_MARKS:
+        supported = ", ".join(f"cards_{n}" for n in sorted(_SUPPORTED_CARDS_MARKS))
+        raise ValueError(f"num_cards={num_cards} has no registered marker. Supported: {supported}.")
+    return getattr(pytest.mark, f"cards_{num_cards}")
+
+
 def cuda_marks(*, res: str, num_cards: int):
     test_platform_detail = pytest.mark.cuda
     if res == "L4":
@@ -77,18 +95,15 @@ def cuda_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.H800
     else:
         raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100, H800")
-    marks = [test_resource, test_platform_detail]
-    if num_cards == 1:
+    marks = [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    if num_cards == 1 or not current_platform.is_cuda():
         return marks
-    test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
-
-    if not current_platform.is_cuda():
-        return marks + [test_distributed]
-    test_skipif = pytest.mark.skipif(
-        current_platform.device_count() < num_cards,
-        reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
-    )
-    return marks + [test_distributed, test_skipif]
+    return marks + [
+        pytest.mark.skipif(
+            current_platform.device_count() < num_cards,
+            reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
+        )
+    ]
 
 
 def rocm_marks(*, res: str, num_cards: int):
@@ -97,11 +112,7 @@ def rocm_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.MI325
     else:
         raise ValueError(f"Invalid ROCm resource type: {res}. Supported: MI325")
-    marks = [test_resource, test_platform_detail]
-    if num_cards == 1:
-        return marks
-    test_distributed = pytest.mark.distributed_rocm(num_cards=num_cards)
-    return marks + [test_distributed]
+    return [test_resource, test_platform_detail, _cards_mark(num_cards)]
 
 
 def xpu_marks(*, res: str, num_cards: int):
@@ -110,18 +121,15 @@ def xpu_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.B60
     else:
         raise ValueError(f"Invalid XPU resource type: {res}. Supported: B60")
-    marks = [test_resource, test_platform_detail]
-    if num_cards == 1:
+    marks = [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    if num_cards == 1 or not current_platform.is_xpu():
         return marks
-    test_distributed = pytest.mark.distributed_xpu(num_cards=num_cards)
-
-    if not current_platform.is_xpu():
-        return marks + [test_distributed]
-    test_skipif = pytest.mark.skipif(
-        current_platform.device_count() < num_cards,
-        reason=f"Need at least {num_cards} XPUs to run the test.",
-    )
-    return marks + [test_distributed, test_skipif]
+    return marks + [
+        pytest.mark.skipif(
+            current_platform.device_count() < num_cards,
+            reason=f"Need at least {num_cards} XPUs to run the test.",
+        )
+    ]
 
 
 def musa_marks(*, res: str, num_cards: int):
@@ -130,11 +138,7 @@ def musa_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.S5000
     else:
         raise ValueError(f"Invalid MUSA resource type: {res}. Supported: S5000")
-    marks = [test_resource, test_platform_detail]
-    if num_cards == 1:
-        return marks
-    test_distributed = pytest.mark.distributed_musa(num_cards=num_cards)
-    return marks + [test_distributed]
+    return [test_resource, test_platform_detail, _cards_mark(num_cards)]
 
 
 def gpu_marks(*, res: str, num_cards: int):
@@ -158,47 +162,105 @@ def npu_marks(*, res: str, num_cards: int):
         test_resource = pytest.mark.A3
     else:
         test_resource = None
-    if num_cards == 1:
-        return [mark for mark in [test_platform, test_resource] if mark is not None]
-    test_distributed = pytest.mark.distributed_npu(num_cards=num_cards)
-    return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
+    marks = [mark for mark in [test_platform, test_resource] if mark is not None]
+    marks.append(_cards_mark(num_cards))
+    return marks
+
+
+def _normalize_num_cards(res: dict[str, str], num_cards: int | dict[str, int]) -> dict[str, int]:
+    for platform in res:
+        if platform not in _SUPPORTED_PLATFORMS:
+            raise ValueError(f"Unsupported platform: {platform}")
+    if isinstance(num_cards, int) and not isinstance(num_cards, bool):
+        return {platform: num_cards for platform in res}
+    if not isinstance(num_cards, dict):
+        raise ValueError(f"num_cards must be a positive int or dict, got {num_cards!r}")
+    num_cards_dict = dict(num_cards)
+    for platform in num_cards_dict:
+        if platform not in res:
+            raise ValueError(f"Platform '{platform}' in num_cards but not in res.")
+    for platform in res:
+        num_cards_dict.setdefault(platform, 1)
+    return num_cards_dict
+
+
+def _marks_for_platform(platform: str, resource: str, num_cards: int) -> list[pytest.MarkDecorator]:
+    if platform in ("cuda", "rocm", "xpu", "musa"):
+        return gpu_marks(res=resource, num_cards=num_cards)
+    if platform == "npu":
+        return npu_marks(res=resource, num_cards=num_cards)
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
+def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:
+    from vllm_omni.platforms import current_omni_platform
+
+    checkers = {
+        "cuda": current_omni_platform.is_cuda,
+        "rocm": current_omni_platform.is_rocm,
+        "xpu": current_omni_platform.is_xpu,
+        "npu": current_omni_platform.is_npu,
+        "musa": current_omni_platform.is_musa,
+    }
+    return pytest.mark.skipif(not checkers[platform](), reason=f"Requires {platform} platform")
+
+
+def _apply_marks(func, marks: list[pytest.MarkDecorator]):
+    for mark in reversed(marks):
+        func = mark(func)
+    return func
 
 
 def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
-    for platform, _ in res.items():
-        if platform not in ("cuda", "rocm", "xpu", "npu", "musa"):
-            raise ValueError(f"Unsupported platform: {platform}")
-    if isinstance(num_cards, int):
-        num_cards_dict = {platform: num_cards for platform in res.keys()}
-    else:
-        num_cards_dict = num_cards
-        for platform in num_cards_dict.keys():
-            if platform not in res:
-                raise ValueError(f"Platform '{platform}' in num_cards but not in res.")
-        for platform in res.keys():
-            if platform not in num_cards_dict:
-                num_cards_dict[platform] = 1
+    """Return marks for a **single** pytest item.
+
+    Different per-platform ``num_cards`` cannot share one item: ``cards_2`` and
+    ``cards_4`` would both match ``-m cards_2`` / ``-m cards_4``. Use
+    ``@hardware_test`` (one collected variant per platform) or call this once
+    per platform and attach each list to its own ``pytest.param``.
+    """
+    num_cards_dict = _normalize_num_cards(res, num_cards)
+    unique_counts = set(num_cards_dict.values())
+    if len(res) > 1 and len(unique_counts) > 1:
+        raise ValueError(
+            "hardware_marks() cannot attach different per-platform num_cards to one pytest item "
+            f"(got {num_cards_dict}). Use @hardware_test, which collects one variant per platform, "
+            "or call hardware_marks() once per platform."
+        )
 
     all_marks: list[pytest.MarkDecorator] = []
     for platform, resource in res.items():
-        cards = num_cards_dict[platform]
-        if platform in ("cuda", "rocm", "xpu", "musa"):
-            marks = gpu_marks(res=resource, num_cards=cards)
-        elif platform == "npu":
-            marks = npu_marks(res=resource, num_cards=cards)
-        else:
-            raise ValueError(f"Unsupported platform: {platform}")
-        all_marks.extend(marks)
+        all_marks.extend(_marks_for_platform(platform, resource, num_cards_dict[platform]))
     return all_marks
 
 
 def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
-    all_marks = hardware_marks(res=res, num_cards=num_cards)
+    """Apply hardware marks; split collected items when card counts differ by platform.
 
-    def wrapper(f):
-        func = f
-        for mark in reversed(all_marks):
-            func = mark(func)
-        return func
+    A single item cannot carry both ``cards_4`` (CUDA) and ``cards_2`` (ROCm):
+    ``-m "H100 and cards_4 and cuda"`` would otherwise also match
+    ``-m "H100 and cards_2 and cuda"``. When ``num_cards`` differs across
+    platforms, this decorator parametrizes one variant per platform so each
+    item only has that platform's SKU and ``cards_{n}``.
+    """
+    num_cards_dict = _normalize_num_cards(res, num_cards)
+    mixed_counts = len(res) > 1 and len(set(num_cards_dict.values())) > 1
+    if not mixed_counts:
+        all_marks = hardware_marks(res=res, num_cards=num_cards)
 
-    return wrapper
+        def apply_union_marks(f):
+            return _apply_marks(f, all_marks)
+
+        return apply_union_marks
+
+    params = []
+    for platform, resource in res.items():
+        marks = _marks_for_platform(platform, resource, num_cards_dict[platform])
+        marks.append(_skipif_not_platform(platform))
+        params.append(pytest.param(platform, marks=marks, id=platform))
+
+    def apply_split_params(f):
+        func = pytest.mark.usefixtures(HARDWARE_PLATFORM_FIXTURE)(f)
+        return pytest.mark.parametrize(HARDWARE_PLATFORM_FIXTURE, params, indirect=True)(func)
+
+    return apply_split_params

@@ -338,7 +338,7 @@ Classify the model's **CI priority** first:
 
 **L2 & L3 online — same file, dual marks on the baseline smoke:** The **first / simplest** case in `test_{slug}.py` (default deploy, minimal steps, single prompt) should carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** function so L2 (`test-ready.yml`) and L3 (`test-merge.yml`) share one smoke test. Heavier deploy variants or API paths in the same file use **`advanced_model` only**. When L3 moves to nightly, migrate those heavier cases into `test_{slug}_expansion.py` with `full_model` and remove the dedicated `test-merge.yml` job (see `test_longcat_image_expansion.py`, `test_qwen_image_expansion.py`).
 
-**L4 design (high priority):** Combine multiple supported features (Cache-DiT, TP, USP, CFG, HSDP, CPU offload, quantization) into **few parametrized** `OmniServerParams` rows so each feature appears in at least one case without exploding GPU jobs. Shard single-GPU vs multi-GPU cases across the nightly X2I/X2V function steps (1-GPU vs `distributed_cuda`).
+**L4 design (high priority):** Combine multiple supported features (Cache-DiT, TP, USP, CFG, HSDP, CPU offload, quantization) into **few parametrized** `OmniServerParams` rows so each feature appears in at least one case without exploding GPU jobs. Shard single-GPU vs multi-GPU cases across the nightly X2I/X2V function steps (`cards_1` vs `not cards_1`).
 
 **L4 design (medium / low):** One or two parametrized rows covering the best quality/perf trade-off; skip perf JSON unless the model is high priority.
 

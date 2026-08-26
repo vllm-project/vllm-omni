@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for DFX runner metadata field exclusion."""
 
 import json
@@ -105,7 +108,7 @@ def test_resolve_pytest_marks_hardware_dict_with_extra():
     assert "H100" in names
     assert "cuda" in names
     assert "gpu" in names
-    assert "distributed_cuda" in names
+    assert "cards_2" in names
     assert "full_model" in names
     assert "diffusion" in names
     assert "local_model" in names
