@@ -514,6 +514,7 @@ class TestPipeFusionConvMixin:
         runtime = PipeFusionRuntime()
         runtime.patch_mode = True
         runtime.num_pipeline_patch = 2
+        runtime.split_dim = "height"
         runtime.pp_patches_start_end_idx = [(0, 2), (2, 6)]
         runtime.pp_patches_post_start_end_idx = [(0, 2), (2, 6)]
         monkeypatch.setattr(pf_conv, "get_pipefusion_runtime", lambda: runtime)
@@ -529,6 +530,33 @@ class TestPipeFusionConvMixin:
         full_output = conv.orig_forward(full_input)
 
         torch.testing.assert_close(patch_output, full_output[:, :, :, 2:6, :])
+        torch.testing.assert_close(conv.activation_cache, full_input)
+
+    def test_conv3d_forward_supports_temporal_split(self, monkeypatch):
+        runtime = PipeFusionRuntime()
+        runtime.patch_mode = True
+        runtime.num_pipeline_patch = 2
+        runtime.split_dim = "temporal"
+        runtime.pp_patches_start_end_idx = [(0, 2), (2, 6)]
+        runtime.pp_patches_post_start_end_idx = [(0, 2), (2, 6)]
+        monkeypatch.setattr(pf_conv, "get_pipefusion_runtime", lambda: runtime)
+
+        conv = DummyConv()
+        conv.kernel_size = (3, 1, 1)
+        conv.stride = (1, 1, 1)
+        conv.padding = (1, 0, 0)
+        conv.weight = torch.ones(1, 1, 3, 1, 1)
+
+        full_input = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1, 1)
+
+        runtime.pipeline_patch_idx = 0
+        _ = conv.pipefusion_conv3d_forward(full_input[:, :, :2, :, :], dims=full_input.shape)
+
+        runtime.pipeline_patch_idx = 1
+        patch_output = conv.pipefusion_conv3d_forward(full_input[:, :, 2:, :, :], dims=full_input.shape)
+        full_output = conv.orig_forward(full_input)
+
+        torch.testing.assert_close(patch_output, full_output[:, :, 2:6, :, :])
         torch.testing.assert_close(conv.activation_cache, full_input)
 
 
