@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter, DuplexCapability, OutputChunk
+from vllm_omni.experimental.fullduplex.core.session import DuplexSession
+
+
+@dataclass(frozen=True)
+class MageVLCodecWindow:
+    """One causal Mage-VL visual window.
+
+    A window may carry decoded frames, codec-native side information, or both.
+    The adapter deliberately keeps these fields opaque so traditional H.264/HEVC
+    metadata and neural codec tensors can share the same full-duplex session API.
+    """
+
+    data: Any
+    kind: str = "frames"
+    segment_id: str | None = None
+    pts_ms: int | None = None
+    duration_ms: int | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MageVLGateDecision:
+    should_respond: bool
+    text: str = ""
+    event_id: str | None = None
+    score: float | None = None
+    reason: str = ""
+
+
+GateResult = MageVLGateDecision | Mapping[str, Any] | bool | str | None
+GateFn = Callable[[DuplexSession, Sequence[MageVLCodecWindow]], Awaitable[GateResult] | GateResult]
+GenerateResult = AsyncIterator[str | OutputChunk] | Sequence[str | OutputChunk] | str | OutputChunk | Awaitable[Any]
+GenerateFn = Callable[
+    [DuplexSession, Sequence[MageVLCodecWindow], str | None, MageVLGateDecision | None],
+    GenerateResult,
+]
+
+
+class MageVLDuplexAdapter(DuplexAdapter):
+    """Full-duplex session adapter for Mage-VL's proactive streaming mode.
+
+    This adapter owns the serving/session contract around Mage-VL: bounded causal
+    visual memory, rolling-window cognition-gate evaluation, event de-duplication,
+    explicit user queries, and stale-output cleanup through the shared runtime.
+    Model execution is injected through ``gate`` and ``generate`` callables so the
+    same adapter can front the remote-code Transformers path, vLLM once native
+    ``mage_vl`` support lands, or an OpenAI-compatible backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        gate: GateFn | None = None,
+        generate: GenerateFn | None = None,
+        window_size: int = 4,
+        max_windows: int = 64,
+        output_modality: str = "text",
+    ) -> None:
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if max_windows <= 0:
+            raise ValueError("max_windows must be positive")
+        self._gate = gate
+        self._generate = generate
+        self._window_size = window_size
+        self._max_windows = max_windows
+        self._output_modality = output_modality
+        # Adapter instances are shared by the serving runtime. Keep mutable
+        # cognition state per session so concurrent sessions cannot leak visual
+        # windows, queries, or event ids into one another.
+        self._session_state: dict[str, _MageVLSessionState] = {}
+
+    def capabilities(self) -> DuplexCapability:
+        return DuplexCapability(
+            input_modalities=frozenset({"codec_window", "image", "text", "video"}),
+            output_modalities=frozenset({self._output_modality}),
+            proactive=True,
+        )
+
+    async def on_input(self, session: DuplexSession, modality: str, data: Any) -> None:
+        state = self._state_for(session)
+        if modality == "text":
+            text = str(data or "").strip()
+            if text:
+                state.pending_query = text
+            return
+
+        window = _coerce_window(modality, data)
+        state.windows.append(window)
+        if len(state.windows) > self._max_windows:
+            del state.windows[: len(state.windows) - self._max_windows]
+        await self._evaluate_gate(session)
+
+    def should_respond(self, session: DuplexSession) -> bool:
+        state = self._state_for(session)
+        if state.pending_query and state.windows:
+            return True
+        return bool(state.pending_gate and state.pending_gate.should_respond)
+
+    async def respond(self, session: DuplexSession) -> AsyncIterator[OutputChunk]:
+        state = self._state_for(session)
+        windows = tuple(state.windows[-self._window_size :])
+        query = state.pending_query
+        gate = state.pending_gate
+        state.pending_query = None
+        state.pending_gate = None
+
+        if self._generate is None:
+            if gate and gate.text:
+                yield OutputChunk(self._output_modality, gate.text)
+            return
+
+        async for chunk in _iter_generate_result(self._generate(session, windows, query, gate)):
+            yield _as_output_chunk(chunk, self._output_modality)
+
+    async def on_barge_in(self, session: DuplexSession) -> None:
+        state = self._state_for(session)
+        state.pending_query = None
+        state.pending_gate = None
+
+    def close_session(self, session: DuplexSession) -> None:
+        """Release all mutable state owned by a disconnected session."""
+        self._session_state.pop(session.session_id, None)
+
+    async def _evaluate_gate(self, session: DuplexSession) -> None:
+        state = self._state_for(session)
+        if self._gate is None or len(state.windows) < self._window_size:
+            return
+        decision = _coerce_gate_decision(
+            await _maybe_await(self._gate(session, tuple(state.windows[-self._window_size :])))
+        )
+        if not decision.should_respond:
+            return
+        if decision.event_id and decision.event_id in state.seen_events:
+            return
+        if decision.event_id:
+            state.seen_events.add(decision.event_id)
+        state.pending_gate = decision
+
+    def _state_for(self, session: DuplexSession) -> _MageVLSessionState:
+        return self._session_state.setdefault(session.session_id, _MageVLSessionState())
+
+
+@dataclass
+class _MageVLSessionState:
+    windows: list[MageVLCodecWindow] = field(default_factory=list)
+    pending_query: str | None = None
+    pending_gate: MageVLGateDecision | None = None
+    seen_events: set[str] = field(default_factory=set)
+
+
+def _coerce_window(modality: str, data: Any) -> MageVLCodecWindow:
+    if isinstance(data, MageVLCodecWindow):
+        return data
+    if isinstance(data, Mapping):
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, Mapping):
+            metadata = {"metadata": metadata}
+        payload = data.get("data", data.get("frames", data.get("frame", data.get("codec"))))
+        return MageVLCodecWindow(
+            data=payload,
+            kind=str(data.get("kind", modality)),
+            segment_id=_optional_str(data.get("segment_id")),
+            pts_ms=_optional_int(data.get("pts_ms")),
+            duration_ms=_optional_int(data.get("duration_ms")),
+            metadata=metadata,
+        )
+    return MageVLCodecWindow(data=data, kind=modality)
+
+
+def _coerce_gate_decision(result: GateResult) -> MageVLGateDecision:
+    if isinstance(result, MageVLGateDecision):
+        return result
+    if isinstance(result, Mapping):
+        return MageVLGateDecision(
+            should_respond=bool(result.get("should_respond", result.get("respond", result.get("open", False)))),
+            text=str(result.get("text", "")),
+            event_id=_optional_str(result.get("event_id")),
+            score=_optional_float(result.get("score")),
+            reason=str(result.get("reason", "")),
+        )
+    if isinstance(result, str):
+        text = result.strip()
+        return MageVLGateDecision(should_respond=bool(text), text=text)
+    return MageVLGateDecision(should_respond=bool(result))
+
+
+async def _iter_generate_result(result: GenerateResult) -> AsyncIterator[str | OutputChunk]:
+    resolved: Any = await _maybe_await(result)
+    if isinstance(resolved, str | OutputChunk):
+        yield resolved
+        return
+    if hasattr(resolved, "__aiter__"):
+        async for item in resolved:
+            yield item
+        return
+    for item in resolved:
+        yield item
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _as_output_chunk(chunk: str | OutputChunk, default_modality: str) -> OutputChunk:
+    if isinstance(chunk, OutputChunk):
+        return chunk
+    return OutputChunk(default_modality, chunk)
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
