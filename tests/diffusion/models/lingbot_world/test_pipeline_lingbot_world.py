@@ -1763,3 +1763,193 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+class TestConditionSteadyState:
+    """Where the image condition stops moving, and what follows from knowing it.
+
+    The condition is one VAE encode of the first frame followed by zeros, sliced
+    a block at a time. A causal VAE's response to a constant input settles, and
+    once it has, every later tick can be handed the same settled block -- which
+    is what turns a ten-tick ceiling into no ceiling at all.
+    """
+
+    BLOCK = 3
+
+    @staticmethod
+    def _condition(blocks: list[float], block_frames: int = 3, channels: int = 2) -> torch.Tensor:
+        """One frame-block per entry, each filled with that entry's value."""
+        frames = torch.cat(
+            [torch.full((1, channels, block_frames, 2, 2), value, dtype=torch.float32) for value in blocks],
+            dim=2,
+        )
+        return frames
+
+    def test_a_condition_that_settles_reports_the_first_settled_frame(self):
+        # Blocks 2 through 5 are identical, so the settled region starts at
+        # block 2 -- reported as a frame index, not a block index.
+        condition = self._condition([3.0, 1.0, 0.5, 0.5, 0.5, 0.5])
+        onset = lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=0.0)
+        assert onset == 2 * self.BLOCK
+
+    def test_a_condition_still_moving_at_the_end_reports_nothing(self):
+        # Not "settled at the last block": an encode too short to show the
+        # settling has to say so rather than return a number.
+        condition = self._condition([3.0, 1.0, 0.5, 0.25, 0.125, 0.0625])
+        assert lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=0.0) is None
+
+    def test_a_single_trailing_block_is_not_evidence_of_settling(self):
+        # With one block left there is nothing to compare against, so a scan
+        # that allowed it would report "settled" having compared nothing.
+        condition = self._condition([3.0, 1.0])
+        assert lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=0.0) is None
+
+    def test_the_tolerance_is_what_decides_it(self):
+        condition = self._condition([3.0, 1.0, 0.50, 0.51, 0.50, 0.51])
+        assert lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=0.0) is None
+        assert lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=0.02) == 2 * self.BLOCK
+
+    def test_the_tolerance_has_no_default(self):
+        # Zero is the tempting value and the one value that can never be right
+        # on real weights, so the caller is made to choose.
+        with pytest.raises(TypeError):
+            lingbot_pipeline.condition_steady_state_onset(self._condition([1.0, 1.0, 1.0]), self.BLOCK)
+
+    def test_nonsense_arguments_are_refused(self):
+        condition = self._condition([1.0, 1.0, 1.0])
+        with pytest.raises(ValueError):
+            lingbot_pipeline.condition_steady_state_onset(condition, 0, atol=0.0)
+        with pytest.raises(ValueError):
+            lingbot_pipeline.condition_steady_state_onset(condition, self.BLOCK, atol=-1.0)
+
+    def test_a_bfloat16_plateau_is_read_as_settled_and_a_float32_decay_is_not(self):
+        # The failure this tolerance exists for. The same decaying tail is still
+        # moving in float32 but lands on one repeated bfloat16 value, so an
+        # exact comparison answers "never settles" on the dtype the model
+        # actually consumes.
+        tail = [4.0, 4.0 + 2**-9, 4.0 + 2**-10, 4.0 + 2**-11]
+        exact = torch.cat([torch.full((1, 1, self.BLOCK, 2, 2), value, dtype=torch.float32) for value in tail], dim=2)
+        quantised = exact.bfloat16()
+
+        assert lingbot_pipeline.condition_steady_state_onset(exact, self.BLOCK, atol=0.0) is None
+        tolerance = 2.0 * lingbot_pipeline.representable_step(quantised)
+        assert lingbot_pipeline.condition_steady_state_onset(quantised, self.BLOCK, atol=tolerance) == 0
+
+    def test_representable_step_follows_the_dtype_and_the_magnitude(self):
+        assert lingbot_pipeline.representable_step(torch.tensor([5.72], dtype=torch.bfloat16)) == pytest.approx(2**-5)
+        assert lingbot_pipeline.representable_step(torch.tensor([0.9], dtype=torch.bfloat16)) == pytest.approx(2**-8)
+        # An all-zero tensor has no magnitude to take a step at.
+        assert lingbot_pipeline.representable_step(torch.zeros(4, dtype=torch.bfloat16)) == 0.0
+
+    def test_the_kept_frames_round_up_to_whole_blocks(self):
+        # Ticks slice at multiples of the block size, so the retained region has
+        # to end on a block boundary. Rounding up only ever keeps more than the
+        # onset needs, which leaves the reused block inside the settled region.
+        cls = lingbot_pipeline.LingBotWorldCausalDMDPipeline
+        pipeline = SimpleNamespace(
+            vae_scale_factor_temporal=4,
+            transformer=SimpleNamespace(config=SimpleNamespace(num_frames_per_block=3)),
+            _measured_condition_onset=None,
+        )
+        pipeline._condition_horizon_latent_frames = lambda: cls._condition_horizon_latent_frames(pipeline)
+        horizon = pipeline._condition_horizon_latent_frames()
+        latent_frames = cls._condition_latent_frames
+
+        assert horizon == 30
+        assert latent_frames(pipeline) == 30  # nothing measured yet: keep it all
+
+        pipeline._measured_condition_onset = 9
+        assert latent_frames(pipeline) == 12
+        pipeline._measured_condition_onset = 10
+        assert latent_frames(pipeline) == 15
+        pipeline._measured_condition_onset = 0
+        assert latent_frames(pipeline) == 3
+        # A checkpoint that only settles at the very end keeps the horizon.
+        pipeline._measured_condition_onset = 28
+        assert latent_frames(pipeline) == 30
+
+
+def test_a_session_runs_past_the_condition_horizon_once_the_onset_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The point of measuring: no tick ceiling, and one settled block reused.
+
+    Before this, a session raised at chunk_index 10 because the preallocated
+    image condition ran out -- 10 ticks is 7.3 s of video at 16 fps. The ceiling
+    was never a property of the model: the transformer is handed a fixed-width
+    slice and is never told how long the session has been running.
+    """
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    conditions = []
+
+    def generate_block(**kwargs):
+        conditions.append(kwargs["condition"].clone())
+        return torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"])
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda prompt_embeds, *, invalidate: [SimpleNamespace()])
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    ticks = 15  # comfortably past the old ceiling of 10
+    for chunk_index in range(ticks):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+
+    assert len(conditions) == ticks
+
+    # The fake VAE returns a first frame and zeros after it, so everything from
+    # frame 1 onwards is settled. The onset is a frame index and the scan is
+    # per-frame, so it reports the tightest boundary rather than the enclosing
+    # block; rounding that up to whole blocks leaves a session holding two
+    # blocks instead of the ten the horizon would have cost.
+    assert pipeline._measured_condition_onset == 1
+    assert pipeline._ar_sessions["world-1"].image_condition.shape[2] == 6
+
+    # The opening block is the one that carries the image; every tick past the
+    # transient is handed the same settled block.
+    assert not torch.equal(conditions[0], conditions[1])
+    for later in conditions[2:]:
+        assert torch.equal(later, conditions[1])
+
+
+def test_a_condition_that_never_settles_keeps_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifting the ceiling is earned by a measurement, not assumed.
+
+    A checkpoint whose condition is still moving at the end of the horizon has
+    no settled block to reuse, so the old behaviour is exactly what it should
+    get -- including the error at the old place.
+    """
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+
+    def restless_encode(video: torch.Tensor):
+        latent_frames = (video.shape[2] - 1) // 4 + 1
+        latents = torch.zeros(
+            video.shape[0], 16, latent_frames, video.shape[-2] // 8, video.shape[-1] // 8, dtype=video.dtype
+        )
+        # Never repeats: every frame differs from every other by more than any
+        # dtype-scaled tolerance.
+        latents[:, :, :] = torch.arange(latent_frames, dtype=video.dtype).view(1, 1, -1, 1, 1)
+        return SimpleNamespace(latents=latents)
+
+    monkeypatch.setattr(pipeline.vae, "encode", restless_encode)
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda prompt_embeds, *, invalidate: [SimpleNamespace()])
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+
+    for chunk_index in range(10):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+
+    assert pipeline._measured_condition_onset is None
+    with pytest.raises(ValueError, match="at most 10 ticks"):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=10))))
