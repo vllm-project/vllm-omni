@@ -184,8 +184,9 @@ def test_mirror_hardwares_cuda_string_skips_when_selector_is_other_chip(
                     {"label": "H100 only", "mirror_hardwares": "h100_4"},
                     {
                         "label": "Count remap",
-                        "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
-                        "mirror_hardwares": 2,
+                        "commands": [
+                            'pytest -sv tests/e2e -m "full_model and H100 and B200 and omni and cards_2"',
+                        ],
                     },
                     {"label": "String H100", "mirror_hardwares": "h100_4"},
                 ],
@@ -214,90 +215,119 @@ def test_mirror_hardwares_cuda_string_kept_when_selector_unset(monkeypatch: pyte
 
 
 def test_mirror_hardwares_mapping_is_rejected() -> None:
-    with pytest.raises(ValueError, match="must be a GPU count or a preset string"):
+    with pytest.raises(ValueError, match="must be a preset string"):
         _expand_mirror_hardwares(
             {"label": "bad", "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"}},
         )
 
 
-def test_mirror_hardwares_count_uses_h100_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("hardware", [2, "2", "h100_99", "not_a_preset"])
+def test_mirror_hardwares_unknown_name_is_rejected(hardware: int | str) -> None:
+    with pytest.raises(ValueError, match="unknown mirror_hardwares"):
+        _expand_mirror_hardwares(
+            {
+                "label": "unknown preset",
+                "mirror_hardwares": hardware,
+            },
+        )
+
+
+def test_mirror_hardwares_string_ignores_pytest_cards_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "forced",
+            "commands": ['pytest -sv tests/e2e -m "full_model and L4 and cards_4"'],
+            "mirror_hardwares": "h100_1",
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 1
+
+
+def test_mirror_hardwares_inferred_from_sku_and_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     step = _expand_mirror_hardwares(
         {
             "label": "Omni Function",
-            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
-            "mirror_hardwares": 2,
+            "commands": [
+                'pytest -sv tests/e2e -m "full_model and H100 and B200 and omni and cards_2"',
+            ],
         },
     )
     assert step is not None
+    assert "mirror_hardwares" not in step
     assert step["agents"]["queue"] == "mithril-h100-pool"
     assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
 
 
-def test_mirror_hardwares_count_uses_l4_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
-    step = _expand_mirror_hardwares(
-        {
-            "label": "TTS L4",
-            "commands": ["pytest -s -v tests/e2e/ -m 'full_model and L4 and tts'"],
-            "mirror_hardwares": 1,
-        },
+def test_mirror_hardwares_inferred_skips_when_h100_only_and_mirror_hw_b200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    assert (
+        _expand_mirror_hardwares(
+            {
+                "label": "Omni Function",
+                "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni and cards_2"'],
+            },
+        )
+        is None
     )
-    assert step is not None
-    assert step["agents"]["queue"] == "gpu_1_queue"
 
 
-def test_mirror_hardwares_count_single_sku_ignores_mirror_hw(
+def test_mirror_hardwares_inferred_skips_when_unset_and_only_b200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    assert (
+        _expand_mirror_hardwares(
+            {
+                "label": "B200 only",
+                "commands": ['pytest -sv tests/e2e -m "B200 and cards_2"'],
+            },
+        )
+        is None
+    )
+
+
+def test_mirror_hardwares_inferred_skips_when_cards_without_h100_or_l4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    assert (
+        _expand_mirror_hardwares(
+            {
+                "label": "no sku",
+                "commands": ['pytest -sv tests/e2e -m "full_model and cards_2"'],
+            },
+        )
+        is None
+    )
+
+
+def test_mirror_hardwares_inferred_follows_mirror_hw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
     step = _expand_mirror_hardwares(
         {
             "label": "Omni Function",
-            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
-            "mirror_hardwares": 2,
-        },
-    )
-    assert step is not None
-    assert step["agents"]["queue"] == "mithril-h100-pool"
-    assert step["commands"] == ['pytest -sv tests/e2e -m "full_model and H100 and omni"']
-
-
-def test_mirror_hardwares_count_multi_sku_unset_prefers_h100_over_b200(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
-    step = _expand_mirror_hardwares(
-        {
-            "label": "Omni Function",
-            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
-            "mirror_hardwares": 2,
-        },
-    )
-    assert step is not None
-    assert step["agents"]["queue"] == "mithril-h100-pool"
-
-
-def test_mirror_hardwares_count_multi_sku_matches_mirror_hw(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
-    step = _expand_mirror_hardwares(
-        {
-            "label": "Omni Function",
-            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
-            "mirror_hardwares": 2,
+            "commands": [
+                'pytest -sv tests/e2e -m "full_model and H100 and B200 and omni and cards_2"',
+            ],
         },
     )
     assert step is not None
     assert step["agents"]["queue"] == "b200-k8s"
-    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
-    assert step["commands"] == [
-        'pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"',
-    ]
 
 
-def test_mirror_hardwares_count_multi_sku_skips_when_mirror_hw_not_in_m(
+def test_mirror_hardwares_inferred_skips_when_mirror_hw_not_in_m(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
@@ -305,63 +335,149 @@ def test_mirror_hardwares_count_multi_sku_skips_when_mirror_hw_not_in_m(
         _expand_mirror_hardwares(
             {
                 "label": "H100 or L4",
-                "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
-                "mirror_hardwares": 4,
+                "commands": ['pytest -sv tests/e2e -m "H100 or L4 and cards_4"'],
             },
         )
         is None
     )
 
 
-def test_mirror_hardwares_count_prefers_l4_when_both_markers_unset(
+def _gpu_limit(step: dict) -> int:
+    return step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"]
+
+
+def test_mirror_hardwares_inferred_not_cards_1_uses_l4_highest_preset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     step = _expand_mirror_hardwares(
         {
-            "label": "mixed",
-            "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
-            "mirror_hardwares": 4,
+            "label": "L4 remaining",
+            "commands": [
+                'pytest -sv tests/e2e -m "full_model and diffusion and L4 and not cards_1"',
+            ],
         },
     )
     assert step is not None
     assert step["agents"]["queue"] == "gpu_4_queue"
 
 
-def test_mirror_hardwares_count_falls_back_when_l4_count_has_no_preset(
+def test_mirror_hardwares_inferred_not_cards_1_uses_h100_highest_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "H100 remaining",
+            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and not cards_1"'],
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert _gpu_limit(step) == 4
+
+
+def test_mirror_hardwares_inferred_not_cards_1_follows_mirror_hw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "Omni remaining",
+            "commands": [
+                'pytest -sv tests/e2e -m "full_model and H100 and B200 and not cards_1"',
+            ],
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "b200-k8s"
+    assert _gpu_limit(step) == 4
+
+
+def test_mirror_hardwares_inferred_multiple_cards_uses_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "H100 mixed cards",
+            "commands": ['pytest -sv tests/e2e -m "H100 and cards_2 and cards_3"'],
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert _gpu_limit(step) == 3
+
+
+def test_mirror_hardwares_inferred_uses_h100_when_h100_and_l4_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     step = _expand_mirror_hardwares(
         {
             "label": "mixed",
-            "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
-            "mirror_hardwares": 2,
+            "commands": ['pytest -sv tests/e2e -m "H100 or L4 and cards_4"'],
         },
     )
     assert step is not None
     assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert _gpu_limit(step) == 4
 
 
-def test_mirror_hardwares_count_requires_sku_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mirror_hardwares_inferred_uses_l4_when_l4_and_b200_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
-    with pytest.raises(ValueError, match="needs a pytest -m SKU marker"):
-        _expand_mirror_hardwares(
-            {
-                "label": "no sku",
-                "commands": ['pytest -sv tests/e2e -m "full_model and cuda"'],
-                "mirror_hardwares": 2,
-            },
-        )
+    step = _expand_mirror_hardwares(
+        {
+            "label": "L4 and B200",
+            "commands": ['pytest -sv tests/e2e -m "L4 and B200 and cards_4"'],
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "gpu_4_queue"
 
 
-def test_mirror_hardwares_count_ignores_not_h100(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mirror_hardwares_inferred_l4_and_b200_follows_mirror_hw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "L4 and B200",
+            "commands": ['pytest -sv tests/e2e -m "L4 and B200 and cards_4"'],
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "b200-k8s"
+    assert _gpu_limit(step) == 4
+
+
+def test_mirror_hardwares_inferred_positive_cards_beats_not_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "H100 2-gpu",
+            "commands": ['pytest -sv tests/e2e -m "H100 and cards_2 and not cards_1"'],
+        },
+    )
+    assert step is not None
+    assert _gpu_limit(step) == 2
+
+
+def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
+    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
+    assert _expand_mirror_hardwares(step) is step
+
+
+def test_mirror_hardwares_inferred_ignores_not_h100(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     step = _expand_mirror_hardwares(
         {
             "label": "L4 only",
-            "commands": ['pytest -sv tests/e2e -m "full_model and L4 and not H100"'],
-            "mirror_hardwares": 4,
+            "commands": ['pytest -sv tests/e2e -m "full_model and L4 and not H100 and cards_4"'],
         },
     )
     assert step is not None
@@ -396,8 +512,7 @@ def test_mirror_hw_typo_fails_before_skipping_steps(monkeypatch: pytest.MonkeyPa
             {"label": "CPU report", "commands": ["echo ok"]},
             {
                 "label": "Nightly Omni",
-                "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
-                "mirror_hardwares": 2,
+                "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni and cards_2"'],
             },
             {"label": "H100 string", "mirror_hardwares": "h100_4"},
         ],

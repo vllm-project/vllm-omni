@@ -14,20 +14,17 @@ Test pipeline mode (e.g. test-level3.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
-  - ``mirror_hardwares`` may be a GPU count (``2``) or a preset string (``l4_1``)::
+  - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
+    markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
+    positive ``cards_*`` uses that chip's highest existing preset). An explicit
+    preset string (``h100_2``) is used as-is (marks are ignored). Names that
+    are not keys in ``ci_mirror_hardwares.yml`` fail the upload.
 
-      mirror_hardwares: 2
-      # or
-      mirror_hardwares: h100_2
-
-    Count form composes ``{chip}_{count}`` from pytest ``-m`` SKU markers
-    (``H100``, ``L4``, ``B200``). One SKU → that chip (``MIRROR_HW`` is ignored).
-    Several SKUs → unset ``MIRROR_HW`` picks L4 then H100; ``MIRROR_HW=b200``
-    matches ``B200`` in ``-m`` (otherwise the step is skipped). ``-m`` is not
-    rewritten: B200 collection must already be in the YAML and on the tests.
-    ``MIRROR_HW`` must be empty or ``b200`` (case-insensitive); unknown values
-    (e.g. ``b20o``) fail the upload. A CUDA preset string such as ``h100_4``
-    is omitted when ``MIRROR_HW=b200``.
+    Inferred chip: unset ``MIRROR_HW`` matches ``H100`` or ``L4`` in ``-m``
+    (both → H100); no match skips the step. ``MIRROR_HW=b200`` matches
+    ``B200`` in ``-m`` (otherwise skipped). ``-m`` is not rewritten.
+    ``MIRROR_HW`` must be empty or ``b200``; unknown values fail the upload.
+    A CUDA preset string such as ``h100_4`` is omitted when ``MIRROR_HW=b200``.
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
@@ -45,7 +42,7 @@ import subprocess
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 try:
     import yaml
@@ -252,10 +249,16 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
 # Longer tokens first so ``h100`` is not matched as a prefix of ``h200``.
 _CUDA_MIRROR_CHIPS = ("b200", "h200", "h100", "l4")
 _SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"b200"})
-# Unset MIRROR_HW + both H100 and L4 markers: prefer L4, then H100.
-_COUNT_UNSET_CHIP_PREFERENCE = ("l4", "h100")
+# Unset MIRROR_HW: match H100 then L4 in -m (skip if neither).
+_DEFAULT_INFER_CHIPS = ("h100", "l4")
 _PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
+_CARDS_MARK = re.compile(r"\bcards_([1-4])\b")
+_NOT_CARDS_MARK = re.compile(r"\bnot\s+cards_([1-4])\b")
+_NOT_SKU_MARK = re.compile(
+    r"\bnot\s+(" + "|".join(re.escape(chip.upper()) for chip in _CUDA_MIRROR_CHIPS) + r")\b",
+)
 _COUNT_PRESET_RANGE = range(1, 5)
+_CARDS_CHIP_MAX: Literal["max"] = "max"
 
 
 def _english_or(names: Any) -> str:
@@ -282,149 +285,170 @@ def _get_mirror_hw_selector() -> str:
     return selector
 
 
-def _pytest_marker_chips(commands: Any) -> set[str]:
-    """Positive CUDA SKU tokens in pytest ``-m`` (``H100`` from ``h100`` in ``_CUDA_MIRROR_CHIPS``)."""
+def _read_pytest_marks(commands: Any) -> tuple[set[str], int | Literal["max"] | None]:
+    """Read pytest ``-m`` from step commands: CUDA SKU chips and cards count.
 
-    def _command_text(value: Any) -> str:
+    *chips* are lowercase SKUs from positive markers (``not H100`` is ignored).
+    *cards* is the max positive ``cards_n``, ``"max"`` when only ``not cards_*``
+    is present, or ``None``.
+    """
+    chunks: list[str] = []
+
+    def _collect(value: Any) -> None:
         if value is None:
-            return ""
+            return
         if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "\n".join(_command_text(part) for part in value)
-        return str(value)
+            chunks.append(value)
+        elif isinstance(value, list):
+            for part in value:
+                _collect(part)
+        else:
+            chunks.append(str(value))
 
-    not_sku = re.compile(
-        r"\bnot\s+(" + "|".join(re.escape(chip.upper()) for chip in _CUDA_MIRROR_CHIPS) + r")\b",
-    )
+    _collect(commands)
+    text = "\n".join(chunks)
+
     chips: set[str] = set()
-    for match in _PYTEST_MARKER_ARG.finditer(_command_text(commands)):
+    positives: set[int] = set()
+    has_not_cards = False
+    for match in _PYTEST_MARKER_ARG.finditer(text):
         expr = match.group(1) or match.group(2) or match.group(3) or ""
-        stripped = not_sku.sub(" ", expr)
+        stripped_sku = _NOT_SKU_MARK.sub(" ", expr)
         for chip in _CUDA_MIRROR_CHIPS:
-            if re.search(rf"\b{re.escape(chip.upper())}\b", stripped):
+            if re.search(rf"\b{re.escape(chip.upper())}\b", stripped_sku):
                 chips.add(chip)
-    return chips
+        if _NOT_CARDS_MARK.search(expr):
+            has_not_cards = True
+        stripped_cards = _NOT_CARDS_MARK.sub(" ", expr)
+        for cards_match in _CARDS_MARK.finditer(stripped_cards):
+            positives.add(int(cards_match.group(1)))
+
+    if positives:
+        cards: int | Literal["max"] | None = max(positives)
+    elif has_not_cards:
+        cards = _CARDS_CHIP_MAX
+    else:
+        cards = None
+    return chips, cards
 
 
-def _resolve_mirror_hardware_name(hardware: Any, *, step: dict[str, Any], step_label: str) -> str | None:
+def _compose_mirror_hardware_name(
+    chips: set[str],
+    cards: int | Literal["max"] | None,
+    *,
+    step_label: str,
+) -> str | None:
+    """Assemble ``{chip}_{n}`` from pytest ``-m`` chips/cards, or None to skip.
+
+    Unset ``MIRROR_HW``: ``H100`` if in ``-m``, else ``L4``, else skip.
+    Set ``MIRROR_HW``: that chip if in ``-m``, else skip.
+    ``cards`` is 1–4, ``"max"`` for that chip's highest existing preset, or
+    None (error after a chip matched — the step has no ``cards_*``).
+    """
+    selector = _get_mirror_hw_selector()
+    if selector:
+        chip = selector if selector in chips else None
+        skip_reason = f"MIRROR_HW={selector!r} not in -m SKUs {sorted(chips)}"
+    else:
+        chip = next((c for c in _DEFAULT_INFER_CHIPS if c in chips), None)
+        skip_reason = f"no H100 or L4 in -m SKUs {sorted(chips)}"
+    if chip is None:
+        _log(f"skip {step_label}: {skip_reason}")
+        return None
+    if cards is None:
+        raise ValueError(
+            f"step {step_label!r} has a pytest -m SKU marker but no cards_1..4 "
+            f"(or not cards_*); add cards_n or set mirror_hardwares to force a preset",
+        )
+
+    count_source = "not cards_*" if cards == _CARDS_CHIP_MAX else f"cards_{cards}"
+    count = None if cards == _CARDS_CHIP_MAX else cards
+    if count is not None and count not in _COUNT_PRESET_RANGE:
+        raise ValueError(
+            f"{count_source} in step {step_label!r} must be 1–4, got {count}",
+        )
+    known = _load_mirror_hardwares()
+    if count is None:
+        available = [n for n in _COUNT_PRESET_RANGE if f"{chip}_{n}" in known]
+        if not available:
+            raise ValueError(
+                f"{count_source} in step {step_label!r} has no CUDA count presets for {chip}",
+            )
+        count = max(available)
+    chosen = f"{chip}_{count}"
+    if chosen not in known:
+        raise ValueError(
+            f"{count_source} in step {step_label!r} has no preset {chosen!r}",
+        )
+    _log(f"{step_label}: {count_source} → {chosen!r}")
+    return chosen
+
+
+def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | None:
     """Map ``mirror_hardwares`` to a ``ci_mirror_hardwares.yml`` preset, or None to skip.
 
-    Count (``2`` / ``"2"``): compose ``{chip}_{count}`` from pytest ``-m`` SKUs.
-    One SKU uses that chip (``MIRROR_HW`` ignored). Several SKUs: unset prefers
-    L4 then H100; ``b200`` must appear in ``-m``. String (``h100_2``): omitted
-    when ``MIRROR_HW`` names a different CUDA chip. NPU strings ignore it.
+    The value is a preset name (``h100_2``). Unknown names fail later when the
+    registry is loaded. CUDA names are omitted when ``MIRROR_HW`` names a
+    different chip; NPU strings ignore ``MIRROR_HW``.
     """
-    # bool is a subclass of int; reject YAML ``true`` before treating it as a count.
     if isinstance(hardware, bool):
         raise ValueError(f"mirror_hardwares must not be a boolean in step {step_label!r}")
-
-    count: int | None
-    if isinstance(hardware, int):
-        count = hardware
-    elif isinstance(hardware, str) and hardware.strip().isdigit():
-        count = int(hardware.strip())
-    else:
-        count = None
-
-    if count is not None:
-        if count not in _COUNT_PRESET_RANGE:
-            raise ValueError(
-                f"mirror_hardwares GPU count in step {step_label!r} must be 1–4, got {count}",
-            )
-        chips = _pytest_marker_chips(step.get("commands"))
-        if not chips:
-            raise ValueError(
-                f"mirror_hardwares: {count} in step {step_label!r} needs a pytest -m SKU marker "
-                f"({_english_or(chip.upper() for chip in _CUDA_MIRROR_CHIPS)}), "
-                f"or an explicit preset string",
-            )
-        known = _load_mirror_hardwares()
-        selector = _get_mirror_hw_selector()
-
-        def _require_preset(chip: str) -> str:
-            chosen = f"{chip}_{count}"
-            if chosen not in known:
-                raise ValueError(
-                    f"mirror_hardwares: {count} in step {step_label!r} has no preset {chosen!r}",
-                )
-            return chosen
-
-        if len(chips) == 1:
-            chip = next(iter(chips))
-            chosen = _require_preset(chip)
-            extra = f" (ignored MIRROR_HW={selector!r})" if selector and selector != chip else ""
-            _log(f"{step_label}: mirror_hardwares count {count} → single marker {chip}{extra} → {chosen!r}")
-            return chosen
-
-        if selector:
-            if selector not in chips:
-                _log(
-                    f"skip {step_label}: MIRROR_HW={selector!r} is not among -m SKUs {sorted(chips)}",
-                )
-                return None
-            chosen = _require_preset(selector)
-            _log(f"{step_label}: mirror_hardwares count {count} → MIRROR_HW={selector!r} → {chosen!r}")
-            return chosen
-
-        tried: list[str] = []
-        for chip in _COUNT_UNSET_CHIP_PREFERENCE:
-            if chip not in chips:
-                continue
-            chosen = f"{chip}_{count}"
-            tried.append(chosen)
-            if chosen not in known:
-                continue
-            _log(
-                f"{step_label}: mirror_hardwares count {count} → marker {chip} "
-                f"(multiple SKU markers; preferred "
-                f"{' then '.join(c.upper() for c in _COUNT_UNSET_CHIP_PREFERENCE)}) → {chosen!r}",
-            )
-            return chosen
-        raise ValueError(
-            f"mirror_hardwares: {count} in step {step_label!r} found SKU markers {sorted(chips)} "
-            f"but no {'/'.join(c.upper() for c in _COUNT_UNSET_CHIP_PREFERENCE)} preset "
-            f"among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
-        )
-
     if isinstance(hardware, str):
         name = hardware.strip()
-        if not name:
-            raise ValueError(f"mirror_hardwares must be a non-empty string in step {step_label!r}")
-        selector = _get_mirror_hw_selector()
-        token = name.lower()
-        chip = next(
-            (c for c in _CUDA_MIRROR_CHIPS if token == c or token.startswith(f"{c}_")),
-            None,
+    elif isinstance(hardware, int):
+        name = str(hardware)
+    else:
+        raise ValueError(
+            f"mirror_hardwares must be a preset string in step {step_label!r}",
         )
-        if selector and chip is not None and chip != selector:
-            _log(
-                f"skip {step_label}: preset {name!r} is {chip} hardware; MIRROR_HW={selector!r}",
-            )
-            return None
-        return name
+    if not name:
+        raise ValueError(f"mirror_hardwares must be a non-empty string in step {step_label!r}")
 
-    raise ValueError(
-        f"mirror_hardwares must be a GPU count or a preset string in step {step_label!r}",
+    selector = _get_mirror_hw_selector()
+    token = name.lower()
+    chip = next(
+        (c for c in _CUDA_MIRROR_CHIPS if token == c or token.startswith(f"{c}_")),
+        None,
     )
+    if selector and chip is not None and chip != selector:
+        _log(
+            f"skip {step_label}: preset {name!r} is {chip} hardware; MIRROR_HW={selector!r}",
+        )
+        return None
+    return name
 
 
 def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
-    """Replace uploader-only ``mirror_hardwares`` with preset fields from ci_mirror_hardwares.yml.
+    """Replace ``mirror_hardwares`` (or infer it from ``-m``) with preset agents/plugins.
 
-    Returns None when the current ``MIRROR_HW`` selector does not apply to this step.
+    Explicit preset string: used as-is; pytest marks are ignored.
+    Omitted key: match H100/L4 (or ``MIRROR_HW``) in ``-m``, then compose
+    ``{chip}_{n}`` from ``cards_n``. No match skips the step. Steps with no
+    SKU/cards and no ``mirror_hardwares`` are left unchanged (CPU jobs).
+
+    Returns None when the current ``MIRROR_HW`` selector does not apply.
     """
-    hardware = step.get("mirror_hardwares")
-    if hardware is None:
-        return step
-
     step_label = _get_step_label(step)
-    if step.get("agents") is not None or step.get("plugins") is not None or step.get("image") is not None:
-        raise ValueError(
-            f"step {step_label!r} sets mirror_hardwares together with agents/plugins/image; use mirror_hardwares only",
+    has_pool = step.get("agents") is not None or step.get("plugins") is not None or step.get("image") is not None
+
+    if "mirror_hardwares" not in step:
+        if has_pool:
+            return step
+        chips, cards = _read_pytest_marks(step.get("commands"))
+        if not chips and cards is None:
+            return step
+        preset_name = _compose_mirror_hardware_name(chips, cards, step_label=step_label)
+    else:
+        if has_pool:
+            raise ValueError(
+                f"step {step_label!r} sets mirror_hardwares together with agents/plugins/image; "
+                f"use mirror_hardwares only",
+            )
+        preset_name = _resolve_mirror_hardware_name(
+            step.get("mirror_hardwares"),
+            step_label=step_label,
         )
 
-    preset_name = _resolve_mirror_hardware_name(hardware, step=step, step_label=step_label)
     if preset_name is None:
         return None
 

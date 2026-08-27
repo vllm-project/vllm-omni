@@ -3,9 +3,9 @@
 # ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins``, then strips
 # ``mirror_hardwares`` before Buildkite upload.
 #
-# Count form (compose {chip}_{count} from pytest -m H100/L4/B200):
-#   mirror_hardwares: 2
-# One SKU in -m → that chip. Several SKUs: unset MIRROR_HW prefers L4 then H100;
+# Omit the key: compose {chip}_{n} from pytest -m SKU + cards_n (max of several
+# positives; not cards_1 with no positive cards_* → that chip's highest existing preset).
+# Unset MIRROR_HW matches H100 or L4 in -m (both → H100); no match skips the step.
 # MIRROR_HW=b200 matches B200 in -m (else the step is skipped).
 # MIRROR_HW must be empty or b200 (case-insensitive); unknown values fail the upload.
 # CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW=b200.
