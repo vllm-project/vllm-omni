@@ -113,13 +113,71 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = False
         self.requires_full_prefix_cached_hidden_states = False
 
-        # Stateful per-request execution is only validated at batch size 1
-        # (the shipped offline scope); fail fast on silent multi-request use.
+        # The vendored (eager / captured-step) paths share single-session
+        # buffers (StaticCache, capture-time addresses) and stay batch=1; the
+        # NATIVE path keeps all per-request state in _sessions (paged KV,
+        # per-request MoG on each request's own hidden slice) and supports
+        # multi-session batching (validated at max_num_seqs<=4). The native
+        # flag is read below, so peek at it here for the guard.
         max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-        if max_num_seqs != 1:
+        if max_num_seqs != 1 and not bool(getattr(self.config, "use_native_talker", False)):
             raise NotImplementedError(
-                f"NemotronVoiceChat talker supports max_num_seqs=1 only (got {max_num_seqs}); "
-                "the vendored EAR-TTS session state is not batch-safe."
+                f"NemotronVoiceChat talker supports max_num_seqs=1 only (got {max_num_seqs}) on the "
+                "vendored paths; the EAR-TTS session buffers are not batch-safe. Use "
+                "hf_overrides.use_native_talker for multi-session batching."
+            )
+
+        # CUDA-graph fast path (hf_overrides.use_talker_cuda_graphs). Off by
+        # default: the eager path is the NeMo bit-parity acceptance path, while
+        # the captured step replays the same math ~3x faster with a
+        # graph-managed RNG (audio equivalent but not bit-identical).
+        self._use_cuda_graphs = bool(getattr(self.config, "use_talker_cuda_graphs", False))
+        self._graph_max_cache_len = int(getattr(self.config, "talker_graph_max_cache_len", 4096))
+        self._step_graph: Any | None = None
+
+        # Native-vLLM path (hf_overrides.use_native_talker, experimental): the
+        # Gemma3 backbone runs as a real vLLM model on PagedAttention (KV and
+        # per-step attention cost scale with the ACTUAL session length; vLLM's
+        # own decode CUDA graphs apply), mirroring NVIDIA's deployment. The
+        # per-frame MoG sampling runs on the backbone's hidden state in
+        # make_omni_output. Classifier-free guidance is NOT applied yet on
+        # this path (single conditional stream; the paired-request CFG design
+        # is a documented follow-up), so audio quality trails the vendored
+        # CFG paths — use for development only.
+        self._use_native_backbone = bool(getattr(self.config, "use_native_talker", False))
+        # Classifier-free guidance on the native path
+        # (hf_overrides.native_talker_guidance): the conditional stream stays
+        # on vLLM paged KV; the unconditional stream mirrors it on the vendored
+        # HF backbone (see talker_native.UncondStream) and the pair is blended
+        # per NeMo's generate_step math. Off by default (measured ASR-equivalent
+        # at this checkpoint's guidance_scale=0.2, but kept available for
+        # listening-test parity with the vendored paths).
+        self._native_guidance = self._use_native_backbone and bool(
+            getattr(self.config, "native_talker_guidance", False)
+        )
+        # Captured MoG sampling step (built lazily on the first decode frame;
+        # falls back to eager sampling if capture fails).
+        self._mog_graph: Any | None = None
+        self._uncond_graph: Any | None = None
+        self.backbone: nn.Module | None = None
+        if self._use_native_backbone:
+            if self._use_cuda_graphs:
+                raise ValueError(
+                    "NemotronVoiceChat talker: use_native_talker and use_talker_cuda_graphs are mutually exclusive."
+                )
+            from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+
+            from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                synthesize_backbone_config,
+            )
+
+            tts_config = dict(getattr(self.config, "tts_cfg", {}) or {}).get("tts_config") or {}
+            backbone_cfg = synthesize_backbone_config(dict(tts_config))
+            self.backbone = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=backbone_cfg,
+                prefix=maybe_prefix(prefix, "backbone"),
+                architectures=["Gemma3ForCausalLM"],
             )
 
         # Vendored DuplexEARTTS; constructed in load_weights.
@@ -141,6 +199,16 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
+        if self._use_native_backbone:
+            # Real Gemma3 forward on PagedAttention; preprocess injected the
+            # fused embeddings, make_omni_output turns the hidden state into
+            # codes (MoG) and the CONTINUE/STOP flag.
+            return self.backbone(
+                input_ids=None,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
         # The per-frame compute happens in preprocess; the "hidden state" only
         # transports the stop flag (column 0) to compute_logits.
         if inputs_embeds is not None:
@@ -161,6 +229,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+        if self._use_native_backbone:
+            return self._native_make_omni_output(model_outputs, **kwargs)
         hidden = model_outputs
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         codes_list: list[torch.Tensor] = []
@@ -275,6 +345,36 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             )
         return timeline
 
+    @staticmethod
+    def _expected_total_tokens(info: dict[str, Any]) -> int | None:
+        """Producer-announced FINAL timeline length (meta.expected_total_tokens)."""
+        meta = info.get("meta")
+        value = meta.get("expected_total_tokens") if isinstance(meta, dict) else None
+        if value is None:
+            value = info.get("meta.expected_total_tokens")
+        return int(value) if value is not None else None
+
+    def _graph_session_usable(self, timeline: torch.Tensor, expected_len: int | None) -> bool:
+        """Whether the CUDA-graph fast path can serve this session.
+
+        ``expected_len`` is the known FINAL timeline length (sync mode, or a
+        frame-locked async producer's meta.expected_total_tokens); the graph
+        picks the smallest fitting cache bucket from it, since per-step
+        attention cost scales with the bucket size. ``None`` = unbounded
+        (duplex) -> largest bucket.
+        """
+        if self._step_graph is None:
+            return False
+        needed = max(int(timeline.numel()), expected_len or 0)
+        if not self._step_graph.fits(needed):
+            logger.warning(
+                "NemotronVoiceChat talker: timeline of %d positions exceeds the CUDA-graph "
+                "capacity; using the eager per-frame step for this request.",
+                needed,
+            )
+            return False
+        return self._step_graph.ensure_captured(expected_len)
+
     def _init_session(self, request_id: str, info: dict[str, Any], device: torch.device) -> dict[str, Any]:
         assert self.tts is not None
         timeline = self._timeline(info).to(device)
@@ -283,15 +383,6 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 f"NemotronVoiceChat talker timeline for request {request_id} has "
                 f"{timeline.numel()} positions; need at least 2 (prompt + one frame)."
             )
-        # Warmup: pre-baked speaker latent + init prompt forward (NeMo
-        # offline_inference lines around get_init_inputs/first forward).
-        self.tts.set_init_inputs(speaker_name=self._speaker_name)
-        init_inputs = self.tts.get_init_inputs(B=1)
-        guidance_enabled = self._guidance_enabled()
-        generation_config = self.tts._get_generation_config(guidance_enabled)
-        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
-        with torch.inference_mode():
-            outputs = self.tts.tts_model(**init_inputs)
         prompt_len = self._logical_prompt_len(info)
         if prompt_len is None:
             raise ValueError(
@@ -304,17 +395,17 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         codec_streaming = scalar_bool(meta.get("codec_streaming")) if isinstance(meta, dict) else False
         codec_streaming = codec_streaming or scalar_bool(info.get("meta.codec_streaming"))
         codec_request_id = meta.get("request_id") if isinstance(meta, dict) else None
+        # Warmup: pre-baked speaker latent (NeMo offline_inference lines around
+        # get_init_inputs); the init prompt forward runs in the eager branch
+        # below, or inside the CUDA-graph session's own StaticCache prefill.
+        self.tts.set_init_inputs(speaker_name=self._speaker_name)
+        guidance_enabled = self._guidance_enabled()
         session = {
             "timeline": timeline,
             "prompt_len": prompt_len,
             "step": 1,  # NeMo's loop starts at t=1
-            "past_key_values": outputs.past_key_values,
-            "code": init_inputs["code"][:, -1:],
-            "first_context_subword_id": init_inputs["subword_ids"][:, -1].unsqueeze(-1),
             "current_subword_mask": torch.ones(1, 1, device=device, dtype=torch.bool),
-            "tts_initialized": False,
             "guidance_enabled": guidance_enabled,
-            "generation_config": generation_config,
             "codes_rows": [],
             "codec_streaming": codec_streaming,
             "codec_request_id": codec_request_id,
@@ -324,14 +415,337 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             "sync_mode": info.get("nvc_text_timeline") is not None,
             "upstream_finished": self._upstream_finished(info) or info.get("nvc_text_timeline") is not None,
         }
+        if session["sync_mode"]:
+            expected_len: int | None = int(timeline.numel())
+        else:
+            expected_len = self._expected_total_tokens(info)
+        if self._graph_session_usable(timeline, expected_len):
+            self._step_graph.start_session(timeline, expected_len=expected_len)
+            session["use_graph"] = True
+        else:
+            init_inputs = self.tts.get_init_inputs(B=1)
+            generation_config = self.tts._get_generation_config(guidance_enabled)
+            init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
+            with torch.inference_mode():
+                outputs = self.tts.tts_model(**init_inputs)
+            session.update(
+                {
+                    "use_graph": False,
+                    "past_key_values": outputs.past_key_values,
+                    "code": init_inputs["code"][:, -1:],
+                    "first_context_subword_id": init_inputs["subword_ids"][:, -1].unsqueeze(-1),
+                    "tts_initialized": False,
+                    "generation_config": generation_config,
+                }
+            )
         self._sessions[request_id] = session
         return session
+
+    # ------------------------------------------------------------------
+    # Native-vLLM path (experimental; see __init__).
+    # ------------------------------------------------------------------
+    def _encode_cas_rows(self, ids: torch.Tensor) -> torch.Tensor:
+        """Batched CharAwareSubwordEncoder rows for timeline tokens ([n, H])."""
+        model = self.tts.tts_model
+        mask = torch.ones(1, ids.numel(), dtype=torch.bool, device=ids.device)
+        with torch.inference_mode():
+            return model.embed_subword(ids.unsqueeze(0), mask)[0]
+
+    def _init_native_session(self, request_id: str, info: dict[str, Any], device: torch.device) -> dict[str, Any]:
+        from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+            build_prefill_embeds,
+        )
+
+        timeline = self._timeline(info).to(device)
+        prompt_len = self._logical_prompt_len(info)
+        if prompt_len is None:
+            raise ValueError(
+                "NemotronVoiceChat talker request is missing its logical prompt length "
+                "('nvc_logical_prompt_len' or async meta.num_processed_tokens); the code2wav "
+                "producer cannot trim the prompt-region codes without it."
+            )
+        meta = info.get("meta")
+        codec_streaming = scalar_bool(meta.get("codec_streaming")) if isinstance(meta, dict) else False
+        codec_streaming = codec_streaming or scalar_bool(info.get("meta.codec_streaming"))
+        codec_request_id = meta.get("request_id") if isinstance(meta, dict) else None
+        sync_mode = info.get("nvc_text_timeline") is not None
+        if not sync_mode and not codec_streaming:
+            raise NotImplementedError(
+                "NemotronVoiceChat native talker supports the sync pipeline and duplex "
+                "(resumable) serving; the offline async-chunk pipeline would free-run past "
+                "the received timeline (non-resumable requests cannot park per segment) — "
+                "use the captured-step fast_streaming yaml for offline streaming."
+            )
+        self.tts.set_init_inputs(speaker_name=self._speaker_name)
+        init_inputs = self.tts.get_init_inputs(B=1)
+        init_len = int(init_inputs["code"].shape[1])
+        model = self.tts.tts_model
+        with torch.inference_mode():
+            prefill = build_prefill_embeds(
+                model,
+                code=init_inputs["code"],
+                subword_ids=init_inputs["subword_ids"],
+                subword_mask=init_inputs["subword_mask"],
+                audio_mask=init_inputs["audio_mask"],
+                audio_prompt_latent=init_inputs.get("audio_prompt_latent"),
+                uncond=False,
+            )[0]  # [init_len, H]
+        uncond_stream = None
+        if self._native_guidance:
+            from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                UncondStepGraph,
+                UncondStream,
+            )
+
+            with torch.inference_mode():
+                uncond_prefill = build_prefill_embeds(
+                    model,
+                    code=init_inputs["code"],
+                    subword_ids=init_inputs["subword_ids"],
+                    subword_mask=init_inputs["subword_mask"],
+                    audio_mask=init_inputs["audio_mask"],
+                    audio_prompt_latent=init_inputs.get("audio_prompt_latent"),
+                    uncond=True,
+                ).to(self._dtype)
+            # Captured StaticCache step when the graph is free (one session at
+            # a time; sync sessions pick the smallest fitting bucket, duplex
+            # takes the largest). Concurrent sessions step eagerly.
+            if self._uncond_graph is None:
+                self._uncond_graph = UncondStepGraph(
+                    model,
+                    hidden_size=int(uncond_prefill.shape[-1]),
+                    dtype=self._dtype,
+                    device=timeline.device,
+                    max_cache_len=self._graph_max_cache_len,
+                )
+            total_positions = (init_len + int(timeline.numel()) + 8) if sync_mode else None
+            if self._uncond_graph.start_session(request_id, uncond_prefill, total_positions):
+                uncond_stream = self._uncond_graph
+            else:
+                uncond_stream = UncondStream(model)
+                uncond_stream.prefill(uncond_prefill)
+        session = {
+            "use_native": True,
+            "timeline": timeline,
+            "cas_table": self._encode_cas_rows(timeline),
+            "prompt_len": int(prompt_len),
+            "init_len": init_len,
+            "prefill_embeds": prefill,
+            "step": 1,  # NeMo's loop starts at t=1
+            "code": init_inputs["code"][:, -1:],
+            # CFG: native_talker_guidance mirrors the stream on the vendored
+            # HF backbone (UncondStream); otherwise a single conditional
+            # stream (measured ASR-equivalent at guidance_scale=0.2; see yaml).
+            "generation_config": self.tts._get_generation_config(self._native_guidance),
+            "uncond_stream": uncond_stream,
+            "uncond_hidden": None,
+            # NeMo's inference_force_speech_silence_on_eos (default on): EOS
+            # text frames feed the silence codec frame back instead of the
+            # sampled codes.
+            "silence_codes": (
+                self.tts.codec_silence_tokens.reshape(1, 1, -1).to(device=timeline.device, dtype=torch.long)
+                if bool(self.tts.cfg.get("inference_force_speech_silence_on_eos", True))
+                else None
+            ),
+            "text_eos_id": int(self.tts.text_eos_id),
+            "codes_rows": [],
+            "pending_step": None,
+            "codec_streaming": codec_streaming,
+            "codec_request_id": codec_request_id,
+            "sync_mode": info.get("nvc_text_timeline") is not None,
+            "upstream_finished": self._upstream_finished(info) or info.get("nvc_text_timeline") is not None,
+        }
+        self._sessions[request_id] = session
+        return session
+
+    def _refresh_native_timeline(self, session: dict[str, Any], info: dict[str, Any], device: torch.device) -> None:
+        """Adopt a longer timeline from the latest chunk; CAS-encode new rows."""
+        latest = self._try_timeline(info)
+        old_len = int(session["timeline"].numel())
+        if latest is not None and latest.numel() > old_len:
+            latest = latest.to(device)
+            new_rows = self._encode_cas_rows(latest[old_len:].to(torch.long))
+            session["timeline"] = latest
+            session["cas_table"] = torch.cat([session["cas_table"], new_rows.to(session["cas_table"].dtype)], dim=0)
+        if self._upstream_finished(info):
+            session["upstream_finished"] = True
+
+    def _native_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        info: dict[str, Any],
+        device: torch.device,
+        span: int,
+        is_prefill: bool,
+        request_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+            build_decode_embeds,
+        )
+
+        # NOTE: resumable (duplex) segments report _omni_is_prefill=True on
+        # EVERY wake (each appended placeholder extends the prompt), so the
+        # branch is decided by the engine POSITION, never by the prefill flag:
+        # positions [0, init_len) carry the speaker-prompt prefill embeddings,
+        # every later position consumes exactly one timeline step.
+        del is_prefill
+        session = self._sessions.get(request_id)
+        if session is None:
+            session = self._init_native_session(request_id, info, device)
+        else:
+            self._refresh_native_timeline(session, info, device)
+        offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
+        init_len = int(session["init_len"])
+        if offset < init_len:
+            # Speaker-prompt prefill region (possibly chunked across steps).
+            if offset + span > init_len:
+                raise ValueError(
+                    f"NemotronVoiceChat native talker got a span [{offset}, {offset + span}) crossing "
+                    f"the speaker-prompt boundary ({init_len}); the stage prompt must be exactly "
+                    f"{init_len} placeholder tokens (set hf_overrides.talker_init_len / "
+                    f"async_chunk_prewarm_prompt_len to {init_len} in the deploy yaml) "
+                    "and duplex configs must schedule one timeline position per step "
+                    "(max_num_batched_tokens: 1 on this stage)."
+                )
+            prefill: torch.Tensor = session["prefill_embeds"]
+            return input_ids, prefill[offset : offset + span].to(self._dtype), {}
+
+        if span != 1:
+            raise RuntimeError(
+                f"NemotronVoiceChat native talker was scheduled {span} timeline positions in one "
+                "step; the per-frame code feedback is strictly sequential. Duplex/async configs "
+                "must set max_num_batched_tokens: 1 on this stage."
+            )
+        t = offset - init_len + 1
+        total = int(session["timeline"].numel())
+        if t != int(session["step"]):
+            raise RuntimeError(
+                f"NemotronVoiceChat native talker desynchronized: engine position implies timeline "
+                f"step {t} but the session is at step {session['step']} (recompute/preemption is "
+                "not supported on the native path)."
+            )
+        if t >= total:
+            raise RuntimeError(f"NemotronVoiceChat native talker stepped past the timeline: step {t} of {total}.")
+        model = self.tts.tts_model
+        with torch.inference_mode():
+            prev_codes = session["code"]
+            if session["silence_codes"] is not None:
+                # NeMo's inference_force_speech_silence_on_eos: on an EOS text
+                # frame the code feedback becomes the silence frame, so the
+                # turn ends in clean silence instead of a trailing artifact.
+                # Tensor-level select — no host sync on the timeline token.
+                is_eos = session["timeline"][t : t + 1].reshape(1, 1, 1) == session["text_eos_id"]
+                prev_codes = torch.where(is_eos, session["silence_codes"].expand_as(prev_codes), prev_codes)
+            embeds = build_decode_embeds(
+                model,
+                prev_codes=prev_codes,
+                subword_embed=session["cas_table"][t : t + 1].unsqueeze(0),
+                uncond=False,
+            )[0]  # [1, H]
+            if session["uncond_stream"] is not None:
+                # Advance the unconditional stream in lockstep: same prev codes,
+                # null conditioning. Its hidden row pairs with this step's
+                # conditional row in make_omni_output.
+                uncond_embed = build_decode_embeds(
+                    model,
+                    prev_codes=prev_codes,
+                    subword_embed=session["cas_table"][t : t + 1].unsqueeze(0),
+                    uncond=True,
+                ).to(self._dtype)
+                session["uncond_hidden"] = session["uncond_stream"].step(uncond_embed)
+        session["pending_step"] = t
+        return input_ids, embeds.to(self._dtype), {}
+
+    def _native_make_omni_output(self, hidden: torch.Tensor, **kwargs: Any) -> OmniOutput:
+        infos = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        spans = kwargs.get("request_token_spans")
+        flag = torch.zeros(hidden.shape[0], 2, dtype=torch.float32, device=hidden.device)
+        outputs: dict[str, Any] = {}
+        for i, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            request_id = info.get("request_id")
+            session = self._sessions.get(str(request_id)) if request_id is not None else None
+            if not session or not session.get("use_native"):
+                continue
+            pending = session.get("pending_step")
+            if pending is None:
+                continue  # prefill forward: no codes yet
+            session["pending_step"] = None
+            if spans is None:
+                raise RuntimeError("NemotronVoiceChat native talker needs request_token_spans from the runner.")
+            start, end = spans[i]
+            model = self.tts.tts_model
+            if session["uncond_stream"] is not None:
+                # CFG: pair the conditional row with this frame's uncond row
+                # ([cond; uncond] order — generate_step chunks in that order)
+                # and let generate_step apply NeMo's hidden-space blends
+                # (lm_head EOS blend + the post-MLP blend inside MoGHead.infer).
+                uncond_hidden = session["uncond_hidden"]
+                if uncond_hidden is None:
+                    raise RuntimeError(
+                        "NemotronVoiceChat native talker CFG desynchronized: no unconditional "
+                        "hidden row for this frame (preprocess/make_omni_output mismatch)."
+                    )
+                session["uncond_hidden"] = None
+                pair = torch.cat(
+                    [hidden[end - 1 : end].reshape(1, 1, -1), uncond_hidden.reshape(1, 1, -1)],
+                    dim=0,
+                ).to(self._dtype)
+                if self._mog_graph is None:
+                    from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                        MoGStepGraph,
+                    )
+
+                    self._mog_graph = MoGStepGraph(model, session["generation_config"], batch=2)
+                codes = self._mog_graph.run(pair)
+            else:
+                if self._mog_graph is None:
+                    from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                        MoGStepGraph,
+                    )
+
+                    self._mog_graph = MoGStepGraph(model, session["generation_config"], batch=1)
+                codes = self._mog_graph.run(hidden[end - 1 : end].reshape(1, 1, -1))
+            session["code"] = codes
+            session["codes_rows"].append(codes.reshape(1, -1).to(torch.long))
+            session["step"] = int(pending) + 1
+            # Duplex (codec_streaming) sessions stop per segment when the
+            # received timeline is exhausted and resume with KV intact when
+            # the next thinker frame arrives; sync sessions stop at the end.
+            finished = int(session["step"]) >= int(session["timeline"].numel()) and self._segment_stops_at_exhaustion(
+                session
+            )
+            if finished:
+                flag[start:end, 0] = 1.0
+            cumulative = torch.cat(session["codes_rows"], dim=0)
+            payload_meta: dict[str, Any] = {
+                # 1-D tensor on purpose: the wire-payload builder indexes
+                # element.shape[0] (see the eager make_omni_output).
+                "nvc_logical_prompt_len": torch.tensor([session["prompt_len"]], dtype=torch.long)
+            }
+            if session["codec_streaming"]:
+                payload_meta["codec_streaming"] = torch.tensor([True], dtype=torch.bool)
+            outputs = {"codes": {"audio": cumulative}, "meta": payload_meta}
+            # Belt and braces: also mirror into the live per-request buffer so
+            # the flush-time full-payload producer can read it from
+            # additional_information as well as from the wire payload.
+            info["codes"] = {"audio": cumulative}
+            info["meta"] = {
+                "nvc_tts_step": int(session["step"]),
+                "nvc_logical_prompt_len": int(session["prompt_len"]),
+                "codec_streaming": bool(session["codec_streaming"]),
+                "request_id": session["codec_request_id"],
+            }
+        return OmniOutput(text_hidden_states=flag, multimodal_outputs=outputs)
 
     def _refresh_session_timeline(self, session: dict[str, Any], info: dict[str, Any], device: torch.device) -> None:
         """Adopt a longer timeline from the latest async-chunk payload."""
         latest = self._try_timeline(info)
         if latest is not None and latest.numel() > int(session["timeline"].numel()):
             session["timeline"] = latest.to(device)
+            if session.get("use_graph"):
+                self._step_graph.extend_timeline(session["timeline"])
         if self._upstream_finished(info):
             session["upstream_finished"] = True
 
@@ -374,14 +788,22 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         session["code"] = code
         session["past_key_values"] = past_key_values
         session["step"] = t + 1
-        # Native codec streaming uses one resumable scheduler segment per
-        # received timeline suffix. The pre-existing offline async-chunk path,
-        # however, must stay alive until the thinker sends its terminal marker;
-        # stopping at an intermediate cumulative snapshot starves Stage 2.
-        finished = (t + 1) >= int(session["timeline"].numel()) and (
-            bool(session["codec_streaming"]) or bool(session["upstream_finished"])
-        )
+        finished = (t + 1) >= int(session["timeline"].numel()) and self._segment_stops_at_exhaustion(session)
         return code.reshape(1, -1).to(torch.long), finished
+
+    @staticmethod
+    def _segment_stops_at_exhaustion(session: dict[str, Any]) -> bool:
+        """Whether exhausting the received timeline should emit the stop token.
+
+        Duplex serving submits RESUMABLE talker requests and marks them with
+        ``codec_streaming``: exhausting the timeline ends the current scheduler
+        segment, and the parked request resumes (TTS state intact) when the
+        next thinker frame arrives. Offline requests are NOT resumable — a
+        stop token would end them permanently — so mid-stream exhaustion emits
+        CONTINUE instead, and the stop waits for the upstream's final chunk
+        (``meta.finished``; sync mode ships the whole timeline up front, so it
+        counts as finished from the start)."""
+        return bool(session["codec_streaming"]) or bool(session["upstream_finished"])
 
     def preprocess(
         self,
@@ -396,6 +818,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         is_prefill = bool(is_prefill_raw) if isinstance(is_prefill_raw, bool) else span > 1
         request_id = require_request_id(info, "talker")
 
+        if self._use_native_backbone:
+            return self._native_preprocess(input_ids, info, device, span, is_prefill, request_id)
+
         embeds = torch.zeros((span, self._hidden), device=device, dtype=self._dtype)
         if is_prefill or request_id not in self._sessions:
             # The 1-token vLLM prefill is the session boundary: run the vendored
@@ -405,47 +830,56 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
 
         session = self._sessions[request_id]
         self._refresh_session_timeline(session, info, device)
-        # Sync mode: one NeMo TTS step per engine step (the verified parity
-        # path, unchanged). Async-chunk mode: DRAIN every received timeline
-        # position on each wake. The engine tokens are placeholders
-        # (CONTINUE/STOP) and the codes ride the cumulative payload, so
-        # multiple TTS steps per engine step are safe — and necessary:
+        # DRAIN every received timeline position on each wake, in both modes.
+        # The engine tokens are placeholders (CONTINUE/STOP) and the codes ride
+        # the cumulative payload, so multiple TTS steps per engine step are
+        # safe — and necessary:
+        #   * sync mode ships the WHOLE timeline up front, so the first decode
+        #     wake runs every TTS step back-to-back instead of paying a full
+        #     engine round trip (scheduler + sampler + IPC) per 80 ms frame;
+        #     the codes are computed in the same order as the stepwise loop,
+        #     so the output is bit-identical,
         #   * the save_async background thread can coalesce thinker steps into
         #     one chunk (fewer wakes than new positions), and
         #   * the prompt-region PAD steps (logical_prompt_len - 1 of them) all
         #     become available with chunk 0 and must not cost one upstream
         #     chunk each.
+        # Rows stay on the GPU (tiny [1, Q] longs): a per-frame .cpu() would
+        # stall the dispatch pipeline once per frame; the stage producers move
+        # the final payload to CPU when shipping.
         finished = False
         steps_run = 0
-        new_code_rows: list[torch.Tensor] = []
-        codec_streaming = bool(session["codec_streaming"])
-        while int(session["step"]) < int(session["timeline"].numel()):
-            codes_row, finished = self._step_session(session)
-            if codec_streaming:
-                # One D2H copy per wake is enough; avoid synchronizing after every drained TTS step.
-                new_code_rows.append(codes_row)
-            else:
-                session["codes_rows"].append(codes_row.cpu())
-            steps_run += 1
-            if session["sync_mode"]:
-                break
+        total = int(session["timeline"].numel())
+        if session.get("use_graph"):
+            steps_run = total - int(session["step"])
+            if steps_run > 0:
+                self._step_graph.run_steps(steps_run)
+                session["step"] = total
+                finished = self._segment_stops_at_exhaustion(session)
+        else:
+            while int(session["step"]) < total:
+                codes_row, finished = self._step_session(session)
+                session["codes_rows"].append(codes_row)
+                steps_run += 1
         if steps_run == 0:
             # Zero-progress wake (duplicate/terminal-marker chunk): no TTS step
-            # was run, so never fabricate a frame. Stop the current scheduler
-            # segment only for native codec streaming, or once the ordinary
-            # offline async producer has sent its terminal marker.
-            finished = int(session["step"]) >= int(session["timeline"].numel()) and (
-                bool(session["codec_streaming"]) or bool(session["upstream_finished"])
+            # was run, so never fabricate a frame. Stop only when this session
+            # may end at exhaustion (see _segment_stops_at_exhaustion);
+            # otherwise emit CONTINUE and wait for more upstream input.
+            finished = int(session["step"]) >= int(session["timeline"].numel()) and self._segment_stops_at_exhaustion(
+                session
             )
             if finished:
                 embeds[:, 0] = 1.0
             return input_ids, embeds, {}
-        if codec_streaming:
-            # The code2wav producer owns suffix slicing and therefore requires
-            # cumulative history on every wake. Keep the history on CPU and do
-            # one D2H transfer for all rows produced by this wake.
-            session["codes_rows"].append(torch.cat(new_code_rows, dim=0).cpu())
-        cumulative = torch.cat(session["codes_rows"], dim=0)
+        # The code2wav producers own the suffix slicing and therefore receive
+        # the cumulative history on every wake. Rows stay on the GPU (tiny
+        # [1, Q] longs; a per-step .cpu() would stall dispatch once per frame);
+        # the producers move the shipped payload to CPU.
+        if session.get("use_graph"):
+            cumulative = self._step_graph.codes_rows(1, int(session["step"]))
+        else:
+            cumulative = torch.cat(session["codes_rows"], dim=0)
         if finished:
             embeds[:, 0] = 1.0  # stop flag -> compute_logits emits the stop token
         info_update: dict[str, Any] = {
@@ -467,6 +901,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             self._sessions.pop(str(request_id), None)
+            if self._uncond_graph is not None:
+                self._uncond_graph.release(str(request_id))
 
     # ------------------------------------------------------------------
     # Weights.
@@ -498,22 +934,49 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         tts = DuplexEARTTS({"data": tts_data, "model": tts_model_cfg})
 
         prefix = "tts_model."
+        backbone_prefix = "tts_model.tts_model.backbone."
         state: dict[str, torch.Tensor] = {}
+        backbone_weights: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
             if not name.startswith(prefix):
                 continue
+            if self._use_native_backbone and name.startswith(backbone_prefix):
+                # The backbone runs as a native vLLM Gemma3 model instead.
+                backbone_weights.append((name, tensor))
+                if not self._native_guidance:
+                    continue
+                # CFG keeps a second copy in the vendored module: the
+                # unconditional stream decodes on the HF backbone.
             target = name.removeprefix(prefix)
             if target.startswith("audio_codec."):
                 state[target] = tensor.to(dtype=torch.float32)
             else:
                 state[target] = tensor.to(dtype=self._dtype)
+        if self._use_native_backbone:
+            from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                iter_backbone_weights,
+            )
+
+            loaded = self.backbone.load_weights(
+                iter_backbone_weights(backbone_weights, hidden_size=self._hidden, dtype=self._dtype)
+            )
+            logger.info("NemotronVoiceChat native talker backbone loaded %d vLLM tensors", len(loaded))
         if not state:
             raise ValueError(
                 "No 'tts_model.*' tensors found in the checkpoint; the NemotronVoiceChat "
                 "unified model.safetensors is required for the talker stage."
             )
+        if self._use_native_backbone and not self._native_guidance:
+            # The HF backbone inside the vendored model is unused on the native
+            # path (only the embedding/CAS/MoG modules are consulted); drop it
+            # before loading so its ~2.4 GiB of fp32 parameters are freed and
+            # its (rerouted) weights are not reported missing. With CFG the
+            # backbone stays: the unconditional stream decodes on it.
+            tts.tts_model.backbone = nn.Identity()
         missing, unexpected = tts.load_state_dict(state, strict=False)
         real_missing = [m for m in missing if not m.startswith("audio_codec.")]
+        if self._use_native_backbone and not self._native_guidance:
+            real_missing = [m for m in real_missing if not m.startswith("tts_model.backbone.")]
         if real_missing:
             raise ValueError(f"NemotronVoiceChat talker is missing TTS weights: {sorted(real_missing)[:10]} ...")
         if unexpected:
@@ -534,4 +997,25 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             self._speaker_name,
             self._guidance_enabled(),
         )
+        if self._use_cuda_graphs:
+            from vllm_omni.model_executor.models.nemotron_voicechat.talker_graph import (
+                TalkerStepGraph,
+            )
+
+            step_graph = TalkerStepGraph(
+                self.tts,
+                dtype=self._dtype,
+                device=torch.device(device) if not isinstance(device, torch.device) else device,
+                max_cache_len=self._graph_max_cache_len,
+                guidance_enabled=self._guidance_enabled(),
+            )
+            supported, reason = step_graph.config_supported()
+            if supported:
+                self._step_graph = step_graph
+            else:
+                logger.warning(
+                    "NemotronVoiceChat talker CUDA graphs requested but unsupported (%s); "
+                    "using the eager per-frame step.",
+                    reason,
+                )
         return {name for name, _ in self.named_parameters()}

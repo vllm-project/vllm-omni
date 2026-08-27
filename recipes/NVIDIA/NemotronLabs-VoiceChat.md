@@ -31,7 +31,7 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
   [`examples/offline_inference/nemotron_voicechat/end2end.py`](../../examples/offline_inference/nemotron_voicechat/end2end.py)
 - Model modules (thinker / talker / code2wav / vendored NeMo):
   [`vllm_omni/model_executor/models/nemotron_voicechat/`](../../vllm_omni/model_executor/models/nemotron_voicechat/)
-- Staged pipeline config:
+- Staged pipeline config (NeMo bit-parity path):
   [`vllm_omni/deploy/nemotron_labs_voicechat.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat.yaml)
 - Native duplex config and E2E probe:
   [`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml),
@@ -50,10 +50,56 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
 | 1 talker | `NemotronVoiceChatTalker` (LLM_AR) | fp32 | text timeline -> 31-quantizer RVQ code stacks (one per 80 ms frame) |
 | 2 code2wav | `NemotronVoiceChatCode2Wav` (LLM_GENERATION) | fp32 | RVQ-VAE decode -> 22.05 kHz PCM |
 
-Stages 0/1 default to fp32 for exact parity with the NeMo reference
-implementation (greedy decoding matches it token for token on the acceptance
-fixture). The deploy yaml documents a ~2x-faster bf16 thinker option whose
-output stayed within one word of the reference in testing.
+The deploy yamls default to a fast execution profile; every fast setting
+carries a "PARITY:" comment whose edits restore the eager fp32 reference
+execution that matches the NeMo implementation token for token (see
+Performance below).
+
+## Performance
+
+Each deploy yaml defaults to a fast execution profile, mirroring how NVIDIA's
+own serving stack runs this model (bf16 LLM + CUDA-graph decode, EAR-TTS on a
+vLLM engine, incremental codec cache):
+
+- `nemotron_labs_voicechat.yaml` (offline sync): bf16 + CUDA-graph thinker and
+  the talker's Gemma3 backbone as a native vLLM model
+  (`hf_overrides.use_native_talker`) — PagedAttention KV, vLLM decode CUDA
+  graphs, and the MoG sampling step captured into a single graph. RTF ~0.23 on
+  the 196-frame acceptance fixture (1x H100, warm).
+- `nemotron_labs_voicechat_streaming.yaml` (offline streaming): the vendored
+  per-frame EAR-TTS step captured into CUDA graphs
+  (`hf_overrides.use_talker_cuda_graphs`), 5-frame codec chunks decoded
+  incrementally with a per-request causal-conv cache
+  (`use_incremental_codec_cache`, O(T) instead of O(T^2) codec work). First
+  audio chunk ~1.5 s after submission on the same fixture.
+- `nemotron_labs_voicechat_duplex.yaml` (realtime): native talker + bf16
+  thinker; audio is delivered as one 80 ms packet per frame at the frame clock
+  (median inter-chunk gap ~81 ms on the bundled fixture) and the session
+  length is unbounded (paged KV, no StaticCache bucket cap).
+
+Notes on the fast settings:
+
+- Thinker: `dtype: bfloat16` + `enforce_eager: false`. The 9B NemotronH decode
+  is memory- and launch-bound, so both are enabled together; weights fit in
+  ~21 GB, so the pipeline also runs on sub-80 GB parts. Text stays coherent
+  but greedy decoding can legitimately diverge from the fp32 reference
+  (verified turn-for-turn coherent and ASR-clean on the bundled fixtures).
+- Talker (captured-step, streaming yaml): the whole EAR-TTS frame step
+  (Gemma3 backbone via HF StaticCache + CFG batch doubling + MoG iterative
+  unmasking) replays as one CUDA graph per cache-size bucket. MoG noise draws
+  from the CUDA-graph Philox stream: audio is equivalent but not
+  bit-identical to the eager path. Capture failures and oversize sessions
+  fall back to the eager step automatically.
+- Talker (native, sync/duplex yamls): engine positions map 1:1 onto timeline
+  steps; fused input embeddings are numerically verified against the
+  reference forward, and the reference's EOS-silence code feedback
+  (`inference_force_speech_silence_on_eos`) is applied. Supports
+  multi-session batching (`max_num_seqs > 1`).
+
+Bit parity with the NeMo reference is preserved behind the `PARITY:` comments
+in each yaml: applying those edits runs the eager fp32 reference execution
+(md5-anchored WAV on the acceptance fixture; the drain-all talker scheduling
+added for performance was verified WAV-byte identical against it).
 
 ## Hardware Support
 
@@ -110,7 +156,7 @@ vllm-omni serve /path/to/NVIDIA-NemotronLabs-VoiceChat-11B \
   --deploy-config vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml
 ```
 
-The single-GPU profile runs three eager fp32 engine processes on one device.
+The single-GPU profile runs all three engine processes on one device.
 
 In another shell, stream only the user channel of one of NVIDIA's bundled
 stereo conversation fixtures:
@@ -142,14 +188,53 @@ python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
   --expected-post-tool-text "random number"
 ```
 
+Probe caveats observed on the bundled `turn_taking.wav`: stream the FULL
+fixture (a `--max-frames` truncation cuts the conversation mid-turn, the model
+then never closes its last response, and the probe times out waiting for a
+`response.done`), and note that the pass/fail condition "a response completes
+after the final commit" is timing-sensitive — a faster pipeline can legitimately
+complete every turn before the commit lands (use
+`--allow-incomplete-response` when measuring latency rather than protocol
+completion).
+
+#### Duplex performance profile
+
+`nemotron_labs_voicechat_duplex.yaml` defaults to the fast profile: the
+talker's Gemma3 backbone on PagedAttention + vLLM CUDA graphs (MoG sampling
+in a captured step graph, unbounded session length) and a bf16 + CUDA-graph
+thinker inherited from the streaming base. On the bundled `turn_taking.wav`
+fixture (1x H100) the client receives one 80 ms packet per frame at the frame
+clock (median inter-chunk gap ~81 ms / p95 ~110 ms) with sub-second first-packet
+latency per turn; playback clients should still keep a small (~200-300 ms)
+prebuffer to absorb scheduling jitter.
+
+The bf16 thinker's greedy text stream can legitimately diverge from fp32
+mid-conversation. On the bundled fixture it was verified turn-for-turn:
+coherent transcripts, every turn reaching EOS/`response.done`, ASR-clean
+output. Apply the PARITY edits in the yaml to bit-match the fp32 reference
+thinker instead.
+
+Classifier-free guidance on the native talker
+(`hf_overrides.native_talker_guidance: true` + `gpu_memory_utilization: 0.18`
+on stage 1): the conditional stream stays on vLLM paged KV while the
+unconditional stream mirrors it on the vendored HF backbone (a captured
+StaticCache step), and the pair is blended with NeMo's `generate_step` math
+(hidden-space blends in `lm_head` and inside `MoGHead.infer`). The per-frame
+cost stays within the 80 ms duplex budget, and a paired 4-fixture ASR study
+matched the guided reference. Off by default since guidance at this
+checkpoint's scale (0.2) is ASR-indistinguishable; enable it for strict parity
+with NVIDIA's guided deployment or for listening tests. Under CFG the
+unconditional stream's StaticCache is bucketed (largest 4096 positions ≈ 5.4
+minutes); one session at a time uses the captured step, extra concurrent
+sessions fall back to eager stepping.
+
 #### Notes
 
-- Memory usage: the shipped yaml runs all three stages on one GPU
-  (`gpu_memory_utilization` 0.62 / 0.12 / 0.06); peak usage is dominated by the
-  fp32 thinker. The fp32 default has a hard floor of roughly 43 GB of thinker
-  weights alone (9B backbone + 587M `embed_tokens` + 587M `function_head` +
-  0.6B Conformer), so 48 GB cards cannot run it — use the bf16 thinker option
-  documented in the deploy yaml on anything smaller than an 80 GB part.
+- Memory usage: the shipped yamls run all three stages on one GPU
+  (`gpu_memory_utilization` 0.62 / 0.12 / 0.06). The default bf16 thinker fits
+  in ~21 GB of weights; the fp32 PARITY thinker needs roughly 43 GB of weights
+  alone (9B backbone + 587M `embed_tokens` + 587M `function_head` + 0.6B
+  Conformer), so the PARITY execution requires an 80 GB part.
 - Input sizing: the timeline is frame-locked, so the reply budget IS the input
   duration. The acoustic channel trails the text channel; if the WAV does not
   carry enough trailing silence for the reply to finish, the spoken answer is
@@ -164,12 +249,13 @@ python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
 - The talker's `max_tokens` is 16383 (its stage prompt is one placeholder
   token, and the stage context is 16384).
 - The 80 ms frame period is a model/protocol contract, not a throughput
-  guarantee. In an eager fp32 H200 profile, Stage 2 emitted 80 ms packets at
-  roughly 0.87--0.88 s intervals (RTF about 10.8--10.9); placing the three
-  stages on separate GPUs did not remove the serial 8-step EAR-TTS bottleneck.
-  The current native duplex path is functionally streaming but not wall-clock
-  realtime.
-- Known limitations: batch=1 only. The native duplex deployment allows one
+  guarantee. The default duplex profile keeps up with the frame clock on 1x
+  H100; the eager fp32 PARITY execution is functionally streaming but not
+  wall-clock realtime (the serial 8-step EAR-TTS unmasking dominates, and
+  placing the three stages on separate GPUs does not remove it).
+- Known limitations: the offline pipeline is single-request per call
+  (the native talker supports engine-level multi-session batching via
+  max_num_seqs > 1). The native duplex deployment allows one
   active session and does not support barge-in. Tool execution remains
   client-owned: the server emits function-call events, accepts a validated
   `function_call_output`, and resumes the live model with the returned result;

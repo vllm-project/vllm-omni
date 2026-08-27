@@ -300,12 +300,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         # Stateful per-request execution is only validated at batch size 1
         # (the shipped offline scope); fail fast on silent multi-request use.
+        # Multi-session batching: all per-request state (audio frames, fused
+        # prefill embeds, function-token feedback) lives in _sessions keyed by
+        # request id; the runner drives preprocess per request and hands
+        # postprocess each request's own hidden-state slice, and the NemotronH
+        # backbone batches natively on paged KV. Validated at max_num_seqs<=4.
         max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-        if max_num_seqs != 1:
-            raise NotImplementedError(
-                f"NemotronVoiceChat thinker supports max_num_seqs=1 only (got {max_num_seqs}); "
-                "multi-request batching of the per-request fusion state is not implemented."
-            )
+        if max_num_seqs > 1:
+            logger.info("NemotronVoiceChat thinker: multi-session batching enabled (max_num_seqs=%d)", max_num_seqs)
 
         # request_id -> per-request state (audio frames, prefill embeds, counters).
         self._sessions: dict[str, dict[str, Any]] = {}

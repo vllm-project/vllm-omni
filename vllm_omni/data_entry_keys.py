@@ -191,6 +191,12 @@ class MetaStruct(_StructBase):
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
     ref_code_len: int | None = None
+    # Expected FINAL length of a growing async-chunk sequence, when the
+    # producer knows it up front (e.g. a frame-locked AR stage whose
+    # max_tokens is exact). Lets consumers size fixed-capacity state (such as
+    # a CUDA-graph StaticCache bucket) optimally instead of assuming the
+    # worst case.
+    expected_total_tokens: int | None = None
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None

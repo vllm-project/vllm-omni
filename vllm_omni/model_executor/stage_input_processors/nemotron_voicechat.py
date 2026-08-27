@@ -79,6 +79,7 @@ def thinker2talker_token_only(
     source_outputs: list,
     prompt: Any = None,
     _requires_multimodal_data: bool = False,
+    next_stage_hf_config: Any = None,
 ) -> list:
     """Build the talker's engine inputs from the thinker's finished outputs.
 
@@ -91,6 +92,16 @@ def thinker2talker_token_only(
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     del prompt, _requires_multimodal_data
+    # Default: one placeholder token (timeline position 0; the NeMo TTS loop
+    # starts at t=1) — the vendored talker paths ignore the vLLM positions.
+    # The NATIVE talker (hf_overrides.use_native_talker) instead maps vLLM
+    # positions onto real PagedAttention KV: its prompt must be exactly the
+    # speaker-prompt length (hf_overrides.talker_init_len; 37 for the shipped
+    # "Aria" speaker) so the prefill covers the speaker-init embeddings — the
+    # talker validates the value and reports the right one on mismatch.
+    talker_prompt_len = 1
+    if next_stage_hf_config is not None and bool(getattr(next_stage_hf_config, "use_native_talker", False)):
+        talker_prompt_len = max(int(getattr(next_stage_hf_config, "talker_init_len", 37)), 1)
     inputs: list = []
     for thinker_output in source_outputs:
         if not getattr(thinker_output, "finished", False):
@@ -107,11 +118,10 @@ def thinker2talker_token_only(
         timeline = [pad_id] * logical_prompt_len + [int(t) for t in generated]
         inputs.append(
             OmniTokensPrompt(
-                # The vLLM-side prompt is one placeholder (timeline position 0;
-                # the NeMo TTS loop starts at t=1). Each decode step consumes
-                # one timeline position from additional_information, so the
-                # talker needs len(timeline) - 1 decode steps.
-                prompt_token_ids=[0],
+                # Each decode step consumes one timeline position from
+                # additional_information, so the talker needs
+                # len(timeline) - 1 decode steps.
+                prompt_token_ids=[0] * talker_prompt_len,
                 additional_information={
                     "nvc_text_timeline": timeline,
                     "nvc_logical_prompt_len": logical_prompt_len,
@@ -187,15 +197,47 @@ def thinker2talker_async_chunk(
         "nvc_duplex_text_tokens": generated if is_duplex else (),
     }
 
+    # Offline timelines are frame-locked: the thinker emits exactly max_tokens
+    # tokens (ignore_eos), so the FINAL timeline length is known up front.
+    # Shipping it lets the talker's CUDA-graph fast path pick the smallest
+    # fitting StaticCache bucket (per-step attention cost scales with the
+    # bucket size) instead of assuming an unbounded session. Duplex sessions
+    # really are unbounded — no expectation is shipped for them.
+    expected_total = None
+    if not is_duplex:
+        max_tokens = getattr(getattr(request, "sampling_params", None), "max_tokens", None)
+        if max_tokens is not None:
+            expected_total = logical_prompt_len + int(max_tokens)
+
+    # The NATIVE talker (connector extra ``native_talker: true``, matching the
+    # stage's hf_overrides.use_native_talker) maps engine positions 1:1 onto
+    # timeline steps, so each chunk must append exactly as many placeholder
+    # positions as it carries NEW timeline tokens (a coalesced chunk would
+    # otherwise leave the audio permanently behind the text). The vendored
+    # talker drains model-side and keeps the 1-position default.
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    native_talker = bool(cfg.get("native_talker", False))
+    new_positions = 1
+    if native_talker:
+        # A timeline of length L needs L-1 engine positions (the NeMo loop
+        # starts at t=1), so grow by new_len - previous_len against a baseline
+        # of 1 for the first chunk.
+        new_positions = max(len(timeline) - max(last_len, 1), 1)
+
     return OmniPayloadStruct(
         ids=IdsStruct(all=timeline, prompt=[0]),
         meta=MetaStruct(
             finished=torch.tensor(bool(is_finished and not is_duplex), dtype=torch.bool),
             num_processed_tokens=logical_prompt_len,
-            # The talker's vLLM prompt stays a single placeholder token.
-            next_stage_prompt_len=1,
+            # Vendored talker: one placeholder position per chunk (it drains
+            # all new timeline tokens model-side). Native talker: one position
+            # PER NEW TOKEN (see native_talker above).
+            next_stage_prompt_len=new_positions,
             codec_streaming=is_duplex,
             request_id=request_id if is_duplex else None,
+            expected_total_tokens=expected_total,
         ),
     )
 
