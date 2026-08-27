@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run LingBot-World 2.0 as an in-process realtime AR-Diffusion session.
 
 This example exercises the internal session API. It is not a public HTTP or
@@ -127,7 +127,10 @@ async def run(argv: Sequence[str] | None = None) -> Path:
 
     from vllm_omni.diffusion.models.lingbot_world.actions import LingBotCameraControlReducer
     from vllm_omni.entrypoints.async_omni import AsyncOmni
-    from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
+    from vllm_omni.experimental.ar_diffusion.consumer import (
+        ARDiffusionOmniTickConsumer,
+        omni_prompt_for_ar_tick,
+    )
     from vllm_omni.experimental.ar_diffusion.session import (
         ARDiffusionSessionEvent,
         ARDiffusionSessionManager,
@@ -163,10 +166,10 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     )
     consumer = ARDiffusionOmniTickConsumer(
         engine,
-        prompt_provider=lambda tick: {
-            "prompt": tick.prompt,
-            "multi_modal_data": {"image": str(image)},
-        },
+        prompt_provider=lambda tick: omni_prompt_for_ar_tick(
+            tick,
+            init_multi_modal_data={"image": str(image)},
+        ),
         sampling_params_list=[sampling],
         diffusion_stage_id=0,
     )

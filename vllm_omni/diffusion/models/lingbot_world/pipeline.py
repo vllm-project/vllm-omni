@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-scoped LingBot-World v2 causal DMD pipeline."""
 
 from __future__ import annotations
@@ -84,12 +84,18 @@ _SOURCE_IMAGE_ERROR = (
 )
 
 
+def _tick_reuses_cached_image_condition(tick: ARDiffusionTickRequest | None) -> bool:
+    """Later realtime chunks keep the chunk-0 VAE image condition."""
+
+    return tick is not None and tick.chunk_index > 0
+
+
 @dataclass(frozen=True)
 class _LingBotRequestInputs:
     """Validated model-specific request boundary."""
 
     prompt: str
-    image: PIL.Image.Image | torch.Tensor
+    image: PIL.Image.Image | torch.Tensor | None
     camera_trajectory: CameraTrajectory | None
     camera_actions: tuple[tuple[str, ...], ...] | None
     height: int
@@ -244,22 +250,27 @@ def get_lingbot_world_pre_process_func(
                 "sampling_params.extra_args.action_path."
             )
 
-        image = multi_modal_data.get("image")
-        if isinstance(image, list):
-            raise ValueError("LingBot World requires one image and does not accept an image list.")
-        if image is None:
-            raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
-        if isinstance(image, (str, os.PathLike)):
-            image = _load_source_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            image = _decode_source_image(image)
-        elif not isinstance(image, torch.Tensor):
-            raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
-
         extra_args = getattr(request.sampling_params, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
         tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        image = multi_modal_data.get("image")
+        if _tick_reuses_cached_image_condition(tick):
+            # Chunk 0 already encoded the first frame into session state.
+            # Drop any caller-supplied image so later ticks do not reopen,
+            # convert, or pickle pixels to the GPU worker.
+            image = None
+        else:
+            if isinstance(image, list):
+                raise ValueError("LingBot World requires one image and does not accept an image list.")
+            if image is None:
+                raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
+            if isinstance(image, (str, os.PathLike)):
+                image = _load_source_image(image)
+            elif isinstance(image, PIL.Image.Image):
+                image = _decode_source_image(image)
+            elif not isinstance(image, torch.Tensor):
+                raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
         if tick is not None:
             camera_controls = [control for control in tick.controls if control.track == "camera"]
             if len(camera_controls) != 1:
@@ -326,7 +337,10 @@ def get_lingbot_world_pre_process_func(
 
         updated_prompt = dict(prompt)
         updated_multi_modal_data = dict(multi_modal_data)
-        updated_multi_modal_data["image"] = image
+        if image is None:
+            updated_multi_modal_data.pop("image", None)
+        else:
+            updated_multi_modal_data["image"] = image
         updated_prompt["multi_modal_data"] = updated_multi_modal_data
         request.prompt = updated_prompt
         request.sampling_params.extra_args = {
@@ -602,19 +616,25 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(multi_modal_data, dict):
             raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
 
-        image = multi_modal_data.get("image")
-        if isinstance(image, list):
-            raise ValueError("LingBot World requires one image and does not accept an image list.")
-        if image is None:
-            raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
-        if isinstance(image, (str, os.PathLike)):
-            raise ValueError("file-path images must be materialized by the LingBot pre-process function.")
-        if not isinstance(image, (PIL.Image.Image, torch.Tensor)):
-            raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
-
         extra_args = getattr(sampling, "extra_args", None) or {}
         if not isinstance(extra_args, dict):
             raise ValueError("sampling_params.extra_args must be a mapping.")
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        reuse_session_image = _tick_reuses_cached_image_condition(tick)
+
+        image = multi_modal_data.get("image")
+        if isinstance(image, list):
+            raise ValueError("LingBot World requires one image and does not accept an image list.")
+        if reuse_session_image:
+            image = None
+        else:
+            if image is None:
+                raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
+            if isinstance(image, (str, os.PathLike)):
+                raise ValueError("file-path images must be materialized by the LingBot pre-process function.")
+            if not isinstance(image, (PIL.Image.Image, torch.Tensor)):
+                raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+
         camera_trajectory = extra_args.get(_PREPROCESSED_CAMERA_KEY)
         camera_actions = extra_args.get(_PREPROCESSED_CAMERA_ACTIONS_KEY)
         if camera_trajectory is not None and not isinstance(camera_trajectory, CameraTrajectory):
@@ -631,7 +651,15 @@ class LingBotWorldCausalDMDPipeline(
 
         height = getattr(sampling, "height", None)
         width = getattr(sampling, "width", None)
-        if isinstance(image, PIL.Image.Image):
+        if image is None:
+            if (height is None) != (width is None):
+                raise ValueError("height and width must either both be provided or both be omitted.")
+            if height is None or width is None:
+                raise ValueError(
+                    "Follow-up LingBot AR-Diffusion ticks omit the source image; "
+                    "sampling height and width must both be provided."
+                )
+        elif isinstance(image, PIL.Image.Image):
             image_width, image_height = image.size
         elif image.ndim == 3 and image.shape[0] == 3:
             image_height, image_width = image.shape[-2:]
@@ -639,12 +667,13 @@ class LingBotWorldCausalDMDPipeline(
             image_height, image_width = image.shape[-2:]
         else:
             raise ValueError("tensor image must have shape [3, height, width] or [1, 3, height, width].")
-        if image_height <= 0 or image_width <= 0:
-            raise ValueError("source image width and height must be positive integers.")
-        if image_height * image_width > _MAX_SOURCE_IMAGE_PIXELS:
-            raise ValueError("source image pixel count must not exceed 4096 * 4096.")
-        if (height is None) != (width is None):
-            raise ValueError("height and width must either both be provided or both be omitted.")
+        if image is not None:
+            if image_height <= 0 or image_width <= 0:
+                raise ValueError("source image width and height must be positive integers.")
+            if image_height * image_width > _MAX_SOURCE_IMAGE_PIXELS:
+                raise ValueError("source image pixel count must not exceed 4096 * 4096.")
+            if (height is None) != (width is None):
+                raise ValueError("height and width must either both be provided or both be omitted.")
         patch_size = tuple(self.transformer.config.patch_size)
         if len(patch_size) != 3 or patch_size[0] != 1:
             raise RuntimeError(
@@ -777,6 +806,8 @@ class LingBotWorldCausalDMDPipeline(
     def _prepare_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         """Encode the first frame as ``[mask4, image_latent16]``."""
 
+        if inputs.image is None:
+            raise RuntimeError("LingBot image condition requires multi_modal_data.image on the first chunk.")
         image = self._prepare_image_tensor(inputs.image, height=inputs.height, width=inputs.width)
         video_condition = image.new_zeros(1, 3, inputs.num_frames, inputs.height, inputs.width)
         video_condition[:, :, 0] = image
@@ -1156,6 +1187,10 @@ class LingBotWorldCausalDMDPipeline(
         else:
             assert session_state is not None
             if session_state.image_condition is None:
+                if inputs.image is None:
+                    raise RuntimeError(
+                        "LingBot realtime image condition is missing; chunk 0 must provide multi_modal_data.image."
+                    )
                 horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
                 session_state.image_condition = self._prepare_condition(
                     replace(

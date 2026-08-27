@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -549,6 +549,101 @@ def test_preprocess_materializes_chunk_sized_actions_from_typed_tick() -> None:
         ("w", "j"),
         (),
     )
+
+
+def _camera_action_tick(*, chunk_index: int) -> ARDiffusionTickRequest:
+    return ARDiffusionTickRequest(
+        session_id="world-actions",
+        request_id=f"tick-request-{chunk_index}",
+        chunk_index=chunk_index,
+        controls=(
+            ARDiffusionControlInput(
+                track="camera",
+                schema="lingbot.camera_actions.v1",
+                data={
+                    "mode": "frames",
+                    "frames": [["w"], ["w"], []],
+                },
+            ),
+        ),
+    )
+
+
+def test_preprocess_does_not_open_image_on_followup_ar_ticks(tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    missing_path = tmp_path / "must-not-be-opened.png"
+    tick = _camera_action_tick(chunk_index=1)
+    sampling = _SamplingParams(include_action=False)
+    sampling.extra_args.update(tick.to_extra_args())
+    request = SimpleNamespace(
+        prompt={"prompt": "move", "multi_modal_data": {"image": str(missing_path)}},
+        sampling_params=sampling,
+    )
+
+    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
+
+    assert "image" not in result.prompt["multi_modal_data"]
+    assert result.sampling_params.extra_args["_lingbot_camera_actions"] == (
+        ("w",),
+        ("w",),
+        (),
+    )
+
+
+def test_preprocess_allows_followup_tick_without_image() -> None:
+    module = _load_pipeline_module()
+    tick = _camera_action_tick(chunk_index=2)
+    sampling = _SamplingParams(include_action=False)
+    sampling.extra_args.update(tick.to_extra_args())
+    request = SimpleNamespace(
+        prompt={"prompt": "move", "multi_modal_data": {}},
+        sampling_params=sampling,
+    )
+
+    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
+
+    assert "image" not in result.prompt["multi_modal_data"]
+
+
+def test_preprocess_chunk0_tick_still_requires_image() -> None:
+    module = _load_pipeline_module()
+    tick = _camera_action_tick(chunk_index=0)
+    sampling = _SamplingParams(include_action=False)
+    sampling.extra_args.update(tick.to_extra_args())
+    request = SimpleNamespace(
+        prompt={"prompt": "move", "multi_modal_data": {}},
+        sampling_params=sampling,
+    )
+
+    with pytest.raises(ValueError, match="exactly one image"):
+        module.get_lingbot_world_pre_process_func(_od_config())(request)
+
+
+def test_parse_request_accepts_followup_tick_without_image() -> None:
+    module = _load_pipeline_module()
+    tick = _camera_action_tick(chunk_index=1)
+    sampling = _SamplingParams()
+    sampling.extra_args.update(tick.to_extra_args())
+
+    parsed = _pipeline(module)._parse_request(
+        _RequestBatch({"prompt": "move through the room", "multi_modal_data": {}}, sampling)
+    )
+
+    assert parsed.image is None
+    assert parsed.height == 16
+    assert parsed.width == 16
+
+
+def test_parse_request_followup_tick_requires_explicit_resolution() -> None:
+    module = _load_pipeline_module()
+    tick = _camera_action_tick(chunk_index=1)
+    sampling = _SamplingParams(height=None, width=None)
+    sampling.extra_args.update(tick.to_extra_args())
+
+    with pytest.raises(ValueError, match="omit the source image"):
+        _pipeline(module)._parse_request(
+            _RequestBatch({"prompt": "move through the room", "multi_modal_data": {}}, sampling)
+        )
 
 
 def _request(*, sampling=None, prompt=None, num_reqs: int = 1):

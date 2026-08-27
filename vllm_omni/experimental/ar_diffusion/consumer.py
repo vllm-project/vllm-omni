@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AsyncOmni consumer for typed realtime AR-Diffusion ticks."""
 
 from __future__ import annotations
@@ -19,6 +20,24 @@ from vllm_omni.inputs.data import (
 from vllm_omni.outputs import OmniRequestOutput
 
 AR_DIFFUSION_OUTPUT_METADATA_KEY = "ar_diffusion"
+
+
+def omni_prompt_for_ar_tick(
+    tick: ARDiffusionTickRequest,
+    *,
+    init_multi_modal_data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the Omni prompt for one AR-Diffusion tick.
+
+    Session-initialization multimodal payloads (for example the first-frame
+    image) are attached only on ``chunk_index == 0``. Later ticks reuse
+    worker-side session state and must not re-send those bytes.
+    """
+
+    multi_modal_data: dict[str, Any] = {}
+    if tick.chunk_index == 0 and init_multi_modal_data:
+        multi_modal_data = dict(init_multi_modal_data)
+    return {"prompt": tick.prompt, "multi_modal_data": multi_modal_data}
 
 
 class ARDiffusionGenerateClient(Protocol):
@@ -78,8 +97,10 @@ class ARDiffusionOmniTickConsumer:
     """Converts a typed tick into one AsyncOmni diffusion request.
 
     ``prompt_provider`` packages session initialization data such as an initial
-    image into the normal Omni prompt. Control ``track/schema/data`` remains in
-    the typed tick and is not interpreted by this class.
+    image into the normal Omni prompt. Attach that payload on ``chunk_index==0``
+    only; later ticks reuse worker-side session state. Control
+    ``track/schema/data`` remains in the typed tick and is not interpreted by
+    this class.
     """
 
     def __init__(

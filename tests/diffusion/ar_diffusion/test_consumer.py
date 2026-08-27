@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
 
-from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
+from vllm_omni.experimental.ar_diffusion.consumer import (
+    ARDiffusionOmniTickConsumer,
+    omni_prompt_for_ar_tick,
+)
 from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
     ARDiffusionSessionEvent,
@@ -110,6 +115,21 @@ def make_tick() -> ARDiffusionTickRequest:
             ),
         ),
     )
+
+
+def test_omni_prompt_for_ar_tick_attaches_init_image_only_on_chunk_zero() -> None:
+    later = make_tick()
+    first = replace(later, chunk_index=0, request_id="world-1-chunk-0")
+
+    init = {"image": "initial-image"}
+    assert omni_prompt_for_ar_tick(first, init_multi_modal_data=init) == {
+        "prompt": "turn left",
+        "multi_modal_data": {"image": "initial-image"},
+    }
+    assert omni_prompt_for_ar_tick(later, init_multi_modal_data=init) == {
+        "prompt": "turn left",
+        "multi_modal_data": {},
+    }
 
 
 def test_consumer_rejects_replicated_ar_diffusion_stage() -> None:
