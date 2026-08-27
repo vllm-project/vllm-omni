@@ -277,6 +277,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             )
         if not enabled:
             return nullcontext()
+
         # NPU-specific fallback
         try:
             return torch.npu.amp.autocast(dtype=dtype)
