@@ -294,6 +294,59 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
     torch.testing.assert_close(flat_v[n].float(), torch.full_like(flat_v[n], -2.5).float())
     torch.testing.assert_close(flat_k[n - 1].float(), kept.float())
 
+@cuda_only
+@pytest.mark.cuda
+@pytest.mark.L4
+def test_a_whole_decode_loop_matches_the_unpaged_path():
+    """Per-step kernel equivalence is not loop equivalence.
+
+    With the switch off a single-token step attends over a cache grown by
+    ``torch.cat`` and no mask; with it on the same step reads a bucket-sized
+    buffer through ``seqused_k``. Run the same sequence of steps through both,
+    crossing a bucket boundary on the way, and require the same argmax at every
+    step off a fixed projection -- which is the token id the pipeline would emit.
+    """
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import PagedDecodeCache
+
+    heads, kv_heads, dim = 8, 2, 64
+    prefill, steps = 500, 40  # crosses the 512 bucket at step 13
+    dev, dt = torch.device("cuda"), torch.bfloat16
+    scale = dim**-0.5
+    torch.manual_seed(7)
+
+    keys = torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt)
+    values = torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt)
+    paged = PagedDecodeCache.from_dynamic_cache(_Cache([_Layer(keys, values)]), 1, dev, dt)
+    ref_k, ref_v = keys.clone(), values.clone()
+    proj = torch.randn(dim * heads, 128, device=dev, dtype=torch.float32)
+
+    paged_ids, ref_ids, worst = [], [], 0.0
+    for step in range(steps):
+        q = torch.randn(1, heads, 1, dim, device=dev, dtype=dt)
+        k = torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt)
+        v = torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt)
+
+        if paged.length + 1 > paged.bucket:
+            paged.grow(paged.length + 1)
+        paged.set_length(paged.length + 1)
+        got = paged.attend(0, q, k, v, scale)
+
+        ref_k = torch.cat([ref_k, k], dim=2)
+        ref_v = torch.cat([ref_v, v], dim=2)
+        want = F.scaled_dot_product_attention(q, ref_k, ref_v, enable_gqa=True, scale=scale).transpose(1, 2)
+
+        worst = max(worst, (got.float() - want.float()).abs().max().item())
+        paged_ids.append(int((got.float().reshape(1, -1) @ proj).argmax()))
+        ref_ids.append(int((want.float().reshape(1, -1) @ proj).argmax()))
+
+    assert paged.bucket == 1024, "the loop never crossed a bucket boundary"
+    assert paged_ids == ref_ids, (
+        f"argmax diverges at step {next(i for i, (a, b) in enumerate(zip(paged_ids, ref_ids)) if a != b)}"
+    )
+    assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
+
 # ---------------------------------------------------------------------------
 # The cache is only worth anything if production actually reaches it, and the
 # kwargs it needs are not in every wheel that exports the kernel. The tests
