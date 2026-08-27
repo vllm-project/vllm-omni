@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -446,7 +446,7 @@ def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
     assert spec.sink_frames == 3
     assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
     assert spec.cross_attention_lengths == {"text": 512}
-    assert spec.model_owned_state_bytes_per_session == 9_600
+    assert spec.model_owned_state_bytes_per_session == 1_920
 
 
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
@@ -1646,7 +1646,7 @@ def test_typed_tick_rejects_non_contiguous_chunk_index(
         pipeline(_request(sampling=sampling))
 
 
-def test_typed_tick_rejects_chunk_beyond_realtime_condition_horizon(
+def test_typed_ticks_reuse_bounded_blank_tail_beyond_ten_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_pipeline_module()
@@ -1654,21 +1654,42 @@ def test_typed_tick_rejects_chunk_beyond_realtime_condition_horizon(
     pipeline._ar_height = 16
     pipeline._ar_width = 16
     pipeline._ar_diffusion_kv_state = object()
-    pipeline._ar_sessions["world-1"] = module._LingBotARSessionState(
-        next_chunk_index=10,
-    )
+    generated = []
     monkeypatch.setattr(
         pipeline,
-        "encode_prompt",
-        lambda *args, **kwargs: pytest.fail("the realtime horizon must be validated before prompt encoding"),
+        "_ar_text_caches",
+        lambda *args, **kwargs: [SimpleNamespace()],
     )
 
-    sampling = _SamplingParams(extra_args=_tick_extra_args(chunk_index=10))
-    with pytest.raises(
-        ValueError,
-        match=r"at most 10 ticks.*chunk_index 0 through 9.*117 pixel frames",
-    ):
+    def generate_block(**kwargs):
+        generated.append(
+            {
+                "condition": kwargs["condition"].clone(),
+                "start_frame": kwargs["start_frame"],
+            }
+        )
+        return torch.zeros_like(kwargs["condition"][:, :16])
+
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    for chunk_index in range(11):
+        sampling = _SamplingParams(
+            extra_args=_tick_extra_args(chunk_index=chunk_index),
+        )
         pipeline(_request(sampling=sampling))
+
+    assert len(pipeline.vae.encode_inputs) == 1
+    assert pipeline.vae.encode_inputs[0].shape[2] == 21
+    assert pipeline._ar_sessions["world-1"].image_condition.shape[2] == 6
+    assert pipeline._ar_sessions["world-1"].next_chunk_index == 11
+    assert [item["start_frame"] for item in generated] == list(range(0, 33, 3))
+    assert torch.count_nonzero(generated[0]["condition"][:, :4]) > 0
+    torch.testing.assert_close(
+        generated[1]["condition"][:, :4],
+        torch.zeros_like(generated[1]["condition"][:, :4]),
+    )
+    for item in generated[2:]:
+        torch.testing.assert_close(item["condition"], generated[1]["condition"])
 
 
 def test_request_cache_is_released_before_vae_decode() -> None:

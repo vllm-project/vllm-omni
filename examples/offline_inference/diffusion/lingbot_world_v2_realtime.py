@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run LingBot-World 2.0 as an in-process realtime AR-Diffusion session.
 
 This example exercises the internal session API. It is not a public HTTP or
 WebSocket protocol. Each JSONL event advances the world by one three-latent
-frame AR block and writes the latent plus its identity metadata. The current
-scoped implementation supports at most ten ticks per generation epoch because
-its image condition is bounded to 117 pixel frames; reset or create a session
-to start a new world.
+frame AR block and writes the latent plus its identity metadata. A bounded
+blank-tail image condition supports open-ended contiguous realtime ticks.
 """
 
 from __future__ import annotations

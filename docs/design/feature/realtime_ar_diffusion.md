@@ -143,8 +143,10 @@ fraction to select additional resident sessions up to the model-declared cap.
 All model-owned reservations are deducted before the paged self-attention pool
 is allocated.
 
-LingBot reports its persistent full-horizon image-condition tensor. DreamZero
-reports the measured 603 MiB per-session Wan VAE causal-convolution state.
+LingBot reports a bounded two-block image-condition tensor: the first block
+contains the initial image condition and the second is a reusable blank tail for
+all later ticks. DreamZero reports the measured 603 MiB per-session Wan VAE
+causal-convolution state.
 
 ## Concurrency and routing limits
 

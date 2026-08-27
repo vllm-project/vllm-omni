@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-scoped LingBot-World v2 causal DMD pipeline."""
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
 _MAX_RAW_FRAMES = 117
+_REALTIME_CONDITION_BLOCKS = 2
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
 _PREPROCESSED_CAMERA_KEY = "_lingbot_camera_trajectory"
@@ -523,11 +524,11 @@ class LingBotWorldCausalDMDPipeline(
         recent_window_frames = total_window_frames - sink_frames
         if recent_window_frames <= 0:
             raise ValueError("LingBot AR-Diffusion cache needs a positive recent window after reserving sink frames.")
-        horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+        condition_latent_frames = _REALTIME_CONDITION_BLOCKS * int(self.transformer.config.num_frames_per_block)
         condition_channels = self.vae_scale_factor_temporal + int(self.transformer.config.out_channels)
         condition_bytes_per_session = (
             condition_channels
-            * horizon_latent_frames
+            * condition_latent_frames
             * latent_height
             * latent_width
             * torch.empty((), dtype=self.transformer.dtype).element_size()
@@ -1121,16 +1122,6 @@ class LingBotWorldCausalDMDPipeline(
                     "fixed cache geometry "
                     f"{self._ar_height}x{self._ar_width}."
                 )
-            horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-            max_realtime_ticks = horizon_latent_frames // block_frames
-            if tick.chunk_index >= max_realtime_ticks:
-                raise ValueError(
-                    "LingBot realtime generation currently supports at most "
-                    f"{max_realtime_ticks} ticks per generation epoch "
-                    f"(chunk_index 0 through {max_realtime_ticks - 1}) because "
-                    f"the image-condition horizon is {_MAX_RAW_FRAMES} pixel "
-                    "frames; reset or create a session to start a new world."
-                )
             session_state = self._ar_sessions.setdefault(
                 tick.session_id,
                 _LingBotARSessionState(),
@@ -1156,20 +1147,26 @@ class LingBotWorldCausalDMDPipeline(
         else:
             assert session_state is not None
             if session_state.image_condition is None:
-                horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+                condition_latent_frames = _REALTIME_CONDITION_BLOCKS * block_frames
+                condition_pixel_frames = (condition_latent_frames - 1) * self.vae_scale_factor_temporal + 1
                 session_state.image_condition = self._prepare_condition(
                     replace(
                         inputs,
-                        num_frames=_MAX_RAW_FRAMES,
-                        num_latent_frames=horizon_latent_frames,
+                        num_frames=condition_pixel_frames,
+                        num_latent_frames=condition_latent_frames,
                     ),
                     dtype=dtype,
                 )
             block_frames = int(self.transformer.config.num_frames_per_block)
-            condition_start = tick.chunk_index * block_frames
+            condition_blocks = session_state.image_condition.shape[2] // block_frames
+            if condition_blocks != _REALTIME_CONDITION_BLOCKS:
+                raise RuntimeError(
+                    "LingBot realtime image condition must contain exactly "
+                    f"{_REALTIME_CONDITION_BLOCKS} latent blocks; got {condition_blocks}."
+                )
+            condition_block = min(tick.chunk_index, condition_blocks - 1)
+            condition_start = condition_block * block_frames
             condition_stop = condition_start + block_frames
-            if condition_stop > session_state.image_condition.shape[2]:
-                raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
             condition = session_state.image_condition[
                 :,
                 :,
