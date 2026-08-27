@@ -43,6 +43,12 @@ BLOCK_SIZE = 16
 # Growth schedule. Each new bucket costs one capture, so keep the list short and
 # let the last entry cover the tail rather than doubling forever.
 BUCKETS = (512, 1024, 2048, 4096, 8192)
+# Past the last bucket the schedule grows by this much at a time. A request
+# decodes at most `max_think_tokens` (1024) or `max_tokens` (512) steps, so a
+# step this size costs at most one reallocation per request. Doubling the last
+# bucket instead would also cost at most one, but a 9,100-token request would
+# then reserve 766 MiB it never uses, against 118 MiB here.
+TAIL_STEP = 2048
 
 
 # The paged path exists only through these two kwargs. An older wheel can export
@@ -86,8 +92,12 @@ def _bucket_for(length: int) -> int:
     for b in BUCKETS:
         if length <= b:
             return b
-    # Past the schedule, round up to a whole number of blocks.
-    return ((length + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    # Past the schedule, grow in TAIL_STEP-sized steps. Rounding to a whole
+    # number of blocks here would reallocate and re-capture every BLOCK_SIZE
+    # tokens: a think edit with two 2048x2048 inputs runs to about 9,100 tokens
+    # and paid 41 reallocations and 42 captures in one request.
+    over = length - BUCKETS[-1]
+    return BUCKETS[-1] + ((over + TAIL_STEP - 1) // TAIL_STEP) * TAIL_STEP
 
 
 class PagedDecodeCache:

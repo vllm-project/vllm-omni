@@ -16,6 +16,8 @@ import torch
 import vllm_omni.diffusion.models.sensenova_u1.paged_decode as paged_decode
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
+    BUCKETS,
+    TAIL_STEP,
     PagedDecodeCache,
     _bucket_for,
 )
@@ -56,6 +58,24 @@ def test_bucket_rounds_up_and_is_block_aligned():
     assert _bucket_for(512) == 512
     assert _bucket_for(513) == 1024
     assert _bucket_for(100_000) % BLOCK_SIZE == 0
+
+
+def test_past_the_last_bucket_the_schedule_grows_in_steps():
+    """Every bucket change reallocates the cache and re-captures the graph, so
+    the tail of the schedule must not step by BLOCK_SIZE. A think edit with two
+    2048x2048 inputs runs to about 9,100 tokens, so this regime is reachable,
+    and a request decodes at most 1024 steps.
+    """
+    last = BUCKETS[-1]
+    assert _bucket_for(last + 1) == last + TAIL_STEP
+    assert _bucket_for(100_000) % BLOCK_SIZE == 0
+    for start in (last + 1, last + TAIL_STEP - 1, last + TAIL_STEP + 7):
+        bucket, grows = _bucket_for(start), 0
+        for n in range(start, start + 1025):
+            if _bucket_for(n) != bucket:
+                bucket = _bucket_for(n)
+                grows += 1
+        assert grows <= 1, f"start {start}: {grows} reallocations over 1024 decode steps"
 
 
 def test_prefix_survives_the_hand_off():
