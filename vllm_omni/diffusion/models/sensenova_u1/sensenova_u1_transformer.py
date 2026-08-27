@@ -314,8 +314,6 @@ class SenseNovaU1Attention(nn.Module):
         self.q_norm_hw_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
         self.k_norm_hw_mot_gen = Qwen3RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
 
-        self.rotary_emb, self.rotary_emb_hw = _build_3d_rope(config)
-
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -365,9 +363,13 @@ class SenseNovaU1Attention(nn.Module):
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
     def _project_and_rope(
-        self, hidden_states, indexes, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw, position_embeddings=None
+        self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw
     ):
-        """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE."""
+        """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE.
+
+        The three tables come from the model, which builds them once per forward
+        because every layer is handed the same `indexes`.
+        """
         input_shape = hidden_states.shape[:-1]  # (B, S)
         qkv, _ = qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -376,12 +378,7 @@ class SenseNovaU1Attention(nn.Module):
         k = k.view(*input_shape, self.num_kv_heads, self.head_dim)
         v = v.view(*input_shape, self.num_kv_heads, self.head_dim)
 
-        if position_embeddings is None:
-            cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
-            cos_h, sin_h = self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0))
-            cos_w, sin_w = self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0))
-        else:
-            (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = position_embeddings
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = position_embeddings
 
         value_states = v.transpose(1, 2)  # [B, H, S, D]
         try:
@@ -436,13 +433,12 @@ class SenseNovaU1Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
-            indexes,
+            kwargs["position_embeddings"],
             self.qkv_proj,
             self.q_norm,
             self.k_norm,
             self.q_norm_hw,
             self.k_norm_hw,
-            position_embeddings=kwargs.get("position_embeddings"),
         )
         # Single-token decode with a paged cache: append this step's K/V and let
         # the kernel read the valid prefix via `seqused_k`. Shapes stay fixed,
@@ -474,13 +470,12 @@ class SenseNovaU1Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
-            indexes,
+            kwargs["position_embeddings"],
             self.qkv_proj_mot_gen,
             self.q_norm_mot_gen,
             self.k_norm_mot_gen,
             self.q_norm_hw_mot_gen,
             self.k_norm_hw_mot_gen,
-            position_embeddings=kwargs.get("position_embeddings"),
         )
         update_cache = kwargs.get("update_cache", True)
 
@@ -675,7 +670,8 @@ class SenseNovaU1Model(nn.Module):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Every layer receives the same `indexes`, so the tables are the same for
-        # all of them and are built once per forward here rather than per layer.
+        # all of them: build them once per forward here and thread them down,
+        # rather than giving every layer its own pair.
         self.rotary_emb, self.rotary_emb_hw = _build_3d_rope(config)
 
     def forward(
@@ -722,13 +718,11 @@ class SenseNovaU1Model(nn.Module):
             causal_mask_mapping = attention_mask
 
         hidden_states = inputs_embeds
-        position_embeddings = None
-        if indexes is not None:
-            position_embeddings = (
-                self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
-                self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
-                self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
-            )
+        position_embeddings = (
+            self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
+            self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
+            self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+        )
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
