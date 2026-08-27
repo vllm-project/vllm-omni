@@ -16,7 +16,7 @@ validation_paths:
   - tests/host_weight_runtime/**
 upstream_refs:
   - https://github.com/vllm-project/vllm-omni/issues/6414
-last_reviewed: 2026-08-21
+last_reviewed: 2026-08-25
 ---
 
 # Host Weight Runtime
@@ -56,7 +56,8 @@ The contracts have deliberately narrow ownership:
 
 - `HostWeightRuntime` applies resolution and fallback policy and emits one
   terminal resolution report. Explicit post-load publication emits a separate
-  report and may return a lease, but does not revise the completed resolution.
+  report and closes its store-returned lease before returning; it does not
+  revise the completed resolution.
   The runtime does not own a model or call the canonical loader.
 - `HostWeightStore` owns artifact lookup, coordinated construction,
   publication, validation, quarantine, and lifecycle.
@@ -82,6 +83,13 @@ another. `WeightArtifactIdentity` includes:
 - static adaptation identity; and
 - producer version, implementation fingerprint, manifest schema, and restorer
   schema.
+
+Loader integrations may persist content digests for canonical source shards in
+the selected storage domain. Reuse requires the same path, inode, size,
+timestamps, symlink target, and cache-record checksum. Corrupt records are
+rebuilt, and coordination or cache-I/O failure falls back to hashing the
+canonical source directly. This is an identity-computation optimization, not a
+second source of truth or an artifact substitution rule.
 
 The identity excludes transfer policy such as registered mmap versus private
 pinned staging. Those paths move the same host representation and must not
@@ -235,6 +243,12 @@ Every publication computes full file and tensor hashes. Local lookup supports:
   metadata, file descriptors, sizes, tensor keys, shapes, dtypes, and strides;
   and
 - `full_checksum`, which additionally reads and hashes every payload file.
+
+An ordered producer may compute file and tensor digests while payload bytes are
+written and overlap each closed payload's `fsync` with later producer work. An
+unordered producer retains parallel readback hashing. In both cases manifest
+and `READY` publication wait for every payload digest and `fsync`; the atomic
+publication and validation contract is unchanged.
 
 Filesystem verity is modeled but unsupported. Invalid artifacts receive an
 external deny marker before their shared lookup lock is released; a build owner

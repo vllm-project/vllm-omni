@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for AsyncOmniEngine single-stage mode and OmniMasterServer."""
 
 from __future__ import annotations
@@ -1175,7 +1178,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert od_config.max_num_seqs == 4
+        assert od_config.max_num_seqs is None
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1374,7 +1377,7 @@ class TestConnectRemoteEngineCoresCoordinator:
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
         omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
-        _, _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        _, core_engines, parallel_config, *_ = mock_wait.call_args.args
         assert core_engines[0].local is False
         assert parallel_config.data_parallel_size_local == 0
 

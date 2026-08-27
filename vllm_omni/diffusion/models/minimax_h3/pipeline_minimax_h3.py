@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """vLLM-Omni pipeline for MiniMax H3 FL2VA and Ref2VA partitions."""
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from itertools import groupby
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -45,6 +46,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
+    BoundedAllocatorCache,
     OffloadPlan,
     apply_sequential_offload,
     remove_sequential_offload,
@@ -56,7 +58,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -68,13 +70,24 @@ from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config as _resolve_encoder_quant_config,
 )
 
+from .batched_packing import minimax_h3_batched_forward_kwargs
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
 )
-from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
+from .denoise_loop import (
+    MiniMaxH3DenoiseBranch,
+    minimax_h3_denoise_loop,
+    minimax_h3_prepare_denoise_rows,
+    minimax_h3_publish_denoise_progress,
+)
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .lora import load_minimax_h3_turbo_lora
+from .minimax_h3_transformer import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiTModel,
+    _attention_isolates_packed_requests,
+)
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -101,6 +114,10 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
+from .scheduling_minimax_h3_euler_ancestral import (
+    minimax_h3_euler_eta0_step,
+    minimax_h3_rf_v_to_x0,
+)
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
@@ -108,7 +125,17 @@ from .time_request import (
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from vllm_omni.lora.request import LoRARequest
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -130,6 +157,9 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_TURBO_SIGMA_POINTS = 5
+MINIMAX_H3_TURBO_VIDEO_SHIFT = 6.0
+MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -188,6 +218,68 @@ def _resolve_minimax_h3_model_root(
             require_all=True,
         )
     )
+
+
+# Keys of ``_prepare_request_inputs`` that feed ``diffuse`` / ``_build_denoise_inputs``.
+_MINIMAX_H3_DENOISE_INPUT_KEYS = (
+    "task",
+    "text_embeddings",
+    "text_tags",
+    "seed",
+    "latent_t",
+    "latent_h",
+    "latent_w",
+    "audio_t",
+    "num_frames",
+    "num_steps",
+    "video_shift",
+    "audio_shift",
+    "base_schedule",
+    "visual_condition",
+    "visual_condition_shape",
+    "audio_condition",
+    "ref_audio_t",
+    "ref_blocks",
+    "visual_condition_shapes",
+    "audio_condition_lengths",
+    "keyframe_frame_indices",
+)
+
+# ``StepRequestState.extra`` keys owned by the step-execution path.
+_STEP_BRANCH = "minimax_h3_branch"
+_STEP_AUDIO_ROWS = "minimax_h3_audio_rows"
+_STEP_AUDIO_NOISE_PRED = "minimax_h3_audio_noise_pred"
+_STEP_SIGMAS_VIDEO = "minimax_h3_sigmas_video"
+_STEP_SIGMAS_AUDIO = "minimax_h3_sigmas_audio"
+_STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
+_STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
+_STEP_SHAPE = "minimax_h3_shape"
+_STEP_TRANSFORMER = "minimax_h3_transformer"
+
+
+def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
+    """Return the sigma/timestep values this request needs for its current step.
+
+    Mirrors the per-iteration arithmetic of ``minimax_h3_denoise_loop`` so step
+    mode and request mode advance identically.
+    """
+    step = int(state.step_index)
+    sigmas_video = state.extra[_STEP_SIGMAS_VIDEO]
+    sigmas_audio = state.extra[_STEP_SIGMAS_AUDIO]
+    sigma_video = float(sigmas_video[step])
+    sigma_audio = float(sigmas_audio[step])
+    t_video = 1.0 - sigma_video
+    t_audio = 1.0 - sigma_audio
+    return {
+        "sigma_video": sigma_video,
+        "sigma_video_next": float(sigmas_video[step + 1]),
+        "sigma_audio": sigma_audio,
+        "sigma_audio_next": float(sigmas_audio[step + 1]),
+        "t_video": t_video,
+        "t_audio": t_audio,
+        "imgvid_cond_timestep": max(t_video, MINIMAX_H3_IMGVID_COND_TIMESTEP),
+        "audio_ref_cond_timestep": max(t_audio, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+    }
 
 
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
@@ -433,6 +525,58 @@ def _dit_rank_world() -> tuple[Any, int, int]:
     return group, dist.get_rank(group), dist.get_world_size(group)
 
 
+def _broadcast_rank0_exception(exc: Exception | None) -> None:
+    """Synchronize a rank-0-only exception across every DiT rank.
+
+    H3 reference-video preparation runs only on rank 0; the other DiT ranks
+    return ``None`` without touching disk. When rank 0 raises inside that
+    path it exits :meth:`prepare_encode` before reaching the downstream
+    ``dist.broadcast`` calls, and non-zero ranks then hang on those
+    collectives forever. Every rank calls this helper right after the
+    rank-0-only work, before any subsequent collective, so all ranks either
+    raise the same error together or all continue.
+    """
+    group, rank, world_size = _dit_rank_world()
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    if rank == 0:
+        if exc is None:
+            payload: list[Any] = [None]
+        else:
+            payload = [
+                {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "status_code": getattr(exc, "status_code", None),
+                    "error_type": getattr(exc, "error_type", None),
+                }
+            ]
+    else:
+        payload = [None]
+    dist.broadcast_object_list(payload, src=0, group=group)
+    info = payload[0]
+    if info is None:
+        return
+    if rank == 0:
+        assert exc is not None
+        raise exc
+    # Rebuild a matching client-facing error on non-zero ranks so the runner's
+    # per-request try/except records the same 4xx status as rank 0. The exact
+    # subclass need not survive the wire; the message and status suffice.
+    status_code = info.get("status_code")
+    error_type = info.get("error_type")
+    message = f"[rank 0] {info['type']}: {info['message']}"
+    if status_code is not None:
+        raise client_error_from_metadata(
+            message,
+            status_code=int(status_code),
+            error_type=error_type,
+        )
+    raise RuntimeError(message)
+
+
 def _broadcast_tensor(
     tensor: torch.Tensor | None,
     *,
@@ -537,6 +681,8 @@ class MiniMaxH3Pipeline(
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
+    supports_step_execution: ClassVar[bool] = True
+
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
@@ -553,11 +699,86 @@ class MiniMaxH3Pipeline(
         "_encode_reference_audio_conditions",
         "diffuse",
         "decode",
+        "prepare_encode",
+        "denoise_step",
+        "post_decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+
+    def _load_diffusion_lora_adapter(
+        self,
+        *,
+        lora_request: LoRARequest,
+        lora_path: str | Path,
+        dtype: torch.dtype,
+    ) -> tuple[LoRAModel, PEFTHelper] | None:
+        # A cache eviction may be followed by a different adapter reusing the
+        # same client-supplied ID. Every real load replaces the classification.
+        self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        od_config = getattr(self, "od_config", None)
+        offload_modes = []
+        if getattr(od_config, "enable_cpu_offload", False):
+            offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
+        if getattr(od_config, "enable_layerwise_offload", False):
+            offload_modes.append("layerwise offload (--enable-layerwise-offload)")
+        loaded = load_minimax_h3_turbo_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if loaded is not None:
+            self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
+        return loaded
+
+    def _validate_diffusion_lora_binding(
+        self,
+        *,
+        lora_model: LoRAModel,
+        bound_lora_names: frozenset[str],
+    ) -> None:
+        if lora_model.id not in self._turbo_lora_adapter_ids:
+            return
+        missing = sorted(set(lora_model.loras) - bound_lora_names)
+        if missing:
+            raise ValueError(
+                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+            )
+
+    def _has_active_turbo_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._turbo_lora_adapter_ids
+        )
+
+    def _validate_turbo_sampling(self, sampling: Any) -> None:
+        extra = sampling.extra_args or {}
+        sigma_points = sampling.num_inference_steps
+        if sigma_points != MINIMAX_H3_TURBO_SIGMA_POINTS:
+            raise OmniClientError(
+                "MiniMax-H3 Turbo requires num_inference_steps=5 (five sigma points produce four denoiser evaluations)"
+            )
+        try:
+            video_shift = float(extra.get("flow_shift", self.default_video_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}") from exc
+        if not math.isclose(video_shift, MINIMAX_H3_TURBO_VIDEO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires flow_shift={MINIMAX_H3_TURBO_VIDEO_SHIFT:g}")
+        try:
+            audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(
+                f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}"
+            ) from exc
+        if not math.isclose(audio_shift, MINIMAX_H3_TURBO_AUDIO_SHIFT):
+            raise OmniClientError(f"MiniMax-H3 Turbo requires audio_flow_shift={MINIMAX_H3_TURBO_AUDIO_SHIFT:g}")
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -589,6 +810,7 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        self._turbo_lora_adapter_ids: set[int] = set()
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -729,6 +951,12 @@ class MiniMaxH3Pipeline(
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
 
+        self._dlo_component_cache = None
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            self._dlo_component_cache = BoundedAllocatorCache(self.device)
+            for component in (self.text_encoder, self.video_vae, self.audio_vae):
+                component.set_omni_component_cache(self._dlo_component_cache)
+
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
 
@@ -781,6 +1009,8 @@ class MiniMaxH3Pipeline(
         self,
         requested: str | None,
         multi_modal_data: dict[str, Any],
+        *,
+        has_turbo_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -798,6 +1028,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"checkpoint partition {self.partition!r} supports {sorted(self.supported_tasks)}, got task={task!r}"
             )
+        if task == "ref2va" and has_turbo_lora:
+            raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
         return task
 
     def _resolve_shape(
@@ -1144,11 +1376,8 @@ class MiniMaxH3Pipeline(
         ):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
-            self.text_encoder.load_to_device()
-            try:
+            with self._component_on_device(self.text_encoder):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
-            finally:
-                self.text_encoder.offload_to_cpu()
 
         # Keep both Qwen and DiT resident across requests. Moving either model
         # here makes encoder latency include a tens-of-gigabytes PCIe transfer,
@@ -1206,13 +1435,35 @@ class MiniMaxH3Pipeline(
                 yield
             return
         staged = self._uses_manual_component_offload()
-        if staged:
-            component.load_to_device()
         try:
-            yield
-        finally:
             if staged:
-                component.offload_to_cpu()
+                component.load_to_device()
+            yield
+        except BaseException:
+            if staged:
+                try:
+                    component.offload_to_cpu()
+                except BaseException:
+                    logger.exception("Failed to release %s after component failure", component.__class__.__name__)
+                cache = getattr(self, "_dlo_component_cache", None)
+                if cache is not None:
+                    try:
+                        cache.release_if_needed(force=True)
+                    except BaseException:
+                        logger.exception("Failed to release retained allocator cache after component failure")
+            raise
+        else:
+            if staged:
+                try:
+                    component.offload_to_cpu()
+                except BaseException:
+                    cache = getattr(self, "_dlo_component_cache", None)
+                    if cache is not None:
+                        try:
+                            cache.release_if_needed(force=True)
+                        except BaseException:
+                            logger.exception("Failed to release retained allocator cache after offload failure")
+                    raise
 
     def _encode_visual_conditions(
         self,
@@ -1448,7 +1699,7 @@ class MiniMaxH3Pipeline(
             if controller is not None and enabled:
                 controller.offload_resident_layers()
 
-    def diffuse(
+    def _build_denoise_inputs(
         self,
         *,
         task: str,
@@ -1472,7 +1723,12 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> dict[str, Any]:
+        """Build the packed layout, initial rows, anchors, and sigma schedules.
+
+        Shared by request-mode :meth:`diffuse` and step-mode
+        :meth:`prepare_encode` so both paths start from identical state.
+        """
         initial_video, initial_audio = self._initial_noise(
             seed=seed,
             latent_t=latent_t,
@@ -1572,32 +1828,34 @@ class MiniMaxH3Pipeline(
             shift_scale=audio_shift,
             base_schedule=base_schedule,
         )
-        transformer = self._transformer_for_task(task)
-        # The static DLO plan keeps leading blocks resident only for the
-        # primary ``transformer``. In combined mode ``transformers_ref`` is
-        # fully streamed, so a Ref2VA request must not stage the inactive
-        # FL2VA transformer resident blocks.
-        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
-            with self.progress_bar(total=len(video_sigmas) - 1) as progress:
-                video_rows, audio_rows = minimax_h3_denoise_loop(
-                    model=transformer,
-                    positive=branch,
-                    initial_video_rows=initial_video,
-                    initial_audio_rows=initial_audio,
-                    keyframe_cond_rows=visual_anchor,
-                    audio_ref_rows=audio_anchor,
-                    sigmas_video=video_sigmas,
-                    sigmas_audio=audio_sigmas,
-                    device=self.device,
-                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
-                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
-                    on_step_start=lambda step, video_sigma, audio_sigma: self.record_denoise_step(
-                        step,
-                        normalized_timestep=video_sigma,
-                    ),
-                    on_step_end=lambda step, video, audio: progress.update(),
-                )
+        return {
+            "branch": branch,
+            # The request-mode loop moves these onto the device itself; step mode
+            # keeps them resident across steps, so normalize once for both.
+            "video_rows": initial_video.to(device=self.device, dtype=torch.float32),
+            "audio_rows": initial_audio.to(device=self.device, dtype=torch.float32),
+            "cond_anchor": (
+                None if visual_anchor is None else visual_anchor.to(device=self.device, dtype=torch.float32)
+            ),
+            "audio_anchor": (
+                None if audio_anchor is None else audio_anchor.to(device=self.device, dtype=torch.float32)
+            ),
+            "sigmas_video": video_sigmas,
+            "sigmas_audio": audio_sigmas,
+        }
 
+    def _unpack_denoised_rows(
+        self,
+        branch: MiniMaxH3DenoiseBranch,
+        video_rows: torch.Tensor,
+        audio_rows: torch.Tensor,
+        *,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select the target rows and unpack them back into VAE latents."""
         target_video = video_rows[branch.update_mask_dev]
         video_latent = minimax_h3_unpatchify_video_tokens(
             target_video,
@@ -1616,6 +1874,83 @@ class MiniMaxH3Pipeline(
             audio_channel=2,
         )
         return video_latent, audio_latent
+
+    def diffuse(
+        self,
+        *,
+        task: str,
+        text_embeddings: torch.Tensor,
+        text_tags: torch.Tensor,
+        seed: int,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        num_frames: int,
+        num_steps: int,
+        video_shift: float,
+        audio_shift: float,
+        base_schedule: Sequence[float] | None,
+        visual_condition: torch.Tensor | None,
+        visual_condition_shape: tuple[int, int, int] | None,
+        audio_condition: torch.Tensor | None,
+        ref_audio_t: int | None,
+        ref_blocks: list[dict[str, Any]] | None = None,
+        visual_condition_shapes: list[tuple[int, int, int]] | None = None,
+        audio_condition_lengths: list[int] | None = None,
+        keyframe_frame_indices: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inputs = self._build_denoise_inputs(
+            task=task,
+            text_embeddings=text_embeddings,
+            text_tags=text_tags,
+            seed=seed,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            num_frames=num_frames,
+            num_steps=num_steps,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+            base_schedule=base_schedule,
+            visual_condition=visual_condition,
+            visual_condition_shape=visual_condition_shape,
+            audio_condition=audio_condition,
+            ref_audio_t=ref_audio_t,
+            ref_blocks=ref_blocks,
+            visual_condition_shapes=visual_condition_shapes,
+            audio_condition_lengths=audio_condition_lengths,
+            keyframe_frame_indices=keyframe_frame_indices,
+        )
+        branch = inputs["branch"]
+        transformer = self._transformer_for_task(task)
+        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+            with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
+                video_rows, audio_rows = minimax_h3_denoise_loop(
+                    model=transformer,
+                    positive=branch,
+                    initial_video_rows=inputs["video_rows"],
+                    initial_audio_rows=inputs["audio_rows"],
+                    keyframe_cond_rows=inputs["cond_anchor"],
+                    audio_ref_rows=inputs["audio_anchor"],
+                    sigmas_video=inputs["sigmas_video"],
+                    sigmas_audio=inputs["sigmas_audio"],
+                    device=self.device,
+                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    on_step=lambda step, video, audio: progress.update(),
+                )
+
+        return self._unpack_denoised_rows(
+            branch,
+            video_rows,
+            audio_rows,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+        )
 
     def decode(
         self,
@@ -1637,11 +1972,9 @@ class MiniMaxH3Pipeline(
             audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
 
-    @torch.no_grad()
-    def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
-        if len(request.prompts) != 1:
-            raise OmniClientError("MiniMax H3 supports one request at a time")
-        raw_prompt = request.prompts[0]
+    @staticmethod
+    def _extract_prompt(raw_prompt: Any) -> tuple[str, dict[str, Any]]:
+        """Split a request prompt into its text and multimodal parts."""
         if isinstance(raw_prompt, str):
             prompt = raw_prompt
             multi_modal_data: dict[str, Any] = {}
@@ -1650,12 +1983,32 @@ class MiniMaxH3Pipeline(
             multi_modal_data = raw_prompt.get("multi_modal_data") or {}
         if not prompt:
             raise OmniClientError("MiniMax H3 requires a non-empty prompt")
+        return prompt, multi_modal_data
 
-        sampling = request.sampling_params
+    def _prepare_request_inputs(
+        self,
+        *,
+        prompt: str,
+        multi_modal_data: dict[str, Any],
+        sampling: Any,
+    ) -> dict[str, Any]:
+        """Resolve the task and output shape, then run every request-level encode.
+
+        Shared by request-mode :meth:`forward` and step-mode
+        :meth:`prepare_encode`; the returned mapping feeds :meth:`diffuse` and
+        :meth:`_build_denoise_inputs` unchanged.
+        """
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
-        task = self._resolve_task(extra.get("task"), multi_modal_data)
+        has_turbo_lora = self._has_active_turbo_lora(sampling)
+        task = self._resolve_task(
+            extra.get("task"),
+            multi_modal_data,
+            has_turbo_lora=has_turbo_lora,
+        )
+        if has_turbo_lora:
+            self._validate_turbo_sampling(sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -1721,12 +2074,24 @@ class MiniMaxH3Pipeline(
             video_count = 0
             if raw_videos is not None:
                 video_count = len(raw_videos) if isinstance(raw_videos, (list, tuple)) else 1
-                prepared_videos = self._prepare_reference_videos(
-                    raw_videos,
-                    target_frame_count=num_frames,
-                    workdir=workdir,
-                    start_time_seconds=extra.get("start_time_seconds"),
-                )
+                # File-based reference-video prep runs only on rank 0; other
+                # ranks return None without touching disk. If rank 0 raises
+                # (e.g. invalid file, unsupported codec) it must not exit
+                # ``prepare_encode`` before the downstream broadcasts below --
+                # non-zero ranks would then deadlock on them forever. Capture
+                # the exception here and let every rank agree on the outcome
+                # before starting any subsequent collective.
+                prep_error: Exception | None = None
+                try:
+                    prepared_videos = self._prepare_reference_videos(
+                        raw_videos,
+                        target_frame_count=num_frames,
+                        workdir=workdir,
+                        start_time_seconds=extra.get("start_time_seconds"),
+                    )
+                except Exception as exc:
+                    prep_error = exc
+                _broadcast_rank0_exception(prep_error)
                 has_audio_tensor = torch.zeros(
                     video_count,
                     dtype=torch.long,
@@ -1863,37 +2228,360 @@ class MiniMaxH3Pipeline(
         )
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
+        return {
+            "task": task,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "latent_t": latent_t,
+            "latent_h": height // 16,
+            "latent_w": width // 16,
+            "audio_t": audio_t,
+            "text_embeddings": text_embeddings,
+            "text_tags": text_tags,
+            "visual_condition": visual_condition,
+            "visual_condition_shape": visual_shape,
+            "audio_condition": audio_condition,
+            "ref_audio_t": ref_audio_t,
+            "ref_blocks": ref_blocks,
+            "visual_condition_shapes": visual_shapes,
+            "audio_condition_lengths": audio_lengths,
+            "keyframe_frame_indices": keyframe_frame_indices,
+            "seed": seed,
+            "num_steps": num_steps,
+            "video_shift": video_shift,
+            "audio_shift": audio_shift,
+            "base_schedule": base_schedule,
+            "num_outputs": num_outputs,
+        }
+
+    @staticmethod
+    def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
+        """Select the denoise-input arguments from a prepared request context."""
+        return {key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS}
+
+    @torch.no_grad()
+    def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
+        if len(request.prompts) != 1:
+            raise OmniClientError("MiniMax H3 supports one request at a time")
+        prompt, multi_modal_data = self._extract_prompt(request.prompts[0])
+        context = self._prepare_request_inputs(
+            prompt=prompt,
+            multi_modal_data=multi_modal_data,
+            sampling=request.sampling_params,
+        )
+        denoise_kwargs = self._denoise_kwargs(context)
+        num_outputs = context["num_outputs"]
         videos = []
         audios = []
-        for output_seed in _minimax_h3_output_seeds(seed, num_outputs):
-            video_latent, audio_latent = self.diffuse(
-                task=task,
-                text_embeddings=text_embeddings,
-                text_tags=text_tags,
-                seed=output_seed,
-                latent_t=latent_t,
-                latent_h=height // 16,
-                latent_w=width // 16,
-                audio_t=audio_t,
-                num_frames=num_frames,
-                num_steps=num_steps,
-                video_shift=video_shift,
-                audio_shift=audio_shift,
-                base_schedule=base_schedule,
-                visual_condition=visual_condition,
-                visual_condition_shape=visual_shape,
-                audio_condition=audio_condition,
-                ref_audio_t=ref_audio_t,
-                ref_blocks=ref_blocks,
-                visual_condition_shapes=visual_shapes,
-                audio_condition_lengths=audio_lengths,
-                keyframe_frame_indices=keyframe_frame_indices,
+        for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
+            video_latent, audio_latent = self.diffuse(**{**denoise_kwargs, "seed": output_seed})
+            video, audio = self.decode(
+                video_latent,
+                audio_latent,
+                height=context["height"],
+                width=context["width"],
             )
-            video, audio = self.decode(video_latent, audio_latent, height=height, width=width)
             videos.append(video)
             audios.append(audio)
         video = torch.cat(videos, dim=0)
         audio = torch.cat(audios, dim=0)
+        return DiffusionOutput(
+            output=(video, audio),
+            post_process_func=get_minimax_h3_post_process_func(self.od_config),
+            stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+        )
+
+    # ------------------------------------------------------------------
+    # Step-wise execution (continuous batching)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _packed_batch_supported(transformer: MiniMaxH3DiTModel) -> bool:
+        """Whether every attention in this DiT honors multi-document cu_seqlens.
+
+        A packed batch is only isolated if *all* of them do: the token refiner
+        runs under its own attention role and can resolve to a different backend
+        from the DiT blocks. Ring sequence parallelism dispatches through
+        ``RingParallelAttention``, whose kernels ignore the packed
+        ``cu_seqlens`` metadata regardless of the configured backend; packing
+        multiple requests under ring would let attention cross document
+        boundaries, so any layer running ring disqualifies the batch.
+
+        The gate probes a per-backend capability rather than a fixed backend
+        name: FLASH_ATTN, for example, only isolates arbitrary N-document
+        packed cu_seqlens on CUDA/ROCm/MUSA. Its NPU path only accepts a
+        ``[real, pad]`` two-document layout and its XPU path ignores
+        cu_seqlens outright — either would silently attend across request
+        boundaries.
+        """
+        attentions = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
+        if not attentions:
+            return False
+        return all(_attention_isolates_packed_requests(module.attention) for module in attentions)
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Run every request-level stage once and seed the per-request step state."""
+        del kwargs
+        # Two request-mode features have no place in the shared step contract:
+        # a request state carries exactly one latent tensor, and distributed
+        # layerwise offload streams the DiT around one whole denoise loop rather
+        # than around a single scheduler-driven step.
+        num_outputs = _resolve_minimax_h3_num_outputs(state.sampling.num_outputs_per_prompt)
+        if num_outputs != 1:
+            raise OmniClientError(
+                f"MiniMax H3 step execution produces one output per request, got num_outputs_per_prompt={num_outputs}"
+            )
+        if getattr(self, "_dlo_residency_controller", None) is not None:
+            raise ValueError(
+                "MiniMax H3 step execution is not compatible with distributed layerwise offload; "
+                "the resident-layer window spans a whole denoise loop, so per-step streaming would "
+                "reload the DiT every step. Drop --step-execution or --enable-distributed-layerwise-offload."
+            )
+        # Request-scoped Cache-DiT (quality=high) mutates hook state on the
+        # shared transformer rather than on ``StepRequestState``. In step mode
+        # two requests can interleave denoise steps, or be co-batched into a
+        # single forward, and the second one would then re-enter the DiT with
+        # cache buffers shaped for the first. Reject the profile here rather
+        # than let it corrupt outputs at runtime; startup-configured Cache-DiT
+        # is already blocked in ``DiffusionModelRunner.execute_stepwise``.
+        if getattr(state.sampling, "quality", None) == "high":
+            raise OmniClientError(
+                "MiniMax H3 step execution does not support the high-quality Cache-DiT profile "
+                "(quality=high); its hooks live on the shared transformer, so interleaved or "
+                "co-batched requests would reuse incompatible cache state. Drop --step-execution "
+                "or omit quality=high."
+            )
+        prompt, multi_modal_data = self._extract_prompt(state.prompt)
+        context = self._prepare_request_inputs(
+            prompt=prompt,
+            multi_modal_data=multi_modal_data,
+            sampling=state.sampling,
+        )
+        inputs = self._build_denoise_inputs(**self._denoise_kwargs(context))
+
+        sigmas_video = inputs["sigmas_video"]
+        sigmas_audio = inputs["sigmas_audio"]
+        if len(sigmas_video) < 2:
+            raise OmniClientError(
+                f"MiniMax H3 step execution needs at least one denoise step, got num_inference_steps="
+                f"{len(sigmas_video) - 1}"
+            )
+
+        branch = inputs["branch"]
+        video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+            positive=branch,
+            initial_video_rows=inputs["video_rows"],
+            initial_audio_rows=inputs["audio_rows"],
+            keyframe_cond_rows=inputs["cond_anchor"],
+            audio_ref_rows=inputs["audio_anchor"],
+            device=self.device,
+        )
+
+        # The denoise loop consumes sigma pairs, so the schedule carries one more
+        # point than there are steps. ``timesteps`` holds the video branch because
+        # the shared contract gives a request exactly one timestep sequence; the
+        # audio schedule rides along in ``extra``.
+        state.timesteps = torch.tensor(
+            [1.0 - sigma for sigma in sigmas_video[:-1]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        state.step_index = 0
+        # Video rows are the batched tensor the runner slices per request; audio
+        # rows have a different width, so they stay request-private.
+        state.latents = video_rows
+        state.do_true_cfg = False  # H3 checkpoints are CFG-distilled.
+        state.extra.update(
+            {
+                _STEP_BRANCH: branch,
+                _STEP_TRANSFORMER: self._transformer_for_task(context["task"]),
+                _STEP_AUDIO_ROWS: audio_rows,
+                _STEP_COND_ANCHOR: cond_anchor,
+                _STEP_AUDIO_ANCHOR: audio_anchor,
+                _STEP_SIGMAS_VIDEO: sigmas_video,
+                _STEP_SIGMAS_AUDIO: sigmas_audio,
+                _STEP_SHAPE: {
+                    "height": context["height"],
+                    "width": context["width"],
+                    "latent_t": context["latent_t"],
+                    "latent_h": context["latent_h"],
+                    "latent_w": context["latent_w"],
+                    "audio_t": context["audio_t"],
+                },
+            }
+        )
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one denoise forward covering every request in the batch.
+
+        Requests are concatenated into a single packed sequence that keeps one
+        attention document each, so the whole batch costs one DiT forward.
+        Backends that ignore ``cu_seqlens`` cannot express that isolation, so
+        they fall back to one forward per request.
+        """
+        del kwargs
+        batch_states = list(states if states is not None else input_batch.states)
+
+        branches = [state.extra[_STEP_BRANCH] for state in batch_states]
+        video_rows = [state.latents for state in batch_states]
+        audio_rows = [state.extra[_STEP_AUDIO_ROWS] for state in batch_states]
+        schedules = [_minimax_h3_step_schedule(state) for state in batch_states]
+        transformers = [state.extra[_STEP_TRANSFORMER] for state in batch_states]
+        mixed_transformers = len({id(transformer) for transformer in transformers}) > 1
+
+        # Both execution modes must publish denoise progress for step-gated
+        # attention features. Requests can differ in both step index and sigma
+        # schedule, so a batch that is not at one single point has nothing to
+        # publish and those gates stay dense -- which is their safe default.
+        progress = {(state.step_index, schedule["sigma_video"]) for state, schedule in zip(batch_states, schedules)}
+        minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None)))
+
+        if len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])):
+            if mixed_transformers:
+                logger.warning_once(
+                    "MiniMax H3 step batch contains requests for different task-specific DiTs; "
+                    "running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            elif any(
+                getattr(getattr(module, "attention", None), "use_ring", False)
+                for module in transformers[0].modules()
+                if isinstance(module, MiniMaxH3Attention)
+            ):
+                logger.warning_once(
+                    "MiniMax H3 step batching is disabled when ring attention is active: "
+                    "the ring kernels ignore packed cu_seqlens and would attend across request "
+                    "boundaries. Running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            else:
+                logger.warning_once(
+                    "MiniMax H3 step batching needs every attention on a backend that isolates "
+                    "packed multi-document cu_seqlens (see AttentionBackend."
+                    "supports_multi_doc_packed_varlen); running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            video_parts: list[torch.Tensor] = []
+            audio_parts: list[torch.Tensor] = []
+            for index, branch in enumerate(branches):
+                forward_kwargs = branch.forward_kwargs(
+                    video_rows=video_rows[index],
+                    audio_rows=audio_rows[index],
+                    t_video=schedules[index]["t_video"],
+                    t_audio=schedules[index]["t_audio"],
+                    imgvid_cond_timestep=schedules[index]["imgvid_cond_timestep"],
+                    audio_ref_cond_timestep=schedules[index]["audio_ref_cond_timestep"],
+                )
+                request_video, request_audio = transformers[index](**forward_kwargs)
+                video_parts.append(request_video)
+                audio_parts.append(request_audio)
+            video_velocity = torch.cat(video_parts)
+            audio_velocity = torch.cat(audio_parts)
+        else:
+            forward_kwargs = minimax_h3_batched_forward_kwargs(
+                branches=branches,
+                video_rows=video_rows,
+                audio_rows=audio_rows,
+                t_video=[schedule["t_video"] for schedule in schedules],
+                t_audio=[schedule["t_audio"] for schedule in schedules],
+                imgvid_cond_timesteps=[schedule["imgvid_cond_timestep"] for schedule in schedules],
+                audio_ref_cond_timesteps=[schedule["audio_ref_cond_timestep"] for schedule in schedules],
+            )
+            logger.debug(
+                "MiniMax H3 denoise step: %d request(s) packed into %d rows",
+                len(batch_states),
+                int(forward_kwargs["x"].shape[1]),
+            )
+            video_velocity, audio_velocity = transformers[0](**forward_kwargs)
+
+        # The shared contract carries one velocity tensor per step, and audio rows
+        # are a different width than video rows, so hand the audio branch to
+        # step_scheduler() through request-private state.
+        audio_parts_by_request = torch.split(audio_velocity, [int(branch.audio_pos.shape[0]) for branch in branches])
+        for state, request_audio in zip(batch_states, audio_parts_by_request, strict=True):
+            state.extra[_STEP_AUDIO_NOISE_PRED] = request_audio
+        return video_velocity
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """Apply one Euler-eta0 update to this request's video and audio rows."""
+        del kwargs
+        # denoise_step() stages the audio half of this step's velocity; popping
+        # it keeps a second step_scheduler() call from reusing a stale one.
+        audio_noise_pred = state.extra.pop(_STEP_AUDIO_NOISE_PRED)
+
+        branch = state.extra[_STEP_BRANCH]
+        schedule = _minimax_h3_step_schedule(state)
+        update = branch.update_mask_dev
+        audio_update = branch.audio_update_mask_dev
+        video_rows = state.latents
+        audio_rows = state.extra[_STEP_AUDIO_ROWS]
+        cond_anchor = state.extra[_STEP_COND_ANCHOR]
+        audio_anchor = state.extra[_STEP_AUDIO_ANCHOR]
+        device = video_rows.device
+
+        x0_video = minimax_h3_rf_v_to_x0(
+            video_rows[update],
+            noise_pred.float()[update],
+            torch.tensor(schedule["t_video"], dtype=torch.float32, device=device),
+        )
+        new_video = minimax_h3_euler_eta0_step(
+            video_rows[update],
+            x0_video,
+            sigma_curr=schedule["sigma_video"],
+            sigma_next=schedule["sigma_video_next"],
+        )
+        video_rows = video_rows.clone()
+        video_rows[update] = new_video
+        if cond_anchor is not None:
+            video_rows[~update] = cond_anchor  # per-step imgvid cond reset
+
+        x0_audio = minimax_h3_rf_v_to_x0(
+            audio_rows[audio_update],
+            audio_noise_pred.float()[audio_update],
+            torch.tensor(schedule["t_audio"], dtype=torch.float32, device=device),
+        )
+        new_audio = minimax_h3_euler_eta0_step(
+            audio_rows[audio_update],
+            x0_audio,
+            sigma_curr=schedule["sigma_audio"],
+            sigma_next=schedule["sigma_audio_next"],
+        )
+        audio_rows = audio_rows.clone()
+        audio_rows[audio_update] = new_audio
+        if audio_anchor is not None:
+            audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
+
+        state.latents = video_rows
+        state.extra[_STEP_AUDIO_ROWS] = audio_rows
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Unpack the denoised rows and run the joint video/audio VAE decode."""
+        del kwargs
+        shape = state.extra[_STEP_SHAPE]
+        video_latent, audio_latent = self._unpack_denoised_rows(
+            state.extra[_STEP_BRANCH],
+            state.latents,
+            state.extra[_STEP_AUDIO_ROWS],
+            latent_t=shape["latent_t"],
+            latent_h=shape["latent_h"],
+            latent_w=shape["latent_w"],
+            audio_t=shape["audio_t"],
+        )
+        video, audio = self.decode(
+            video_latent,
+            audio_latent,
+            height=shape["height"],
+            width=shape["width"],
+        )
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

@@ -73,6 +73,8 @@ dev = [
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
     "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
+    # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
+    # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
 ]
 
@@ -133,13 +135,6 @@ docs = [
     "regex",
     "ruff",
     "pydantic",
-]
-
-soulx-svs = [
-    "funasr>=1.0.0",
-    "g2pM>=0.1.2.5",
-    "g2p-en>=2.1.0",
-    "ToJyutping>=3.2.0",
 ]
 
 [project.urls]
@@ -273,6 +268,7 @@ markers = [
     # specified computation resources marks (auto-added)
     # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
     "H100: [hardware-resource] Tests that require H100 GPU",
+    "H800: [hardware-resource] Tests that require H800 GPU",
     "H200: [hardware-resource] Tests that require H200 GPU",
     "L4: [hardware-resource] Tests that require L4 GPU",
     "B200: [hardware-resource] Tests that require B200 GPU",

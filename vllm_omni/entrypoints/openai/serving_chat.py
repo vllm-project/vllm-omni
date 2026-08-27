@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import json
@@ -19,8 +22,10 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    get_history_tool_calls_cnt,
     make_tool_call_id,
+)
+from vllm.parser.utils import (
+    count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
@@ -86,14 +91,7 @@ from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.multimodal.media.connector import MediaConnector
 from vllm.outputs import RequestOutput
-
-try:
-    from vllm.parser.mistral import MistralToolCall
-except ImportError:
-    # Accelerator images can lag the core vLLM release by one version.
-    from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
-
-
+from vllm.parser.mistral import MistralToolCall
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
@@ -3649,7 +3647,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if reference_audios:
                 gen_params.extra_args["audio_path"] = reference_audios[0]
 
-            # Generate image or audio (e.g. AudioX) via AsyncOmni
+            # Generate image or audio via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
             default_sampling_params_list = get_default_sampling_params_list(diffusion_engine)

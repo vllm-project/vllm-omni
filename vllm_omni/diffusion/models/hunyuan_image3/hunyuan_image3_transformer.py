@@ -1134,7 +1134,7 @@ class ImageKVCacheManager(nn.Module):
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not keep_kv_compressed:
+        if not keep_kv_compressed and not self.attn.is_paged_kv_active():
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:

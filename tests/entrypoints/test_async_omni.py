@@ -186,6 +186,58 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
 
 
 @pytest.mark.cpu
+def test_abort_pops_request_states_only_after_ack():
+    async def run():
+        release = asyncio.Event()
+        seen_during_wait: list[int] = []
+
+        async def slow_abort_async(request_ids):
+            del request_ids
+            seen_during_wait.append(len(omni.request_states))
+            await release.wait()
+
+        omni = get_async_omni_instance(fake_abort_request=slow_abort_async)
+        omni.request_states["req-1-aaaa"] = SimpleNamespace(
+            request_id="req-1-aaaa",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        task = asyncio.create_task(omni.abort("req-1"))
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert "req-1-aaaa" in omni.request_states
+        assert seen_during_wait == [1]
+
+        release.set()
+        await task
+        assert "req-1-aaaa" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_propagates_engine_errors_without_popping_state():
+    async def run():
+        async def failing_abort_async(request_ids):
+            del request_ids
+            raise RuntimeError("orchestrator abort failed")
+
+        omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
+        omni.request_states["req-1-bbbb"] = SimpleNamespace(
+            request_id="req-1-bbbb",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        with pytest.raises(RuntimeError, match="orchestrator abort failed"):
+            await omni.abort("req-1")
+        assert "req-1-bbbb" in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
         submitted_request_ids = []
