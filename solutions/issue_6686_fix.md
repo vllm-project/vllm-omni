@@ -1,0 +1,1 @@
+Solution proposal for [Feature]: Boogu-Image modulation fusion,  evaluate & port the #6281 H3 fusion family
