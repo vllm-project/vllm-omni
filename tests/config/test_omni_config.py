@@ -96,6 +96,7 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
     omni_config = _from_pipeline_key("personaplex")
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
+    assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -105,6 +106,7 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
     omni_config = _from_pipeline_key("personaplex", deploy_config_path=str(deploy_path))
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
+    assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["turn", "turn"]
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
@@ -132,6 +134,7 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
 
         engine_args = legacy_stage.yaml_engine_args
         assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
+        assert omni_stage.model_config.session_mode == engine_args.get("session_mode", "turn")
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
@@ -579,6 +582,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "active_stream_window",
+        "session_mode",
         "duplex_max_sessions",
         "enable_sleep_mode",
         "default_sampling_params",

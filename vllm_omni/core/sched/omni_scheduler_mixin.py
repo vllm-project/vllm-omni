@@ -588,10 +588,14 @@ class OmniSchedulerMixin:
             self.skipped_waiting.remove_requests(removable)
 
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
-        """Resume connector polling without waiting for an external update."""
+        """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
         adapter.segment_finished_requests.discard(request.request_id)
-        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+        if (
+            not adapter.receives_chunks
+            or getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex"
+            or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
             return
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING

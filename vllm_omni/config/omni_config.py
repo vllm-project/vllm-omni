@@ -384,6 +384,7 @@ class OmniStageModelConfig:
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
+    session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -1632,6 +1633,7 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return cast(Any, OmniStageModelConfig)(
         default_sampling_params=default_sampling_params,
+        session_mode=deploy.session_mode,
         duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )

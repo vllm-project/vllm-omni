@@ -851,6 +851,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
         # model-owned streaming state. Propagate it to every stage instead of

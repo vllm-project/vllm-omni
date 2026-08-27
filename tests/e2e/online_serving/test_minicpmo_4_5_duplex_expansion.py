@@ -15,6 +15,7 @@ import pytest
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
+    deploy_max_sessions,
     multi_session_args,
     realtime_url,
     resolve_ref_audio,
@@ -46,7 +47,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None
     args.disconnect_session_index = None
     args.takeover_session_index = None
     args.expire_session_index = 0
-    args.verify_admission_limit = 2
+    args.verify_admission_limit = deploy_max_sessions()
     result = asyncio.run(run_lifecycle_probes(args))
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
