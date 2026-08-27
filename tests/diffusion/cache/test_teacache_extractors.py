@@ -764,13 +764,20 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
             def __init__(self):
                 super().__init__()
                 self.inputs: list[torch.Tensor] = []
+                self.outputs: list[torch.Tensor] = []
 
             def forward(self, tensor):
                 self.inputs.append(tensor.clone())
                 if tensor.shape[-1] == hidden_size:
                     raise AssertionError("TeaCache must not gather hidden states in strict SP")
                 assert tensor.shape == (local_len, video_width + audio_width)
-                return tensor
+                # Model the all-gather of compact logits from every SP rank.
+                # postprocess() indexes the resulting global layout with
+                # infer_out_pos/audio_pos, including rows owned by another rank.
+                gathered = tensor.repeat(seq_len // local_len, 1)
+                assert gathered.shape == (seq_len, video_width + audio_width)
+                self.outputs.append(gathered)
+                return gathered
 
         class _StrictSPGroup:
             def __init__(self):
