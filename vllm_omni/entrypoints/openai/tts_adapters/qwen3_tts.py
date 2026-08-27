@@ -33,9 +33,17 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     name = "qwen3_tts"
 
     def _get_model_variant(self) -> str | None:
-        """Return the task supported by the loaded Qwen3-TTS checkpoint."""
+        """Return the task supported by the loaded Qwen3-TTS checkpoint.
+
+        Checkpoint metadata is authoritative. Metadata-less re-exports may be
+        served from dated snapshot directories, so only when metadata is
+        absent or unrecognized do we inspect path components from the leaf
+        upwards. A marker must end a component to avoid inferring ``Base`` from
+        names such as ``base_models`` or ``database``.
+        """
         model_config = self.ctx.server.engine_client.model_config
-        configured_variant = getattr(model_config.hf_config, "tts_model_type", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        configured_variant = getattr(hf_config, "tts_model_type", None)
         variants = {
             "customvoice": "CustomVoice",
             "voicedesign": "VoiceDesign",
@@ -44,16 +52,17 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
         if isinstance(configured_variant, str):
             normalized = re.sub(r"[^a-z]", "", configured_variant.lower())
-            return variants.get(normalized)
+            if (variant := variants.get(normalized)) is not None:
+                return variant
 
         model_path = getattr(model_config, "model", None)
         if not isinstance(model_path, str):
             return None
-        final_component = Path(model_path.rstrip("/\\")).name.lower()
-        match = re.search(r"(?:^|[-_.])(custom[-_.]?voice|voice[-_.]?design|base)$", final_component)
-        if match is None:
-            return None
-        return variants[re.sub(r"[-_.]", "", match.group(1))]
+        for component in reversed(re.split(r"[\\/]+", model_path.rstrip("/\\"))):
+            match = re.search(r"(?:^|[-_.])(custom[-_.]?voice|voice[-_.]?design|base)$", component.lower())
+            if match is not None:
+                return variants[re.sub(r"[-_.]", "", match.group(1))]
+        return None
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
@@ -70,8 +79,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
-            stored_voice = request.voice in server.uploaded_speakers or request.voice in server.precomputed_speakers
-            if stored_voice and request.task_type is None:
+            stored_voice = (
+                request.voice in server.uploaded_speakers or request.voice in self.capabilities.precomputed_speakers
+            )
+            # _build_tts_params dispatches stored voices as Base. Normalize to
+            # that effective task before model-variant validation so the
+            # admission gate and builder cannot disagree.
+            if stored_voice:
                 request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 

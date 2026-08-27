@@ -1160,7 +1160,45 @@ class TestTTSMethods:
         assert result is not None
         assert "CustomVoice checkpoint does not support task_type='Base'" in result
 
-    def test_task_type_variant_path_does_not_use_parent_directories(self, speech_server):
+    def test_task_type_variant_falls_back_to_dated_snapshot_directory(self, speech_server):
+        """Metadata-less dated exports use the nearest matching path component."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/models/Qwen3-TTS-12Hz-1.7B-CustomVoice/20260623_01",
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_task_type_variant_unknown_config_falls_back_to_model_path(self, speech_server):
+        """An unrecognized metadata value should not discard a useful path signal."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/models/Qwen3-TTS-12Hz-1.7B-Base",
+            hf_config=SimpleNamespace(
+                tts_model_type="future_variant",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "Base checkpoint does not support task_type='CustomVoice'" in result
+
+    def test_task_type_variant_path_does_not_match_nonvariant_parent_components(self, speech_server):
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
             model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
@@ -1176,8 +1214,8 @@ class TestTTSMethods:
             x_vector_only_mode=True,
         )
 
-        # No checkpoint variant is inferred from the generic final component,
-        # so validation must not guess and reject a valid request.
+        # Path fallback walks ancestors for dated snapshots, but base_models
+        # is not a delimited variant marker and must not imply Base.
         assert speech_server._validate_tts_request(req) is None
 
     def test_task_type_variant_config_wins_over_conflicting_path(self, speech_server):
@@ -1220,7 +1258,7 @@ class TestTTSMethods:
 
         assert speech_server._validate_tts_request(req) is None
 
-    def test_uploaded_voice_infers_base_then_checks_model_variant(self, speech_server):
+    def test_stored_voice_uses_base_then_checks_model_variant(self, speech_server):
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
             model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
@@ -1236,12 +1274,28 @@ class TestTTSMethods:
             }
         }
 
-        req = OpenAICreateSpeechRequest(input="Hello", voice="alice")
+        # Explicit CustomVoice must not pass validation and then be silently
+        # rewritten to Base by _build_tts_params.
+        req = OpenAICreateSpeechRequest(input="Hello", voice="alice", task_type="CustomVoice")
         result = speech_server._validate_tts_request(req)
 
         assert req.task_type == "Base"
         assert result is not None
         assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_precomputed_voice_infers_base_without_server_attribute(self, speech_server):
+        """Cover the non-uploaded side of stored_voice's ``or`` expression."""
+        speech_server._tts_model_type = "qwen3_tts"
+        adapter = speech_server._get_tts_adapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            precomputed_speakers={"precomputed-alice": {"mode": "xvec"}},
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="precomputed-alice")
+
+        assert speech_server._validate_tts_request(req) is None
+        assert req.task_type == "Base"
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
