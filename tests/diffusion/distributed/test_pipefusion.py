@@ -31,7 +31,7 @@ from vllm_omni.diffusion.distributed.pipefusion.pipefusion_transformer import (
 )
 from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 
-pytestmark = [pytest.mark.parallel, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu]
 
 
 class FakePPGroup:
@@ -362,6 +362,22 @@ class TestPipeFusionTransformerHelpers:
         torch.testing.assert_close(updated_key, expected_key)
         torch.testing.assert_close(updated_value, expected_value)
 
+    def test_kv_cache_request_scoped_reset_before_first_store(self, monkeypatch):
+        # Matches production: wrapped_forward sets request_id, then
+        # wrapped_diffuse calls pipefusion_reset_cache(request_id, sequence_id)
+        # before any warmup KV has been written.
+        runtime = PipeFusionRuntime()
+        runtime.patch_mode = False
+        runtime.set_request_context("req-a", 0)
+        runtime.set_cache_key("inputs")
+        monkeypatch.setattr(pf_transformer, "get_pipefusion_runtime", lambda: runtime)
+
+        attention = DummyAttention()
+        attention.pipefusion_reset_cache(runtime.request_id, runtime.sequence_id)
+        attention._pipefusion_update_kv_cache(torch.ones(1, 1, 1, 1), torch.ones(1, 1, 1, 1))
+
+        assert set(attention._kv_caches) == {("req-a", 0, "inputs")}
+
     def test_kv_cache_requires_warmup_cache_before_patch_mode(self, monkeypatch):
         runtime = PipeFusionRuntime()
         runtime.patch_mode = True
@@ -494,6 +510,12 @@ class DummyConv(PipeFusionConvMixin):
 
 
 class TestPipeFusionConvMixin:
+    def test_reset_cache_accepts_request_scoped_args(self):
+        conv = DummyConv()
+        conv.activation_cache = torch.ones(1)
+        conv.pipefusion_reset_cache("req-a", 0)
+        assert conv.activation_cache is None
+
     def test_conv3d_enabled_only_for_overlapping_patch_mode(self, monkeypatch):
         runtime = PipeFusionRuntime()
         runtime.patch_mode = True
