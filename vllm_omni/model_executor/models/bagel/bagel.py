@@ -15,7 +15,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bagel import BagelForConditionalGeneration
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMRoPE
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     PositionEmbedding,
     TimestepEmbedder,
 )
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
+from vllm_omni.diffusion.models.bagel.pipeline_bagel import bagel_image_size, bagel_vit_transform, default_ae_params
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -63,12 +63,12 @@ class OmniBagelProcessor(BagelProcessor):
     def __call__(self, text=None, images=None, **kwargs):
         is_img2img = kwargs.pop("is_img2img", False)
 
+        from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
+
         if is_img2img and images is not None:
             # transformers>=5.0 enforces strict kwarg typing on image
             # processors, so split generic kwargs into text/image buckets
             # via the standard ProcessorMixin helper before dispatch.
-            from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
-
             output_kwargs = self._merge_kwargs(
                 BagelProcessorKwargs,
                 tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -93,12 +93,19 @@ class OmniBagelProcessor(BagelProcessor):
             else:
                 return BatchFeature({})
 
+        if images is not None:
+            output_kwargs = self._merge_kwargs(
+                BagelProcessorKwargs, tokenizer_init_kwargs=self.tokenizer.init_kwargs, **kwargs
+            )
+            pixel_values = [bagel_vit_transform(img) for img in (images if isinstance(images, list) else [images])]
+            text_inputs = dict(self.tokenizer(text, **output_kwargs["text_kwargs"])) if text is not None else {}
+            return BatchFeature({"pixel_values": pixel_values, **text_inputs})
         return super().__call__(text, images, **kwargs)
 
 
 class OmniBagelProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": 1, "img2img": 1}
+        return {"image": None, "img2img": 1}
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(OmniBagelProcessor, **kwargs)
@@ -313,12 +320,20 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
 
         replacements: list[PromptReplacement] = []
 
+        vit_config = hf_config.vit_config
+        image_size, patch_size = vit_config.image_size, vit_config.patch_size
+
+        def num_vit_tokens(width: int, height: int) -> int:
+            """<|vision_start|> + patches of the aspect-preserving resize + <|vision_end|>."""
+            w, h = bagel_image_size(width, height, image_size, 224, patch_size)
+            return (h // patch_size) * (w // patch_size) + 2
+
         image_token_id = tokenizer.get_vocab().get("<|image_pad|>")
         if image_token_id is not None:
-            num_patches = hf_config.vit_max_num_patch_per_side**2
 
             def get_image_replacement(item_idx: int):
-                return [image_token_id] * num_patches
+                size = mm_items.get_items("image", ImageProcessorItems).get_image_size(item_idx)
+                return [image_token_id] * num_vit_tokens(size.width, size.height)
 
             replacements.append(
                 PromptReplacement(
@@ -330,10 +345,6 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
 
         img2img_token_id = tokenizer.get_vocab().get("<|fim_middle|>")
         if img2img_token_id is not None:
-            vit_config = hf_config.vit_config
-            image_size = vit_config.image_size
-            num_vit_patches = (image_size // vit_config.patch_size) ** 2
-
             latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
             downsample = hf_config.vae_config.get("downsample", 8)
             latent_downsample = downsample * latent_patch_size
@@ -359,7 +370,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
 
                 num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
                 num_vae_total = num_vae_patches + 2
-                num_vit_total = num_vit_patches + 2
+                num_vit_total = num_vit_tokens(w, h)
                 # +1 separator between VAE and ViT blocks so that
                 # extract_embeds_range() produces two distinct mm_prefix_range
                 # entries, preventing VAE tokens from attending to ViT.
@@ -411,7 +422,7 @@ class VAEEncoder(nn.Module):
     info=OmniBagelProcessingInfo,
     dummy_inputs=OmniBagelDummyInputsBuilder,
 )
-class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
+class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsMRoPE):
     """
     Omni version of BagelForConditionalGeneration.
 
@@ -419,13 +430,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
     both VAE latents and ViT features within the AR stage, producing a
     combined KV cache that is then transferred to the DiT stage.
 
-    Position IDs are adjusted so that:
-      - VAE tokens all share position 0
-      - ViT tokens all share position 1
-      - Text tokens use sequential positions starting from 2
-    This matches the position scheme used by the single-stage DiT pipeline,
-    ensuring the transferred KV cache + ropes are directly compatible with
-    the DiT's denoising loop.
+    RoPE positions follow BAGEL (modeling/bagel/bagel.py): every image block --
+    <|vision_start|> + ViT patches + <|vision_end|>, or the VAE / ViT block of
+    img2img -- occupies one position and the text continues from the next one,
+    so the KV cache + ropes handed to the DiT stage match the single-stage
+    pipeline. They are computed per request in get_mrope_input_positions (the
+    LLM itself uses plain 1-D RoPE; the three rows are identical).
     """
 
     # LoRA packed→sublayer mapping for both standard Qwen2 projections
@@ -477,7 +487,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._img2img_token_id = int(_tok.convert_tokens_to_ids("<|fim_middle|>"))
         self._vae_token_mask: torch.Tensor | None = None
         # Whether the current request packs any VAE / non-VAE tokens, refreshed
-        # in _adjust_positions_for_img2img. Cached as plain bools so the per-layer
+        # in _prepare_img2img. Cached as plain bools so the per-layer
         # MoT routing can branch without calling .any() (which forces a device sync).
         self._has_vae_tokens: bool = False
         self._has_non_vae_tokens: bool = True
@@ -592,12 +602,25 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         num_scheduled_tokens: Sequence[int],
         input_ids_buffer: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Restore input_ids so _adjust_positions_for_img2img can locate
+        """Restore input_ids so _prepare_img2img can locate
         the <|fim_middle|> placeholder for thinking-mode pre_text_len
         detection."""
         if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
             input_ids = input_ids_buffer
         return input_ids, positions
+
+    def get_mrope_input_positions(self, input_tokens: list[int], mm_features: list) -> tuple[torch.Tensor, int]:
+        """One RoPE position per image block (BAGEL prepare_vit_images / prepare_vae_images: markers and
+        patches share it): a token advances the position unless it continues a multimodal placeholder;
+        a placeholder's second embedded range (img2img's ViT block after its VAE block) starts a new one,
+        and the plain <|vision_end|> that closes the VAE block keeps that block's position."""
+        step = torch.ones(len(input_tokens), dtype=torch.long)
+        for f in mm_features:
+            step[f.mm_position.offset + 1 : f.mm_position.offset + f.mm_position.length] = 0
+            for start, _ in f.mm_position.extract_embeds_range()[1:]:
+                step[start] = 1
+        positions = step.cumsum(0) - 1
+        return positions.unsqueeze(0).repeat(3, 1), int(positions[-1]) + 1 - len(input_tokens)
 
     def flush_pending_metadata(self, req_ids: Sequence[str]) -> None:
         """Map pending metadata (batch order) to req_ids after forward().
@@ -618,6 +641,32 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 if ropes:
                     meta["ropes"] = [int(r.item()) if isinstance(r, torch.Tensor) else r for r in ropes]
                 self._ropes_metadata[rid] = meta
+
+    def _parse_and_validate_image_input(self, **kwargs: object) -> dict | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        return None if pixel_values is None else {"type": "pixel_values", "pixel_values": pixel_values}
+
+    @staticmethod
+    def _image_list(pixel_values) -> list[torch.Tensor]:
+        """(N, 3, H, W) / (B, N, 3, H, W) tensors, or lists of them for mixed sizes -> one (3, H, W) per image."""
+        if not isinstance(pixel_values, (list, tuple)):
+            pixel_values = [pixel_values]
+        return [img for t in pixel_values for img in t.reshape(-1, *t.shape[-3:])]
+
+    def _vit_embeddings(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
+        """SigLIP NaViT as in modeling/bagel/siglip_navit.py: each image is its own sequence with
+        2-D position ids into the 70x70 table, then post_layernorm, connector and BAGEL's sin-cos
+        position embedding on the same grid."""
+        vit = self.vit_model.vision_model
+        patch, side = self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side
+        out = []
+        for img in images:
+            ids = self.get_flattened_position_ids(img.shape[-2], img.shape[-1], patch, side).to(img.device)
+            x = vit.embeddings.patch_embedding(img[None].to(vit.embeddings.patch_embedding.weight.dtype))
+            x = x.flatten(2).transpose(1, 2) + vit.embeddings.position_embedding(ids)
+            x = vit.maybe_layer_norm_and_apply_head(vit.encoder(inputs_embeds=x, return_all_hidden_states=False))
+            out.append(self.connector(x[0]) + self.vit_pos_embed(ids).to(x.device))
+        return out
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
@@ -658,45 +707,40 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         pos_ids = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
         return pos_ids
 
-    def _process_img2text_input(self, multimodal_input):
-        return self._process_image_input(multimodal_input)
+    def _process_img2text_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
+        images = self._image_list(multimodal_input["pixel_values"])
+        marker_ids = torch.tensor([self._start_of_image_id, self._end_of_image_id], device=images[0].device)
+        start, end = self.language_model.model.embed_tokens(marker_ids).split(1)
+        return tuple(torch.cat([start.to(e.dtype), e, end.to(e.dtype)]) for e in self._vit_embeddings(images))
 
     def _process_img2img_input(self, multimodal_input):
-        pixel_values = multimodal_input["pixel_values"]
-        if pixel_values.ndim == 5:
-            b, n, c, h, w = pixel_values.shape
-            pixel_values = pixel_values.reshape(b * n, c, h, w)
-
-        num_images = pixel_values.shape[0]
-        image_size = self.config.vit_config.image_size
+        pixel_values = self._image_list(multimodal_input["pixel_values"])
+        num_images = len(pixel_values)
+        image_size, patch_size = self.config.vit_config.image_size, self.config.vit_config.patch_size
         p = self.latent_patch_size
         timestep = 0
 
         if self._ropes_pending:
             self._ropes_pending.clear()
 
-        vit_pixel_values = torch.nn.functional.interpolate(
-            pixel_values,
-            size=(image_size, image_size),
-            mode="bicubic",
-            align_corners=False,
+        vit_embeddings_tuple = self._vit_embeddings(
+            [
+                torch.nn.functional.interpolate(
+                    pv[None],
+                    size=bagel_image_size(pv.shape[-1], pv.shape[-2], image_size, 224, patch_size)[::-1],
+                    mode="bicubic",
+                    align_corners=False,
+                )[0]
+                for pv in pixel_values
+            ]
         )
-
-        vit_embeddings_tuple = self._process_image_input({"pixel_values": vit_pixel_values})
-
-        marker_ids = torch.tensor(
-            [self._start_of_image_id, self._end_of_image_id],
-            device=pixel_values.device,
-            dtype=torch.long,
-        )
-        marker_embeds = self.language_model.model.embed_tokens(marker_ids)
-        start_embed = marker_embeds[0:1]
-        end_embed = marker_embeds[1:2]
+        marker_ids = torch.tensor([self._start_of_image_id, self._end_of_image_id], device=pixel_values[0].device)
+        start_embed, end_embed = self.language_model.model.embed_tokens(marker_ids).split(1)
 
         results = []
 
         for i in range(num_images):
-            single_pv = pixel_values[i : i + 1]
+            single_pv = pixel_values[i][None]
             single_pv = self._resize_to_stride(single_pv)
             H, W = single_pv.shape[2:]
 
@@ -744,20 +788,30 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         **kwargs: object,
     ) -> torch.Tensor:
         use_mot = False
+        if positions.ndim == 2:
+            positions = positions[0]
         seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
+        has_img2img = (self._pending_img2img_info or self._last_img2img_info is not None) and (
+            input_ids is not None and bool((input_ids == self._img2img_token_id).any())
+        )
+        if self._pending_img2img_info and not has_img2img:
+            # img2img state left over from a concurrently processed request must not
+            # leak onto a batch that carries no img2img placeholder tokens.
+            self._pending_img2img_info.clear()
+
         if self._pending_img2img_info:
-            positions = self._adjust_positions_for_img2img(positions, input_ids)
+            positions = self._prepare_img2img(positions, input_ids)
             use_mot = True
 
-        elif self._last_img2img_info is not None:
+        elif self._last_img2img_info is not None and has_img2img:
             info = self._last_img2img_info
             num_vae, num_vit, _, _ = info
-            num_img2img = num_vae + 1 + num_vit
+            num_img2img = num_vae + 1 + num_vit  # +1 separator
 
             if seq_len >= num_img2img:
                 self._pending_img2img_info = [info]
-                positions = self._adjust_positions_for_img2img(positions, input_ids)
+                positions = self._prepare_img2img(positions, input_ids)
                 use_mot = True
             else:
                 rope = positions[seq_len - 1] + 1
@@ -767,24 +821,15 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
-    def _adjust_positions_for_img2img(
+    def _prepare_img2img(
         self,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Rewrite position IDs for img2img.
-
-        Supports an optional ``pre_text_len`` prefix (thinking-mode) detected
-        via the ``<|fim_middle|>`` token in *input_ids*:
-
-            pre_text -> 0 .. M-1
-            VAE      -> M       (all share)
-            separator-> M
-            ViT      -> M+1     (all share)
-            post_text-> M+2, M+3, ...
-
-        When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
-        """
+        """Locate the VAE patches of each img2img request for MoT routing and
+        record the rope the DiT stage continues from (positions themselves come
+        from get_mrope_input_positions); ``pre_text_len`` (thinking mode) is
+        detected via the ``<|fim_middle|>`` token in *input_ids*."""
         info_list = self._pending_img2img_info
         self._pending_img2img_info = []
 
@@ -803,15 +848,14 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 boundaries.append(i)
         boundaries.append(len(pos_list))
 
-        num_requests = len(boundaries) - 1
-        new_positions = positions.clone()
         vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
 
         img2img_idx = 0
-        for req_idx in range(num_requests):
+        for req_idx in range(len(boundaries) - 1):
             start = boundaries[req_idx]
             end = boundaries[req_idx + 1]
             req_len = end - start
+            rope = pos_list[end - 1] + 1
 
             if img2img_idx < len(info_list):
                 cur_info = info_list[img2img_idx]
@@ -832,35 +876,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         if indices.numel() > 0:
                             pre_text_len = int(indices[0].item())
 
-                    M = pre_text_len
-                    img_start = start + M
-                    post_text_start = img_start + num_img2img
-
-                    if M > 0:
-                        new_positions[start:img_start] = torch.arange(
-                            0, M, device=positions.device, dtype=positions.dtype
-                        )
-
-                    new_positions[img_start : img_start + num_vae] = M
-                    new_positions[img_start + num_vae] = M  # separator
-                    vit_start = img_start + num_vae + 1
-                    new_positions[vit_start : vit_start + num_vit] = M + 1
-
-                    num_post_text = end - post_text_start
-                    if num_post_text > 0:
-                        new_positions[post_text_start:end] = torch.arange(
-                            M + 2,
-                            M + 2 + num_post_text,
-                            device=positions.device,
-                            dtype=positions.dtype,
-                        )
-
+                    img_start = start + pre_text_len
                     vae_patches_start = img_start + 1
                     vae_patches_end = img_start + num_vae - 1
                     if vae_patches_end > vae_patches_start:
                         vae_mask[vae_patches_start:vae_patches_end] = True
 
-                    rope = M + 2 + num_post_text
                     self._ropes_pending.append(
                         {
                             "ropes": [rope],
@@ -871,7 +892,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     img2img_idx += 1
                     continue
 
-            rope = int(new_positions[end - 1].item()) + 1
             self._ropes_pending.append({"ropes": [rope]})
 
         # Resolve mask occupancy once here (the only .any() syncs on this path)
@@ -881,7 +901,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._vae_token_mask = vae_mask if has_vae else None
         self._has_vae_tokens = has_vae
         self._has_non_vae_tokens = bool((~vae_mask).any()) if has_vae else True
-        return new_positions
+        return positions
 
     # ------------------------------------------------------------------
     # MoT (Mixture-of-Transformers) forward path
