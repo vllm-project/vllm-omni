@@ -40,7 +40,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             apply_minicpmo_4_5_code2wav_patch,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
-            apply_qwen3_tts_code2wav_patch,
+            apply_qwen3_tts_patches,
         )
         from vllm_omni.platforms.npu.models.qwen3_tts_tokenizer_v2 import (
             apply_qwen3_tts_tokenizer_v2_patch,
@@ -48,7 +48,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         adapt_patch(is_global_patch=True)
         apply_minicpmo_4_5_code2wav_patch()
-        apply_qwen3_tts_code2wav_patch()
+        apply_qwen3_tts_patches()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
 
@@ -277,7 +277,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             )
         if not enabled:
             return nullcontext()
-
         # NPU-specific fallback
         try:
             return torch.npu.amp.autocast(dtype=dtype)

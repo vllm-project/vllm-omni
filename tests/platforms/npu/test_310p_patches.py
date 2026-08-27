@@ -42,8 +42,8 @@ def _install_fake_module(monkeypatch: pytest.MonkeyPatch, name: str, **attrs):
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
-    monkeypatch.setitem(sys.modules, name, module)
-    return module
+    monkeypatch.setitem(sys.modules, name, module) 
+   return module
 
 
 def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
@@ -706,9 +706,8 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
     _install_fake_module(monkeypatch, "vllm_ascend.utils", maybe_trans_nz=maybe_trans_nz)
     _install_fake_module(monkeypatch, "vllm_omni")
     _install_fake_module(monkeypatch, "vllm_omni.platforms", current_omni_platform=current_platform)
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor")
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor.models")
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor.models.qwen3_tts")
+    # Not A5: keep the FRACTAL_Z conv weight layout for 310P.
+    _install_fake_module(monkeypatch, "vllm_omni.platforms.npu", is_a5=lambda: False)
 
     path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts_code2wav.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_npu_patch", path)
