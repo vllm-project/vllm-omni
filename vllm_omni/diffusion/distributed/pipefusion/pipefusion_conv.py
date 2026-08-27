@@ -50,7 +50,11 @@ class PipeFusionConvMixin:
         runtime = get_pipefusion_runtime()
         return runtime.patch_mode and runtime.num_pipeline_patch > 1 and self.kernel_size != self.stride
 
-    def pipefusion_reset_cache(self) -> None:
+    def pipefusion_reset_cache(self, request_id: str | None = None, sequence_id: int | None = None) -> None:
+        # Signature matches PipeFusionSelfAttentionMixin so
+        # PipeFusionPipelineMixin._reset_pipefusion_caches can pass request
+        # scope. Conv activations are not request-keyed.
+        del request_id, sequence_id
         self.activation_cache = None
 
     @staticmethod
