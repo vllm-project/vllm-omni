@@ -771,59 +771,80 @@ class QwenImageCrossAttention(nn.Module):
 
         seq_len_txt = encoder_hidden_states.shape[1]
         chunk_size = image_chunks.shape[1]
-        text_outputs: list[torch.Tensor | None] = [None] * encoder_hidden_states.shape[0]
+        num_requests = encoder_hidden_states.shape[0]
+        text_outputs: list[torch.Tensor | None] = [None] * num_requests
         image_outputs: list[torch.Tensor | None] = [None] * image_chunks.shape[0]
 
-        buckets: dict[int, list[int]] = {}
+        # Per-request real text length. Prompt padding is dropped from the flat
+        # packed joint attention so padded text tokens never enter the kernel
+        # (padded_tokens == 0), matching the mask-unpad path used by the dense
+        # joint forward.
+        if encoder_hidden_states_mask is not None:
+            real_txt_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
+        else:
+            real_txt_lens = [seq_len_txt] * num_requests
+
+        flat_queries: list[torch.Tensor] = []
+        flat_keys: list[torch.Tensor] = []
+        flat_values: list[torch.Tensor] = []
+        cu_seqlens = [0]
+        max_seq_len = 0
         for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+            txt_len = int(real_txt_lens[req_idx])
             image_seq_len = (chunk_end - chunk_start) * chunk_size
-            buckets.setdefault(seq_len_txt + image_seq_len, []).append(req_idx)
+            req_img_query = img_query[chunk_start:chunk_end].reshape(-1, self.query_num_heads, self.head_dim)
+            req_img_key = img_key[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
+            req_img_value = img_value[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
+            flat_queries.append(torch.cat([txt_query[req_idx, :txt_len], req_img_query], dim=0))
+            flat_keys.append(torch.cat([txt_key[req_idx, :txt_len], req_img_key], dim=0))
+            flat_values.append(torch.cat([txt_value[req_idx, :txt_len], req_img_value], dim=0))
+            req_len = txt_len + image_seq_len
+            cu_seqlens.append(cu_seqlens[-1] + req_len)
+            max_seq_len = max(max_seq_len, req_len)
 
-        for req_indices in buckets.values():
-            bucket_queries: list[torch.Tensor] = []
-            bucket_keys: list[torch.Tensor] = []
-            bucket_values: list[torch.Tensor] = []
-            bucket_masks: list[torch.Tensor] = []
-            for req_idx in req_indices:
-                chunk_start, chunk_end = request_chunk_ranges[req_idx]
-                req_img_query = img_query[chunk_start:chunk_end].reshape(1, -1, self.query_num_heads, self.head_dim)
-                req_img_key = img_key[chunk_start:chunk_end].reshape(1, -1, self.kv_num_heads, self.head_dim)
-                req_img_value = img_value[chunk_start:chunk_end].reshape(1, -1, self.kv_num_heads, self.head_dim)
-                bucket_queries.append(torch.cat([txt_query[req_idx : req_idx + 1], req_img_query], dim=1))
-                bucket_keys.append(torch.cat([txt_key[req_idx : req_idx + 1], req_img_key], dim=1))
-                bucket_values.append(torch.cat([txt_value[req_idx : req_idx + 1], req_img_value], dim=1))
-                if encoder_hidden_states_mask is not None:
-                    image_mask = torch.ones(
-                        (1, req_img_query.shape[1]),
-                        dtype=torch.bool,
-                        device=encoder_hidden_states_mask.device,
-                    )
-                    bucket_masks.append(
-                        torch.cat([encoder_hidden_states_mask[req_idx : req_idx + 1], image_mask], dim=1)
-                    )
+        joint_query = torch.cat(flat_queries, dim=0)
+        joint_key = torch.cat(flat_keys, dim=0)
+        joint_value = torch.cat(flat_values, dim=0)
+        cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=joint_query.device)
+        attn_metadata = AttentionMetadata(
+            is_varlen=True,
+            q_cu_seqlens=cu_seqlens_tensor,
+            kv_cu_seqlens=cu_seqlens_tensor,
+            max_q_len=max_seq_len,
+            max_kv_len=max_seq_len,
+            padded_tokens=0,
+        )
+        joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
 
-            joint_query = torch.cat(bucket_queries, dim=0)
-            joint_key = torch.cat(bucket_keys, dim=0)
-            joint_value = torch.cat(bucket_values, dim=0)
-            attn_metadata = None
-            if bucket_masks:
-                attn_metadata = AttentionMetadata(attn_mask=torch.cat(bucket_masks, dim=0))
-            joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
+        for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+            txt_len = int(real_txt_lens[req_idx])
+            req_out = joint_hidden_states[cu_seqlens[req_idx] : cu_seqlens[req_idx + 1]]
+            text_outputs[req_idx] = req_out[:txt_len].unsqueeze(0)
+            image_output = req_out[txt_len:].reshape(
+                chunk_end - chunk_start,
+                chunk_size,
+                self.query_num_heads,
+                self.head_dim,
+            )
+            for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
+                image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
 
-            for bucket_row, req_idx in enumerate(req_indices):
-                chunk_start, chunk_end = request_chunk_ranges[req_idx]
-                text_outputs[req_idx] = joint_hidden_states[bucket_row : bucket_row + 1, :seq_len_txt]
-                image_output = joint_hidden_states[bucket_row : bucket_row + 1, seq_len_txt:]
-                image_output = image_output.reshape(
-                    chunk_end - chunk_start,
-                    chunk_size,
-                    self.query_num_heads,
-                    self.head_dim,
+        # Re-pad per-request text outputs to the padded text length so the
+        # residual add and downstream text projections stay shape-compatible.
+        # Padded positions get zero output, identical to the mask-unpad path.
+        padded_text_outputs: list[torch.Tensor] = []
+        for req_idx in range(num_requests):
+            out = text_outputs[req_idx]
+            if out is None:
+                raise ValueError(f"Missing text attention output for request {req_idx}.")
+            if out.shape[1] < seq_len_txt:
+                out = torch.cat(
+                    [out, out.new_zeros((1, seq_len_txt - out.shape[1], out.shape[2], out.shape[3]))],
+                    dim=1,
                 )
-                for local_chunk_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
-                    image_outputs[chunk_idx] = image_output[local_chunk_idx : local_chunk_idx + 1]
+            padded_text_outputs.append(out)
 
-        txt_attn_output = torch.cat([out for out in text_outputs if out is not None], dim=0)
+        txt_attn_output = torch.cat(padded_text_outputs, dim=0)
         img_attn_output = torch.cat([out for out in image_outputs if out is not None], dim=0)
 
         txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)

@@ -208,6 +208,22 @@ class AttentionMetadata:
     # not advertise supports_packed_mask_free ignore it.
     packed_padding: PackedPaddingMetadata | None = None
 
+    # Packed flat varlen attention metadata (dynamic mixed-length batching).
+    # When is_varlen is True, query/key/value are flat packed
+    # [total_tokens, num_heads, head_dim] tensors and the per-request
+    # boundaries are given by q_cu_seqlens / kv_cu_seqlens.
+    is_varlen: bool = False
+    # cumulative sequence lengths for packed query tokens, shape [batch + 1]
+    q_cu_seqlens: torch.Tensor | None = None
+    # cumulative sequence lengths for packed key/value tokens, shape [batch + 1]
+    kv_cu_seqlens: torch.Tensor | None = None
+    # maximum query sequence length in the packed batch
+    max_q_len: int | None = None
+    # maximum key/value sequence length in the packed batch
+    max_kv_len: int | None = None
+    # number of padded tokens that must not participate in attention (0 = padding-free)
+    padded_tokens: int = 0
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 
