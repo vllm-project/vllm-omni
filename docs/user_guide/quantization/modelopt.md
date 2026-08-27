@@ -233,6 +233,47 @@ those paths still require GPU end-to-end validation. Distributed layer-wise
 offload is rejected because its direct loader bypasses ModelOpt post-load
 transformations.
 
+A checkpoint can opt in by adding a versioned policy to its authoritative
+`transformer/config.json`. The same policy schema is used for FP8 and NVFP4:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "modelopt",
+    "quant_algo": "FP8",
+    "runtime": {
+      "diffusion_step_policy": {
+        "schema_version": 1,
+        "type": "first_last_n",
+        "index_space": "denoising_loop_iteration",
+        "scope": ["transformer"],
+        "default_mode": "native",
+        "first_steps": {"count": 3, "mode": "a16"},
+        "last_steps": {"count": 3, "mode": "a16"},
+        "overlap": "a16",
+        "reasoner": "a16"
+      }
+    }
+  }
+}
+```
+
+The example preserves the checkpoint's existing `quant_method` and
+`quant_algo`; only `runtime` is added.
+
+When present and valid, the checkpoint policy is the default. An explicit
+runtime object overrides it. To retain ordinary checkpoint-native execution
+for every step, disable only the schedule:
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config '{"cosmos3_mixed_precision":{"enabled":false}}'
+```
+
+This does not disable checkpoint quantization; it prevents installation of the
+mixed-step runtime.
+
 ```bash
 vllm serve /path/to/Cosmos3-Nano-modelopt \
   --omni \
@@ -240,12 +281,13 @@ vllm serve /path/to/Cosmos3-Nano-modelopt \
   '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
 ```
 
-The presence of `cosmos3_mixed_precision` enables the schedule; an empty object
-uses the defaults shown above.
+The presence of `cosmos3_mixed_precision` supplies an explicit runtime
+override; an empty object uses the defaults shown above.
 The schedule uses vLLM's selected native backend and fails during loading if
 its live weight layout cannot support A16 dequantization.
-The runtime infers FP8 or NVFP4 independently for every ModelOpt linear method,
-so mixed checkpoints require no format selection. BF16 linears are untouched.
+The runtime selects FP8 or NVFP4 from the checkpoint's ModelOpt configuration.
+BF16 linears are untouched. Mixed FP8/NVFP4 checkpoints are not supported by
+this schedule.
 
 ## Validation and Notes
 

@@ -11,8 +11,10 @@ import torch
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
+    resolve_mixed_precision_config,
 )
 from vllm_omni.diffusion.models.cosmos3.mixed_precision import runtime as runtime_impl
+from vllm_omni.diffusion.models.cosmos3.mixed_precision.checkpoint import read_checkpoint_policy
 from vllm_omni.diffusion.models.cosmos3.mixed_precision.runtime import (
     Cosmos3MixedPrecisionLinearMethod,
 )
@@ -22,6 +24,67 @@ from vllm_omni.diffusion.models.cosmos3.mixed_precision.strategy import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def _policy(
+    *,
+    first_steps: int = 3,
+    last_steps: int = 3,
+    reasoner: str = "a16",
+    scope: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "type": "first_last_n",
+        "index_space": "denoising_loop_iteration",
+        "scope": scope or ["transformer"],
+        "default_mode": "native",
+        "first_steps": {"count": first_steps, "mode": "a16"},
+        "last_steps": {"count": last_steps, "mode": "a16"},
+        "overlap": "a16",
+        "reasoner": reasoner,
+    }
+
+
+def _fake_quant_config(name: str, *, serialized: bool = True):
+    if name == "modelopt":
+        return SimpleNamespace(
+            get_name=lambda: name,
+            is_checkpoint_fp8_serialized=serialized,
+        )
+    if name == "modelopt_fp4":
+        return SimpleNamespace(
+            get_name=lambda: name,
+            quant_method="NVFP4",
+            is_checkpoint_nvfp4_serialized=serialized,
+        )
+    return SimpleNamespace(get_name=lambda: name)
+
+
+def _checkpoint_od_config(
+    quant_config,
+    *,
+    policy: object | None = None,
+    additional_config: dict[str, object] | None = None,
+):
+    quant_config_name = quant_config.get_name()
+    quant_algo = {
+        "modelopt": "FP8",
+        "modelopt_fp4": "NVFP4",
+    }.get(quant_config_name, "FP8")
+    disk_quant_config: dict[str, object] = {
+        "quant_method": quant_config_name,
+        "quant_algo": quant_algo,
+    }
+    if policy is not None:
+        disk_quant_config["runtime"] = {"diffusion_step_policy": policy}
+    return SimpleNamespace(
+        tf_model_config=SimpleNamespace(
+            params={"quantization_config": disk_quant_config},
+            quant_config=quant_config,
+        ),
+        additional_config=additional_config,
+    )
 
 
 def _swizzle_blockscale_cpu(scale: torch.Tensor) -> torch.Tensor:
@@ -89,6 +152,11 @@ def test_one_step_request_honors_boundary_precision() -> None:
         ({"cosmos3_mixed_precision": True}, "must be a mapping"),
         ({"cosmos3_mixed_precision": {"first_steps": -1}}, "non-negative"),
         ({"cosmos3_mixed_precision": {"reasoner": "fp16"}}, "must be one of"),
+        ({"cosmos3_mixed_precision": {"enabled": 0}}, "must be a boolean"),
+        (
+            {"cosmos3_mixed_precision": {"enabled": False, "first_steps": 1}},
+            "cannot be combined",
+        ),
         ({"cosmos3_mixed_precision": {"unknown": 1}}, "Unknown"),
     ],
 )
@@ -118,6 +186,155 @@ def test_noop_config_does_not_install_runtime() -> None:
         )
         is None
     )
+
+
+def test_additional_config_distinguishes_absent_and_disabled() -> None:
+    assert Cosmos3MixedPrecisionConfig.resolve_additional_config({}) == (False, None)
+    assert Cosmos3MixedPrecisionConfig.resolve_additional_config({"cosmos3_mixed_precision": {"enabled": False}}) == (
+        True,
+        None,
+    )
+    assert Cosmos3MixedPrecisionConfig.resolve_additional_config(
+        {
+            "cosmos3_mixed_precision": {
+                "first_steps": 0,
+                "last_steps": 0,
+                "reasoner": "native",
+            }
+        }
+    ) == (True, None)
+
+
+def test_checkpoint_policy_round_trip_through_transformer_config() -> None:
+    from vllm_omni.diffusion.data import TransformerConfig
+
+    disk = {
+        "_class_name": "Cosmos3VFMTransformer",
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "FP8",
+            "runtime": {"diffusion_step_policy": _policy(first_steps=2, last_steps=4)},
+        },
+    }
+
+    tf_config = TransformerConfig.from_dict(disk)
+    assert tf_config.quant_config is not None
+    assert tf_config.quant_config.get_name() == "modelopt"
+    assert (
+        tf_config.to_dict()["quantization_config"]["runtime"]
+        == disk["quantization_config"]["runtime"]
+    )
+    assert read_checkpoint_policy(SimpleNamespace(tf_model_config=tf_config)) == Cosmos3MixedPrecisionConfig(
+        first_steps=2,
+        last_steps=4,
+        reasoner="a16",
+    )
+
+
+@pytest.mark.parametrize("name", ["modelopt", "modelopt_fp4"])
+def test_checkpoint_policy_supports_serialized_modelopt_formats(name: str) -> None:
+    od_config = _checkpoint_od_config(_fake_quant_config(name), policy=_policy())
+    assert read_checkpoint_policy(od_config) == Cosmos3MixedPrecisionConfig()
+
+
+@pytest.mark.parametrize("name", ["modelopt", "modelopt_fp4"])
+def test_checkpoint_policy_rejects_nonserialized_modelopt_formats(name: str) -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config(name, serialized=False),
+        policy=_policy(),
+    )
+    with pytest.raises(ValueError, match="serialized ModelOpt"):
+        read_checkpoint_policy(od_config)
+
+
+def test_checkpoint_policy_rejects_mixed_modelopt_format() -> None:
+    with pytest.raises(ValueError, match="serialized ModelOpt FP8 or NVFP4"):
+        read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("modelopt_mixed"), policy=_policy()))
+
+
+def test_checkpoint_policy_missing_metadata_preserves_ordinary_path() -> None:
+    assert read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("modelopt"))) is None
+
+
+def test_checkpoint_policy_rejects_malformed_runtime_container() -> None:
+    od_config = _checkpoint_od_config(_fake_quant_config("modelopt"))
+    od_config.tf_model_config.params["quantization_config"]["runtime"] = True
+    with pytest.raises(TypeError, match="runtime must be a mapping"):
+        read_checkpoint_policy(od_config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("schema_version", 2, "schema_version"),
+        ("type", "sigma_ranges", "type"),
+        ("index_space", "scheduler_timestep", "index_space"),
+        ("default_mode", "a16", "default_mode"),
+        ("overlap", "native", "overlap"),
+        ("reasoner", "fp16", "reasoner"),
+    ],
+)
+def test_checkpoint_policy_rejects_invalid_schema(field: str, value: object, message: str) -> None:
+    policy = _policy()
+    policy[field] = value
+    with pytest.raises(ValueError, match=message):
+        read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("modelopt"), policy=policy))
+
+
+@pytest.mark.parametrize(
+    ("step_range", "message"),
+    [
+        ({"count": -1, "mode": "a16"}, "non-negative"),
+        ({"count": True, "mode": "a16"}, "non-negative"),
+        ({"count": 1, "mode": "native"}, "mode"),
+        ({"mode": "a16"}, "Missing"),
+        ({"count": 1, "mode": "a16", "sigma": 1.0}, "Unknown"),
+    ],
+)
+def test_checkpoint_policy_rejects_invalid_step_range(step_range: object, message: str) -> None:
+    policy = _policy()
+    policy["first_steps"] = step_range
+    with pytest.raises((TypeError, ValueError), match=message):
+        read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("modelopt"), policy=policy))
+
+
+def test_checkpoint_policy_rejects_unsupported_quantization_config() -> None:
+    with pytest.raises(ValueError, match="serialized ModelOpt FP8 or NVFP4"):
+        read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("compressed-tensors"), policy=_policy()))
+
+
+def test_checkpoint_policy_for_other_scope_is_not_applied() -> None:
+    od_config = _checkpoint_od_config(
+        _fake_quant_config("modelopt"),
+        policy=_policy(scope=["vae"]),
+    )
+    assert read_checkpoint_policy(od_config) is None
+
+
+def test_additional_config_overrides_and_disables_checkpoint_policy() -> None:
+    checkpoint = _checkpoint_od_config(
+        _fake_quant_config("modelopt"),
+        policy=_policy(first_steps=1, last_steps=1),
+    )
+    assert resolve_mixed_precision_config(checkpoint) == (
+        Cosmos3MixedPrecisionConfig(first_steps=1, last_steps=1),
+        "checkpoint",
+    )
+
+    checkpoint.additional_config = {
+        "cosmos3_mixed_precision": {
+            "first_steps": 2,
+            "last_steps": 0,
+            "reasoner": "native",
+        }
+    }
+    assert resolve_mixed_precision_config(checkpoint) == (
+        Cosmos3MixedPrecisionConfig(first_steps=2, last_steps=0, reasoner="native"),
+        "additional_config",
+    )
+
+    checkpoint.additional_config = {"cosmos3_mixed_precision": {"enabled": False}}
+    assert resolve_mixed_precision_config(checkpoint) == (None, "additional_config_disabled")
 
 
 def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch) -> None:

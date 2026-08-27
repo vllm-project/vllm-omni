@@ -12,7 +12,7 @@ from typing import Literal, cast
 ReasonerPolicy = Literal["native", "a16"]
 
 _REASONER_POLICIES = frozenset({"native", "a16"})
-_CONFIG_FIELDS = frozenset({"first_steps", "last_steps", "reasoner"})
+_CONFIG_FIELDS = frozenset({"enabled", "first_steps", "last_steps", "reasoner"})
 
 
 @dataclass(frozen=True)
@@ -29,15 +29,43 @@ class Cosmos3MixedPrecisionConfig:
         additional_config: Mapping[str, object] | None,
     ) -> Cosmos3MixedPrecisionConfig | None:
         """Parse Cosmos3 fields from vLLM-Omni's additional configuration."""
+        _, config = cls.resolve_additional_config(additional_config)
+        return config
+
+    @classmethod
+    def resolve_additional_config(
+        cls,
+        additional_config: Mapping[str, object] | None,
+    ) -> tuple[bool, Cosmos3MixedPrecisionConfig | None]:
+        """Return whether an override was supplied and its effective policy.
+
+        The separate presence bit distinguishes an absent runtime override from
+        an explicit disable.  That distinction matters when a checkpoint owns a
+        default policy.
+        """
+        if additional_config is not None and not isinstance(additional_config, Mapping):
+            raise TypeError("additional_config must be a mapping")
         values = additional_config or {}
         if "cosmos3_mixed_precision" not in values:
-            return None
+            return False, None
         raw_config = values["cosmos3_mixed_precision"]
         if not isinstance(raw_config, Mapping):
             raise TypeError("cosmos3_mixed_precision must be a mapping")
         unknown = set(raw_config) - _CONFIG_FIELDS
         if unknown:
             raise ValueError(f"Unknown cosmos3_mixed_precision fields: {sorted(unknown)}")
+
+        enabled = raw_config.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise TypeError("cosmos3_mixed_precision.enabled must be a boolean")
+        if not enabled:
+            conflicting = set(raw_config) - {"enabled"}
+            if conflicting:
+                raise ValueError(
+                    "cosmos3_mixed_precision.enabled=false cannot be combined with "
+                    f"schedule fields: {sorted(conflicting)}"
+                )
+            return True, None
 
         first_steps = _non_negative_int(
             raw_config.get("first_steps", 3),
@@ -60,8 +88,8 @@ class Cosmos3MixedPrecisionConfig:
             reasoner=cast(ReasonerPolicy, reasoner),
         )
         if first_steps == 0 and last_steps == 0 and reasoner == "native":
-            return None
-        return config
+            return True, None
+        return True, config
 
     def use_high_precision(self, step_index: int, num_steps: int) -> bool:
         """Select the high path for an actual scheduler-step index."""

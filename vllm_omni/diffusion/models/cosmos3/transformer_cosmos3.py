@@ -43,6 +43,7 @@ from vllm_omni.platforms import current_omni_platform
 from .mixed_precision import (
     Cosmos3MixedPrecisionConfig,
     Cosmos3MixedPrecisionRuntime,
+    resolve_mixed_precision_config,
 )
 
 if TYPE_CHECKING:
@@ -1155,9 +1156,18 @@ class Cosmos3VFMTransformer(nn.Module):
 
         dtype = od_config.dtype
         quant_config = getattr(od_config, "quantization_config", None) if od_config else None
-        mixed_precision_config = Cosmos3MixedPrecisionConfig.from_additional_config(
-            getattr(od_config, "additional_config", None)
-        )
+        mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
+        if mixed_precision_config is None:
+            if mixed_precision_source == "additional_config_disabled":
+                logger.info("Cosmos3 checkpoint mixed-precision policy disabled by additional_config")
+        else:
+            logger.info(
+                "Cosmos3 mixed precision active (source=%s): first_steps=%d last_steps=%d reasoner=%s",
+                mixed_precision_source,
+                mixed_precision_config.first_steps,
+                mixed_precision_config.last_steps,
+                mixed_precision_config.reasoner,
+            )
         _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
         self.language_model = self._language_model_cls(
