@@ -30,8 +30,8 @@ Use this recipe for U1.5 specifically, including its distilled few-step LoRA. Fo
 #### 1x A800 80GB
 
 - OS: Linux, Python 3.12
-- vLLM: 0.27.0
-- Peak GPU memory: 34.4 GB at 1024x1024, 36.5 GB at 1536x2720
+- vLLM: 0.28.0
+- Peak GPU memory: 34.3 GB at 1024x1024, 36.4 GB at 1536x2720
 
 ##### Text-to-Image
 
@@ -93,10 +93,10 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 | Resolution | Step latency | Total |
 | --- | --- | --- |
-| 1024x1024 | 219.9 ms | 5.50 s |
-| 1536x1536 | 472.6 ms | 11.82 s |
+| 1024x1024 | 209.5 ms | 5.24 s |
+| 1536x1536 | 458.5 ms | 11.46 s |
 
-At 1536x2720 with 50 steps, end-to-end is 46.5 s.
+At 1536x2720 with 50 steps, end-to-end is 43.0 s.
 
 #### Verification
 
@@ -118,7 +118,7 @@ pytest -q tests/diffusion/models/sensenova_u1/
   that fallback.
 - The first request after startup costs about 0.7 s more than the steady state whether the paged
   path is on or off. Measured on one A800 with the inductor, triton and vLLM compile caches all
-  cleared: 711 ms above steady with the path on, 664 ms with it off.
+  cleared, median of three runs: 718 ms above steady with the path on, 679 ms with it off.
 - Each request captures its own graphs, and a think request captures twice because the sequence
-  grows past the 512 bucket: 150 ms for the first capture in a process and about 94 ms after
-  that, so roughly 188 ms of every request rather than a one-off startup cost.
+  grows past the 512 bucket, so the capture cost is paid per request rather than once at
+  startup.
