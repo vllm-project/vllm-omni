@@ -839,7 +839,7 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
-Start from a non-offloaded FL2VA server command and add
+Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
 `--lora-path` preloads the adapter; each request still activates it and uses
 the published sampling settings:
@@ -853,9 +853,10 @@ the published sampling settings:
 
 For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
 ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion, DLO, or LoRA composition.
-It also rejects model-level, layerwise, and distributed layerwise offload;
-the legacy dynamic LoRA tensors do not participate in those weight lifecycles.
+dynamic-only and does not support prefusion or LoRA composition. DLO is
+supported by keeping the request-switchable LoRA A/B buffers resident on the
+accelerator while DLO streams only the base blocks; budget for this additional
+fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The five requested sigma points produce the four denoiser evaluations expected
 by the Turbo artifact.
 

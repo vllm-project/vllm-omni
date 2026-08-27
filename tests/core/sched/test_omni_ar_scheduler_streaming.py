@@ -93,6 +93,7 @@ def _run_resumable_segment_stop(
     sched.pending_stop_after_extraction = set()
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
@@ -198,6 +199,7 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
         inter_stage_output,
         session,
         True,
+        new_token_ids=[42],
         confirmed_num_computed_tokens=26,
     )
 
@@ -226,6 +228,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.pending_stop_after_extraction = set()
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
@@ -427,3 +430,33 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
     assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {session.request_id}
     assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+
+
+def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
+    """A WAITING_FOR_CHUNK stop must not delete its newly parked session."""
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def queue(*requests):
+        result = MagicMock()
+        result.requests = set(requests)
+        result.add_request.side_effect = result.requests.add
+        result.remove_requests.side_effect = result.requests.difference_update
+        return result
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.running = []
+    sched.waiting = queue()
+    sched.skipped_waiting = queue(session)
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={session.request_id})
+
+    sched._resume_downstream_chunk_receiver(session)
+    sched._remove_stopped_requests_from_queues(set(), {session})
+
+    assert session.status == RequestStatus.WAITING
+    assert session in sched.waiting.requests
+    assert session not in sched.skipped_waiting.requests
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
