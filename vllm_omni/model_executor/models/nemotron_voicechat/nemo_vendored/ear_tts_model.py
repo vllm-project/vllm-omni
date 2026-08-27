@@ -935,8 +935,8 @@ class GatedProjectedSumRMSNorm(nn.Module):
         audio_emb = audio_emb / self.num_codebooks
 
         # projections run in model dtype (BF16)
-        audio_h = self.audio_proj(audio_emb)
-        text_h = self.text_proj(text_emb)
+        audio_h = self.audio_proj(audio_emb.to(dtype=self.audio_proj.weight.dtype))
+        text_h = self.text_proj(text_emb.to(dtype=self.text_proj.weight.dtype))
 
         dtype = audio_h.dtype
 
@@ -1302,7 +1302,7 @@ class RVQEARTTSModel(nn.Module):
             pre_bos_mask = bos_mask.cumsum(dim=1) == 0  # [B, T, 1]
 
             # Apply projection to model size
-            code_embed = self.embed_code(code_embed)
+            code_embed = self.embed_code(code_embed.to(dtype=self.embed_code.weight.dtype))
 
             # Choose projection
             if self.config.get("audio_prompt_encoder_config", None):
@@ -1336,7 +1336,7 @@ class RVQEARTTSModel(nn.Module):
             code_embeds = code_embed + bos_mask * self.bos_emb
 
         else:  # Inference
-            code_embeds = self.embed_code(self.depthsum_embedding(code))
+            code_embeds = self.embed_code(self.depthsum_embedding(code).to(dtype=self.embed_code.weight.dtype))
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
         if guidance_enabled:
@@ -1591,7 +1591,7 @@ class RVQEARTTSModel(nn.Module):
             top_p_or_k_i = top_p_or_k[i] if top_p_or_k is not None else 1.0
             noise_scale_i = noise_scale[i] if noise_scale is not None else 1.0
 
-            mog_input_embeds = self.embed_code(self.depthsum_embedding(code))
+            mog_input_embeds = self.embed_code(self.depthsum_embedding(code).to(self.embed_code.weight.dtype))
             if self.config.random_target_masking:
                 mog_input_embeds += self.embed_target_mask(cnt + k - 1)
             if guidance_scale_i > 0.0:

@@ -564,8 +564,37 @@ class OmniSchedulerMixin:
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
-            self.waiting.remove_requests(stopped_preempted_reqs)
-            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
+            # ``_handle_stopped_request`` re-enqueues a resumable segment as
+            # WAITING_FOR_STREAMING_REQ before this cleanup runs.  A
+            # downstream async-chunk request can have entered the update with
+            # the older WAITING_FOR_CHUNK status, which puts it in
+            # ``stopped_preempted_reqs``; deleting it here would immediately
+            # undo the requeue and the receiver would never poll chunk 1.
+            removable = {
+                request
+                for request in stopped_preempted_reqs
+                if not (
+                    request.resumable
+                    and request.status
+                    in (
+                        RequestStatus.WAITING,
+                        RequestStatus.WAITING_FOR_STREAMING_REQ,
+                    )
+                )
+            }
+            self.waiting.remove_requests(removable)
+            self.skipped_waiting.remove_requests(removable)
+
+    def _resume_downstream_chunk_receiver(self, request: Request) -> None:
+        """Resume connector polling without waiting for an external update."""
+        adapter = self.chunk_transfer_adapter
+        adapter.segment_finished_requests.discard(request.request_id)
+        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            return
+        self.num_waiting_for_streaming_input -= 1
+        request.status = RequestStatus.WAITING
+        self.skipped_waiting.remove_requests((request,))
+        self._enqueue_waiting_request(request)
 
     def _aggregate_kv_connector_stats(
         self,

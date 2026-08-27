@@ -561,8 +561,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
                             # Downstream async-chunk stages receive real payloads from the
-                            # connector. This update only resumes polling for the next segment.
-                            self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                            # connector, not an external StreamingUpdate. Move the
+                            # resumable request back to the ordinary waiting queue so
+                            # connector polling starts again immediately.
+                            self._resume_downstream_chunk_receiver(request)
                     outstanding_async_tokens = request.num_output_placeholders
                     # Always record the discard signal (0 when nothing is in
                     # flight). Upstream a0c092ee72 removed the
@@ -641,6 +643,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     inter_stage_output,
                     request,
                     is_segment_finished,
+                    new_token_ids=new_token_ids,
                     confirmed_num_computed_tokens=confirmed_num_computed_tokens,
                 )
 

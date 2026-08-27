@@ -444,9 +444,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _resolve_pooler_payload_req_ids(self, req_ids_output_copy: list[str]) -> tuple[str, list[str]]:
         downstream_req_ids = [rid for rid in req_ids_output_copy if self._request_needs_downstream_stage_payload(rid)]
         engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
+        if self._client_multimodal_output_keys():
+            downstream_req_ids = req_ids_output_copy
         # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
         # need multimodal payloads for final audio postprocess/output.
-        if engine_output_type == "audio" and not downstream_req_ids:
+        elif engine_output_type == "audio" and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
@@ -1555,7 +1557,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         lists are wrapped into tensors, and anything that cannot be safely
         converted is dropped.
         """
-        if self.vllm_config.model_config.engine_output_type == "text":
+        if self.vllm_config.model_config.engine_output_type == "text" and not self._client_multimodal_output_keys():
             return None
         if per_req_payloads is None:
             return None
@@ -1613,6 +1615,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _runner_model_omni_flag(self, name: str, default: bool = False) -> bool:
         return self._model_omni_flag(getattr(self, "model", None), name, default)
+
+    def _client_multimodal_output_keys(self) -> tuple[str, ...]:
+        raw = getattr(
+            getattr(self, "model", None),
+            "omni_client_multimodal_output_keys",
+            (),
+        )
+        if not isinstance(raw, tuple) or any(not isinstance(key, str) or not key for key in raw):
+            raise TypeError("omni_client_multimodal_output_keys must be a tuple of non-empty strings")
+        if len(raw) != len(set(raw)):
+            raise ValueError("omni_client_multimodal_output_keys must not contain duplicates")
+        return raw
 
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
@@ -1921,6 +1935,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # Connector-less stages expose the same payload through the
             # orchestrator bridge; non-async stages preserve legacy behavior.
             pooler_inter, pooler_client = pooler_output, pooler_output
+        client_output_keys = self._client_multimodal_output_keys()
+        if client_output_keys:
+            allowed = frozenset(client_output_keys)
+            pooler_client = [
+                {key: value for key, value in payload.items() if key in allowed} for payload in pooler_output
+            ]
 
         if pooler_inter and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):

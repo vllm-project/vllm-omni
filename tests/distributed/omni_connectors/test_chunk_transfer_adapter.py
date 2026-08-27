@@ -1209,6 +1209,67 @@ def test_cleanup_preserves_pending_save(build_adapter):
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-old", RequestStatus.WAITING, external_req_id="ext-reused")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    stale_task = adapter._pending_save_reqs.popleft()
+    adapter.cleanup(request.request_id, request.external_req_id)
+    adapter._send_single_request(stale_task)
+
+    connector.put.assert_not_called()
+    assert request.external_req_id not in adapter.put_req_chunk
+
+    replacement = _req("req-new", RequestStatus.WAITING, external_req_id=request.external_req_id)
+    adapter.save_async(multimodal_output=None, request=replacement)
+    current_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(current_task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
+
+
+def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    first = _req("req-first", RequestStatus.WAITING, external_req_id="ext-first")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    put_started = threading.Event()
+    release_put = threading.Event()
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        release_put.wait(timeout=2)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_put
+    adapter.save_async(multimodal_output=None, request=first)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    assert put_started.wait(timeout=1)
+    cleaner = threading.Thread(
+        target=adapter.finish_requests,
+        args=([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first}),
+    )
+    cleaner.start()
+    try:
+        cleaner.join(timeout=0.5)
+        assert not cleaner.is_alive()
+        assert task["sender_token"].cancelled
+        assert first.external_req_id in adapter._sender_tokens
+    finally:
+        release_put.set()
+        sender.join(timeout=1)
+        cleaner.join(timeout=1)
+    assert not sender.is_alive()
+    assert first.external_req_id not in adapter._sender_tokens
+    assert first.external_req_id not in adapter.put_req_chunk
+
+
 def test_cleanup_only_affects_target_request(build_adapter):
     """Cleanup for one request must not affect another request's state."""
     adapter, _ = build_adapter(stage_id=1)
@@ -2216,3 +2277,43 @@ def test_expiry_is_per_request(build_adapter):
 
     assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"stalled"}
     assert "healthy" in adapter._waiting_since
+
+
+def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1, connector_extra={"codec_chunk_frames": 1})
+    external_req_id = "ext-native-abort"
+    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    first.resumable = True
+    first.model_intermediate_buffer = None
+    first.additional_information = {"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1}
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
+        first,
+        is_finished=False,
+    )
+
+    adapter.requests_num_chunks_sent[external_req_id] = 1
+    adapter.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first})
+
+    assert external_req_id not in adapter.request_payload
+    assert external_req_id not in adapter.requests_num_chunks_sent
+
+    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    replacement.resumable = True
+    replacement.model_intermediate_buffer = None
+    replacement.additional_information = first.additional_information
+    replacement_payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.full((1, 31), 202, dtype=torch.long)}, "meta": {"codec_streaming": True}},
+        replacement,
+        is_finished=False,
+    )
+
+    assert torch.equal(replacement_payload.codes.audio, torch.full((1, 31), 202, dtype=torch.long))
