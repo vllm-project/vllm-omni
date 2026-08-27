@@ -1901,6 +1901,18 @@ class TestQwen3TTSPipeline:
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    @pytest.mark.parametrize(
+        "deploy_name",
+        ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"],
+    )
+    def test_default_async_deploy_enables_chunk_ramp(self, deploy_name):
+        deploy = load_deploy_config(Path(get_deploy_config_path(deploy_name)))
+
+        assert deploy.async_chunk is True
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_chunk_ramp"] == [4, 4, 8, 16, 25]
+
     def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
         """Verify subtalker sampling params participate in stage deep-merge."""
         base = {
