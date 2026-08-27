@@ -125,6 +125,7 @@ class PipeFusionSelfAttentionMixin(ABC):
             @wraps(init)
             def wrapped_init(self, *args, **kwargs):
                 init(self, *args, **kwargs)
+                self._kv_caches = {}
                 for module in self.modules():
                     if isinstance(module, Attention):
                         self._pipefusion_patch_attention(module)
@@ -143,7 +144,7 @@ class PipeFusionSelfAttentionMixin(ABC):
         attention.forward = pipefusion_forward
 
     def pipefusion_reset_cache(self, request_id: str | None = None, sequence_id: int | None = None) -> None:
-        if request_id is None and sequence_id is None:
+        if request_id is None and sequence_id is None or not hasattr(self, "_kv_caches"):
             self._kv_caches = {}
             return
         self._kv_caches = {
