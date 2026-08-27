@@ -501,6 +501,13 @@ def test_mot_qkv_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers allocate weights via torch.empty without
+            # initializing them; on hosts where fresh CUDA pages are
+            # zero-filled both outputs become all-zero and the cosine
+            # similarity check degenerates (cos_sim of zero vectors is 0).
+            ref_linear.weight.normal_(0, 0.02)
+            if bias and ref_linear.bias is not None:
+                ref_linear.bias.normal_(0, 0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
@@ -549,6 +556,11 @@ def test_mot_row_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # Same rationale as in test_mot_qkv_und_mode: initialize the
+            # torch.empty-allocated weights so the comparison is meaningful.
+            ref_linear.weight.normal_(0, 0.02)
+            if bias and ref_linear.bias is not None:
+                ref_linear.bias.normal_(0, 0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
