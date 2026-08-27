@@ -111,3 +111,38 @@ RGB (2048, 2048)
 
 - Tensor parallelism shards the attention, MLP, timestep, and pixel projection weights across both GPUs.
 - Image editing and image-conditioned generation are not supported.
+
+## TeaCache acceleration
+
+TeaCache for HiDream-O1 uses coefficients calibrated from HiDream-O1 full-compute trajectories. The model-specific default is `rel_l1_thresh=0.10`; the example below specifies the same value explicitly so that its speed/quality policy is visible and reproducible.
+
+The validated configuration used 2048 x 2048 output, 50 inference steps, guidance scale 5.0, BF16, and tensor parallel size 2. Other resolutions, schedulers, step counts, and guidance scales should be validated separately.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+engine = Omni(
+    model="HiDream-ai/HiDream-O1-Image",
+    cache_backend="tea_cache",
+    cache_config={"rel_l1_thresh": 0.10},
+    tensor_parallel_size=2,
+    enforce_eager=True,
+)
+
+outputs = engine.generate(
+    {
+        "prompt": "A cat is sitting next to a sign that says 'HiDream-O1 vLLM-Omni'",
+        "modalities": ["image"],
+    },
+    OmniDiffusionSamplingParams(
+        height=2048,
+        width=2048,
+        num_inference_steps=50,
+        guidance_scale=5.0,
+        seed=42,
+    ),
+)
+outputs[0].images[0].save("hidream_o1_teacache.png")
+engine.close()
+```

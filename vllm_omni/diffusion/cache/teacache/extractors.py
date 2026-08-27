@@ -391,6 +391,44 @@ def extract_bagel_context(
     )
 
 
+def extract_hidream_o1_context(
+    module: nn.Module,
+    inputs_embeds: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    full_attn_spans: list[list[tuple[int, int]]] | None,
+    **kwargs: Any,
+) -> CacheContext:
+    if not hasattr(module, "layers") or len(module.layers) == 0:
+        raise ValueError("Module must have decoder layers")
+
+    position_embeddings = module.rotary_emb(inputs_embeds, position_ids)
+    modulated_input = inputs_embeds
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        hidden_states = inputs_embeds
+        for layer in module.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+            )
+        return (hidden_states,)
+
+    def postprocess(hidden_states: torch.Tensor) -> torch.Tensor:
+        return module.norm(hidden_states)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=inputs_embeds,
+        encoder_hidden_states=None,
+        temb=modulated_input,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_zimage_context(
     module: nn.Module,
     x: list[torch.Tensor],
@@ -1404,6 +1442,7 @@ def extract_minimax_h3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "HiDreamO1TextModel": extract_hidream_o1_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
