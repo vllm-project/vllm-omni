@@ -20,7 +20,6 @@ from vllm_omni.lora.request import LoRARequest
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 _TINY_HIDDEN = 2
-_TINY_INNER = 3
 _TINY_FFN = 2
 _TINY_TIME = 2
 _TINY_BLOCK_ADALN = 4
@@ -30,6 +29,10 @@ _TINY_NUM_QUERY_GROUPS = 2
 _TINY_HEADS_PER_GROUP = 1
 _TINY_HEAD_DIM = 1
 _TINY_QKV_SLICE = _TINY_NUM_QUERY_GROUPS * _TINY_HEADS_PER_GROUP * _TINY_HEAD_DIM
+# Grouped qkv stores (heads_per_group + 2) * head_dim rows per query group, so
+# the attention inner size follows from the head layout and cannot be picked
+# independently: 3 * inner must equal the grouped row count.
+_TINY_INNER = _TINY_QKV_SLICE
 
 
 @pytest.fixture(autouse=True)
@@ -163,16 +166,18 @@ def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     assert "blocks.0.adaln_proj.linear" in lora_model.loras
     assert "final_layer.adaln_proj.linear" in lora_model.loras
 
+    # The writer tags group g with q=g*10+1, k=g*10+2, v=g*10+3, so a correct
+    # grouped -> q/k/v permutation yields slices that are uniform per role.
     qkv = lora_model.get_lora("blocks.0.attn.qkv_proj")
     assert isinstance(qkv, PackedLoRALayerWeights)
-    torch.testing.assert_close(qkv.lora_b[0], torch.tensor([[10.0], [11.0]]))
-    torch.testing.assert_close(qkv.lora_b[1], torch.tensor([[12.0], [22.0]]))
-    torch.testing.assert_close(qkv.lora_b[2], torch.tensor([[13.0], [23.0]]))
+    torch.testing.assert_close(qkv.lora_b[0], torch.tensor([[1.0] * _TINY_RANK, [11.0] * _TINY_RANK]))
+    torch.testing.assert_close(qkv.lora_b[1], torch.tensor([[2.0] * _TINY_RANK, [12.0] * _TINY_RANK]))
+    torch.testing.assert_close(qkv.lora_b[2], torch.tensor([[3.0] * _TINY_RANK, [13.0] * _TINY_RANK]))
 
     fc1 = lora_model.get_lora("blocks.0.mlp.fc1")
     assert isinstance(fc1, PackedLoRALayerWeights)
-    torch.testing.assert_close(fc1.lora_b[0], torch.full((1, _TINY_RANK), 2.0))
-    torch.testing.assert_close(fc1.lora_b[1], torch.full((1, _TINY_RANK), 1.0))
+    torch.testing.assert_close(fc1.lora_b[0], torch.full((_TINY_FFN, _TINY_RANK), 2.0))
+    torch.testing.assert_close(fc1.lora_b[1], torch.full((_TINY_FFN, _TINY_RANK), 1.0))
 
 
 def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
@@ -186,7 +191,11 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
             dtype=torch.float32,
         )
 
-    valid = tmp_path / "valid.safetensors"
+    # The exact-filename guard runs before the partition check, so the artifact
+    # has to keep the published name for this to reach the Ref2VA rejection.
+    valid_dir = tmp_path / "valid"
+    valid_dir.mkdir()
+    valid = valid_dir / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(valid)
     with pytest.raises(ValueError, match="supports T2VA only"):
         load_minimax_h3_native_lora(
@@ -196,11 +205,45 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
             dtype=torch.float32,
         )
 
+    renamed = tmp_path / "renamed.safetensors"
+    _write_tiny_native(renamed)
+    with pytest.raises(ValueError, match="supports only"):
+        load_minimax_h3_native_lora(
+            partition="fl2va",
+            lora_request=_request(renamed),
+            lora_path=renamed,
+            dtype=torch.float32,
+        )
+
 
 def test_h3_native_rejects_truncated_artifact(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, omit_target="blocks.49.mlp.fc2")
     with pytest.raises(ValueError, match="target set does not match"):
+        load_minimax_h3_native_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
+
+
+def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
+    """A mislabeled schedule must fail closed instead of silently changing steps."""
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(
+        path,
+        metadata={
+            "format": "pt",
+            "key_format": "minimax-h3-native",
+            "qkv_layout": "grouped",
+            "lora_rank": str(_TINY_RANK),
+            "lora_alpha": str(_TINY_RANK),
+            "base_schedule": "1.0,0.5,0.0",
+            "tasks": "t2va",
+        },
+    )
+    with pytest.raises(ValueError, match="4-interval base_schedule"):
         load_minimax_h3_native_lora(
             partition="fl2va",
             lora_request=_request(path),
@@ -256,6 +299,33 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     pipeline._base_schedule_by_partition = {"fl2va": DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0])}
     with pytest.raises(OmniClientError, match="already pins base_schedule"):
         pipeline._sigma_schedule_for_request(sampling, "t2va")
+
+
+def test_pipeline_native_step_count_follows_adapter_schedule():
+    """The accepted step count is the adapter's interval count, never a literal."""
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline._native_lora_adapter_ids = {7}
+    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0])}
+    request = LoRARequest("flashgen", 7, "/tmp/native.safetensors")
+
+    pipeline._validate_native_sampling(
+        SimpleNamespace(lora_request=request, num_inference_steps=2),
+        task="t2va",
+    )
+    with pytest.raises(OmniClientError, match="num_inference_steps must be 2 or omitted, not 3"):
+        pipeline._validate_native_sampling(
+            SimpleNamespace(lora_request=request, num_inference_steps=3),
+            task="t2va",
+        )
+    with pytest.raises(OmniClientError, match="requires num_inference_steps=2"):
+        pipeline._validate_native_sampling(
+            SimpleNamespace(lora_request=request, num_inference_steps=4),
+            task="t2va",
+        )
 
 
 def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_path):
@@ -374,6 +444,81 @@ def test_h3_native_qkv_reorder_matches_base_loader_contract():
     assert q.reshape(num_query_groups, head_dim)[0, 0] == grouped[0, 0]
     assert k.reshape(num_query_groups, head_dim)[0, 0] == grouped[0, head_dim]
     assert v.reshape(num_query_groups, head_dim)[0, 0] == grouped[0, 2 * head_dim]
+
+
+def test_native_target_pattern_matches_component_qualified_names():
+    """The manager matches "<component>.<module>", so the pattern needs the prefix."""
+    import regex as re
+
+    pattern = lora_module._NATIVE_TARGET_PATTERN
+    matched = [
+        target
+        for target in lora_module._NATIVE_EXPECTED_TARGETS
+        if re.search(pattern, f"transformer.{target}") is not None
+    ]
+    assert len(matched) == 259
+    assert re.search(pattern, "transformer.blocks.0.attn.q_proj") is None
+    assert re.search(pattern, "transformer.token_refiner.blocks.0.adaln_proj.linear") is None
+
+
+def test_replace_layers_binds_every_native_target(monkeypatch):
+    """Regression for bound=0/259: layer replacement must reach all 259 modules."""
+    from vllm.lora.layers import BaseLayerWithLoRA
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from vllm_omni.diffusion.lora import manager as manager_module
+
+    class _StubLoRALayer(BaseLayerWithLoRA):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+
+    def _linear() -> torch.nn.Module:
+        return torch.nn.Linear(_TINY_HIDDEN, _TINY_HIDDEN)
+
+    def _block(*, with_adaln: bool) -> torch.nn.Module:
+        block = torch.nn.Module()
+        block.attn = torch.nn.Module()
+        block.attn.qkv_proj = _linear()
+        block.attn.out_proj = _linear()
+        block.mlp = torch.nn.Module()
+        block.mlp.fc1 = _linear()
+        block.mlp.fc2 = _linear()
+        if with_adaln:
+            block.adaln_proj = torch.nn.Module()
+            block.adaln_proj.linear = _linear()
+        return block
+
+    transformer = torch.nn.Module()
+    transformer.blocks = torch.nn.ModuleList([_block(with_adaln=True) for _ in range(50)])
+    transformer.token_refiner = torch.nn.Module()
+    transformer.token_refiner.blocks = torch.nn.ModuleList([_block(with_adaln=False) for _ in range(2)])
+    transformer.final_layer = torch.nn.Module()
+    transformer.final_layer.adaln_proj = torch.nn.Module()
+    transformer.final_layer.adaln_proj.linear = _linear()
+    pipeline = torch.nn.Module()
+    pipeline.transformer = transformer
+
+    monkeypatch.setattr(manager_module, "from_layer_diffusion", lambda *, layer, **_: _StubLoRALayer(layer))
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline = pipeline
+    manager.dtype = torch.float32
+    manager.max_cached_adapters = 1
+    manager._lora_modules = {}
+    manager._max_lora_rank = 64
+    manager._resident_lora_device = None
+
+    peft_helper = PEFTHelper.from_dict(
+        {
+            "r": _TINY_RANK,
+            "lora_alpha": _TINY_RANK,
+            "target_modules": lora_module._NATIVE_TARGET_PATTERN,
+        }
+    )
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert set(manager._lora_modules) == {f"transformer.{target}" for target in lora_module._NATIVE_EXPECTED_TARGETS}
 
 
 def test_legacy_manager_uses_native_loader(tmp_path):
@@ -512,7 +657,11 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     manager._registered_adapters = {
         lora_model.id: lora_model,
     }
+    manager._active_adapter_id = None
+    manager._adapter_scales = {}
     manager._activate_adapter(lora_model.id, scale=0.5)
+
+    assert manager._active_adapter_id == lora_model.id
 
     assert len(layer.set_calls) == 1
     lora_a_list, lora_b_list = layer.set_calls[0]

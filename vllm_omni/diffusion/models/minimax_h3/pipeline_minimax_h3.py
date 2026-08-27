@@ -82,7 +82,11 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .lora import load_minimax_h3_native_lora, load_minimax_h3_turbo_lora
+from .lora import (
+    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
+    load_minimax_h3_native_lora,
+    load_minimax_h3_turbo_lora,
+)
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
@@ -793,15 +797,22 @@ class MiniMaxH3Pipeline(
     def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
         if task != "t2va":
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
+        # Derive the expected count from the adapter's own schedule so the
+        # message can never disagree with the schedule the denoise loop runs.
+        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
         sigma_steps = sampling.num_inference_steps
-        if sigma_steps == 5:
+        if sigma_steps is None:
+            return
+        if int(sigma_steps) == expected_steps + 1:
             raise OmniClientError(
                 "MiniMax-H3 native LoRA uses the distilled interval-count contract; "
-                "num_inference_steps must be 4 or omitted, not 5"
+                f"num_inference_steps must be {expected_steps} or omitted, not {expected_steps + 1}"
             )
-        if sigma_steps is not None and int(sigma_steps) != 4:
+        if int(sigma_steps) != expected_steps:
             raise OmniClientError(
-                "MiniMax-H3 native LoRA requires num_inference_steps=4 (four denoiser evaluations) or omitted"
+                f"MiniMax-H3 native LoRA requires num_inference_steps={expected_steps} "
+                "(one denoiser evaluation per sigma interval) or omitted"
             )
 
     def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:

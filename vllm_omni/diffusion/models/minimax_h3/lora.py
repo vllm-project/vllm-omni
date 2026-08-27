@@ -223,6 +223,8 @@ _NATIVE_HEAD_DIM = 128
 _NATIVE_QKV_SLICE = _NATIVE_ATTENTION_INNER_SIZE
 _NATIVE_KEY_FORMAT = "minimax-h3-native"
 _NATIVE_QKV_LAYOUT = "grouped"
+# Public because request validation in the pipeline speaks the same contract.
+MINIMAX_H3_NATIVE_INFERENCE_STEPS = 4
 _NATIVE_FILENAME = "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
 _NATIVE_TARGET_SUFFIXES = (
     "attn.qkv_proj",
@@ -312,6 +314,13 @@ def _validate_native_metadata(metadata: Mapping[str, str]) -> DMD2SigmaSchedule:
     schedule = DMD2SigmaSchedule.from_safetensors_metadata(metadata)
     if schedule is None:
         raise ValueError("MiniMax-H3 native LoRA requires safetensors metadata base_schedule")
+    # Request validation speaks in interval counts, so a mislabeled schedule
+    # would otherwise silently change the step count instead of failing here.
+    if schedule.num_inference_steps != MINIMAX_H3_NATIVE_INFERENCE_STEPS:
+        raise ValueError(
+            f"MiniMax-H3 native LoRA v1.0 requires a {MINIMAX_H3_NATIVE_INFERENCE_STEPS}-interval base_schedule "
+            f"({MINIMAX_H3_NATIVE_INFERENCE_STEPS + 1} sigma positions), got {schedule.num_inference_steps}"
+        )
     return schedule
 
 
