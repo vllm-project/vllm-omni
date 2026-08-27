@@ -28,9 +28,9 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 
 ### CI job runners (L2–L4): logs, timing, and timeouts
 
-[`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh), [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh), and [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh) share the same run-time behavior (via [`tools/run_jobs_common.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_jobs_common.sh)):
+[`tools/run_level2_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_level2_jobs.sh), [`tools/run_level3_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_level3_jobs.sh), and [`tools/nightly/run_level4_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_level4_jobs.sh) share the same run-time behavior (via [`tools/run_jobs_common.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_jobs_common.sh)):
 
-**Log layout** (default under `logs/ready_jobs`, `logs/merge_jobs`, or `logs/nightly_jobs`; override with `--log-dir`):
+**Log layout** (default under `logs/level2_jobs`, `logs/level3_jobs`, or `logs/level4_jobs`; override with `--log-dir`):
 
 | Path | Description |
 | ------ | ------------- |
@@ -57,29 +57,29 @@ Failed jobs: 1/2
     cd tests
     pytest -s -v -m "core_model and cpu"
     ```
-    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml).
+    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level2.yml).
 
 === "L2 level"
 
-    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_ready_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_ready_jobs.sh). The script reads [`.buildkite/cuda/test-ready.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-ready.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/ready_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts) for timing and timeout behavior). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_level2_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_level2_jobs.sh). The script reads [`.buildkite/cuda/test-level2.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level2.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/level2_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts) for timing and timeout behavior). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
-    # All L2 and L1 jobs (default: every pytest step in test-ready.yml)
-    bash tools/run_ready_jobs.sh
+    # All L2 and L1 jobs (default: every pytest step in test-level2.yml)
+    bash tools/run_level2_jobs.sh
 
-    # Skip L1-style "Simple Test" steps in test-ready.yml (group or "Simple ·" labels)
-    bash tools/run_ready_jobs.sh --skip-simple
-    bash tools/run_ready_jobs.sh --skip-simple --model-type diffusion
+    # Skip L1-style "Simple Test" steps in test-level2.yml (group or "Simple ·" labels)
+    bash tools/run_level2_jobs.sh --skip-simple
+    bash tools/run_level2_jobs.sh --skip-simple --model-type diffusion
 
     # Preview extracted commands without running
-    bash tools/run_ready_jobs.sh --dry-run
+    bash tools/run_level2_jobs.sh --dry-run
 
     # Filter by model area (OR semantics): omni | tts | diffusion | all
-    bash tools/run_ready_jobs.sh --model-type omni
-    bash tools/run_ready_jobs.sh --model-type tts,diffusion
+    bash tools/run_level2_jobs.sh --model-type omni
+    bash tools/run_level2_jobs.sh --model-type tts,diffusion
 
     # Match a Buildkite label substring (e.g. one model suite)
-    bash tools/run_ready_jobs.sh --model-type tts --label-substr "VoxCPM2"
+    bash tools/run_level2_jobs.sh --model-type tts --label-substr "VoxCPM2"
 
     ```
 
@@ -93,25 +93,25 @@ Failed jobs: 1/2
 
 === "L3 level"
 
-    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/cuda/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_level3_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_level3_jobs.sh). The script reads [`.buildkite/cuda/test-level3.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level3.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/level3_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
-    # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
-    bash tools/run_merge_jobs.sh
+    # All L3 and L1 jobs (default: every pytest step in test-level3.yml)
+    bash tools/run_level3_jobs.sh
 
-    # Skip L1-style "Simple Test" steps in test-merge.yml (group or "Simple ·" labels)
-    bash tools/run_merge_jobs.sh --skip-simple
-    bash tools/run_merge_jobs.sh --skip-simple --model-type omni
+    # Skip L1-style "Simple Test" steps in test-level3.yml (group or "Simple ·" labels)
+    bash tools/run_level3_jobs.sh --skip-simple
+    bash tools/run_level3_jobs.sh --skip-simple --model-type omni
 
     # Preview extracted commands without running
-    bash tools/run_merge_jobs.sh --dry-run
+    bash tools/run_level3_jobs.sh --dry-run
 
     # Filter by model area (OR semantics): omni | tts | diffusion | all
-    bash tools/run_merge_jobs.sh --model-type diffusion
-    bash tools/run_merge_jobs.sh --model-type omni,tts
+    bash tools/run_level3_jobs.sh --model-type diffusion
+    bash tools/run_level3_jobs.sh --model-type omni,tts
 
     # Match a Buildkite label substring
-    bash tools/run_merge_jobs.sh --model-type diffusion --label-substr "Wan22"
+    bash tools/run_level3_jobs.sh --model-type diffusion --label-substr "Wan22"
 
     ```
 
@@ -124,26 +124,26 @@ Failed jobs: 1/2
 
 === "L4 level"
 
-    **Recommended:** run CI-aligned nightly jobs from the repo root via [`tools/nightly/run_nightly_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_nightly_jobs.sh). The script reads [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml), generates per-step bash wrappers, runs pytest (perf jobs first, then aggregates perf JSON into Excel), and tees logs under `logs/nightly_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts); `generate_nightly_perf_excel` is included in the timing summary). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
+    **Recommended:** run CI-aligned nightly jobs from the repo root via [`tools/nightly/run_level4_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/nightly/run_level4_jobs.sh). The script reads [`.buildkite/cuda/test-level4.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level4.yml), generates per-step bash wrappers, runs pytest (perf jobs first, then aggregates perf JSON into Excel), and tees logs under `logs/level4_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts); `generate_nightly_perf_excel` is included in the timing summary). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
     # All nightly jobs (default: test-type all, model-type all)
-    bash tools/nightly/run_nightly_jobs.sh
+    bash tools/nightly/run_level4_jobs.sh
 
     # Preview extracted commands without running
-    bash tools/nightly/run_nightly_jobs.sh --dry-run
+    bash tools/nightly/run_level4_jobs.sh --dry-run
 
     # Test kind (--test-type, OR semantics): perf | acc | function | stability | local | all
-    bash tools/nightly/run_nightly_jobs.sh --test-type function
-    bash tools/nightly/run_nightly_jobs.sh --test-type perf,acc
+    bash tools/nightly/run_level4_jobs.sh --test-type function
+    bash tools/nightly/run_level4_jobs.sh --test-type perf,acc
 
     # Model area (--model-type, OR semantics): omni | tts | diffusion | all
-    bash tools/nightly/run_nightly_jobs.sh --test-type function --model-type omni
-    bash tools/nightly/run_nightly_jobs.sh --test-type perf --model-type diffusion
+    bash tools/nightly/run_level4_jobs.sh --test-type function --model-type omni
+    bash tools/nightly/run_level4_jobs.sh --test-type perf --model-type diffusion
 
     # Stability scripts (tests/dfx/stability/scripts/) and local marker tests
-    bash tools/nightly/run_nightly_jobs.sh --test-type stability --model-type omni
-    bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
+    bash tools/nightly/run_level4_jobs.sh --test-type stability --model-type omni
+    bash tools/nightly/run_level4_jobs.sh --test-type local --model-type tts
     ```
 
     Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI.
@@ -167,7 +167,7 @@ Failed jobs: 1/2
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
     pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
-    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
+    Nightly **Perf Test** jobs in [``test-level4.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level4.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-level5.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level5.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
 === "L5 level"
 
@@ -193,7 +193,7 @@ Failed jobs: 1/2
 
     ```
 
-    The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
+    The latest L5 CI jobs are in [test-level5.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level5.yml):
 
     - **Reliability** (+ invalid-parameter), **Perf Test** (Omni vLLM Text / Multi-Replica), and **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Scheduled upload of those env-gated steps still requires `main`.
     - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)

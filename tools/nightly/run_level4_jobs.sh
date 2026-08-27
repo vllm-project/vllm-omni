@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
-# Extract steps from .buildkite/cuda/test-nightly.yml that contain pytest, synthesize
+# Extract steps from .buildkite/cuda/test-level4.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
 # after each step's Buildkite "key" when present (otherwise a slug of the label).
 # YAML steps whose label contains "Perf Test" run first, then
@@ -25,7 +25,7 @@
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
 #              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
-#   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-nightly.yml)
+#   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-level4.yml)
 #
 # Model area (--model-type / MODEL_TYPE), multiple allowed (OR semantics):
 #   e.g. --model-type omni,tts
@@ -53,24 +53,24 @@
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
 #
 # Usage:
-#   bash path/to/run_nightly_jobs.sh
-#   REPO_ROOT=/path/to/vllm-omni bash path/to/run_nightly_jobs.sh --test-type perf,acc --dry-run
-#   YML=/path/to/vllm-omni/.buildkite/cuda/test-nightly.yml bash path/to/run_nightly_jobs.sh
+#   bash path/to/run_level4_jobs.sh
+#   REPO_ROOT=/path/to/vllm-omni bash path/to/run_level4_jobs.sh --test-type perf,acc --dry-run
+#   YML=/path/to/vllm-omni/.buildkite/cuda/test-level4.yml bash path/to/run_level4_jobs.sh
 #
 # Repository / YAML (no dependency on where this script lives):
-#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-nightly.yml
+#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-level4.yml
 #   • Or set YML (or --yaml) — repo root is inferred as parent of the .buildkite directory
 #   • Or run from inside the clone: git rev-parse --show-toplevel, else walk up from $PWD,
-#     then from the script's directory, until .buildkite/cuda/test-nightly.yml exists
+#     then from the script's directory, until .buildkite/cuda/test-level4.yml exists
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/cuda/test-nightly.yml)
+#   YML           - path to test-level4.yml (default: $REPO_ROOT/.buildkite/cuda/test-level4.yml)
 #   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
 #                   $REPO_ROOT/logs/ is created:
-#                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
-#                     nightly_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
-#                     nightly_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
+#                     level4_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
+#                     level4_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
+#                     level4_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
 #                   per-job *.log plus timing_summary.log after the run;
 #                   perf JSON from tests/dfx/perf/results/ (produced this run) -> $LOG_DIR/perf_results/
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
@@ -236,7 +236,7 @@ TEST_TYPE="$(_finalize_test_type_csv)"
 MODEL_TYPE="$(_finalize_model_type_csv)"
 
 # Default log directory basename: date + local timestamp; prefix depends on TEST_TYPE.
-_nightly_log_dir_basename() {
+_level4_log_dir_basename() {
   local ts has_local=0 has_stability=0 has_yaml=0 _t
   ts="$(date +%Y%m%d-%H%M%S)"
   IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
@@ -249,17 +249,17 @@ _nightly_log_dir_basename() {
     esac
   done
   if [[ "${has_local}" -eq 1 && "${has_yaml}" -eq 0 && "${has_stability}" -eq 0 ]]; then
-    printf 'nightly_local_jobs_%s' "${ts}"
+    printf 'level4_local_jobs_%s' "${ts}"
   elif [[ "${has_stability}" -eq 1 && "${has_yaml}" -eq 0 && "${has_local}" -eq 0 ]]; then
-    printf 'nightly_stability_jobs_%s' "${ts}"
+    printf 'level4_stability_jobs_%s' "${ts}"
   else
-    printf 'nightly_jobs_%s' "${ts}"
+    printf 'level4_jobs_%s' "${ts}"
   fi
 }
 
-BUILDKITE_REL=".buildkite/cuda/test-nightly.yml"
+BUILDKITE_REL=".buildkite/cuda/test-level4.yml"
 
-_find_repo_containing_nightly() {
+_find_repo_containing_yml() {
   local dir="${1:-}"
   [[ -n "$dir" ]] || return 1
   dir="$(cd "$dir" && pwd)" || return 1
@@ -294,7 +294,7 @@ if [[ -n "${YML:-}" && -n "${REPO_ROOT:-}" ]]; then
 elif [[ -n "${YML:-}" ]]; then
   YML="$(cd "$(dirname "${YML}")" && pwd)/$(basename "${YML}")"
   if ! REPO_ROOT="$(_derive_repo_root_from_yml "${YML}")"; then
-    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/cuda/test-nightly.yml)." >&2
+    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/cuda/test-level4.yml)." >&2
     echo "Set REPO_ROOT explicitly (or pass --repo-root) for pytest working directory." >&2
     exit 2
   fi
@@ -307,10 +307,10 @@ else
     REPO_ROOT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${PWD}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${PWD}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${SCRIPT_DIR}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${SCRIPT_DIR}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
     echo "Could not locate ${BUILDKITE_REL}. Set REPO_ROOT or YML, run from inside the vllm-omni clone," >&2
@@ -321,23 +321,23 @@ else
 fi
 
 if [[ -z "${LOG_DIR:-}" ]]; then
-  LOG_DIR="${REPO_ROOT}/logs/$(_nightly_log_dir_basename)"
+  LOG_DIR="${REPO_ROOT}/logs/$(_level4_log_dir_basename)"
 fi
 
 echo "Log directory: ${LOG_DIR}" >&2
 
-# Require nightly YAML only when at least one non-stability test kind needs it (validated in Python too).
-_needs_nightly_yml=0
+# Require test-level4.yml only when at least one non-stability test kind needs it (validated in Python too).
+_needs_level4_yml=0
 IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
 for _t in "${_TTOK[@]}"; do
   _t="$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   case "${_t}" in
     perf | acc | function | all)
-      _needs_nightly_yml=1
+      _needs_level4_yml=1
       ;;
   esac
 done
-if [[ "${_needs_nightly_yml}" -eq 1 ]] && [[ ! -f "${YML}" ]]; then
+if [[ "${_needs_level4_yml}" -eq 1 ]] && [[ ! -f "${YML}" ]]; then
   echo "YAML not found: ${YML}" >&2
   exit 2
 fi
@@ -971,7 +971,6 @@ PERF_RESULTS_SRC="${REPO_ROOT}/tests/dfx/perf/results"
 # Copy perf benchmark JSON written under tests/dfx/perf/results/ during this run into LOG_DIR.
 _collect_perf_result_jsons() {
   local since_epoch="${1:?}"
-  local dest="${LOG_DIR}/perf_results"
 
   if [[ ! -d "${PERF_RESULTS_SRC}" ]]; then
     return 0

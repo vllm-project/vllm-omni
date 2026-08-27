@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
-Parse pytest commands from Buildkite .buildkite/cuda/test-{ready,merge,nightly,weekly}.yml;
+Parse pytest commands from Buildkite .buildkite/cuda/test-level{2,3,4,5}.yml;
 collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.
 
 Leaf steps may live under ``group:`` blocks (nested ``steps``); those are flattened with the
@@ -30,7 +33,7 @@ import yaml
 # Repo root (parent of the directory containing this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDKITE_DIR = REPO_ROOT / ".buildkite" / "cuda"
-PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml", "test-weekly.yml"]
+PIPELINE_FILES = ["test-level2.yml", "test-level3.yml", "test-level4.yml", "test-level5.yml"]
 
 
 def load_yaml(path: Path) -> dict:
@@ -438,10 +441,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     """Write stats to HTML with styling and responsive tables."""
     root = repo_root if repo_root is not None else REPO_ROOT
     pipeline_badges = {
-        "test-ready": "ready",
-        "test-merge": "merge",
-        "test-nightly": "nightly",
-        "test-weekly": "weekly",
+        "test-level2": "level2",
+        "test-level3": "level3",
+        "test-level4": "level4",
+        "test-level5": "level5",
     }
 
     def esc(s: str) -> str:
@@ -598,10 +601,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       --text: #e6edf3;
       --muted: #8b949e;
       --accent: #58a6ff;
-      --ready: #3fb950;
-      --merge: #a371f7;
-      --nightly: #f0883e;
-      --weekly: #79c0ff;
+      --level2: #3fb950;
+      --level3: #a371f7;
+      --level4: #f0883e;
+      --level5: #79c0ff;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -713,10 +716,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       font-size: 0.8rem;
       font-weight: 500;
     }}
-    .badge.ready {{ background: rgba(63, 185, 80, 0.2); color: var(--ready); }}
-    .badge.merge {{ background: rgba(163, 113, 247, 0.2); color: var(--merge); }}
-    .badge.nightly {{ background: rgba(240, 136, 62, 0.2); color: var(--nightly); }}
-    .badge.weekly {{ background: rgba(121, 192, 255, 0.2); color: var(--weekly); }}
+    .badge.level2 {{ background: rgba(63, 185, 80, 0.2); color: var(--level2); }}
+    .badge.level3 {{ background: rgba(163, 113, 247, 0.2); color: var(--level3); }}
+    .badge.level4 {{ background: rgba(240, 136, 62, 0.2); color: var(--level4); }}
+    .badge.level5 {{ background: rgba(121, 192, 255, 0.2); color: var(--level5); }}
     .badge.skip {{ background: rgba(139, 148, 158, 0.25); color: var(--muted); }}
     td.status {{ color: var(--muted); font-size: 0.85rem; }}
     .case-details details {{
@@ -915,8 +918,8 @@ def _sample_preview_stats() -> list[tuple]:
     skipped_a = {"tests/e2e/demo/test_alpha.py::test_smoke"}
     return [
         (
-            "test-ready / :card_index_dividers: Simple Test / Simple · Diffusion",
-            "test-ready",
+            "test-level2 / :card_index_dividers: Simple Test / Simple · Diffusion",
+            "test-level2",
             ":card_index_dividers: Simple Test",
             "Simple · Diffusion & Model Executor Test",
             ["tests/diffusion/test_dummy.py", "tests/model_executor/test_dummy.py"],
@@ -928,8 +931,8 @@ def _sample_preview_stats() -> list[tuple]:
             skipped_a,
         ),
         (
-            "test-ready / Custom Pipeline Test",
-            "test-ready",
+            "test-level2 / Custom Pipeline Test",
+            "test-level2",
             None,
             "Custom Pipeline Test",
             ["tests/e2e/features/custom_pipeline/test_cp.py"],
@@ -941,8 +944,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-merge / :card_index_dividers: Diffusion Test / LoRA",
-            "test-merge",
+            "test-level3 / :card_index_dividers: Diffusion Test / LoRA",
+            "test-level3",
             ":card_index_dividers: Diffusion Test",
             "Diffusion · LoRA Test",
             ["tests/diffusion/lora/test_lora.py"],
@@ -957,8 +960,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-nightly / Omni marker-only (sample)",
-            "test-nightly",
+            "test-level4 / Omni marker-only (sample)",
+            "test-level4",
             ":card_index_dividers: Omni Model Test",
             "Omni · marker-only step (sample)",
             [],
@@ -970,8 +973,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-weekly / Reliability (sample)",
-            "test-weekly",
+            "test-level5 / Reliability (sample)",
+            "test-level5",
             None,
             "Reliability Test - qwen3-omni",
             ["tests/dfx/reliability/test_reliability_qwen3_omni.py"],

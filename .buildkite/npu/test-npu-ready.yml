@@ -1,7 +1,7 @@
 steps:
   - label: "Platforms Test"
     key: ready-platforms-test
-    depends_on: upload-ready-pipeline
+    depends_on: upload-level2-pipeline
     mirror_hardwares: a3_npu_2
     commands:
       - >-
@@ -12,7 +12,7 @@ steps:
 
   - group: ":card_index_dividers: Omni Model Test"
     key: ready-omni-group
-    depends_on: upload-ready-pipeline
+    depends_on: upload-level2-pipeline
     steps:
       - label: "Omni · MiniCPM-o 4.5 Test"
         mirror_hardwares: a3_npu_2
@@ -40,7 +40,7 @@ steps:
 
   - group: ":card_index_dividers: TTS Model Test"
     key: ready-tts-group
-    depends_on: upload-ready-pipeline
+    depends_on: upload-level2-pipeline
     steps:
       - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
         mirror_hardwares: a3_npu_2

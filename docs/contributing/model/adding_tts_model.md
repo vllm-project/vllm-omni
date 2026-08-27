@@ -438,7 +438,7 @@ selects the scheduler and worker family:
 Key topology fields belong to `StagePipelineConfig`:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `model_stage` | Logical stage name (`ar_stage`, `decoder`, etc.). |
 | `execution_type` | Runtime family for this stage. |
 | `input_sources` | Upstream stage IDs that provide input. |
@@ -649,7 +649,7 @@ down and spawn a new one mid-module. A few rules that save real CI debugging tim
   warmup signals, expose them through `/health` rather than adding `time.sleep(...)`
   inside the test. (Bare TCP `connect_ex` probes were insufficient; see
   `tests/conftest.py` `OmniServer.wait_for_ready`.)
-- **Use `core_model` marker + H100 hardware_test** to match the `test-ready.yml`
+- **Use `core_model` marker + H100 hardware_test** to match the `test-level2.yml`
   pipeline so your test is picked up by the `ready` label, not only nightly.
 
 ## Online Serving Integration

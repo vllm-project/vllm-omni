@@ -49,8 +49,8 @@ self-check.
 - [`vllm-omni-test`](vllm-omni-test/SKILL.md): guides generation and execution
   of CI-aligned tests (L1–L4), pytest marker selection (`core_model` /
   `advanced_model` / `full_model`, `omni` / `tts` / `diffusion`), Buildkite
-  wiring (`test-ready.yml`, `test-merge.yml`, `test-nightly.yml`,
-  `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
+  wiring (`test-level2.yml`, `test-level3.yml`, `test-level4.yml`,
+  `test-level5.yml`), and copy-paste local plus CI-like `pytest` commands; see
   `references/test-routing.md` for level-to-command mapping
 
 ## Maintenance Guidelines

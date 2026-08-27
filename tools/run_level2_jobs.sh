@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
-# Extract steps from .buildkite/cuda/test-ready.yml that contain pytest, synthesize
+# Extract steps from .buildkite/cuda/test-level2.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
 # after each step's Buildkite "key" when present (otherwise a slug of the label).
 #
@@ -19,20 +19,20 @@
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
 #
 # Usage:
-#   bash tools/run_ready_jobs.sh
-#   REPO_ROOT=/path/to/vllm-omni bash tools/run_ready_jobs.sh --model-type omni --dry-run
-#   YML=/path/to/vllm-omni/.buildkite/cuda/test-ready.yml bash tools/run_ready_jobs.sh
+#   bash tools/run_level2_jobs.sh
+#   REPO_ROOT=/path/to/vllm-omni bash tools/run_level2_jobs.sh --model-type omni --dry-run
+#   YML=/path/to/vllm-omni/.buildkite/cuda/test-level2.yml bash tools/run_level2_jobs.sh
 #
 # Repository / YAML (no dependency on where this script lives):
-#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-ready.yml
+#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-level2.yml
 #   • Or set YML (or --yaml) — repo root is inferred as parent of the .buildkite directory
 #   • Or run from inside the clone: git rev-parse --show-toplevel, else walk up from $PWD,
-#     then from the script's directory, until .buildkite/cuda/test-ready.yml exists
+#     then from the script's directory, until .buildkite/cuda/test-level2.yml exists
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-ready.yml (default: $REPO_ROOT/.buildkite/cuda/test-ready.yml)
-#   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/ready_jobs);
+#   YML           - path to test-level2.yml (default: $REPO_ROOT/.buildkite/cuda/test-level2.yml)
+#   LOG_DIR       - logs + generated job scripts (default: $REPO_ROOT/logs/level2_jobs);
 #                   per-job *.log plus timing_summary.log after the run
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
 #   LABEL_SUBSTR  - substring of Buildkite step label
@@ -41,8 +41,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILDKITE_REL=".buildkite/cuda/test-ready.yml"
-DEFAULT_LOG_SUBDIR="ready_jobs"
+BUILDKITE_REL=".buildkite/cuda/test-level2.yml"
+DEFAULT_LOG_SUBDIR="level2_jobs"
 
 # shellcheck source=tools/run_jobs_common.sh
 source "${SCRIPT_DIR}/run_jobs_common.sh"

@@ -3,13 +3,11 @@
 # ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins``, then strips
 # ``mirror_hardwares`` before Buildkite upload.
 #
-# Mapping form (selected by env ``MIRROR_HW`` at upload time):
-#   mirror_hardwares:
-#     default: h100_2
-#     b200: b200_2
-# Unset/empty MIRROR_HW → default; MIRROR_HW=b200 → b200 entry.
+# Count form (compose {chip}_{count} from pytest -m H100/L4/B200):
+#   mirror_hardwares: 2
+# One SKU in -m → that chip. Several SKUs: unset MIRROR_HW prefers L4 then H100;
+# MIRROR_HW=b200 matches B200 in -m (else the step is skipped).
 # MIRROR_HW must be empty or b200 (case-insensitive); unknown values fail the upload.
-# Mapping without a key for a known MIRROR_HW omits that step (e.g. H100-only: default only).
 # CUDA preset strings (h100_4, l4_1) are omitted when MIRROR_HW=b200.
 # Unset MIRROR_HW keeps string presets. NPU presets ignore MIRROR_HW.
 #

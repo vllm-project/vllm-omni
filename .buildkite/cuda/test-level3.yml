@@ -1,3 +1,6 @@
+# CUDA CI L3 (`advanced_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
+# Uploaded by Upload Level3 Pipeline: PR label `merge-test`, or post-merge on main.
+
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_USE_FLASHINFER_MOE_FP16: 0
@@ -6,7 +9,7 @@ env:
 
 steps:
   - group: ":card_index_dividers: Simple Test"
-    depends_on: upload-merge-pipeline
+    depends_on: upload-level3-pipeline
     steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
@@ -33,7 +36,7 @@ steps:
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
-    depends_on: upload-merge-pipeline
+    depends_on: upload-level3-pipeline
     steps:
       - label: "Diffusion · LoRA Test"
         timeout_in_minutes: 30
@@ -42,7 +45,7 @@ steps:
         mirror_hardwares: l4_1
 
   - label: "Distributed Test"
-    depends_on: upload-merge-pipeline
+    depends_on: upload-level3-pipeline
     timeout_in_minutes: 60
     commands:
       - |
@@ -54,7 +57,7 @@ steps:
     mirror_hardwares: h100_1
 
   - group: ":card_index_dividers: Entrypoints Test"
-    depends_on: upload-merge-pipeline
+    depends_on: upload-level3-pipeline
     steps:
       - label: "Entrypoint Test with H100"
         # TEMPORARY 60 -> 90: engine startup/sleep-wake is ~13-15 min slower per
@@ -73,7 +76,7 @@ steps:
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Test"
-    depends_on: upload-merge-pipeline
+    depends_on: upload-level3-pipeline
     steps:
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies:

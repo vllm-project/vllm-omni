@@ -1,3 +1,6 @@
+# CUDA CI L5 (`slow` / reliability / extra coverage).
+# Uploaded by Upload Level5 Pipeline: WEEKLY=1 / NON_CRITICAL=1, or PR label `weekly-test`.
+
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_USE_FLASHINFER_MOE_FP16: 0
@@ -7,7 +10,7 @@ env:
 steps:
   - label: "Simple · CPU Coverage Test"
     key: weekly-simple-cpu-coverage
-    depends_on: upload-weekly-pipeline
+    depends_on: upload-level5-pipeline
     if: build.env("WEEKLY") == "1"
     timeout_in_minutes: 60
     commands:
@@ -22,7 +25,7 @@ steps:
     mirror_hardwares: l4_1
 
   - group: "Reliability Test"
-    depends_on: upload-weekly-pipeline
+    depends_on: upload-level5-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
 
@@ -57,7 +60,7 @@ steps:
         mirror_hardwares: l4_1
 
   - group: "Perf Test"
-    depends_on: upload-weekly-pipeline
+    depends_on: upload-level5-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
 
@@ -101,7 +104,7 @@ steps:
         mirror_hardwares: h100_3
 
   - group: ":card_index_dividers: E2E Tests"
-    depends_on: upload-weekly-pipeline
+    depends_on: upload-level5-pipeline
     if: build.env("NON_CRITICAL") == "1"
     steps:
 

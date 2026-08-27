@@ -9,47 +9,47 @@ steps:
       queue: "cpu_queue_premerge"
 
   # L2 Test — PR ready label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
-  - label: "Upload Ready Pipeline"
+  - label: "Upload Level2 Pipeline"
     depends_on: image-build
-    key: upload-ready-pipeline
+    key: upload-level2-pipeline
     commands:
       - |
         EXTRA=""
         if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-level2.yml
     agents:
       queue: "cpu_queue_premerge"
 
   # L3 Test — PR merge-test label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
-  - label: "Upload Merge Pipeline"
+  - label: "Upload Level3 Pipeline"
     depends_on: image-build
-    key: upload-merge-pipeline
+    key: upload-level3-pipeline
     commands:
       - |
         EXTRA=""
         if [ "${WEEKLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
           EXTRA="--e2e"
         fi
-        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-level3.yml
     agents:
       queue: "cpu_queue_premerge"
 
   # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
-  - label: "Upload Nightly Pipeline"
+  - label: "Upload Level4 Pipeline"
     depends_on: image-build
-    key: upload-nightly-pipeline
+    key: upload-level4-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-nightly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-level4.yml
     agents:
       queue: "cpu_queue_premerge"
 
   # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (scheduled), or PR with weekly-test label
-  - label: "Upload Weekly Pipeline"
+  - label: "Upload Level5 Pipeline"
     depends_on: image-build
-    key: upload-weekly-pipeline
+    key: upload-level5-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-weekly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/test-level5.yml
     agents:
       queue: "cpu_queue_premerge"

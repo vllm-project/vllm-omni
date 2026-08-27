@@ -24,10 +24,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
-  - key: upload-ready-pipeline
-  - key: upload-merge-pipeline
-  - key: upload-nightly-pipeline
-  - key: upload-weekly-pipeline
+  - key: upload-level2-pipeline
+  - key: upload-level3-pipeline
+  - key: upload-level4-pipeline
+  - key: upload-level5-pipeline
 """
 
 
@@ -51,14 +51,14 @@ def test_bootstrap_if_injected_by_step_key() -> None:
     assert "image-build" in by_key
     # Unconditional image has no ``if`` (Buildkite rejects YAML bool if: true).
     assert "if" not in by_key["image-build"]
-    assert isinstance(by_key["upload-ready-pipeline"]["if"], str)
-    assert isinstance(by_key["upload-nightly-pipeline"]["if"], str)
+    assert isinstance(by_key["upload-level2-pipeline"]["if"], str)
+    assert isinstance(by_key["upload-level4-pipeline"]["if"], str)
 
 
 def test_bootstrap_steps_loaded_from_file() -> None:
     steps = _load_bootstrap_steps(CUDA_BOOTSTRAP_STEPS)
     assert "key: image-build" in steps
-    assert "key: upload-ready-pipeline" in steps
+    assert "key: upload-level2-pipeline" in steps
     assert "placeholder:" not in steps
 
 
@@ -66,18 +66,18 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
-    assert "key: upload-nightly-pipeline" in rendered
-    assert "key: upload-weekly-pipeline" in rendered
+    assert "key: upload-level4-pipeline" in rendered
+    assert "key: upload-level5-pipeline" in rendered
     # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
     doc = yaml.safe_load(rendered)
     by_key = {step["key"]: step for step in doc["steps"]}
-    assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
-    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
-    assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
-    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
-    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-level2-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-level2-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-level2-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-level3-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-level3-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-level3-pipeline"]["if"]
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-level4-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
     assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
@@ -96,23 +96,23 @@ def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
     )
     doc = yaml.safe_load(rendered)
     by_key = {step["key"]: step for step in doc["steps"]}
-    assert "upload-ready-pipeline" not in by_key
-    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+    assert "upload-level2-pipeline" not in by_key
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-level4-pipeline"]["if"]
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
-    rendered = _render([".buildkite/cuda/test-nightly.yml"])
+    rendered = _render([".buildkite/cuda/test-level4.yml"])
     assert "if: true" not in rendered
     assert 'build.pull_request.labels includes "nightly-test"' in rendered
     assert 'build.pull_request.labels includes "weekly-test"' in rendered
     # L2/L3 upload steps are unconditionally disabled → omitted from pipeline
-    assert "key: upload-ready-pipeline" not in rendered
-    assert "key: upload-merge-pipeline" not in rendered
-    assert "key: upload-weekly-pipeline" in rendered
+    assert "key: upload-level2-pipeline" not in rendered
+    assert "key: upload-level3-pipeline" not in rendered
+    assert "key: upload-level5-pipeline" in rendered
 
 
 def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
-    rendered = _render([".buildkite/cuda/test-ready.yml"])
+    rendered = _render([".buildkite/cuda/test-level2.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered
     assert "if: true" not in rendered
 
@@ -163,73 +163,6 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     ]
 
 
-def test_mirror_hardwares_mapping_uses_default_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
-    step = _expand_mirror_hardwares(
-        {
-            "label": "Nightly Omni",
-            "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"},
-        },
-    )
-    assert step is not None
-    assert step["agents"]["queue"] == "mithril-h100-pool"
-    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
-
-
-def test_mirror_hardwares_mapping_selects_b200_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
-    step = _expand_mirror_hardwares(
-        {
-            "label": "Nightly Omni",
-            "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"},
-        },
-    )
-    assert step is not None
-    assert step["agents"]["queue"] == "b200-k8s"
-    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
-
-
-def test_mirror_hardwares_mapping_missing_selector_skips_step(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
-    assert (
-        _expand_mirror_hardwares(
-            {
-                "label": "H100 only",
-                "mirror_hardwares": {"default": "h100_4"},
-            },
-        )
-        is None
-    )
-
-    doc = {
-        "steps": [
-            {
-                "group": ":card_index_dividers: Mixed",
-                "steps": [
-                    {"label": "H100 only", "mirror_hardwares": {"default": "h100_4"}},
-                    {
-                        "label": "Both",
-                        "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"},
-                    },
-                    {"label": "String H100", "mirror_hardwares": "h100_4"},
-                ],
-            },
-            {
-                "group": ":card_index_dividers: H100 only group",
-                "steps": [
-                    {"label": "Skip me", "mirror_hardwares": {"default": "h100_1"}},
-                ],
-            },
-        ],
-    }
-    rendered = _render_test_pipeline(doc, changed_files=None)
-    groups = [step.get("group") for step in rendered["steps"]]
-    assert ":card_index_dividers: H100 only group" not in groups
-    mixed = next(step for step in rendered["steps"] if step.get("group") == ":card_index_dividers: Mixed")
-    assert [child["label"] for child in mixed["steps"]] == ["Both"]
-    assert mixed["steps"][0]["agents"]["queue"] == "b200-k8s"
-
-
 def test_mirror_hardwares_cuda_string_skips_when_selector_is_other_chip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -243,6 +176,35 @@ def test_mirror_hardwares_cuda_string_skips_when_selector_is_other_chip(
     assert npu is not None
     assert npu["agents"]["queue"] == "ascend-a2b3"
 
+    doc = {
+        "steps": [
+            {
+                "group": ":card_index_dividers: Mixed",
+                "steps": [
+                    {"label": "H100 only", "mirror_hardwares": "h100_4"},
+                    {
+                        "label": "Count remap",
+                        "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
+                        "mirror_hardwares": 2,
+                    },
+                    {"label": "String H100", "mirror_hardwares": "h100_4"},
+                ],
+            },
+            {
+                "group": ":card_index_dividers: H100 only group",
+                "steps": [
+                    {"label": "Skip me", "mirror_hardwares": "h100_1"},
+                ],
+            },
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files=None)
+    groups = [step.get("group") for step in rendered["steps"]]
+    assert ":card_index_dividers: H100 only group" not in groups
+    mixed = next(step for step in rendered["steps"] if step.get("group") == ":card_index_dividers: Mixed")
+    assert [child["label"] for child in mixed["steps"]] == ["Count remap"]
+    assert mixed["steps"][0]["agents"]["queue"] == "b200-k8s"
+
 
 def test_mirror_hardwares_cuda_string_kept_when_selector_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
@@ -251,11 +213,159 @@ def test_mirror_hardwares_cuda_string_kept_when_selector_unset(monkeypatch: pyte
     assert step["agents"]["queue"] == "mithril-h100-pool"
 
 
-def test_mirror_hardwares_mapping_requires_default() -> None:
-    with pytest.raises(ValueError, match="must include a 'default' key"):
+def test_mirror_hardwares_mapping_is_rejected() -> None:
+    with pytest.raises(ValueError, match="must be a GPU count or a preset string"):
         _expand_mirror_hardwares(
-            {"label": "bad", "mirror_hardwares": {"b200": "b200_2"}},
+            {"label": "bad", "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"}},
         )
+
+
+def test_mirror_hardwares_count_uses_h100_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "Omni Function",
+            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
+            "mirror_hardwares": 2,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
+
+
+def test_mirror_hardwares_count_uses_l4_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "TTS L4",
+            "commands": ["pytest -s -v tests/e2e/ -m 'full_model and L4 and tts'"],
+            "mirror_hardwares": 1,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "gpu_1_queue"
+
+
+def test_mirror_hardwares_count_single_sku_ignores_mirror_hw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "Omni Function",
+            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
+            "mirror_hardwares": 2,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+    assert step["commands"] == ['pytest -sv tests/e2e -m "full_model and H100 and omni"']
+
+
+def test_mirror_hardwares_count_multi_sku_unset_prefers_h100_over_b200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "Omni Function",
+            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
+            "mirror_hardwares": 2,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+
+
+def test_mirror_hardwares_count_multi_sku_matches_mirror_hw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "Omni Function",
+            "commands": ['pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"'],
+            "mirror_hardwares": 2,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "b200-k8s"
+    assert step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 2
+    assert step["commands"] == [
+        'pytest -sv tests/e2e -m "full_model and H100 and B200 and omni"',
+    ]
+
+
+def test_mirror_hardwares_count_multi_sku_skips_when_mirror_hw_not_in_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    assert (
+        _expand_mirror_hardwares(
+            {
+                "label": "H100 or L4",
+                "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
+                "mirror_hardwares": 4,
+            },
+        )
+        is None
+    )
+
+
+def test_mirror_hardwares_count_prefers_l4_when_both_markers_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "mixed",
+            "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
+            "mirror_hardwares": 4,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "gpu_4_queue"
+
+
+def test_mirror_hardwares_count_falls_back_when_l4_count_has_no_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "mixed",
+            "commands": ['pytest -sv tests/e2e -m "H100 or L4"'],
+            "mirror_hardwares": 2,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "mithril-h100-pool"
+
+
+def test_mirror_hardwares_count_requires_sku_marker_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    with pytest.raises(ValueError, match="needs a pytest -m SKU marker"):
+        _expand_mirror_hardwares(
+            {
+                "label": "no sku",
+                "commands": ['pytest -sv tests/e2e -m "full_model and cuda"'],
+                "mirror_hardwares": 2,
+            },
+        )
+
+
+def test_mirror_hardwares_count_ignores_not_h100(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    step = _expand_mirror_hardwares(
+        {
+            "label": "L4 only",
+            "commands": ['pytest -sv tests/e2e -m "full_model and L4 and not H100"'],
+            "mirror_hardwares": 4,
+        },
+    )
+    assert step is not None
+    assert step["agents"]["queue"] == "gpu_4_queue"
 
 
 @pytest.mark.parametrize("selector", ["", "   "])
@@ -286,7 +396,8 @@ def test_mirror_hw_typo_fails_before_skipping_steps(monkeypatch: pytest.MonkeyPa
             {"label": "CPU report", "commands": ["echo ok"]},
             {
                 "label": "Nightly Omni",
-                "mirror_hardwares": {"default": "h100_2", "b200": "b200_2"},
+                "commands": ['pytest -sv tests/e2e -m "full_model and H100 and omni"'],
+                "mirror_hardwares": 2,
             },
             {"label": "H100 string", "mirror_hardwares": "h100_4"},
         ],

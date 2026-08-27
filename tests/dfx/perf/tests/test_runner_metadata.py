@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for DFX runner metadata field exclusion."""
 
 import json
@@ -194,6 +197,7 @@ def test_create_unique_server_pytest_params_applies_marks(tmp_path):
     assert len(by_id["test_with_mark"].values) == 1
     assert isinstance(by_id["test_with_mark"].values[0], tuple)
     assert any(m.name == "H100" for m in by_id["test_with_mark"].marks)
+    assert not any(m.name == "B200" for m in by_id["test_with_mark"].marks)
     assert not any(m.name == "H100" for m in by_id["test_without_mark"].marks)
 
 

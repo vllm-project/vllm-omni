@@ -67,17 +67,17 @@ def get_hardware_mark_list() -> frozenset[str]:
     return frozenset(names)
 
 
-def cuda_marks(*, res: str, num_cards: int):
-    test_platform_detail = pytest.mark.cuda
-    if res == "L4":
-        test_resource = pytest.mark.L4
-    elif res == "H100":
-        test_resource = pytest.mark.H100
-    elif res == "H800":
-        test_resource = pytest.mark.H800
-    else:
-        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100, H800")
-    marks = [test_resource, test_platform_detail]
+def cuda_marks(*, res: str | list[str] | tuple[str, ...], num_cards: int):
+    skus = [res] if isinstance(res, str) else list(res)
+    if not skus:
+        raise ValueError("CUDA resource list must not be empty")
+    allowed = ("L4", "H100", "H800", "B200")
+    for sku in skus:
+        if sku not in allowed:
+            raise ValueError(f"Invalid CUDA resource type: {sku}. Supported: {', '.join(allowed)}")
+    marks = [pytest.mark.cuda]
+    for sku in skus:
+        marks.append(getattr(pytest.mark, sku))
     if num_cards == 1:
         return marks
     test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
@@ -137,17 +137,27 @@ def musa_marks(*, res: str, num_cards: int):
     return marks + [test_distributed]
 
 
-def gpu_marks(*, res: str, num_cards: int):
+def gpu_marks(*, res: str | list[str] | tuple[str, ...], num_cards: int):
     test_platform = pytest.mark.gpu
-    if res in ("L4", "H100", "H800"):
-        return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
+    skus = [res] if isinstance(res, str) else list(res)
+    cuda_skus = {"L4", "H100", "H800", "B200"}
+    if skus and all(sku in cuda_skus for sku in skus):
+        return [test_platform] + cuda_marks(res=skus, num_cards=num_cards)
+    # Multi-SKU lists are CUDA-only; other backends take a single SKU string.
+    if not isinstance(res, str):
+        raise ValueError(
+            f"Invalid resource type: {res}. Multi-SKU lists are CUDA-only "
+            "(L4, H100, H800, B200). Supported: L4, H100, H800, B200, MI325, B60, S5000",
+        )
     if res == "MI325":
         return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
     if res == "B60":
         return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
     if res == "S5000":
         return [test_platform] + musa_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, H800, MI325, B60, S5000")
+    raise ValueError(
+        f"Invalid resource type: {res}. Supported: L4, H100, H800, B200, MI325, B60, S5000",
+    )
 
 
 def npu_marks(*, res: str, num_cards: int):
@@ -164,7 +174,7 @@ def npu_marks(*, res: str, num_cards: int):
     return [mark for mark in [test_platform, test_resource, test_distributed] if mark is not None]
 
 
-def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+def hardware_marks(*, res: dict[str, str | list[str] | tuple[str, ...]], num_cards: int | dict[str, int] = 1):
     for platform, _ in res.items():
         if platform not in ("cuda", "rocm", "xpu", "npu", "musa"):
             raise ValueError(f"Unsupported platform: {platform}")
@@ -185,6 +195,8 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
         if platform in ("cuda", "rocm", "xpu", "musa"):
             marks = gpu_marks(res=resource, num_cards=cards)
         elif platform == "npu":
+            if not isinstance(resource, str):
+                raise ValueError(f"NPU resource must be a string, got {resource!r}")
             marks = npu_marks(res=resource, num_cards=cards)
         else:
             raise ValueError(f"Unsupported platform: {platform}")
@@ -192,7 +204,7 @@ def hardware_marks(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
     return all_marks
 
 
-def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
+def hardware_test(*, res: dict[str, str | list[str] | tuple[str, ...]], num_cards: int | dict[str, int] = 1):
     all_marks = hardware_marks(res=res, num_cards=num_cards)
 
     def wrapper(f):

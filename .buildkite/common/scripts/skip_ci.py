@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared Buildkite skip-ci and CI-YAML level targeting logic.
 
 ``resolve_ci_decision(changed_files, ...)`` buckets explicit file lists (tests, dry-run).
@@ -29,20 +30,20 @@ PLATFORMS = ("cuda", "amd", "intel", "npu")
 L23_LEVELS = frozenset({"l2", "l3"})
 
 L2_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-ready.yml": "cuda",
+    ".buildkite/cuda/test-level2.yml": "cuda",
     ".buildkite/npu/test-npu-ready.yml": "npu",
     ".buildkite/amd/test-amd-ready.yml": "amd",
     ".buildkite/intel/pipeline-intel.yml": "intel",
 }
 
 L3_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-merge.yml": "cuda",
+    ".buildkite/cuda/test-level3.yml": "cuda",
     ".buildkite/amd/test-amd-merge.yml": "amd",
 }
 
 L45_YAML_FILES: dict[str, str] = {
-    ".buildkite/cuda/test-nightly.yml": "cuda",
-    ".buildkite/cuda/test-weekly.yml": "cuda",
+    ".buildkite/cuda/test-level4.yml": "cuda",
+    ".buildkite/cuda/test-level5.yml": "cuda",
     ".buildkite/npu/test-npu-nightly.yml": "npu",
 }
 

@@ -159,22 +159,22 @@ steps:
       echo "--- Image pushed successfully"
       echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
 
-  - label: "Upload Ready Pipeline"
+  - label: "Upload Level2 Pipeline"
     depends_on:
       - image-build-a2
       - image-build-a3
-    key: upload-ready-pipeline
+    key: upload-level2-pipeline
     agents:
       queue: "cpu_queue_premerge"
     command: |
       python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-ready.yml
 
   # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
-  - label: "Upload Nightly Pipeline"
+  - label: "Upload Level4 Pipeline"
     depends_on:
       - image-build-a2
       - image-build-a3
-    key: upload-nightly-pipeline
+    key: upload-level4-pipeline
     commands:
       - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-nightly.yml
     agents:

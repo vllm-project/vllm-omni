@@ -10,22 +10,23 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
-Test pipeline mode (e.g. test-merge.yml):
+Test pipeline mode (e.g. test-level3.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
-  - ``mirror_hardwares`` may be a preset string (``l4_1``) or a mapping selected by
-    env ``MIRROR_HW``, e.g.::
+  - ``mirror_hardwares`` may be a GPU count (``2``) or a preset string (``l4_1``)::
 
-      mirror_hardwares:
-        default: h100_2
-        b200: b200_2
+      mirror_hardwares: 2
+      # or
+      mirror_hardwares: h100_2
 
-    Unset / empty ``MIRROR_HW`` → ``default``; ``MIRROR_HW=b200`` → ``b200`` entry.
-    ``MIRROR_HW`` must be empty or ``b200`` (case-insensitive); unknown values
-    (e.g. ``b20o``) fail the upload. If the mapping has no key for a *known*
-    ``MIRROR_HW``, that step is omitted (H100-only jobs list ``default`` and omit
-    ``b200``). A CUDA preset string such as ``h100_4`` is omitted when
+    Count form composes ``{chip}_{count}`` from pytest ``-m`` SKU markers
+    (``H100``, ``L4``, ``B200``). One SKU → that chip (``MIRROR_HW`` is ignored).
+    Several SKUs → unset ``MIRROR_HW`` picks L4 then H100; ``MIRROR_HW=b200``
+    matches ``B200`` in ``-m`` (otherwise the step is skipped) and appends
+    ``and B200`` when the resolved preset is ``b200_*``. ``MIRROR_HW`` must be
+    empty or ``b200`` (case-insensitive); unknown values (e.g. ``b20o``) fail
+    the upload. A CUDA preset string such as ``h100_4`` is omitted when
     ``MIRROR_HW=b200``.
 
 Usage:
@@ -39,6 +40,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import subprocess
 import sys
 from functools import lru_cache
@@ -65,10 +67,10 @@ LOG = "upload_pipeline"
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
 BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
 BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-ready-pipeline": "ready",
-    "upload-merge-pipeline": "merge",
-    "upload-nightly-pipeline": "nightly",
-    "upload-weekly-pipeline": "weekly",
+    "upload-level2-pipeline": "level2",
+    "upload-level3-pipeline": "level3",
+    "upload-level4-pipeline": "level4",
+    "upload-level5-pipeline": "level5",
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
@@ -90,14 +92,14 @@ NIGHTLY_LABEL_IF = (
 WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
 WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-MERGE_MAIN_IF = (
+LEVEL2_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
+LEVEL3_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
+LEVEL3_MAIN_IF = (
     'build.branch == "main" && build.env("NIGHTLY") != "1" && '
     'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
 )
-READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
-MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
+LEVEL2_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({LEVEL2_LABEL_IF})"
+LEVEL3_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({LEVEL3_MAIN_IF}) || ({LEVEL3_LABEL_IF}))"
 BOOTSTRAP_DISABLED_IF = "false"
 BOOTSTRAP_ENABLED_IF = "true"
 
@@ -132,53 +134,53 @@ def _format_bootstrap_if(expr: str) -> str:
 
 def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     if platform == "npu":
-        ready_upload = READY_LABEL_IF
-        merge_upload = BOOTSTRAP_DISABLED_IF
-        weekly_label_if = BOOTSTRAP_DISABLED_IF
+        level2_upload = LEVEL2_LABEL_IF
+        level3_upload = BOOTSTRAP_DISABLED_IF
+        level5_label_if = BOOTSTRAP_DISABLED_IF
     else:
-        ready_upload = READY_UPLOAD_IF
-        merge_upload = MERGE_UPLOAD_IF
-        weekly_label_if = WEEKLY_LABEL_IF
+        level2_upload = LEVEL2_UPLOAD_IF
+        level3_upload = LEVEL3_UPLOAD_IF
+        level5_label_if = WEEKLY_LABEL_IF
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
         # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
         # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
         image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
-        ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        nightly_expr = NIGHTLY_MAIN_IF
-        weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level2_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level3_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level4_expr = NIGHTLY_MAIN_IF
+        level5_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
 
-        ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
-        merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
-        nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level2_expr = level2_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
+        level3_expr = level3_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
+        level4_expr = NIGHTLY_LABEL_IF
+        level5_expr = level5_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
         image_parts = [f"({NIGHTLY_LABEL_IF})"]
         if platform == "cuda":
-            image_parts.append(f"({weekly_label_if})")
+            image_parts.append(f"({level5_label_if})")
         if l2_enabled:
-            image_parts.insert(0, f"({ready_upload})")
+            image_parts.insert(0, f"({level2_upload})")
         if l3_enabled:
-            image_parts.insert(1 if l2_enabled else 0, f"({merge_upload})")
+            image_parts.insert(1 if l2_enabled else 0, f"({level3_upload})")
         image_expr = " || ".join(image_parts)
     else:
         image_expr = BOOTSTRAP_ENABLED_IF
-        ready_expr = ready_upload
-        merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level2_expr = level2_upload
+        level3_expr = level3_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        level4_expr = NIGHTLY_LABEL_IF
+        level5_expr = level5_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
     return {
         "image": _format_bootstrap_if(image_expr),
-        "ready": _format_bootstrap_if(ready_expr),
-        "merge": _format_bootstrap_if(merge_expr),
-        "nightly": _format_bootstrap_if(nightly_expr),
-        "weekly": _format_bootstrap_if(weekly_expr),
+        "level2": _format_bootstrap_if(level2_expr),
+        "level3": _format_bootstrap_if(level3_expr),
+        "level4": _format_bootstrap_if(level4_expr),
+        "level5": _format_bootstrap_if(level5_expr),
     }
 
 
@@ -231,7 +233,7 @@ def _render_bootstrap_pipeline(
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-# --- Test pipeline (test-ready.yml, test-merge.yml) ---
+# --- Test pipeline (test-level2.yml, test-level3.yml) ---
 
 
 @lru_cache(maxsize=1)
@@ -250,6 +252,10 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
 # Longer tokens first so ``h100`` is not matched as a prefix of ``h200``.
 _CUDA_MIRROR_CHIPS = ("b200", "h200", "h100", "l4")
 _SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"b200"})
+# Unset MIRROR_HW + both H100 and L4 markers: prefer L4, then H100.
+_COUNT_UNSET_CHIP_PREFERENCE = ("l4", "h100")
+_PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
+_COUNT_PRESET_RANGE = range(1, 5)
 
 
 def _cuda_chip_from_preset(preset: str) -> str | None:
@@ -261,8 +267,150 @@ def _cuda_chip_from_preset(preset: str) -> str | None:
     return None
 
 
+def _step_command_text(commands: Any) -> str:
+    if commands is None:
+        return ""
+    if isinstance(commands, str):
+        return commands
+    if isinstance(commands, list):
+        return "\n".join(_step_command_text(part) for part in commands)
+    return str(commands)
+
+
+def _chips_from_marker_expr(expr: str) -> set[str]:
+    """Return SKU chips named positively in a pytest ``-m`` expression."""
+    stripped = re.sub(r"\bnot\s+H100\b", " ", expr)
+    stripped = re.sub(r"\bnot\s+L4\b", " ", stripped)
+    stripped = re.sub(r"\bnot\s+B200\b", " ", stripped)
+    chips: set[str] = set()
+    if re.search(r"\bH100\b", stripped):
+        chips.add("h100")
+    if re.search(r"\bL4\b", stripped):
+        chips.add("l4")
+    if re.search(r"\bB200\b", stripped):
+        chips.add("b200")
+    return chips
+
+
+def _pytest_marker_chips(commands: Any) -> set[str]:
+    chips: set[str] = set()
+    for match in _PYTEST_MARKER_ARG.finditer(_step_command_text(commands)):
+        expr = match.group(1) or match.group(2) or match.group(3) or ""
+        chips |= _chips_from_marker_expr(expr)
+    return chips
+
+
+def _parse_gpu_count(hardware: Any, *, step_label: str) -> int | None:
+    """Return GPU count for count-form ``mirror_hardwares``, or None if not count-form."""
+    if isinstance(hardware, bool):
+        raise ValueError(f"mirror_hardwares must not be a boolean in step {step_label!r}")
+    if isinstance(hardware, int):
+        count = hardware
+    elif isinstance(hardware, str) and hardware.strip().isdigit():
+        count = int(hardware.strip())
+    else:
+        return None
+    if count not in _COUNT_PRESET_RANGE:
+        raise ValueError(
+            f"mirror_hardwares GPU count in step {step_label!r} must be 1–4, got {count}",
+        )
+    return count
+
+
+def _append_b200_to_marker_expr(expr: str) -> str:
+    """Require B200 in addition to existing H100/L4 so SKU splits stay disjoint."""
+    if re.search(r"\bB200\b", expr):
+        return expr
+    if not re.search(r"\bH100\b", expr) and not re.search(r"\bL4\b", expr):
+        return expr
+    return f"({expr}) and B200"
+
+
+def _rewrite_pytest_marker_arg(raw: str) -> str:
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        quote = raw[0]
+        return f"{quote}{_append_b200_to_marker_expr(raw[1:-1])}{quote}"
+    return _append_b200_to_marker_expr(raw)
+
+
+def _rewrite_command_add_b200(command: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{_rewrite_pytest_marker_arg(match.group(2))}"
+
+    marker_arg = re.compile(r"(-m\s+)(\"[^\"]*\"|'[^']*'|\S+)")
+    return marker_arg.sub(_replace, command)
+
+
+def _rewrite_commands_add_b200(commands: Any) -> Any:
+    if isinstance(commands, str):
+        return _rewrite_command_add_b200(commands)
+    if isinstance(commands, list):
+        return [_rewrite_commands_add_b200(part) for part in commands]
+    return commands
+
+
+def _count_preset_name(chip: str, count: int, *, step_label: str) -> str:
+    chosen = f"{chip}_{count}"
+    known = _load_mirror_hardwares()
+    if chosen not in known:
+        raise ValueError(
+            f"mirror_hardwares: {count} in step {step_label!r} has no preset {chosen!r}",
+        )
+    return chosen
+
+
+def _resolve_count_preset(count: int, *, step: dict[str, Any], step_label: str) -> str | None:
+    """Compose ``{chip}_{count}`` from pytest SKU markers and ``MIRROR_HW``.
+
+    One SKU in ``-m`` uses that chip. Several SKUs: unset ``MIRROR_HW`` prefers
+    L4 then H100; a set selector must appear in ``-m`` or the step is skipped.
+    """
+    chips = _pytest_marker_chips(step.get("commands"))
+    if not chips:
+        raise ValueError(
+            f"mirror_hardwares: {count} in step {step_label!r} needs a pytest -m SKU marker "
+            f"(H100, L4, or B200), or an explicit preset string",
+        )
+
+    selector = _get_mirror_hw_selector()
+    if len(chips) == 1:
+        chip = next(iter(chips))
+        chosen = _count_preset_name(chip, count, step_label=step_label)
+        extra = f" (ignored MIRROR_HW={selector!r})" if selector and selector != chip else ""
+        _log(f"{step_label}: mirror_hardwares count {count} → single marker {chip}{extra} → {chosen!r}")
+        return chosen
+
+    if selector:
+        if selector not in chips:
+            _log(
+                f"skip {step_label}: MIRROR_HW={selector!r} is not among -m SKUs {sorted(chips)}",
+            )
+            return None
+        chosen = _count_preset_name(selector, count, step_label=step_label)
+        _log(f"{step_label}: mirror_hardwares count {count} → MIRROR_HW={selector!r} → {chosen!r}")
+        return chosen
+
+    tried: list[str] = []
+    for chip in _COUNT_UNSET_CHIP_PREFERENCE:
+        if chip not in chips:
+            continue
+        chosen = f"{chip}_{count}"
+        tried.append(chosen)
+        if chosen not in _load_mirror_hardwares():
+            continue
+        _log(
+            f"{step_label}: mirror_hardwares count {count} → marker {chip} "
+            f"(multiple SKU markers; preferred L4 then H100) → {chosen!r}",
+        )
+        return chosen
+    raise ValueError(
+        f"mirror_hardwares: {count} in step {step_label!r} found SKU markers {sorted(chips)} "
+        f"but no H100/L4 preset among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
+    )
+
+
 def _get_mirror_hw_selector() -> str:
-    """Return lowercase ``MIRROR_HW``, or empty to use the mapping ``default`` key.
+    """Return lowercase ``MIRROR_HW``, or empty to keep string presets / marker chips.
 
     A set value must be ``b200`` (case-insensitive). Unknown values fail closed
     so a typo cannot silently drop the CUDA pipeline.
@@ -275,20 +423,22 @@ def _get_mirror_hw_selector() -> str:
     return selector
 
 
-def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | None:
+def _resolve_mirror_hardware_name(hardware: Any, *, step: dict[str, Any], step_label: str) -> str | None:
     """Resolve ``mirror_hardwares`` to a preset name from ``ci_mirror_hardwares.yml``.
 
-    Accepts a preset string, or a mapping::
+    Accepts a GPU count or a preset string::
 
-        mirror_hardwares:
-          default: h100_2
-          b200: b200_2
+        mirror_hardwares: 2
+        mirror_hardwares: h100_2
 
-    Selection uses env ``MIRROR_HW`` (case-insensitive). Unset/empty → ``default``.
-    Only ``b200`` is a supported set value; anything else raises (fail the upload).
-    Missing mapping key for a *known* selector omits the step (returns None).
-    A CUDA preset string is omitted when ``MIRROR_HW`` names a different chip.
+    Count form: one ``-m`` SKU uses that chip; several SKUs use ``MIRROR_HW``
+    (unset → L4 then H100; ``b200`` must appear in ``-m``). A CUDA preset
+    string is omitted when ``MIRROR_HW`` names a different chip.
     """
+    count = _parse_gpu_count(hardware, step_label=step_label)
+    if count is not None:
+        return _resolve_count_preset(count, step=step, step_label=step_label)
+
     if isinstance(hardware, str):
         name = hardware.strip()
         if not name:
@@ -302,40 +452,9 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | No
             return None
         return name
 
-    if not isinstance(hardware, dict):
-        raise ValueError(
-            f"mirror_hardwares must be a preset string or a mapping with 'default' in step {step_label!r}",
-        )
-
-    if "default" not in hardware:
-        raise ValueError(
-            f"mirror_hardwares mapping in step {step_label!r} must include a 'default' key",
-        )
-    key_map: dict[str, str] = {}
-    for key, value in hardware.items():
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError(
-                f"mirror_hardwares mapping keys must be non-empty strings in step {step_label!r}",
-            )
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"mirror_hardwares mapping values must be non-empty preset strings "
-                f"in step {step_label!r} (key {key!r})",
-            )
-        key_map[key.strip().lower()] = value.strip()
-
-    selector = _get_mirror_hw_selector()
-    if not selector:
-        chosen = key_map["default"]
-        _log(f"{step_label}: mirror_hardwares mapping → default={chosen!r}")
-        return chosen
-    if selector not in key_map:
-        known = ", ".join(sorted(hardware))
-        _log(f"skip {step_label}: MIRROR_HW={selector!r} is not a key in mirror_hardwares mapping {{{known}}}")
-        return None
-    chosen = key_map[selector]
-    _log(f"{step_label}: MIRROR_HW={selector!r} → mirror_hardwares={chosen!r}")
-    return chosen
+    raise ValueError(
+        f"mirror_hardwares must be a GPU count or a preset string in step {step_label!r}",
+    )
 
 
 def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
@@ -353,7 +472,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             f"step {step_label!r} sets mirror_hardwares together with agents/plugins/image; use mirror_hardwares only",
         )
 
-    preset_name = _resolve_mirror_hardware_name(hardware, step_label=step_label)
+    preset_name = _resolve_mirror_hardware_name(hardware, step=step, step_label=step_label)
     if preset_name is None:
         return None
 
@@ -365,7 +484,13 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
         )
 
     expanded = copy.deepcopy(preset)
-    return {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
+    merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
+    if _cuda_chip_from_preset(preset_name) == "b200" and merged.get("commands") is not None:
+        rewritten = _rewrite_commands_add_b200(merged["commands"])
+        if rewritten != merged["commands"]:
+            merged["commands"] = rewritten
+            _log(f"{step_label}: appended B200 to pytest -m (MIRROR_HW=b200)")
+    return merged
 
 
 def _match_source_file(changed_files: list[str], prefixes: list[str]) -> bool:

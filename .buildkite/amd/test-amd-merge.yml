@@ -150,9 +150,7 @@ steps:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - timeout 20m pytest -s -v tests/engine/test_async_omni_engine_abort.py
 
-# This is from test-nightly.yml.
 # This model seems to be important, so I am trying to run it here.
-# Since this is from test-nightly.yml,
 # I keep this non-blocking.
 - group: ":card_index_dividers: E2E Test"
   steps:

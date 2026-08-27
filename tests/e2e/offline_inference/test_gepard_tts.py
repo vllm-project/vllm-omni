@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for the Gepard-1.0 single-stage native-AR TTS.
 
 Zero-shot only (the model's default learned voice). These tests need a GPU and
@@ -30,7 +30,7 @@ from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_id
 
 # The codec decoder is an optional dependency; skip rather than fail the engine
 # inside the worker process when it is absent. The CI image does not carry it,
-# so the weekly step installs it first -- see .buildkite/cuda/test-weekly.yml.
+# so the weekly step installs it first -- see .buildkite/cuda/test-level5.yml.
 # Install recipe: examples/offline_inference/text_to_speech/README.md.
 pytest.importorskip("nemo.collections.tts.models")
 

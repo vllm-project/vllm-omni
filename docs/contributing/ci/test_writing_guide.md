@@ -656,6 +656,6 @@ Add pytest modules under `tests/dfx/reliability/` (for example `test_reliability
 1. Add `test_reliability_<model>.py` under `tests/dfx/reliability/`.
 2. Define **`RELIABILITY_SCENARIOS`** and pass them through **`create_reliability_omni_server_params()`** with the correct deploy or e2e deploy-config directory (same pattern as existing files).
 3. Reuse **`helpers`** for OOM / kill / raw HTTP; prefer **`assert_fault_exception()`** and **`resolve_oom_device_spec()`** from `tests/dfx/conftest.py` for consistent device selection vs deploy YAML.
-4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-weekly.yml`** when the suite should run in weekly L5.
+4. Register **`slow`** (and **`hardware_test`** if needed); extend **`.buildkite/cuda/test-level5.yml`** when the suite should run in weekly L5.
 
 </details>

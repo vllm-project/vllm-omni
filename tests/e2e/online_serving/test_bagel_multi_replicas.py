@@ -5,7 +5,7 @@
 
 This test needs 4 H100 GPUs; keep it out of generic test_bagel_* jobs.
 It is covered by the weekly Diffusion · H100 · Multi-GPU lane
-(``.buildkite/cuda/test-weekly.yml``, ``mirror_hardwares: h100_4``).
+(``.buildkite/cuda/test-level5.yml``, ``mirror_hardwares: h100_4``).
 """
 
 import os

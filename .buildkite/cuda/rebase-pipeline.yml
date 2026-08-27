@@ -7,29 +7,29 @@ steps:
       queue: "cpu_queue_premerge"
 
   # L2 Test
-  - label: "Upload Ready Pipeline"
+  - label: "Upload Level2 Pipeline"
     depends_on: image-build
-    key: upload-ready-pipeline
+    key: upload-level2-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-ready.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-level2.yml
     agents:
       queue: "cpu_queue_premerge"
 
   # L3 Test
-  - label: "Upload Merge Pipeline"
+  - label: "Upload Level3 Pipeline"
     depends_on: image-build
-    key: upload-merge-pipeline
+    key: upload-level3-pipeline
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-merge.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-level3.yml
     agents:
       queue: "cpu_queue_premerge"
 
   # L4 Test
-  - label: "Upload Nightly Pipeline"
+  - label: "Upload Level4 Pipeline"
     depends_on: image-build
-    key: upload-nightly-pipeline
+    key: upload-level4-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
-      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-nightly.yml
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload --all .buildkite/cuda/test-level4.yml
     agents:
       queue: "cpu_queue_premerge"

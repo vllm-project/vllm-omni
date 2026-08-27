@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GPU e2e for PersonaPlex elastic batching (bit-exact isolation + recycle).
 
 Greedy decoding makes every cross-slot leak observable as a bit difference:
@@ -27,9 +27,15 @@ import pytest
 torch = pytest.importorskip("torch")
 
 # slow + H100 + omni routes this module into the weekly Buildkite E2E group
-# ("Omni · H100" in .buildkite/cuda/test-weekly.yml: -m "slow and H100 and
+# ("Omni · H100" in .buildkite/cuda/test-level5.yml: -m "slow and H100 and
 # omni" --run-level full_model); the ready/merge CPU sweeps exclude it by mark.
-pytestmark = [pytest.mark.full_model, pytest.mark.omni, pytest.mark.slow, pytest.mark.H100]
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+    pytest.mark.slow,
+    pytest.mark.H100,
+    pytest.mark.B200,
+]
 
 if not torch.cuda.is_available():  # noqa: E402
     pytest.skip("needs CUDA", allow_module_level=True)
