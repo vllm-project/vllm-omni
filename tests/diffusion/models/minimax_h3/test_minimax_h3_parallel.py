@@ -198,6 +198,61 @@ def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest
     assert model.forward_calls == 2
 
 
+def test_denoise_branch_keeps_rope_construction_on_the_reference_path_off_npu(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MiniMaxH3DenoiseBranch,
+        minimax_h3_denoise_loop,
+    )
+
+    monkeypatch.setattr(denoise_loop.current_omni_platform, "is_npu", lambda: False)
+    packed = {
+        "seq_len": torch.tensor(3),
+        "img_pos": torch.tensor([1]),
+        "audio_pos": torch.tensor([2]),
+        "text_pos": torch.tensor([0]),
+        "update_mask": torch.tensor([True]),
+        "cu_seqlens": torch.tensor([0, 3, 3], dtype=torch.int32),
+        "img_position_ids": torch.zeros(3, 3, dtype=torch.long),
+        "latent_grid": torch.tensor([1, 1, 1]),
+        "video_row_start": torch.tensor(1),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(1, 2),
+        token_tags=torch.zeros(3, dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+
+    class Model:
+        def __init__(self):
+            self.forward_calls = 0
+
+        def prepare_rope_table(self, *_args, **_kwargs):
+            raise AssertionError("the reference path must not pre-build a rope_table")
+
+        def __call__(self, **kwargs):
+            assert "rope_table" not in kwargs
+            self.forward_calls += 1
+            return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    model = Model()
+    minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=torch.zeros(1, 96),
+        initial_audio_rows=torch.zeros(1, 32),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+    )
+
+    assert model.forward_calls == 2
+
+
 def test_strict_sp_local_span_uses_rank_owned_rows(monkeypatch):
     from vllm_omni.diffusion import forward_context
     from vllm_omni.diffusion.distributed import parallel_state

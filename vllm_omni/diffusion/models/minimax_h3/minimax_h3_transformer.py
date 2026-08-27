@@ -49,6 +49,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -1415,10 +1416,16 @@ class MiniMaxH3DiTModel(nn.Module):
         local_start, local_len = local_span
         rope_table = kwargs.get("rope_table")
         if rope_table is None:
-            rope_table = self.prepare_rope_table(
-                img_position_ids,
-                seq_len=seq_len,
-            )
+            if current_omni_platform.is_npu():
+                rope_table = self.prepare_rope_table(
+                    img_position_ids,
+                    seq_len=seq_len,
+                )
+            else:
+                # Keep CUDA/CPU numerically and structurally identical to the
+                # main-branch reference path used by the H100 accuracy suite.
+                rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+                rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
         else:
             self._validate_prepared_rope_table(
                 rope_table,
