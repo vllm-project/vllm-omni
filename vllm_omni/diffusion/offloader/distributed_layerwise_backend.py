@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from itertools import chain
 from typing import Any
 
@@ -124,6 +125,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
         rank_local_mmap: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
+        runtime_lease_storage: bool = False,
+        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -136,6 +139,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
+        self.runtime_lease_storage = runtime_lease_storage
+        self.release_source_pages = release_source_pages
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -232,6 +237,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.rank,
                 self.pin_memory,
                 self.tensor_transforms,
+                self.runtime_lease_storage,
+                self.release_source_pages,
             )
 
         # Allocate device buffers only if not using shared buffers from backend
@@ -345,6 +352,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank: int,
         pin_memory: bool,
         tensor_transforms: dict[int, Any] | None = None,
+        runtime_lease_storage: bool = False,
+        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
@@ -393,7 +402,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             # Allocate ONLY the shard (1/dp_size), zero-padded to ceil.
             # Avoids materialising the full block on CPU.
-            shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
+            shard = torch.zeros(
+                shard_size,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=pin_memory and runtime_lease_storage,
+            )
 
             current_offset = 0
             for (
@@ -423,13 +437,16 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 if overlap_start < overlap_end:
                     if local_tensor.is_contiguous():
                         flat_storage = local_tensor.flatten()
+                    elif runtime_lease_storage:
+                        # Runtime FP8 is a transposed view over contiguous
+                        # canonical storage. Slice that physical storage
+                        # directly instead of repacking the complete tensor.
+                        flat_storage = torch.as_strided(
+                            local_tensor,
+                            size=(storage_numel,),
+                            stride=(1,),
+                        )
                     else:
-                        # Online FP8 stores Cutlass weights as transposed views
-                        # (e.g. stride=(1, K)). Flattening such a tensor in
-                        # logical order and later rebuilding it with .view()
-                        # changes its layout and makes scaled_mm reject it.
-                        # Pack the physical storage order and preserve the
-                        # original stride for zero-copy reconstruction.
                         flat_storage = torch.zeros(
                             storage_numel,
                             dtype=dtype,
@@ -447,6 +464,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     dst_end = overlap_end - shard_start
                     shard[dst_start:dst_end].copy_(flat_storage[src_start:src_end])
 
+                if release_source_pages is not None:
+                    release_source_pages(original_tensor)
                 # Replace original tensor with placeholder (frees CPU storage)
                 set_tensor_storage(
                     original_tensor,
@@ -454,9 +473,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 )
                 current_offset += storage_numel
 
-            if pin_memory:
+            if pin_memory and not shard.is_pinned():
                 shard = shard.pin_memory()
-
             cpu_shards[dtype] = shard
 
         return cpu_shards, dtype_metadata
@@ -760,6 +778,8 @@ def apply_distributed_block_hook(
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     rank_local_mmap: bool = False,
     tensor_transforms: dict[int, Any] | None = None,
+    runtime_lease_storage: bool = False,
+    release_source_pages: Callable[[torch.Tensor], None] | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -775,6 +795,8 @@ def apply_distributed_block_hook(
         shared_buffers=shared_buffers,
         rank_local_mmap=rank_local_mmap,
         tensor_transforms=tensor_transforms,
+        runtime_lease_storage=runtime_lease_storage,
+        release_source_pages=release_source_pages,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -816,6 +838,8 @@ class PinnedResidentLayerGroup:
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
+        runtime_lease_storage: bool = False,
+        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
@@ -845,6 +869,8 @@ class PinnedResidentLayerGroup:
                     rank=0,
                     pin_memory=pin_memory,
                     tensor_transforms=tensor_transforms,
+                    runtime_lease_storage=runtime_lease_storage,
+                    release_source_pages=release_source_pages,
                 )
                 cpu_sources = {}
             self._states.append(
@@ -998,9 +1024,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
+        self._using_runtime_lease = False
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
         self._host_registration: HostRegistration | None = None
+        self._release_runtime_source_pages: Callable[[torch.Tensor], None] | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
 
     def load_resident_layers(self) -> None:
@@ -1526,6 +1554,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             shared_buffers=[None, None],
             rank_local_mmap=self._using_rank_local_mmap,
             tensor_transforms=self._mmap_transforms_by_tensor_id,
+            runtime_lease_storage=self._using_runtime_lease,
+            release_source_pages=self._release_runtime_source_pages,
         )
         sub_hooks = [last_hook]
         for i, block in enumerate(blocks[:-1]):
@@ -1543,6 +1573,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 shared_buffers=[None, None],
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                runtime_lease_storage=self._using_runtime_lease,
+                release_source_pages=self._release_runtime_source_pages,
             )
             sub_hooks.append(hook)
 
@@ -1680,11 +1712,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # prevalidated plan that caused the loader to skip materialization;
         # without a plan, all weights must already come from the ordinary
         # loader.  The transfer protocol is selected independently below.
-        self._using_mmap = self.host_weight_plan is not None
-        self._using_rank_local_mmap = self._using_mmap and self.dp_size <= 1
-        if self._using_mmap:
-            if self.host_weight_plan.backing_kind == "host_weight_runtime":
-                carrier = self.host_weight_plan.lease_carrier
+        host_weight_plan = self.host_weight_plan
+        self._using_mmap = host_weight_plan is not None
+        self._using_rank_local_mmap = False
+        self._using_runtime_lease = False
+        if host_weight_plan is not None:
+            if host_weight_plan.backing_kind == "host_weight_runtime":
+                carrier = host_weight_plan.lease_carrier
                 if carrier is None:
                     raise RuntimeError("DLO received a Host Weight Runtime plan without a lease carrier")
                 self._host_weight_lease = carrier.take()
@@ -1692,21 +1726,26 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     raise RuntimeError("DLO received a closed Host Weight Runtime lease")
                 # The final-layout restorer has already rebound the model to
                 # immutable host tensors.  Treat those tensors as mmap-like
-                # sources; transport setup below selects registered direct
-                # H2D or the bounded two-slot staging fallback.
-                self._using_rank_local_mmap = True
+                # sources. Single-rank DLO selects registered direct H2D or
+                # bounded staging; multi-rank DLO shards them for AllGather.
+                self._using_rank_local_mmap = self.dp_size <= 1
+                self._using_runtime_lease = not self._using_rank_local_mmap
+                if self._using_runtime_lease:
+                    self._release_runtime_source_pages = self._host_weight_lease.release_tensor_pages
                 logger.info(
-                    "DLO consuming final-layout Host Weight Runtime lease %s",
+                    "DLO consuming final-layout Host Weight Runtime lease %s via %s",
                     self._host_weight_lease.provenance.resolution_id,
+                    "bounded rank-local staging" if self._using_rank_local_mmap else "sharded AllGather",
                 )
-            elif self.host_weight_plan.backing_kind == "checkpoint_mmap":
+            elif host_weight_plan.backing_kind == "checkpoint_mmap":
+                self._using_rank_local_mmap = self.dp_size <= 1
                 self._load_weights_via_mmap(
                     pipeline,
                     modules,
-                    self.host_weight_plan,
+                    host_weight_plan,
                 )
             else:
-                raise ValueError(f"Unsupported DLO host-weight backing: {self.host_weight_plan.backing_kind}")
+                raise ValueError(f"Unsupported DLO host-weight backing: {host_weight_plan.backing_kind}")
             if self._using_rank_local_mmap:
                 logger.info(
                     "DLO rank-local host storage enabled: source pages are "
@@ -1726,7 +1765,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 raise RuntimeError(
                     f"DLO received meta tensors without a loader-owned host-weight plan (first 5: {remaining_meta[:5]})"
                 )
-            logger.info("DLO is using host tensors materialized by the ordinary loader")
+            logger.info(
+                "DLO is using %s host tensors",
+                "runtime-lease" if host_weight_plan is not None else "ordinary-loader",
+            )
 
         # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
         # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
@@ -1828,6 +1870,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 shared_buffers=[None, None],
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                runtime_lease_storage=self._using_runtime_lease,
+                release_source_pages=self._release_runtime_source_pages,
             )
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
@@ -1846,6 +1890,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
+                    runtime_lease_storage=self._using_runtime_lease,
+                    release_source_pages=self._release_runtime_source_pages,
                 )
                 block_hooks.append(hook)
 
@@ -1877,6 +1923,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                runtime_lease_storage=self._using_runtime_lease,
+                release_source_pages=self._release_runtime_source_pages,
             )
             pipeline._dlo_residency_controller = self
 
@@ -1885,7 +1933,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks)
-            if self._using_mmap and not self.enabled:
+            if self._using_runtime_lease or (self._using_mmap and not self.enabled):
                 self._release_mmap_handles()
             return
 
@@ -1988,6 +2036,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             logger.info("Released safetensors mmap file handles")
         lease = self._host_weight_lease
         self._host_weight_lease = None
+        self._release_runtime_source_pages = None
         if lease is not None and not lease.closed:
             lease.close()
             logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
@@ -2053,6 +2102,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = False
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
+        self._using_runtime_lease = False
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
 

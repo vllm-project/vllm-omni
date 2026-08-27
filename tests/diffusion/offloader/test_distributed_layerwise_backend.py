@@ -169,6 +169,33 @@ class TestDistributedLayerwiseOffloadHook:
         assert next_block.weight.stride() == expected_stride
         assert torch.equal(next_block.weight, expected)
 
+    def test_runtime_lease_sharding_slices_transposed_physical_storage_and_releases_source(self):
+        physical = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        weight = nn.Parameter(physical.t(), requires_grad=False)
+        released: list[int] = []
+
+        shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+            {"weight": weight},
+            {},
+            dp_size=2,
+            rank=1,
+            pin_memory=False,
+            runtime_lease_storage=True,
+            release_source_pages=lambda tensor: released.append(id(tensor)),
+        )
+
+        assert torch.equal(shards[torch.float32], torch.arange(6, 12, dtype=torch.float32))
+        assert metadata[torch.float32] == [
+            {
+                "name": "weight",
+                "offset": 0,
+                "numel": 12,
+                "shape": torch.Size((4, 3)),
+                "stride": (1, 4),
+            }
+        ]
+        assert released == [id(weight)]
+
     def test_allgather_reconstructs_online_fp8_weight_and_scale(
         self,
         patched_offload_runtime,
@@ -712,6 +739,10 @@ class _FakeHostWeightLease:
         self.provenance = SimpleNamespace(resolution_id=resolution_id)
         self.mapped_regions = (MappedHostRegion("weights.safetensors", 0x1000, 4096),)
         self._events = events
+        self.released_tensor_ids: list[int] = []
+
+    def release_tensor_pages(self, tensor: torch.Tensor):
+        self.released_tensor_ids.append(id(tensor))
 
     def close(self):
         if self._events is not None:
@@ -1124,6 +1155,46 @@ class TestMmapWeightLoading:
 
         backend.disable()
         assert lease.closed
+
+    def test_hwr_allgather_consumes_lease_shards_and_releases_mapped_pages(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        pipeline = _HWRPipeline()
+        plan, carrier, lease = _fake_hwr_plan()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+
+        def init_group():
+            backend.dp_group = object()  # type: ignore[assignment]
+            backend.rank = 0
+
+        def allgather(output, local_shard, *, group):
+            assert group is backend.dp_group
+            output[: local_shard.numel()].copy_(local_shard)
+            output[local_shard.numel() :].copy_(local_shard)
+
+        monkeypatch.setattr(backend, "_init_dp_group", init_group)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", allgather)
+
+        backend.enable(pipeline)
+
+        assert carrier.taken
+        assert backend._using_runtime_lease
+        assert all(hook.runtime_lease_storage for group in backend._all_hook_groups for hook in group)
+        assert len(lease.released_tensor_ids) == 3
+        assert lease.closed
+
+        backend.disable()
 
     def test_hwr_backend_failure_drains_partial_setup_before_lease_close(
         self,

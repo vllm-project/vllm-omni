@@ -14,9 +14,13 @@ depends_on:
   - quantization.md
 validation_paths:
   - tests/host_weight_runtime/**
+  - tests/diffusion/model_loader/test_final_layout_host_weights.py
+  - tests/diffusion/model_loader/test_final_layout_fp8_host_weights.py
+  - tests/diffusion/model_loader/test_diffusers_loader.py
+  - tests/diffusion/offloader/test_distributed_layerwise_backend.py
 upstream_refs:
   - https://github.com/vllm-project/vllm-omni/issues/6414
-last_reviewed: 2026-08-25
+last_reviewed: 2026-08-26
 ---
 
 # Host Weight Runtime
@@ -273,22 +277,36 @@ they must not be reported operationally as ordinary disk capacity. The store
 owns files and reports capacity. The kernel controls page-cache residency, and
 transport controls registration or page locking.
 
-## First implementation scope
+## Foundation scope and current consumers
 
-The foundation implements a CPU local filesystem store and
-`SINGLE_PROCESS` production for one exact artifact. It intentionally adds no:
+The top-level foundation implements a CPU local filesystem store and
+`SINGLE_PROCESS` production for one exact artifact. It deliberately owns no
+model-specific layout, quantizer, CUDA registration, pinned staging, H2D
+scheduling, or collective. Those responsibilities remain in versioned model
+producers/restorers and transport consumers outside
+`vllm_omni.host_weight_runtime`.
 
-- public CLI or DLO configuration;
-- BF16, FP8, or model-specific producer/restorer;
-- change to DLO AllGather or no-AllGather behavior;
-- CUDA registration, pinned staging, or H2D scheduling;
-- remote provider, group-cohort producer, artifact bundle, eviction, or
-  cross-node coordination.
+The current diffusion integration adds two such consumers without changing the
+foundation boundary:
 
-Consumer PRs must prove ordinary-loader parity, warm-hit work avoidance,
+- final-layout BF16 with preserved FP32 tensors uses a `POST_LOAD_ONLY`
+  producer and hands its lease to no-AllGather DLO for registered mmap or
+  bounded staging; and
+- online per-tensor FP8 uses a bounded `PRE_LOAD_SAFE` checkpoint-stream
+  producer for eligible multi-rank DLO AllGather. Restoration first binds
+  canonical contiguous FP8 storage and generated scales, then activates
+  zero-copy kernel views. DLO copies physical-storage slices into persistent
+  rank-local shards and closes the lease after shard preparation.
+
+FP8 no-AllGather, FP8 TP greater than one, FP8 HSDP, merged adaptations, remote
+providers, group-cohort production, artifact bundles, automatic eviction, and
+cross-node coordination remain outside the current integrations.
+
+Every consumer must prove ordinary-loader parity, cold/warm behavior,
 parallel-layout correctness, clean teardown, shared-backing evidence, and
 representation-specific startup and memory behavior. Generic foundation tests
-remain CPU-only and make no production performance claim.
+remain CPU-only and make no production performance claim; representation and
+transport tests live with their owning diffusion modules.
 
 The complete rationale and staged rollout are tracked in
 [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414).

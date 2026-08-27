@@ -278,10 +278,31 @@ def tensor_contract_sha256(records: Sequence[RuntimeTensorTarget]) -> str:
     return hashlib.sha256(canonical_json(contract)).hexdigest()
 
 
+def split_tensor_targets_by_bytes(
+    records: Sequence[RuntimeTensorTarget],
+    max_shard_bytes: int,
+) -> tuple[tuple[RuntimeTensorTarget, ...], ...]:
+    """Partition ordered targets without splitting an individual tensor."""
+    shards: list[tuple[RuntimeTensorTarget, ...]] = []
+    current: list[RuntimeTensorTarget] = []
+    current_bytes = 0
+    for record in records:
+        if current and current_bytes + record.nbytes > max_shard_bytes:
+            shards.append(tuple(current))
+            current = []
+            current_bytes = 0
+        current.append(record)
+        current_bytes += record.nbytes
+    if current:
+        shards.append(tuple(current))
+    return tuple(shards)
+
+
 __all__ = [
     "ModelRestoreBinding",
     "RuntimeTensorTarget",
     "collect_final_layout_targets",
+    "split_tensor_targets_by_bytes",
     "tensor_contract_sha256",
     "validate_final_layout_model_contract",
 ]

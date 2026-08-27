@@ -798,6 +798,70 @@ def test_dlo_allgather_online_fp8_uses_ordinary_loader(monkeypatch):
     assert loader.take_host_weight_plan() is None
 
 
+def test_dlo_allgather_online_fp8_hwr_plan_skips_ordinary_loading(monkeypatch, tmp_path):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    od_config = _make_dlo_online_quant_config()
+    od_config.host_weight_runtime_mode = "required"
+    od_config.host_weight_runtime_root = str(tmp_path / "store")
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    plan = HostWeightPlan(
+        backing_kind="host_weight_runtime",
+        bindings={},
+        planned_source_prefixes=frozenset({"transformer."}),
+        runtime_mode="required",
+    )
+    calls: list[str] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda *_args, **_kwargs: pytest.fail("HWR plan re-entered ordinary loading")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    monkeypatch.setattr(loader_mod, "runtime_fp8_requested", lambda *_args, **_kwargs: True)
+
+    def resolve_fp8(*_args, **_kwargs):
+        calls.append("resolve")
+        return plan
+
+    monkeypatch.setattr(loader, "_resolve_fp8_hwr", resolve_fp8)
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cuda")) is model
+    assert calls == ["resolve"]
+    assert loader.take_host_weight_plan() is plan
+
+
+def test_dlo_allgather_online_fp8_preferred_resolution_failure_uses_fresh_canonical_model(
+    monkeypatch,
+    tmp_path,
+):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.model_loader.host_weights.runtime_fp8 import RuntimeFP8UnavailableError
+
+    od_config = _make_dlo_online_quant_config()
+    od_config.host_weight_runtime_mode = "preferred"
+    od_config.host_weight_runtime_root = str(tmp_path / "store")
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    disposable = nn.Module()
+    disposable.transformer = nn.Linear(2, 2, bias=False)
+    canonical = nn.Module()
+    calls: list[str] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: disposable  # type: ignore[method-assign]
+    monkeypatch.setattr(loader_mod, "runtime_fp8_requested", lambda *_args, **_kwargs: True)
+
+    def unavailable(*_args, **_kwargs):
+        calls.append("resolve")
+        raise RuntimeFP8UnavailableError("checkpoint binding failed")
+
+    monkeypatch.setattr(loader, "_resolve_fp8_hwr", unavailable)
+    monkeypatch.setattr(loader, "load_fresh_canonical_model", lambda: canonical)
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cuda")) is canonical
+    assert calls == ["resolve"]
+    assert loader.take_host_weight_plan() is None
+
+
 def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 

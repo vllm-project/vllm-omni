@@ -876,7 +876,9 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
 def test_parallel_identity_matrix_is_exact_for_tp_and_sp(tmp_path: Path, parallel: FinalLayoutParallelIdentity) -> None:
     """TP rank/size and SP backend are identity coordinates for HWR artifacts."""
     model = _TinyPipeline()
-    source = _prepared_source(tmp_path)
+    source = _prepared_source(
+        tmp_path, directory=f"parallel-{parallel.tensor_parallel_size}-{parallel.tensor_parallel_rank}"
+    )
     context = _identity(model, source, request=_request(parallel=parallel))
     layout = context.identity.layout
 

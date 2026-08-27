@@ -40,9 +40,14 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.host_weights.runtime_fp8 import (
+    RuntimeFP8UnavailableError,
+    runtime_fp8_requested,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.host_weight_runtime import RuntimeMode
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 
@@ -482,12 +487,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         }
         if load_format is None:
             load_format = "default"
-        # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
-        # weights are already quantized in the checkpoint — load directly on CPU.
-        # For online quantization, load on device so quantization can run on accelerator,
-        # then move back to CPU afterward.
+
+        runtime_requested = (
+            not self._force_canonical_load
+            and self.quant_config is not None
+            and runtime_fp8_requested(self.od_config, load_format, device)
+        )
+
+        # Offline-quantized checkpoints can load directly on CPU. Ordinary
+        # online quantization must run on the accelerator before CPU offload.
         offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+        if runtime_requested:
+            load_device = "cpu"
+        elif load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
@@ -513,7 +525,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
                 _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
                 _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
-                _has_online_quant = self._has_online_quant(model)
                 _tp_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
                 _use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
                 _dp_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
@@ -522,35 +533,54 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
+                modules = ModuleDiscovery.discover(model)
                 hwr_state = None
-                if not self._force_canonical_load:
-                    try:
+                try:
+                    if runtime_requested:
+                        assert device is not None
+                        self.host_weight_plan = self._resolve_fp8_hwr(
+                            model,
+                            modules,
+                            load_format=load_format,
+                            device=device,
+                            sources=weight_sources,
+                        )
+                    elif not self._force_canonical_load:
                         hwr_state = self._resolve_hwr(
                             model,
-                            ModuleDiscovery.discover(model),
+                            modules,
                             dist_offload=_dist_offload,
                             use_allgather=_use_ag,
                             load_format=load_format,
                             sources=weight_sources,
                         )
-                    except _HWRCommitError:
-                        from vllm_omni.host_weight_runtime import RuntimeMode
-
-                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
-                        if mode is not RuntimeMode.PREFERRED:
-                            raise
-                        logger.warning(
-                            "HWR restore commit failed; discarding the model and retrying a fresh canonical load",
-                            exc_info=True,
-                        )
-                        del model
-                        return self.load_fresh_canonical_model()
+                except RuntimeFP8UnavailableError as exc:
+                    mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                    if mode is RuntimeMode.REQUIRED:
+                        raise RuntimeError("required runtime FP8 resolution failed") from exc
+                    logger.warning("Host Weight Runtime preferred fallback: %s", exc)
+                    del model
+                    return self.load_fresh_canonical_model()
+                except _HWRCommitError:
+                    mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                    if mode is not RuntimeMode.PREFERRED:
+                        raise
+                    logger.warning(
+                        "HWR restore commit failed; discarding the model and retrying a fresh canonical load",
+                        exc_info=True,
+                    )
+                    del model
+                    return self.load_fresh_canonical_model()
                 self._hwr_state = hwr_state
-                hwr_active = hwr_state is not None
-                if hwr_active and hwr_state is not None:
+                if hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if _dist_offload and not hwr_active and not self._force_canonical_load:
-                    modules = ModuleDiscovery.discover(model)
+                _has_online_quant = self._has_online_quant(model)
+                if (
+                    _dist_offload
+                    and self.host_weight_plan is None
+                    and hwr_state is None
+                    and not self._force_canonical_load
+                ):
                     plan_result = build_checkpoint_mmap_plan(
                         model,
                         dit_modules=tuple(zip(modules.dit_names, modules.dits)),
@@ -562,19 +592,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     )
                     self.host_weight_plan = plan_result.plan
 
-                _skip_load = self.host_weight_plan is not None
-
-                if _skip_load:
+                host_weight_plan = self.host_weight_plan
+                if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
                         "AllGather" if _use_ag and _dlo_group_size > 1 else "rank-local",
-                        self.host_weight_plan.backing_kind,
-                        sorted(self.host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
+                        host_weight_plan.backing_kind,
+                        sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
                     ordinary_sources = tuple(
                         source
                         for source in weight_sources
-                        if source.prefix not in self.host_weight_plan.planned_source_prefixes
+                        if source.prefix not in host_weight_plan.planned_source_prefixes
                     )
                     if ordinary_sources:
                         logger.info(
@@ -584,7 +613,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         self.load_weights(
                             model,
                             sources=ordinary_sources,
-                            planned_weights=self.host_weight_plan.bindings,
+                            planned_weights=host_weight_plan.bindings,
                         )
                 else:
                     if _dist_offload and _use_ag and _has_online_quant:
@@ -641,15 +670,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     self._assert_final_layout_tensors_unchanged(model, cast(dict[str, tuple[int, str]], warm_snapshot))
                 self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), self._hwr_state)
         except Exception:
-            hwr_plan = self._hwr_state.get("plan") if self._hwr_state is not None else None
-            if isinstance(hwr_plan, HostWeightPlan):
+            hwr_plan = self.host_weight_plan
+            if hwr_plan is not None and hwr_plan.backing_kind == "host_weight_runtime":
                 carrier = hwr_plan.lease_carrier
                 if carrier is not None:
                     carrier.close()
-                from vllm_omni.host_weight_runtime import RuntimeMode
-
-                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
-                if mode is RuntimeMode.PREFERRED:
+                if hwr_plan.runtime_mode == RuntimeMode.PREFERRED.value:
                     logger.warning(
                         "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
                         exc_info=True,

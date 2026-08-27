@@ -795,9 +795,8 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
-    # Final-layout Host Weight Runtime policy. The loader only activates this
-    # for eligible no-AllGather DLO; all other configurations preserve their
-    # existing loader/storage path.
+    # Final-layout Host Weight Runtime policy. Representation-specific
+    # producers decide which DLO transport and tensor layout are eligible.
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
     # Optional per-worker ceiling for registering final-layout HWR mappings.

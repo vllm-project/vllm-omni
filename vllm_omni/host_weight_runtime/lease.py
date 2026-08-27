@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import mmap
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -15,6 +17,10 @@ import torch
 
 from .identity import WeightArtifactIdentity
 from .manifest import WeightManifest
+
+_MADVISE = ctypes.CDLL(None, use_errno=True).madvise
+_MADVISE.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_MADVISE.restype = ctypes.c_int
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,19 @@ class HostWeightLease:
     def closed(self) -> bool:
         with self._state_lock:
             return self._closed
+
+    def release_tensor_pages(self, tensor: torch.Tensor) -> None:
+        """Discard a mapped tensor's pages after transport copies it."""
+        storage = tensor.untyped_storage()
+        length = storage.nbytes()
+        if not length:
+            return
+        address = storage.data_ptr()
+        page_start = address - address % mmap.PAGESIZE
+        page_end = (address + length + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+        if _MADVISE(page_start, page_end - page_start, mmap.MADV_DONTNEED):
+            error = ctypes.get_errno()
+            raise OSError(error, "madvise(MADV_DONTNEED) failed")
 
     def close(self) -> None:
         with self._state_lock:

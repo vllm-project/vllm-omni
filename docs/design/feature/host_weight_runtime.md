@@ -15,11 +15,16 @@ specified in the [Host Weight Runtime module design](../module/host_weight_runti
 ## Status
 
 The first implementation provides contracts and a CPU local-filesystem store.
-The initial diffusion consumer contract additionally defines typed,
-representation-independent final-layout identity/restoration mechanics plus a
-concrete BF16-with-preserved-FP32 policy for MiniMax H3. It remains
-library-only: no loader or DLO path selects, publishes, restores, or transports
-that artifact yet.
+Diffusion now has two opt-in consumers over the shared, representation-neutral
+final-layout identity and restoration mechanics:
+
+- a BF16-with-preserved-FP32 `POST_LOAD_ONLY` producer consumed by
+  no-AllGather DLO; and
+- an online per-tensor FP8 `PRE_LOAD_SAFE` producer consumed by eligible
+  multi-rank DLO AllGather.
+
+Both are currently scoped to model-declared final-layout contracts such as
+MiniMax H3 and retain the ordinary loader as the preferred-mode fallback.
 
 V1 includes:
 
@@ -28,18 +33,20 @@ V1 includes:
 - descriptor-backed safetensors mmap leases;
 - preferred and required resolution policy;
 - explicit, separately reported post-load publication;
+- opt-in diffusion loader activation and transactional lease handoff to DLO;
+- separate BF16/no-AllGather and online-FP8/AllGather representations;
 - validation, deny, quarantine, cleanup, and capacity controls; and
 - typed reports for every terminal resolution outcome.
 
 V1 does not include:
 
-- a public CLI, loader activation, or default-on model integration;
-- lease handoff to DLO or another transport consumer;
-- FP8, quantized, merged-adaptation, or additional model producers;
-- CUDA registration, pinned staging, H2D scheduling, or GPU kernels;
+- default-on model integration;
+- FP8 no-AllGather, FP8 TP greater than one, FP8 HSDP, merged adaptations, or
+  quantized representations beyond the explicitly versioned consumers;
 - a remote artifact provider or cross-node coordination;
 - automatic eviction; or
-- a change to DLO AllGather or no-AllGather behavior.
+- ownership of CUDA registration, pinned staging, H2D scheduling, or
+  collectives, which remain DLO transport responsibilities.
 
 ## Motivation and use cases
 
@@ -255,20 +262,26 @@ The contract is intentionally separate from loader activation:
 - `FinalLayoutBF16Producer` accepts only the matching identity context and a
   finalized CPU model. It is `POST_LOAD_ONLY` and `SINGLE_PROCESS` per exact TP
   coordinate. Its BF16 policy preserves model-declared FP32 parameters and
-  buffers and revalidates MiniMax H3 mixed-precision invariants.
+  buffers and revalidates MiniMax H3 mixed-precision invariants; and
+- `FinalLayoutFP8Producer` accepts the matching structural CPU/meta model and
+  exact checkpoint bindings. It is `PRE_LOAD_SAFE`, streams bounded BF16
+  checkpoint chunks through online per-tensor FP8 quantization, writes canonical
+  contiguous weight storage plus generated FP32 scales, and activates the
+  kernel's transposed zero-copy views only after restoration commits.
 
-Other representations reuse source identity, typed parallel identity, tensor
-ownership, and exact restoration only when their policy proves those semantics.
-For example, runtime FP8 needs a separate policy/producer for generated scales,
-quantization metadata, and Cutlass physical layouts; it is not enabled by
-changing a dtype string on the BF16 producer.
+The BF16 and FP8 consumers reuse source identity, typed parallel identity,
+tensor ownership, and exact restoration because each policy proves its own
+semantics. Their generated scales, physical layouts, producer ABIs, manifest
+schemas, and eligibility rules remain distinct; FP8 is not enabled by changing
+a dtype string on the BF16 producer.
 
-This stage makes no startup, sharing, or DLO performance claim. A following
-consumer PR owns disabled/preferred/required precedence, mixed-component loader
-transactions, warm-hit restoration, and transactional lease handoff. A TP2
-prewarm deployment will require a matching TP2 producer cohort to populate both
-TP-coordinate identities even though the store coordinates each artifact
-independently.
+The loader integration owns disabled/preferred/required precedence,
+mixed-component transactions, warm-hit restoration, and transactional lease
+handoff. The BF16 producer populates after canonical loading in preferred mode.
+The eligible FP8 producer can build during cold pre-load resolution in either
+preferred or required mode; preferred falls back to a fresh ordinary-loader
+model if FP8 HWR is unavailable. TP coordinates remain distinct identities, and
+the Phase 1 FP8 producer is limited to TP1 without HSDP and base weights.
 
 ## Host sharing and GPU transport
 

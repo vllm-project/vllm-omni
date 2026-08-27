@@ -25,7 +25,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
 | **HSDP** | ❌ Rejected to avoid double-sharding parameters. | ⚠️ Limited end-to-end coverage. |
-| **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Per-tensor online FP8 linears** | ✅ Eligible multi-rank TP1 deployments may use the opt-in final-layout HWR producer; other deployments use the ordinary loader before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -42,11 +42,12 @@ AllGather path is the primary path for DP and SP deployments. The
 DLO weight collective.
 
 Host storage is selected separately from the transfer protocol. The loader can
-produce a direct-checkpoint mmap plan for a proven-compatible runtime layout;
-otherwise it uses the ordinary loader. Consequently, no-AllGather replicas on
-the same node can share immutable checkpoint pages when direct mmap is
-selected, while the ordinary-loader fallback still keeps a private runtime
-copy per process.
+produce a direct-checkpoint mmap plan for a proven-compatible runtime layout or
+an exact final-layout HWR plan for an eligible representation; otherwise it
+uses the ordinary loader. Consequently, no-AllGather replicas can share BF16
+checkpoint or final-layout pages, while eligible multi-rank AllGather workers
+can consume a shared final-layout FP8 artifact before preparing persistent
+rank-local shards.
 
 The Phase A shared-mmap support boundary is TP1. TP greater than one is an
 ordinary-loader compatibility path: DLO can consume the resulting TP-local
@@ -78,8 +79,9 @@ DLO's AllGather path.
 ### The loader owns host-weight planning
 
 Before it decides whether ordinary weight materialization can be skipped, the
-diffusion loader builds one `HostWeightPlan`. A direct-checkpoint mmap plan is
-accepted only when preflight proves all of the following:
+diffusion loader builds one `HostWeightPlan`. The plan may contain exact
+checkpoint bindings or a restored final-layout HWR lease. A direct-checkpoint
+mmap plan is accepted only when preflight proves all of the following:
 
 - every required DiT parameter and persistent buffer has exactly one source;
 - runtime names, checkpoint keys, shapes, and dtypes match;
@@ -87,10 +89,12 @@ accepted only when preflight proves all of the following:
 - every custom loader operation is represented by a loader-owned checkpoint
   adapter.
 
-The exact plan object is handed to DLO. The backend does not rescan checkpoint
-files, repeat the capability decision, or reconstruct names from its block
-topology. If preflight fails, the loader materializes weights normally and DLO
-consumes those runtime tensors.
+An HWR plan is accepted only after representation-specific identity,
+production, lease validation, and restoration complete. The exact plan object
+is handed to DLO. The backend does not rescan checkpoint files, parse artifact
+manifests, repeat the capability decision, or reconstruct names from its block
+topology. If preflight fails and policy permits fallback, the loader
+materializes weights normally and DLO consumes those runtime tensors.
 
 The plan owns only dedicated DiT component sources. If a pipeline also exposes
 ordinary sources for a text encoder or another non-DiT component, the loader
@@ -125,9 +129,10 @@ Buffers:    [current slot]       [prefetch slot]       [current slot]
 The backend uses two shared device buffers, so accelerator weight residency is
 bounded by the largest streamed blocks rather than the complete model.
 
-When direct checkpoint mmap is selected, the checkpoint mappings are only the
-source used to prepare each rank's persistent shard. They can be closed after
-shard preparation. Across the AllGather group, those private shards total
+When direct checkpoint mmap or an FP8 HWR lease is selected, its mappings are
+only the source used to prepare each rank's persistent shard. Source pages are
+released as their rank-local slices are copied, and the mappings can be closed
+after shard preparation. Across the AllGather group, those private shards total
 approximately one runtime model copy.
 
 An effective DLO group size of one performs no collective, even when
@@ -194,64 +199,57 @@ topologies and platforms receive the same bounded policy but are not claimed
 performance targets; other DLO models remain unchanged unless they explicitly
 adopt it.
 
-### Final-layout Host Weight Runtime consumer
+### Final-layout Host Weight Runtime consumers
 
-> **Status:** PR2 landed in
-> [PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486). PR3 adds
-> registered direct H2D plus generic HWR publication/source-digest
-> optimizations without changing AllGather behavior.
-
-Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
-only to no-AllGather DLO. Enable it with
+Final-layout Host Weight Runtime (HWR) backing is opt-in. Enable it with
 `--host-weight-runtime-mode preferred` (or `required`) and
-`--host-weight-runtime-root <node-local-root>`.
+`--host-weight-runtime-root <node-local-root>`. The diffusion integration has
+two representation-specific producer and transport contracts:
 
-The modes express operator fallback policy, not different artifact formats:
+| Representation | Eligible DLO path | Producer phase | DLO consumption |
+| --- | --- | --- | --- |
+| Final-layout BF16 with preserved FP32 tensors | no-AllGather | `POST_LOAD_ONLY`; a preferred miss canonically loads and publishes for a future startup | rank-local registered mmap or bounded staging |
+| Online per-tensor FP8 with generated FP32 scales | multi-rank AllGather, CUDA, default load format, TP1 without HSDP, base weights | `PRE_LOAD_SAFE`; a cold startup builds directly from bounded checkpoint streaming | direct physical-storage slicing into persistent rank-local shards, then existing H2D plus AllGather |
 
-- `preferred` consumes an exact hit, but on a miss it allows canonical loading
-  followed by post-load publication. It is the normal population path.
-- `required` consumes the same exact artifact but fails startup on a miss or
-  unusable artifact. It never invokes canonical DiT fallback or post-load
-  publication and therefore cannot populate an empty store.
+Both representations use the same exact identity, filesystem store, manifest,
+lease, restoration transaction, and operator modes. They do not share artifact
+identities or producer semantics.
 
-PR2 has no separate prewarm command. Operators populate one matching producer
-cohort per node-local storage domain in `preferred` mode, then restart the same
-model revision and parallel layout with `required`. TP coordinates have distinct
-identities, while equivalent DP replicas share them.
-
-The current producer/consumer boundary is the model-declared final-layout BF16
-contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
-and TP2 rank identities plus SP layout identities; online quantization, HSDP,
-LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
-`disabled`, DLO-disabled, and DLO AllGather configurations stop before source
-identity or store construction and retain the existing checkpoint-mmap or
-ordinary-loader path.
+- `disabled` performs zero final-layout HWR interaction.
+- `preferred` consumes an exact hit. An eligible FP8 miss may build before
+  ordinary loading; a BF16 miss canonically loads and publishes afterward.
+  Ineligible or retryable FP8 resolution falls back to the ordinary online-FP8
+  loader using a fresh model.
+- `required` fails when its selected representation cannot provide an exact
+  lease. The pre-load FP8 producer may populate an empty store; the post-load
+  BF16 producer cannot bootstrap an empty store in required mode.
 
 Eligibility is decided before constructing HWR, resolving canonical sources,
-hashing identity inputs, probing a filesystem, or emitting an HWR observer
-event:
+hashing identity inputs, or probing the filesystem:
 
 ```text
-DLO disabled / HWR disabled / DLO AllGather
+HWR disabled or DLO disabled
   -> zero final-layout HWR interaction
-  -> preserve current checkpoint-mmap or ordinary-loader behavior
+
+eligible online per-tensor FP8 + multi-rank DLO AllGather
+  -> bounded checkpoint-stream FP8 production or exact local hit
+  -> restore canonical FP8 storage and activate kernel views
+  -> hand lease to DLO AllGather
+
+eligible unquantized final-layout BF16 + no-AllGather DLO
+  -> exact local hit, or preferred canonical load plus post-load publication
+  -> hand lease to rank-local DLO transport
+
+otherwise
+  -> preserve the ordinary-loader/checkpoint-mmap path when policy permits
 ```
 
-When final-layout HWR is explicitly enabled for no-AllGather DLO, runtime
-outcomes are authoritative:
-
-- `LOCAL_HIT`: plan and commit an exact restoration, then transfer the lease
-  transactionally to DLO.
-- `CANONICAL_FALLBACK`: bypass checkpoint mmap, canonically materialize and
-  finalize the DiT, then call `publish_after_load()` for a future startup. The
-  current startup retains its canonical tensors.
-- `FAILED`: fail startup. Preferred mode does not reinterpret nonretryable
-  identity, configuration, or compatibility failures as misses.
-- Required mode cannot bootstrap an empty store through a `POST_LOAD_ONLY`
-  producer.
-
-Checkpoint mmap remains an unchanged control path whenever final-layout HWR is
-not selected.
+Runtime outcomes are authoritative. `LOCAL_HIT` and `LOCAL_PRODUCTION` restore
+the exact representation before transactionally transferring the lease to DLO.
+`CANONICAL_FALLBACK` runs only where preferred policy permits it. `FAILED`
+remains a startup failure; preferred mode does not reinterpret a nonretryable
+identity, configuration, or compatibility failure as a miss. Checkpoint mmap
+remains an unchanged control path whenever final-layout HWR is not selected.
 
 Local source identity and publication avoid repeated full-payload passes while
 preserving the same semantic contract:
@@ -272,7 +270,7 @@ preserving the same semantic contract:
 
 #### Registered mmap transport
 
-After DLO takes an HWR lease, the no-AllGather backend may register the lease's
+After DLO takes a BF16 HWR lease, the no-AllGather backend may register the lease's
 complete immutable mapped ranges under the existing `pin_cpu_memory` policy.
 Registration is transport state: it does not change artifact identity, the
 store, tensor ownership, or H2D payload. On success, each tensor view copies
@@ -287,9 +285,11 @@ partial registration that cannot be rolled back aborts startup because closing
 the lease would unmap memory still owned by the platform.
 
 Direct checkpoint mmap remains unchanged and continues to use staging. It may
-require loader-owned per-block transforms, while the HWR artifact already
-contains final runtime bytes. DLO AllGather never receives an HWR final-layout
-lease and therefore never enters this registration path.
+require loader-owned per-block transforms, while an HWR artifact already
+contains final runtime bytes. The FP8 AllGather consumer does receive an HWR
+lease, but does not register it: DLO copies only each rank's physical-storage
+slice into its persistent shard, advises the consumed mapped pages away, and
+closes the lease after shard preparation.
 
 #### Pre-service transaction boundary
 
@@ -372,7 +372,7 @@ retains both registration and lease for retry/process teardown. Preferred mode
 then uses the runner's fresh canonical retry; required mode propagates the
 failure.
 
-#### PR2 and PR3 promotion gates
+#### Final-layout HWR promotion gates
 
 - Warm hit performs zero ordinary DiT materialization and zero producer calls.
 - Shared warm finalization changes neither restored bytes nor backing pointers.
@@ -381,7 +381,8 @@ failure.
 - Any pre-service failure after commit begins discards the restored model;
   preferred mode uses a fresh canonical model and required mode fails.
 - Mixed components load normally and no required tensor remains on `meta`.
-- Disabled mode and AllGather emit zero final-layout HWR interaction.
+- Disabled mode and DLO-disabled configurations emit zero final-layout HWR
+  interaction; AllGather selects HWR only for the eligible FP8 representation.
 - The lease carrier rejects duplicate take and serialization.
 - Backend setup or prefetch failure drains asynchronous work before lease close.
 - Registration is all-or-nothing; rollback/unregistration failure never closes
@@ -432,14 +433,16 @@ requirements.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
-ordinary loader. Per-tensor online FP8 linears can use DLO AllGather after the
-ordinary loader finalizes their runtime weights and scales; DLO then shards and
-reconstructs those tensors with their recorded layouts. Other online methods
-must use `--dlo-no-use-allgather` or disable online quantization until their
-runtime layouts are validated.
+ordinary loader. Eligible per-tensor online FP8 linears can instead use the
+final-layout HWR producer before ordinary materialization; preferred-mode
+fallback still lets the ordinary loader finalize their runtime weights and
+scales. DLO then shards and reconstructs either source with its recorded
+physical layout. Other online methods must use `--dlo-no-use-allgather` or
+disable online quantization until their runtime layouts are validated.
 
-The Host Weight Runtime representation, publication, and no-AllGather consumer
-contracts are merged; see
+The Host Weight Runtime representation, publication, and no-AllGather BF16
+consumer contracts are merged; the FP8 Phase 1 consumer extends the same lease
+contract to eligible multi-rank AllGather. See
 [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414),
 [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445), and
 [PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486). Registered
@@ -455,6 +458,9 @@ Current source-level validation includes:
   loaders, missing keys, and shape/dtype mismatches;
 - ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
   sharding of finalized weights and scales;
+- FP8 HWR scope/fallback policy, bounded pre-load production, exact cold/warm
+  restoration, physical-storage shard slicing, mapped-page release, and lease
+  handoff to DLO AllGather;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
 - ordered publication hashing, overlapped durability, unordered parallel
   checksum fallback, and node-local source-digest reuse/invalidation;
