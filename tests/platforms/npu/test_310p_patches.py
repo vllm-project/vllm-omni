@@ -42,8 +42,8 @@ def _install_fake_module(monkeypatch: pytest.MonkeyPatch, name: str, **attrs):
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
-    monkeypatch.setitem(sys.modules, name, module) 
-   return module
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
 
 
 def _install_qwen3_tts_patch_fakes(monkeypatch: pytest.MonkeyPatch):
