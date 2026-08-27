@@ -346,6 +346,67 @@ class RealtimeOutputProjector:
                     "reason": event.get("finish_reason") or "stop",
                 },
             )
+        if event_type == "function_call.done":
+            call_id = event.get("call_id")
+            name = event.get("name")
+            arguments = event.get("arguments", "")
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                return [{"type": "duplex.function_call.done", "event": event}]
+            if not isinstance(arguments, str):
+                arguments = str(arguments)
+            response_id = f"resp_{uuid4().hex}"
+            item = {
+                "id": f"item_{uuid4().hex}",
+                "object": "realtime.item",
+                "type": "function_call",
+                "status": "completed",
+                "name": name,
+                "call_id": call_id,
+                "arguments": arguments,
+            }
+            self._conversation_items[str(item["id"])] = item
+            response = {
+                "id": response_id,
+                "object": "realtime.response",
+                "status": "completed",
+                "status_details": {"type": "completed", "reason": "completed"},
+                "output": [dict(item)],
+                "metadata": {},
+            }
+            return [
+                {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+                *self._conversation_item_added_events(item),
+                {
+                    "type": "response.output_item.added",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": response_id,
+                    "item_id": item["id"],
+                    "output_index": 0,
+                    "call_id": call_id,
+                    "delta": arguments,
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "response_id": response_id,
+                    "item_id": item["id"],
+                    "output_index": 0,
+                    "call_id": call_id,
+                    "arguments": arguments,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+                self._conversation_item_done_event(item),
+                {"type": "response.done", "response": response},
+            ]
         if event_type == "error":
             raw_error = event.get("error")
             if isinstance(raw_error, dict):

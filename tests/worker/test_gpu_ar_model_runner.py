@@ -1832,6 +1832,7 @@ class TestPreferModelSamplerNoneFallback:
             "hunyuan_image3",
             "minicpmo_4_5",
             "minimax_music3",
+            "nemotron_voicechat",
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"

@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
+    BoundedAllocatorCache,
     OffloadPlan,
     apply_sequential_offload,
     remove_sequential_offload,
@@ -723,8 +724,6 @@ class MiniMaxH3Pipeline(
             offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
         if getattr(od_config, "enable_layerwise_offload", False):
             offload_modes.append("layerwise offload (--enable-layerwise-offload)")
-        if getattr(od_config, "enable_distributed_layerwise_offload", False):
-            offload_modes.append("distributed layerwise offload (--enable-distributed-layerwise-offload)")
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -951,6 +950,12 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        self._dlo_component_cache = None
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            self._dlo_component_cache = BoundedAllocatorCache(self.device)
+            for component in (self.text_encoder, self.video_vae, self.audio_vae):
+                component.set_omni_component_cache(self._dlo_component_cache)
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
@@ -1371,11 +1376,8 @@ class MiniMaxH3Pipeline(
         ):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
-            self.text_encoder.load_to_device()
-            try:
+            with self._component_on_device(self.text_encoder):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
-            finally:
-                self.text_encoder.offload_to_cpu()
 
         # Keep both Qwen and DiT resident across requests. Moving either model
         # here makes encoder latency include a tens-of-gigabytes PCIe transfer,
@@ -1433,13 +1435,35 @@ class MiniMaxH3Pipeline(
                 yield
             return
         staged = self._uses_manual_component_offload()
-        if staged:
-            component.load_to_device()
         try:
-            yield
-        finally:
             if staged:
-                component.offload_to_cpu()
+                component.load_to_device()
+            yield
+        except BaseException:
+            if staged:
+                try:
+                    component.offload_to_cpu()
+                except BaseException:
+                    logger.exception("Failed to release %s after component failure", component.__class__.__name__)
+                cache = getattr(self, "_dlo_component_cache", None)
+                if cache is not None:
+                    try:
+                        cache.release_if_needed(force=True)
+                    except BaseException:
+                        logger.exception("Failed to release retained allocator cache after component failure")
+            raise
+        else:
+            if staged:
+                try:
+                    component.offload_to_cpu()
+                except BaseException:
+                    cache = getattr(self, "_dlo_component_cache", None)
+                    if cache is not None:
+                        try:
+                            cache.release_if_needed(force=True)
+                        except BaseException:
+                            logger.exception("Failed to release retained allocator cache after offload failure")
+                    raise
 
     def _encode_visual_conditions(
         self,

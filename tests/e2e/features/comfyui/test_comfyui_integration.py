@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Integration tests for ComfyUI nodes that use the Omni API client, with a mocked AsyncOmni and a real API server running in a background process.
 These tests cover the integration between ComfyUI node and the API server, without actual model inference logic.
@@ -39,6 +42,7 @@ from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
@@ -515,7 +519,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni, tmp_path):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned
@@ -533,7 +537,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)
 
-    port = unused_tcp_port_factory()
+    port = get_open_port()
     args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
 
     def run_server():
@@ -550,11 +554,12 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     wait_poll_interval = 1
     for _ in range(wait_time // wait_poll_interval):
         try:
-            response = requests.get(f"http://127.0.0.1:{port}/health")
+            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=wait_poll_interval)
             if response.status_code == 200:
                 break
-        except requests.ConnectionError:
-            time.sleep(wait_poll_interval)
+        except requests.RequestException:
+            pass
+        time.sleep(wait_poll_interval)
     else:
         if server_process.is_alive():
             server_process.terminate()

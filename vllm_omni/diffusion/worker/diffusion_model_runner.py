@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_prompt_update,
     supports_step_execution,
 )
-from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -336,15 +336,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
-        # Apply CPU offloading
-        self.offload_backend = get_offload_backend(
+        # The offloader owns loader-plan handoff and startup recovery. The
+        # runner only receives the pipeline/backend pair that is ready to use.
+        self.pipeline, self.offload_backend = enable_offload_backend(
             self.od_config,
+            self.pipeline,
             device=self.device,
-            host_weight_plan=model_loader.take_host_weight_plan(),
         )
-        if self.offload_backend is not None:
-            logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
-            self.offload_backend.enable(self.pipeline)
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
@@ -541,6 +539,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 target_device=self._target_device if use_prefetch else getattr(self.pipeline, "device", None),
             )
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+        req.kv_recv_ms = kv_recv_ms
         logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
@@ -598,6 +597,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         reqs: list[OmniDiffusionRequest],
         outputs: list[DiffusionOutput],
     ) -> BatchRunnerOutput:
+        for i in range(len(reqs)):
+            # Carry the runner-measured KV-recv timing onto the output so the
+            # engine's step_streaming can surface it as diffusion_kv_load_s.
+            outputs[i].kv_recv_ms = reqs[i].kv_recv_ms
         return BatchRunnerOutput.from_list(
             [
                 RunnerOutput(

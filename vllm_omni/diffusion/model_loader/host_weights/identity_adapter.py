@@ -27,6 +27,7 @@ from .contracts import (
 )
 from .source_identity import (
     FinalLayoutSourceContext,
+    NodeSourceDigestCache,
     PreparedWeightSource,
     resolve_final_layout_source_identity,
 )
@@ -78,6 +79,7 @@ def build_final_layout_identity(
     prepared_sources: Sequence[PreparedWeightSource],
     request: FinalLayoutRequest,
     policy: FinalLayoutTensorPolicy,
+    source_digest_cache: NodeSourceDigestCache | None = None,
 ) -> FinalLayoutIdentityContext:
     """Build exact source, representation, layout, and implementation identity."""
     if not isinstance(request, FinalLayoutRequest):
@@ -99,6 +101,7 @@ def build_final_layout_identity(
         prepared_sources,
         model_id=request.model_id,
         target_names=target_names,
+        digest_cache=source_digest_cache,
     )
     dit_names = tuple(name for name, _ in dit_modules)
     model_contracts = tuple(binding.contract for binding in bindings)

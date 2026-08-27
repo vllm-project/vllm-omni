@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for Omni AR streaming-session async placeholder handling."""
 
@@ -64,6 +64,9 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    handle_stopped=None,
+    chunk_transfer_adapter=None,
+    inter_stage_output=None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -75,11 +78,14 @@ def _run_resumable_segment_stop(
         return [42], True
 
     sched._update_request_with_output.side_effect = stop_request
-    sched._handle_stopped_request.return_value = session_finished
     # vLLM 0.26 returns (kv_xfer_params, ec_xfer_params); an unconfigured
     # MagicMock iterates empty and fails to unpack at the call site.
     sched._free_request.return_value = (None, None)
-    sched.chunk_transfer_adapter = None
+    if handle_stopped is None:
+        sched._handle_stopped_request.return_value = session_finished
+    else:
+        sched._handle_stopped_request.side_effect = handle_stopped
+    sched.chunk_transfer_adapter = chunk_transfer_adapter
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -105,6 +111,7 @@ def _run_resumable_segment_stop(
     model_runner_output.cudagraph_stats = None
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
+    model_runner_output.inter_stage_outputs = [inter_stage_output] if inter_stage_output is not None else None
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
@@ -160,6 +167,42 @@ def test_update_from_output_settles_in_flight_tokens() -> None:
     assert session.num_in_flight_tokens == 0
 
 
+def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> None:
+    """The old segment's transfer must not observe the next segment's reset.
+
+    A queued streaming update can replace the same mutable Request while the
+    stop output is still being handled. The connector needs the confirmed
+    token count from before that replacement to avoid dropping the boundary.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = 26
+    adapter = MagicMock()
+    adapter._confirmed_num_computed_tokens.return_value = 26
+    inter_stage_output = {"codes": {"audio": [7]}}
+
+    def replace_with_next_segment(request: Request) -> bool:
+        request.num_computed_tokens = 0
+        request.status = RequestStatus.WAITING
+        return False
+
+    _run_resumable_segment_stop(
+        session,
+        handle_stopped=replace_with_next_segment,
+        chunk_transfer_adapter=adapter,
+        inter_stage_output=inter_stage_output,
+    )
+
+    adapter.save_async.assert_called_once_with(
+        inter_stage_output,
+        session,
+        True,
+        new_token_ids=[42],
+        confirmed_num_computed_tokens=26,
+    )
+
+
 def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
     """A decode step that neither stops nor carries an inter-stage payload.
 
@@ -208,6 +251,37 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
 
     # Nothing to hand downstream: no payload, no segment boundary, not finished.
     sched.chunk_transfer_adapter.save_async.assert_not_called()
+
+
+def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
+    """Native duplex + async: the next unit is usually already queued when the
+    current one stops, so _handle_stopped_request applies the update and the
+    stop site below it fences the same in-flight decode a second time. An
+    accumulated residue outlives the drain and swallows the next unit's
+    listen/speak, which the client sees as silence until its timeout.
+    """
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.append_output_token_ids([7])
+    session.num_computed_tokens = 4
+    session.num_output_placeholders = 1
+    # This step's frame (settled to 0 by update_from_output) plus one extra
+    # async decode still in flight.
+    session.num_in_flight_tokens = 2
+
+    sched = _make_scheduler(stage_id=0)
+    sched._enqueue_waiting_request = MagicMock()
+
+    def handle_stopped(request: Request) -> bool:
+        sched._update_request_as_session(request, _make_update([10, 20]))
+        return False
+
+    _run_resumable_segment_stop(session, handle_stopped=handle_stopped)
+
+    # Exactly the one unreported decode, so the drain reaches zero before the
+    # new segment's first frame arrives.
+    assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
@@ -354,3 +428,33 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
     assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {session.request_id}
     assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+
+
+def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
+    """A WAITING_FOR_CHUNK stop must not delete its newly parked session."""
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def queue(*requests):
+        result = MagicMock()
+        result.requests = set(requests)
+        result.add_request.side_effect = result.requests.add
+        result.remove_requests.side_effect = result.requests.difference_update
+        return result
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.running = []
+    sched.waiting = queue()
+    sched.skipped_waiting = queue(session)
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={session.request_id})
+
+    sched._resume_downstream_chunk_receiver(session)
+    sched._remove_stopped_requests_from_queues(set(), {session})
+
+    assert session.status == RequestStatus.WAITING
+    assert session in sched.waiting.requests
+    assert session not in sched.skipped_waiting.requests
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests

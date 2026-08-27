@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -9,9 +9,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -335,6 +336,121 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_segment_boundary_starts_new_send_watermark_before_background_flush(build_adapter):
+    """A queued boundary owns the end of its deduplication generation.
+
+    The next segment can start before the save thread sends the old boundary.
+    Sending that old task later must not erase the new segment's watermark.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 26
+
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+        confirmed_num_computed_tokens=26,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    boundary_task = adapter._pending_save_reqs.popleft()
+    assert "ext-stream" not in adapter.requests_num_chunks_sent
+
+    request.num_computed_tokens = 3
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=False,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+    adapter._send_single_request(boundary_task)
+
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+
+def test_background_send_uses_enqueued_request_snapshot(build_adapter):
+    """A queued segment must not observe later in-place request mutations."""
+    adapter, _ = build_adapter(stage_id=1)
+    request = Request(
+        request_id="req-stream",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = "ext-stream"
+    ref_audio = torch.tensor([0.1, -0.1])
+    request.additional_information = {"codes": {"ref": ref_audio}, "meta": {"segment": "old"}}
+    request.append_output_token_ids([7])
+    seen_requests = []
+
+    def recording_processor(**kwargs):
+        queued = kwargs["request"]
+        seen_requests.append(
+            (
+                queued.additional_information["meta"]["segment"],
+                list(queued.prompt_token_ids),
+                list(queued.output_token_ids),
+                list(queued.all_token_ids),
+                queued.additional_information["codes"]["ref"] is ref_audio,
+            )
+        )
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "next"
+    request.prompt_token_ids.append(3)
+    request.append_output_token_ids([8])
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "later"
+    request.prompt_token_ids.append(4)
+    request.append_output_token_ids([9])
+
+    assert len(adapter._pending_save_reqs) == 2
+    first_task = adapter._pending_save_reqs.popleft()
+    second_task = adapter._pending_save_reqs.popleft()
+    assert first_task["request"].additional_information is not request.additional_information
+    assert first_task["request"].additional_information["meta"] is not request.additional_information["meta"]
+
+    adapter._send_single_request(first_task)
+    adapter._send_single_request(second_task)
+
+    assert seen_requests == [
+        ("old", [1, 2], [7], [1, 2, 7], True),
+        ("next", [1, 2, 3], [7, 8], [1, 2, 7, 8], True),
+    ]
+
+
+def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")
+    snapshot = mocker.patch.object(
+        adapter,
+        "_snapshot_processor_request",
+        side_effect=AssertionError("unexpected snapshot"),
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+
+    snapshot.assert_not_called()
+    assert adapter._pending_save_reqs.popleft()["request"] is request
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -1091,6 +1207,67 @@ def test_cleanup_preserves_pending_save(build_adapter):
     adapter.cleanup(req_id, ext_id)
 
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-old", RequestStatus.WAITING, external_req_id="ext-reused")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    stale_task = adapter._pending_save_reqs.popleft()
+    adapter.cleanup(request.request_id, request.external_req_id)
+    adapter._send_single_request(stale_task)
+
+    connector.put.assert_not_called()
+    assert request.external_req_id not in adapter.put_req_chunk
+
+    replacement = _req("req-new", RequestStatus.WAITING, external_req_id=request.external_req_id)
+    adapter.save_async(multimodal_output=None, request=replacement)
+    current_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(current_task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
+
+
+def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    first = _req("req-first", RequestStatus.WAITING, external_req_id="ext-first")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    put_started = threading.Event()
+    release_put = threading.Event()
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        release_put.wait(timeout=2)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_put
+    adapter.save_async(multimodal_output=None, request=first)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    assert put_started.wait(timeout=1)
+    cleaner = threading.Thread(
+        target=adapter.finish_requests,
+        args=([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first}),
+    )
+    cleaner.start()
+    try:
+        cleaner.join(timeout=0.5)
+        assert not cleaner.is_alive()
+        assert task["sender_token"].cancelled
+        assert first.external_req_id in adapter._sender_tokens
+    finally:
+        release_put.set()
+        sender.join(timeout=1)
+        cleaner.join(timeout=1)
+    assert not sender.is_alive()
+    assert first.external_req_id not in adapter._sender_tokens
+    assert first.external_req_id not in adapter.put_req_chunk
 
 
 def test_cleanup_only_affects_target_request(build_adapter):
@@ -2100,3 +2277,43 @@ def test_expiry_is_per_request(build_adapter):
 
     assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"stalled"}
     assert "healthy" in adapter._waiting_since
+
+
+def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1, connector_extra={"codec_chunk_frames": 1})
+    external_req_id = "ext-native-abort"
+    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    first.resumable = True
+    first.model_intermediate_buffer = None
+    first.additional_information = {"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1}
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
+        first,
+        is_finished=False,
+    )
+
+    adapter.requests_num_chunks_sent[external_req_id] = 1
+    adapter.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first})
+
+    assert external_req_id not in adapter.request_payload
+    assert external_req_id not in adapter.requests_num_chunks_sent
+
+    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    replacement.resumable = True
+    replacement.model_intermediate_buffer = None
+    replacement.additional_information = first.additional_information
+    replacement_payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.full((1, 31), 202, dtype=torch.long)}, "meta": {"codec_streaming": True}},
+        replacement,
+        is_finished=False,
+    )
+
+    assert torch.equal(replacement_payload.codes.audio, torch.full((1, 31), 202, dtype=torch.long))

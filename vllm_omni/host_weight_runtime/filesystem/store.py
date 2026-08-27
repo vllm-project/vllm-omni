@@ -863,7 +863,11 @@ class FilesystemHostWeightStore:
                 manifest, _ = writer.finalize(identity, metadata)
                 artifact_bytes = self._tree_bytes(staging)
                 self._check_capacity(artifact_bytes, 0)
-                os.chmod(staging, 0o555)
+                # Keep the staging directory writable until the atomic rename.
+                # overlayfs rejects renaming a non-writable source directory;
+                # the artifact lock keeps readers out while the published
+                # directory is hardened below.
+                os.chmod(staging, 0o755)
                 _fsync_directory(staging)
             except HostWeightError as exc:
                 if writer is not None:
@@ -934,6 +938,11 @@ class FilesystemHostWeightStore:
                         self._remove_tree(staging)
                     else:
                         os.replace(staging, entry_path)
+                        try:
+                            os.chmod(entry_path, 0o555)
+                        except OSError:
+                            self._quarantine_locked(identity.key, reason="publication_hardening_failure")
+                            raise
                         _fsync_directory(self.artifacts_dir)
                         _fsync_directory(self.tmp_dir)
                     self._remove_deny_locked(identity.key)

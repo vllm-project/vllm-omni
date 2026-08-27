@@ -16,6 +16,7 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
+from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
 
 logger = init_logger(__name__)
 
@@ -186,6 +187,7 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    requires_full_payload_input: bool = False
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
@@ -240,12 +242,19 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.worker_cls is None:
+        if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
+
+        connector_extra = self.stage_connector_spec.get("extra")
+        connector_role = connector_extra.get("role") if isinstance(connector_extra, dict) else None
+        needs_connector = bool(
+            self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
+        )
+        validate_worker_omni_connector(self.worker_cls, needs_connector)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -416,6 +425,7 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
+            requires_full_payload_input=self.requires_full_payload_input,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             silence_ban_frames=self.silence_ban_frames,
@@ -559,6 +569,9 @@ class OrchestratorArgs:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = 0.0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

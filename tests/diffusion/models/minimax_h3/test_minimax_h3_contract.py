@@ -774,6 +774,12 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     assert metadata.attn_mask is None
     assert metadata.extra["valid_kv_length"] == 5
     assert metadata.extra["npu_attn_varlen"] is True
+    packed_padding = metadata.packed_padding
+    assert packed_padding is not None
+    assert packed_padding.q_length == 5
+    assert packed_padding.kv_length == 5
+    assert packed_padding.cu_seqlens_q.tolist() == [0, 5]
+    assert packed_padding.cu_seqlens_k.tolist() == [0, 5]
 
 
 def test_packed_attention_keeps_padding_mask_for_other_backends():
@@ -956,6 +962,80 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
+
+
+def test_text_attention_routes_local_gqa_heads_through_sdpa_helper(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    class FakeEncoderGroup:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_reduce(self, tensor):
+            del tensor
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+        rms_norm_eps=1e-6,
+    )
+    with (
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        attention = encoder_module.MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    # This CPU contract test only needs projection shapes and head reshaping.
+    # Avoid dispatching platform-specific norm and linear kernels (for example,
+    # rocm_unquantized_gemm when the test suite is collected on ROCm).
+    attention.q_norm = nn.Identity()
+    attention.k_norm = nn.Identity()
+    with torch.no_grad():
+        attention.qkv_proj.weight.zero_()
+    attention.o_proj = nn.Linear(
+        attention.qkv_proj.local_num_heads * attention.head_dim,
+        config.hidden_size,
+        bias=False,
+    )
+    attn_call = {}
+
+    def fake_attention(query, key, value):
+        attn_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape)
+        return query
+
+    monkeypatch.setattr(encoder_module, "_scaled_dot_product_attention", fake_attention)
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    cos = torch.ones(1, 3, config.head_dim)
+    sin = torch.zeros_like(cos)
+
+    output = attention(hidden_states, (cos, sin))
+
+    assert attn_call["query_shape"] == (1, config.num_attention_heads // 2, 3, config.head_dim)
+    assert attn_call["key_shape"] == (1, config.num_key_value_heads // 2, 3, config.head_dim)
+    assert attn_call["value_shape"] == (1, config.num_key_value_heads // 2, 3, config.head_dim)
+    assert output.shape == hidden_states.shape
+
+
+def test_text_attention_sdpa_helper_preserves_expanded_kv_fallback(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+
+    sdpa_call = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        sdpa_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape, kwargs=kwargs)
+        return query
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
+    output = encoder_module._scaled_dot_product_attention(
+        torch.randn(1, 4, 3, 8),
+        torch.randn(1, 2, 3, 8),
+        torch.randn(1, 2, 3, 8),
+    )
+
+    assert sdpa_call["query_shape"] == sdpa_call["key_shape"] == sdpa_call["value_shape"] == (1, 4, 3, 8)
+    assert sdpa_call["kwargs"] == {"dropout_p": 0.0, "is_causal": True}
+    assert output.shape == (1, 4, 3, 8)
 
 
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():

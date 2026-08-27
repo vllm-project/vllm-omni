@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # ruff: noqa
 # code borrowed from https://github.com/pytorch/pytorch/blob/main/torch/utils/collect_env.py
@@ -494,6 +494,16 @@ def is_xnnpack_available():
 
 
 def get_env_vars():
+    try:
+        from vllm_omni.config.environment_variable_inventory import ENVIRONMENT_VARIABLE_INVENTORY
+    except Exception:
+        # Keep environment collection usable when an incomplete/broken Omni
+        # installation is the reason the user is running this diagnostic.
+        # Importing an Omni submodule executes package initialization, which
+        # may fail with RuntimeError, AssertionError, or OSError as well as
+        # ImportError when vLLM or the accelerator stack is broken.
+        ENVIRONMENT_VARIABLE_INVENTORY = {}
+
     env_vars = ""
     secret_terms = ("secret", "token", "api", "access", "password")
     report_prefix = (
@@ -507,12 +517,17 @@ def get_env_vars():
         "MKL_",
         "NVIDIA",
     )
-    for k, v in os.environ.items():
-        if any(term in k.lower() for term in secret_terms):
+    for k, v in sorted(os.environ.items()):
+        omni_classification = ENVIRONMENT_VARIABLE_INVENTORY.get(k)
+        if (omni_classification is not None and omni_classification.redact_value) or any(
+            term in k.lower() for term in secret_terms
+        ):
             continue
-        if k in environment_variables:
-            env_vars = env_vars + "{}={}".format(k, v) + "\n"
-        if k.startswith(report_prefix):
+        if (
+            k in environment_variables
+            or (omni_classification is not None and omni_classification.is_public_omni)
+            or k.startswith(report_prefix)
+        ):
             env_vars = env_vars + "{}={}".format(k, v) + "\n"
 
     return env_vars

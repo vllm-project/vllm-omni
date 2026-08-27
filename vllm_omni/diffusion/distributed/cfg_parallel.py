@@ -235,8 +235,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Predict noise with N-branch CFG dispatch across M GPUs.
 
         This is the multi-branch counterpart of predict_noise_maybe_with_cfg().
-        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel,
-        DreamID). Existing 2-branch models should continue using
+        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel).
+        Existing 2-branch models should continue using
         predict_noise_maybe_with_cfg().
 
         Args:
