@@ -87,7 +87,7 @@ recipes/
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
 | [`XiaomiMiMo/MiMo-Audio.md`](./XiaomiMiMo/MiMo-Audio.md) | Offline + online omni audio (TTS, ASR, dialogue) | 1x RTX 5090 / 5090D 32GB |
 | [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB |
-| [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB |
+| [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |
 

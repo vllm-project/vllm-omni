@@ -53,6 +53,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+# Blocking-wait interval for the event-driven final-output drain
+# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
+# the janus queue's condition variable; this timeout only bounds how often the
+# orchestrator liveness check runs while the pipeline is idle.
+_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
 
 
 class AsyncEventResolver:
@@ -880,14 +885,29 @@ class AsyncOmni(EngineClient, OmniBase):
 
         engine = self.engine
 
+        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
+        # queue's condition variable in a dedicated thread instead of the
+        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
+        # event-driven loop (vllm_omni/engine/orchestrator.py).
+        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
+
+        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
+
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
             try:
                 while True:
-                    msg = await engine.try_get_output_async()
-                    if msg is None:
-                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                        continue
+                    if event_driven_drain:
+                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
+                        if msg is None:
+                            # Timed out with the orchestrator alive; loop for
+                            # the periodic liveness check.
+                            continue
+                    else:
+                        msg = await engine.try_get_output_async()
+                        if msg is None:
+                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
+                            continue
 
                     if isinstance(msg, dict) and msg.get("type") == "ack":
                         ack_data = msg.get("ack")

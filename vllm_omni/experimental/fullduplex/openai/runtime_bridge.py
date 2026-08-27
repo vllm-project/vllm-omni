@@ -135,7 +135,9 @@ class NativeRuntimeBridgeMixin:
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
-                append_kwargs["collect_outputs"] = False
+                append_kwargs["collect_outputs"] = bool(
+                    getattr(self._serving_runtime_adapter, "collect_outputs_on_append", False)
+                )
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -315,16 +317,21 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_task = task
         return True
 
-    # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
-    # official full-duplex behavior where the microphone keeps streaming
-    # silence while the assistant speaks; replies span multiple units.
+    # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
+    # Other native-duplex adapters may use a different frame-locked unit.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
+        samples = int(getattr(self._serving_runtime_adapter, "silence_continuation_samples", 16000))
+        audio = (
+            self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+            if samples == 16000
+            else base64.b64encode(bytes(samples * 4)).decode("ascii")
+        )
         return {
             "type": "audio",
-            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "audio": audio,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
         }
@@ -825,6 +832,18 @@ class NativeRuntimeBridgeMixin:
                         "playback": session.playback.as_dict(),
                     }
                 )
+            return close_reason, True
+        if native_result.get("function_call") is True:
+            await send_json(
+                {
+                    "type": "function_call.done",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": native_result.get("call_id"),
+                    "name": native_result.get("name"),
+                    "arguments": native_result.get("arguments", ""),
+                }
+            )
             return close_reason, True
         if native_result.get("requires_stage_handoff") is True or native_result.get("requires_tts_stage") is True:
             # Stage0 announces a talker handoff before Stage1 has produced

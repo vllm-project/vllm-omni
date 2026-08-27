@@ -35,7 +35,10 @@ from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadHook,
     PinnedResidentLayerGroup,
 )
-from vllm_omni.diffusion.offloader.host_registration import HostRegistrationCleanupError
+from vllm_omni.diffusion.offloader.host_registration import (
+    HostRegistrationCleanupError,
+    HostRegistrationError,
+)
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
@@ -807,7 +810,10 @@ def test_registered_mmap_resident_group_bypasses_host_staging(patched_offload_ru
     assert torch.equal(block.weight, expected)
 
 
-def test_hwr_registration_uses_transport_budget(monkeypatch: pytest.MonkeyPatch):
+def test_hwr_registration_uses_transport_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    patched_offload_runtime,
+):
     dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
     plan, _, lease = _fake_hwr_plan()
     backend = DistributedLayerwiseOffloadBackend(
@@ -1120,6 +1126,51 @@ class TestMmapWeightLoading:
             for buffer in backend._all_hook_groups[0][0].cpu_staging_buffers[0].values()
         )
         assert staging_bytes * 2 < model_bytes
+        assert not lease.closed
+
+        backend.disable()
+        assert lease.closed
+
+    def test_hwr_registration_failure_falls_back_to_bounded_staging(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        plan, carrier, lease = _fake_hwr_plan("hwr-registration-fallback")
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=True,
+                dp_size=1,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+        pipeline = _HWRPipeline()
+        original_staging_allocator = backend._allocate_shared_cpu_staging_buffers
+
+        def fail_registration(*args, **kwargs):
+            del args, kwargs
+            raise HostRegistrationError("registration unavailable in CPU test")
+
+        def allocate_unpinned_staging(hooks, resident_group=None):
+            # Registration selection still observes pin_cpu_memory=True. The
+            # CPU-only test avoids asking the host for CUDA-pinned allocations.
+            for hook in hooks:
+                hook.pin_memory = False
+            return original_staging_allocator(hooks, resident_group)
+
+        monkeypatch.setattr(dist_backend_module, "register_host_mappings", fail_registration)
+        monkeypatch.setattr(backend, "_allocate_shared_cpu_staging_buffers", allocate_unpinned_staging)
+
+        backend.enable(pipeline)
+
+        assert carrier.taken
+        assert backend._using_rank_local_mmap
+        assert not backend._using_registered_mmap
+        assert backend._host_registration is None
+        assert all(len(hook.cpu_staging_buffers) == 2 for group in backend._all_hook_groups for hook in group)
         assert not lease.closed
 
         backend.disable()
@@ -2132,8 +2183,9 @@ class TestDynamicSlotTracking:
                 prev_idx = (i - 1) % num_blocks
 
                 # Dynamic slot tracking: read from prev's prefetched slot
-                if prefetched_slots[prev_idx] is not None:
-                    current_slots[i] = prefetched_slots[prev_idx]
+                prefetched_slot = prefetched_slots[prev_idx]
+                if prefetched_slot is not None:
+                    current_slots[i] = prefetched_slot
 
                 read_slot = current_slots[i]
 

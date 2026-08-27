@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
@@ -55,12 +55,12 @@ def _register_humming_stubs() -> None:
         registry[name] = mod
 
     # wire parent references
-    registry["humming"].config = registry["humming.config"]
-    registry["humming"].dtypes = registry["humming.dtypes"]
-    registry["humming"].layer = registry["humming.layer"]
-    registry["humming"].schema = registry["humming.schema"]
-    registry["humming"].utils = registry["humming.utils"]
-    registry["humming.utils"].weight = registry["humming.utils.weight"]
+    setattr(registry["humming"], "config", registry["humming.config"])
+    setattr(registry["humming"], "dtypes", registry["humming.dtypes"])
+    setattr(registry["humming"], "layer", registry["humming.layer"])
+    setattr(registry["humming"], "schema", registry["humming.schema"])
+    setattr(registry["humming"], "utils", registry["humming.utils"])
+    setattr(registry["humming.utils"], "weight", registry["humming.utils.weight"])
 
     for name, mod in registry.items():
         sys.modules[name] = mod
@@ -125,6 +125,13 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4DualScaleMixedConfig(**kw)
 
 
+def _build_svdquant(**kw: Any) -> QuantizationConfig:
+    """Build the serialized SVDQuant diffusion checkpoint loader."""
+    from .svdquant_config import DiffusionSVDQuantConfig
+
+    return DiffusionSVDQuantConfig.from_config(kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -145,6 +152,7 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
+    "svdquant": _build_svdquant,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
