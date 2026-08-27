@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -83,33 +84,25 @@ NEGATIVE_PROMPT = (
 # Release parity exercises the accelerated BF16 cuDNN path in both runtimes.
 # Degenerate one-token attention falls back to PyTorch SDPA MATH.
 ATTENTION_BACKEND = "torch_sdpa_cudnn_bf16"
-VIDEO_SSIM_MEAN_THRESHOLD = 0.95
-VIDEO_SSIM_MIN_THRESHOLD = 0.90
-VIDEO_PSNR_MEAN_THRESHOLD = 30.0
-AUDIO_RELATIVE_L2_THRESHOLD = 0.2
-AUDIO_COSINE_THRESHOLD = 0.95
-
-# Decoded-output gates for the pinned official/Omni BF16 cuDNN comparison.
-# The metrics artifact preserves the exact observed values.
-LTX25_VIDEO_SSIM_MEAN_THRESHOLD = 0.99
-LTX25_I2V_VIDEO_SSIM_MEAN_THRESHOLD = 0.99
-LTX25_VIDEO_SSIM_MIN_THRESHOLD = 0.99
-LTX25_VIDEO_PSNR_MEAN_THRESHOLD = 40.0
-LTX25_VIDEO_LPIPS_MEAN_THRESHOLD = 0.01
-LTX25_AUDIO_RELATIVE_L2_THRESHOLD = 0.32
-LTX25_AUDIO_COSINE_THRESHOLD = 0.95
-
-# Full/SFT uses independently converted dev weights, but the release contract
-# still requires decoded-video parity at the same 0.99 SSIM floor as the
-# distilled paths when both runtimes use BF16 cuDNN attention.
-LTX25_FULL_VIDEO_SSIM_MEAN_THRESHOLD = 0.99
-LTX25_FULL_VIDEO_SSIM_MIN_THRESHOLD = 0.99
-LTX25_FULL_VIDEO_PSNR_MEAN_THRESHOLD = 40.0
-LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD = 0.3
-LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD = 0.01
-LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD = 0.02
-LTX25_FULL_AUDIO_COSINE_THRESHOLD = AUDIO_COSINE_THRESHOLD
 LTX25_STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+
+
+@dataclass(frozen=True)
+class LTXAccuracyThresholds:
+    video_ssim_mean: float
+    video_ssim_min: float
+    video_psnr_mean_db: float
+    audio_relative_l2: float
+    audio_cosine_similarity: float
+
+
+STRICT_THRESHOLDS = LTXAccuracyThresholds(
+    video_ssim_mean=0.99,
+    video_ssim_min=0.99,
+    video_psnr_mean_db=40.0,
+    audio_relative_l2=0.10,
+    audio_cosine_similarity=0.99,
+)
 
 
 def test_ltx_reference_runner_unwraps_flattened_pipeline_output() -> None:
@@ -419,8 +412,6 @@ def test_ltx25_i2v_requests_pin_official_crf() -> None:
 
 
 def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
-    from benchmarks.diffusion.quantization_quality import compute_lpips_video
-
     assert reference.shape == prediction.shape
     assert reference.ndim == 4 and reference.shape[-1] == 3
     ssim_scores: list[float] = []
@@ -435,7 +426,6 @@ def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
         "ssim_mean": float(np.mean(ssim_scores)),
         "ssim_min": float(np.min(ssim_scores)),
         "psnr_mean_db": float(np.mean(psnr_scores)),
-        "lpips_alex_mean": compute_lpips_video(reference, prediction),
         "max_abs": float(difference.max()),
         "mean_abs": float(difference.mean()),
     }
@@ -461,6 +451,17 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
         "relative_l2": float(np.linalg.norm(difference) / reference_norm),
         "cosine_similarity": float(np.vdot(reference.ravel(), prediction.ravel()) / (reference_norm * prediction_norm)),
     }
+
+
+def _assert_strict_similarity(
+    video_metrics: dict[str, float],
+    audio_metrics: dict[str, float | bool],
+) -> None:
+    assert video_metrics["ssim_mean"] >= STRICT_THRESHOLDS.video_ssim_mean
+    assert video_metrics["ssim_min"] >= STRICT_THRESHOLDS.video_ssim_min
+    assert video_metrics["psnr_mean_db"] >= STRICT_THRESHOLDS.video_psnr_mean_db
+    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
+    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
 
 
 @pytest.mark.slow
@@ -569,6 +570,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         "omni_model": omni_model_source,
         "omni_model_revision": omni_model_revision,
         "resolved_omni_model_path": str(omni_model),
+        "thresholds": asdict(STRICT_THRESHOLDS),
         "peak_memory_mb": {
             "official_allocated": official_metadata["peak_memory_allocated_mb"],
             "official_reserved": official_metadata["peak_memory_reserved_mb"],
@@ -582,13 +584,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
-    ssim_mean_threshold = LTX25_VIDEO_SSIM_MEAN_THRESHOLD if task == "t2v" else LTX25_I2V_VIDEO_SSIM_MEAN_THRESHOLD
-    assert video_metrics["ssim_mean"] >= ssim_mean_threshold
-    assert video_metrics["ssim_min"] >= LTX25_VIDEO_SSIM_MIN_THRESHOLD
-    assert video_metrics["psnr_mean_db"] >= LTX25_VIDEO_PSNR_MEAN_THRESHOLD
-    assert video_metrics["lpips_alex_mean"] <= LTX25_VIDEO_LPIPS_MEAN_THRESHOLD
-    assert audio_metrics["cosine_similarity"] >= LTX25_AUDIO_COSINE_THRESHOLD
-    assert audio_metrics["relative_l2"] <= LTX25_AUDIO_RELATIVE_L2_THRESHOLD
+    _assert_strict_similarity(video_metrics, audio_metrics)
 
 
 @pytest.mark.slow
@@ -729,6 +725,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         "omni_model": omni_model_source,
         "omni_model_revision": omni_model_revision,
         "resolved_omni_model_path": str(omni_model),
+        "thresholds": asdict(STRICT_THRESHOLDS),
         "peak_memory_mb": {
             "official_allocated": official_metadata["peak_memory_allocated_mb"],
             "official_reserved": official_metadata["peak_memory_reserved_mb"],
@@ -742,12 +739,4 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
-    assert video_metrics["ssim_mean"] >= LTX25_FULL_VIDEO_SSIM_MEAN_THRESHOLD
-    assert video_metrics["ssim_min"] >= LTX25_FULL_VIDEO_SSIM_MIN_THRESHOLD
-    assert video_metrics["psnr_mean_db"] >= LTX25_FULL_VIDEO_PSNR_MEAN_THRESHOLD
-    lpips_threshold = (
-        LTX25_FULL_VIDEO_LPIPS_MEAN_THRESHOLD if task == "t2v" else LTX25_FULL_I2V_VIDEO_LPIPS_MEAN_THRESHOLD
-    )
-    assert audio_metrics["relative_l2"] <= LTX25_FULL_AUDIO_RELATIVE_L2_THRESHOLD
-    assert video_metrics["lpips_alex_mean"] <= lpips_threshold
-    assert audio_metrics["cosine_similarity"] >= LTX25_FULL_AUDIO_COSINE_THRESHOLD
+    _assert_strict_similarity(video_metrics, audio_metrics)

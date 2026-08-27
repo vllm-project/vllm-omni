@@ -152,6 +152,7 @@ class OmniModelConfig(ModelConfig):
     # place it can learn which request-shaping conventions a stage uses (e.g.
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
+    requires_full_payload_input: bool = False
 
     @property
     def registry(self):
