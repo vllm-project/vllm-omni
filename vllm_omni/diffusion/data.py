@@ -1528,6 +1528,9 @@ class DiffusionOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
+    # KV-recv wall-clock (ms) from the runner; feeds vllm_omni:diffusion_kv_load_s.
+    kv_recv_ms: float = 0.0
+
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.

@@ -452,6 +452,10 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
         "env": {runtime_env_var: "stage-value"},
     }
     monkeypatch.setenv(runtime_env_var, "parent-value")
+    # Pin the logical->physical device mapping so the assertion below is
+    # deterministic regardless of the ambient CUDA_VISIBLE_DEVICES (which on a
+    # rebase host can be e.g. "3,4", mapping logical device 0 -> physical 3).
+    runtime._init_visible_devices_baseline = "0"
 
     captured: dict[str, str | None] = {}
 

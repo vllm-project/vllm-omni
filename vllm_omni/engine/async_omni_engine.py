@@ -107,7 +107,10 @@ class AsyncOmniEngine:
     _log_stats: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
+    _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    # Lazily created by get_output_blocking_async().
+    _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def __init__(
         self,
@@ -117,6 +120,7 @@ class AsyncOmniEngine:
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
         transfer_emitter: Any = None,
+        prom_metrics: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
@@ -133,6 +137,7 @@ class AsyncOmniEngine:
         # Optional: when None, Orchestrator silently skips TX emit (existing
         # RX path still works via OrchestratorAggregator).
         self._transfer_emitter = transfer_emitter
+        self._prom_metrics = prom_metrics
         # Drives upstream EngineCore + scheduler stats production. When False
         # the engine skips SchedulerStats / IterationStats; the per-(stage,
         # replica) vllm:* wrap stays registered but reads zero. Respects the
@@ -398,6 +403,7 @@ class AsyncOmniEngine:
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
+                prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 duplex_runtime_extension=duplex_runtime_extension,
@@ -1735,6 +1741,42 @@ class AsyncOmniEngine:
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
+    async def get_output_blocking_async(self, timeout: float = 1.0) -> EngineQueueMessage | None:
+        """Blocking-wait read from the Orchestrator output queue.
+
+        Waits up to ``timeout`` seconds in a dedicated drain thread for the
+        next message (condition-variable wakeup instead of a poll cadence);
+        returns ``None`` on timeout so the caller keeps its liveness check,
+        mirroring ``try_get_output_async``'s contract. Used by the serving
+        final-output drain when ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` is on.
+        """
+        executor = self._output_drain_executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="omni-output-drain",
+            )
+            self._output_drain_executor = executor
+
+        sync_q = self.output_queue.sync_q
+
+        def _drain_get() -> EngineQueueMessage | None:
+            # Exceptions are swallowed to a None sentinel: the queue may be
+            # closed mid-shutdown, and an exception left on an executor future
+            # after task cancellation would warn as never-retrieved.
+            try:
+                return sync_q.get(timeout=timeout)
+            except queue.Empty:
+                return None
+            except Exception:
+                return None
+
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(executor, _drain_get)
+        if msg is None and not self.is_alive():
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+        return msg
+
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
         return self.stage_metadata[stage_id]
@@ -1923,6 +1965,12 @@ class AsyncOmniEngine:
                     q.close()
             except Exception:
                 pass
+
+        if self._output_drain_executor is not None:
+            # Any in-flight blocking get bails out within its ≤1 s timeout
+            # (or immediately via the queue close above), so don't wait.
+            self._output_drain_executor.shutdown(wait=False)
+            self._output_drain_executor = None
 
         if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:

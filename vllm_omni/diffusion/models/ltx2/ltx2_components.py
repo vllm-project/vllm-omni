@@ -637,14 +637,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         upsampler_config = os.path.join(model, "latent_upsampler", "config.json")
         if os.path.isfile(upsampler_config) or not local_files_only:
             try:
-                pipeline.latent_upsampler = _load_component(
-                    LTX2LatentUpsamplerModel,
-                    model,
-                    "latent_upsampler",
-                    local_files_only=local_files_only,
-                    dtype=dtype,
-                    revision=revision,
-                )
+                # Diffusers builds the rational-resampler kernel with Long
+                # tensors; constructing it under a CUDA default-device context
+                # attempts an unsupported Long addmm before weights are loaded.
+                with torch.device("cpu"):
+                    pipeline.latent_upsampler = _load_component(
+                        LTX2LatentUpsamplerModel,
+                        model,
+                        "latent_upsampler",
+                        local_files_only=local_files_only,
+                        dtype=dtype,
+                        revision=revision,
+                    )
             except (OSError, ValueError):
                 if profile.latent_upsampler_filename is None or profile.artifact_repo_id is None:
                     raise

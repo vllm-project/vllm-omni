@@ -1,8 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prettytable import PrettyTable
+
+from vllm_omni.metrics import definitions as metric_defs
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.modality import OmniModalityMetrics
+    from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
+    from vllm_omni.metrics.stats import StageRequestStats
+
+FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
+DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
+
+
+def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
+    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
+        return None
+    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def observe_stage_workload_metrics(
+    prom_metrics: OmniPrometheusMetrics,
+    *,
+    stage_type: str,
+    stage_metrics: StageRequestStats,
+) -> None:
+    if stage_type == "diffusion":
+        prom_metrics.observe_num_inference_steps(stage_metrics.num_inference_steps)
+
+    if stage_metrics.output_unit_type == "image":
+        prom_metrics.observe_image_pixels(stage_metrics.image_pixels)
+        prom_metrics.inc_image_count(stage_metrics.output_unit_count)
+
+
+def observe_audio_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+    engine_outputs: Any,
+) -> None:
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
+    mm_out = extract_mm_output(engine_outputs)
+
+    sample_rate = metric_defs.resolve_audio_sample_rate(mm_out)
+    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+    if n_frames == 0:
+        n_frames = count_audio_frames(mm_out)
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+    if duration_s > 0:
+        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+        mod_metrics.observe_audio_rtf(
+            stage_label,
+            replica_label,
+            metric_defs.compute_audio_rtf(gen_time_s, duration_s),
+        )
+    else:
+        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+
+
+def observe_diffusion_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+) -> None:
+    diff_metrics = getattr(stage_metrics, "diffusion_metrics", None)
+    if not diff_metrics:
+        return
+
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+
+    exec_s = diff_metrics.get("diffusion_engine_exec_time_s")
+    if exec_s is not None:
+        mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
+
+    pre_s = diff_metrics.get("preprocess_time_s")
+    if pre_s is not None:
+        mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
+
+    post_s = diff_metrics.get("postprocess_time_s")
+    if post_s is not None:
+        mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
+
+    vae_s = diff_metrics.get("vae_decode_time_s")
+    if vae_s is not None:
+        mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
+
+    forward_s = diff_metrics.get("forward_time_s")
+    if forward_s is not None:
+        mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0 and getattr(stage_metrics, "output_unit_type", None) == "image":
+            mod_metrics.observe_denoise_step_latency(stage_label, replica_label, float(forward_s) / num_steps)
+
+    kv_load_s = diff_metrics.get("kv_recv_time_s")
+    if kv_load_s is not None:
+        mod_metrics.observe_diffusion_kv_load(stage_label, replica_label, float(kv_load_s))
+
+
+def normalize_failure_reason(reason: str | None) -> str:
+    """Map request failure details to the bounded metrics taxonomy."""
+    return reason if reason in FAILURE_REASONS else "unknown"
+
+
+def diffusion_scheduler_waiting_metrics(n_waiting: int) -> dict[str, int]:
+    """Build the diffusion scheduler snapshot consumed by the orchestrator."""
+    return {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: max(int(n_waiting), 0)}
+
+
+def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
+    """Return metrics attached to a terminal diffusion error."""
+    metrics = getattr(exc, "diffusion_metrics", None)
+    return dict(metrics) if isinstance(metrics, dict) else {}
+
+
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+    """Sum matching diffusion stage durations in milliseconds."""
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, dict):
+        return None
+
+    total = 0.0
+    found = False
+    for key, value in durations.items():
+        if not key.endswith(suffix):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total * 1000.0 if found else None
+
+
+def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
+    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+
+
+def extract_diffusion_denoise_ms(output: Any) -> float | None:
+    """Extract denoise-loop time (transformer and per-step scheduler)."""
+    return sum_diffusion_stage_durations_ms(output, ".diffuse")
 
 
 def coerce_positive_int_scalar(value: object) -> int | None:
