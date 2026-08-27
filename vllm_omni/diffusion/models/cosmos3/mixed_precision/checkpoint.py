@@ -151,9 +151,7 @@ def _validate_checkpoint_quantization(quant_config: object | None) -> None:
     get_name = getattr(quant_config, "get_name", None)
     name = get_name() if callable(get_name) else None
     if name not in _SUPPORTED_MODEL_OPT_CONFIGS:
-        raise ValueError(
-            f"diffusion_step_policy requires a serialized ModelOpt FP8 or NVFP4 checkpoint, got {name!r}"
-        )
+        raise ValueError(f"diffusion_step_policy requires a serialized ModelOpt FP8 or NVFP4 checkpoint, got {name!r}")
 
     if name == "modelopt":
         _require_serialized(quant_config, "is_checkpoint_fp8_serialized", "FP8")

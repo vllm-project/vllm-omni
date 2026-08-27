@@ -179,14 +179,11 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
         output_size = int(layer.output_size_per_partition)
         input_size = int(layer.input_size_per_partition)
         if input_size % _NVFP4_BLOCK_SIZE != 0:
-            raise ValueError(
-                f"{module_name} input size {input_size} is not divisible by {_NVFP4_BLOCK_SIZE}"
-            )
+            raise ValueError(f"{module_name} input size {input_size} is not divisible by {_NVFP4_BLOCK_SIZE}")
         expected_weight = (output_size, input_size // 2)
         if packed.shape[0] < expected_weight[0] or packed.shape[1] < expected_weight[1]:
             raise ValueError(
-                f"{module_name} live NVFP4 weight shape {tuple(packed.shape)} "
-                f"does not cover {expected_weight}"
+                f"{module_name} live NVFP4 weight shape {tuple(packed.shape)} does not cover {expected_weight}"
             )
         _validate_positive_finite_scale(global_scale, module_name)
         lut_handle = nvfp4_emulation_utils.kE2M1ToFloat_handle

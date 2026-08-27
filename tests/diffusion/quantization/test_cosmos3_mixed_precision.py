@@ -98,9 +98,13 @@ def _swizzle_blockscale_cpu(scale: torch.Tensor) -> torch.Tensor:
     )
     padded[0, :rows, :cols] = scale
     padded = padded.reshape(1, padded_rows // 128, 4, 32, padded_cols // 4, 4)
-    return padded.permute(0, 1, 4, 3, 2, 5).contiguous().reshape(
-        padded_rows,
-        padded_cols,
+    return (
+        padded.permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(
+            padded_rows,
+            padded_cols,
+        )
     )
 
 
@@ -167,9 +171,7 @@ def test_config_rejects_invalid_values(values: dict, message: str) -> None:
 
 def test_config_presence_enables_defaults() -> None:
     assert Cosmos3MixedPrecisionConfig.from_additional_config({}) is None
-    config = Cosmos3MixedPrecisionConfig.from_additional_config(
-        {"cosmos3_mixed_precision": {}}
-    )
+    config = Cosmos3MixedPrecisionConfig.from_additional_config({"cosmos3_mixed_precision": {}})
     assert config == Cosmos3MixedPrecisionConfig()
 
 
@@ -220,10 +222,7 @@ def test_checkpoint_policy_round_trip_through_transformer_config() -> None:
     tf_config = TransformerConfig.from_dict(disk)
     assert tf_config.quant_config is not None
     assert tf_config.quant_config.get_name() == "modelopt"
-    assert (
-        tf_config.to_dict()["quantization_config"]["runtime"]
-        == disk["quantization_config"]["runtime"]
-    )
+    assert tf_config.to_dict()["quantization_config"]["runtime"] == disk["quantization_config"]["runtime"]
     assert read_checkpoint_policy(SimpleNamespace(tf_model_config=tf_config)) == Cosmos3MixedPrecisionConfig(
         first_steps=2,
         last_steps=4,
@@ -578,9 +577,7 @@ def test_reasoner_policy_is_independent_of_generation_step(
 
 
 def test_reset_clears_generation_state() -> None:
-    runtime = Cosmos3MixedPrecisionRuntime(
-        Cosmos3MixedPrecisionConfig(first_steps=1, last_steps=1)
-    )
+    runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(first_steps=1, last_steps=1))
     runtime.set_step(0, 5)
     assert runtime.use_high_precision("generation")
     runtime.reset()

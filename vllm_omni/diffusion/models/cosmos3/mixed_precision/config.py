@@ -79,8 +79,7 @@ class Cosmos3MixedPrecisionConfig:
         reasoner = str(raw_config.get("reasoner", "a16")).lower()
         if reasoner not in _REASONER_POLICIES:
             raise ValueError(
-                "cosmos3_mixed_precision.reasoner must be one of "
-                f"{sorted(_REASONER_POLICIES)}, got {reasoner!r}"
+                f"cosmos3_mixed_precision.reasoner must be one of {sorted(_REASONER_POLICIES)}, got {reasoner!r}"
             )
         config = cls(
             first_steps=first_steps,
