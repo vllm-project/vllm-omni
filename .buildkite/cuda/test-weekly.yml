@@ -169,6 +169,41 @@ steps:
             --run-level "full_model"
         mirror_hardwares: l4_1
 
+      # Own step: Amphion is not on PyPI (the CI image is expected to have it
+      # pre-cloned at /opt/Amphion) and the RMSnow/Vevo2 checkpoint ships no
+      # root config.json, so the tests import-skip out of the mark-selected TTS
+      # steps above unless VEVO2_MODEL_PATH points at an initialised checkout.
+      # A failed download/init fails the step rather than skipping green.
+      - label: "TTS · Vevo2 · L4"
+        timeout_in_minutes: 60
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+          - "test -d /opt/Amphion || { echo 'ERROR: /opt/Amphion not found; the Vevo2 lane requires Amphion pre-cloned into the CI image.' >&2; exit 1; }"
+          - export PYTHONPATH="/opt/Amphion:${PYTHONPATH:-}"
+          - export VEVO2_MODEL_PATH="${VEVO2_MODEL_PATH:-/fsx/hf_cache/vevo2_ckpt/Vevo2}"
+          - |
+            set -e
+            # Download once onto the persistent cache. The gate is a sub-checkpoint
+            # that only the download provides and the initialiser never writes, so a
+            # partially initialised root can not suppress the download (gating on the
+            # root config.json would, since the initialiser writes that first).
+            # Exclude training-only artifacts (optimizer.pt is ~2 GB; the
+            # rng_state_*.pth files) so the cold download is ~6.5 GB, not ~11 GB.
+            if [ ! -d "${VEVO2_MODEL_PATH}/contentstyle_modeling/posttrained" ]; then
+              hf download RMSnow/Vevo2 --local-dir "${VEVO2_MODEL_PATH}" --exclude '*optimizer.pt' --exclude '*rng_state_*.pth' --exclude '*scheduler.pt' --exclude '*trainer_state.json' --exclude '*training_args.bin' --exclude '*optimizer.bin' --exclude '*scheduler.bin' --exclude '*random_states_*.pkl'
+            fi
+            # Always run the initialiser: it is idempotent, repairs a partially
+            # initialised checkpoint in place, and exits non-zero if any required
+            # root artifact is still missing afterwards.
+            python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py "${VEVO2_MODEL_PATH}"
+          - >-
+            pytest -s -v
+            tests/e2e/offline_inference/test_vevo2.py tests/e2e/online_serving/test_vevo2.py
+            -m "tts and cuda"
+            --run-level "full_model"
+        mirror_hardwares: l4_1
+
       - label: "Diffusion · L4"
         timeout_in_minutes: 60
         commands:

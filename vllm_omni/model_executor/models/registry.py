@@ -322,6 +322,12 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## Vevo2 (Amphion: AR + flow-matching unified TTS / SVS)
+    "Vevo2ForCausalLM": (
+        "vevo2",
+        "modeling_vevo2",
+        "Vevo2ForCausalLM",
+    ),
     ## MOSS-TTS (full variants: Delay + Realtime)
     # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
     "MossTTSDelayModel": (

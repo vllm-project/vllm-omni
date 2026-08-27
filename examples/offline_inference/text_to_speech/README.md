@@ -28,6 +28,7 @@ list of supported architectures across all modalities, see
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
+| Vevo2 | `RMSnow/Vevo2` | single (AR + FM + Vocos) | ✓ (required) | — | TTS only (MVP); SVS / conv / editing follow up | 24 kHz |
 
 ## Common Quick Start
 
@@ -616,3 +617,72 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+## Vevo2
+
+[Vevo2](https://github.com/open-mmlab/Amphion/tree/main/models/svc/vevo2) is a unified controllable AR + flow-matching framework for speech and singing voice generation from CUHK-Shenzhen / Amphion. The published checkpoint is at [`RMSnow/Vevo2`](https://huggingface.co/RMSnow/Vevo2).
+
+> **License**: the `RMSnow/Vevo2` checkpoint is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives). The Amphion framework itself is MIT. Commercial deployment of the weights requires contacting the upstream authors. The `RMSnow/Vevo2` weights ship with a notice that explicitly forbids derivative redistribution.
+
+> **MVP scope**: zero-shot text-to-speech with optional voice cloning via a timbre reference. Singing voice synthesis, voice / singing style conversion, editing, and melody control are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)). Streaming (`async_chunk: true`) is also a follow-up.
+
+### Prerequisites
+Vevo2 is not on PyPI; clone Amphion and put it on `PYTHONPATH`:
+
+```bash
+git clone https://github.com/open-mmlab/Amphion.git
+export PYTHONPATH=$PWD/Amphion:$PYTHONPATH
+pip install -r Amphion/models/svc/vevo2/requirements.txt
+# NOTE: Amphion's flow-matching transformer builds `LlamaConfig` with positional
+# args, which transformers>=5 rejects. vLLM-Omni installs a small import-time
+# shim (`modeling_vevo2._llama_config_positional_args`) that maps those
+# positionals to keyword names, so you do NOT need to downgrade transformers --
+# the repo's pinned `transformers>=5.5.3` (which vLLM also requires) works as-is.
+# Do not `pip install "transformers<5"`: it conflicts with that floor and breaks
+# the rest of the stack.
+# A few transitive deps are imported by upstream but missing from
+# Amphion's requirements.txt. Install them explicitly:
+pip install pyworld json5 praat-parselmouth torchcrepe ruamel.yaml
+```
+
+Then download the checkpoint:
+
+```bash
+hf download RMSnow/Vevo2 --local-dir ./ckpts/Vevo2
+```
+
+The published checkpoint ships its real configs in sub-folders but not at the root, so vLLM-Omni's auto-dispatch can't find a `model_type`. Run the one-time setup script to write a minimal root `config.json`:
+
+```bash
+python examples/offline_inference/text_to_speech/vevo2/init_vevo2_checkpoint.py ./ckpts/Vevo2
+```
+
+> **Note**: `init_vevo2_checkpoint.py` imports `vllm_omni.model_executor.models.vevo2` to reuse the config class, so it is not standalone — run it from a checkout where vLLM-Omni is installed/importable, not as a copied-out script.
+
+### Quick start
+Vevo2 has **no built-in speaker presets**, so `--ref-audio` is **required** on every call — `end2end.py` enforces it (`required=True`), overriding the "optional" note in the shared quick-start above. `--ref-text` (the transcript of the reference clip) is optional but recommended for prosody quality:
+
+```bash
+python examples/offline_inference/text_to_speech/vevo2/end2end.py \
+    --model ./ckpts/Vevo2 \
+    --text "Hello, this is Vevo2 speaking." \
+    --ref-audio ./Amphion/models/vc/vevo/wav/arabic_male.wav \
+    --ref-text "Philip stood undecided, his ears strained to catch the slightest sound."
+```
+
+### Voice cloning with separate timbre reference
+Pass a different timbre source while keeping the prosodic style of the reference:
+
+```bash
+python examples/offline_inference/text_to_speech/vevo2/end2end.py \
+    --model ./ckpts/Vevo2 \
+    --text "Hello, this is Vevo2 speaking." \
+    --ref-audio ./Amphion/models/vc/vevo/wav/arabic_male.wav \
+    --timbre-ref ./Amphion/models/svc/vevosing/wav/jaychou.wav \
+    --ref-text "Philip stood undecided, his ears strained to catch the slightest sound."
+```
+
+### Notes
+- Default deploy config: `vllm_omni/deploy/vevo2.yaml` (auto-loaded; override with `--deploy-config`).
+- Output sample rate: 24 kHz mono.
+- The first call loads the full Vevo2 pipeline (Qwen2.5-0.5B AR LM + 350M flow-matching transformer + Vocos vocoder) plus a Whisper-medium encoder used internally for reference-audio feature extraction. Measured peak on CUDA is ~7.5 GiB allocated / ~8.8 GiB reserved (includes the fp32 cast; see `vllm_omni/deploy/vevo2.yaml`), so leave real headroom on a 24 GB card.
+- For Mandarin / English / mixed-language synthesis, the reference clip's language conditions tone — the upstream README includes recommended sample clips.
