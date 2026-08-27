@@ -922,6 +922,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._sync_result_buffer.put(msg)
                 continue
 
+            # If shutdown started while we were dequeuing / unpacking, drop
+            # this delivery so it cannot repopulate _completed_outputs after
+            # shutdown() cleared it (issue #6413 / #6439 review).
+            if self._closed:
+                continue
+
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
@@ -957,6 +963,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                     if batch_id:
                         with self._futures_lock:
+                            if self._closed:
+                                # shutdown() cleared _completed_outputs while
+                                # we were unpacking; drop this delivery.
+                                continue
                             pending = self._output_futures.pop(batch_id, None)
                             if pending is None:
                                 # No waiter registered yet: cache for a later
@@ -982,6 +992,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         error: str | None = None,
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
+        if self._closed:
+            # shutdown() has taken over; do not touch _completed_outputs.
+            return
         for per_req_id, req_id in per_req_map.items():
             req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
@@ -992,6 +1005,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             else:
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
+                if self._closed:
+                    # Belt-and-braces: re-check under the lock so a shutdown
+                    # that started mid-loop cannot repopulate the cleared dict.
+                    return
                 pending = self._output_futures.pop(per_req_id, None)
                 if pending is None:
                     # No waiter registered yet: cache for a later
@@ -1050,6 +1067,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         drain through the normal path.
         """
         with self._futures_lock:
+            if self._closed:
+                # Executor is torn down; abort path must not repopulate the
+                # cleared state (issue #6413 / #6439 review).
+                return
             if self._completed_outputs.pop(async_output_id, None) is not None:
                 return
             if async_output_id in self._output_futures:
