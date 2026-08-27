@@ -113,6 +113,11 @@ class OmniDiffusionRequest:
     def is_dummy_run(self) -> bool:
         return self.is_dummy_run_request_id(self.request_id)
 
+    @property
+    def prompts(self) -> list[OmniPromptType]:
+        """Backwards-compatible accessor for code that iterates request prompts."""
+        return [self.prompt]
+
     @classmethod
     def is_dummy_run_request_id(cls, request_id: str | None) -> bool:
         return request_id == DUMMY_DIFFUSION_REQUEST_ID or (
