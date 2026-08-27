@@ -107,11 +107,16 @@ class _LingBotARSessionState:
     """Small model-owned state; attention tensors remain runner-owned."""
 
     next_chunk_index: int = 0
-    prompt: str | None = None
     generator_state: torch.Tensor | None = None
     image_condition: torch.Tensor | None = None
     camera_tail: CameraTrajectory | None = None
     camera_pitch: float = 0.0
+    # The text encode, and the prompt it was made from. A session sends the
+    # same prompt on every tick -- a tick is a camera movement, not a new
+    # request -- so the encode is the same tensor every time until the prompt
+    # changes.
+    prompt_embeds: torch.Tensor | None = None
+    prompt_embeds_prompt: str | None = None
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -887,6 +892,44 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding), tail
 
+    def _session_prompt_embeds(
+        self,
+        session_state: _LingBotARSessionState,
+        inputs: _LingBotRequestInputs,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, bool]:
+        """Encode a session's prompt once, not once per tick.
+
+        A realtime session sends the same prompt with every tick -- the tick is
+        a camera movement, not a new request -- and the pipeline re-ran the
+        tokenizer and the text encoder each time. The cross-attention K/V built
+        from the result was already cached per session; the encode that
+        produces it was not, so the cheap half was reused and the expensive
+        half was repeated.
+
+        The prompt is a sufficient key because nothing else the encode depends
+        on can vary within a session: ``_parse_request`` pins
+        ``max_sequence_length`` to exactly ``_MAX_SEQUENCE_LENGTH``, and the
+        dtype is the transformer's.
+
+        The cached tensor is one padded text sequence -- a few MiB, against
+        gigabytes of self-attention K/V for the same session.
+
+        Returns the encode and whether it replaced an earlier one, which is the
+        same condition the cross-attention cache is invalidated on.
+        """
+        if session_state.prompt_embeds is not None and session_state.prompt_embeds_prompt == inputs.prompt:
+            return session_state.prompt_embeds, False
+        replaced = session_state.prompt_embeds is not None
+        session_state.prompt_embeds = self.encode_prompt(
+            inputs.prompt,
+            max_sequence_length=inputs.max_sequence_length,
+            dtype=dtype,
+        )
+        session_state.prompt_embeds_prompt = inputs.prompt
+        return session_state.prompt_embeds, replaced
+
     def _ar_text_caches(
         self,
         prompt_embeds: torch.Tensor,
@@ -1146,11 +1189,15 @@ class LingBotWorldCausalDMDPipeline(
         )
         dtype = self.transformer.dtype
         # Phase 1: turn all three user inputs into DiT-ready conditions.
-        prompt_embeds = self.encode_prompt(
-            inputs.prompt,
-            max_sequence_length=inputs.max_sequence_length,
-            dtype=dtype,
-        )
+        if tick is None:
+            prompt_embeds = self.encode_prompt(
+                inputs.prompt,
+                max_sequence_length=inputs.max_sequence_length,
+                dtype=dtype,
+            )
+        else:
+            assert session_state is not None
+            prompt_embeds, prompt_changed = self._session_prompt_embeds(session_state, inputs, dtype=dtype)
         if tick is None:
             condition = self._prepare_condition(inputs, dtype=dtype)
         else:
@@ -1211,7 +1258,6 @@ class LingBotWorldCausalDMDPipeline(
             )
         else:
             assert session_state is not None
-            prompt_changed = session_state.prompt is not None and session_state.prompt != inputs.prompt
             if session_state.generator_state is not None:
                 inputs.generator.set_state(session_state.generator_state)
             ar_cross_attention = self._ar_text_caches(
@@ -1252,7 +1298,6 @@ class LingBotWorldCausalDMDPipeline(
         cache = None
         if tick is not None:
             assert session_state is not None
-            session_state.prompt = inputs.prompt
             session_state.generator_state = inputs.generator.get_state()
             session_state.camera_tail = camera_tail
             if camera_pitch is not None:
