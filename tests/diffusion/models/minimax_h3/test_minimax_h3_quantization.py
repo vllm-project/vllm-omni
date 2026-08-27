@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -6,6 +7,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+
+import vllm_omni.quantization.int8_config as int8_config
+from vllm_omni.diffusion.models.minimax_h3.encoder import (
+    MiniMaxH3Qwen3VLRowParallelLinear,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -64,6 +70,98 @@ def _small_od_config():
         tf_model_config=arch,
         parallel_config=SimpleNamespace(ulysses_degree=1),
     )
+
+
+def _make_text_encoder_int8_row(mocker, world_size):
+    mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_rank", return_value=0)
+    mocker.patch("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", return_value=1)
+    mocker.patch.object(int8_config.current_omni_platform, "is_cuda", return_value=True)
+    mocker.patch.object(int8_config.current_omni_platform, "is_npu", return_value=False)
+
+    kernel = mocker.Mock()
+    kernel.layer_param_names = (
+        "weight",
+        "weight_scale",
+        "input_scale",
+        "input_zero_point",
+        "azp_adj",
+    )
+    mocker.patch.object(int8_config, "init_int8_linear_kernel", return_value=kernel)
+
+    device_group = mocker.sentinel.minimax_text_encoder_group
+    group = SimpleNamespace(rank_in_group=0, world_size=world_size, device_group=device_group)
+    quant_config = int8_config.DiffusionInt8Config()
+
+    layer = MiniMaxH3Qwen3VLRowParallelLinear(
+        group=group,
+        input_size=4,
+        output_size=2,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+    )
+    return layer, device_group
+
+
+def test_text_encoder_int8_scale_uses_encoder_tp_group(mocker):
+    layer, device_group = _make_text_encoder_int8_row(mocker, world_size=2)
+    full_weight = torch.tensor(
+        [[1, -2, 8, -64], [2, -3, 7, -56]],
+        dtype=torch.bfloat16,
+    )
+    full_amax = full_weight.abs().amax(dim=1, keepdim=True).float()
+    layer.weight = nn.Parameter(full_weight[:, :2], requires_grad=False)
+
+    get_tp_group = mocker.patch.object(int8_config, "get_tp_group")
+    native_quant = mocker.patch.object(int8_config.ops, "scaled_int8_quant")
+
+    def max_reduce(row_amax, op, group):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is device_group
+        row_amax.copy_(full_amax)
+
+    all_reduce = mocker.patch("torch.distributed.all_reduce", side_effect=max_reduce)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert isinstance(layer.quant_method, int8_config.Int8OnlineLinearMethod)
+    # LinearBase sees default TP disabled; the separate encoder group is TP2.
+    assert layer.tp_size == 1
+    assert layer.input_size == 4
+    assert layer.input_size_per_partition == 2
+    assert layer._int8_scale_tp_group is device_group
+    get_tp_group.assert_not_called()
+    native_quant.assert_not_called()
+    all_reduce.assert_called_once()
+
+    inv_scale = torch.iinfo(torch.int8).max / full_amax
+    expected = full_weight.float().mul(inv_scale).round().clamp(-127, 127).to(torch.int8)
+    assert torch.equal(layer.weight.t(), expected[:, :2])
+    assert torch.equal(layer.weight_scale, full_amax / torch.iinfo(torch.int8).max)
+
+
+def test_text_encoder_tp1_int8_uses_native_quantization(mocker):
+    layer, device_group = _make_text_encoder_int8_row(mocker, world_size=1)
+    weight = torch.tensor([[1, -2, 8, -64], [2, -3, 7, -56]], dtype=torch.bfloat16)
+    layer.weight = nn.Parameter(weight, requires_grad=False)
+    original_weight = layer.weight
+    qweight = torch.ones_like(weight, dtype=torch.int8)
+    weight_scale = torch.ones((weight.shape[0], 1), dtype=torch.float32)
+
+    native_quant = mocker.patch.object(
+        int8_config.ops,
+        "scaled_int8_quant",
+        return_value=(qweight, weight_scale, None),
+    )
+    get_tp_group = mocker.patch.object(int8_config, "get_tp_group")
+    all_reduce = mocker.patch("torch.distributed.all_reduce")
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert layer.input_size == layer.input_size_per_partition == 4
+    assert layer._int8_scale_tp_group is device_group
+    native_quant.assert_called_once_with(original_weight, scale=None)
+    get_tp_group.assert_not_called()
+    all_reduce.assert_not_called()
 
 
 def test_fp8_scope_and_prefix_propagation(monkeypatch):

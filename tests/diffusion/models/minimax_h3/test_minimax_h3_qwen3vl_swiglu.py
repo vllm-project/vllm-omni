@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -7,7 +10,34 @@ import torch.nn.functional as F
 
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+def test_qwen3_vl_npu_mlp_uses_projection_module() -> None:
+    from vllm_omni.platforms.npu.models.minimax_h3 import (
+        _forward_minimax_h3_qwen3vl_text_mlp_npu,
+    )
+
+    x = Mock()
+    gate_up = Mock()
+    activated = Mock()
+    output = Mock()
+    mlp = SimpleNamespace(
+        gate_up_proj=Mock(return_value=gate_up),
+        down_proj=Mock(return_value=output),
+    )
+
+    with patch(
+        "vllm_omni.platforms.npu.models.minimax_h3.npu_swiglu_from_packed",
+        return_value=activated,
+    ) as swiglu:
+        result = _forward_minimax_h3_qwen3vl_text_mlp_npu(mlp, x)
+
+    mlp.gate_up_proj.assert_called_once_with(x)
+    swiglu.assert_called_once_with(gate_up)
+    mlp.down_proj.assert_called_once_with(activated)
+    assert result is output
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")

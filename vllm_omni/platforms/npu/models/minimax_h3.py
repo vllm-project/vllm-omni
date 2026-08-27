@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """NPU patches for the MiniMax H3 Qwen3-VL text encoder."""
 
@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 import torch_npu
 from vllm.logger import init_logger
 
@@ -100,7 +99,7 @@ def npu_swiglu_from_packed(gate_up: torch.Tensor) -> torch.Tensor:
 
 def _forward_minimax_h3_qwen3vl_text_mlp_npu(self: Any, x: torch.Tensor) -> torch.Tensor:
     """Run the Qwen3-VL MLP with one packed GEMM and fused SwiGLU."""
-    gate_up = F.linear(x, self.gate_up_proj.weight)
+    gate_up = self.gate_up_proj(x)
     return self.down_proj(npu_swiglu_from_packed(gate_up))
 
 
@@ -112,5 +111,5 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
 
     from vllm_omni.diffusion.models.minimax_h3 import encoder
 
-    encoder.MiniMaxH3Qwen3VLTextMLP.forward = _forward_minimax_h3_qwen3vl_text_mlp_npu
+    encoder.MiniMaxH3Qwen3VLTextMLP.forward = _forward_minimax_h3_qwen3vl_text_mlp_npu  # type: ignore[method-assign]
     _SWIGLU_PATCHED = True

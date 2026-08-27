@@ -3,7 +3,7 @@
 """INT8 quantization config for diffusion transformers.
 
 Supports both online (dynamic) and offline (checkpoint) INT8 quantization
-on CUDA and NPU platforms.
+on CUDA, ROCm, and NPU platforms.
 """
 
 from collections.abc import Callable
@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_int8_linear_kernel,
@@ -61,6 +62,49 @@ ACTIVATION_SCHEMES = ["dynamic"]
 NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
 
 logger = init_logger(__name__)
+
+_INT8_MAX = torch.iinfo(torch.int8).max
+# Keep the fp32 quantization temporary below roughly 64 MiB.
+_QUANT_CHUNK_ELEMS = 16 * 1024 * 1024
+
+
+def _quantize_input_sharded_weight(layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an input-sharded weight with one scale per full row."""
+    row_min, row_max = layer.weight.aminmax(dim=1, keepdim=True)
+    row_amax = torch.maximum(row_min.abs(), row_max.abs()).float()
+
+    # MiniMax's text encoder has a TP group independent from the DiT TP group.
+    # Standard vLLM layers and BAGEL's secondary expert weights use the default
+    # TP group, so only the MiniMax path needs to provide an override.
+    scale_tp_group = getattr(layer, "_int8_scale_tp_group", None)
+    if scale_tp_group is None:
+        scale_tp_group = get_tp_group().device_group
+    torch.distributed.all_reduce(
+        row_amax,
+        op=torch.distributed.ReduceOp.MAX,
+        group=scale_tp_group,
+    )
+
+    weight_scale = row_amax / _INT8_MAX
+    # Match vLLM's dynamic INT8 kernel exactly. It multiplies by
+    # 127 / absmax and maps an all-zero row to an all-zero INT8 row. Dividing
+    # by absmax / 127 is mathematically equivalent, but fp32 rounding differs
+    # at some half-way values and can make TP=1 and TP>1 weights disagree.
+    inv_scale = torch.where(
+        row_amax == 0,
+        torch.zeros_like(row_amax),
+        _INT8_MAX / row_amax,
+    )
+    qweight = torch.empty_like(layer.weight, dtype=torch.int8)
+    # vLLM's scaled_int8_quant accepts one supplied static scale, not one scale
+    # per row. Keep the missing per-row operation local until vLLM provides it.
+    chunk_rows = max(1, _QUANT_CHUNK_ELEMS // layer.weight.shape[1])
+    for start in range(0, layer.weight.shape[0], chunk_rows):
+        rows = slice(start, start + chunk_rows)
+        qweight[rows] = (
+            layer.weight[rows].float().mul_(inv_scale[rows]).round_().clamp_(-_INT8_MAX, _INT8_MAX).to(torch.int8)
+        )
+    return qweight, weight_scale
 
 
 def _fell_back_to_unquantized_npu(
@@ -130,7 +174,7 @@ class DiffusionInt8Config(QuantizationConfig):
 
     Supports online (dynamic) quantization from BF16/FP16 checkpoints
     and offline quantization from serialized INT8 checkpoints.
-    Works on both CUDA and NPU platforms.
+    Works on CUDA, ROCm, and NPU platforms.
     """
 
     def __init__(
@@ -197,7 +241,10 @@ class DiffusionInt8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             if not self.is_checkpoint_int8_serialized:
-                if current_omni_platform.is_cuda():
+                # ROCm uses the same upstream vLLM INT8 quantization and
+                # scaled-matmul interfaces as CUDA. Keep only the NPU-specific
+                # weight layout and operators in the separate method below.
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
                     online_method = Int8OnlineLinearMethod(self)
                 elif current_omni_platform.is_npu():
                     online_method = NPUInt8OnlineLinearMethod(self)
@@ -205,7 +252,7 @@ class DiffusionInt8Config(QuantizationConfig):
                     raise NotImplementedError("The current platform is not supported int8 online quant.")
                 return online_method
             else:
-                if current_omni_platform.is_cuda():
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
                     offline_method = Int8LinearMethod(self)
                 elif current_omni_platform.is_npu():
                     offline_method = NPUInt8LinearMethod(self)
@@ -310,6 +357,11 @@ class LazyWeightMixin:
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
+        # Some model wrappers, such as BAGEL's secondary expert, use a bare
+        # Module as the weight owner. Keep the full size beside the local size
+        # so online INT8 can use vLLM's structural row-parallel contract instead
+        # of relying on a concrete linear class.
+        layer.input_size = input_size
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
@@ -347,7 +399,7 @@ class LazyWeightMixin:
             # process_weights_after_loading
             target_loaded_numel = layer.weight.numel()
             if layer._loaded_numel == target_loaded_numel:
-                self.process_weights_after_loading(layer)
+                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
 
                 # Prevent the usual `process_weights_after_loading` call from doing
                 # anything
@@ -410,7 +462,12 @@ class Int8LinearMethod(BaseInt8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.int8_linear.apply_weights(layer, x, bias)
+        original_shape = x.shape
+        # Diffusion layers can pass batched hidden states, but vLLM's ROCm
+        # Triton and AITER INT8 kernels accept only a two-dimensional matrix.
+        x = x.reshape(-1, original_shape[-1])
+        output = self.int8_linear.apply_weights(layer, x, bias)
+        return output.reshape(*original_shape[:-1], -1)
 
 
 class NPUInt8LinearMethod(BaseInt8LinearMethod):
@@ -480,7 +537,14 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
             initialize_single_dummy_weight(layer.weight)
 
         w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.int8_linear.layer_param_names
-        qweight, weight_scale, _ = ops.scaled_int8_quant(layer.weight, scale=None)
+        # Per-row scales reduce the input dimension, so follow upstream vLLM's
+        # full-size versus local-size check. Do not also check layer.tp_size:
+        # MiniMax disables the default TP group in LinearBase and shards with a
+        # separate encoder group, leaving the inherited tp_size equal to 1.
+        if layer.input_size != layer.input_size_per_partition:
+            qweight, weight_scale = _quantize_input_sharded_weight(layer)
+        else:
+            qweight, weight_scale, _ = ops.scaled_int8_quant(layer.weight, scale=None)
 
         # Update layer with new values.
         replace_parameter(layer, w_q_name, torch.nn.Parameter(qweight.t().data, requires_grad=False))
@@ -522,8 +586,11 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
-        weight = layer.weight
-        qweight, weight_scale = torch_npu.npu_dynamic_quant(weight)
+        if layer.input_size != layer.input_size_per_partition:
+            qweight, weight_scale = _quantize_input_sharded_weight(layer)
+            weight_scale = weight_scale.squeeze(-1)
+        else:
+            qweight, weight_scale = torch_npu.npu_dynamic_quant(layer.weight)
 
         qweight = qweight.t().contiguous()
 
