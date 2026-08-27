@@ -435,6 +435,7 @@ class RealtimeDuplexClient:
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._media_clock_ms = 0
 
     async def __aenter__(self) -> RealtimeDuplexClient:
         self._ws = await websockets.connect(
@@ -463,6 +464,7 @@ class RealtimeDuplexClient:
                     continue
                 event = json.loads(raw)
                 if isinstance(event, dict):
+                    event.setdefault("_media_clock_ms", self._media_clock_ms)
                     self.events.add(event)
         except ConnectionClosed:
             return
@@ -559,21 +561,36 @@ class RealtimeDuplexClient:
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
             PCM16_BYTES_PER_SAMPLE,
         )
+        await self.stream_av_units(
+            ((pcm16[offset : offset + chunk_bytes], None) for offset in range(0, len(pcm16), chunk_bytes)),
+            realtime=realtime,
+        )
+
+    async def stream_av_units(
+        self,
+        units: Any,
+        *,
+        realtime: bool = True,
+    ) -> None:
+        """Stream PCM16 units, optionally attaching a JPEG to each unit."""
         audio_end_ms = 0
-        for offset in range(0, len(pcm16), chunk_bytes):
-            chunk = pcm16[offset : offset + chunk_bytes]
+        for chunk, frame in units:
+            if not chunk:
+                continue
             duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
             audio_end_ms += duration_ms
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_end_ms,
-                }
-            )
+            self._media_clock_ms = audio_end_ms
+            event: dict[str, object] = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": audio_end_ms,
+            }
+            if frame is not None:
+                event["video_frames"] = [base64.b64encode(frame).decode("ascii") if isinstance(frame, bytes) else frame]
+            await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
 
