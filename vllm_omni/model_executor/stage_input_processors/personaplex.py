@@ -25,6 +25,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 _NUM_ACTIVE_CODEBOOKS = 8  # agent cb 0..7 (the PCM-bearing rows)
 
@@ -196,6 +197,7 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk = int(cfg.get("codec_chunk_frames", 25))
     initial_chunk = int(cfg.get("initial_codec_chunk_frames") or 0)
+    initial_chunk, _ = per_request_initial_chunk_size_override(request, initial_chunk)
     if chunk <= 0 or initial_chunk < 0:
         raise ValueError(
             "PersonaPlex codec chunk sizes must be positive/non-negative: "

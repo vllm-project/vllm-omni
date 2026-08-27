@@ -28,6 +28,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
+    per_request_initial_chunk_size_override,
 )
 
 logger = logging.getLogger(__name__)
@@ -719,6 +720,7 @@ def talker2code2wav_async_chunk(
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    configured_initial_chunk_size, _ = per_request_initial_chunk_size_override(request, configured_initial_chunk_size)
 
     chunk_id = transfer_manager.put_req_chunk[request_id]
     length = len(transfer_manager.code_prompt_token_ids[request_id])

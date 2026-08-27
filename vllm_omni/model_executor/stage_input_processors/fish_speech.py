@@ -10,6 +10,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 
 def _get_connector_extra(transfer_manager: Any) -> dict[str, Any]:
@@ -141,18 +142,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
 
-    initial_chunk_size = configured_initial_chunk_size
-
-    # Per-request override.
-    additional_information = getattr(request, "additional_information", None)
-    if (
-        additional_information is not None
-        and hasattr(additional_information, "entries")
-        and "initial_codec_chunk_frames" in additional_information.entries
-    ):
-        entry = additional_information.entries["initial_codec_chunk_frames"]
-        if entry.list_data is not None and len(entry.list_data) == 1:
-            initial_chunk_size = int(entry.list_data[0])
+    initial_chunk_size, _ = per_request_initial_chunk_size_override(request, configured_initial_chunk_size)
 
     if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
         raise ValueError(

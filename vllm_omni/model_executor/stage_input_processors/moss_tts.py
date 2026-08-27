@@ -14,6 +14,7 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 logger = init_logger(__name__)
 
@@ -271,6 +272,7 @@ def talker2codec_raw_async_chunk(
     cfg = cfg if isinstance(cfg, dict) else {}
     chunk_frames = int(cfg.get("codec_chunk_frames", 15) or 15)
     initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames") or 0)
+    initial_chunk_frames, _ = per_request_initial_chunk_size_override(request, initial_chunk_frames)
     if chunk_frames <= 0:
         raise ValueError(f"codec_chunk_frames must be positive for MOSS raw streaming, got {chunk_frames}")
     if initial_chunk_frames < 0:

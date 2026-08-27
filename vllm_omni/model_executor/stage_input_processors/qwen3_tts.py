@@ -24,6 +24,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
+    per_request_initial_chunk_size_override,
 )
 
 logger = init_logger(__name__)
@@ -108,20 +109,11 @@ def talker2code2wav_async_chunk(
         transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_size)
     ramp = transfer_manager._ramp_parsed
 
-    # Per-request override takes priority over dynamic IC.
-    fixed_initial_chunk_size = configured_initial_chunk_size > 0
-    initial_chunk_size = configured_initial_chunk_size
-    additional_information = getattr(request, "additional_information", None)
-
-    if (
-        additional_information is not None
-        and hasattr(additional_information, "entries")
-        and "initial_codec_chunk_frames" in additional_information.entries
-    ):
-        entry = additional_information.entries["initial_codec_chunk_frames"]
-        if entry.list_data is not None and len(entry.list_data) == 1:
-            initial_chunk_size = int(entry.list_data[0])
-            fixed_initial_chunk_size = True
+    # Config or per-request override takes priority over dynamic IC.
+    initial_chunk_size, fixed_initial_chunk_size = per_request_initial_chunk_size_override(
+        request, configured_initial_chunk_size
+    )
+    fixed_initial_chunk_size |= configured_initial_chunk_size > 0
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     # Skipped when ramp is active (ramp replaces IC/steady entirely).

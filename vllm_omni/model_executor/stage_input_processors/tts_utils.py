@@ -181,3 +181,19 @@ def extract_language_from_prompt(
     if isinstance(language, list) and language:
         return language
     return None
+
+
+def per_request_initial_chunk_size_override(request: Any, initial_codec_chunk_frames: int) -> tuple[int, bool]:
+    overridden = False
+    additional_information = getattr(request, "additional_information", None)
+    if (
+        additional_information is not None
+        and hasattr(additional_information, "entries")
+        and "initial_codec_chunk_frames" in additional_information.entries
+    ):
+        entry = additional_information.entries["initial_codec_chunk_frames"]
+        if entry.list_data is not None and len(entry.list_data) == 1:
+            initial_codec_chunk_frames = int(entry.list_data[0])
+            overridden = True
+
+    return initial_codec_chunk_frames, overridden

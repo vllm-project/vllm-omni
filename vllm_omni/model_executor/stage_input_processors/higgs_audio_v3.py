@@ -33,6 +33,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -268,6 +269,7 @@ def talker2code2wav_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
     right_holdback_size_config = int(cfg.get("codec_right_holdback_frames", _DEFAULT_CODEC_RIGHT_HOLDBACK_FRAMES))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    configured_initial_chunk_size, _ = per_request_initial_chunk_size_override(request, configured_initial_chunk_size)
 
     if (
         chunk_size <= 0
