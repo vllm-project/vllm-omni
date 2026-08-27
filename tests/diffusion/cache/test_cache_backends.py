@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for cache backends (cache-dit and teacache).
@@ -7,6 +7,7 @@ Unit tests for cache backends (cache-dit and teacache).
 This module tests the cache backend implementations:
 - CacheDiTBackend: cache-dit acceleration backend
 - TeaCacheBackend: TeaCache hook-based backend
+- TeaCacheHook skip / recompute decisions
 - Cache selector function: get_cache_backend
 - DiffusionCacheConfig: configuration dataclass
 """
@@ -16,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import cache_dit
 import pytest
+import torch
 from cache_dit import ForwardPattern
 
 from vllm_omni.diffusion.cache.cachedit import (
@@ -27,6 +29,9 @@ from vllm_omni.diffusion.cache.cachedit import (
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -570,6 +575,43 @@ class TestTeaCacheBackend:
         # Test refresh
         backend.refresh(mock_pipeline, num_inference_steps=50)
         mock_registry.reset_hook.assert_called_once()
+
+
+class TestTeaCacheShouldCompute:
+    """Branch coverage for TeaCacheHook._should_compute_full_transformer.
+
+    Identity rescale (poly = x) and rel_l1_thresh=0.3 make L1 outcomes exact.
+    """
+
+    @staticmethod
+    def _hook() -> TeaCacheHook:
+        return TeaCacheHook(
+            TeaCacheConfig(
+                transformer_type="QwenImageTransformer2DModel",
+                rel_l1_thresh=0.3,
+                coefficients=[0.0, 0.0, 0.0, 1.0, 0.0],
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("cnt", "prev_shape", "curr_shape", "curr_scale", "accum", "expect_compute", "expect_accum"),
+        [
+            pytest.param(0, (4, 8), (2, 8), 1.0, 0.5, True, 0.0, id="first_step"),
+            pytest.param(1, None, (4, 8), 1.0, 0.2, True, 0.2, id="missing_previous"),
+            pytest.param(1, (4, 8), (2, 8), 1.0, 0.2, True, 0.0, id="shape_mismatch"),
+            pytest.param(1, (4, 8), (4, 8), 1.1, 0.25, True, 0.0, id="accum_crosses_threshold"),
+            pytest.param(1, (4, 8), (4, 8), 1.01, 0.25, False, pytest.approx(0.26, abs=1e-4), id="accum_stays_below"),
+        ],
+    )
+    def test_decision(self, cnt, prev_shape, curr_shape, curr_scale, accum, expect_compute, expect_accum):
+        state = TeaCacheState()
+        state.cnt = cnt
+        state.accumulated_rel_l1_distance = accum
+        state.previous_modulated_input = None if prev_shape is None else torch.ones(prev_shape)
+        current = torch.ones(curr_shape) * curr_scale
+
+        assert self._hook()._should_compute_full_transformer(state, current) is expect_compute
+        assert state.accumulated_rel_l1_distance == expect_accum
 
 
 class TestCacheSelector:

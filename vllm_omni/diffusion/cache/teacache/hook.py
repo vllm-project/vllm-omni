@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based TeaCache implementation for vLLM-Omni.
@@ -214,6 +214,12 @@ class TeaCacheHook(ModelHook):
 
         # Need previous input for comparison
         if state.previous_modulated_input is None:
+            return True
+
+        # Packed CFG concatenates branches into one forward. A change in
+        # branch count makes the cached residual the wrong shape; recompute.
+        if state.previous_modulated_input.shape != modulated_inp.shape:
+            state.accumulated_rel_l1_distance = 0.0
             return True
 
         # Compute relative L1 distance between consecutive modulated inputs
