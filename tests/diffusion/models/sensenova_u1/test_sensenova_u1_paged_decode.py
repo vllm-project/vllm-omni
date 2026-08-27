@@ -10,6 +10,8 @@ eagerly and silently wrong once captured, because capture bakes it in -- which
 is exactly what the last test here pins.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -24,6 +26,7 @@ from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
 from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
     SenseNovaU1Attention,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -43,11 +46,14 @@ class _Cache:
         self.layers = layers
 
 
-def _dyn_cache(prefix):
+def _dyn_cache(prefix, device=None):
     torch.manual_seed(0)
     return _Cache(
         [
-            _Layer(torch.randn(1, KV_HEADS, prefix, HEAD_DIM), torch.randn(1, KV_HEADS, prefix, HEAD_DIM))
+            _Layer(
+                torch.randn(1, KV_HEADS, prefix, HEAD_DIM, device=device),
+                torch.randn(1, KV_HEADS, prefix, HEAD_DIM, device=device),
+            )
             for _ in range(LAYERS)
         ]
     )
@@ -233,7 +239,6 @@ def test_a_captured_graph_follows_a_later_length():
     torch.testing.assert_close(out.float(), want.float(), atol=2e-3, rtol=2e-3)
 
 
-
 @cuda_only
 @pytest.mark.cuda
 @pytest.mark.L4
@@ -286,13 +291,14 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
     k[0, :, 0] = 1.5
     v[0, :, 0] = -2.5
     graph.replay()
-    torch.cuda.synchronize()
+    current_omni_platform.synchronize()
 
     flat_k = paged.k[0].view(-1, kv_heads, dim)
     flat_v = paged.v[0].view(-1, kv_heads, dim)
     torch.testing.assert_close(flat_k[n].float(), torch.full_like(flat_k[n], 1.5).float())
     torch.testing.assert_close(flat_v[n].float(), torch.full_like(flat_v[n], -2.5).float())
     torch.testing.assert_close(flat_k[n - 1].float(), kept.float())
+
 
 @cuda_only
 @pytest.mark.cuda
@@ -347,6 +353,52 @@ def test_a_whole_decode_loop_matches_the_unpaged_path():
     )
     assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
 
+
+class _StubLM:
+    """Just enough CUDA work inside the capture for a pool to be allocated."""
+
+    def __init__(self, device):
+        self.w = torch.randn(16, 64, device=device)
+
+    def __call__(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+        x = input_ids.float().expand(1, 16) @ self.w
+        return SimpleNamespace(logits=x.unsqueeze(0))
+
+
+@cuda_only
+@pytest.mark.cuda
+@pytest.mark.L4
+def test_the_decode_graph_captures_into_the_shared_platform_pool(monkeypatch):
+    """``_decode_context`` builds a runner per request, so a private capture pool
+    hands every request its own arena and never gives it back. Measured on a
+    real model that was about 40 MiB of device memory per request, rising
+    linearly over twelve sequential think requests while the same twelve with
+    the switch off held flat.
+    """
+    from vllm.platforms import current_platform
+
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import DecodeGraphRunner
+
+    pools = []
+    real_graph = torch.cuda.graph
+
+    def spy(graph, pool=None, **kwargs):
+        pools.append(pool)
+        return real_graph(graph, pool=pool, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "graph", spy)
+
+    dev = torch.device("cuda")
+    cache = PagedDecodeCache.from_dynamic_cache(_dyn_cache(8, dev), LAYERS, dev, torch.float32)
+    runner = DecodeGraphRunner(_StubLM(dev), cache, dev)
+    runner.step(0, 0)
+
+    assert pools, "no graph was captured"
+    assert pools[0] is not None, "captured into a fresh private pool"
+    assert pools[0] == current_platform.get_global_graph_pool()
+    assert not hasattr(runner, "_pool"), "the runner still keeps a pool of its own"
+
+
 # ---------------------------------------------------------------------------
 # The cache is only worth anything if production actually reaches it, and the
 # kwargs it needs are not in every wheel that exports the kernel. The tests
@@ -397,7 +449,7 @@ def test_forward_und_sends_a_single_token_decode_to_the_paged_cache():
     """Goes through the real dispatch, so deleting the branch turns this red."""
     out = torch.randn(1, N_HEADS, 1, HEAD_DIM)
     host = _AttnHost(seq=1, paged_out=out)
-    got = host.forward_und(torch.zeros(1, 1, 16), None, None, paged_cache=host.paged)
+    got = host.forward_und(torch.zeros(1, 1, 16), None, None, position_embeddings=None, paged_cache=host.paged)
     assert len(host.paged.calls) == 1, "the paged hook was never reached"
     assert host.sdpa_calls == [], "the same step also ran the SDPA path"
     assert host.paged.calls[0][0] == host.layer_idx
@@ -412,7 +464,7 @@ def test_forward_und_sends_a_single_token_decode_to_the_paged_cache():
 def test_only_an_unmasked_single_token_step_takes_the_paged_path(seq, mask):
     """Both other shapes are uncapturable, and the cache holds one row per step."""
     host = _AttnHost(seq=seq, paged_out=torch.zeros(1, N_HEADS, seq, HEAD_DIM))
-    host.forward_und(torch.zeros(1, seq, 16), None, mask, paged_cache=host.paged)
+    host.forward_und(torch.zeros(1, seq, 16), None, mask, position_embeddings=None, paged_cache=host.paged)
     assert host.paged.calls == [], "a step that cannot be captured reached the paged cache"
     assert len(host.sdpa_calls) == 1
 

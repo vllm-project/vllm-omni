@@ -36,6 +36,7 @@ import inspect
 
 import torch
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -254,7 +255,6 @@ class DecodeGraphRunner:
         self.input_ids = torch.zeros(1, 1, dtype=torch.long, device=device)
         self.indexes = torch.zeros(3, 1, dtype=torch.long, device=device)
         self._graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
-        self._pool = None
         self.captures = 0
 
     def _forward(self):
@@ -278,10 +278,13 @@ class DecodeGraphRunner:
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
+        # A runner is built per request, so capturing into a private pool would
+        # hand every request its own arena and never give it back: measured, that
+        # grew device memory by about 40 MiB per request and never levelled off.
+        # The platform pool is shared, which is what every other captured path
+        # in the tree uses.
+        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
             logits = self._forward()
-        if self._pool is None:
-            self._pool = graph.pool()
         self.captures += 1
         logger.debug("Captured decode graph for bucket=%d generation=%d", self.cache.bucket, self.cache.generation)
         self._graphs[key] = (graph, logits)

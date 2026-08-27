@@ -362,9 +362,7 @@ class SenseNovaU1Attention(nn.Module):
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
-    def _project_and_rope(
-        self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw
-    ):
+    def _project_and_rope(self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
         """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE.
 
         The three tables come from the model, which builds them once per forward
