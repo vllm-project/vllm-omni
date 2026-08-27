@@ -202,6 +202,9 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
             "stage_1_sigmas",
             "stage_2_sigmas",
             "image_crf",
+            "auto_duration",
+            "min_seconds",
+            "max_seconds",
         }
     )
 

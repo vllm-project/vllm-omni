@@ -249,6 +249,9 @@ class LTXRuntime(
             raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
         request_sigmas = self._resolve_request_sigmas(req, sigmas)
         request_phase_sigmas = self._resolve_request_phase_sigmas(req, stage_1_sigmas, stage_2_sigmas)
+        prompt_context = None
+        if request_inputs.auto_duration:
+            request_inputs, prompt_context = self._predict_duration(request_inputs)
         validate_pipeline_request(
             request_inputs,
             pipeline_recipe=self.pipeline_recipe,
@@ -265,6 +268,15 @@ class LTXRuntime(
             raise ValueError(
                 f"{self.__class__.__name__} cannot compose a request LoRA with its internal phase adapter."
             )
+        if prompt_context is not None:
+            return self._run_recipe(
+                req,
+                request_inputs,
+                request_sigmas=request_sigmas,
+                request_phase_sigmas=request_phase_sigmas,
+                image=image,
+                prompt_context=prompt_context,
+            )
         return self._run_recipe(
             req,
             request_inputs,
@@ -272,6 +284,52 @@ class LTXRuntime(
             request_phase_sigmas=request_phase_sigmas,
             image=image,
         )
+
+    def _predict_duration(
+        self,
+        request_inputs: LTXRequestInputs,
+    ) -> tuple[LTXRequestInputs, LTXPromptContext]:
+        duration_head = getattr(self, "duration_head", None)
+        if duration_head is None:
+            raise ValueError(
+                f"{self.__class__.__name__} does not provide a Duration Head; "
+                "auto duration is available for LTX-2.5 checkpoints only."
+            )
+        if request_inputs.latents is not None or request_inputs.audio_latents is not None:
+            raise ValueError("LTX auto duration cannot be combined with request-provided latents.")
+
+        if isinstance(request_inputs.prompt, list):
+            prompt_batch_size = len(request_inputs.prompt)
+        elif request_inputs.prompt_embeds is not None:
+            prompt_batch_size = request_inputs.prompt_embeds.shape[0]
+        else:
+            prompt_batch_size = 1
+        if prompt_batch_size != 1:
+            raise ValueError(
+                "LTX auto duration supports one prompt per request because one predicted frame count "
+                "cannot serve prompts with different natural durations."
+            )
+
+        self._guidance_plan = LTXGuidancePlan.build(request_inputs.guidance)
+        prompt_context = self._prepare_prompt_context(
+            prompt=request_inputs.prompt,
+            negative_prompt=request_inputs.negative_prompt,
+            prompt_embeds=request_inputs.prompt_embeds,
+            negative_prompt_embeds=request_inputs.negative_prompt_embeds,
+            prompt_attention_mask=request_inputs.prompt_attention_mask,
+            negative_prompt_attention_mask=request_inputs.negative_prompt_attention_mask,
+            num_videos_per_prompt=request_inputs.num_videos_per_prompt,
+            max_sequence_length=request_inputs.max_sequence_length,
+        )
+        num_frames = duration_head.predict_num_frames(
+            prompt_context.positive_connector_prompt_embeds[:1],
+            prompt_context.positive_connector_audio_prompt_embeds[:1],
+            frame_rate=request_inputs.frame_rate,
+            temporal_compression_ratio=self.vae_temporal_compression_ratio,
+            min_seconds=request_inputs.min_seconds,
+            max_seconds=request_inputs.max_seconds,
+        )
+        return replace(request_inputs, num_frames=num_frames), prompt_context
 
     def _run_recipe(
         self,
@@ -281,10 +339,10 @@ class LTXRuntime(
         request_sigmas: list[float] | None,
         request_phase_sigmas: tuple[list[float] | None, ...] | None = None,
         image: Any | None = None,
+        prompt_context: LTXPromptContext | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         """Execute one- and multi-phase recipes through the same control flow."""
         phase_results: list[LTXPhaseResult] = []
-        prompt_context = None
         for phase_index, phase_recipe in enumerate(self.pipeline_recipe.phases):
             override_sigmas = None if request_phase_sigmas is None else request_phase_sigmas[phase_index]
             phase_sigmas = (

@@ -25,6 +25,9 @@ LTX_EXTRA_BODY_PARAMS = frozenset(
         "stage_1_sigmas",
         "stage_2_sigmas",
         "image_crf",
+        "auto_duration",
+        "min_seconds",
+        "max_seconds",
     }
 )
 

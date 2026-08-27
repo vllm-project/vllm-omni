@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -44,6 +45,9 @@ class LTXRequestInputs:
     max_sequence_length: int
     audio_latents_normalized: bool = False
     image_crf: int | None = None
+    auto_duration: bool = False
+    min_seconds: float = 1.0
+    max_seconds: float = 20.0
 
     @property
     def guidance_scale(self) -> float:
@@ -194,6 +198,33 @@ def _normalize_image_crf(value: Any) -> int | None:
     if not 0 <= value <= 51:
         raise ValueError("`image_crf` must be an integer from 0 through 51.")
     return value
+
+
+def _resolve_identical_extra_arg(sampling_params: list[Any], name: str) -> Any:
+    values = [_get_extra_arg(item, name) for item in sampling_params]
+    first = values[0] if values else None
+    if any(item != first for item in values[1:]):
+        raise ValueError(f"Batched LTX requests must use identical `{name}` values.")
+    return first
+
+
+def _normalize_auto_duration(value: Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("`auto_duration` must be a boolean.")
+    return value
+
+
+def _normalize_duration_seconds(value: Any, *, name: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"`{name}` must be a positive number.")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"`{name}` must be a positive number.")
+    return seconds
 
 
 def _normalize_stg_blocks(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -483,8 +514,20 @@ class LTXRequestMixin:
             raise ValueError("Batched LTX requests must use identical `image_crf` values.")
         image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
 
+        auto_duration = _normalize_auto_duration(_resolve_identical_extra_arg(sampling_params_list, "auto_duration"))
+        min_seconds = _normalize_duration_seconds(
+            _resolve_identical_extra_arg(sampling_params_list, "min_seconds"), name="min_seconds", default=1.0
+        )
+        max_seconds = _normalize_duration_seconds(
+            _resolve_identical_extra_arg(sampling_params_list, "max_seconds"), name="max_seconds", default=20.0
+        )
+        if min_seconds >= max_seconds:
+            raise ValueError("`min_seconds` must be less than `max_seconds`.")
+
         sampling = sampling_params_list[0]
         is_dummy_run = req.is_dummy_run()
+        if is_dummy_run:
+            auto_duration = False
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
             req.prompts,
@@ -614,4 +657,7 @@ class LTXRequestMixin:
             output_type=output_type,
             max_sequence_length=int(max_sequence_length),
             image_crf=image_crf,
+            auto_duration=auto_duration,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
         )

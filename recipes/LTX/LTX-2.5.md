@@ -117,6 +117,28 @@ python examples/offline_inference/image_to_video/image_to_video.py \
 
 LTX-2.5 uses the official CRF-18 first-frame conditioning path by default.
 
+## Automatic duration
+
+LTX-2.5 can predict the natural shot length from the prompt. To enable the
+Duration Head for offline T2V or I2V, remove `--num-frames` and add:
+
+```bash
+--extra-body '{"auto_duration":true}'
+```
+
+The default range is 1 to 20 seconds. Override it with
+`min_seconds` and `max_seconds`, for example:
+
+```bash
+--extra-body '{"auto_duration":true,"min_seconds":2,"max_seconds":12}'
+```
+
+For online requests, pass the same object through the `extra_params` form
+field. Duration prediction accepts one prompt per request, reuses the connector
+conditioning used by denoising, and snaps the result to the VAE's `8k+1`
+frame grid. Without `auto_duration`, the selected pipeline keeps its fixed
+frame-count default.
+
 ## Online serving
 
 Start one server for the selected pipeline:

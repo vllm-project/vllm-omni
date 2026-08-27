@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_duration_head import LTX2DurationHead
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -66,6 +67,7 @@ _LTX_COMPONENT_SUBFOLDERS = (
     "vocoder",
     "scheduler",
     "latent_upsampler",
+    "duration_head",
 )
 logger = logging.getLogger(__name__)
 
@@ -117,7 +119,7 @@ LTX25_FULL_COMPONENT_PROFILE = LTXComponentProfile(
     dit_modules=("transformer",),
     encoder_modules=("text_encoder", "connectors"),
     vae_modules=("vae", "audio_vae"),
-    resident_modules=("vocoder",),
+    resident_modules=("vocoder", "duration_head"),
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
     vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
     vocoder_fallback_cls=LTX2Vocoder,
@@ -143,7 +145,7 @@ LTX25_DISTILLED_COMPONENT_PROFILE = LTXComponentProfile(
     dit_modules=("transformer",),
     encoder_modules=("text_encoder", "connectors"),
     vae_modules=("vae", "audio_vae"),
-    resident_modules=("vocoder", "latent_upsampler"),
+    resident_modules=("vocoder", "latent_upsampler", "duration_head"),
     video_vae_cls=DistributedAutoencoderKLLTX2Video,
     vocoder_cls=LTX2VocoderWithBWE or LTX2Vocoder,
     vocoder_fallback_cls=LTX2Vocoder,
@@ -565,6 +567,16 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             fall_back_to_pt=True,
         ),
     ]
+    if "duration_head" in profile.resident_modules:
+        pipeline.weights_sources.append(
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder="duration_head",
+                revision=revision,
+                prefix="duration_head.",
+                fall_back_to_pt=True,
+            )
+        )
     prefetch_subfolders(model, _LTX_COMPONENT_SUBFOLDERS, local_files_only=local_files_only, revision=revision)
 
     pipeline.tokenizer = AutoTokenizer.from_pretrained(
@@ -668,6 +680,19 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             )
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 
+    if "duration_head" in profile.resident_modules:
+        duration_head_config = load_component_config(
+            model,
+            "duration_head",
+            local_files_only,
+            revision=revision,
+        )
+        signature = inspect.signature(LTX2DurationHead.__init__)
+        duration_head_kwargs = {
+            key: value for key, value in duration_head_config.items() if key in signature.parameters
+        }
+        pipeline.duration_head = LTX2DurationHead(**duration_head_kwargs).to(dtype=dtype)
+
     transformer_config = load_transformer_config(
         model, profile.transformer_subfolder, local_files_only, revision=revision
     )
@@ -713,18 +738,18 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     pipeline._interrupt = False
 
 
-def load_transformer_config(
+def load_component_config(
     model_path: str,
-    subfolder: str = "transformer",
+    subfolder: str,
     local_files_only: bool = True,
     *,
     revision: str | None = None,
 ) -> dict:
-    """Load an LTX transformer config from a local model or the HF Hub."""
+    """Load an LTX component config from a local model or the HF Hub."""
     if local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
         if not os.path.exists(config_path):
-            raise FileNotFoundError(f"LTX transformer config not found: {config_path}")
+            raise FileNotFoundError(f"LTX component config not found: {config_path}")
     else:
         config_path = hf_hub_download(
             repo_id=model_path,
@@ -733,6 +758,17 @@ def load_transformer_config(
         )
     with open(config_path) as config_file:
         return json.load(config_file)
+
+
+def load_transformer_config(
+    model_path: str,
+    subfolder: str = "transformer",
+    local_files_only: bool = True,
+    *,
+    revision: str | None = None,
+) -> dict:
+    """Load an LTX transformer config from a local model or the HF Hub."""
+    return load_component_config(model_path, subfolder, local_files_only, revision=revision)
 
 
 def create_transformer_from_config(

@@ -187,7 +187,7 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
 
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
-    calls = {"components": []}
+    calls = {"components": [], "component_configs": []}
     profile = replace(
         LTX25_DISTILLED_COMPONENT_PROFILE,
         text_encoder_cls=object,
@@ -228,13 +228,22 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         return object()
 
     def fake_transformer_config(model, subfolder, local_files_only, *, revision):
-        calls["transformer_config"] = (model, subfolder, local_files_only, revision)
+        calls["component_configs"].append((model, subfolder, local_files_only, revision))
+        if subfolder == "duration_head":
+            return {
+                "video_cross_attention_dim": 12,
+                "audio_cross_attention_dim": 8,
+                "pooler_hidden_dim": 16,
+                "num_queries": 1,
+                "num_pooler_heads": 4,
+                "mlp_hidden_dim": 10,
+            }
         return {"component": "transformer"}
 
     monkeypatch.setattr(ltx2_components, "prefetch_subfolders", fake_prefetch)
     monkeypatch.setattr(ltx2_components.AutoTokenizer, "from_pretrained", fake_tokenizer)
     monkeypatch.setattr(ltx2_components, "_load_component", fake_component)
-    monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
+    monkeypatch.setattr(ltx2_components, "load_component_config", fake_transformer_config)
     monkeypatch.setattr(
         ltx2_components,
         "create_transformer_from_config",
@@ -250,6 +259,8 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     ltx2_components.initialize_pipeline_components(pipeline, od_config)
 
     assert pipeline.weights_sources[0].revision == revision
+    assert pipeline.weights_sources[1].prefix == "duration_head."
+    assert pipeline.weights_sources[1].revision == revision
     assert calls["prefetch"][2]["revision"] == revision
     assert calls["tokenizer"][1]["revision"] == revision
     assert {call[2] for call in calls["components"]} == {
@@ -261,12 +272,11 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         "latent_upsampler",
     }
     assert all(call[3]["revision"] == revision for call in calls["components"])
-    assert calls["transformer_config"] == (
-        od_config.model,
-        profile.transformer_subfolder,
-        False,
-        revision,
-    )
+    assert calls["component_configs"] == [
+        (od_config.model, "duration_head", False, revision),
+        (od_config.model, profile.transformer_subfolder, False, revision),
+    ]
+    assert pipeline.duration_head.video_input_proj.in_features == 12
     assert calls["scheduler"][1]["revision"] == revision
 
 
@@ -404,6 +414,13 @@ def test_ltx25_four_public_pipeline_semantics_are_disjoint():
     assert resolve_ltx_pipeline_recipe("distilled_one_stage", "2.5") is LTX25_DISTILLED_ONE_STAGE_RECIPE
     assert resolve_ltx_component_profile("distilled_two_stage", "2.5") is LTX25_DISTILLED_COMPONENT_PROFILE
     assert resolve_ltx_pipeline_recipe("distilled_two_stage", "2.5") is LTX25_DISTILLED_TWO_STAGE_RECIPE
+    for profile in (
+        LTX25_FULL_COMPONENT_PROFILE,
+        LTX25_TWO_STAGE_COMPONENT_PROFILE,
+        LTX25_DISTILLED_ONE_STAGE_COMPONENT_PROFILE,
+        LTX25_DISTILLED_COMPONENT_PROFILE,
+    ):
+        assert "duration_head" in profile.resident_modules
 
     assert LTX2Pipeline.pipeline_kind == "one_stage"
     assert LTX2TwoStagePipeline.pipeline_kind == "two_stage"
@@ -815,6 +832,144 @@ class TestLTXRequestParsing:
 
         with pytest.raises(ValueError, match="image_crf"):
             _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX2Pipeline), req)
+
+    def test_request_resolves_auto_duration_bounds(self):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="prompt",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        extra_args={"auto_duration": True, "min_seconds": 2.0, "max_seconds": 12.5}
+                    ),
+                    request_id="ltx-auto-duration",
+                )
+            ]
+        )
+
+        inputs = _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX2Pipeline), req)
+
+        assert inputs.auto_duration
+        assert inputs.min_seconds == 2.0
+        assert inputs.max_seconds == 12.5
+
+    @pytest.mark.parametrize(
+        ("extra_args", "match"),
+        [
+            ({"auto_duration": "yes"}, "auto_duration"),
+            ({"min_seconds": 0}, "min_seconds"),
+            ({"max_seconds": float("inf")}, "max_seconds"),
+            ({"min_seconds": 4.0, "max_seconds": 4.0}, "min_seconds"),
+        ],
+    )
+    def test_request_rejects_invalid_auto_duration_options(self, extra_args, match):
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        req = DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt="prompt",
+                    sampling_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+                    request_id="ltx-invalid-auto-duration",
+                )
+            ]
+        )
+
+        with pytest.raises(ValueError, match=match):
+            _resolve_request_inputs_for_test(_make_ltx_request_pipe(LTX2Pipeline), req)
+
+
+def test_ltx25_auto_duration_reuses_positive_connector_context():
+    request_inputs = LTXRequestInputs(
+        prompt=["prompt"],
+        negative_prompt=[""],
+        height=544,
+        width=960,
+        num_frames=121,
+        frame_rate=24.0,
+        num_inference_steps=30,
+        guidance=LTX25_FULL_RECIPE.request_guidance,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=32,
+        auto_duration=True,
+        min_seconds=2.0,
+        max_seconds=10.0,
+    )
+    prompt_context = SimpleNamespace(
+        positive_connector_prompt_embeds=torch.randn(1, 4, 12),
+        positive_connector_audio_prompt_embeds=torch.randn(1, 5, 8),
+    )
+    calls = {}
+
+    class FakeDurationHead:
+        def predict_num_frames(self, video_tokens, audio_tokens, **kwargs):
+            calls["video_tokens"] = video_tokens
+            calls["audio_tokens"] = audio_tokens
+            calls["kwargs"] = kwargs
+            return 97
+
+    pipe = _make_ltx_request_pipe(LTX2Pipeline)
+    pipe.duration_head = FakeDurationHead()
+    object.__setattr__(pipe, "_prepare_prompt_context", lambda **_kwargs: prompt_context)
+
+    resolved, resolved_context = LTXRuntime._predict_duration(pipe, request_inputs)
+
+    assert resolved.num_frames == 97
+    assert resolved_context is prompt_context
+    torch.testing.assert_close(calls["video_tokens"], prompt_context.positive_connector_prompt_embeds)
+    torch.testing.assert_close(calls["audio_tokens"], prompt_context.positive_connector_audio_prompt_embeds)
+    assert calls["kwargs"] == {
+        "frame_rate": 24.0,
+        "temporal_compression_ratio": 8,
+        "min_seconds": 2.0,
+        "max_seconds": 10.0,
+    }
+
+
+def test_ltx25_auto_duration_rejects_multiple_prompts():
+    request_inputs = LTXRequestInputs(
+        prompt=["first", "second"],
+        negative_prompt=["", ""],
+        height=544,
+        width=960,
+        num_frames=121,
+        frame_rate=24.0,
+        num_inference_steps=30,
+        guidance=LTX25_FULL_RECIPE.request_guidance,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=32,
+        auto_duration=True,
+    )
+    pipe = _make_ltx_request_pipe(LTX2Pipeline)
+    pipe.duration_head = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="one prompt"):
+        LTXRuntime._predict_duration(pipe, request_inputs)
 
 
 class TestLTXForwardStages:
