@@ -14,7 +14,7 @@ from vllm.lora.lora_weights import PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.model_executor.models.utils import WeightsMapper
 
-from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+from vllm_omni.diffusion.sched.sigma_schedule import BASE_SCHEDULE_KEY, DMD2SigmaSchedule
 from vllm_omni.lora.request import LoRARequest
 
 from .minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
@@ -294,6 +294,24 @@ def _native_target_dims(target: str) -> tuple[int, int]:
     raise ValueError(f"Unsupported MiniMax-H3 native target: {target!r}")
 
 
+def _parse_native_base_schedule(metadata: Mapping[str, str]) -> DMD2SigmaSchedule | None:
+    """Read the adapter-declared schedule from safetensors string metadata.
+
+    safetensors metadata is string-only, so the native artifact ships the sigma
+    positions comma separated. Absent means the adapter declares no schedule.
+    """
+    raw = metadata.get(BASE_SCHEDULE_KEY)
+    if raw is None:
+        return None
+    positions = [part.strip() for part in str(raw).split(",") if part.strip()]
+    if not positions:
+        raise ValueError(f"MiniMax-H3 native LoRA {BASE_SCHEDULE_KEY} must not be empty")
+    try:
+        return DMD2SigmaSchedule.from_positions([float(position) for position in positions])
+    except ValueError as exc:
+        raise ValueError(f"MiniMax-H3 native LoRA {BASE_SCHEDULE_KEY} is malformed: {exc}") from exc
+
+
 def _validate_native_metadata(metadata: Mapping[str, str]) -> DMD2SigmaSchedule:
     if metadata.get("key_format") != _NATIVE_KEY_FORMAT:
         raise ValueError(f"MiniMax-H3 native LoRA requires safetensors metadata key_format={_NATIVE_KEY_FORMAT!r}")
@@ -311,9 +329,9 @@ def _validate_native_metadata(metadata: Mapping[str, str]) -> DMD2SigmaSchedule:
     tasks = {part.strip().lower() for part in str(metadata.get("tasks", "")).split(",") if part.strip()}
     if tasks != {"t2va"}:
         raise ValueError("MiniMax-H3 native LoRA v1.0 supports tasks=t2va only")
-    schedule = DMD2SigmaSchedule.from_safetensors_metadata(metadata)
+    schedule = _parse_native_base_schedule(metadata)
     if schedule is None:
-        raise ValueError("MiniMax-H3 native LoRA requires safetensors metadata base_schedule")
+        raise ValueError(f"MiniMax-H3 native LoRA requires safetensors metadata {BASE_SCHEDULE_KEY}")
     # Request validation speaks in interval counts, so a mislabeled schedule
     # would otherwise silently change the step count instead of failing here.
     if schedule.num_inference_steps != MINIMAX_H3_NATIVE_INFERENCE_STEPS:

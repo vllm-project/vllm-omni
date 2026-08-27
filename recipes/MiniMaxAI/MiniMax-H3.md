@@ -907,8 +907,10 @@ size. Pure Ulysses replicates the adapter on every rank, while DiT tensor
 parallelism shards the B buffers. Model-level and standard layerwise offload
 remain unsupported.
 
-Ascend NPU validation (259/259 binding, Base/LoRA SHA256 toggling) uses
-[`scripts/npu_validate_native_lora.sh`](../../scripts/npu_validate_native_lora.sh).
+To validate a deployment, post the same fixed-seed T2VA request twice with the
+adapter and twice without it, then compare the four output digests. The adapter
+is bound and deterministic when each pair matches internally and the two pairs
+differ from each other.
 
 ## Key parameters
 

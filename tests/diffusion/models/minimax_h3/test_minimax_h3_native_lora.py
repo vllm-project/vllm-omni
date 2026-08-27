@@ -252,6 +252,40 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("raw_schedule", "message"),
+    [
+        (None, "requires safetensors metadata base_schedule"),
+        ("", "must not be empty"),
+        (",,", "must not be empty"),
+        ("1.0,oops,0.15,0.0", "is malformed"),
+        ("0.9,0.7,0.4,0.15,0.0", "is malformed"),
+    ],
+)
+def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, message):
+    """safetensors metadata is string-only, so the loader owns the parse contract."""
+    metadata = {
+        "format": "pt",
+        "key_format": "minimax-h3-native",
+        "qkv_layout": "grouped",
+        "lora_rank": str(_TINY_RANK),
+        "lora_alpha": str(_TINY_RANK),
+        "tasks": "t2va",
+    }
+    if raw_schedule is not None:
+        metadata["base_schedule"] = raw_schedule
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path, metadata=metadata)
+
+    with pytest.raises(ValueError, match=message):
+        load_minimax_h3_native_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
+
+
 def test_h3_native_declared_file_fails_closed_on_invalid_metadata(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, metadata={"key_format": "other"})

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -9,17 +9,6 @@ from dataclasses import dataclass
 from typing import Any
 
 BASE_SCHEDULE_KEY = "base_schedule"
-
-
-def _coerce_schedule_positions(raw: Any) -> list[float]:
-    if isinstance(raw, str):
-        parts = [part.strip() for part in raw.split(",") if part.strip()]
-        if not parts:
-            raise ValueError("DMD2 base_schedule must not be empty")
-        return [float(part) for part in parts]
-    if isinstance(raw, Mapping):
-        raise ValueError("DMD2 base_schedule must be a sequence, not a mapping")
-    return [float(value) for value in raw]
 
 
 @dataclass(frozen=True)
@@ -73,20 +62,7 @@ class DMD2SigmaSchedule:
         raw = metadata.get(key)
         if raw is None:
             return None
-        return cls.from_positions(_coerce_schedule_positions(raw))
-
-    @classmethod
-    def from_safetensors_metadata(
-        cls,
-        metadata: Mapping[str, str],
-        *,
-        key: str = BASE_SCHEDULE_KEY,
-    ) -> DMD2SigmaSchedule | None:
-        """Read a comma-separated schedule from safetensors string metadata."""
-        raw = metadata.get(key)
-        if raw is None:
-            return None
-        return cls.from_positions(_coerce_schedule_positions(raw))
+        return cls.from_positions(raw)
 
     @property
     def num_inference_steps(self) -> int:
