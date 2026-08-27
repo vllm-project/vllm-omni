@@ -125,7 +125,7 @@ class _RecordingTransformer(nn.Module):
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
         for block in self.blocks:
-            block.self_attn = SimpleNamespace(num_local_heads=2, head_dim=4)
+            block.self_attn = SimpleNamespace(num_local_heads=2, num_sp_heads=2, head_dim=4)
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -383,6 +383,9 @@ def _od_config(**overrides):
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
             sequence_parallel_size=1,
+            ulysses_degree=1,
+            ring_degree=1,
+            allgather_degree=1,
             cfg_parallel_size=1,
             vae_patch_parallel_size=1,
             use_hsdp=False,
@@ -600,7 +603,6 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     ("field", "value", "feature"),
     [
         ("pipeline_parallel_size", 2, "pipeline parallelism"),
-        ("sequence_parallel_size", 2, "sequence parallelism"),
         ("cfg_parallel_size", 2, "CFG parallelism"),
         ("vae_patch_parallel_size", 2, "VAE parallelism"),
         ("use_hsdp", True, "HSDP"),
@@ -616,6 +618,27 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
     assert module._loader_state.prefetch_calls == []
+
+
+def test_pure_ulysses_parallel_config_is_supported() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 2
+    parallel_config.ulysses_degree = 2
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert pipeline.transformer is not None
+
+
+def test_non_ulysses_sequence_parallelism_is_rejected() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 2
+    parallel_config.ring_degree = 2
+
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
 
 def test_unsupported_quantization_fails_before_component_loading() -> None:

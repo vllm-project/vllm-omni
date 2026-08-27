@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -181,7 +180,6 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         return
     unsupported_sizes = {
         "pipeline_parallel_size": "pipeline parallelism",
-        "sequence_parallel_size": "sequence parallelism",
         "cfg_parallel_size": "CFG parallelism",
         "vae_patch_parallel_size": "VAE parallelism",
     }
@@ -189,6 +187,16 @@ def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
         size = getattr(parallel_config, field, 1) or 1
         if size > 1:
             raise NotImplementedError(f"LingBot World v1 does not support {feature} ({field}={size}).")
+    sequence_parallel_size = getattr(parallel_config, "sequence_parallel_size", 1) or 1
+    ulysses_degree = getattr(parallel_config, "ulysses_degree", sequence_parallel_size) or 1
+    ring_degree = getattr(parallel_config, "ring_degree", 1) or 1
+    allgather_degree = getattr(parallel_config, "allgather_degree", 1) or 1
+    if sequence_parallel_size != ulysses_degree or ring_degree != 1 or allgather_degree != 1:
+        raise NotImplementedError(
+            "LingBot World sequence parallelism currently supports pure Ulysses only: "
+            f"sequence_parallel_size={sequence_parallel_size}, ulysses_degree={ulysses_degree}, "
+            f"ring_degree={ring_degree}, allgather_degree={allgather_degree}."
+        )
     if getattr(parallel_config, "use_hsdp", False):
         raise NotImplementedError("LingBot World v1 does not support HSDP.")
     if getattr(parallel_config, "enable_expert_parallel", False):
@@ -535,8 +543,7 @@ class LingBotWorldCausalDMDPipeline(
         latent_height = self._ar_height // spatial
         latent_width = self._ar_width // spatial
         tokens_per_frame = (latent_height // patch_height) * (latent_width // patch_width)
-        tp_size = get_tensor_model_parallel_world_size()
-        num_local_heads = int(self.transformer.config.num_attention_heads) // tp_size
+        num_local_heads = self.transformer.blocks[0].self_attn.num_sp_heads
         total_window_frames = (
             int(self.transformer.config.local_attn_size)
             if int(self.transformer.config.local_attn_size) != -1
@@ -938,19 +945,23 @@ class LingBotWorldCausalDMDPipeline(
             def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
                 for block in self.transformer.blocks:
                     cross_attention = block.cross_attn
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
-                        2,
-                        (
-                            cross_attention.num_local_heads,
-                            cross_attention.head_dim,
-                        ),
+                    key = cross_attention.shard_kv_heads(
+                        cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(
+                            2,
+                            (
+                                cross_attention.num_local_heads,
+                                cross_attention.head_dim,
+                            ),
+                        )
                     )
-                    value = cross_attention.v(projected_text).unflatten(
-                        2,
-                        (
-                            cross_attention.num_local_heads,
-                            cross_attention.head_dim,
-                        ),
+                    value = cross_attention.shard_kv_heads(
+                        cross_attention.v(projected_text).unflatten(
+                            2,
+                            (
+                                cross_attention.num_local_heads,
+                                cross_attention.head_dim,
+                            ),
+                        )
                     )
                     yield key, value
 

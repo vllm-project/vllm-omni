@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -417,6 +417,20 @@ def test_transformer_declares_regional_compile_block() -> None:
     module = attention_tests._load_module()
 
     assert module.CausalLingBotWorldTransformer3DModel._repeated_blocks == ["LingBotAttentionBlock"]
+
+
+def test_transformer_declares_token_aligned_ulysses_sp_plan() -> None:
+    module = attention_tests._load_module()
+
+    plan = module.CausalLingBotWorldTransformer3DModel._sp_plan
+
+    assert set(plan["sp_prepare"]) == {0, 1, 2, 3, 4}
+    assert plan["sp_prepare"][0].split_dim == 1
+    assert plan["sp_prepare"][1].split_dim == 1
+    assert plan["sp_prepare"][2].split_dim == 1
+    assert plan["sp_prepare"][3].split_dim == 0
+    assert plan["sp_prepare"][4].split_dim == 0
+    assert plan["sp_output_gather"].gather_dim == 1
 
 
 def test_lingbot_rms_norm_uses_global_tp_square_mean(monkeypatch) -> None:
