@@ -11,6 +11,31 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBaseVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            return value
+
+    monkeypatch.setattr(
+        ltx_runtime.torch,
+        "autocast",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("base vocoder must not use autocast")),
+    )
+    vocoder = FakeBaseVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.bfloat16
+    assert output.dtype == torch.bfloat16
+
+
 class TestLTXOutputRank:
     @pytest.mark.parametrize(
         ("distributed_vae_state", "expected_decode_calls"),

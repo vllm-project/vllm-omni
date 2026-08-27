@@ -534,6 +534,7 @@ class TestPipelineDiscovery:
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
         assert "qwen3_omni_moe" in OMNI_PIPELINES
+        assert "qwen3_omni_moe_thinker_only" in OMNI_PIPELINES
         assert "qwen3_tts" in OMNI_PIPELINES
 
     def test_registry_resolver_qwen3_omni_all_stages(self):
@@ -557,6 +558,18 @@ class TestPipelineDiscovery:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
         assert pipeline.default_deploy_config_name is None
         assert len(pipeline.stages) == 1  # thinker only
+
+    def test_registry_qwen3_omni_thinker_only_key_is_static(self):
+        """Explicit registry key must not re-enter the HF-config resolver."""
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe_thinker_only",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert pipeline is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
+        assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+        assert len(pipeline.stages) == 1
+        assert pipeline.stages[0].engine_output_type == "text"
+        assert pipeline.stages[0].final_output_type == "text"
 
     @pytest.mark.parametrize(
         "pipeline",
@@ -1225,14 +1238,22 @@ stages:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
-    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self):
+    @pytest.mark.parametrize(
+        ("hf_config", "model"),
+        [
+            (Q3_OMNI_THINKER_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Thinking"),
+            (Q3_OMNI_ALL_STAGES_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+        ],
+        ids=["thinker_checkpoint", "instruct_forced_thinker_only"],
+    )
+    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self, hf_config, model):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe_thinking.yaml"))
         with patch(
             "vllm_omni.config.config_factory.get_config",
-            return_value=Q3_OMNI_THINKER_HF_CONFIG,
+            return_value=hf_config,
         ):
             pipeline = StageConfigFactory.get_pipeline_config(
-                "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+                model,
                 trust_remote_code=False,
                 deploy_config_path=str(deploy_path),
             )
@@ -1241,6 +1262,7 @@ stages:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
 
         deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == "qwen3_omni_moe_thinker_only"
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert len(stages) == 1

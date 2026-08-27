@@ -66,6 +66,12 @@ the boundary affected by the in-flight stage client/process refactor in
 [#5441](https://github.com/vllm-project/vllm-omni/pull/5441). Names and
 responsibilities proposed only by that PR are not current contracts.
 
+The orchestration loop also has an opt-in event-driven mode
+(`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, default off) proposed in
+[#5221](https://github.com/vllm-project/vllm-omni/pull/5221). It changes poll
+cadence only: the routing, ordering, and terminal-state contracts below hold
+identically on both loops.
+
 ## Ownership boundary
 
 This document owns `AsyncOmniEngine`, `Orchestrator`, request-state creation,

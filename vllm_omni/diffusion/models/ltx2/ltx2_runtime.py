@@ -60,6 +60,29 @@ from .ltx2_request import (
 )
 
 
+def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
+    """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
+    if not hasattr(vocoder, "bwe_generator"):
+        return vocoder(generated_mel)
+
+    input_dtype = generated_mel.dtype
+    device_type = generated_mel.device.type
+    module_dtype = next(vocoder.parameters()).dtype
+    if device_type == "mps":
+        if module_dtype != torch.float32:
+            vocoder.float()
+        try:
+            return vocoder(generated_mel.float()).to(input_dtype)
+        finally:
+            if module_dtype != torch.float32:
+                vocoder.to(module_dtype)
+
+    # BF16 errors compound through the BWE model's long convolution stack.
+    # FP32 autocast upcasts each op without materializing a second FP32 model.
+    with torch.autocast(device_type=device_type, dtype=torch.float32):
+        return vocoder(generated_mel.float()).to(input_dtype)
+
+
 def _expand_per_prompt_decode_value(
     value: float | list[float],
     *,
@@ -558,7 +581,7 @@ class LTXRuntime(
         if video.numel() > 0:
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
-        audio = self.vocoder(generated_mel)
+        audio = _run_ltx_vocoder(self.vocoder, generated_mel)
         return self._make_output((video, audio))
 
     def _prepare_video_latents_stage(
