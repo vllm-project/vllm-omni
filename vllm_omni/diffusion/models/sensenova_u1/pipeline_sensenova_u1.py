@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
@@ -31,6 +31,7 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -108,6 +109,33 @@ def _ceil_by_factor(number: float, factor: int) -> int:
 
 def _floor_by_factor(number: float, factor: int) -> int:
     return math.floor(number / factor) * factor
+
+
+def _build_fm_head(
+    input_dim: int,
+    intermediate_dim: int,
+    output_dim: int,
+    prefix: str = "fm_modules.fm_head",
+) -> nn.Sequential:
+    return nn.Sequential(
+        ReplicatedLinear(
+            input_dim,
+            intermediate_dim,
+            bias=True,
+            return_bias=False,
+            disable_tp=True,
+            prefix=f"{prefix}.0",
+        ),
+        nn.GELU(),
+        ReplicatedLinear(
+            intermediate_dim,
+            output_dim,
+            bias=True,
+            return_bias=False,
+            disable_tp=True,
+            prefix=f"{prefix}.2",
+        ),
+    )
 
 
 def _smart_resize(
@@ -472,7 +500,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
     # Top-level module(s) the diffusion LoRA manager scans (both MoT branches).
     # TODO: promote to a shared LoRA contract/mixin instead of per-pipeline opt-in.
-    _lora_components: ClassVar[list[str]] = ["language_model"]
+    _lora_components: ClassVar[list[str]] = ["language_model", "fm_modules"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -521,10 +549,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             # (those fields are unused in the released checkpoint). The deeper variant
             # has not been ported yet.
             fm_intermediate_dim = 4096
-            fm_head = nn.Sequential(
-                nn.Linear(llm_hidden_size, fm_intermediate_dim, bias=True),
-                nn.GELU(),
-                nn.Linear(fm_intermediate_dim, output_dim, bias=True),
+            fm_head = _build_fm_head(
+                input_dim=llm_hidden_size,
+                intermediate_dim=fm_intermediate_dim,
+                output_dim=output_dim,
             )
 
         self.fm_modules = nn.ModuleDict(
