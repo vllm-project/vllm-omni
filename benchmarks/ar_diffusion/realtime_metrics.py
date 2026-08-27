@@ -18,6 +18,12 @@ number no deployment can use:
     Sessions consume at ``target_fps``, so a chunk is due once per release
     period. Measures continuity -- CPR, TTFC and worst-case chunk latency.
     SLO is only defined in this mode.
+
+Both modes additionally report ``stage_coverage``: the pipeline profiler's
+per-stage medians *and the chunk latency no stage claims*. Reporting the
+stages without the remainder is what lets a serving-layer cost stay invisible
+indefinitely -- the instrumented parts are all inside the pipeline, and the
+work of turning a tick into a pipeline call is outside every one of them.
 """
 
 from __future__ import annotations
@@ -106,12 +112,22 @@ class WorkloadProfile:
 
 @dataclass(frozen=True)
 class ChunkEvent:
-    """One committed chunk, timed against a common monotonic clock."""
+    """One committed chunk, timed against a common monotonic clock.
+
+    ``stage_durations`` is whatever the pipeline profiler reported for this
+    tick, and it is kept for one reason: **the stages never add up to the
+    tick.** A pipeline instruments the work it knows about -- denoising, VAE,
+    text encoding -- and everything between the tick arriving and the pipeline
+    being called is nobody's stage. Reporting the instrumented parts without
+    reporting the remainder makes that gap invisible, and it is the part a
+    serving layer is most able to remove.
+    """
 
     session_id: str
     chunk_index: int
     t_submit: float
     t_ready: float
+    stage_durations: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -120,10 +136,50 @@ class ChunkEvent:
             raise ValueError("chunk_index must be a non-negative integer.")
         if self.t_ready < self.t_submit:
             raise ValueError("t_ready must not precede t_submit.")
+        if not isinstance(self.stage_durations, Mapping):
+            raise TypeError("stage_durations must be a mapping of stage name to seconds.")
+        for name, seconds in self.stage_durations.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("stage_durations keys must be non-empty strings.")
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+                raise TypeError(f"stage duration {name!r} must be a number.")
+            if not math.isfinite(seconds) or seconds < 0:
+                raise ValueError(f"stage duration {name!r} must be finite and non-negative.")
 
     @property
     def latency_s(self) -> float:
         return self.t_ready - self.t_submit
+
+    @property
+    def instrumented(self) -> bool:
+        """Whether this chunk carries any stage timing at all.
+
+        Distinguishing "the profiler was off" from "the profiler was on and
+        could not explain the time" matters: the first reports no coverage,
+        the second reports a real gap. Collapsing them would read as 100%
+        unaccounted on every uninstrumented run.
+        """
+        return bool(self.stage_durations)
+
+    @property
+    def accounted_s(self) -> float | None:
+        """Seconds this tick's stages claim, or ``None`` if uninstrumented."""
+        if not self.instrumented:
+            return None
+        return float(sum(self.stage_durations.values()))
+
+    @property
+    def unaccounted_s(self) -> float | None:
+        """Tick latency no stage claims. Negative means the stages overlap."""
+        accounted = self.accounted_s
+        return None if accounted is None else self.latency_s - accounted
+
+    @property
+    def accounted_fraction(self) -> float | None:
+        accounted = self.accounted_s
+        if accounted is None or self.latency_s <= 0:
+            return None
+        return accounted / self.latency_s
 
     def to_dict(self, *, deadline: float | None = None) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -133,6 +189,11 @@ class ChunkEvent:
             "t_ready": self.t_ready,
             "latency_s": self.latency_s,
         }
+        if self.instrumented:
+            record["stage_durations"] = dict(self.stage_durations)
+            record["accounted_s"] = self.accounted_s
+            record["unaccounted_s"] = self.unaccounted_s
+            record["accounted_fraction"] = self.accounted_fraction
         if deadline is not None:
             record["deadline"] = deadline
             record["met_deadline"] = self.t_ready <= deadline
@@ -195,6 +256,50 @@ def chunk_deadlines(record: SessionRecord, profile: WorkloadProfile) -> dict[int
     }
 
 
+def stage_coverage(events: Sequence[ChunkEvent]) -> dict[str, Any]:
+    """Median per-stage seconds, and the tick time no stage claims.
+
+    Returns ``instrumented_chunks == 0`` rather than a fabricated 0% coverage
+    when nothing was profiled, so a run with the profiler disabled cannot be
+    read as a run whose time is entirely unexplained.
+
+    The per-stage medians are reported alongside the residual on purpose: a
+    residual is only actionable next to the stages it is being compared
+    against, and a stage that appears on some ticks but not others (a cached
+    encode, say) shows up as a median far below its own mean.
+    """
+    instrumented = [event for event in events if event.instrumented]
+    if not instrumented:
+        return {
+            "instrumented_chunks": 0,
+            "chunks": len(events),
+            "stage_p50_s": {},
+            "accounted_p50_s": None,
+            "unaccounted_p50_s": None,
+            "accounted_fraction_p50": None,
+        }
+
+    names = sorted({name for event in instrumented for name in event.stage_durations})
+    stage_p50 = {
+        # Absent means the stage did not run on that tick, which is a zero for
+        # the median rather than a missing sample -- that is precisely how a
+        # per-session cache shows up.
+        name: percentile([float(event.stage_durations.get(name, 0.0)) for event in instrumented], 0.50)
+        for name in names
+    }
+    return {
+        "instrumented_chunks": len(instrumented),
+        "chunks": len(events),
+        "stage_p50_s": stage_p50,
+        "accounted_p50_s": percentile([event.accounted_s for event in instrumented], 0.50),
+        "unaccounted_p50_s": percentile([event.unaccounted_s for event in instrumented], 0.50),
+        "accounted_fraction_p50": percentile(
+            [f for f in (event.accounted_fraction for event in instrumented) if f is not None],
+            0.50,
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class SessionSummary:
     session_id: str
@@ -210,6 +315,7 @@ class SessionSummary:
     deadline_misses: int
     continuous_play_ratio: float | None
     lost_reason: str | None
+    stage_coverage: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -259,6 +365,7 @@ def summarize_session(
         deadline_misses=misses,
         continuous_play_ratio=cpr,
         lost_reason=record.lost_reason,
+        stage_coverage=stage_coverage(events),
     )
 
 
@@ -279,6 +386,7 @@ class RunSummary:
     mean_chunk_latency_s: float | None
     rtf_spread: float | None
     peak_concurrent_sessions: int
+    stage_coverage: Mapping[str, Any] = field(default_factory=dict)
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,6 +411,7 @@ class RunSummary:
             "worst_case_chunk_latency_s": self.worst_case_chunk_latency_s,
             "continuous_play_ratio": self.continuous_play_ratio,
             "rtf_spread": self.rtf_spread,
+            "stage_coverage": dict(self.stage_coverage),
             "notes": list(self.notes),
             "per_session": [summary.to_dict() for summary in self.sessions],
         }
@@ -348,6 +457,11 @@ def summarize_run(
         mean_chunk_latency_s=statistics.fmean(latencies) if latencies else None,
         rtf_spread=max(rtfs) - min(rtfs) if len(rtfs) > 1 else None,
         peak_concurrent_sessions=(peak_concurrent_sessions if peak_concurrent_sessions is not None else len(summaries)),
+        # Pooled over every chunk of every session rather than averaged over
+        # the per-session figures: the residual is a property of the tick path,
+        # not of a session, and pooling keeps a short session from weighing as
+        # much as a long one.
+        stage_coverage=stage_coverage([event for record in ordered for event in record.events]),
         notes=tuple(notes),
     )
 

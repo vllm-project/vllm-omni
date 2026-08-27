@@ -52,6 +52,38 @@ which TTFC reports. Walking cumulative frames rather than multiplying a constant
 period is what lets a deeper buffer grant real slack, and what keeps a causal
 decoder's shorter opening chunk from being credited with a full period.
 
+## Stage coverage: the tick time no stage claims
+
+`stage_coverage` reports the median seconds of each stage the pipeline
+profiler timed, and next to them:
+
+```
+accounted_p50_s          the stages, summed
+unaccounted_p50_s        chunk latency - accounted
+accounted_fraction_p50   accounted / latency
+instrumented_chunks      how many chunks carried any stage timing at all
+```
+
+The residual is reported because the stages do not add up to the tick and are
+not expected to. A pipeline times the work it knows it is doing -- denoising,
+VAE, text encoding -- and everything between the tick arriving and the pipeline
+being entered belongs to no stage: request parsing, multimodal decode, output
+packing, scheduling. Publishing the instrumented parts alone hides that gap,
+and the gap is precisely the part a serving layer can remove without touching
+the model.
+
+`instrumented_chunks` exists so "the profiler was off" cannot be read as "the
+profiler was on and could not explain any of the time". With no instrumented
+chunk the coverage figures are `None` rather than zero.
+
+A negative `unaccounted_p50_s` is not clamped: it means stages overlap, or are
+timed across a different span than the chunk, and that is a fault in the
+instrument rather than a result to present as perfect coverage.
+
+Stage medians treat an absent stage as zero for that chunk rather than as a
+missing sample. That is what makes a per-session cache visible: an encode that
+runs on the first tick only lands at a median of zero, not at full cost.
+
 ## Model neutrality
 
 The chunk shape comes from the pipeline's declared `ARDiffusionKVCacheSpec`. No

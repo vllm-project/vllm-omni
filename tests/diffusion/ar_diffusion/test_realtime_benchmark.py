@@ -593,3 +593,125 @@ def test_frames_per_chunk_needs_a_mapping_the_spec_does_not_declare() -> None:
 
     with pytest.raises(ValueError, match="frames_per_block"):
         frames_per_chunk_from_spec(NoSpec())
+
+
+# ---------------------------------------------------------------------------
+# stage coverage: the tick time no stage claims
+# ---------------------------------------------------------------------------
+def _timed_chunk(index: int, latency: float, *, session_id: str = "s0", **stages: float) -> ChunkEvent:
+    return ChunkEvent(
+        session_id=session_id,
+        chunk_index=index,
+        t_submit=float(index),
+        t_ready=index + latency,
+        stage_durations=stages,
+    )
+
+
+def test_the_residual_is_what_the_stages_do_not_explain() -> None:
+    event = _timed_chunk(0, 2.0, _generate_block=1.5, vae_decode=0.2)
+
+    assert event.accounted_s == pytest.approx(1.7)
+    assert event.unaccounted_s == pytest.approx(0.3)
+    assert event.accounted_fraction == pytest.approx(0.85)
+
+
+def test_an_uninstrumented_chunk_reports_no_coverage_rather_than_none_accounted() -> None:
+    """The distinction the whole feature exists for.
+
+    A run with the profiler off must not read as a run whose time is entirely
+    unexplained -- that would turn "we did not look" into "we looked and found
+    100% overhead".
+    """
+    event = _timed_chunk(0, 2.0)
+
+    assert event.instrumented is False
+    assert event.accounted_s is None
+    assert event.unaccounted_s is None
+    assert event.accounted_fraction is None
+    assert "accounted_s" not in event.to_dict()
+
+
+def test_overlapping_stages_report_a_negative_residual_rather_than_clamping() -> None:
+    """Stages that overlap mean the timings are wrong, and that must show.
+
+    Clamping at zero would present a broken instrument as a perfectly
+    explained tick.
+    """
+    event = _timed_chunk(0, 1.0, a=0.8, b=0.7)
+
+    assert event.unaccounted_s == pytest.approx(-0.5)
+    assert event.accounted_fraction == pytest.approx(1.5)
+
+
+def test_stage_coverage_pools_every_chunk_of_every_session() -> None:
+    records = [
+        SessionRecord(
+            session_id="s0",
+            t_start=0.0,
+            events=(
+                _timed_chunk(0, 2.0, _generate_block=1.6, other_stage=0.1),
+                _timed_chunk(1, 2.0, _generate_block=1.6, other_stage=0.1),
+            ),
+        ),
+        SessionRecord(
+            session_id="s1",
+            t_start=0.0,
+            events=(_timed_chunk(0, 2.0, session_id="s1", _generate_block=1.6, other_stage=0.1),),
+        ),
+    ]
+
+    summary = summarize_run(records, PROFILE, mode=LoadMode.SATURATING, wall_s=6.0)
+    coverage = summary.stage_coverage
+
+    assert coverage["instrumented_chunks"] == 3
+    assert coverage["chunks"] == 3
+    assert coverage["unaccounted_p50_s"] == pytest.approx(0.3)
+    assert coverage["accounted_fraction_p50"] == pytest.approx(0.85)
+    assert coverage["stage_p50_s"]["_generate_block"] == pytest.approx(1.6)
+
+
+def test_a_stage_that_runs_on_some_ticks_only_shows_up_below_its_own_mean() -> None:
+    """A per-session cache is exactly this shape, and must stay visible.
+
+    Treating an absent stage as a missing sample would report the cached
+    encode at full cost forever; treating it as zero shows the caching.
+    """
+    record = SessionRecord(
+        session_id="s0",
+        t_start=0.0,
+        events=(
+            _timed_chunk(0, 2.0, encode=0.4, _generate_block=1.5),
+            _timed_chunk(1, 2.0, _generate_block=1.5),
+            _timed_chunk(2, 2.0, _generate_block=1.5),
+        ),
+    )
+
+    coverage = summarize_session(record, PROFILE, mode=LoadMode.SATURATING).stage_coverage
+
+    assert coverage["stage_p50_s"]["encode"] == pytest.approx(0.0)
+    assert coverage["stage_p50_s"]["_generate_block"] == pytest.approx(1.5)
+
+
+def test_a_run_with_no_instrumentation_reports_zero_instrumented_chunks() -> None:
+    record = SessionRecord(
+        session_id="s0",
+        t_start=0.0,
+        events=(_timed_chunk(0, 2.0), _timed_chunk(1, 2.0)),
+    )
+
+    summary = summarize_run([record], PROFILE, mode=LoadMode.SATURATING, wall_s=4.0)
+
+    assert summary.stage_coverage["instrumented_chunks"] == 0
+    assert summary.stage_coverage["chunks"] == 2
+    assert summary.stage_coverage["unaccounted_p50_s"] is None
+    json.dumps(summary.to_dict())
+
+
+def test_stage_durations_must_be_finite_and_non_negative() -> None:
+    with pytest.raises(ValueError):
+        _timed_chunk(0, 1.0, bad=-0.1)
+    with pytest.raises(ValueError):
+        _timed_chunk(0, 1.0, bad=float("inf"))
+    with pytest.raises(TypeError):
+        ChunkEvent(session_id="s0", chunk_index=0, t_submit=0.0, t_ready=1.0, stage_durations=[("a", 1.0)])

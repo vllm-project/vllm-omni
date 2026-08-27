@@ -28,7 +28,7 @@ import contextlib
 import json
 import random
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -121,6 +121,26 @@ class BenchmarkConfig:
             raise ValueError("chunks_per_session must be at least 1.")
 
 
+def _stage_durations(output: Any) -> dict[str, float]:
+    """Read the pipeline profiler's per-stage seconds off one tick output.
+
+    Deliberately total, never raising: stage timings are diagnostic, and a
+    pipeline that reports none, or reports them in a shape this harness does
+    not recognise, must still produce a benchmark result. What it must not do
+    is silently contribute a zero, which is why an unrecognised shape yields
+    an empty mapping and is counted as uninstrumented rather than as a tick
+    whose stages took no time.
+    """
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, Mapping):
+        return {}
+    return {
+        str(name): float(seconds)
+        for name, seconds in durations.items()
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds >= 0
+    }
+
+
 async def _drive_session(
     session_id: str,
     *,
@@ -159,7 +179,7 @@ async def _drive_session(
                     await sleep(lag)
             t_submit = clock()
             try:
-                await session.next_chunk()
+                output = await session.next_chunk()
             except Exception as exc:  # noqa: BLE001 - a lost session is a result, not a crash
                 lost_reason = f"{type(exc).__name__}: {exc}"
                 break
@@ -169,6 +189,7 @@ async def _drive_session(
                     chunk_index=chunk_index,
                     t_submit=t_submit,
                     t_ready=clock(),
+                    stage_durations=_stage_durations(output),
                 )
             )
     finally:
