@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 import sys
@@ -112,19 +112,36 @@ def test_explicit_ring_backend_does_not_fallback_to_sdpa(monkeypatch):
         strategy.run_attention(query, query, query, attn_metadata=None)
 
 
-def test_explicit_non_ring_backend_is_rejected(monkeypatch):
+@pytest.mark.parametrize(
+    "backend_pref",
+    [
+        "CUDNN_ATTN",
+        "FLASH_ATTN_HUB",
+        "FLASH_ATTN_3_HUB",
+    ],
+)
+def test_explicit_non_ring_backend_is_rejected(monkeypatch, backend_pref):
+    # Local FA is available so a missing rejection would silently run FA4/FA3/FA2
+    # instead of the requested Hub/cuDNN backend.
+    monkeypatch.setattr(ring, "HAS_FA4", True)
+    monkeypatch.setattr(ring, "_can_use_fa4", lambda _device: True)
     module_name = "vllm_omni.diffusion.attention.backends.ring_pytorch_attn"
     monkeypatch.setitem(
         sys.modules,
         module_name,
         SimpleNamespace(ring_pytorch_attn_func=lambda *args, **kwargs: pytest.fail("unexpected SDPA fallback")),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.attention.backends.ring_flash_attn",
+        SimpleNamespace(ring_flash_attn_func=lambda *args, **kwargs: pytest.fail("unexpected local FA ring")),
+    )
     strategy = ring.RingParallelAttention(
         SimpleNamespace(ring_group=object()),
-        attn_backend_pref="CUDNN_ATTN",
+        attn_backend_pref=backend_pref,
         attn_backend_explicit=True,
     )
-    query = torch.randn(1, 2, 1, 8)
+    query = torch.randn(1, 2, 1, 8, dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="ring sequence parallelism has no implementation"):
         strategy.run_attention(query, query, query, attn_metadata=None)

@@ -155,7 +155,7 @@ class TestPipelineArgumentsHandling:
         return adapter
 
     def test_explicit_unbound_backend_is_rejected(self):
-        calls = []
+        calls: list[str] = []
         adapter = self._make_adapter("CUDNN_ATTN", calls.append)
 
         with pytest.raises(ValueError, match="do not provide a binding"):
@@ -164,7 +164,7 @@ class TestPipelineArgumentsHandling:
         assert calls == []
 
     def test_failed_explicit_backend_does_not_fallback_to_native(self):
-        calls = []
+        calls: list[str] = []
 
         def reject_backend(backend):
             calls.append(backend)
@@ -178,8 +178,42 @@ class TestPipelineArgumentsHandling:
         assert calls == ["sage_hub", "sage", "sage_varlen"]
         assert "native" not in calls
 
+    def test_explicit_flash_attn_3_hub_does_not_fallback_to_fa2_or_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_later_backends(backend):
+            calls.append(backend)
+            if backend in ("flash_hub", "flash_varlen_hub", "flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_3_HUB", accept_later_backends)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_3_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["_flash_3_hub", "_flash_3_varlen_hub"]
+
+    def test_explicit_flash_attn_hub_does_not_fallback_to_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_local_flash(backend):
+            calls.append(backend)
+            if backend in ("flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_HUB", accept_local_flash)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["flash_hub", "flash_varlen_hub"]
+
     def test_explicit_torch_sdpa_maps_to_diffusers_native(self):
-        calls = []
+        calls: list[str] = []
         adapter = self._make_adapter("TORCH_SDPA", calls.append)
 
         adapter._set_attention_backend()

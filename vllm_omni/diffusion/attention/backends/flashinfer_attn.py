@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -12,6 +15,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
 logger = init_logger(__name__)
 
@@ -49,7 +55,7 @@ class FlashInferAttentionBackend(AttentionBackend):
         return "FLASHINFER_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> type["FlashInferAttentionImpl"]:
+    def get_impl_cls() -> type[FlashInferAttentionImpl]:
         return FlashInferAttentionImpl
 
 
@@ -94,6 +100,10 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
         self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
         requested_backend = quant.get("flashinfer_backend", "auto")
+        # Set when AttentionConfig (or --diffusion-attention-backend) selected
+        # FLASHINFER_ATTN. Cute-dsl custom-mask SDPA is automatic-only.
+        self.backend_explicit = bool(extra_impl_args.get("backend_explicit", False))
+        self._sdpa_fallback: SDPAImpl | None = None
 
         if not HAS_FLASHINFER:
             raise ImportError("FLASHINFER_ATTN backend requires flashinfer")
@@ -332,6 +342,28 @@ class FlashInferAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         return self._wrapper.run(query, key, value)
 
+    def _sdpa_for_unsupported_mask(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        reason: str,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+        logger.warning_once("FLASHINFER_ATTN falling back to SDPA: %s", reason)
+        fallback = self._sdpa_fallback
+        if fallback is None:
+            fallback = SDPAImpl(
+                num_heads=query.shape[2],
+                head_size=query.shape[3],
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+            )
+            self._sdpa_fallback = fallback
+        return fallback.forward_cuda(query, key, value, attn_metadata)
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -345,27 +377,57 @@ class FlashInferAttentionImpl(AttentionImpl):
                 "Install it or set DIFFUSION_ATTENTION_BACKEND to another backend."
             )
 
-        # Validate the custom_mask path before launching the kernel. Unsupported
-        # masks raise instead of silently switching away from FLASHINFER_ATTN.
+        # Explicit FLASHINFER_ATTN must not silently switch away from the
+        # requested kernel. Automatic platform selection (Blackwell cute-dsl)
+        # may use SDPA for masks that this FlashInfer variant cannot run.
         batch_size = query.shape[0]
         custom_mask = None
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
-            custom_mask = self._pack_mask_for_flashinfer(
-                attn_metadata.attn_mask,
-                batch_size=batch_size,
-                qo_len=query.shape[1],
-                kv_len=key.shape[1],
-            )
+            try:
+                custom_mask = self._pack_mask_for_flashinfer(
+                    attn_metadata.attn_mask,
+                    batch_size=batch_size,
+                    qo_len=query.shape[1],
+                    kv_len=key.shape[1],
+                )
+            except ValueError:
+                if self.backend_explicit:
+                    raise
+                return self._sdpa_for_unsupported_mask(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    "attn_mask is not a FlashInfer boolean custom_mask",
+                )
             # FlashInfer cannot combine causal masking with a custom_mask; rather
             # than silently dropping the explicit mask (diverging from SDPA),
-            # require the caller to select a compatible backend.
+            # require an explicit caller to select a compatible backend.
             if custom_mask is not None and self.causal:
-                raise ValueError("FLASHINFER_ATTN does not support causal=True together with an explicit custom mask.")
+                if self.backend_explicit:
+                    raise ValueError(
+                        "FLASHINFER_ATTN does not support causal=True together with an explicit custom mask."
+                    )
+                return self._sdpa_for_unsupported_mask(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                    "causal=True with a custom mask",
+                )
 
         if custom_mask is not None and self.flashinfer_backend == "cute-dsl":
-            raise ValueError(
-                "FLASHINFER_ATTN cute-dsl backend does not support custom masks. "
-                "Select TORCH_SDPA or a FlashInfer backend that accepts custom_mask."
+            if self.backend_explicit:
+                raise ValueError(
+                    "FLASHINFER_ATTN cute-dsl backend does not support custom masks. "
+                    "Select TORCH_SDPA or a FlashInfer backend that accepts custom_mask."
+                )
+            return self._sdpa_for_unsupported_mask(
+                query,
+                key,
+                value,
+                attn_metadata,
+                "cute-dsl does not support custom masks",
             )
 
         return self._run_batch_prefill(query, key, value, custom_mask)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
 import sys
@@ -19,7 +19,7 @@ SAGE_ATTN3_MODULE = "vllm_omni.diffusion.attention.backends.sage_attn3"
 
 def load_sage_attn3_module(monkeypatch: pytest.MonkeyPatch, kernel_impl):
     fake_module = types.ModuleType("sageattn3")
-    fake_module.sageattn3_blackwell = kernel_impl
+    setattr(fake_module, "sageattn3_blackwell", kernel_impl)
     monkeypatch.setitem(sys.modules, "sageattn3", fake_module)
     sys.modules.pop(SAGE_ATTN3_MODULE, None)
     return importlib.import_module(SAGE_ATTN3_MODULE)
@@ -129,6 +129,36 @@ def test_cuda_platform_selects_sage_attn3_alias(monkeypatch: pytest.MonkeyPatch)
     backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
 
     assert backend_path == DiffusionAttentionBackendEnum.SAGE_ATTN_3.get_path()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")
+@pytest.mark.parametrize("head_size", [32, 320])
+def test_cuda_platform_rejects_explicit_sage_attn3_unsupported_head_size(
+    monkeypatch: pytest.MonkeyPatch, head_size: int
+):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda import platform as cuda_platform_module
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    original_import_module = importlib.import_module
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 0)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+    monkeypatch.setattr(
+        cuda_platform_module.importlib,
+        "import_module",
+        lambda module_name: object() if module_name == "sageattn3" else original_import_module(module_name),
+    )
+    load_sage_attn3_module(monkeypatch, lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=f"head_size={head_size} is unsupported"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=head_size)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="sage_attn3 tests require CUDA platform")

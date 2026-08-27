@@ -128,3 +128,47 @@ def test_explicit_cudnn_accepts_supported_head_size(monkeypatch: pytest.MonkeyPa
     path = CudaOmniPlatform.get_diffusion_attn_backend_cls("CUDNN_ATTN", head_size=72)
 
     assert path == DiffusionAttentionBackendEnum.CUDNN_ATTN.get_path()
+
+
+def test_explicit_cudnn_skips_head_size_check_for_capability_probe(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls("CUDNN_ATTN", head_size=-1)
+
+    assert path == DiffusionAttentionBackendEnum.CUDNN_ATTN.get_path()
+
+
+@pytest.mark.parametrize("head_size", [32, 320])
+def test_explicit_flashinfer_raises_for_unsupported_head_size(monkeypatch: pytest.MonkeyPatch, head_size: int):
+    _blackwell_sm120(monkeypatch)
+    _install_dummy_flashinfer_prefill(monkeypatch)
+
+    with pytest.raises(ValueError, match=f"head_size={head_size} is unsupported"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASHINFER_ATTN", head_size=head_size)
+
+
+def test_explicit_flashinfer_accepts_supported_head_size(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+    _install_dummy_flashinfer_prefill(monkeypatch)
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASHINFER_ATTN", head_size=128)
+
+    assert path == DiffusionAttentionBackendEnum.FLASHINFER_ATTN.get_path()
+
+
+def test_explicit_flashinfer_skips_head_size_check_for_capability_probe(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+    _install_dummy_flashinfer_prefill(monkeypatch)
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASHINFER_ATTN", head_size=-1)
+
+    assert path == DiffusionAttentionBackendEnum.FLASHINFER_ATTN.get_path()
+
+
+def test_auto_selects_cudnn_for_unknown_head_size_probe(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+    _install_dummy_flashinfer_prefill(monkeypatch)
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(None, head_size=-1)
+
+    assert path == DiffusionAttentionBackendEnum.CUDNN_ATTN.get_path()

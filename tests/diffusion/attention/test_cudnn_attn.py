@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager, nullcontext
+from typing import Any
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_cudnn_backend_uses_math_for_kv_seq_len_one(monkeypatch):
+    """Automatic CUDNN_ATTN (platform default) may use MATH for singleton K/V."""
     selected_backends = []
 
     @contextmanager
@@ -36,6 +38,20 @@ def test_cudnn_backend_uses_math_for_kv_seq_len_one(monkeypatch):
 
     assert output.shape == query.shape
     assert selected_backends == [(SDPBackend.MATH,)]
+
+
+def test_explicit_cudnn_rejects_kv_seq_len_one():
+    impl = CuDNNAttentionImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=0.5,
+        backend_explicit=True,
+    )
+    query = torch.randn(1, 2, 2, 8)
+    singleton_kv = torch.randn(1, 1, 2, 8)
+
+    with pytest.raises(ValueError, match="explicitly selected.*sequence length 1"):
+        impl.forward_cuda(query, singleton_kv, singleton_kv)
 
 
 def test_cudnn_backend_pins_cudnn_only_when_kv_seq_len_gt_one(monkeypatch):
@@ -62,7 +78,7 @@ def test_cudnn_backend_pins_cudnn_only_when_kv_seq_len_gt_one(monkeypatch):
 
 
 def test_cudnn_slices_valid_kv_prefix_without_padding_mask(monkeypatch):
-    observed = {}
+    observed: dict[str, Any] = {}
 
     def fake_sdpa(query, key, value, **kwargs):
         observed.update(query=query, key=key, value=value, kwargs=kwargs)

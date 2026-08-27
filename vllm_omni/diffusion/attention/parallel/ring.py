@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -178,10 +178,10 @@ class RingParallelAttention:
                 joint_strategy=joint_strategy,
             )
 
-        # Ring only implements FA/AITER and SDPA kernels. Non-FA diffusion
-        # backends (CUDNN / FlashInfer / TRT-LLM / Sage) can use the SDPA ring
-        # path only when they came from automatic platform selection. An
-        # explicit backend request must never be silently substituted.
+        # Ring only implements local Flash/AITER and SDPA kernels. HuggingFace
+        # Hub FA and other non-local backends can use the SDPA ring path only
+        # when they came from automatic platform selection. An explicit
+        # request must never silently substitute local FA4/FA3/FA2.
         _sdpa_prefs = {
             "sdpa",
             "torch",
@@ -193,6 +193,8 @@ class RingParallelAttention:
             "trtllm_attn",
             "sage_attn",
             "sage_attn_3",
+            "flash_attn_hub",
+            "flash_attn_3_hub",
         }
         if backend_pref in _sdpa_prefs:
             return _run_sdpa()

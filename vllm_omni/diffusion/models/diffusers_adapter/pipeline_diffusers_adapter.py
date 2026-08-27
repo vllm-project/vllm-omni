@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusers backend adapter for vLLM-Omni.
 
 Provides a black-box wrapper around any 🤗 Diffusers pipeline, enabling
@@ -44,13 +44,21 @@ logger = logging.getLogger(__name__)
 # with the accuracy tests' diffusers reference runs so both sides of a
 # similarity comparison resolve to the same backend on any given image
 # (hub kernels may lack a build variant for the image's torch).
-CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS: list[str] = [
+# Automatic / FLASH_ATTN selection walks the full chain. Explicit Hub
+# options attempt only their matching Diffusers backend names.
+CUDA_FLASH_ATTN_3_HUB_ATTEMPTS: list[str] = [
     "_flash_3_hub",
     "_flash_3_varlen_hub",
-    "_flash_3",
-    "_flash_varlen_3",
+]
+CUDA_FLASH_ATTN_HUB_ATTEMPTS: list[str] = [
     "flash_hub",
     "flash_varlen_hub",
+]
+CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS: list[str] = [
+    *CUDA_FLASH_ATTN_3_HUB_ATTEMPTS,
+    "_flash_3",
+    "_flash_varlen_3",
+    *CUDA_FLASH_ATTN_HUB_ATTEMPTS,
     "flash",
     "flash_varlen",
     "_native_flash",
@@ -321,7 +329,21 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         attention_backend_config = default_spec.backend if default_spec is not None else None
         attention_backend_attempts: list[str] = []
         match attention_backend_config:
-            case "FLASH_ATTN" | "FLASH_ATTN_HUB" | "FLASH_ATTN_3_HUB" | None:
+            case "FLASH_ATTN_3_HUB":
+                if self._is_blackwell_gpu():
+                    raise ValueError(
+                        "FLASH_ATTN_3_HUB was explicitly selected for a Diffusers adapter on "
+                        "Blackwell, but no runnable sm_10x+ Flash Attention kernel is available."
+                    )
+                attention_backend_attempts.extend(CUDA_FLASH_ATTN_3_HUB_ATTEMPTS)
+            case "FLASH_ATTN_HUB":
+                if self._is_blackwell_gpu():
+                    raise ValueError(
+                        "FLASH_ATTN_HUB was explicitly selected for a Diffusers adapter on "
+                        "Blackwell, but no runnable sm_10x+ Flash Attention kernel is available."
+                    )
+                attention_backend_attempts.extend(CUDA_FLASH_ATTN_HUB_ATTEMPTS)
+            case "FLASH_ATTN" | None:
                 if current_omni_platform.is_rocm():
                     attention_backend_attempts.append("aiter")
                 elif current_omni_platform.is_xpu():

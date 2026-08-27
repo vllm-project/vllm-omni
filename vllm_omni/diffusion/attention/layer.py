@@ -144,6 +144,7 @@ class Attention(nn.Module):
             prefix=prefix,
             backend_kwargs=backend_kwargs,
             role=role,
+            backend_explicit=self.backend_explicit,
         )
         # Some model-specific paths call this helper directly. The main backend
         # dispatch below never switches to it implicitly.

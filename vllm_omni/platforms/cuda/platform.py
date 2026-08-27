@@ -178,6 +178,14 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                         "Install SageAttention/sageattention3_blackwell or select a different backend."
                     ) from e
             cls.validate_diffusion_attn_backend(backend_upper)
+            if backend_upper == "SAGE_ATTN_3" and head_size > 0:
+                sage3_cls = DiffusionAttentionBackendEnum.SAGE_ATTN_3.get_class()
+                if not sage3_cls.supports_head_size(head_size):
+                    raise ValueError(
+                        f"SAGE_ATTN_3 was explicitly selected but head_size={head_size} is unsupported. "
+                        f"Supported head sizes: {sage3_cls.get_supported_head_sizes()}. "
+                        "Select TORCH_SDPA or another backend."
+                    )
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 try:
                     importlib.import_module("kernels")
@@ -224,10 +232,24 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                     "FLASHINFER_ATTN was explicitly selected, but the installed FlashInfer build does not "
                     "provide BatchPrefillWithRaggedKVCacheWrapper. Install a compatible build."
                 )
+            if backend_upper == "FLASHINFER_ATTN":
+                from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionBackend
+
+                # head_size <= 0 is the capability-probe sentinel. Skip geometry
+                # validation; Attention construction still checks the real size.
+                if head_size > 0 and not FlashInferAttentionBackend.supports_head_size(head_size):
+                    raise ValueError(
+                        f"FLASHINFER_ATTN was explicitly selected but head_size={head_size} is unsupported. "
+                        f"Supported head sizes: {FlashInferAttentionBackend.get_supported_head_sizes()}. "
+                        "Select TORCH_SDPA or another backend."
+                    )
             if backend_upper == "CUDNN_ATTN":
                 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend
 
-                if not CuDNNAttentionBackend.supports_head_size(head_size):
+                # head_size <= 0 is the capability-probe sentinel (auto-pad does
+                # not know head_dim). Skip geometry validation; the real
+                # Attention construction still checks the configured size.
+                if head_size > 0 and not CuDNNAttentionBackend.supports_head_size(head_size):
                     raise ValueError(
                         f"CUDNN_ATTN was explicitly selected but head_size={head_size} is unsupported. "
                         "Blackwell cuDNN FMHA requires head_dim divisible by 8 and no larger than 256. "
@@ -268,7 +290,9 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if is_blackwell and cudnn_blackwell_ready:
             from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend
 
-            if CuDNNAttentionBackend.supports_head_size(head_size):
+            # Unknown head_size is a capability probe (SP auto-pad), not a
+            # real DiT geometry. Keep CUDNN so mask support is reported.
+            if head_size <= 0 or CuDNNAttentionBackend.supports_head_size(head_size):
                 logger.info(
                     "Defaulting to diffusion attention backend CUDNN_ATTN (Blackwell %s, cuDNN %d, head_dim %d)",
                     sm_str,

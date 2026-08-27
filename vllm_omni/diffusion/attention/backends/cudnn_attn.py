@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -62,6 +62,9 @@ class CuDNNAttentionImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        # Set when AttentionConfig (or --diffusion-attention-backend) selected
+        # CUDNN_ATTN. The kv_seq_len=1 MATH path is automatic-only.
+        self.backend_explicit = bool(extra_impl_args.get("backend_explicit", False))
 
     def forward_cuda(
         self,
@@ -102,15 +105,23 @@ class CuDNNAttentionImpl(AttentionImpl):
         # cuDNN gets runtime-disabled in the same call and the dispatcher falls
         # through to MATH even though cuDNN alone handles the mask fine
         # (~11 ms vs ~215 ms for MATH on sm_120 HV-1.5 shapes).
-        # Explicit CUDNN_ATTN must not silently substitute MATH/EFFICIENT for
-        # shapes cuDNN can run.
+        # Explicit CUDNN_ATTN must not silently substitute MATH/EFFICIENT.
         #
-        # Exception: cuDNN FMHA rejects KV sequence length 1
-        # ("cudnn SDPA does not support key/value sequence length 1"). MATH is
-        # the only kernel that can execute that shape; using it here is not the
-        # masked-attn silent fallback above. Dummy warmup and some I2V layers
-        # (e.g. LTX-2) hit this on Blackwell when CUDNN_ATTN is the default.
-        backends = [SDPBackend.MATH] if kv_seq_len <= 1 else [SDPBackend.CUDNN_ATTENTION]
+        # Automatic-only: cuDNN FMHA rejects KV sequence length 1
+        # ("cudnn SDPA does not support key/value sequence length 1"). Dummy
+        # warmup and some I2V layers (e.g. LTX-2) hit this when CUDNN_ATTN is
+        # the platform default. MATH is the only kernel that can run that shape.
+        # An explicit CUDNN_ATTN request raises instead of silently switching.
+        if kv_seq_len <= 1:
+            if self.backend_explicit:
+                raise ValueError(
+                    "CUDNN_ATTN was explicitly selected but cuDNN FMHA does not "
+                    f"support key/value sequence length {kv_seq_len}. "
+                    "Select TORCH_SDPA or another backend for this shape."
+                )
+            backends = [SDPBackend.MATH]
+        else:
+            backends = [SDPBackend.CUDNN_ATTENTION]
         with sdpa_kernel(backends):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query,

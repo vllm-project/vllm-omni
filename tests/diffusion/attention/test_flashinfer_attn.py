@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -11,12 +11,14 @@ from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAtt
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _impl(*, causal: bool = False):
+def _impl(*, causal: bool = False, backend_explicit: bool = False):
     # Avoid CUDA/wrapper init; these tests only cover mask validation.
     obj = FlashInferAttentionImpl.__new__(FlashInferAttentionImpl)
     obj.causal = causal
     obj.softmax_scale = 0.5
     obj.flashinfer_backend = "fa2"
+    obj.backend_explicit = backend_explicit
+    obj._sdpa_fallback = None
     return obj
 
 
@@ -26,7 +28,7 @@ def test_flashinfer_rejects_float_mask_instead_of_falling_back(monkeypatch):
     metadata = AttentionMetadata(attn_mask=torch.zeros(2, 2))
 
     with pytest.raises(ValueError, match="boolean-only"):
-        _impl().forward_cuda(query, query, query, metadata)
+        _impl(backend_explicit=True).forward_cuda(query, query, query, metadata)
 
 
 def test_flashinfer_rejects_causal_custom_mask_instead_of_falling_back(monkeypatch):
@@ -35,15 +37,28 @@ def test_flashinfer_rejects_causal_custom_mask_instead_of_falling_back(monkeypat
     metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False], [True, True]]))
 
     with pytest.raises(ValueError, match="causal=True"):
-        _impl(causal=True).forward_cuda(query, query, query, metadata)
+        _impl(causal=True, backend_explicit=True).forward_cuda(query, query, query, metadata)
 
 
-def test_flashinfer_rejects_cute_dsl_custom_mask_instead_of_falling_back(monkeypatch):
+def test_explicit_cute_dsl_rejects_custom_mask_instead_of_falling_back(monkeypatch):
     monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
-    impl = _impl()
+    impl = _impl(backend_explicit=True)
     impl.flashinfer_backend = "cute-dsl"
     query = torch.randn(1, 2, 2, 8)
     metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False], [True, True]]))
 
     with pytest.raises(ValueError, match="cute-dsl"):
         impl.forward_cuda(query, query, query, metadata)
+
+
+def test_auto_cute_dsl_falls_back_to_sdpa_for_custom_mask(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    impl = _impl(backend_explicit=False)
+    impl.flashinfer_backend = "cute-dsl"
+    impl._run_batch_prefill = lambda *args, **kwargs: pytest.fail("unexpected cute-dsl prefill")
+    query = torch.randn(1, 2, 2, 8)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False], [True, True]]))
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert output.shape == query.shape
