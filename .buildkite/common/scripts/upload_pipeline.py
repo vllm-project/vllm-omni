@@ -258,6 +258,13 @@ _PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
 _COUNT_PRESET_RANGE = range(1, 5)
 
 
+def _english_or(names: Any) -> str:
+    items = [str(name) for name in names]
+    if len(items) <= 2:
+        return " or ".join(items)
+    return f"{', '.join(items[:-1])}, or {items[-1]}"
+
+
 def _get_mirror_hw_selector() -> str:
     """Return lowercase ``MIRROR_HW``, or empty to keep string presets / marker chips.
 
@@ -268,12 +275,15 @@ def _get_mirror_hw_selector() -> str:
     if not selector:
         return ""
     if selector not in _SUPPORTED_MIRROR_HW_SELECTORS:
-        raise ValueError(f"unsupported MIRROR_HW={selector!r}; expected empty or 'b200'")
+        raise ValueError(
+            f"unsupported MIRROR_HW={selector!r}; expected empty or "
+            f"{_english_or(f'{s!r}' for s in sorted(_SUPPORTED_MIRROR_HW_SELECTORS))}"
+        )
     return selector
 
 
 def _pytest_marker_chips(commands: Any) -> set[str]:
-    """Positive H100/L4/B200 tokens in pytest ``-m`` on the step (nested command lists ok)."""
+    """Positive CUDA SKU tokens in pytest ``-m`` (``H100`` from ``h100`` in ``_CUDA_MIRROR_CHIPS``)."""
 
     def _command_text(value: Any) -> str:
         if value is None:
@@ -284,12 +294,15 @@ def _pytest_marker_chips(commands: Any) -> set[str]:
             return "\n".join(_command_text(part) for part in value)
         return str(value)
 
+    not_sku = re.compile(
+        r"\bnot\s+(" + "|".join(re.escape(chip.upper()) for chip in _CUDA_MIRROR_CHIPS) + r")\b",
+    )
     chips: set[str] = set()
     for match in _PYTEST_MARKER_ARG.finditer(_command_text(commands)):
         expr = match.group(1) or match.group(2) or match.group(3) or ""
-        stripped = re.sub(r"\bnot\s+(H100|L4|B200)\b", " ", expr)
-        for token, chip in (("H100", "h100"), ("L4", "l4"), ("B200", "b200")):
-            if re.search(rf"\b{token}\b", stripped):
+        stripped = not_sku.sub(" ", expr)
+        for chip in _CUDA_MIRROR_CHIPS:
+            if re.search(rf"\b{re.escape(chip.upper())}\b", stripped):
                 chips.add(chip)
     return chips
 
@@ -323,7 +336,8 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step: dict[str, Any], step_l
         if not chips:
             raise ValueError(
                 f"mirror_hardwares: {count} in step {step_label!r} needs a pytest -m SKU marker "
-                f"(H100, L4, or B200), or an explicit preset string",
+                f"({_english_or(chip.upper() for chip in _CUDA_MIRROR_CHIPS)}), "
+                f"or an explicit preset string",
             )
         known = _load_mirror_hardwares()
         selector = _get_mirror_hw_selector()
@@ -363,12 +377,14 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step: dict[str, Any], step_l
                 continue
             _log(
                 f"{step_label}: mirror_hardwares count {count} → marker {chip} "
-                f"(multiple SKU markers; preferred L4 then H100) → {chosen!r}",
+                f"(multiple SKU markers; preferred "
+                f"{' then '.join(c.upper() for c in _COUNT_UNSET_CHIP_PREFERENCE)}) → {chosen!r}",
             )
             return chosen
         raise ValueError(
             f"mirror_hardwares: {count} in step {step_label!r} found SKU markers {sorted(chips)} "
-            f"but no H100/L4 preset among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
+            f"but no {'/'.join(c.upper() for c in _COUNT_UNSET_CHIP_PREFERENCE)} preset "
+            f"among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
         )
 
     if isinstance(hardware, str):
