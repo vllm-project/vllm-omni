@@ -4,7 +4,12 @@
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
 Flow: raw obs → engine request → actions.
-The loaded policy model owns dataset transforms inside its pipeline.
+
+A diffusion policy owns its dataset transforms inside its pipeline, so the raw
+observation is handed straight through and the actions come back on
+`multimodal_output`. A policy whose actions are generated tokens has no such
+pipeline, so a model-owned adapter (see `adapters.py`) converts the observation
+into a prompt and the returned token ids back into an action array.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ from typing import Any
 import numpy as np
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
+
+from vllm_omni.entrypoints.openpi.adapters import resolve_robot_ar_adapter
 
 logger = init_logger(__name__)
 
@@ -74,8 +81,10 @@ class ServingRealtimeRobotOpenPI:
     ) -> None:
         self.engine_client = engine_client
         self.model_name = model_name
-        self.policy_server_config = self._get_policy_server_config(engine_client)
+        self.ar_adapter = resolve_robot_ar_adapter(engine_client)
+        self.policy_server_config = self._get_policy_server_config(engine_client, self.ar_adapter)
         self._request_counter = count()
+        self._ar_tokenizer: Any = None
 
     @classmethod
     def create_policy_server(
@@ -92,7 +101,7 @@ class ServingRealtimeRobotOpenPI:
             return None
 
     @staticmethod
-    def _get_policy_server_config(engine_client: Any) -> PolicyServerConfig:
+    def _get_policy_server_config(engine_client: Any, ar_adapter: Any = None) -> PolicyServerConfig:
         model_config = None
         get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
         if callable(get_od_config):
@@ -112,6 +121,14 @@ class ServingRealtimeRobotOpenPI:
             od_config = getattr(engine_client, "od_config", None)
             model_config = getattr(od_config, "model_config", None)
 
+        # An AR policy has no diffusion stage and so no od_config; its handshake
+        # is derived from the checkpoint by the model-owned adapter. Falling
+        # through to the branch below would hand `from_model_config` a vLLM
+        # ModelConfig, which has neither a `policy_server_config` field nor a
+        # `__getattr__`, so the endpoint would silently stay off.
+        if model_config is None and ar_adapter is not None:
+            return PolicyServerConfig(ar_adapter.policy_server_values())
+
         if model_config is None:
             model_config = getattr(engine_client, "model_config", None)
         return PolicyServerConfig.from_model_config(model_config)
@@ -122,7 +139,16 @@ class ServingRealtimeRobotOpenPI:
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
-        request = self._build_request(obs, session_id=session_id, reset=reset)
+        if self.ar_adapter is not None:
+            if self._ar_tokenizer is None:
+                self._ar_tokenizer = await self.engine_client.get_tokenizer()
+            request = self.ar_adapter.build_request(
+                obs,
+                tokenizer=self._ar_tokenizer,
+                request_id=self._next_request_id(session_id),
+            )
+        else:
+            request = self._build_request(obs, session_id=session_id, reset=reset)
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -136,6 +162,8 @@ class ServingRealtimeRobotOpenPI:
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
+        if self.ar_adapter is not None:
+            return self.ar_adapter.decode_actions(result, obs.get("unnorm_key"))
         return self._extract_actions(result)
 
     def _next_request_id(self, session_id: str) -> str:

@@ -92,6 +92,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
     NEMOTRON_VOICECHAT_PIPELINE,
 )
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
+from vllm_omni.model_executor.models.openvla.pipeline import OPENVLA_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
@@ -138,6 +139,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "openvla": OPENVLA_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,

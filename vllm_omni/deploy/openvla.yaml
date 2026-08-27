@@ -1,0 +1,38 @@
+# OpenVLA-7B deploy: a single autoregressive action stage.
+#
+# Topology is declared in vllm_omni/model_executor/models/openvla/pipeline.py.
+# Unlike the diffusion robot policies, this one runs on the ordinary AR engine,
+# so paged KV, continuous batching and CUDA graphs all apply and max_num_seqs
+# is a real knob rather than a hard 1.
+#
+# The OpenPI handshake is not configured here. An LLM_AR stage may not carry the
+# `model_config:` block the diffusion robot deploys use — it is a diffusion-only
+# key and the stage-override validator rejects it — so OpenVLA advertises itself
+# from the checkpoint's own norm_stats instead.
+
+pipeline: openvla
+# Single-stage pipelines have no next-stage processor, so the deploy validator
+# rejects the default async_chunk=true.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 16
+    # 1 BOS + 256 image tokens + the instruction + 7 action tokens; 1024 leaves
+    # room for a long instruction without over-reserving KV.
+    max_model_len: 1024
+    # Unlike the diffusion robot deploys, this one does not force eager
+    # execution. Measured on one A800 with a distinct image per request, eager
+    # and CUDA graphs are within run-to-run noise at batch 1 (142-165 ms vs
+    # 144-146 ms) and graphs are consistently ahead once requests batch
+    # (38.7-39.0 ms/action vs 39.8-43.0 at batch 8).
+    enforce_eager: false
+    # The 256 image tokens sit immediately after BOS, so the part of the prompt
+    # that changes every control step is at the front and nothing is reusable.
+    enable_prefix_caching: false
+    # openvla-7b ships action statistics for 25 embodiments, so one has to be
+    # chosen; a request may still override it per observation.
+    hf_overrides:
+      unnorm_key: bridge_orig
