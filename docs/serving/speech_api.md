@@ -109,7 +109,7 @@ Content-Type: application/json
 | `input` | string | **required** | The text to synthesize into speech |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
+| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
 | `speed` | float | 1.0 | Playback speed (0.25-4.0) |
 
 #### vLLM-Omni Extension Parameters
@@ -131,7 +131,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -141,7 +141,20 @@ The response shape depends on the streaming parameters:
 
 **Non-streaming (default).** With `stream=false` and no `stream_format`, returns the
 complete clip as binary audio data with an appropriate `Content-Type` header (e.g.
-`audio/wav`). The raw-bytes body has no JSON carrier, so no `usage` is reported.
+`audio/wav`). Because the raw-bytes body has no JSON carrier, successful
+non-streaming responses from non-diffusion speech servers report usage through
+response headers:
+
+| Header | Description |
+| --- | --- |
+| `x-vllm-omni-input-tokens` | Total input tokens (`text_tokens` + `audio_tokens`). |
+| `x-vllm-omni-output-tokens` | Generated codec/audio tokens. |
+| `x-vllm-omni-total-tokens` | `input_tokens` + `output_tokens`. |
+| `x-vllm-omni-input-text-tokens` | Tokens from the synthesized text (`input` plus `instructions`). |
+| `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
+
+Diffusion-mode speech servers route through a separate response path and do not
+emit these headers.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
@@ -276,19 +289,41 @@ Client -> Server:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "session.config", ...}` | Session configuration (sent once, first message) |
+| `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
-| `{"type": "input.done"}` | End of input, flushes remaining buffer |
+| `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
+| `{"type": "session.close"}` | End of connection |
 
 Server -> Client:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
+| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
-| `{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
-| `{"type": "session.done", "total_sentences": N}` | Session complete |
+| `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
+| `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Flushed utterance complete |
 | `{"type": "error", "message": "..."}` | Non-fatal error |
+
+### Flushing vs. Closing
+
+`input.done` is a flush, not a disconnect. The server synthesizes the buffered
+text, emits `session.done`, and then waits on the same connection for the next
+utterance, so a client that speaks repeatedly (for example one driven by an
+upstream LLM) pays the WebSocket handshake once instead of once per utterance.
+
+* The session config is sticky. Send `input.text` again straight after
+  `session.done` to reuse it, or send another `session.config` first to change
+  voice, format, or reference audio. A `session.config` sent while text is
+  still buffered is rejected so no pending input is silently dropped.
+* An utterance is the flush unit, not a linguistic one: it is whatever text was
+  buffered when `input.done` arrived, of any length, synthesized as one request.
+  `utterance_index` counts those flushes across the connection, so it tells you
+  which `input.done` a frame belongs to. `sentence_index` counts within one
+  flush and so pairs with `total_sentences`, which means every utterance reports
+  `sentence_index: 0` of `total_sentences: 1` (or `0` for an empty buffer).
+* End the connection with `session.close`, or by closing the socket. An idle
+  connection is still closed after the server's idle timeout, which now also
+  applies to the gap between utterances.
 
 ### Session Config Parameters
 
@@ -653,7 +688,7 @@ for result in response.json()["results"]:
 |-----------|--------|---------|-------------|
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
-All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
+All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
 
 For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 
@@ -775,6 +810,51 @@ If you encounter OOM errors:
 ### Unsupported Speaker
 
 Use `/v1/audio/voices` to list available voices for the loaded model.
+
+## Orchestration Loop (experimental)
+
+Multi-stage omni deployments route stage outputs through a single orchestrator
+loop. By default that loop polls every stage replica on a 1 ms cadence. An
+opt-in event-driven mode replaces the poll with one reader task per live stage
+replica awaiting its client directly, and switches the serving-side
+final-output drain to a condition-variable wakeup at the same time.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+
+Set it on the process that runs the orchestrator (stage 0 of an omni
+deployment) before starting the server:
+
+```bash
+export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --port 8091
+```
+
+The server logs the selected loop mode and its reader/poller counts once at
+startup, so you can confirm which loop is live.
+
+Routing, output ordering, and terminal-state behavior are identical on both
+loops; only the poll cadence changes. Leaving the variable unset keeps the
+legacy poll loop, which is the supported default.
+
+**Known limitations:**
+
+- The measured serving A/B (idle CPU 2.43% to 0.07%; TTFP p99 -32% at
+  concurrency 8) predates the rebuild on the per-replica fault-isolation work
+  in [#4285](https://github.com/vllm-project/vllm-omni/pull/4285). That work
+  changed dead-replica handling and reader/poller lifecycle rather than the
+  steady-state output path, and the parity suite covers it, but the serving
+  A/B has not been re-run on the current head.
+- The diffusion-poller branch is covered by unit tests only. Deployments whose
+  stages all run as standard engine cores never exercise it, including GLM-TTS,
+  which deploys its DiT without `stage_type: diffusion`.
+- Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
+  latency is admission-bound, which this mode does not address.
 
 ## Development
 

@@ -70,9 +70,10 @@ def find_module_with_attr(model, attr_name="transformer"):
     return None
 
 
-def get_transformer_from_pipeline(pipeline: Any):
-    pipe = find_module_with_attr(pipeline, attr_name="transformer")
+def get_transformer_from_pipeline(pipeline: Any, transformer_name: str = "transformer"):
+    """Return a named transformer from a pipeline or pipeline wrapper."""
+    pipe = find_module_with_attr(pipeline, attr_name=transformer_name)
 
     if pipe is not None:
-        return pipe.transformer
+        return getattr(pipe, transformer_name)
     return None

@@ -2,6 +2,11 @@
 
 The CLI for vLLM-Omni inherits from vllm with some additional arguments.
 
+Environment variables are process configuration rather than CLI-only options.
+See the [Environment Variables](../configuration/environment_variables.md)
+reference for ownership, precedence, evaluation time, and per-stage `env`
+scoping.
+
 ## serve
 
 Starts the vLLM-Omni OpenAI Compatible API server.
@@ -18,11 +23,11 @@ Specify the port:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
-If you have custom stage configs file, launch the server with command below
-```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --stage-configs-path /path/to/stage_configs_file
-```
+Load a custom deploy configuration with `--deploy-config`:
 
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --deploy-config /path/to/deploy_config.yaml
+```
 
 ## bench
 
@@ -39,4 +44,5 @@ vllm bench serve --omni \
     --num-prompts  5
 ```
 
-See [vllm bench serve](./bench/serve.md) for the full reference of all available arguments.
+See [vllm bench serve](./bench/serve.md) for serving benchmark arguments and
+dataset-specific examples, including OmniInteract native-duplex sessions.

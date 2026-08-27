@@ -30,6 +30,18 @@ but the changes are correct — stage the modified files and re-commit.
 | `ruff F841` | Variable extracted but never forwarded to model call | Remove the extraction or wire it through |
 | `ruff E402` | Import added below function definitions | Move to top-level import block |
 | `ruff format` | Line length, spacing, quote style | Accept auto-fix, stage, re-commit |
+| `check-spdx-header` | Missing header, or copyright still says `vLLM project` | Two-line Omni header (`vLLM-Omni project`); restage the rewrite |
+| `check-forbidden-imports` | Stdlib `re`/`base64`, pickle, Hugging Face Hub API, or direct Triton/TileLang | `import regex as re` and `pybase64`; use `vllm.transformers_utils.repo_utils`. Do **not** add the file to `allowed_files` without review |
+| `check-torch-cuda-call` | New `torch.cuda.*` call site | Use `current_omni_platform` / `OmniPlatform`; do not grow `ALLOWED_FILES` without review |
+| `check-tts-adapter-migration` | New `self._tts_model_type` branch in `serving_speech.py` | Put per-model logic in `tts_adapters/`. Lower `MAX_MODEL_TYPE_BRANCHES` when removing branches; do not raise it without review |
+| `check-test-ci-coverage` | New `tests/**/test_*.py` missing level or hardware mark | Add `core_model`/`advanced_model`/… plus `cpu`/`cuda`/`hardware_test(` |
+| `mypy-3.10` | Type error on changed `vllm_omni/` files | Fix the types; model trees are excluded. Extra versions: `pre-commit run --hook-stage manual mypy-3.12` |
+| `markdownlint-cli2` | Docs/README markdown lint | Accept auto-fix under `docs/` / `recipes/` / root README |
+| `check-buildkite` | Invalid `.buildkite/*.yml` | Fix the YAML; do not grow `SKIP_FILES` without review |
+| `shellcheck` | No `shellcheck` on PATH, or script warning | `apt-get`/`dnf`/`brew install shellcheck`, or `shellcheck.exe` on Windows PATH |
+
+Canonical policy, CI `SKIP` list, and allowlist locations:
+[docs/contributing/README.md](../../../docs/contributing/README.md#linting).
 
 ## DCO sign-off
 

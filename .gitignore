@@ -46,6 +46,8 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+coverage-*.xml
+coverage-*.xml.gz
 *.cover
 *.py,cover
 .hypothesis/
@@ -240,17 +242,19 @@ data/
 datasets/
 *.csv
 *.json
+!recipes/cosmos3/negative_prompt.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
-!tests/assets/soulxsinger/*.json
 *.jsonl
 *.parquet
 
 # Output files
 outputs/
+!vllm_omni/outputs/
 results/
 generated/
 output_*/
+/tests/e2e/accuracy/artifacts/
 
 # Configuration overrides
 configs/local.yaml
@@ -258,7 +262,6 @@ configs/production.yaml
 configs/development.yaml
 
 # Docker
-.dockerignore
 Dockerfile.dev
 discussion
 tmp_test
@@ -275,3 +278,6 @@ tests/.ci_generated/
 
 # Local Lance precision-matching dump scripts (not part of the repo)
 lance_compare/
+
+# Linting binaries downloaded by local pre-commit hooks
+shellcheck*/

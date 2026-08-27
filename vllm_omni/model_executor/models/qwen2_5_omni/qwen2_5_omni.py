@@ -17,7 +17,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.model_executor.models.vision import (
@@ -39,6 +38,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
+    Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
@@ -76,7 +76,14 @@ class Qwen2_5OmniForConditionalGeneration(
         talker_config: Qwen2_5OmniTalkerConfig = config.talker_config
         self.talker_config = talker_config
 
-        self.model_stage = vllm_config.model_config.model_stage
+        # See qwen3_omni for the full rationale. model_stage is only set by omni's
+        # staged startup; this class is now also constructed for non-staged runs
+        # (its arch overrides upstream's in the registry), where reading the
+        # attribute directly raises AttributeError during engine-core init.
+        # Default to the thinker — the text-generation stage. Note there is no
+        # else-branch below, so an unset stage would otherwise build no submodule
+        # at all and fail later at self.thinker.
+        self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)
             self.thinker = init_vllm_registered_model(

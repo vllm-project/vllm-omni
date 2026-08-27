@@ -22,12 +22,20 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-v1.5"
 DEPLOY_CONFIG = get_deploy_config_path("moss_tts.yaml")
-_OMNI_RUNNER_PARAM = (MODEL, DEPLOY_CONFIG, {"stage_init_timeout": 600})
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    DEPLOY_CONFIG,
+    {"stage_init_timeout": 600, "trust_remote_code": True},
+)
+
+_SKIP_ISSUE_6417 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/6417",
+)
 
 pytestmark = [
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4643"),
     pytest.mark.slow,
     pytest.mark.tts,
+    _SKIP_ISSUE_6417,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 

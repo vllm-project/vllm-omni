@@ -17,7 +17,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -27,15 +26,30 @@ connectors:
       codec_left_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
-      # Common Stage1 decode buckets:
-          #   no-ref first/steady chunks: 25 / 97 frames
-          #   Base ref-context first/steady chunks: 73 / 169 frames
-          #   decoder internal non-streaming chunks: 325 frames
-      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # Chunk ramp (opt-in): gradual size increase for first N chunks to
+      # eliminate the IC→steady cliff (1→25). Uncomment to enable.
+      # Each entry is the size of that chunk index; indices past the table
+      # fall back to codec_chunk_frames. When enabled, ramp overrides
+      # initial_codec_chunk_frames (including the per-request API field).
+      # Example:
+      #   codec_chunk_ramp: [4, 4, 8, 16, 25]
+      # Decoder CUDA Graph sizing:
+      #   * async_chunk=true derives all stateful ICL/xvec shapes from
+      #     codec_chunk_ramp when enabled, otherwise from
+      #     initial_codec_chunk_frames, codec_chunk_frames, and sliding_window;
+      #     decode_cudagraph_capture_sizes is ignored in this mode.
+      #   * async_chunk=false captures stateless shapes 150 and
+      #     decode_chunk_frames + decode_left_context_frames (325 by default).
+      #     Extra stateless shapes may be added (union, not intersection) with:
+      #       decode_cudagraph_capture_sizes: [97, 400]
+      # Graph batch size defaults to 1. Add larger buckets only when needed:
+      #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
+      decode_batch_max_size: 4
 
 stages:
   - stage_id: 0
-    max_num_seqs: 10
+    max_num_seqs: 64
     gpu_memory_utilization: 0.3
     trust_remote_code: true
     # Prefix caching on by default. The HS opt-out (talker only consumes the
@@ -43,9 +57,9 @@ stages:
     # PR make per-step bookkeeping negligible, and any text repetition across
     # requests (same voice or shared ref_audio) is a net throughput win.
     # Disable explicitly if memory headroom is tight on a single-GPU deploy.
-    enable_prefix_caching: true
+    enable_prefix_caching: false
     async_scheduling: true
-    max_num_batched_tokens: 512
+    max_num_batched_tokens: 32768
     max_model_len: 4096
     devices: "0"
     output_connectors:
@@ -54,8 +68,15 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 4096
-      seed: 42
+      # Official qwen-tts generates the talker with min_new_tokens=2; without
+      # it, checkpoints that sample codec EOS on the first frame return empty
+      # audio (HTTP 400). See #4962.
+      min_tokens: 2
       repetition_penalty: 1.05
+    # Suppress codebook-0 silence tokens for the first N decode frames of a
+    # request (#4966). Applies to every request on this stage, so intended
+    # for x-vector-only (Base voice-clone) deploys. 0 = off.
+    silence_ban_frames: 0
     subtalker_sampling_params:
       do_sample: true
       temperature: 0.9
@@ -64,7 +85,7 @@ stages:
 
   - stage_id: 1
     # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
-    max_num_seqs: 10
+    max_num_seqs: 64
     gpu_memory_utilization: 0.3
     enforce_eager: false
     trust_remote_code: true
@@ -85,11 +106,22 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
-      seed: 42
       repetition_penalty: 1.0
 
 platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # MIOpen Conv1d cannot be invoked while vLLM captures the outer
+        # Code2Wav model graph. Keep CUDA's graph-enabled default, but run
+        # Stage 1 eager on ROCm so decoder convolutions execute normally.
+        enforce_eager: true
   npu:
     stages:
       - stage_id: 0
         enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        compilation_config:
+          cudagraph_mode: PIECEWISE

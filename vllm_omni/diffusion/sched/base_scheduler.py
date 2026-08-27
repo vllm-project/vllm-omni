@@ -3,68 +3,68 @@
 
 from __future__ import annotations
 
+import time
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import fields
 
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
-    DiffusionRequestState,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    KVPrefetchJob,
     NewRequestData,
     RequestBatchSamplingParamsKey,
-    SamplingParamsKey,
-    SchedulerInterface,
+    SchedulerRequestState,
+    StepBatchSamplingParamsKey,
+    _AdmissionWaitDecision,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
+BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
+
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
 # on sampling params, so it must be resolved separately from the bulk lookup.
-_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey)) - {"lora_int_id"}
-_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(f.name for f in fields(RequestBatchSamplingParamsKey)) - {
+_STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "lora_int_id"
 }
 
 
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey:
-    """Build a batch-compatibility key from the request's sampling params."""
-    sampling = request.sampling_params
-    lora_request = getattr(sampling, "lora_request", None)
-    return SamplingParamsKey(
-        lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _SAMPLING_PARAMS_KEY_FIELD_NAMES},
-    )
-
-
-def get_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-    """Build a request-batch compatibility key from the request's sampling params."""
-    sampling = request.sampling_params
-    lora_request = getattr(sampling, "lora_request", None)
-    key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-    return RequestBatchSamplingParamsKey(**key_kwargs)
-
-
-class _BaseScheduler(SchedulerInterface):
+class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers."""
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
-        self._request_states: dict[str, DiffusionRequestState] = {}
+        self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
-        self._running_sampling_params_key: SamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+        self._running_sampling_params_key: BatchSamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
+        self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
 
-    def initialize(self, od_config: OmniDiffusionConfig) -> None:
+    def initialize(
+        self,
+        od_config: OmniDiffusionConfig,
+        *,
+        kv_cache_config: KVCacheConfig | None = None,
+        scheduler_block_size: int | None = None,
+        hash_block_size: int | None = None,
+        kv_vllm_config: VllmConfig | None = None,
+    ) -> None:
         self.od_config = od_config
         self._request_states.clear()
         self._step_id = 0
@@ -79,6 +79,36 @@ class _BaseScheduler(SchedulerInterface):
             self.max_num_running_reqs = 1
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
+        diffusion_kv_enabled = (
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        if diffusion_kv_enabled:
+            if kv_cache_config is None:
+                raise ValueError("paged_scheduler Diffusion KV requires a native Scheduler KVCacheConfig")
+            if scheduler_block_size is None or hash_block_size is None:
+                raise ValueError("paged_scheduler Diffusion KV requires native scheduler/hash block sizes")
+            if kv_vllm_config is None:
+                raise ValueError("paged_scheduler Diffusion KV requires the native VllmConfig used for cache sizing")
+            self._diffusion_kv_manager = DiffusionKVCacheManager(
+                kv_cache_config,
+                max_model_len=kv_vllm_config.model_config.max_model_len,
+                scheduler_block_size=scheduler_block_size,
+                hash_block_size=hash_block_size,
+                max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
+            )
+        else:
+            if any(
+                value is not None
+                for value in (
+                    kv_cache_config,
+                    scheduler_block_size,
+                    hash_block_size,
+                    kv_vllm_config,
+                )
+            ):
+                raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
+            self._diffusion_kv_manager = None
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -88,6 +118,7 @@ class _BaseScheduler(SchedulerInterface):
         if request_id in self._request_states:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
+        state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
         self._waiting.append(request_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
@@ -113,6 +144,35 @@ class _BaseScheduler(SchedulerInterface):
             if not self._can_schedule_waiting(state):
                 break
 
+            diffusion_kv_metadata: DiffusionKVMetadata | None = None
+            if self._diffusion_kv_manager is not None:
+                if self._diffusion_kv_manager.has_request(request_id):
+                    diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
+                else:
+                    try:
+                        allocation = self._diffusion_kv_manager.reserve_request(
+                            request_id,
+                            state.diffusion_kv_requests,
+                        )
+                    except Exception as exc:
+                        # schedule() runs outside the Engine execution-error
+                        # wrapper. Convert both expected admission failures and
+                        # unexpected native allocator failures into a terminal
+                        # request error so the busy loop can wake its stream.
+                        if not isinstance(exc, DiffusionKVAdmissionError):
+                            logger.exception(
+                                "Unexpected Diffusion KV allocation failure for request %s",
+                                request_id,
+                            )
+                        self._finish_requests(
+                            {request_id: DiffusionRequestStatus.FINISHED_ERROR},
+                            {request_id: str(exc)},
+                        )
+                        continue
+                    if allocation is None:
+                        break
+                    diffusion_kv_metadata = allocation
+
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
             if not self._running:
@@ -120,7 +180,13 @@ class _BaseScheduler(SchedulerInterface):
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
             if was_new_request:
-                scheduled_new_reqs.append(NewRequestData.from_state(state))
+                state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
+                scheduled_new_reqs.append(
+                    NewRequestData.from_state(
+                        state,
+                        diffusion_kv_metadata=diffusion_kv_metadata,
+                    )
+                )
             else:
                 scheduled_cached_request_ids.append(request_id)
 
@@ -129,13 +195,13 @@ class _BaseScheduler(SchedulerInterface):
         # kv_sender_info (would target the wrong sender under multi-replica) or
         # one already finished/aborted (would consume its sender buffer for
         # nothing).
-        kv_prefetch_jobs: dict | None = None
+        kv_prefetch_job: KVPrefetchJob | None = None
         if self._prefetch_enabled and self._waiting:
             nxt = self._request_states.get(self._waiting[0])
             if nxt is not None and not nxt.is_finished():
                 sender_info = getattr(nxt.req, "kv_sender_info", None)
                 if sender_info:
-                    kv_prefetch_jobs = {
+                    kv_prefetch_job = {
                         "request_id": nxt.request_id,
                         "kv_sender_info": sender_info,
                     }
@@ -147,13 +213,17 @@ class _BaseScheduler(SchedulerInterface):
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
-            kv_prefetch_jobs=kv_prefetch_jobs,
+            kv_prefetch_job=kv_prefetch_job,
         )
 
         # update after schedule
         self._step_id += 1
         self._finished_req_ids.clear()
         return scheduler_output
+
+    @abstractmethod
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+        pass
 
     def has_requests(self) -> bool:
         return bool(self._waiting or self._running)
@@ -164,10 +234,33 @@ class _BaseScheduler(SchedulerInterface):
     def num_running_requests(self) -> int:
         return len(self._running)
 
-    def get_request_state(self, request_id: str) -> DiffusionRequestState | None:
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        """Return the admission-delay policy for the next scheduling wave."""
+        del now, dp_concurrent
+        return _AdmissionWaitDecision(should_wait=False)
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        """Return whether an active admission delay should end."""
+        del decision, now, stable_since
+        return True
+
+    def get_request_state(self, request_id: str) -> SchedulerRequestState | None:
         return self._request_states.get(request_id)
 
-    def pop_request_state(self, request_id: str) -> DiffusionRequestState | None:
+    def pop_request_state(self, request_id: str) -> SchedulerRequestState | None:
+        if self._diffusion_kv_manager is not None:
+            self._diffusion_kv_manager.free_request(request_id)
         self._pop_extra_request_state(request_id)
         return self._request_states.pop(request_id, None)
 
@@ -190,6 +283,9 @@ class _BaseScheduler(SchedulerInterface):
         self._finish_requests({request_id: status for request_id in request_ids})
 
     def close(self) -> None:
+        if self._diffusion_kv_manager is not None:
+            self._diffusion_kv_manager.close()
+            self._diffusion_kv_manager = None
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
@@ -229,6 +325,8 @@ class _BaseScheduler(SchedulerInterface):
             self._waiting = deque(request_id for request_id in self._waiting if request_id not in waiting_to_remove)
 
         for request_id in finished_req_ids:
+            if self._diffusion_kv_manager is not None:
+                self._diffusion_kv_manager.free_request(request_id)
             state = self._request_states[request_id]
             status = statuses[request_id]
             state.status = status
@@ -250,7 +348,13 @@ class _BaseScheduler(SchedulerInterface):
         # update_from_output() processes the runner output. It is already
         # marked finished at that point, but we still need to surface its id
         # in this update so the engine can observe the terminal state.
+        # Also surface admission failures recorded while schedule() built this
+        # output. Older finished ids retained only for Worker cleanup have
+        # already been popped by the Engine and are deliberately ignored.
         finished_req_ids = {
+            request_id for request_id in sched_output.finished_req_ids if request_id in self._request_states
+        }
+        finished_req_ids |= {
             request_id for request_id in sched_output.scheduled_request_ids if request_id in self._finished_req_ids
         }
         finished_req_ids |= self._finish_requests(statuses, errors)
@@ -262,21 +366,52 @@ class _BaseScheduler(SchedulerInterface):
     def _pop_extra_request_state(self, request_id: str) -> None:
         """Remove subclass-owned per-request state before popping request state."""
 
-    def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> DiffusionRequestState:
-        return DiffusionRequestState(
+    def _make_request_state(self, request_id: str, request: OmniDiffusionRequest) -> SchedulerRequestState:
+        kv_requests = request.diffusion_kv_requests or ()
+        if self._diffusion_kv_manager is not None:
+            self._reject_legacy_dense_kv(request)
+            if not kv_requests:
+                raise ValueError("paged_scheduler request preprocessing did not produce DiffusionKVRequest state")
+        elif kv_requests:
+            raise ValueError("dense_legacy request unexpectedly contains Scheduler Diffusion KV requests")
+
+        # DiffusionKVRequest objects are mutable Scheduler/native-KVCacheManager
+        # state and must never ride the normal request payload to a Worker.
+        request.diffusion_kv_requests = None
+        return SchedulerRequestState(
             request_id=request_id,
             req=request,
             sampling_params_key=self._build_sampling_params_key(request),
+            diffusion_kv_requests=kv_requests,
         )
 
-    def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
+    @staticmethod
+    def _reject_legacy_dense_kv(request: OmniDiffusionRequest) -> None:
+        """Keep dense injected KV out of the Scheduler-owned paged path."""
+
+        populated_fields: list[str] = []
+        for owner_name, owner in (
+            ("request", request),
+            ("sampling_params", request.sampling_params),
+        ):
+            for field_name, value in vars(owner).items():
+                if value is not None and (field_name == "past_key_values" or field_name.endswith("_past_key_values")):
+                    populated_fields.append(f"{owner_name}.{field_name}")
+        if populated_fields:
+            fields_text = ", ".join(sorted(populated_fields))
+            raise ValueError(
+                "paged_scheduler Diffusion KV does not accept legacy dense KV payloads; "
+                f"clear these fields before admission: {fields_text}"
+            )
+
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:
             return True
 
         current_key = self._current_sampling_params_key()
         return current_key is not None and current_key == state.sampling_params_key
 
-    def _current_sampling_params_key(self) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
+    def _current_sampling_params_key(self) -> BatchSamplingParamsKey | None:
         if self._running_sampling_params_key is not None or not self._running:
             return self._running_sampling_params_key
         state = self._request_states.get(self._running[0])
@@ -285,5 +420,30 @@ class _BaseScheduler(SchedulerInterface):
 
     def _build_sampling_params_key(
         self, request: OmniDiffusionRequest
-    ) -> SamplingParamsKey | RequestBatchSamplingParamsKey | None:
-        return get_sampling_params_key(request)
+    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
+        """Build a step-batch compatibility key from sampling parameters."""
+        sampling = request.sampling_params
+        # LoRA identity is optional on sampling params (and on test stubs).
+        lora_request = getattr(sampling, "lora_request", None)
+        return StepBatchSamplingParamsKey(
+            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+        )
+
+
+class SchedulerInterface(BaseScheduler):
+    """Deprecated compatibility base for custom scheduler injection.
+
+    Prefer subclassing :class:`BaseScheduler` directly. Subclassing this name
+    still works but emits a :class:`DeprecationWarning`.
+    """
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        import warnings
+
+        warnings.warn(
+            "SchedulerInterface is deprecated; subclass BaseScheduler instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init_subclass__(**kwargs)

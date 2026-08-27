@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Subprocess entry point for the diffusion engine.
 
 StageDiffusionProc runs DiffusionEngine in a child process,
@@ -36,10 +39,12 @@ from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
 logger = init_logger(__name__)
 
@@ -92,20 +97,19 @@ class StageDiffusionProc:
     def _is_executor_dead(self) -> bool:
         """True iff the multiproc executor has been closed or marked failed.
 
-        Detects the "workers died but the diffusion proc is still pulling
-        requests" case: ``MultiprocDiffusionExecutor`` sets ``_closed = True``
-        and ``is_failed = True`` from its worker-monitor thread the moment any
-        worker process exits; every subsequent ``execute_request`` /
-        ``collective_rpc`` then raises ``RuntimeError("DiffusionExecutor is
-        closed.")`` inside the engine. Callers in ``run_loop`` use this to
-        decide whether a per-request failure is recoverable or fatal.
+        requests" case: ``MultiprocDiffusionExecutor`` sets ``is_dead`` from its
+        worker-monitor thread the moment any worker process exits; every
+        subsequent ``execute_request`` / ``collective_rpc`` then raises
+        ``RuntimeError("DiffusionExecutor is closed.")`` inside the engine.
+        Callers in ``run_loop`` use this to decide whether a per-request
+        failure is recoverable or fatal.
         """
         if self._engine is None:
             return False
-        executor = getattr(self._engine, "executor", None)
+        executor: DiffusionExecutor | None = getattr(self._engine, "executor", None)
         if executor is None:
             return False
-        return bool(getattr(executor, "_closed", False) or getattr(executor, "is_failed", False))
+        return executor.is_dead
 
     def _signal_fatal_engine_failure(self, reason: str) -> None:
         """Idempotently signal ``run_loop`` to tear down on a fatal engine error."""
@@ -155,7 +159,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
-        """Build a diffusion request and run DiffusionEngine.step()."""
+        """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
@@ -165,8 +169,13 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        results = await self._engine.step(request)
-        result = results[0]
+        # Non-streaming callers share the streaming engine path but only
+        # return the final output.
+        result = None
+        async for results in self._engine.step_streaming(request):
+            result = results[0]
+        if result is None:
+            raise RuntimeError("Diffusion execution finished without output.")
         if not result.request_id:
             result.request_id = request_id
         return result
@@ -356,6 +365,16 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
+                metrics = diffusion_exception_metrics(e)
+                if metrics:
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "metrics",
+                                "metrics": metrics,
+                            }
+                        )
+                    )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 status_code, error_type = client_error_metadata(e)
@@ -367,6 +386,7 @@ class StageDiffusionProc:
                             "error": str(e),
                             "status_code": status_code,
                             "error_type": error_type,
+                            "metrics": diffusion_exception_metrics(e),
                         }
                     )
                 )
@@ -421,9 +441,8 @@ class StageDiffusionProc:
 
                 elif msg_type == "abort":
                     for rid in msg.get("request_ids", []):
-                        task = tasks.pop(rid, None)
-                        if task:
-                            task.cancel()
+                        # Let the request task consume the terminal abort
+                        # output so it can publish the scheduler snapshot.
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":

@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 torch = pytest.importorskip("torch")
 
 
@@ -52,6 +55,10 @@ def _make_bare_talker():
     talker._cfm_buffers = None
     talker._last_audio_output_req_ids = []
     talker._batched_fsq_fusion_max_batch = 32
+    # Added in VoxCPM2TalkerForConditionalGeneration.__init__; set to
+    # default (False) to avoid AttributeError when test exercises forward
+    # path that checks this flag.
+    talker._enable_unified_decode_graph = False
     return talker
 
 
@@ -228,6 +235,9 @@ class _NoopPerf:
     def stop(self, name: str) -> None:
         pass
 
+    def reset(self) -> None:
+        pass
+
 
 class _FakeTTS:
     feat_decoder = SimpleNamespace(estimator=SimpleNamespace(_compiled=False))
@@ -244,6 +254,164 @@ class _FakeTTS:
 
     def enc_to_lm_proj(self, x: torch.Tensor) -> torch.Tensor:
         return x.squeeze(1).mean(dim=1).repeat(1, 4)
+
+
+class TestChunkedPrefillContract:
+    @staticmethod
+    def _make_talker(prompt_len: int = 30):
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _PrefillInputs
+
+        class FakeTTS:
+            def feat_encoder(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            def enc_to_lm_proj(self, x: torch.Tensor) -> torch.Tensor:
+                return x.squeeze(2)
+
+            def stop_proj(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            def stop_actn(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            def stop_head(self, x: torch.Tensor) -> torch.Tensor:
+                return x[:, :2]
+
+            def lm_to_dit_proj(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            def res_to_dit_proj(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+        class FakeScaffold:
+            def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+                return input_ids.to(torch.float32).unsqueeze(-1).repeat(1, 1, 4)
+
+        talker = _make_bare_talker()
+        talker._tts = FakeTTS()
+        talker.model = FakeScaffold()
+        talker.config = SimpleNamespace(bos_token_id=-1, hidden_size=4)
+        talker._side_dtype = torch.float32
+        talker._get_multichar_zh_split = lambda: {}
+        talker._perf = _NoopPerf()
+        talker._enable_torch_compile = False
+        talker._setup_cfm_buffers = lambda: None
+        talker._run_cfm_for_state = lambda *_args: torch.ones(1, 1, 4)
+
+        text_token = torch.arange(prompt_len, dtype=torch.int32).unsqueeze(0)
+        audio_feat = torch.zeros(1, prompt_len, 1, 4)
+        text_mask = torch.ones(1, prompt_len, dtype=torch.int32)
+        audio_mask = torch.zeros(1, prompt_len, dtype=torch.int32)
+        talker._build_prefill_inputs = lambda *_args, **_kwargs: _PrefillInputs(
+            text_token=text_token,
+            audio_feat=audio_feat,
+            text_mask=text_mask,
+            audio_mask=audio_mask,
+        )
+        return talker
+
+    def test_preprocess_slices_full_embeddings_by_request_position(self) -> None:
+        talker = self._make_talker()
+
+        _, first, _ = talker.preprocess(
+            input_ids=torch.ones(15, dtype=torch.int32),
+            input_embeds=None,
+            request_id="req",
+            text_token_ids=[list(range(29))],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+        )
+        state = talker._active_states["req"]
+        state.decode_step_count = 7
+
+        _, second, _ = talker.preprocess(
+            input_ids=torch.ones(15, dtype=torch.int32),
+            input_embeds=None,
+            request_id="req",
+            text_token_ids=[list(range(29))],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=15,
+        )
+
+        torch.testing.assert_close(first[:, 0], torch.arange(15, dtype=torch.float32))
+        torch.testing.assert_close(second[:, 0], torch.arange(15, 30, dtype=torch.float32))
+        assert state.decode_step_count == 7
+        assert state.is_last_prefill_chunk is True
+
+    def test_prefill_cache_lifecycle_across_chunks(self) -> None:
+        talker = self._make_talker()
+        prompt_cache = {"mode": "reference", "ref_audio_feat": torch.ones(1)}
+        build_calls = []
+
+        def _build_prompt_cache(**_kwargs):
+            build_calls.append(1)
+            return prompt_cache
+
+        talker._build_prompt_cache = _build_prompt_cache
+
+        talker.preprocess(
+            input_ids=torch.ones(15, dtype=torch.int32),
+            input_embeds=None,
+            request_id="req",
+            text_token_ids=[list(range(29))],
+            reference_audio="ref.wav",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+        )
+        state = talker._active_states["req"]
+        prefill_embeds = state.prefill_embeds
+        prefill_masks = state.prefill_masks
+
+        talker.preprocess(
+            input_ids=torch.ones(15, dtype=torch.int32),
+            input_embeds=None,
+            request_id="req",
+            text_token_ids=[list(range(29))],
+            reference_audio="ref.wav",
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=15,
+        )
+
+        assert build_calls == [1]
+        assert state.prompt_cache is prompt_cache
+        assert state.prefill_embeds is prefill_embeds
+        assert state.prefill_masks is prefill_masks
+
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _PrefillResidualMeta
+
+        talker._finish_prefill(
+            state,
+            _PrefillResidualMeta(
+                lm_hidden=torch.ones(1, 4),
+                prefix_feat_cond=torch.ones(1, 1, 4),
+            ),
+            res_out=torch.ones(1, 4),
+            dev=torch.device("cpu"),
+        )
+
+        assert state.prefill_completed is True
+        assert state.prompt_cache is None
+        assert state.prefill_embeds is None
+        assert state.prefill_masks is None
+        assert talker._active_states["req"] is state
+
+    def test_single_token_tail_is_still_prefill(self) -> None:
+        talker = self._make_talker()
+
+        _, embeds, _ = talker.preprocess(
+            input_ids=torch.ones(1, dtype=torch.int32),
+            input_embeds=None,
+            request_id="req",
+            text_token_ids=[list(range(29))],
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=29,
+        )
+        is_last_prefill_chunk = talker._active_states["req"].is_last_prefill_chunk
+        is_prefill = talker._pending_requests[-1][1]
+        assert embeds.shape == (1, 4)
+        assert embeds[0, 0] == 29
+        assert is_prefill is True
+        assert is_last_prefill_chunk is True
 
 
 class TestDecodeBatchContract:
@@ -329,23 +497,27 @@ class TestDecodeBatchContract:
 
         for (expected_res, expected_meta), (actual_res, actual_meta) in zip(expected, actual, strict=True):
             torch.testing.assert_close(actual_res, expected_res)
-            torch.testing.assert_close(actual_meta["new_lm_hidden"], expected_meta["new_lm_hidden"])
+            torch.testing.assert_close(actual_meta.new_lm_hidden, expected_meta.new_lm_hidden)
         assert [state.decode_step_count for state in batch_states] == [1, 1]
 
     def test_batch_decode_matches_per_request_state_updates(self) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            _DecodeResidualMeta,
+        )
+
         seq_talker = self._make_decode_talker()
         batch_talker = self._make_decode_talker()
 
         seq_states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         batch_states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         metas = [
-            {"new_lm_hidden": torch.tensor([[1.0, 2.0, 3.0, 4.0]])},
-            {"new_lm_hidden": torch.tensor([[5.0, 6.0, 7.0, 8.0]])},
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[1.0, 2.0, 3.0, 4.0]])),
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[5.0, 6.0, 7.0, 8.0]])),
         ]
         batch_out = torch.tensor([[0.5, 1.0, 1.5, 2.0], [2.5, 3.0, 3.5, 4.0]])
 
         for state, meta, res_out in zip(seq_states, metas, batch_out, strict=True):
-            seq_talker._finish_decode(state, meta, res_out.unsqueeze(0), torch.device("cpu"))
+            seq_talker._finish_decode(state, meta, res_out.unsqueeze(0))
 
         batch_talker._finish_decode_batch(
             [(state, False, meta) for state, meta in zip(batch_states, metas, strict=True)],
@@ -360,12 +532,16 @@ class TestDecodeBatchContract:
             torch.testing.assert_close(actual.last_audio_patch_gpu, expected.last_audio_patch_gpu)
 
     def test_batch_decode_preserves_per_request_cfm_rng_order(self) -> None:
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            _DecodeResidualMeta,
+        )
+
         talker = self._make_decode_talker()
         talker._enable_batched_cfm = False
         states = [self._make_decode_state("req-0", 0.0), self._make_decode_state("req-1", 10.0)]
         metas = [
-            {"new_lm_hidden": torch.tensor([[1.0, 2.0, 3.0, 4.0]])},
-            {"new_lm_hidden": torch.tensor([[5.0, 6.0, 7.0, 8.0]])},
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[1.0, 2.0, 3.0, 4.0]])),
+            _DecodeResidualMeta(new_lm_hidden=torch.tensor([[5.0, 6.0, 7.0, 8.0]])),
         ]
         batch_out = torch.tensor([[0.5, 1.0, 1.5, 2.0], [2.5, 3.0, 3.5, 4.0]])
 

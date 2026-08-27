@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    conditioning_cache_salt,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -18,16 +23,75 @@ if TYPE_CHECKING:
 
 class _MossTTSAdapterBase(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        err = self.ctx.server._apply_uploaded_speaker(request)
+        """Validate any MOSS-TTS-family request (nano + 5 full variants).
+
+        Dispatches by ``self._moss_variant``:
+          - ``tts``/``realtime``: require ``ref_audio`` (voice cloning).
+          - ``ttsd``: require ``ref_audio`` (speaker 1); ``ref_audio_2``
+            optional (defaults to the same ref for both speakers).
+          - ``sound_effect``: require ``ambient_sound`` (no ref_audio).
+          - ``voice_generator``: require ``instructions`` (no ref_audio).
+          - For the legacy moss_tts_nano model_type the variant is None and
+            we fall through to the original nano contract (ref_audio only).
+        """
+        server = self.ctx.server
+        err = server._apply_uploaded_speaker(request)
         if err:
             return err
-        return self.ctx.server._validate_moss_tts_request(request)
+
+        if not request.input or not request.input.strip():
+            # SoundEffect can legitimately have empty input (just ambient_sound).
+            if server._moss_variant != "sound_effect":
+                return "Input text cannot be empty"
+
+        v = server._moss_variant
+        if v in (None, "tts", "realtime", "local"):
+            if request.ref_audio is None:
+                label = (
+                    "MOSS-TTS-Nano"
+                    if v is None
+                    else (
+                        "MOSS-TTS-Realtime"
+                        if v == "realtime"
+                        else ("MOSS-TTS-Local-Transformer" if v == "local" else "MOSS-TTS")
+                    )
+                )
+                return f"{label} requires 'ref_audio' (reference audio for voice cloning)."
+            return server._validate_ref_audio_format(request.ref_audio)
+
+        if v == "ttsd":
+            if request.ref_audio is None:
+                return "MOSS-TTSD requires 'ref_audio' (speaker 1 reference)."
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if request.ref_audio_2 is not None:
+                return server._validate_ref_audio_format(request.ref_audio_2)
+            return None
+
+        if v == "sound_effect":
+            if not request.ambient_sound or not request.ambient_sound.strip():
+                return (
+                    "MOSS-SoundEffect requires 'ambient_sound' (natural language "
+                    "description of the sound effect to synthesise)."
+                )
+            return None
+
+        if v == "voice_generator":
+            if not request.instructions or not request.instructions.strip():
+                return (
+                    "MOSS-VoiceGenerator requires 'instructions' (natural language "
+                    "voice description, e.g. 'a warm female voice with an American accent')."
+                )
+            return None
+
+        return None  # unreachable
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         server = self.ctx.server
-        tts_params = await server._build_moss_tts_params(request)
+        tts_params = await server._build_moss_tts_params(request, has_inline_ref_audio=has_inline_ref_audio)
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
@@ -44,6 +108,15 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
 
 
 @register_tts_adapter

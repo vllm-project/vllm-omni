@@ -417,3 +417,157 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Patch torch inductor: prove factorable symbolic divisibility (CantSplit)
+# =============================================================================
+# WHY: torch 2.13's SizeVarAllocator.statically_known_multiple_of proves
+# symbolic divisibility via torch's own Mod (torch.utils._sympy.functions),
+# which deliberately stays unevaluated to bound compile time on wide
+# expressions. torch <= 2.11 used python `%` (sympy.Mod), whose eval factors
+# common terms. As a result an expression like
+#   15360*s31 + 15360*s87  vs  s31 + s87
+# — FLUX's fp8 graph with two dynamic sequence dims — is no longer provably
+# divisible, and inductor raises CantSplit on the first compiled forward,
+# killing the engine core during the warmup dummy run (nightly builds
+# 2953/2954, Diffusion Quantization Test).
+#
+# SCOPE: wraps statically_known_multiple_of. The wrapper can only ADD True
+# results, and only when sympy.cancel(numerator/denominator) yields a
+# polynomial with integer coefficients — then numerator == denominator * q
+# identically, so divisibility holds for every symbol assignment; this is
+# unconditionally sound. Everything else defers to the original result.
+# Guards: polynomial inputs only (inductor's FloorDiv/ModularIndexing atoms
+# never reach sympy.cancel) and <= 20 free symbols (mirrors upstream's own
+# cost cap).
+#
+# FRAGILITY / REMOVE WHEN: self-extinguishes at install time by probing
+# whether the unpatched method already proves the canonical factorable case
+# (as torch <= 2.11 does). When upstream restores factor-aware proving, the
+# probe passes and nothing is patched.
+def _provably_factorable_multiple(numerator, denominator) -> bool:
+    """True only when numerator/denominator cancels to an integer polynomial."""
+    try:
+        import sympy
+
+        num = sympy.sympify(numerator)
+        den = sympy.sympify(denominator)
+        if den.is_zero:
+            return False
+        symbols = num.free_symbols | den.free_symbols
+        if len(symbols) > 20:
+            return False
+        if not (num.is_polynomial(*symbols) and den.is_polynomial(*symbols)):
+            return False
+        quotient = sympy.cancel(num / den)
+        _, q_den = sympy.fraction(sympy.together(quotient))
+        if q_den != 1:
+            return False
+        if quotient.is_Integer:
+            return True
+        poly = sympy.Poly(quotient, *sorted(quotient.free_symbols, key=str))
+        return all(coeff.is_integer for coeff in poly.coeffs())
+    except Exception:  # noqa: BLE001 - a proof failure must never break compile
+        return False
+
+
+def _patch_inductor_factorable_divisibility():
+    try:
+        import sympy
+        from torch._inductor.sizevars import SizeVarAllocator
+    except ImportError:
+        return
+
+    original = SizeVarAllocator.statically_known_multiple_of
+    if getattr(original, "_vllm_omni_factorable_divisibility", False):
+        return
+
+    try:
+        _a, _b = sympy.symbols("_omni_probe_a _omni_probe_b", positive=True, integer=True)
+        if original(SizeVarAllocator(), 7 * _a + 7 * _b, _a + _b):
+            _PATCH_LOGGER.info("inductor factorable-divisibility patch: skipped (upstream already proves it).")
+            return
+    except Exception:  # noqa: BLE001
+        # Probe broke (constructor drift etc.) — install anyway; the wrapper
+        # never subtracts results from the original.
+        pass
+
+    def statically_known_multiple_of(self, numerator, denominator):
+        if original(self, numerator, denominator):
+            return True
+        return _provably_factorable_multiple(numerator, denominator)
+
+    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
+    _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
+
+
+_patch_inductor_factorable_divisibility()
+
+
+# =============================================================================
+# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# =============================================================================
+# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
+# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
+# gets the safe empty-handle return.  On CUDA, the callback falls through and
+# returns the original handle, causing cuMemRelease on already-freed memory
+# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+#
+# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
+# platforms, then sets ``is_asleep = True``.  When the atexit handler
+# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
+# callback, the asleep entries must return an empty chunk list so the C
+# extension skips ``cuMemRelease`` — exactly the same logic already used by
+# the ROCm guard.
+#
+# The fix removes the ``current_platform.is_rocm()`` condition so the guard
+# applies to CUDA (and any future platform that implements cumem).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
+# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
+# this monkey-patch will silently become a no-op.
+def _patch_cumem_free_callback_cuda() -> None:
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except ImportError:
+        _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
+        return
+
+    _original_free_callback = CuMemAllocator._python_free_callback
+
+    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+        return
+
+    # The upstream bug: `_python_free_callback` only skips the double-free
+    # for ROCm (line ~206).  We wrap the method to extend the guard to all
+    # platforms.
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            # sleep() already called unmap_and_release() on this allocation.
+            # Return an empty chunk list so the C extension skips
+            # cuMemRelease, avoiding a double-free.  Same logic as the
+            # existing ROCm guard, but applied to all platforms.
+            device, size, d_mem, _ = data.handle
+            result = (device, size, d_mem, [])
+            _PATCH_LOGGER.debug(
+                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
+                ptr,
+            )
+            return result
+        # Drain pending kernels before the C extension's cuMemUnmap.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    _patched_free_callback._omni_cumem_cuda_patched = True
+    CuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info(
+        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
+    )
+
+
+_patch_cumem_free_callback_cuda()

@@ -77,6 +77,7 @@ class SequenceParallelConfig:
 
     ulysses_degree: int = 1
     ring_degree: int = 1
+    allgather_degree: int = 1
     convert_to_fp32: bool = True
 
     # Internal state - populated by setup()
@@ -85,18 +86,18 @@ class SequenceParallelConfig:
     _device: torch.device | None = None
 
     def __post_init__(self) -> None:
-        if self.ulysses_degree < 1 or self.ring_degree < 1:
-            raise ValueError("`ulysses_degree` and `ring_degree` must be >= 1.")
+        if self.ulysses_degree < 1 or self.ring_degree < 1 or self.allgather_degree < 1:
+            raise ValueError("SP degrees must be >= 1.")
 
-        if self.ulysses_degree == 1 and self.ring_degree == 1:
-            raise ValueError(
-                "At least one of `ulysses_degree` or `ring_degree` must be > 1 to use sequence parallelism."
-            )
+        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
+            raise ValueError("AllGather-KV is mutually exclusive with Ulysses and Ring.")
+        if self.ulysses_degree == self.ring_degree == self.allgather_degree == 1:
+            raise ValueError("At least one SP degree must be > 1.")
 
     @property
     def sequence_parallel_size(self) -> int:
         """Total sequence parallel world size."""
-        return self.ulysses_degree * self.ring_degree
+        return self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
 
     def get_world_size(self) -> int:
         """Get the sequence parallel world size from parallel state.
@@ -178,13 +179,12 @@ class SequenceParallelConfig:
         self._world_size = world_size
         self._device = device
 
-        expected_sp_size = self.ulysses_degree * self.ring_degree
+        expected_sp_size = self.sequence_parallel_size
         actual_sp_size = self.get_world_size()
 
         if expected_sp_size != actual_sp_size:
             raise ValueError(
-                f"Configuration mismatch: ulysses_degree ({self.ulysses_degree}) * "
-                f"ring_degree ({self.ring_degree}) = {expected_sp_size}, but "
+                f"Configuration mismatch: expected SP size {expected_sp_size}, but "
                 f"actual sequence parallel world size is {actual_sp_size}."
             )
 

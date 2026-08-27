@@ -18,7 +18,10 @@ import types
 
 import pytest
 import torch
+import torch.nn.functional as F
 from pytest_mock import MockerFixture
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Direct file import to avoid vllm_omni.__init__ patch dependencies.
 _MODELS = os.path.join(
@@ -46,9 +49,15 @@ def _load_module(name: str, filename: str):
 
 def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     """Build the dict of modules to inject into sys.modules."""
+
+    class NativeCustomOp(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return self.forward_native(*args, **kwargs)
+
     platforms_mock = mocker.MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
     platforms_mock.current_omni_platform.is_npu.return_value = False
+    platforms_mock.current_omni_platform.is_xpu.return_value = False
 
     logger_mock = mocker.MagicMock()
     logger_mock.init_logger = lambda name: mocker.MagicMock()
@@ -73,6 +82,8 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
 
     vllm_parallel_mock = mocker.MagicMock()
     vllm_parallel_mock.VocabParallelEmbedding = torch.nn.Embedding
+    custom_op_mock = types.ModuleType("vllm_omni.diffusion.layers.custom_op")
+    custom_op_mock.CustomOp = NativeCustomOp
 
     return {
         "vllm_omni": mocker.MagicMock(),
@@ -82,6 +93,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
         "vllm.config.vllm": vllm_config_mod,
         "vllm.model_executor.model_loader.weight_utils": weight_utils_mock,
         "vllm.model_executor.layers.vocab_parallel_embedding": vllm_parallel_mock,
+        "vllm_omni.diffusion.layers.custom_op": custom_op_mock,
         "vllm_omni.model_executor": types.ModuleType("vllm_omni.model_executor"),
         "vllm_omni.model_executor.models": models_pkg,
         "vllm_omni.model_executor.models.common": common_pkg,
@@ -165,6 +177,38 @@ def _make_vllm_config(mocker: MockerFixture, max_num_seqs: int = 4):
     return vllm_config
 
 
+def test_npu_custom_ops_use_fused_norm_and_cached_rope(mocker: MockerFixture, loaded_target_classes) -> None:
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    cp_config, _ = _make_tiny_config(loaded_target_classes)
+    rms_calls = []
+
+    def npu_rms_norm(hidden_states, weight, epsilon):
+        rms_calls.append((hidden_states, weight, epsilon))
+        return hidden_states + 1, None
+
+    mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+    mocker.patch.object(
+        common_mod,
+        "torch_npu",
+        types.SimpleNamespace(npu_rms_norm=npu_rms_norm),
+        create=True,
+    )
+
+    hidden_states = torch.zeros(1, 2, cp_config.hidden_size, dtype=torch.float16)
+    norm = common_mod._RMSNorm(cp_config.hidden_size, eps=cp_config.rms_norm_eps)
+    torch.testing.assert_close(norm.forward_npu(hidden_states), hidden_states + 1)
+    assert len(rms_calls) == 1
+    assert rms_calls[0][2] == cp_config.rms_norm_eps
+
+    rotary = common_mod._RotaryEmbedding(cp_config)
+    assert rotary.cos_cached.shape == (cp_config.num_code_groups + 1, cp_config.head_dim)
+    assert rotary.sin_cached.shape == rotary.cos_cached.shape
+    position_ids = torch.tensor([[0, 2, 4]])
+    cos, sin = rotary.forward_npu(hidden_states, position_ids)
+    torch.testing.assert_close(cos, rotary.cos_cached[position_ids].to(torch.float16))
+    torch.testing.assert_close(sin, rotary.sin_cached[position_ids].to(torch.float16))
+
+
 class TestCodePredictorDtypeAlignment:
     """Test that code predictor buffers match model parameter dtype."""
 
@@ -240,6 +284,28 @@ class TestCodePredictorDtypeAlignment:
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
+
+    def test_setup_compile_uses_eager_on_xpu(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        """XPU should avoid the torch.compile path used by CUDA."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "supports_torch_inductor", return_value=True)
+        mocker.patch.object(common_mod.current_omni_platform, "is_xpu", return_value=True)
+        compile_mock = mocker.patch.object(common_mod.torch, "compile")
+
+        predictor._setup_compile()
+
+        compile_mock.assert_not_called()
+        assert predictor._compiled_model_fwd == predictor.model.forward
 
     def test_forward_with_mismatched_input_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """forward() should not crash when inputs are float32 but model is float16."""
@@ -542,3 +608,570 @@ class TestCodePredictorWrapperConfig:
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
         assert graph_wrapper._prefix_graphs_enabled is True
+
+
+class TestGumbelMaxSampling:
+    """Sanity tests for the shared Gumbel-max sampling helper."""
+
+    @staticmethod
+    def _sample(logits: torch.Tensor, generator=None) -> torch.Tensor:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        return common_mod.CodePredictorWrapper._sample_codes_gumbel(logits, generator=generator)
+
+    def test_gumbel_max_picks_unique_high_logit(self, loaded_target_classes) -> None:
+        """If one logit is dominant, Gumbel-max must always pick it."""
+        torch.manual_seed(0)
+        bsz, vocab = 4, 64
+        logits = torch.full((bsz, vocab), -1e4)
+        logits[:, 7] = 0.0  # only finite entry
+        out = self._sample(logits)
+        assert out.shape == (bsz, 1)
+        assert torch.equal(out.squeeze(-1), torch.full((bsz,), 7, dtype=torch.long))
+
+    def test_gumbel_max_handles_single_finite_entry_rows(self, loaded_target_classes) -> None:
+        """Degenerate rows with one surviving finite entry should still return
+        a valid index instead of tripping multinomial-style asserts."""
+        bsz, vocab = 2, 8
+        logits = torch.full((bsz, vocab), float("-inf"))
+        logits[0, 3] = 0.0
+        logits[1, 5] = 0.0
+        out = self._sample(logits)
+        assert out[0].item() == 3
+        assert out[1].item() == 5
+
+    def test_gumbel_max_generator_makes_results_reproducible(self, loaded_target_classes) -> None:
+        """Same ``Generator.manual_seed`` should produce identical samples."""
+        torch.manual_seed(0)
+        logits = torch.randn(8, 32)
+        g1 = torch.Generator()
+        g1.manual_seed(123)
+        g2 = torch.Generator()
+        g2.manual_seed(123)
+        g3 = torch.Generator()
+        g3.manual_seed(456)
+        s1 = self._sample(logits, generator=g1)
+        s2 = self._sample(logits, generator=g2)
+        s3 = self._sample(logits, generator=g3)
+        assert torch.equal(s1, s2)
+        # Different seeds must (almost surely) yield a different sequence.
+        assert not torch.equal(s1, s3)
+
+    def test_gumbel_max_per_row_generators_match_individual_rows(self, loaded_target_classes) -> None:
+        """A per-row generator list should preserve row independence."""
+        torch.manual_seed(11)
+        logits = torch.randn(3, 16)
+        seeds = [101, 202, 303]
+        batched_generators = []
+        expected_rows = []
+        for row, seed in enumerate(seeds):
+            row_generator = torch.Generator()
+            row_generator.manual_seed(seed)
+            batched_generators.append(row_generator)
+
+            solo_generator = torch.Generator()
+            solo_generator.manual_seed(seed)
+            expected_rows.append(self._sample(logits[row : row + 1], generator=solo_generator))
+
+        batched = self._sample(logits, generator=batched_generators)
+        expected = torch.cat(expected_rows, dim=0)
+        assert torch.equal(batched, expected)
+
+    def test_gumbel_max_rejects_generator_length_mismatch(self, loaded_target_classes) -> None:
+        logits = torch.randn(2, 8)
+        generators = [torch.Generator()]
+        with pytest.raises(ValueError, match="Expected 2 per-row generators"):
+            self._sample(logits, generator=generators)
+
+    def test_gumbel_max_distribution_matches_softmax(self, loaded_target_classes) -> None:
+        """Empirical frequency under Gumbel-max should be close to the
+        softmax probability mass.  Loose tolerance because we draw a
+        finite number of samples."""
+        torch.manual_seed(7)
+        vocab = 16
+        logits = torch.randn(vocab) * 2.0
+        target = F.softmax(logits, dim=-1, dtype=torch.float32)
+
+        n_draws = 20000
+        batched_logits = logits.unsqueeze(0).expand(n_draws, vocab).contiguous()
+        samples = self._sample(batched_logits).squeeze(-1)
+        empirical = torch.bincount(samples, minlength=vocab).float() / n_draws
+        # L1 distance under 0.03 with 20k draws is comfortable for vocab=16.
+        assert (empirical - target).abs().sum().item() < 0.05
+
+
+class TestCodePredictorFusedProjections:
+    """Reference tests for the fused qkv_proj / gate_up_proj paths.
+
+    These CPU tests confirm that the packed projections implement the same
+    linear algebra as the unfused reference under this setup. GPU executions
+    may still diverge at the bit level when kernel choices change.
+    """
+
+    def test_fused_qkv_matches_separate(self, loaded_target_classes) -> None:
+        torch.manual_seed(0)
+        hidden = 32
+        num_heads, num_kv_heads, head_dim = 4, 2, 8
+        q_size = num_heads * head_dim
+        kv_size = num_kv_heads * head_dim
+        x = torch.randn(2, 5, hidden)
+
+        q = torch.nn.Linear(hidden, q_size, bias=False)
+        k = torch.nn.Linear(hidden, kv_size, bias=False)
+        v = torch.nn.Linear(hidden, kv_size, bias=False)
+        fused = torch.nn.Linear(hidden, q_size + 2 * kv_size, bias=False)
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat([q.weight, k.weight, v.weight], dim=0))
+
+        ref_q, ref_k, ref_v = q(x), k(x), v(x)
+        out_q, out_k, out_v = fused(x).split([q_size, kv_size, kv_size], dim=-1)
+        assert torch.equal(ref_q, out_q)
+        assert torch.equal(ref_k, out_k)
+        assert torch.equal(ref_v, out_v)
+
+    def test_attention_split_redensifies_kv_slices(self, loaded_target_classes) -> None:
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        attn = common_mod.CodePredictorAttention(cp_config)
+
+        qkv = torch.randn(2, 5, attn._q_size + 2 * attn._kv_size)
+        q_ref, k_ref, v_ref = qkv.split([attn._q_size, attn._kv_size, attn._kv_size], dim=-1)
+        q_raw, k_raw, v_raw = attn._split_qkv(qkv)
+
+        assert torch.equal(q_raw, q_ref)
+        assert torch.equal(k_raw, k_ref)
+        assert torch.equal(v_raw, v_ref)
+        assert k_raw.is_contiguous()
+        assert v_raw.is_contiguous()
+
+    def test_fused_gate_up_matches_separate(self, loaded_target_classes) -> None:
+        torch.manual_seed(1)
+        hidden, intermediate = 32, 64
+        x = torch.randn(2, 5, hidden)
+
+        g = torch.nn.Linear(hidden, intermediate, bias=False)
+        u = torch.nn.Linear(hidden, intermediate, bias=False)
+        fused = torch.nn.Linear(hidden, 2 * intermediate, bias=False)
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat([g.weight, u.weight], dim=0))
+
+        ref_g, ref_u = g(x), u(x)
+        out_g, out_u = fused(x).split([intermediate, intermediate], dim=-1)
+        assert torch.equal(ref_g, out_g)
+        assert torch.equal(ref_u, out_u)
+
+    def test_load_weights_repacks_hf_shards(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        """``load_weights`` must transparently re-pack HF q/k/v and gate/up
+        shards into the fused ``qkv_proj`` and ``gate_up_proj`` weights."""
+        _, _, _, code_predictor_model, _ = loaded_target_classes
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        model = code_predictor_model(cp_config, embedding_dim=cp_config.hidden_size)
+
+        # The test harness mocks ``default_weight_loader`` as a no-op; install a
+        # real copier so this test verifies both the returned names and the
+        # packed parameter values/order.
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        # Build a synthetic "HF checkpoint" that exposes separate q/k/v
+        # and gate/up shards, mirroring what HuggingFace ships.
+        param_dict = dict(model.named_parameters(remove_duplicate=False))
+        weights: list[tuple[str, torch.Tensor]] = []
+        expected_fused: dict[str, torch.Tensor] = {}
+        torch.manual_seed(42)
+        for name, param in param_dict.items():
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                num_heads = cp_config.num_attention_heads
+                num_kv_heads = cp_config.num_key_value_heads
+                head_dim = cp_config.head_dim
+                q_size = num_heads * head_dim
+                kv_size = num_kv_heads * head_dim
+                hidden = cp_config.hidden_size
+                q_w = torch.randn(q_size, hidden)
+                k_w = torch.randn(kv_size, hidden)
+                v_w = torch.randn(kv_size, hidden)
+                weights.append((f"{prefix}.q_proj.weight", q_w))
+                weights.append((f"{prefix}.k_proj.weight", k_w))
+                weights.append((f"{prefix}.v_proj.weight", v_w))
+                expected_fused[name] = torch.cat([q_w, k_w, v_w], dim=0)
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                gate_w = torch.randn(inter, hidden)
+                up_w = torch.randn(inter, hidden)
+                weights.append((f"{prefix}.gate_proj.weight", gate_w))
+                weights.append((f"{prefix}.up_proj.weight", up_w))
+                expected_fused[name] = torch.cat([gate_w, up_w], dim=0)
+            else:
+                # Pass-through parameters (norms, embeddings, o_proj, down_proj).
+                weights.append((name, torch.randn_like(param)))
+
+        loaded = model.load_weights(weights)
+        after = dict(model.named_parameters(remove_duplicate=False))
+        assert expected_fused, "test config must contain at least one fused projection layer"
+        for fname, expected in expected_fused.items():
+            assert fname in loaded, f"{fname} was not assembled by load_weights"
+            assert torch.equal(after[fname], expected), f"{fname} does not match the packed shard order"
+
+    def test_load_weights_repacks_bias_shards(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        """When ``attention_bias=True``, the q/k/v ``.bias`` shards must be
+        concatenated into ``qkv_proj.bias`` instead of being dropped (which
+        would leave the fused bias randomly initialized)."""
+        _, _, _, code_predictor_model, _ = loaded_target_classes
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        cp_config.attention_bias = True
+        model = code_predictor_model(cp_config, embedding_dim=cp_config.hidden_size)
+
+        # The test harness mocks ``default_weight_loader`` as a no-op; install a
+        # real copier so we can assert the packed values land on the parameter.
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        param_dict = dict(model.named_parameters(remove_duplicate=False))
+        weights: list[tuple[str, torch.Tensor]] = []
+        expected_bias: dict[str, torch.Tensor] = {}
+        torch.manual_seed(11)
+        for name, param in param_dict.items():
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                q_w, k_w, v_w = (torch.randn(s, hidden) for s in (q_size, kv_size, kv_size))
+                q_b, k_b, v_b = (torch.randn(s) for s in (q_size, kv_size, kv_size))
+                weights.append((f"{prefix}.q_proj.weight", q_w))
+                weights.append((f"{prefix}.k_proj.weight", k_w))
+                weights.append((f"{prefix}.v_proj.weight", v_w))
+                weights.append((f"{prefix}.q_proj.bias", q_b))
+                weights.append((f"{prefix}.k_proj.bias", k_b))
+                weights.append((f"{prefix}.v_proj.bias", v_b))
+                expected_bias[f"{prefix}.qkv_proj.bias"] = torch.cat([q_b, k_b, v_b], dim=0)
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                inter, hidden = cp_config.intermediate_size, cp_config.hidden_size
+                weights.append((f"{prefix}.gate_proj.weight", torch.randn(inter, hidden)))
+                weights.append((f"{prefix}.up_proj.weight", torch.randn(inter, hidden)))
+            elif name.endswith(".qkv_proj.bias"):
+                # Fused target is assembled from the q/k/v bias shards above; a
+                # real HF checkpoint never ships a qkv_proj.bias tensor directly.
+                continue
+            else:
+                weights.append((name, torch.randn_like(param)))
+
+        loaded = model.load_weights(weights)
+        after = dict(model.named_parameters())
+        assert expected_bias, "test config must contain at least one qkv layer"
+        for bname, exp in expected_bias.items():
+            assert bname in loaded, f"{bname} bias was not assembled by load_weights"
+            assert torch.equal(after[bname], exp), f"{bname} does not match the packed q/k/v bias"
+
+    def test_wrapper_load_weights_handles_model_prefixed_shards(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        param_dict = dict(predictor.named_parameters(remove_duplicate=False))
+        weights: list[tuple[str, torch.Tensor]] = []
+        expected_fused: dict[str, torch.Tensor] = {}
+        torch.manual_seed(7)
+        for name, param in param_dict.items():
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                q_w = torch.randn(q_size, hidden)
+                k_w = torch.randn(kv_size, hidden)
+                v_w = torch.randn(kv_size, hidden)
+                weights.append((f"{prefix}.q_proj.weight", q_w))
+                weights.append((f"{prefix}.k_proj.weight", k_w))
+                weights.append((f"{prefix}.v_proj.weight", v_w))
+                expected_fused[name] = torch.cat([q_w, k_w, v_w], dim=0)
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                gate_w = torch.randn(inter, hidden)
+                up_w = torch.randn(inter, hidden)
+                weights.append((f"{prefix}.gate_proj.weight", gate_w))
+                weights.append((f"{prefix}.up_proj.weight", up_w))
+                expected_fused[name] = torch.cat([gate_w, up_w], dim=0)
+            else:
+                weights.append((name, torch.randn_like(param)))
+
+        loaded = predictor.load_weights(weights)
+        after = dict(predictor.named_parameters(remove_duplicate=False))
+        assert expected_fused, "test config must contain at least one fused projection layer"
+        for fname, expected in expected_fused.items():
+            assert fname in loaded, f"{fname} was not loaded through the outer wrapper"
+            assert torch.equal(after[fname], expected), f"{fname} does not match the packed shard order"
+
+    def test_wrapper_load_weights_handles_legacy_unprefixed_model_shards(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Qwen3-Omni checkpoints may expose code_predictor body tensors as
+        ``layers.*`` / ``codec_embedding.*`` instead of ``model.*``.  The
+        wrapper must still route those shards through the fused inner loader."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        param_dict = dict(predictor.named_parameters(remove_duplicate=False))
+        weights: list[tuple[str, torch.Tensor]] = []
+        expected_fused: dict[str, torch.Tensor] = {}
+        torch.manual_seed(17)
+        for name, param in param_dict.items():
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                legacy_prefix = prefix.removeprefix("model.")
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                q_w = torch.randn(q_size, hidden)
+                k_w = torch.randn(kv_size, hidden)
+                v_w = torch.randn(kv_size, hidden)
+                weights.append((f"{legacy_prefix}.q_proj.weight", q_w))
+                weights.append((f"{legacy_prefix}.k_proj.weight", k_w))
+                weights.append((f"{legacy_prefix}.v_proj.weight", v_w))
+                expected_fused[name] = torch.cat([q_w, k_w, v_w], dim=0)
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                legacy_prefix = prefix.removeprefix("model.")
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                gate_w = torch.randn(inter, hidden)
+                up_w = torch.randn(inter, hidden)
+                weights.append((f"{legacy_prefix}.gate_proj.weight", gate_w))
+                weights.append((f"{legacy_prefix}.up_proj.weight", up_w))
+                expected_fused[name] = torch.cat([gate_w, up_w], dim=0)
+            elif name.startswith("model."):
+                weights.append((name.removeprefix("model."), torch.randn_like(param)))
+            else:
+                weights.append((name, torch.randn_like(param)))
+
+        loaded = predictor.load_weights(weights)
+        after = dict(predictor.named_parameters(remove_duplicate=False))
+        assert expected_fused, "test config must contain at least one fused projection layer"
+        for fname, expected in expected_fused.items():
+            assert fname in loaded, f"{fname} was not loaded from legacy unprefixed shards"
+            assert torch.equal(after[fname], expected), f"{fname} does not match the packed shard order"
+
+    def test_wrapper_load_weights_handles_nested_code_predictor_prefixed_shards(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Realtime Qwen3-Omni loaders may still prepend ``talker.code_predictor.``
+        before the inner ``model.*`` body; the wrapper must normalize that layer
+        too before delegating to the fused inner loader."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+            prefix="talker.code_predictor",
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        param_dict = dict(predictor.named_parameters(remove_duplicate=False))
+        weights: list[tuple[str, torch.Tensor]] = []
+        expected_fused: dict[str, torch.Tensor] = {}
+        torch.manual_seed(23)
+        wrapper_prefix = "talker.code_predictor."
+        for name, param in param_dict.items():
+            wrapped_name = f"{wrapper_prefix}{name}"
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = wrapped_name[: -len(".qkv_proj.weight")]
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                q_w = torch.randn(q_size, hidden)
+                k_w = torch.randn(kv_size, hidden)
+                v_w = torch.randn(kv_size, hidden)
+                weights.append((f"{prefix}.q_proj.weight", q_w))
+                weights.append((f"{prefix}.k_proj.weight", k_w))
+                weights.append((f"{prefix}.v_proj.weight", v_w))
+                expected_fused[name] = torch.cat([q_w, k_w, v_w], dim=0)
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = wrapped_name[: -len(".gate_up_proj.weight")]
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                gate_w = torch.randn(inter, hidden)
+                up_w = torch.randn(inter, hidden)
+                weights.append((f"{prefix}.gate_proj.weight", gate_w))
+                weights.append((f"{prefix}.up_proj.weight", up_w))
+                expected_fused[name] = torch.cat([gate_w, up_w], dim=0)
+            else:
+                weights.append((wrapped_name, torch.randn_like(param)))
+
+        loaded = predictor.load_weights(weights)
+        after = dict(predictor.named_parameters(remove_duplicate=False))
+        assert expected_fused, "test config must contain at least one fused projection layer"
+        for fname, expected in expected_fused.items():
+            assert fname in loaded, f"{fname} was not loaded from nested code_predictor shards"
+            assert torch.equal(after[fname], expected), f"{fname} does not match the packed shard order"
+
+    def test_wrapper_load_weights_accepts_incremental_non_layer_shard(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Qwen3-Omni splits code-predictor weights across checkpoint shards.
+
+        Its first shard contains the transformer layers, while the next shard
+        re-enters the wrapper with only codec embeddings and LM heads. Loading
+        that second shard must not require every fused layer to appear again.
+        """
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(
+            common_mod,
+            "default_weight_loader",
+            lambda param, weight: param.data.copy_(weight),
+        )
+
+        first_shard: list[tuple[str, torch.Tensor]] = []
+        second_shard: list[tuple[str, torch.Tensor]] = []
+        for name, param in predictor.named_parameters(remove_duplicate=False):
+            if name.startswith("model.codec_embedding.") or name.startswith("lm_head."):
+                second_shard.append((name, torch.randn_like(param)))
+            elif name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len(".qkv_proj.weight")]
+                q_size = cp_config.num_attention_heads * cp_config.head_dim
+                kv_size = cp_config.num_key_value_heads * cp_config.head_dim
+                hidden = cp_config.hidden_size
+                first_shard.extend(
+                    [
+                        (f"{prefix}.q_proj.weight", torch.randn(q_size, hidden)),
+                        (f"{prefix}.k_proj.weight", torch.randn(kv_size, hidden)),
+                        (f"{prefix}.v_proj.weight", torch.randn(kv_size, hidden)),
+                    ]
+                )
+            elif name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len(".gate_up_proj.weight")]
+                inter = cp_config.intermediate_size
+                hidden = cp_config.hidden_size
+                first_shard.extend(
+                    [
+                        (f"{prefix}.gate_proj.weight", torch.randn(inter, hidden)),
+                        (f"{prefix}.up_proj.weight", torch.randn(inter, hidden)),
+                    ]
+                )
+            else:
+                first_shard.append((name, torch.randn_like(param)))
+
+        assert first_shard and second_shard
+        common_mod.CodePredictorWrapper.load_weights(predictor, first_shard)
+        loaded_second = common_mod.CodePredictorWrapper.load_weights(predictor, second_shard)
+
+        assert {name for name, _ in second_shard} <= loaded_second
+
+    def test_load_weights_raises_on_incomplete_shards(self, loaded_target_classes) -> None:
+        """Missing one of q/k/v (or gate/up) must surface a clear error.
+
+        ``CodePredictorBaseModel`` is the inner transformer (its parameter
+        paths look like ``layers.<i>.self_attn.qkv_proj.weight`` -- without
+        the ``model.`` prefix that the outer ``CodePredictorWrapper`` strips
+        before forwarding).  The test mimics that contract.
+        """
+        _, _, _, code_predictor_model, _ = loaded_target_classes
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        model = code_predictor_model(cp_config, embedding_dim=cp_config.hidden_size)
+
+        # Find any actual self_attn layer prefix, to make the test robust
+        # to renaming of the inner model's parameter scheme.
+        attn_prefix = next(
+            (
+                name[: -len(".qkv_proj.weight")]
+                for name in dict(model.named_parameters()).keys()
+                if name.endswith(".self_attn.qkv_proj.weight")
+            ),
+            None,
+        )
+        assert attn_prefix is not None, "test config must contain at least one self_attn layer"
+
+        num_heads = cp_config.num_attention_heads
+        num_kv_heads = cp_config.num_key_value_heads
+        head_dim = cp_config.head_dim
+        hidden = cp_config.hidden_size
+
+        # Provide only q + k (no v).  The fused param exists in the model,
+        # so load_weights must refuse to silently leave it uninitialized.
+        bad_weights: list[tuple[str, torch.Tensor]] = [
+            (f"{attn_prefix}.q_proj.weight", torch.randn(num_heads * head_dim, hidden)),
+            (f"{attn_prefix}.k_proj.weight", torch.randn(num_kv_heads * head_dim, hidden)),
+            # v_proj missing on purpose.
+        ]
+        with pytest.raises(RuntimeError, match="incomplete fused shards"):
+            model.load_weights(bad_weights)
+
+    def test_load_weights_raises_when_fused_shards_absent(self, loaded_target_classes) -> None:
+        """Entirely absent q/k/v or gate/up groups must not leave fused params
+        randomly initialized."""
+        _, _, _, code_predictor_model, _ = loaded_target_classes
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        model = code_predictor_model(cp_config, embedding_dim=cp_config.hidden_size)
+
+        weights = [
+            (name, torch.randn_like(param))
+            for name, param in model.named_parameters(remove_duplicate=False)
+            if not (name.endswith(".qkv_proj.weight") or name.endswith(".gate_up_proj.weight"))
+        ]
+
+        with pytest.raises(RuntimeError, match="missing fused parameters"):
+            model.load_weights(weights)

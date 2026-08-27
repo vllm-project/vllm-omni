@@ -15,7 +15,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
@@ -32,16 +31,19 @@ connectors:
       ref_code_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
-      # Common Stage1 decode buckets:
-      #   no-ref first/steady chunks: 25 / 97 frames
-      #   Base ref-context first/steady chunks: 73 / 169 frames
-      #   decoder internal non-streaming chunks: 325 frames
-      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
-      # Keep B>1 captures opt-in; c64 e2e validation did not show a stable win.
+      # Chunk ramp (opt-in): gradual size increase for first N chunks to
+      # eliminate the IC→steady cliff (1→25). Uncomment to enable.
+      # Each entry is the size of that chunk index; indices past the table
+      # fall back to codec_chunk_frames. When enabled, ramp overrides
+      # initial_codec_chunk_frames (including the per-request API field).
+      # Example:
+      #   codec_chunk_ramp: [4, 4, 8, 16, 25]
+      # async_chunk derives stateful ICL/xvec graph shapes from the ramp when
+      # enabled, otherwise from the fixed chunk settings above, and ignores
+      # decode_cudagraph_capture_sizes. Keep B>1
+      # captures opt-in; c64 e2e validation did not show a stable win.
       decode_cudagraph_batch_sizes: [1]
-      decode_compile_shapes: []
       decode_batch_max_size: 1
-      decode_batch_bucket_frames: []
       decode_enable_tf32: false
 
 stages:
@@ -60,6 +62,10 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 4096
+      # Official qwen-tts generates the talker with min_new_tokens=2; without
+      # it, checkpoints that sample codec EOS on the first frame return empty
+      # audio (HTTP 400). See #4962.
+      min_tokens: 2
       repetition_penalty: 1.05
     subtalker_sampling_params:
       do_sample: true

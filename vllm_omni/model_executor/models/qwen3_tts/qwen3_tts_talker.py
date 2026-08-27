@@ -27,10 +27,11 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_qwen3_tts_profile,
 )
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
-from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder
+from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
@@ -309,6 +310,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # tensor read; postprocess receives the tail-only slice instead, which
         # avoids ~18 ms merge + ~6 ms write per step (Sy0307 profile, #3665).
         self.requires_full_prefix_cached_hidden_states = False
+        # Stage 1 (code2wav) consumes runtime audio codes, not hidden states,
+        # so the inter-stage pooler payload never needs a CPU hidden-states
+        # view. Opting out lets the runner skip the per-step blocking
+        # ``hidden_states[:n].to("cpu")`` (measured at 24% of stage-0 on-CPU
+        # samples at c=64 on H20).
+        self.omni_pooler_payload_include_hidden = False
         # ``codes.audio`` is only needed for future prefix-hit reconstruction
         # after a request has produced codec rows. Keep per-step rows on GPU and
         # materialize the CPU OmniTensorPrefixCache entry once at completion.
@@ -318,13 +325,33 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
+        self.talker_mtp_graph_safe = True
         # talker_mtp samples with per-row generators, so explicitly-seeded
         # requests stay batched instead of one scalar forward per row (#4883).
-        # Only valid while talker_mtp receives the unpadded active batch (this
-        # talker is not graph-wrapped); a padded batch would need the runner to
-        # pad the generators list as well.
-        self.talker_mtp_accepts_per_row_generators = True
-
+        # This is only valid while talker_mtp receives the *unpadded* active
+        # batch, i.e. when it is NOT graph-wrapped. The runner wraps talker_mtp
+        # (padded batches + a single captured RNG stream) whenever full
+        # cudagraphs are enabled, so disable per-row generators in that case.
+        # Consequence: under full cudagraphs, per-request ``tts_local_seed`` is
+        # not reproducible (matching Qwen3-Omni, which has no per-row seeding);
+        # eager mode keeps the per-row generator fast-path.
+        # TODO(#4923): the model should not read ``cudagraph_mode`` — it is an
+        # upstream (runner) concern, and the runner already re-derives the same
+        # wrap decision in ``_init_talker_mtp``. Once all TTS models declare
+        # ``talker_mtp_graph_safe`` we should move this gating into the model
+        # runner (models only expose the static capability flag, and users can
+        # then configure ``cudagraph_mode`` freely). This also means mtp seeding
+        # is silently dropped when the decode batch > 1 under full cudagraphs;
+        # the follow-up should refactor the per-row generator in the runner to
+        # be cudagraph-safe so seeded batches stay reproducible.
+        cudagraph_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+        talker_mtp_graph_wrapped = (
+            self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+        self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
@@ -394,6 +421,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if 0 <= self._codec_eos_token_id < vocab:
             codec_mask[self._codec_eos_token_id] = True
         self.register_buffer("_codec_disallowed_mask", ~codec_mask, persistent=False)
+
+        # Silence-region codec tokens (#4966). The talker has real probability mass on
+        # these in the opening decode frames; how many it draws is a sampling outcome,
+        # which is the source of both the leading silence and its seed-to-seed variance.
+        # The vocabulary is checkpoint-specific, so it is derived at load time in
+        # :meth:`_init_silence_mask`; this is only the placeholder.
+        self._silence_ban_frames = max(0, int(getattr(vllm_config.model_config, "silence_ban_frames", 0) or 0))
+        # vLLM only fills sampling_metadata.output_token_ids when penalties, bad
+        # words, or a logits processor need history. compute_logits reads it for
+        # the per-request decode step, so request it when the ban is on.
+        self.logitsprocs_need_output_token_ids = self._silence_ban_frames > 0
+        self.register_buffer("_silence_mask", torch.zeros((vocab,), dtype=torch.bool), persistent=False)
+
+        # Per-request generation mode for the silence ban (#4966). The ban is a
+        # Base voice-clone (x-vector-only) fix; ICL onsets are legitimate audio
+        # and must not be masked. Mode is only knowable at prefill, so it is
+        # recorded in preprocess_batch and read back at decode. The batch order
+        # comes from set_batch_req_ids, which the runner calls each step with
+        # the same req_id ordering that indexes sampling_metadata.
+        self._req_x_vector_only: dict[str, bool | None] = {}
+        self._batch_req_ids: list[str] = []
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
@@ -480,7 +528,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tensors = load_validated_profile_tensors(
                 profile,
                 expected_model_type="qwen3_tts",
-                qwen3_embedding_dim=expected_dim,
+                validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
+                    profile,
+                    tensors,
+                    expected_embedding_dim=expected_dim,
+                ),
             )
             if tensors is None:
                 continue
@@ -533,6 +585,48 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Mask out invalid codec ids using the pre-built constant buffer.
         logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+
+        # Suppress silence-region tokens for the first N decode frames (#4966). The
+        # per-request decode step is the length of its generated-token history.
+        ban_n = self._silence_ban_frames
+        if ban_n > 0 and sampling_metadata is not None:
+            output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+            if output_token_ids is None or len(output_token_ids) != logits.shape[0]:
+                logger.warning_once(
+                    "Silence ban is enabled but output_token_ids (%s) does not match the "
+                    "logits batch (%d); the ban will not take effect.",
+                    "None" if output_token_ids is None else len(output_token_ids),
+                    logits.shape[0],
+                )
+            else:
+                # Both gates are tiny [B] checks, so keep them on CPU: once no
+                # request is both in scope and inside the window, skip the device
+                # work rather than paying a host-to-device copy and a [B, vocab]
+                # mask on every decode frame.
+                #
+                # Scope the ban to x-vector-only requests (#4966). A request whose
+                # mode was never recorded is left alone: masking a request that
+                # cannot be classified is the risk this gate exists to remove.
+                batch_req_ids = self._batch_req_ids
+                if len(batch_req_ids) == logits.shape[0]:
+                    in_scope = [self._req_x_vector_only.get(rid) is True for rid in batch_req_ids]
+                else:
+                    logger.warning_once(
+                        "Silence ban is enabled but the recorded batch req_ids (%d) do not match "
+                        "the logits batch (%d); the ban will not take effect.",
+                        len(batch_req_ids),
+                        logits.shape[0],
+                    )
+                    in_scope = [False] * logits.shape[0]
+
+                steps = [len(t) for t in output_token_ids]
+                if any(scoped and step < ban_n for scoped, step in zip(in_scope, steps, strict=True)):
+                    early = torch.tensor(
+                        [scoped and step < ban_n for scoped, step in zip(in_scope, steps, strict=True)],
+                        device=logits.device,
+                        dtype=torch.bool,
+                    ).unsqueeze(1)
+                    logits = logits.masked_fill(early & self._silence_mask, float("-inf"))
 
         return logits
 
@@ -918,11 +1012,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         device: torch.device,
     ) -> None:
         """Delegate batched preprocess to :class:`Qwen3TTSPromptEmbedsBuilder`."""
+        if self._silence_ban_frames > 0:
+            for req_id in req_ids:
+                info_dict = model_intermediate_buffer.get(req_id)
+                if isinstance(info_dict, dict):
+                    self._req_x_vector_only[req_id] = resolve_x_vector_only(info_dict)
         self._prompt_builder.preprocess_batch(
             req_ids=req_ids,
             model_intermediate_buffer=model_intermediate_buffer,
             device=device,
         )
+
+    def set_batch_req_ids(self, req_ids: Sequence[str]) -> None:
+        """Record the current batch's req_ids, in the order that indexes logits.
+
+        Called by the runner after the forward and before ``compute_logits``,
+        with the same ``input_batch`` ordering that ``sampling_metadata``
+        uses. Doubles as the eviction point: any request no longer in the batch
+        has finished or been aborted, so its recorded mode is dropped.
+        """
+        self._batch_req_ids = list(req_ids)
+        if len(self._req_x_vector_only) > len(self._batch_req_ids):
+            live = set(self._batch_req_ids)
+            self._req_x_vector_only = {k: v for k, v in self._req_x_vector_only.items() if k in live}
 
     def _encode_ref_audio_batch(self, wavs: list[np.ndarray], sr: int, *, device: torch.device) -> list[torch.Tensor]:
         fe = self._encoder_feature_extractor
@@ -1016,6 +1128,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.encoder.to(device=device, dtype=torch.bfloat16)
 
         self._init_runtime_buffers()
+        self._init_silence_mask()
 
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
@@ -1028,6 +1141,84 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         w = embeds[0].weight
         self._stacked_codec_embed = torch.stack([e.weight.detach() for e in embeds], dim=0).to(
             device=w.device, dtype=w.dtype
+        )
+
+    @torch.no_grad()
+    def _init_silence_mask(self) -> None:
+        """Derive the silence-region codec vocabulary from the checkpoint.
+
+        Encodes silence at several durations and amplitudes and collects the
+        codebook-0 ids the tokenizer emits. These are the tokens the talker draws
+        when it produces leading silence (#4966). Derived rather than hardcoded
+        because the codec vocabulary is checkpoint-specific.
+        """
+        if self._silence_ban_frames <= 0:
+            return
+        device = next(self.parameters()).device
+        sr = 24000
+        try:
+            rng = np.random.RandomState(0)
+            wavs = [
+                (amp * rng.randn(int(dur * sr))).astype(np.float32)
+                for amp in (0.0, 1e-5, 1e-4, 1e-3)
+                for dur in (0.3, 0.5, 1.0)
+            ]
+            codes = self._encode_ref_audio_batch(wavs, sr, device=device)
+            ids: set[int] = set()
+            for code in codes:
+                code = code.detach().cpu()
+                cb0 = code[:, 0] if code.ndim == 2 else code
+                ids.update(int(t) for t in cb0.tolist())
+        except Exception as exc:
+            logger.warning("Could not derive the silence codec vocabulary; disabling the ban: %s", exc)
+            self._silence_ban_frames = 0
+            return
+        vocab = int(self.talker_config.vocab_size)
+        in_range = sorted(t for t in ids if 0 <= t < vocab)
+        num_out_of_range = len(ids) - len(in_range)
+        if num_out_of_range:
+            # Every derived id should be a codebook-0 index for this checkpoint.
+            # Ids outside the talker vocabulary mean the encoder and the talker
+            # disagree on vocabulary size, so the rest of the derivation is not
+            # trustworthy either.
+            logger.warning(
+                "%d of %d derived silence codec tokens fall outside the talker vocabulary "
+                "(size %d); disabling the ban.",
+                num_out_of_range,
+                len(ids),
+                vocab,
+            )
+            self._silence_ban_frames = 0
+            return
+        if not in_range:
+            # An empty derivation would leave an all-False mask: the ban would
+            # suppress nothing while still paying the per-frame check.
+            logger.warning("Derived no silence codec tokens; disabling the ban.")
+            self._silence_ban_frames = 0
+            return
+        # The silence region is a small corner of codebook 0 (12 tokens on
+        # Qwen3-TTS-12Hz-1.7B-Base). A derivation this large means the encode
+        # returned speech-like codes, and masking that much of the vocabulary
+        # would distort generation rather than trim the onset.
+        max_silence_tokens = max(64, vocab // 20)
+        if len(in_range) > max_silence_tokens:
+            logger.warning(
+                "Derived %d silence codec tokens, above the %d sanity limit for a vocabulary of %d; disabling the ban.",
+                len(in_range),
+                max_silence_tokens,
+                vocab,
+            )
+            self._silence_ban_frames = 0
+            return
+        mask = torch.zeros((vocab,), dtype=torch.bool)
+        for token in in_range:
+            mask[token] = True
+        self._silence_mask.copy_(mask.to(self._silence_mask.device))
+        logger.info(
+            "Derived %d silence codec tokens, suppressed for the first %d decode frames: %s",
+            len(in_range),
+            self._silence_ban_frames,
+            in_range,
         )
 
     @torch.no_grad()

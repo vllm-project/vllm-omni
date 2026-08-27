@@ -171,7 +171,13 @@ def _preserve_benchmark_dataset_env() -> Any:
                 os.environ[key] = value
 
 
-def _build_common_args(ns: argparse.Namespace, *, result_filename: str) -> list[str]:
+def _build_common_args(
+    ns: argparse.Namespace,
+    *,
+    result_filename: str,
+    backend: str = "openai-chat-omni",
+    endpoint: str = "/v1/chat/completions",
+) -> list[str]:
     return build_serve_common_argv(
         host=ns.host,
         port=ns.port,
@@ -183,6 +189,11 @@ def _build_common_args(ns: argparse.Namespace, *, result_filename: str) -> list[
         result_dir=ns.result_dir,
         result_filename=result_filename,
         ready_check_timeout_sec=ns.ready_check_timeout_sec,
+        trust_remote_code=ns.trust_remote_code,
+        backend=backend,
+        endpoint=endpoint,
+        temperature=getattr(ns, "temperature", None),
+        output_len=getattr(ns, "output_len", None),
     )
 
 
@@ -201,6 +212,9 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
             json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
         ]
     )
+    pack_mode = getattr(ns, "daily_omni_pack_mode", None)
+    if pack_mode:
+        argv.extend(["--daily-omni-pack-mode", pack_mode])
     if ns.daily_omni_save_eval_items:
         argv.append("--daily-omni-save-eval-items")
     print("\n$", vllm, *argv, "\n", flush=True)
@@ -217,7 +231,12 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
     result_filename = f"qwen_omni_acc_seed_tts_{tag}.json"
     extra = json.loads(ns.seed_extra_body_json)
     argv = (
-        _build_common_args(ns, result_filename=result_filename)
+        _build_common_args(
+            ns,
+            result_filename=result_filename,
+            backend=ns.seed_backend,
+            endpoint=ns.seed_endpoint,
+        )
         + seed_tts_bench_argv(locale=ns.seed_tts_locale)
         + [
             "--seed-tts-wer-eval",
@@ -225,6 +244,8 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
             json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
         ]
     )
+    if ns.seed_tts_turns_per_session > 1:
+        argv.extend(["--seed-tts-turns-per-session", str(ns.seed_tts_turns_per_session)])
     if ns.seed_tts_wer_save_items:
         argv.append("--seed-tts-wer-save-items")
     if ns.seed_tts_file_ref_audio:
@@ -267,6 +288,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Omit to use upstream default (typically skip).",
     )
     p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Forward trust_remote_code to ``vllm bench serve`` for models with custom code.",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Optional sampling temperature forwarded to ``vllm bench serve`` (e.g. 0 for MiniCPM-o Daily-Omni MCQ).",
+    )
+    p.add_argument(
+        "--output-len",
+        type=int,
+        default=None,
+        help="Optional max output tokens forwarded to ``vllm bench serve`` (e.g. 512 for MiniCPM-o Daily-Omni).",
+    )
+    p.add_argument(
         "--result-dir",
         type=Path,
         default=Path(os.environ.get("ACC_BENCH_RESULT_DIR", str(_default_result_dir()))),
@@ -295,6 +333,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional local Videos root; if omitted, media is fetched lazily from Hub Videos.tar.",
     )
     p.add_argument("--daily-omni-input-mode", choices=("all", "visual", "audio"), default="all")
+    p.add_argument(
+        "--daily-omni-pack-mode",
+        choices=("qwen", "minicpm-interleave"),
+        default=None,
+        help="Daily-Omni multimodal pack recipe. Use ``minicpm-interleave`` for MiniCPM-o "
+        "(1fps interleaved image/audio; see PR #5606).",
+    )
     p.add_argument(
         "--daily-extra-body-json",
         default='{"modalities":["text"]}',
@@ -325,6 +370,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--seed-extra-body-json",
         default='{"modalities":["text","audio"]}',
         help="JSON for Seed-TTS chat requests (must include audio for synthesis + PCM capture).",
+    )
+    p.add_argument(
+        "--seed-backend",
+        default="openai-chat-omni",
+        help="Seed-TTS benchmark backend (for example openai-realtime-tts).",
+    )
+    p.add_argument(
+        "--seed-endpoint",
+        default="/v1/chat/completions",
+        help="Seed-TTS serving endpoint corresponding to --seed-backend.",
+    )
+    p.add_argument(
+        "--seed-tts-turns-per-session",
+        type=int,
+        default=1,
+        help="Group this many Seed-TTS target texts into each Realtime session.",
     )
     p.add_argument("--seed-tts-wer-save-items", action="store_true")
     p.add_argument(
@@ -400,6 +461,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 min_mean_sim=ns.min_seed_tts_mean_sim,
                 min_mean_utmos=ns.min_seed_tts_mean_utmos,
             )
+            if ns.seed_tts_turns_per_session > 1:
+                expected_turns = ns.num_prompts * ns.seed_tts_turns_per_session
+                evaluated_turns = int(data.get("seed_tts_content_evaluated") or 0)
+                if evaluated_turns != expected_turns:
+                    errs.append(f"seed_tts_content_evaluated={evaluated_turns} != expected {expected_turns}")
             if errs:
                 failed.extend([f"[Seed-TTS] {e}" for e in errs])
             else:

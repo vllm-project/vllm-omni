@@ -18,12 +18,12 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "k2-fsa/OmniVoice"
-STAGE_CONFIG = get_deploy_config_path("omnivoice.yaml")
+DEPLOY_CONFIG = get_deploy_config_path("omnivoice.yaml")
 
-# (model, stage_config_path, extra_omni_kwargs) — see ``omni_runner`` in tests.helpers.fixtures.runtime
+# OmniRunner tuple: model, deploy config path, extra Omni kwargs.
 _OMNI_RUNNER_PARAM = (
     MODEL,
-    STAGE_CONFIG,
+    DEPLOY_CONFIG,
     {
         "trust_remote_code": True,
         "log_stats": True,
@@ -56,7 +56,7 @@ def test_omnivoice_text_to_audio(omni_runner: OmniRunner) -> None:
 
     # Check final output has audio
     final_output = outputs[-1]
-    ro = final_output.request_output
+    ro = final_output
     assert ro is not None, "No request_output"
 
     mm = getattr(ro, "multimodal_output", None)

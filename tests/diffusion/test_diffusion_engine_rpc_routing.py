@@ -30,16 +30,16 @@ from typing import Any
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _RpcTask
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.sched.interface import RequestBatchSamplingParamsKey
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 # Default values for every batch-key field, so SimpleNamespace-based
-# sampling_params satisfy ``get_sampling_params_key``'s attribute lookups.
+# sampling_params satisfy ``RequestScheduler._build_sampling_params_key``'s attribute lookups.
 _SAMPLING_KEY_DEFAULTS = {f.name: f.default for f in _dc_fields(RequestBatchSamplingParamsKey)}
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
 # ───────────────────────────────────────── helpers ─────────────────────────
@@ -91,7 +91,7 @@ class _ConcurrencyTrackingExecutor:
                 # args[0] is the request-like object for execute_model.
                 req = args[0] if args else None
                 tag = req.request_id if req is not None and hasattr(req, "request_id") else "unknown"
-                return DiffusionOutput(error=f"result_for_{tag}")
+                return DiffusionOutput(error=f"result_for_{tag}", finished=True)
             tag = args[0] if args else method
             return DiffusionOutput(error=f"rpc_result_for_{tag}")
         finally:
@@ -123,10 +123,12 @@ class _ConcurrencyTrackingExecutor:
 def _make_request(tag: str):
     sampling_params = dict(_SAMPLING_KEY_DEFAULTS)
     sampling_params["num_inference_steps"] = 1
+    sampling_params["extra_args"] = {}
     return SimpleNamespace(
         request_id=tag,
         prompt=f"prompt_{tag}",
         sampling_params=SimpleNamespace(**sampling_params),
+        diffusion_kv_requests=None,
     )
 
 
@@ -145,16 +147,16 @@ def _make_engine_with_loop(
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
 
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace(max_num_seqs=1))
+    sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
     engine.scheduler = sched
     engine.step_execution = False
     engine.supports_request_batch = False
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
     engine.execute_fn = engine.executor.execute_request
 
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
-    engine._out_queue = {}
-    engine._out_queue_streaming = {}
+    engine._out_streams = {}
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()
@@ -187,6 +189,15 @@ def _stop_engine(engine: DiffusionEngine) -> None:
     assert not engine.worker_thread.is_alive(), "Busy loop thread did not stop"
 
 
+async def _consume_final_output(generator):
+    final_output = None
+    async for output in generator:
+        final_output = output
+    if final_output is None:
+        raise RuntimeError("Diffusion execution finished without output.")
+    return final_output
+
+
 # ─────────────────────── single-thread invariant ───────────────────────────
 
 
@@ -199,7 +210,7 @@ async def test_executor_only_called_from_busy_loop_thread():
     busy_tid = engine.worker_thread.ident
     try:
         # Per-request path
-        await engine.async_add_req_and_wait_for_response(_make_request("req1"))
+        await _consume_final_output(engine.async_add_req_and_stream_response(_make_request("req1")))
         # Raw RPC path (sync from a worker thread)
         result = await asyncio.to_thread(engine.collective_rpc, "ping", args=("a",), unique_reply_rank=0)
         assert result.error == "rpc_result_for_a"
@@ -228,7 +239,7 @@ async def test_executor_calls_never_overlap_under_load():
             return await engine.async_collective_rpc("ping", args=(f"x{i}",), unique_reply_rank=0)
 
         async def _request(i: int):
-            return await engine.async_add_req_and_wait_for_response(_make_request(f"r{i}"))
+            return await _consume_final_output(engine.async_add_req_and_stream_response(_make_request(f"r{i}")))
 
         tasks = [_rpc(i) for i in range(20)] + [_request(i) for i in range(5)]
         results = await asyncio.gather(*tasks)
@@ -462,6 +473,38 @@ async def test_cancelled_future_does_not_kill_busy_loop():
         _stop_engine(engine)
 
 
+@pytest.mark.asyncio
+async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+
+    def fail_reservation(*args, **kwargs):
+        raise RuntimeError("native allocation bug")
+
+    engine.scheduler._diffusion_kv_manager = SimpleNamespace(
+        has_request=lambda request_id: False,
+        reserve_request=fail_reservation,
+        free_request=lambda request_id: None,
+    )
+    request = _make_request("kv-error")
+    request.diffusion_kv_requests = (object(),)
+    try:
+        response_stream = engine.async_add_req_and_stream_response(request)
+        output_queue = engine._out_streams[request.request_id]
+        for _ in range(300):
+            if not output_queue.empty():
+                break
+            await asyncio.sleep(0.01)
+        assert not output_queue.empty(), "terminal KV allocation error was not delivered to the request stream"
+
+        output = await anext(response_stream)
+        assert output.error == "native allocation bug"
+        assert output.finished
+        assert engine.worker_thread.is_alive()
+    finally:
+        _stop_engine(engine)
+
+
 # ─────────────────────────── _RpcTask basics ───────────────────────────────
 
 
@@ -510,7 +553,9 @@ async def test_rpc_and_request_results_do_not_swap():
     engine = _make_engine_with_loop(loop, rpc_delay=0.02)
     try:
         rpc_task = asyncio.create_task(engine.async_collective_rpc("ping", args=("rpc1",), unique_reply_rank=0))
-        req_task = asyncio.create_task(engine.async_add_req_and_wait_for_response(_make_request("req1")))
+        req_task = asyncio.create_task(
+            _consume_final_output(engine.async_add_req_and_stream_response(_make_request("req1")))
+        )
         rpc_res, req_res = await asyncio.gather(rpc_task, req_task)
     finally:
         _stop_engine(engine)
