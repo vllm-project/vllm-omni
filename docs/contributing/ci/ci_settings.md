@@ -99,7 +99,7 @@ Canonical layout (prefer these paths for new changes):
     # -m "... and H100 and B200 ..." + MIRROR_HW=b200 → b200_2
     ```
 
-    Count form: one SKU in `-m` uses that chip. Several SKUs: unset/`empty` `MIRROR_HW` prefers L4 then H100; `MIRROR_HW=b200` must appear in `-m` or the step is skipped, and pytest `-m` gains `and B200` when the resolved preset is `b200_*`. `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`. Tests that should still run on B200 must declare `B200` explicitly in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`).
+    Count form: one SKU in `-m` uses that chip. Several SKUs: unset/`empty` `MIRROR_HW` prefers L4 then H100; `MIRROR_HW=b200` must appear in `-m` or the step is skipped. The uploader does **not** rewrite pytest `-m`; B200 collection comes from the YAML expression and from tests that declare `B200` in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`.
 
     **Conventions**
 

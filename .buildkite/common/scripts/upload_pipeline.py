@@ -23,11 +23,11 @@ Test pipeline mode (e.g. test-level3.yml):
     Count form composes ``{chip}_{count}`` from pytest ``-m`` SKU markers
     (``H100``, ``L4``, ``B200``). One SKU → that chip (``MIRROR_HW`` is ignored).
     Several SKUs → unset ``MIRROR_HW`` picks L4 then H100; ``MIRROR_HW=b200``
-    matches ``B200`` in ``-m`` (otherwise the step is skipped) and appends
-    ``and B200`` when the resolved preset is ``b200_*``. ``MIRROR_HW`` must be
-    empty or ``b200`` (case-insensitive); unknown values (e.g. ``b20o``) fail
-    the upload. A CUDA preset string such as ``h100_4`` is omitted when
-    ``MIRROR_HW=b200``.
+    matches ``B200`` in ``-m`` (otherwise the step is skipped). ``-m`` is not
+    rewritten: B200 collection must already be in the YAML and on the tests.
+    ``MIRROR_HW`` must be empty or ``b200`` (case-insensitive); unknown values
+    (e.g. ``b20o``) fail the upload. A CUDA preset string such as ``h100_4``
+    is omitted when ``MIRROR_HW=b200``.
 
 Usage:
   python3 upload_pipeline.py [--upload] [--all | --e2e] <pipeline.yml>
@@ -258,157 +258,6 @@ _PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
 _COUNT_PRESET_RANGE = range(1, 5)
 
 
-def _cuda_chip_from_preset(preset: str) -> str | None:
-    """Return the CUDA chip token encoded in a preset name, or None for NPU/other."""
-    token = preset.strip().lower()
-    for chip in _CUDA_MIRROR_CHIPS:
-        if token == chip or token.startswith(f"{chip}_"):
-            return chip
-    return None
-
-
-def _step_command_text(commands: Any) -> str:
-    if commands is None:
-        return ""
-    if isinstance(commands, str):
-        return commands
-    if isinstance(commands, list):
-        return "\n".join(_step_command_text(part) for part in commands)
-    return str(commands)
-
-
-def _chips_from_marker_expr(expr: str) -> set[str]:
-    """Return SKU chips named positively in a pytest ``-m`` expression."""
-    stripped = re.sub(r"\bnot\s+H100\b", " ", expr)
-    stripped = re.sub(r"\bnot\s+L4\b", " ", stripped)
-    stripped = re.sub(r"\bnot\s+B200\b", " ", stripped)
-    chips: set[str] = set()
-    if re.search(r"\bH100\b", stripped):
-        chips.add("h100")
-    if re.search(r"\bL4\b", stripped):
-        chips.add("l4")
-    if re.search(r"\bB200\b", stripped):
-        chips.add("b200")
-    return chips
-
-
-def _pytest_marker_chips(commands: Any) -> set[str]:
-    chips: set[str] = set()
-    for match in _PYTEST_MARKER_ARG.finditer(_step_command_text(commands)):
-        expr = match.group(1) or match.group(2) or match.group(3) or ""
-        chips |= _chips_from_marker_expr(expr)
-    return chips
-
-
-def _parse_gpu_count(hardware: Any, *, step_label: str) -> int | None:
-    """Return GPU count for count-form ``mirror_hardwares``, or None if not count-form."""
-    if isinstance(hardware, bool):
-        raise ValueError(f"mirror_hardwares must not be a boolean in step {step_label!r}")
-    if isinstance(hardware, int):
-        count = hardware
-    elif isinstance(hardware, str) and hardware.strip().isdigit():
-        count = int(hardware.strip())
-    else:
-        return None
-    if count not in _COUNT_PRESET_RANGE:
-        raise ValueError(
-            f"mirror_hardwares GPU count in step {step_label!r} must be 1–4, got {count}",
-        )
-    return count
-
-
-def _append_b200_to_marker_expr(expr: str) -> str:
-    """Require B200 in addition to existing H100/L4 so SKU splits stay disjoint."""
-    if re.search(r"\bB200\b", expr):
-        return expr
-    if not re.search(r"\bH100\b", expr) and not re.search(r"\bL4\b", expr):
-        return expr
-    return f"({expr}) and B200"
-
-
-def _rewrite_pytest_marker_arg(raw: str) -> str:
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-        quote = raw[0]
-        return f"{quote}{_append_b200_to_marker_expr(raw[1:-1])}{quote}"
-    return _append_b200_to_marker_expr(raw)
-
-
-def _rewrite_command_add_b200(command: str) -> str:
-    def _replace(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{_rewrite_pytest_marker_arg(match.group(2))}"
-
-    marker_arg = re.compile(r"(-m\s+)(\"[^\"]*\"|'[^']*'|\S+)")
-    return marker_arg.sub(_replace, command)
-
-
-def _rewrite_commands_add_b200(commands: Any) -> Any:
-    if isinstance(commands, str):
-        return _rewrite_command_add_b200(commands)
-    if isinstance(commands, list):
-        return [_rewrite_commands_add_b200(part) for part in commands]
-    return commands
-
-
-def _count_preset_name(chip: str, count: int, *, step_label: str) -> str:
-    chosen = f"{chip}_{count}"
-    known = _load_mirror_hardwares()
-    if chosen not in known:
-        raise ValueError(
-            f"mirror_hardwares: {count} in step {step_label!r} has no preset {chosen!r}",
-        )
-    return chosen
-
-
-def _resolve_count_preset(count: int, *, step: dict[str, Any], step_label: str) -> str | None:
-    """Compose ``{chip}_{count}`` from pytest SKU markers and ``MIRROR_HW``.
-
-    One SKU in ``-m`` uses that chip. Several SKUs: unset ``MIRROR_HW`` prefers
-    L4 then H100; a set selector must appear in ``-m`` or the step is skipped.
-    """
-    chips = _pytest_marker_chips(step.get("commands"))
-    if not chips:
-        raise ValueError(
-            f"mirror_hardwares: {count} in step {step_label!r} needs a pytest -m SKU marker "
-            f"(H100, L4, or B200), or an explicit preset string",
-        )
-
-    selector = _get_mirror_hw_selector()
-    if len(chips) == 1:
-        chip = next(iter(chips))
-        chosen = _count_preset_name(chip, count, step_label=step_label)
-        extra = f" (ignored MIRROR_HW={selector!r})" if selector and selector != chip else ""
-        _log(f"{step_label}: mirror_hardwares count {count} → single marker {chip}{extra} → {chosen!r}")
-        return chosen
-
-    if selector:
-        if selector not in chips:
-            _log(
-                f"skip {step_label}: MIRROR_HW={selector!r} is not among -m SKUs {sorted(chips)}",
-            )
-            return None
-        chosen = _count_preset_name(selector, count, step_label=step_label)
-        _log(f"{step_label}: mirror_hardwares count {count} → MIRROR_HW={selector!r} → {chosen!r}")
-        return chosen
-
-    tried: list[str] = []
-    for chip in _COUNT_UNSET_CHIP_PREFERENCE:
-        if chip not in chips:
-            continue
-        chosen = f"{chip}_{count}"
-        tried.append(chosen)
-        if chosen not in _load_mirror_hardwares():
-            continue
-        _log(
-            f"{step_label}: mirror_hardwares count {count} → marker {chip} "
-            f"(multiple SKU markers; preferred L4 then H100) → {chosen!r}",
-        )
-        return chosen
-    raise ValueError(
-        f"mirror_hardwares: {count} in step {step_label!r} found SKU markers {sorted(chips)} "
-        f"but no H100/L4 preset among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
-    )
-
-
 def _get_mirror_hw_selector() -> str:
     """Return lowercase ``MIRROR_HW``, or empty to keep string presets / marker chips.
 
@@ -423,28 +272,115 @@ def _get_mirror_hw_selector() -> str:
     return selector
 
 
+def _pytest_marker_chips(commands: Any) -> set[str]:
+    """Positive H100/L4/B200 tokens in pytest ``-m`` on the step (nested command lists ok)."""
+
+    def _command_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(_command_text(part) for part in value)
+        return str(value)
+
+    chips: set[str] = set()
+    for match in _PYTEST_MARKER_ARG.finditer(_command_text(commands)):
+        expr = match.group(1) or match.group(2) or match.group(3) or ""
+        stripped = re.sub(r"\bnot\s+(H100|L4|B200)\b", " ", expr)
+        for token, chip in (("H100", "h100"), ("L4", "l4"), ("B200", "b200")):
+            if re.search(rf"\b{token}\b", stripped):
+                chips.add(chip)
+    return chips
+
+
 def _resolve_mirror_hardware_name(hardware: Any, *, step: dict[str, Any], step_label: str) -> str | None:
-    """Resolve ``mirror_hardwares`` to a preset name from ``ci_mirror_hardwares.yml``.
+    """Map ``mirror_hardwares`` to a ``ci_mirror_hardwares.yml`` preset, or None to skip.
 
-    Accepts a GPU count or a preset string::
-
-        mirror_hardwares: 2
-        mirror_hardwares: h100_2
-
-    Count form: one ``-m`` SKU uses that chip; several SKUs use ``MIRROR_HW``
-    (unset → L4 then H100; ``b200`` must appear in ``-m``). A CUDA preset
-    string is omitted when ``MIRROR_HW`` names a different chip.
+    Count (``2`` / ``"2"``): compose ``{chip}_{count}`` from pytest ``-m`` SKUs.
+    One SKU uses that chip (``MIRROR_HW`` ignored). Several SKUs: unset prefers
+    L4 then H100; ``b200`` must appear in ``-m``. String (``h100_2``): omitted
+    when ``MIRROR_HW`` names a different CUDA chip. NPU strings ignore it.
     """
-    count = _parse_gpu_count(hardware, step_label=step_label)
+    # bool is a subclass of int; reject YAML ``true`` before treating it as a count.
+    if isinstance(hardware, bool):
+        raise ValueError(f"mirror_hardwares must not be a boolean in step {step_label!r}")
+
+    count: int | None
+    if isinstance(hardware, int):
+        count = hardware
+    elif isinstance(hardware, str) and hardware.strip().isdigit():
+        count = int(hardware.strip())
+    else:
+        count = None
+
     if count is not None:
-        return _resolve_count_preset(count, step=step, step_label=step_label)
+        if count not in _COUNT_PRESET_RANGE:
+            raise ValueError(
+                f"mirror_hardwares GPU count in step {step_label!r} must be 1–4, got {count}",
+            )
+        chips = _pytest_marker_chips(step.get("commands"))
+        if not chips:
+            raise ValueError(
+                f"mirror_hardwares: {count} in step {step_label!r} needs a pytest -m SKU marker "
+                f"(H100, L4, or B200), or an explicit preset string",
+            )
+        known = _load_mirror_hardwares()
+        selector = _get_mirror_hw_selector()
+
+        def _require_preset(chip: str) -> str:
+            chosen = f"{chip}_{count}"
+            if chosen not in known:
+                raise ValueError(
+                    f"mirror_hardwares: {count} in step {step_label!r} has no preset {chosen!r}",
+                )
+            return chosen
+
+        if len(chips) == 1:
+            chip = next(iter(chips))
+            chosen = _require_preset(chip)
+            extra = f" (ignored MIRROR_HW={selector!r})" if selector and selector != chip else ""
+            _log(f"{step_label}: mirror_hardwares count {count} → single marker {chip}{extra} → {chosen!r}")
+            return chosen
+
+        if selector:
+            if selector not in chips:
+                _log(
+                    f"skip {step_label}: MIRROR_HW={selector!r} is not among -m SKUs {sorted(chips)}",
+                )
+                return None
+            chosen = _require_preset(selector)
+            _log(f"{step_label}: mirror_hardwares count {count} → MIRROR_HW={selector!r} → {chosen!r}")
+            return chosen
+
+        tried: list[str] = []
+        for chip in _COUNT_UNSET_CHIP_PREFERENCE:
+            if chip not in chips:
+                continue
+            chosen = f"{chip}_{count}"
+            tried.append(chosen)
+            if chosen not in known:
+                continue
+            _log(
+                f"{step_label}: mirror_hardwares count {count} → marker {chip} "
+                f"(multiple SKU markers; preferred L4 then H100) → {chosen!r}",
+            )
+            return chosen
+        raise ValueError(
+            f"mirror_hardwares: {count} in step {step_label!r} found SKU markers {sorted(chips)} "
+            f"but no H100/L4 preset among {tried or list(_COUNT_UNSET_CHIP_PREFERENCE)}",
+        )
 
     if isinstance(hardware, str):
         name = hardware.strip()
         if not name:
             raise ValueError(f"mirror_hardwares must be a non-empty string in step {step_label!r}")
         selector = _get_mirror_hw_selector()
-        chip = _cuda_chip_from_preset(name)
+        token = name.lower()
+        chip = next(
+            (c for c in _CUDA_MIRROR_CHIPS if token == c or token.startswith(f"{c}_")),
+            None,
+        )
         if selector and chip is not None and chip != selector:
             _log(
                 f"skip {step_label}: preset {name!r} is {chip} hardware; MIRROR_HW={selector!r}",
@@ -484,13 +420,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
         )
 
     expanded = copy.deepcopy(preset)
-    merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
-    if _cuda_chip_from_preset(preset_name) == "b200" and merged.get("commands") is not None:
-        rewritten = _rewrite_commands_add_b200(merged["commands"])
-        if rewritten != merged["commands"]:
-            merged["commands"] = rewritten
-            _log(f"{step_label}: appended B200 to pytest -m (MIRROR_HW=b200)")
-    return merged
+    return {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
 
 
 def _match_source_file(changed_files: list[str], prefixes: list[str]) -> bool:
