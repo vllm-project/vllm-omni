@@ -156,6 +156,11 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """Whether a model may capture its dedicated talker MTP graph."""
+        return True
+
+    @classmethod
     def has_flash_attn_package(cls) -> bool:
         """Check if a Flash Attention package is available and usable on this platform."""
         return False
@@ -178,6 +183,28 @@ class OmniPlatform(Platform):
         compatible with the DiffusionModelRunner interface.
         """
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
+
+    @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        """Return the platform's native paged-KV BlockTables implementation."""
+        from vllm.v1.worker.gpu.block_table import BlockTables
+
+        return BlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build native attention metadata for the diffusion paged path.
+
+        The common CUDA/ROCm/XPU path uses vLLM's builder. Platforms with a
+        backend-specific metadata contract can override this hook without
+        making the diffusion adapter import their optional runtime package.
+        ``seq_lens_cpu`` is an adapter-only convenience value and is removed
+        before calling the upstream builder.
+        """
+        from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+
+        kwargs.pop("seq_lens_cpu", None)
+        return build_attn_metadata(**kwargs)
 
     @classmethod
     def init_diffusion_worker_vllm_config(

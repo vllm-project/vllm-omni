@@ -6,11 +6,16 @@ from __future__ import annotations
 import inspect
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import resolve_diffusers_pipeline_class
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 
 def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
+    if (
+        od_config.diffusion_load_format == "diffusers"
+        and (pipe_cls := resolve_diffusers_pipeline_class(od_config)) is not None
+    ):
         signature = inspect.signature(pipe_cls.__call__)
         support_image_input = "image" in signature.parameters
         support_audio_input = (
@@ -47,3 +52,9 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1
+
+
+def get_dummy_run_num_image_inputs(model_class_name: str) -> int:
+    """Return the maximum advertised image-input count for profiling."""
+
+    return get_diffusion_model_metadata(model_class_name).max_multimodal_image_inputs or 1

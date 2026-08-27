@@ -49,6 +49,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def needs_omni_connector(model_config: Any) -> bool:
+    """Whether a runner owns an input, output, or explicitly routed connector."""
+    return (
+        bool(getattr(model_config, "requires_full_payload_input", False))
+        or bool(getattr(model_config, "custom_process_next_stage_input_func", None))
+        or get_stage_connector_role(model_config) is not None
+    )
+
+
 def _should_create_payload_connector(model_config: Any) -> bool:
     """Whether this stage owns runner payload transport for its edge.
 
@@ -406,11 +415,13 @@ class OmniConnectorModelRunnerMixin:
         # thread by one execute_model() cycle, especially when the request was
         # added after the current scheduler_output snapshot.
         #
-        # Orphaned pending recv entries (e.g. from upstream stage crash)
-        # are handled by OmniSchedulingCoordinator.collect_timed_out_request_ids()
-        # which detects wait-time violations.  The scheduler then removes the
-        # request from its queues, sets FINISHED_ERROR, and calls _free_request()
-        # which ultimately triggers cleanup_finished_request() here.
+        # Orphaned pending recv entries (e.g. from upstream stage crash) are
+        # handled by collect_timed_out_request_ids() -- on
+        # OmniSchedulingCoordinator for full-payload requests, and on
+        # OmniChunkTransferAdapter for async-chunk ones -- which detect
+        # wait-time violations.  The scheduler then removes the request from
+        # its queues, sets FINISHED_ERROR, and calls _free_request() which
+        # ultimately triggers cleanup_finished_request() here.
         for attr_name in (
             "_request_ids_mapping",
             "_get_req_chunk",

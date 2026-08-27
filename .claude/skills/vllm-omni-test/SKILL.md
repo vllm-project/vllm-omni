@@ -94,8 +94,8 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 
 | Scenario | Typical location | Fixtures / runner pattern | Baseline markers & level |
 |----------|------------------|---------------------------|---------------------------|
-| **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `omni_runner_handler`. **Function (isolation only):** `omni_runner_function` + `omni_runner_handler_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
-| **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `openai_client`. **Function (isolation only):** `omni_server_function` + `openai_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
+| **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `offline_client`. **Function (isolation only):** `omni_runner_function` + `offline_client_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
+| **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `online_client`. **Function (isolation only):** `omni_server_function` + `online_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
 | **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/cuda/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
 | **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: JSON `mark` with `full_model` + `omni`/`tts`/`diffusion`; wire `test-nightly.yml` Perf steps |
 | **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
@@ -110,10 +110,10 @@ After choosing offline/online/docs/perf, classify the **product under test** and
 |-----------|------------------------------|----------------------------|----------------------------------------|
 | **What it is** | Multimodal LLM pipeline (thinker/talker/stages; text + vision + audio I/O) | Speech synthesis / voice models | Generative diffusion (noise → image, audio, text, or video) |
 | **Examples** | Qwen2.5-Omni, Qwen3-Omni | Qwen3-TTS, VoxCPM2, Higgs-Audio, Step-Audio2 | Qwen-Image, BAGEL, Wan2.2, HunyuanVideo |
-| **Offline runner** | `omni_runner` + `omni_runner_handler`, `generate_multimodal` | `Omni(...).generate` or stage YAML + TTS params | `Omni(...).generate` + `OmniDiffusionSamplingParams` |
-| **Online client** | `openai_client.send_omni_request` (chat completions, modalities) | `openai_client.send_audio_speech_request` (`/v1/audio/speech`) | `send_diffusion_request` (chat/T2I), `send_video_diffusion_request` (`/v1/videos`, X2V), or `send_images_generations_http_request` / `send_images_edits_http_request` (DALL-E routes) |
-| **Typical assertions** | Stage outputs, text/audio keywords via `OmniRunnerHandler` / response handler | WAV bytes, stream chunks, speech endpoint contract | Image/video dimensions, `final_output_type`, `assert_diffusion_response` |
-| **Stage / deploy YAML** | Per-model omni stage configs (`ci/qwen3_omni_moe.yaml`, …) | `qwen3_tts.yaml`, `voxcpm2.yaml`, … | Often default serve; parallel/offload YAML for heavy DiT |
+| **Offline runner** | `omni_runner` + `offline_client`, `generate_multimodal` | `Omni(...).generate` with deploy YAML + TTS params | `Omni(...).generate` + `OmniDiffusionSamplingParams` |
+| **Online client** | `online_client.send_omni_request` (chat completions, modalities) | `online_client.send_audio_speech_request` (`/v1/audio/speech`) | `send_diffusion_request` (chat/T2I), `send_video_diffusion_request` (`/v1/videos`, X2V), or `send_images_generations_http_request` / `send_images_edits_http_request` (DALL-E routes) |
+| **Typical assertions** | Stage outputs, text/audio keywords via `OfflineOmniClient` / response handler | WAV bytes, stream chunks, speech endpoint contract | Image/video dimensions, `final_output_type`, `assert_diffusion_response` |
+| **Deploy YAML** | Per-model deploy configs (`ci/qwen3_omni_moe.yaml`, …) | `qwen3_tts.yaml`, `voxcpm2.yaml`, … | Often default serve; parallel/offload YAML for heavy DiT |
 | **Nightly group** (`test-nightly.yml`) | **Omni Model Test** — `-m "full_model and omni"` | **TTS Model Test** — `-m "full_model and tts"` | **Diffusion X2I(&A&T)** *or* **Diffusion X2V** (see Step 3 table; same `diffusion` marker, different YAML group / file shard) |
 | **L4 pressure** | Expansion per modality/model as needed | Expansion + accuracy/perf in TTS group | X2I: merge feature combos per [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); X2V: separate nightly group |
 
@@ -175,9 +175,9 @@ See **L1 unit test constraints (mocking)** below for the full do/don't list.
 @pytest.mark.omni
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_<scenario>(omni_runner, omni_runner_handler) -> None:
+def test_<scenario>(omni_runner, offline_client) -> None:
     request_config = {"prompts": ..., "modalities": [...]}  # optional: images, videos, audios
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 ```
 
 *Offline generative e2e — **Diffusion** (representative):*
@@ -187,8 +187,8 @@ def test_<scenario>(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.diffusion
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_text_to_image_001(omni_runner_handler) -> None:
-    omni_runner_handler.send_diffusion_request({"prompt": "...", "extra_body": {"num_inference_steps": 4, ...}})
+def test_text_to_image_001(offline_client) -> None:
+    offline_client.send_diffusion_request({"prompt": "...", "extra_body": {"num_inference_steps": 4, ...}})
 ```
 
 *Offline TTS e2e — **Qwen3-TTS** (two-stage; representative):*
@@ -198,8 +198,8 @@ def test_text_to_image_001(omni_runner_handler) -> None:
 @pytest.mark.tts
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
-    omni_runner_handler.send_audio_speech_request({
+def test_text_to_audio_001(omni_runner, offline_client) -> None:
+    offline_client.send_audio_speech_request({
         "input": "...",
         "task_type": "Base",
         "ref_audio": REF_AUDIO_URL,
@@ -214,8 +214,8 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.tts
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
-def test_voice_clone_001(omni_runner_handler) -> None:
-    omni_runner_handler.send_single_stage_tts_request({
+def test_voice_clone_001(offline_client) -> None:
+    offline_client.send_single_stage_tts_request({
         "input": "...",
         "language": "en",
         "prompt_audio_path": REF_AUDIO_PATH,
@@ -231,9 +231,9 @@ def test_voice_clone_001(omni_runner_handler) -> None:
 @pytest.mark.omni
 @hardware_test(...)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     request_config = {"model": omni_server.model, "messages": ..., "modalities": ["text"]}
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 ```
 
 *Online serving e2e — **TTS** (representative):*
@@ -244,9 +244,9 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.tts
 @hardware_test(...)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     request_config = {"model": omni_server.model, "input": "...", "response_format": "wav", ...}
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 ```
 
 *Online serving e2e — **Diffusion** X2I (representative):*
@@ -255,8 +255,8 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
-def test_text_to_image_001(omni_server, openai_client) -> None:
-    openai_client.send_diffusion_request({...})  # chat completions + extra_body
+def test_text_to_image_001(omni_server, online_client) -> None:
+    online_client.send_diffusion_request({...})  # chat completions + extra_body
 ```
 
 *Online serving e2e — **Diffusion** X2V (representative):*
@@ -264,8 +264,8 @@ def test_text_to_image_001(omni_server, openai_client) -> None:
 ```python
 @pytest.mark.core_model
 @pytest.mark.diffusion
-def test_text_to_video_001(omni_server, openai_client) -> None:
-    openai_client.send_video_diffusion_request({"model": ..., "form_data": {...}})  # /v1/videos
+def test_text_to_video_001(omni_server, online_client) -> None:
+    online_client.send_video_diffusion_request({"model": ..., "form_data": {...}})  # /v1/videos
 ```
 
 *Documentation example tests:* follow the **Preferred Test Strategy** in [l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md): dynamic extraction for offline READMEs; explicit copied client code for online pages until extraction is justified; use the documented **naming**, **output directory** (page folder + case id), and **skipping** rules (e.g. Gradio-only scripts).
@@ -274,6 +274,7 @@ def test_text_to_video_001(omni_server, openai_client) -> None:
 
 **3. Cross-cutting rules**
 
+- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** mark/helper (`check-test-ci-coverage` runs locally; GHA skips it). Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
 - Reuse existing fixtures for the chosen scenario; do not mix “online client” assumptions into offline `OmniRunner` tests without a clear reason.
 - Avoid external network dependency in assertions unless the scenario is explicitly “online serving” or doc examples that require a model hub (then align with CI secrets/cache).
 - Keep **one test function = one intent** (one modality combo, one endpoint contract, or one acceleration combo).
@@ -323,21 +324,21 @@ vLLM-Omni e2e tests start a real **OmniServer** (online) or **OmniRunner** (offl
 
 | Scope | Online fixtures | Offline fixtures | When to use |
 |-------|-----------------|------------------|-------------|
-| **Module** (default) | `omni_server` → `openai_client` | `omni_runner` → `omni_runner_handler` | **Default for L2/L3/L4 expansion** — amortize model/server init across `test_*` in the same module. Same `OmniServerParams` / runner config can be reused by multiple tests. |
-| **Function** | `omni_server_function` → `openai_client_function` | `omni_runner_function` → `omni_runner_handler_function` | **Only when required** — each `test_*` must get a **clean** server/runner (no shared engine/GPU state). Typical: `tests/dfx/reliability/`, sleep/wakeup, crash/restart, tests that mutate global server state. |
+| **Module** (default) | `omni_server` → `online_client` | `omni_runner` → `offline_client` | **Default for L2/L3/L4 expansion** — amortize model/server init across `test_*` in the same module. Same `OmniServerParams` / runner config can be reused by multiple tests. |
+| **Function** | `omni_server_function` → `online_client_function` | `omni_runner_function` → `offline_client_function` | **Only when required** — each `test_*` must get a **clean** server/runner (no shared engine/GPU state). Typical: `tests/dfx/reliability/`, sleep/wakeup, crash/restart, tests that mutate global server state. |
 
 **Rules:**
 
 1. **Default to module scope** (`omni_server` / `omni_runner`) unless the scenario **explicitly** needs a fresh instance per test function.
-2. **Indirect parametrize name must match the fixture name**: `@pytest.mark.parametrize("omni_server", ...)` with `omni_server` + `openai_client`; `@pytest.mark.parametrize("omni_server_function", ...)` with `omni_server_function` + `openai_client_function`. Do not mix module fixture with function client (or vice versa).
+2. **Indirect parametrize name must match the fixture name**: `@pytest.mark.parametrize("omni_server", ...)` with `omni_server` + `online_client`; `@pytest.mark.parametrize("omni_server_function", ...)` with `omni_server_function` + `online_client_function`. Do not mix module fixture with function client (or vice versa).
 3. Different `OmniServerParams` per `test_*` (e.g. default vs `--enable-cpu-offload`) is still OK with **module** `omni_server` — pytest parametrizes per test node; only switch to `_function` when isolation between tests matters, not merely because `server_args` differ.
 4. One `test_*` with **many** server configs (expansion matrix) → single function + `@pytest.mark.parametrize("omni_server", [...], indirect=True)` + module `omni_server` (see in-tree `test_qwen_image_expansion.py`).
 
 ```python
 # Default — module-scoped server (L4 expansion)
 @pytest.mark.parametrize("omni_server", [pytest.param(OmniServerParams(model=MODEL), marks=H100)], indirect=True)
-def test_foo_images_generations_default_1024(omni_server, openai_client) -> None:
-    openai_client.send_images_generations_request({...})
+def test_foo_images_generations_default_1024(omni_server, online_client) -> None:
+    online_client.send_images_generations_request({...})
 
 # Function-scoped — reliability / per-test clean state only
 @pytest.mark.parametrize(
@@ -345,9 +346,9 @@ def test_foo_images_generations_default_1024(omni_server, openai_client) -> None
     [pytest.param(OmniServerParams(model=MODEL), marks=H100)],
     indirect=True,
 )
-def test_foo_sleep_wakeup_cycle(omni_server_function, openai_client_function) -> None:
-    openai_client_function.send_omni_sleep_http_request({...})
-    openai_client_function.send_omni_wakeup_http_request({...})
+def test_foo_sleep_wakeup_cycle(omni_server_function, online_client_function) -> None:
+    online_client_function.send_omni_sleep_http_request({...})
+    online_client_function.send_omni_wakeup_http_request({...})
 ```
 
 #### Runtime send helpers — online **and** offline (`tests/helpers/runtime.py`)
@@ -356,19 +357,19 @@ def test_foo_sleep_wakeup_cycle(omni_server_function, openai_client_function) ->
 
 | Principle | Action |
 |-----------|--------|
-| **Reuse first** | Grep `runtime.py` for an existing **`send_*_request`** on `OpenAIClientHandler` (online) or `OmniRunnerHandler` (offline) that matches the endpoint / pipeline shape. |
+| **Reuse first** | Grep `runtime.py` for an existing **`send_*_request`** on `OnlineOmniClient` (online) or `OfflineOmniClient` (offline) that matches the endpoint / pipeline shape. |
 | **Extend when close** | If an existing `send_*_request` almost fits (e.g. missing one optional field), extend it in `runtime.py` — do not fork logic in the test file. |
 | **Add when missing** | No suitable helper → add **`send_<feature>_request`** (high-level: call + general `assert_*`) or **`send_<route>_<verb>_http_request`** (low-level HTTP for negative/dfx) in **`runtime.py` first**, then call it from tests. |
 | **Test module owns payload only** | In `test_*.py`: `MODEL`, deploy path, vendored media, `get_prompt()`, and inline **`request_config` dicts** only. **No** `omni.generate(...)`, raw `requests.post`, OpenAI SDK calls, or `_collect_audio()` / `_process_output()` in e2e tests. |
 
-**Online** (`openai_client` from `omni_server`): `OpenAIClientHandler.send_*_request`.
+**Online** (`online_client` from `omni_server`): `OnlineOmniClient.send_*_request`.
 
-**Offline** (`omni_runner_handler` from `omni_runner`): `OmniRunnerHandler.send_*_request`.
+**Offline** (`offline_client` from `omni_runner`): `OfflineOmniClient.send_*_request`.
 
 | Do | Don't |
 |----|-------|
-| Online: `openai_client.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_video_diffusion_request`, `send_images_generations_request`, … | `requests.post(f"{base_url}/v1/...", json=…)` or `client.chat.completions.create(...)` inside a test |
-| Offline: `omni_runner_handler.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_single_stage_tts_request`, `send_single_stage_tts_batch_request`, … | `omni_runner.omni.generate(...)` + hand-rolled tensor/WAV extraction in `test_*.py` |
+| Online: `online_client.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_video_diffusion_request`, `send_images_generations_request`, … | `requests.post(f"{base_url}/v1/...", json=…)` or `client.chat.completions.create(...)` inside a test |
+| Offline: `offline_client.send_omni_request`, `send_diffusion_request`, `send_audio_speech_request`, `send_single_stage_tts_request`, `send_single_stage_tts_batch_request`, … | `omni_runner.omni.generate(...)` + hand-rolled tensor/WAV extraction in `test_*.py` |
 | Add missing `send_*` to **`runtime.py`** first; bundle general `assert_*` inside the send helper | A one-off `def _post_*` / `def _collect_audio` at the bottom of a test module |
 | Mirror naming/style of neighboring `send_*` (docstring, `request_config` dict, optional `run_level`, `err_code` / `err_message` for negative cases) | Different parameter shapes per test file for the same endpoint |
 
@@ -391,7 +392,7 @@ def test_foo_sleep_wakeup_cycle(omni_server_function, openai_client_function) ->
 
 Changing `request_config` fields (`size`, `n`, `seed`, server flags) is **not** special validation — the general `assert_*` should read those from `request_config` inside `send_*`.
 
-**`send_*` ↔ `assert_*` pairing (online `OpenAIClientHandler`):**
+**`send_*` ↔ `assert_*` pairing (online `OnlineOmniClient`):**
 
 | High-level `send_*` (prefer in L2+ e2e) | Assert already invoked inside `runtime.py` | Low-level HTTP-only sibling |
 |----------------------------------------|--------------------------------------------|-----------------------------|
@@ -404,7 +405,7 @@ Changing `request_config` fields (`size`, `n`, `seed`, server flags) is **not** 
 
 **Rule:** Tests call high-level `send_*_request` for the general contract. **Never** call the same bundled `assert_*` again. Call an extra `assert_*` in the test **only** for special, case-specific validation.
 
-**Common `OpenAIClientHandler` entry points** (non-exhaustive — grep `runtime.py` before adding):
+**Common `OnlineOmniClient` entry points** (non-exhaustive — grep `runtime.py` before adding):
 
 | Area | High-level (SDK + assert) | Low-level HTTP (`*_http_request`) |
 |------|---------------------------|-----------------------------------|
@@ -415,7 +416,7 @@ Changing `request_config` fields (`size`, `n`, `seed`, server flags) is **not** 
 | TTS (online) | `send_audio_speech_request` | `send_audio_speech_http_request`, `send_audio_generate_http_request`, … |
 | Ops / meta | — | `send_health_http_request`, `send_models_http_request`, `send_omni_sleep_http_request`, … |
 
-**Common `OmniRunnerHandler` entry points** (offline — grep `runtime.py` before adding):
+**Common `OfflineOmniClient` entry points** (offline — grep `runtime.py` before adding):
 
 | Area | High-level (`send_*_request` + assert) | Notes |
 |------|----------------------------------------|-------|
@@ -425,7 +426,7 @@ Changing `request_config` fields (`size`, `n`, `seed`, server flags) is **not** 
 | Single-stage TTS (Coqui XTTS, MOSS-TTS-Nano, …) | `send_single_stage_tts_request`, `send_single_stage_tts_batch_request` | `prompt` + `additional_information` + `omni.generate` — **do not** duplicate in tests |
 | New model family | **Add** `send_<family>_request` here first | Then call from `tests/e2e/offline_inference/test_*.py` |
 
-L1 tests under `tests/entrypoints/` may use **FastAPI `TestClient`** or direct handler calls with mocks; they do **not** need `OpenAIClientHandler` / `OmniRunnerHandler`. **L2+ online and offline e2e** must use `runtime.py` `send_*` helpers.
+L1 tests under `tests/entrypoints/` may use **FastAPI `TestClient`** or direct handler calls with mocks; they do **not** need `OnlineOmniClient` / `OfflineOmniClient`. **L2+ online and offline e2e** must use `runtime.py` `send_*` helpers.
 
 #### Invalid parameter validation (`tests/dfx/reliability/invalid_param_test/`)
 
@@ -451,7 +452,7 @@ When the user asks for **invalid parameter validation**, **invalid request bodie
 | **Module markers** | `pytestmark = [pytest.mark.slow, pytest.mark.<omni or tts or diffusion>]` |
 | **Server fixture** | `_PARAMS` / `_QWEN3_TTS_SPEECH`-style list of `pytest.param(OmniServerParams(...), id="...", marks=hardware_marks(...))`; `@pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)` |
 | **Hardware** | `hardware_marks(res={"cuda": "H100"})` for heavy diffusion/omni/video; `hardware_marks(res={"cuda": "L4"})` for smaller TTS models (must match weekly `-m "slow and L4"` step) |
-| **HTTP client** | **Low-level** `openai_client.send_*_http_request({..., "err_code": 400, "err_message": (...)} )` — **not** `send_*_request` (success path) |
+| **HTTP client** | **Low-level** `online_client.send_*_http_request({..., "err_code": 400, "err_message": (...)} )` — **not** `send_*_request` (success path) |
 | **Case shape** | Prefer **one `test_*` per route family** + `@pytest.mark.parametrize("body_spec, err_message", [...])` with stable `id=` per case; or dedicated `test_<route>_malformed_json` when not parametrized |
 | **Body helpers** | `_minimal_<endpoint>_json(omni_server)` / `_minimal_*_form_data()`; merge overrides with `body.update(body_spec)` |
 | **Known gaps** | `pytest.mark.skip(reason="…#3649")` as `_SKIP_ISSUE_3649` when server validation is not yet strict (mirror neighboring cases) |
@@ -484,13 +485,13 @@ When the user asks for **invalid parameter validation**, **invalid request bodie
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_images_generations_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     body_spec: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
     body = _minimal_images_gen_json(omni_server)
     body.update(body_spec)
-    openai_client.send_images_generations_http_request(
+    online_client.send_images_generations_http_request(
         {"json": body, "timeout": 300, "err_code": 400, "err_message": err_message}
     )
 ```
@@ -541,18 +542,18 @@ def send_images_generations_request(self, request_config: dict[str, Any], ...) -
 
 # tests/e2e/.../test_foo_expansion.py — one case per test_* (no case_id branching)
 @pytest.mark.parametrize("omni_server", [pytest.param(OmniServerParams(model=MODEL), marks=SINGLE_L4)], indirect=True)
-def test_foo_images_generations_default_1024(omni_server, openai_client) -> None:
-    openai_client.send_images_generations_request({"json": body, "timeout": 300})
+def test_foo_images_generations_default_1024(omni_server, online_client) -> None:
+    online_client.send_images_generations_request({"json": body, "timeout": 300})
 
 @pytest.mark.parametrize("omni_server", [pytest.param(OmniServerParams(model=MODEL), marks=SINGLE_L4)], indirect=True)
-def test_foo_images_generations_sizes_256_512_1024(omni_server, openai_client) -> None:
+def test_foo_images_generations_sizes_256_512_1024(omni_server, online_client) -> None:
     for size in ("256x256", "512x512", "1024x1024"):
-        openai_client.send_images_generations_request({"json": {**body, "size": size}, "timeout": 300})
+        online_client.send_images_generations_request({"json": {**body, "size": size}, "timeout": 300})
 
 # chat diffusion — separate test; send_diffusion_request bundles assert_diffusion_response
 @pytest.mark.parametrize("omni_server", [pytest.param(OmniServerParams(model=MODEL), marks=SINGLE_L4)], indirect=True)
-def test_foo_chat_completions_t2i_fallback(omni_server, openai_client) -> None:
-    openai_client.send_diffusion_request({...})
+def test_foo_chat_completions_t2i_fallback(omni_server, online_client) -> None:
+    online_client.send_diffusion_request({...})
 ```
 
 L1 tests under `tests/entrypoints/` may keep **minimal** asserts next to the handler under test when validating a single branch; still prefer `assertions.py` when the same JSON/media check appears in more than one file or level (e.g. L1 protocol test + L4 e2e).

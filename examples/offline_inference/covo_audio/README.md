@@ -2,7 +2,8 @@
 
 ## Setup
 
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+Use `--deploy-config` for deployment overrides such as stage memory allocation.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/).
 
 > **Note**
 > Covo-Audio code2wav requires `torchdiffeq`. Install it with: `pip install torchdiffeq`
@@ -41,7 +42,7 @@ python end2end.py -m /path/to/Covo-Audio-Chat --output-dir ./my_output
 | `--sampling-rate` | | `16000` | Sampling rate for audio loading (Hz) |
 | `--output-dir` | | `./output_audio` | Output directory for generated files |
 | `--num-prompts` | | `1` | Number of prompts to generate |
-| `--stage-configs-path` | | (auto) | Path to stage configs YAML file |
+| `--deploy-config` | | (auto) | Optional path to a deploy YAML override |
 | `--log-stats` | | `false` | Enable detailed statistics logging |
 | `--stage-init-timeout` | | `300` | Stage initialization timeout (seconds) |
 | `--batch-timeout` | | `5` | Batching timeout (seconds) |

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -82,6 +84,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.vae_scale_factor_spatial = 8
     pipeline.boundary_ratio = 0.875
     pipeline.expand_timesteps = False
+    pipeline.is_dmd = False
     pipeline._guidance_scale = None
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None
@@ -91,6 +94,29 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.prepare_latents = lambda **kwargs: torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
     pipeline.progress_bar = _noop_progress_bar
     return pipeline
+
+
+def _make_sampling(**overrides):
+    values: dict[str, object] = {
+        "height": None,
+        "width": None,
+        "num_frames": 1,
+        "num_inference_steps": 2,
+        "guidance_scale_provided": True,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": None,
+        "guidance_scale_2_provided": False,
+        "boundary_ratio": None,
+        "generator": None,
+        "seed": None,
+        "num_outputs_per_prompt": 1,
+        "max_sequence_length": 32,
+        "latents": None,
+        "output_type": "latent",
+        "extra_args": {},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 @pytest.mark.parametrize(
@@ -129,9 +155,10 @@ def test_forward_delegates_denoising_to_diffuse(
     )
     batch = DiffusionRequestBatch(requests=[mock_req])
 
-    output = pipeline.forward(batch)
+    outputs = pipeline.forward(batch)
 
-    assert torch.equal(output.output, torch.ones((1, 4, 1, 8, 8)))
+    assert len(outputs) == 1
+    assert torch.equal(outputs[0].output, torch.ones((1, 4, 1, 8, 8)))
     assert torch.equal(captured["prompt_embeds"], torch.zeros(1, 32, 8))
     assert torch.equal(captured["timesteps"], pipeline.scheduler.timesteps)
     assert captured["guidance_low"] == expected_low
@@ -140,6 +167,134 @@ def test_forward_delegates_denoising_to_diffuse(
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None
     assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"))]
+
+
+def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
+    pipeline = _make_pipeline()
+    encode_call = {}
+    prepare_call = {}
+
+    def _fake_encode_prompt(**kwargs):
+        encode_call.update(kwargs)
+        batch_size = len(kwargs["prompt"])
+        n = batch_size * kwargs["num_videos_per_prompt"]
+        return torch.arange(n, dtype=torch.float32).view(n, 1, 1), torch.zeros(n, 1, 1)
+
+    def _fake_prepare_latents(**kwargs):
+        prepare_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.encode_prompt = _fake_encode_prompt  # type: ignore[method-assign]
+    pipeline.prepare_latents = _fake_prepare_latents  # type: ignore[method-assign]
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+
+    gen_a = torch.Generator(device="cpu").manual_seed(1)
+    gen_b = torch.Generator(device="cpu").manual_seed(2)
+    latents_a = torch.zeros(2, 4, 1, 2, 2)
+    latents_b = torch.ones(2, 4, 1, 2, 2)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={"prompt": "first", "negative_prompt": "bad first"},
+                sampling_params=_make_sampling(
+                    generator=gen_a,
+                    latents=latents_a,
+                    num_outputs_per_prompt=2,
+                ),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt": "second", "negative_prompt": "bad second"},
+                sampling_params=_make_sampling(
+                    generator=gen_b,
+                    latents=latents_b,
+                    num_outputs_per_prompt=2,
+                ),
+            ),
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert encode_call["prompt"] == ["first", "second"]
+    assert encode_call["negative_prompt"] == ["bad first", "bad second"]
+    assert prepare_call["batch_size"] == 4
+    assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]
+    torch.testing.assert_close(prepare_call["latents"], torch.cat([latents_a, latents_b]))
+    assert len(outputs) == 2
+    torch.testing.assert_close(outputs[0].output, latents_a)
+    torch.testing.assert_close(outputs[1].output, latents_b)
+
+
+def test_forward_batches_precomputed_prompt_embeddings() -> None:
+    pipeline = _make_pipeline()
+    diffuse_call = {}
+    pipeline.encode_prompt = lambda **kwargs: pytest.fail("text encoder must not run")  # type: ignore[method-assign]
+    pipeline.prepare_latents = lambda **kwargs: torch.zeros(kwargs["batch_size"], 4, 1, 2, 2)  # type: ignore[method-assign]
+
+    def _fake_diffuse(**kwargs):
+        diffuse_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    embeds_a = torch.zeros(3, 4)
+    embeds_b = torch.ones(3, 4)
+    negative_a = torch.full((3, 4), 2.0)
+    negative_b = torch.full((3, 4), 3.0)
+    batch = DiffusionRequestBatch(
+        requests=[
+            SimpleNamespace(
+                request_id="a",
+                prompt={"prompt_embeds": embeds_a, "negative_prompt_embeds": negative_a},
+                sampling_params=_make_sampling(guidance_scale=4.0),
+            ),
+            SimpleNamespace(
+                request_id="b",
+                prompt={"prompt_embeds": embeds_b, "negative_prompt_embeds": negative_b},
+                sampling_params=_make_sampling(guidance_scale=4.0),
+            ),
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    torch.testing.assert_close(diffuse_call["prompt_embeds"], torch.stack([embeds_a, embeds_b]))
+    torch.testing.assert_close(diffuse_call["negative_prompt_embeds"], torch.stack([negative_a, negative_b]))
+    assert len(outputs) == 2
+
+
+def test_prepare_latents_with_request_generators_matches_single_generation() -> None:
+    pipeline = _make_pipeline()
+    kwargs = {
+        "num_channels_latents": 4,
+        "height": 16,
+        "width": 16,
+        "num_frames": 5,
+        "dtype": torch.float32,
+        "device": torch.device("cpu"),
+    }
+
+    batched = Wan22Pipeline.prepare_latents(
+        pipeline,
+        batch_size=2,
+        generator=[torch.Generator().manual_seed(1), torch.Generator().manual_seed(2)],
+        **kwargs,
+    )
+    singles = torch.cat(
+        [
+            Wan22Pipeline.prepare_latents(
+                pipeline,
+                batch_size=1,
+                generator=torch.Generator().manual_seed(seed),
+                **kwargs,
+            )
+            for seed in (1, 2)
+        ]
+    )
+
+    torch.testing.assert_close(batched, singles)
+    assert not torch.equal(batched[0], batched[1])
 
 
 def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
@@ -186,3 +341,125 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+class _StubDMDScheduler:
+    def __init__(self) -> None:
+        self.predict_clean_calls: list[tuple[float, float, float]] = []
+        self.add_noise_calls: list[tuple[float, float, float]] = []
+
+    def predict_clean(self, model_output, sample, timestep):
+        self.predict_clean_calls.append((float(model_output.mean()), float(sample.mean()), float(timestep)))
+        return sample - model_output
+
+    def add_noise(self, clean_sample, noise, timestep):
+        self.add_noise_calls.append((float(clean_sample.mean()), float(noise.mean()), float(timestep)))
+        return clean_sample + 10.0
+
+
+def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = _StubDMDScheduler()
+    latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
+    timesteps = torch.tensor([1000.0, 757.0, 522.0])
+
+    pipeline.predict_noise_maybe_with_cfg = lambda **kwargs: torch.ones_like(latents)  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.randn_tensor",
+        lambda *args, **kwargs: torch.full(args[0], 2.0, dtype=kwargs["dtype"]),
+    )
+
+    result = pipeline.diffuse(
+        latents=latents,
+        timesteps=timesteps,
+        prompt_embeds=torch.zeros(1, 8),
+        negative_prompt_embeds=None,
+        guidance_low=1.0,
+        guidance_high=1.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+        generator=torch.Generator(device="cpu").manual_seed(1),
+    )
+
+    assert pipeline.scheduler.predict_clean_calls == [
+        (1.0, 0.0, 1000.0),
+        (1.0, 9.0, 757.0),
+        (1.0, 18.0, 522.0),
+    ]
+    assert pipeline.scheduler.add_noise_calls == [
+        (-1.0, 2.0, 757.0),
+        (8.0, 2.0, 522.0),
+    ]
+    torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def _make_gate_loading_pipeline():
+    pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
+    nn.Module.__init__(pipeline)
+    gate = WanSelfAttention.__new__(WanSelfAttention)
+    nn.Module.__init__(gate)
+    gate.to_gate_compress = nn.Linear(1, 1)
+    pipeline.gate_holder = gate
+    return pipeline, gate
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("pipeline_wan2_2", "Wan22Pipeline"),
+        ("pipeline_wan2_2_i2v", "Wan22I2VPipeline"),
+        ("pipeline_wan2_2_s2v", "Wan22S2VPipeline"),
+        ("pipeline_wan2_2_vace", "Wan22VACEPipeline"),
+    ],
+)
+def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_name, class_name) -> None:
+    module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
+    pipeline_cls = getattr(module, class_name)
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    expected = {"loaded"}
+
+    def fake_loader(model, weights):
+        assert model is pipeline
+        assert list(weights) == [("weight", torch.ones(1))]
+        return expected
+
+    monkeypatch.setattr(module, "load_wan_weights_with_optional_gate", fake_loader)
+
+    assert pipeline_cls.load_weights(pipeline, iter((("weight", torch.ones(1)),))) is expected
+
+
+def test_load_weights_removes_unloaded_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("other.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is False
+    assert gate.to_gate_compress is None
+
+
+def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
+    pipeline, gate = _make_gate_loading_pipeline()
+    original_gate = gate.to_gate_compress
+
+    class _Loader:
+        def __init__(self, model):
+            del model
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.AutoWeightsLoader", _Loader)
+    pipeline.load_weights(iter((("gate_holder.to_gate_compress.weight", torch.ones(1)),)))
+
+    assert pipeline.has_gate_compress_weights is True
+    assert gate.to_gate_compress is original_gate

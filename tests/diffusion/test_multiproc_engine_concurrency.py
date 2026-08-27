@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import multiprocessing as mp
@@ -14,6 +14,7 @@ import torch
 import zmq
 from vllm.v1.engine.exceptions import EngineDeadError
 
+import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
@@ -413,6 +414,26 @@ class TestRequestModeDispatch:
         assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
         executor.collective_rpc.assert_called_once()
 
+    def test_dlo_dp_forwards_request_metadata_envelopes_as_one_wave(self):
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.diffusion_kv_metadata = SimpleNamespace(request_id=new_req.request_id)
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+        forwarded_envelopes = executor.collective_rpc.call_args.kwargs["args"][0]
+        assert forwarded_envelopes is scheduler_output.scheduled_new_reqs
+        assert [envelope.diffusion_kv_metadata.request_id for envelope in forwarded_envelopes] == ["A", "B"]
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [
@@ -802,6 +823,31 @@ class TestWorkerProcRpcRankStatus:
         assert status["bool_result"] is None
         assert "local boom" in status["traceback"]
 
+    def test_execute_rpc_collect_exception_releases_traceback_and_device_cache(self, monkeypatch):
+        proc = self._make_worker_proc()
+        original = RuntimeError("local boom")
+        proc.worker.execute_method = Mock(side_effect=original)
+        gc_collect = Mock()
+        mock_platform = Mock()
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(diffusion_worker_module.gc, "collect", gc_collect)
+        monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", mock_platform)
+
+        proc._execute_rpc(
+            {
+                "method": "add_lora",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+                "collect_rank_status": True,
+            }
+        )
+
+        assert original.__traceback__ is None
+        gc_collect.assert_called_once_with()
+        mock_platform.empty_cache.assert_called_once_with()
+
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
 
@@ -1032,6 +1078,42 @@ class TestStageDiffusionClientErrorPropagation:
         client._response_socket.recv.side_effect = zmq.Again
 
         assert client.get_diffusion_output_nowait() is None
+
+    def test_error_response_preserves_scheduler_metrics(self):
+        from vllm_omni.metrics import definitions as metric_defs
+
+        client = self._make_client()
+        client._response_socket.recv.side_effect = [b"message", zmq.Again()]
+        client._decoder.decode.return_value = {
+            "type": "error",
+            "request_id": "req-error",
+            "error": "gpu fault",
+            "metrics": {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: 0},
+        }
+
+        output = client.get_diffusion_output_nowait()
+
+        assert output is not None
+        assert output.error == "gpu fault"
+        assert output.metrics[metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY] == 0
+
+    def test_metrics_response_creates_metrics_only_output(self):
+        from vllm_omni.metrics import definitions as metric_defs
+        from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
+
+        client = self._make_client()
+        client._response_socket.recv.side_effect = [b"message", zmq.Again()]
+        client._decoder.decode.return_value = {
+            "type": "metrics",
+            "metrics": {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: 0},
+        }
+
+        output = client.get_diffusion_output_nowait()
+
+        assert output is not None
+        assert output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
+        assert output.error is None
+        assert output.metrics[metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY] == 0
 
     def test_check_health_raises_when_proc_dead(self):
         """``check_health`` detects a dead subprocess via the manager's proc

@@ -6,16 +6,20 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
-import yaml
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.config_factory import (
+    StageConfigFactory,
+    _materialize_object_storage_configs,
+    _name_match_candidate,
+    with_trust_remote_code_override,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
-from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
@@ -211,12 +215,13 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
 
     Searches both the legacy ``stage_configs/*.yaml`` directory and the
     migrated ``deploy/*.yaml`` directory for a stem that substring-matches
-    the model path (e.g. ``cosyvoice3`` in
-    ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``). The longest match wins so
-    ``cosyvoice3`` beats ``cosyvoice`` and ``bagel_single_stage`` beats
-    ``bagel``.
+    the model path basename (e.g. ``cosyvoice3`` in
+    ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``). Only the basename is scanned
+    so URI segments such as the bucket name cannot select an unrelated
+    pipeline. The longest match wins so ``cosyvoice3`` beats ``cosyvoice``
+    and ``bagel_single_stage`` beats ``bagel``.
     """
-    model_lower = model.lower().replace("-", "").replace("_", "")
+    model_lower = _name_match_candidate(model).lower().replace("-", "").replace("_", "")
     best_match: str | None = None
     best_len = 0
     for subdir in ("model_executor/stage_configs", "deploy"):
@@ -275,24 +280,29 @@ def resolve_model_config_path(model: str) -> str | None:
     Raises:
         ValueError: If model_type cannot be determined
     """
+    # Object-storage URIs are streamed by vLLM's Run:AI streamer only after
+    # each stage builds its ModelConfig, so config resolution here reads the
+    # local copy that vLLM-Omni materializes for such URIs. Name-based
+    # fallbacks keep the original string (the materialized path is a hash).
+    config_source = _materialize_object_storage_configs(model)
     # Try to get config from standard transformers format first
     try:
-        hf_config = get_config(model, trust_remote_code=True)
+        hf_config = get_config(config_source, trust_remote_code=True)
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if get_diffusion_model_index(model) is not None:
-            model_type = _try_get_class_name_from_diffusers_config(model)
+        if get_diffusion_model_index(config_source) is not None:
+            model_type = _try_get_class_name_from_diffusers_config(config_source)
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
                     "Please ensure its Diffusers pipeline index contains '_class_name'"
                 )
-        elif file_or_path_exists(model, "config.json", revision=None):
+        elif file_or_path_exists(config_source, "config.json", revision=None):
             # Try to read config.json manually for custom models like Bagel that fail get_config
             # but have a valid config.json with model_type
             try:
-                config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+                config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
@@ -316,7 +326,7 @@ def resolve_model_config_path(model: str) -> str | None:
                 )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
-    if model_type == "vla" and _looks_like_dreamzero(model):
+    if model_type == "vla" and _looks_like_dreamzero(config_source):
         model_type = "dreamzero"
 
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
@@ -359,11 +369,12 @@ def load_stage_configs_from_model(
 ) -> tuple[list, str | None]:
     """Load stage configurations from model's default config file.
 
-    For models registered in the pipeline registry (new path), uses
+    For models registered in the pipeline registry, uses
     ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
-    For other models (legacy path), loads stage configs from YAML.
+    Models that cannot be resolved through the registry return no stages so the
+    caller can apply its default stage configuration, when available.
 
     Args:
         model: Model name or path (used to determine model_type)
@@ -373,7 +384,7 @@ def load_stage_configs_from_model(
         stage_overrides: Per-stage overrides from --stage-overrides.
         strategy_config_path: Optional path to a composable-parallel
             ``strategy.yaml`` whose derived sizing is overlaid onto the
-            registry-merged stages (opt-in; ignored on the legacy YAML path).
+            registry-merged stages.
 
     Returns:
         ``(stage_configs, omni_lb_policy)``: the list of stage configuration
@@ -417,69 +428,17 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
-    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
-    # applied here (it overlays onto registry-merged stages), so warn rather than
-    # silently dropping the operator's --strategy-config.
+    strategy_note = ""
     if strategy_config_path is not None:
-        logger.warning(
-            "--strategy-config (%s) was provided but model %r resolves via the "
-            "legacy stage_configs YAML path, which does not support "
-            "composable-parallel strategies; the strategy is ignored. Use a "
-            "registry-based model to apply it.",
-            strategy_config_path,
-            model,
-        )
-    stage_config_path = resolve_model_config_path(model)
-    if stage_config_path is None:
-        return [], None
-    stage_configs = load_stage_configs_from_yaml(
-        config_path=stage_config_path,
-        base_engine_args=base_engine_args,
-        prefer_stage_engine_args=True,
+        strategy_note = f" Strategy config {strategy_config_path!r} was not applied."
+    logger.warning(
+        "No registered PipelineConfig resolved for model %r. Legacy `stage_args` "
+        "YAMLs are no longer supported; register the pipeline and provide deployment "
+        "overrides through `deploy_config`.%s",
+        model,
+        strategy_note,
     )
-    return stage_configs, None
-
-
-def load_stage_configs_from_yaml(
-    config_path: str,
-    base_engine_args: dict | None = None,
-    prefer_stage_engine_args: bool = True,
-) -> list:
-    """Load stage configurations from a YAML file (legacy OmegaConf path).
-
-    TODO(@lishunyang12): remove once all models use PipelineConfig + DeployConfig.
-
-    Args:
-        config_path: Path to the YAML configuration file
-        base_engine_args: Engine args supplied by the caller.
-        prefer_stage_engine_args: When True, YAML stage args override caller
-            engine args. When False, caller engine args override YAML defaults.
-
-    Returns:
-        List of stage configuration dictionaries from the file's stage_args
-    """
-    if base_engine_args is None:
-        base_engine_args = {}
-    config_data = load_yaml_config(config_path)
-    stage_args = config_data.stage_args
-    global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating DictConfig
-    base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = create_config(base_engine_args)
-    for stage_arg in stage_args:
-        base_engine_args_tmp = base_engine_args.copy()
-        # Update base_engine_args with stage-specific engine_args if they exist
-        if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            if prefer_stage_engine_args:
-                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
-            else:
-                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
-            base_engine_args_tmp = create_config(merged_engine_args)
-        stage_type = getattr(stage_arg, "stage_type", "llm")
-        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            base_engine_args_tmp.async_chunk = global_async_chunk
-        stage_arg.engine_args = base_engine_args_tmp
-    return stage_args
+    return [], None
 
 
 def filter_stages(
@@ -597,7 +556,6 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
 
 def load_and_resolve_stage_configs(
     model: str,
-    stage_configs_path: str | None,
     kwargs: dict | None,
     *,
     trust_remote_code: bool | None,
@@ -606,17 +564,15 @@ def load_and_resolve_stage_configs(
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
 ) -> tuple[str, list, str | None]:
-    """Load stage configurations from model or YAML file with fallback to defaults.
+    """Load stage configurations from a deploy YAML or model defaults.
 
     Args:
         model: Model name or path
-        stage_configs_path: Optional path to legacy YAML (stage_args format)
         kwargs: Engine arguments to merge with stage configs
         trust_remote_code: Whether to trust remote code while resolving the model config.
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
-        deploy_config_path: Optional path to deploy YAML (new format).
-            Mutually exclusive with ``stage_configs_path``.
+        deploy_config_path: Optional path to a deploy YAML.
         stage_overrides: Per-stage overrides from ``--stage-overrides`` JSON.
             Keys are stage_id strings, values are dicts of overrides.
         strategy_config_path: Optional path to a composable-parallel
@@ -627,67 +583,21 @@ def load_and_resolve_stage_configs(
         the strategy-derived pipeline-wide load-balancer policy (``None`` when no
         strategy set one), returned for the engine to apply.
     """
-    if stage_configs_path is not None and deploy_config_path is not None:
-        raise ValueError(
-            "--stage-configs-path and --deploy-config are mutually exclusive: "
-            "they use different path resolution rules and loading paths. "
-            "Use --deploy-config for new-format YAMLs (preferred); "
-            "--stage-configs-path is kept only for the legacy `stage_args` format "
-            "and will be removed in a future release."
-        )
-    if stage_configs_path is not None and deploy_config_path is None:
-        if not os.path.exists(stage_configs_path):
-            raise FileNotFoundError(
-                f"--stage-configs-path {stage_configs_path!r} does not exist. "
-                "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
-                "use --deploy-config. See docs/configuration/stage_configs.md."
-            )
-        with open(stage_configs_path, encoding="utf-8") as f:
-            _peek = yaml.safe_load(f) or {}
-        if "stages" in _peek and "stage_args" not in _peek:
-            deploy_config_path = stage_configs_path
-            stage_configs_path = None
+    config_path = deploy_config_path if deploy_config_path is not None else resolve_model_config_path(model)
+    stage_configs, omni_lb_policy = load_stage_configs_from_model(
+        model,
+        trust_remote_code=trust_remote_code,
+        base_engine_args=kwargs,
+        deploy_config_path=deploy_config_path,
+        stage_overrides=stage_overrides,
+        strategy_config_path=strategy_config_path,
+    )
+    if not stage_configs:
+        if default_stage_cfg_factory is not None:
+            default_stage_cfg = default_stage_cfg_factory()
+            stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
         else:
-            logger.warning(
-                "--stage-configs-path is deprecated; migrate %r and use --deploy-config.",
-                stage_configs_path,
-            )
-
-    omni_lb_policy: str | None = None
-    if deploy_config_path is not None:
-        config_path = deploy_config_path
-        stage_configs, omni_lb_policy = load_stage_configs_from_model(
-            model,
-            trust_remote_code=trust_remote_code,
-            base_engine_args=kwargs,
-            deploy_config_path=deploy_config_path,
-            stage_overrides=stage_overrides,
-            strategy_config_path=strategy_config_path,
-        )
-        if not stage_configs:
-            if default_stage_cfg_factory is not None:
-                default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
-            else:
-                stage_configs = []
-    elif stage_configs_path is None:
-        config_path = resolve_model_config_path(model)
-        stage_configs, omni_lb_policy = load_stage_configs_from_model(
-            model,
-            trust_remote_code=trust_remote_code,
-            base_engine_args=kwargs,
-            stage_overrides=stage_overrides,
-            strategy_config_path=strategy_config_path,
-        )
-        if not stage_configs:
-            if default_stage_cfg_factory is not None:
-                default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
-            else:
-                stage_configs = []
-    else:
-        config_path = stage_configs_path
-        stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+            stage_configs = []
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
     logger.debug(f"stage_configs: {stage_configs}")
@@ -898,3 +808,31 @@ def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
         params.skip_clone = True
     params.output_kind = target_type
     return params
+
+
+class PureDiffusionLauncherAdapter:
+    """vLLM launcher compatibility shim for pure-diffusion mode.
+
+    The upstream launcher's shutdown path reads
+    ``app.state.engine_client.vllm_config.shutdown_timeout``
+    (vllm/entrypoints/launcher.py), but ``AsyncOmni.vllm_config`` returns
+    ``None`` when the pipeline has no comprehension stage (pure diffusion),
+    which crashes ``handle_shutdown`` with AttributeError and hangs server
+    teardown (workers force-killed, spurious resource_tracker noise).
+
+    This adapter only overrides the ``vllm_config`` property with a minimal
+    fallback carrying ``shutdown_timeout`` and forwards every other attribute
+    to the wrapped engine client, so the pure-diffusion detection
+    (``get_vllm_config()`` still returns ``None``) is unaffected.
+    """
+
+    def __init__(self, engine_client: Any, shutdown_timeout: float) -> None:
+        object.__setattr__(self, "_wrapped", engine_client)
+        object.__setattr__(self, "_shutdown_timeout", float(shutdown_timeout))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    @property
+    def vllm_config(self) -> Any:
+        return types.SimpleNamespace(shutdown_timeout=self._shutdown_timeout)

@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
+    run_paged_piecewise_plan,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
@@ -25,6 +26,7 @@ logger = init_logger(__name__)
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
+    supports_paged_kv: bool = True
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
@@ -34,6 +36,20 @@ class FlashAttentionBackend(AttentionBackend):
         # packed contract fails. XPU reads attn_mask, so models must keep
         # constructing it there.
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+
+    @classmethod
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
+        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
+        # over the caller's cu_seqlens without a mask, so an arbitrary
+        # N-document packing keeps its boundaries. NPU's forward path
+        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
+        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
+        # back to a padding-mask rebuild that spans the whole packed row,
+        # so N>=2 real documents would silently attend across request
+        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
+        # therefore stay False here.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -77,12 +93,14 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -136,6 +154,7 @@ class FlashAttentionImpl(AttentionImpl):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _index_first_axis,
             _pad_input,
             _unpad_input,
             _upad_input,
@@ -143,10 +162,21 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
-        query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        batch_size, query_length = query.shape[:2]
+        if not self.is_cross_attn and query_length == key.size(1):
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+        else:
+            # Cross-attention: the mask covers keys only, so keep every query row.
+            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
+            v = _index_first_axis(value, indices_k)
+            q = query.flatten(0, 1)
+            cu_seq_lens_q = torch.arange(
+                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
+            )
+            max_length_q = query_length
+            indices_q = None
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -162,7 +192,9 @@ class FlashAttentionImpl(AttentionImpl):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
-        return _pad_input(out_unpad, indices_q, query.size(0), query_length)
+        if indices_q is None:
+            return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
+        return _pad_input(out_unpad, indices_q, batch_size, query_length)
 
     def _forward_varlen_packed(
         self,
@@ -245,6 +277,73 @@ class FlashAttentionImpl(AttentionImpl):
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
         return out.reshape(batch_size, q_len, *out.shape[1:])
+
+    def forward_paged(self, paged_kv_context) -> torch.Tensor:
+        """Run platform-native paged attention through the Omni backend.
+
+        ``DiffusionPagedAttentionAdapter`` owns BlockTables and prepares the
+        rank-local native cache context.  The adapter no longer performs the
+        attention call itself; this method is the backend-owned execution
+        boundary.  Its native layer wrapper keeps vLLM version-specific cache
+        and kernel details out of Omni's common ``Attention`` layer.
+        """
+
+        layer = getattr(paged_kv_context, "layer", None)
+        if layer is None:
+            raise TypeError("paged_kv_context must expose a native diffusion attention layer")
+        kv_cache = getattr(layer, "kv_cache", None)
+        if kv_cache is None:
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer.layer_name!r}")
+        native_impl = getattr(layer, "impl", None)
+        if native_impl is None:
+            raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
+        if not layer.attn_backend.forward_includes_kv_cache_update:
+            native_impl.do_kv_cache_update(
+                layer,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                kv_cache,
+                paged_kv_context.slot_mapping,
+            )
+
+        def run_native_attention(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            native_metadata,
+        ) -> torch.Tensor:
+            output = torch.empty(
+                (query.shape[0], layer.num_heads, layer.head_size_v),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return native_impl.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                native_metadata,
+                output,
+            )
+
+        if paged_kv_context.piecewise_plan is not None:
+            output = run_paged_piecewise_plan(
+                paged_kv_context.query,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                paged_kv_context.piecewise_plan,
+                paged_kv_context.piecewise_native_metadata,
+                run_native_attention,
+            )
+        else:
+            output = run_native_attention(
+                paged_kv_context.query,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                paged_kv_context.native_metadata,
+            )
+        return paged_kv_context.restore_output(output)
 
     def forward_cuda(
         self,
