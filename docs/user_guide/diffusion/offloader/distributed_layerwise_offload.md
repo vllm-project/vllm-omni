@@ -10,6 +10,11 @@ otherwise DLO streams the ordinary loader's rank-local tensors.
 See the [DLO feature design](../../../design/feature/offloader/distributed_layerwise_offload.md)
 for the implementation contract and compatibility matrix.
 
+This PR does not introduce HSDP + DLO AllGather support. That combination is
+rejected to avoid double sharding; use HSDP without DLO or combine HSDP with
+the no-AllGather DLO path. The FS-axis support described in earlier drafts is
+not part of this PR.
+
 ## Execution model
 
 DLO overlaps three operations with a fixed two-block device buffer:
@@ -271,8 +276,9 @@ must enter each collective.
   and eligible no-AllGather configurations may use HWR final-layout artifacts,
   but direct checkpoint mmap provides no shared-mmap host-memory guarantee for
   TP greater than one.
-- HSDP plus AllGather is rejected to avoid double sharding. HSDP without
-  AllGather has limited end-to-end validation.
+- HSDP plus AllGather is rejected to avoid double sharding and is not a
+  capability introduced by this PR. HSDP without AllGather has limited
+  end-to-end validation.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
   DLO transfer path. With AllGather, every rank temporarily materializes the
   complete FP8 model in host memory before DLO retains only its shard. Other

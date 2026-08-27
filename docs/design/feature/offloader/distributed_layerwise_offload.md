@@ -10,6 +10,11 @@ For user-facing commands, see the
 [distributed layerwise offloading guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md)
 and the [Cosmos3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md).
 
+**Scope note.** This PR does not introduce HSDP + DLO AllGather support. That
+combination is rejected to avoid double sharding; HSDP deployments must use
+the no-AllGather DLO path or HSDP without DLO. The FS-axis implementation
+described in earlier drafts is not part of this PR.
+
 ## Feature compatibility
 
 Host-storage optimization and runtime compatibility are separate decisions.
@@ -24,7 +29,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
 | **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
-| **HSDP** | ✅ Supported through the single-ownership split: the chunk engine owns the repeated DiT blocks (excluded from FSDP wrapping), and the weight collective runs only on the FS axis. | ⚠️ Limited end-to-end coverage. |
+| **HSDP** | ❌ Rejected with AllGather to avoid double sharding. | ⚠️ Limited end-to-end coverage. |
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
@@ -37,7 +42,7 @@ detailed contracts and validation boundaries.
 ## Status
 
 DLO is implemented for multi-device diffusion execution. The default
-AllGather path is the primary path for DP and SP deployments. The
+AllGather path is the primary path for non-HSDP DP and SP deployments. The
 `--dlo-no-use-allgather` path streams complete blocks independently and adds no
 DLO weight collective.
 
@@ -65,22 +70,17 @@ DLO does not create a new DP, TP, or SP topology. It reads the configured
 `DiffusionParallelConfig` and attaches offload hooks to the DiT blocks after the
 standard distributed groups have been initialized.
 
-The DLO weight-sharding group is selected as follows:
+HSDP with AllGather enabled is rejected before DLO selects a weight-sharding
+group. For supported AllGather deployments, the group is selected as follows:
 
-1. Under HSDP with AllGather enabled, use the fully-shard (FS) axis; the
-   shard degree is `hsdp_shard_size`. The HSDP replicate axis serves
-   independent requests and never takes part in a weight collective.
-2. Otherwise, use the existing DP group when `data_parallel_size > 1`.
-3. When DP is one and SP is greater than one, use the SP group.
-4. Otherwise, run rank-locally without a DLO process group.
+1. Use the existing DP group when `data_parallel_size > 1`.
+2. When DP is one and SP is greater than one, use the SP group.
+3. Otherwise, run rank-locally without a DLO process group.
 
-TP is deliberately not used as DLO's AllGather group. HSDP is supported
-because ownership is split structurally before any sharding happens: the
-repeated DiT blocks are resolved before HSDP wrapping and handed to the
-chunk engine, and those same tensors are added to FSDP's `ignored_params` so
-`fully_shard` never touches them. Every parameter therefore has exactly one
-owner — FSDP or the chunk engine — and DLO's weight collectives run only on
-the FS axis.
+TP is deliberately not used as DLO's AllGather group. DLO does not select or
+construct an FS-axis group in this PR; HSDP remains responsible for its own
+parameter sharding and must use the no-AllGather DLO path when combined with
+HSDP.
 
 ### The loader owns host-weight planning
 
@@ -189,6 +189,13 @@ Chunk packing applies only to the sharded AllGather path. With
 `weight_shard_size == 1` and a checkpoint_mmap plan, the rank-local path
 retains the checkpoint mmap views as node-shared host backing and stages one
 block at a time through two bounded pinned staging slots, as described below.
+
+The opt-in `group_persistent` transport backend is experimental and is not
+part of the supported contract introduced by this PR. Its inclusion will be
+decided after the current performance and correctness experiments. Until
+then, the supported chunked path is the non-persistent H2D + AllGather
+schedule; the documentation makes no promise that persistent replay captures
+the H2D operation.
 
 ### Rank-local path without DLO AllGather
 
@@ -503,8 +510,7 @@ direct H2D is an optional transport layer over that merged lease contract.
 
 Current source-level validation includes:
 
-- HSDP + DLO + AllGather acceptance at configuration level, including FS-axis
-  group resolution and the single-ownership split;
+- HSDP + DLO + AllGather rejection at configuration level;
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
