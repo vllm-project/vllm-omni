@@ -10,10 +10,9 @@ This is intentionally different from the synthetic block benchmark:
   - independent: same prompts run one by one
   - mixfusion_batch: the same prompts in one batched diffusion request
 
-The batched path constructs one OmniDiffusionRequest whose `prompts` field has
-multiple entries. That is the path that reaches HunyuanImage3Pipeline.forward()
-with `len(req.prompts) > 1`, allowing the current MixFusion implementation to
-build a mixed-resolution plan.
+The batched path creates one OmniDiffusionRequest per prompt and runs them
+concurrently, reaching HunyuanImage3Pipeline.forward() with a multi-request
+batch so the current MixFusion implementation can build a mixed-resolution plan.
 
 Example:
     python benchmarks/diffusion/hunyuan_image3_real_mixfusion_benefit.py \
@@ -143,16 +142,18 @@ async def run_request(
     request_prefix: str,
 ) -> tuple[float, list[Any]]:
     request_id = f"{request_prefix}-{uuid.uuid4()}"
-    request = OmniDiffusionRequest(
-        prompts=prompts,
-        sampling_params=sampling_params,
-        request_ids=[f"{request_id}-{idx}" for idx in range(len(prompts))],
-        request_id=request_id,
-    )
+    requests = [
+        OmniDiffusionRequest(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=f"{request_id}-{idx}",
+        )
+        for idx, prompt in enumerate(prompts)
+    ]
     start = time.perf_counter()
-    outputs = await engine.step(request)
+    outputs = await asyncio.gather(*(engine.step(request) for request in requests))
     elapsed = time.perf_counter() - start
-    return elapsed, outputs
+    return elapsed, [output for batch in outputs for output in batch]
 
 
 async def run_independent(

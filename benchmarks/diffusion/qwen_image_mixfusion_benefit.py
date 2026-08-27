@@ -189,9 +189,8 @@ def make_request(
 ) -> OmniDiffusionRequest:
     request_id = f"{request_prefix}-{uuid.uuid4()}"
     return OmniDiffusionRequest(
-        prompts=[prompt],
+        prompt=prompt,
         sampling_params=sampling_params,
-        request_ids=[request_id],
         request_id=request_id,
     )
 

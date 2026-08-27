@@ -959,7 +959,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             scatter_latents(states, input_batch)
             for state in states:
                 if interrupted or state.denoise_completed:
-                    self.state_cache.pop(state.req_id, None)
+                    self.state_cache.pop(state.request_id, None)
             return
 
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
