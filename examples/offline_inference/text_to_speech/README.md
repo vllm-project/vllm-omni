@@ -22,6 +22,7 @@ list of supported architectures across all modalities, see
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
+| NeuTTS-Air | `neuphonic/neutts-air` | 2 (Qwen2 + NeuCodec) | ✓ (required) | ✓ | — | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
@@ -329,6 +330,30 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
 
 ---
+
+## NeuTTS-Air
+
+NeuTTS-Air uses a native vLLM Qwen2 stage to generate speech tokens, followed by NeuCodec waveform decoding.
+
+### Prerequisites
+
+```bash
+pip install -e '.[neutts-air]'
+```
+
+### Voice cloning
+
+```bash
+python neutts_air/end2end.py \
+  --text "Hello from NeuTTS-Air." \
+  --ref-audio /path/to/reference.wav \
+  --ref-text "Transcript of the reference audio." \
+  --output outputs/neutts_air.wav
+```
+
+The reference audio and transcript are required. Reference audio is converted to mono 16 kHz before NeuCodec encoding. Supplying precomputed reference codes avoids this CPU encoding step.
+
+NeuTTS-Air currently supports English synthesis and produces 24 kHz audio. Its two-stage pipeline supports asynchronous chunked streaming.
 
 ## Qwen3-TTS
 

@@ -1,0 +1,37 @@
+# NeuTTS-Air deploy: Qwen2 backbone to NeuCodec on one GPU.
+# Async chunking is enabled after synchronous and streaming validation.
+async_chunk: true
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    kv_cache_memory_bytes: 536870912
+    enable_prefix_caching: false
+    max_num_batched_tokens: 2048
+    max_model_len: 2048
+    devices: "0"
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.8
+      top_k: 50
+      repetition_penalty: 1.1
+      max_tokens: 512
+      min_tokens: 50
+      seed: 1234
+      detokenize: false
+      ignore_eos: true
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    dtype: float32
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 2048
+    max_model_len: 2048
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      detokenize: false
