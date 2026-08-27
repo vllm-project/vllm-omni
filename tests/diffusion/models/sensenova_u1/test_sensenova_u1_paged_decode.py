@@ -233,6 +233,67 @@ def test_a_captured_graph_follows_a_later_length():
     torch.testing.assert_close(out.float(), want.float(), atol=2e-3, rtol=2e-3)
 
 
+
+@cuda_only
+@pytest.mark.cuda
+@pytest.mark.L4
+def test_a_captured_graph_writes_each_step_to_its_own_slot():
+    """The write slot has to be a device tensor, not a Python index.
+
+    ``test_a_captured_graph_follows_a_later_length`` pins the attended span.
+    The slot written is the other half: a Python index is frozen at capture, so
+    every replay would overwrite the capture-time slot and the cache would stop
+    growing -- correct eagerly, silently wrong once captured.
+    """
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import PagedDecodeCache
+
+    heads, kv_heads, dim, n = 8, 2, 64, 100
+    dev, dt = torch.device("cuda"), torch.bfloat16
+    torch.manual_seed(0)
+    dyn = _Cache(
+        [
+            _Layer(
+                torch.randn(1, kv_heads, n, dim, device=dev, dtype=dt),
+                torch.randn(1, kv_heads, n, dim, device=dev, dtype=dt),
+            )
+        ]
+    )
+    paged = PagedDecodeCache.from_dynamic_cache(dyn, 1, dev, dt)
+    q = torch.randn(1, heads, 1, dim, device=dev, dtype=dt)
+    k = torch.zeros(1, kv_heads, 1, dim, device=dev, dtype=dt)
+    v = torch.zeros_like(k)
+    scale = dim**-0.5
+
+    # Capture on the step that writes slot n-1, restoring what is already there
+    # so the capture itself changes nothing.
+    paged.set_length(n)
+    k[0, :, 0] = dyn.layers[0].keys[0, :, n - 1]
+    v[0, :, 0] = dyn.layers[0].values[0, :, n - 1]
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            paged.attend(0, q, k, v, scale)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        paged.attend(0, q, k, v, scale)
+
+    kept = paged.k[0].view(-1, kv_heads, dim)[n - 1].clone()
+
+    # The next decode step: one token further, different K/V.
+    paged.set_length(n + 1)
+    k[0, :, 0] = 1.5
+    v[0, :, 0] = -2.5
+    graph.replay()
+    torch.cuda.synchronize()
+
+    flat_k = paged.k[0].view(-1, kv_heads, dim)
+    flat_v = paged.v[0].view(-1, kv_heads, dim)
+    torch.testing.assert_close(flat_k[n].float(), torch.full_like(flat_k[n], 1.5).float())
+    torch.testing.assert_close(flat_v[n].float(), torch.full_like(flat_v[n], -2.5).float())
+    torch.testing.assert_close(flat_k[n - 1].float(), kept.float())
+
 # ---------------------------------------------------------------------------
 # The cache is only worth anything if production actually reaches it, and the
 # kwargs it needs are not in every wheel that exports the kernel. The tests
