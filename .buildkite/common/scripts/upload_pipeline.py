@@ -271,7 +271,6 @@ def _get_mirror_hw_selector() -> str:
     A set value must be ``b200`` (case-insensitive). Unknown values fail closed
     so a typo cannot silently drop the CUDA pipeline.
     """
-    return "b200"  # TODO: delete this line after B200 CI debug
     selector = os.environ.get("MIRROR_HW", "").strip().lower()
     if not selector:
         return ""
