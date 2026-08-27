@@ -736,6 +736,13 @@ class SenseNovaU1Pipeline(
         cache has to be paged for that: it keeps the buffers a fixed size while
         the kernel reads only ``seqused_k`` of them, which is what lets one
         capture serve every step until the next bucket.
+
+        Both live on the pipeline and are reused across requests. A capture
+        binds the addresses it recorded, so a cache built per request forces a
+        capture per request: measured, that left about 40 MiB of device memory
+        behind on every request and re-captured every time. Reuse rests on the
+        same thing the paged path already rests on -- one sequence in flight per
+        pipeline forward.
         """
         if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
             return None
@@ -744,15 +751,22 @@ class SenseNovaU1Pipeline(
             return None
         if past_key_values is None or not past_key_values.layers:
             return None
-        cache = PagedDecodeCache.from_dynamic_cache(
-            past_key_values,
-            len(self.language_model.model.layers),
-            torch.device(self.device),
-            past_key_values.layers[0].keys.dtype,
-        )
-        if cache is None:
+        layer0 = past_key_values.layers[0]
+        if layer0.keys is None:
             return None
-        return cache, DecodeGraphRunner(self.language_model, cache, torch.device(self.device))
+        _, kv_heads, prefix, kv_head_dim = layer0.keys.shape
+        device = torch.device(self.device)
+        num_layers = len(self.language_model.model.layers)
+        decode = getattr(self, "_paged_decode", None)
+        if decode is None or not decode[0].reusable_for(
+            num_layers, kv_heads, kv_head_dim, layer0.keys.dtype, prefix + 1
+        ):
+            cache = PagedDecodeCache(num_layers, kv_heads, kv_head_dim, prefix + 1, device, layer0.keys.dtype)
+            decode = (cache, DecodeGraphRunner(self.language_model, cache, device))
+            self._paged_decode = decode
+        if not decode[0].load_prefix(past_key_values):
+            return None
+        return decode
 
     def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
         """One autoregressive token step. Constructs single-token `indexes` explicitly."""

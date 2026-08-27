@@ -500,6 +500,70 @@ def test_the_kill_switch_returns_no_cache(monkeypatch):
     assert SenseNovaU1Pipeline._decode_context(host, object()) is None
 
 
+def _pipeline_host(monkeypatch, device="cpu", language_model=None):
+    """A bare pipeline carrying only what ``_decode_context`` touches."""
+    from vllm_omni.diffusion.models.sensenova_u1 import pipeline_sensenova_u1 as pipe_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1")
+    monkeypatch.setattr(pipe_mod, "paged_decode_supported", lambda dev, head_dim: True)
+    layer = SimpleNamespace(self_attn=SimpleNamespace(head_dim=HEAD_DIM))
+    host = object.__new__(pipe_mod.SenseNovaU1Pipeline)
+    host.device = device
+    host.language_model = language_model or SimpleNamespace(model=SimpleNamespace(layers=[layer] * LAYERS))
+    if language_model is not None:
+        language_model.model = SimpleNamespace(layers=[layer] * LAYERS)
+    return pipe_mod, host
+
+
+def test_the_decode_context_is_reused_across_requests(monkeypatch):
+    """A capture binds the addresses it recorded, so a cache built per request
+    forces a capture per request. Two requests whose prefill fits the same
+    bucket have to come back with the same cache and the same runner, and with
+    the generation unchanged so the captures stay valid.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", lambda lm, cache, dev: SimpleNamespace(cache=cache))
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    first = ctx(host, _dyn_cache(10))
+    assert first is not None
+    second_input = _dyn_cache(20)
+    second = ctx(host, second_input)
+    assert second[0] is first[0], "the cache was rebuilt for a request that fits it"
+    assert second[1] is first[1], "the runner was rebuilt, so its captures are gone"
+    assert second[0].generation == first[0].generation, "reuse must not invalidate a capture"
+    assert second[0].length == 20
+
+    # The reused buffers must carry the new request's prefill, not the old one.
+    flat = second[0].k[0].view(-1, KV_HEADS, HEAD_DIM)[:20]
+    torch.testing.assert_close(flat, second_input.layers[0].keys[0].transpose(0, 1))
+
+    # A prefill past the bucket cannot share the buffers.
+    bigger = ctx(host, _dyn_cache(BUCKETS[0] + 1))
+    assert bigger[0] is not first[0], "a prefill past the bucket must get new buffers"
+
+
+@cuda_only
+@pytest.mark.cuda
+@pytest.mark.L4
+def test_a_second_request_replays_the_first_capture(monkeypatch):
+    """Reuse is only worth anything if the capture survives it."""
+    dev = torch.device("cuda")
+    pipe_mod, host = _pipeline_host(monkeypatch, device="cuda", language_model=_StubLM(dev))
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    cache, runner = ctx(host, _dyn_cache(10, dev))
+    cache.set_length(cache.length + 1)
+    runner.step(0, 0)
+    assert runner.captures == 1
+
+    cache2, runner2 = ctx(host, _dyn_cache(12, dev))
+    assert cache2 is cache and runner2 is runner
+    cache2.set_length(cache2.length + 1)
+    runner2.step(0, 0)
+    assert runner.captures == 1, "the second request captured the graph again"
+
+
 class _Tok:
     """The two tokenizer calls ``_generate_text`` makes."""
 

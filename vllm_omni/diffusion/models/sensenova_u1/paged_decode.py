@@ -142,23 +142,47 @@ class PagedDecodeCache:
         self.seqused.fill_(n)
         self.pos.fill_(n - 1)
 
+    def reusable_for(self, num_layers, kv_heads, head_dim, dtype, length) -> bool:
+        """Can this cache serve another request without reallocating?
+
+        Reusing the buffers is what lets captured graphs survive across
+        requests: a capture binds the addresses it recorded, so a fresh cache
+        forces a fresh capture.
+        """
+        return (
+            len(self.k) == num_layers
+            and self.kv_heads == kv_heads
+            and self.head_dim == head_dim
+            and self.dtype == dtype
+            and _bucket_for(length) <= self.bucket
+        )
+
+    def load_prefix(self, cache) -> bool:
+        """Copy a prefill cache into the paged buffers.
+
+        Only the first ``seqused`` rows are ever read, so the tail is left as
+        whatever the previous request wrote. Returns False for an empty cache.
+        """
+        layer0 = cache.layers[0]
+        if layer0.keys is None:
+            return False
+        prefix = layer0.keys.shape[2]
+        for i in range(len(self.k)):
+            keys, values = cache.layers[i].keys, cache.layers[i].values
+            # [B, H, S, D] -> [S, H, D], then into the paged blocks
+            self._write_prefix(i, keys[0].transpose(0, 1), values[0].transpose(0, 1))
+        self.set_length(prefix)
+        return True
+
     @classmethod
     def from_dynamic_cache(cls, cache, num_layers, device, dtype, min_length=0):
-        """Copy a prefill cache into paged buffers.
-
-        The prefix is built by the normal path; only decode is paged, so this
-        runs once per request at the hand-off.
-        """
+        """Allocate buffers for a prefill cache and copy it in."""
         layer0 = cache.layers[0]
         if layer0.keys is None:
             return None
         _, kv_heads, prefix, head_dim = layer0.keys.shape
         obj = cls(num_layers, kv_heads, head_dim, max(prefix + 1, min_length), device, dtype)
-        for i in range(num_layers):
-            keys, values = cache.layers[i].keys, cache.layers[i].values
-            # [B, H, S, D] -> [S, H, D], then into the paged blocks
-            obj._write_prefix(i, keys[0].transpose(0, 1), values[0].transpose(0, 1))
-        obj.set_length(prefix)
+        obj.load_prefix(cache)
         return obj
 
     def _write_prefix(self, layer_idx, keys_shd, values_shd):
