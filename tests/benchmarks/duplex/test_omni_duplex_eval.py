@@ -114,7 +114,7 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
     response.with_name("response.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
     video = tmp_path / "video.mp4"
     video.write_bytes(b"video")
-    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"jpeg")
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
 
     class Judge:
         def temporal(self, *args, **kwargs):
@@ -122,7 +122,7 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
 
         def content(self, prompt, video, frames=None, *, mode="video_url"):
             assert mode == "frame-sample"
-            assert frames == [b"jpeg", b"jpeg"]
+            assert frames == [b"\xff\xd8jpeg", b"\xff\xd8jpeg"]
             return '{"content_score": 3}'
 
     sample = DuplexSample(

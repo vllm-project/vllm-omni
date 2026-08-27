@@ -39,7 +39,10 @@ class DuplexJudge:
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        if not response.ok:
+            raise requests.HTTPError(
+                f"{response.status_code} response from judge: {response.text[:500]}", response=response
+            )
         return str(response.json()["choices"][0]["message"]["content"])
 
     def temporal(self, prompt: str, frames: list[bytes]) -> str:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +87,7 @@ def evaluate_sample(
                     }
                 )
                 continue
-            frames = [extract_jpeg(video_path, timestamp=t) for t in _times(*window, fps=judge_fps)]
+            frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
             parsed = parse_judge_json(
                 judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames)
             )
@@ -104,7 +105,7 @@ def evaluate_sample(
             )
         content_frames = None
         if judge_video_mode == "frame-sample":
-            content_frames = [extract_jpeg(video_path, timestamp=t) for t in _content_frame_times(duration)]
+            content_frames = _extract_frames(video_path, _content_frame_times(duration))
         content = parse_judge_json(
             judge.content(
                 build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
@@ -161,6 +162,19 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     )
 
 
+def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+    """Extract only decodable JPEG frames; clips can end on non-keyframes."""
+    frames = []
+    for timestamp in timestamps:
+        try:
+            frame = extract_jpeg(path, timestamp=timestamp)
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            continue
+        if frame.startswith(b"\xff\xd8"):
+            frames.append(frame)
+    return frames
+
+
 def _content_frame_times(duration: float) -> list[float]:
     """Sample the full video at approximately one frame every three seconds."""
     if duration <= 0:
@@ -170,6 +184,11 @@ def _content_frame_times(duration: float) -> list[float]:
     while timestamp < duration:
         times.append(min(timestamp, max(0.0, duration - 0.01)))
         timestamp += 3.0
+    # Qwen2.5-VL has a finite per-request image-token budget. Preserve
+    # coverage while bounding long clips to a safely portable frame count.
+    if len(times) > 16:
+        stride = (len(times) - 1) / 15
+        times = [times[round(i * stride)] for i in range(16)]
     return times
 
 
@@ -187,7 +206,12 @@ def _reminder_times(sample: DuplexSample) -> list[float]:
 
 
 def summarize_scores(score_root: str | Path) -> dict[str, Any]:
-    rows = [_read(path) for path in sorted(Path(score_root).rglob("*.json")) if not path.name.endswith("_summary.json")]
+    rows = []
+    for path in sorted(Path(score_root).rglob("*.json")):
+        if not path.name.endswith("_summary.json"):
+            row = _read(path)
+            row.setdefault("split", path.parent.name)
+            rows.append(row)
     rtd_temporal = [
         row["temporal"]["summary"] | {"content_score": row.get("content", {}).get("content_score", 0.0)}
         for row in rows
@@ -196,9 +220,25 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
     pr = [{"task_type": row.get("task_type"), **row.get("pr", {})} for row in rows if "pr" in row]
     result = {"protocol_pin": PROTOCOL_PIN, "samples": len(rows)}
     if rtd_temporal:
+        by_task: dict[str, list[dict[str, float]]] = {}
+        for row in rows:
+            if "temporal" in row:
+                by_task.setdefault(str(row.get("split", row.get("task_type", "unknown"))), []).append(
+                    {
+                        "content": float(row.get("content", {}).get("content_score", 0.0)),
+                        "temporal": float(row["temporal"]["summary"].get("avg_temporal_score", 0.0)),
+                    }
+                )
         result["rtd"] = {
             "mean_content_score": sum(item["content_score"] for item in rtd_temporal) / len(rtd_temporal),
             "mean_avg_temporal_score": sum(item["avg_temporal_score"] for item in rtd_temporal) / len(rtd_temporal),
+            "by_task": {
+                task: {
+                    "mean_content_score": sum(item["content"] for item in values) / len(values),
+                    "mean_avg_temporal_score": sum(item["temporal"] for item in values) / len(values),
+                }
+                for task, values in by_task.items()
+            },
         }
     if pr:
         result["pr"] = summarize_pr_results(pr)
