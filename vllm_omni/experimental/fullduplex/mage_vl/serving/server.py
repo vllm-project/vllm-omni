@@ -43,6 +43,8 @@ class _MageVLServingRuntime:
         self.adapter = adapter
         self.capabilities = adapter.capabilities()
         self._response_task: asyncio.Task[None] | None = None
+        self._gate_watch_tasks: set[asyncio.Task[None]] = set()
+        self._response_lock = asyncio.Lock()
         self._closed = False
 
     async def run(self, inputs: AsyncIterator[dict[str, Any]], emit: Emit) -> None:
@@ -59,6 +61,8 @@ class _MageVLServingRuntime:
                     self.session.state = DuplexState.LISTENING
                     if self.session.config.proactive and self.adapter.should_respond(self.session):
                         await self._start_response(emit)
+                    elif self.session.config.proactive and modality != "text":
+                        self._watch_gate(emit)
                 elif event_type in (event_protocol.INPUT_COMMIT, event_protocol.RESPONSE_CREATE):
                     if self.adapter.should_respond(self.session):
                         await self._start_response(emit)
@@ -74,6 +78,14 @@ class _MageVLServingRuntime:
                     graceful_close = True
                     break
         finally:
+            gate_tasks = tuple(self._gate_watch_tasks)
+            if graceful_close and gate_tasks:
+                await asyncio.gather(*gate_tasks, return_exceptions=True)
+            else:
+                for gate_task in gate_tasks:
+                    gate_task.cancel()
+                if gate_tasks:
+                    await asyncio.gather(*gate_tasks, return_exceptions=True)
             task = self._response_task
             if graceful_close and task is not None and not task.done():
                 await task
@@ -84,12 +96,29 @@ class _MageVLServingRuntime:
             self._closed = True
 
     async def _start_response(self, emit: Emit) -> None:
-        await self.cancel_response()
-        self._response_task = asyncio.create_task(self._respond(emit))
+        async with self._response_lock:
+            if self._response_task is not None and not self._response_task.done():
+                await self.cancel_response()
+            self._response_task = asyncio.create_task(self._respond(emit))
+
+    def _watch_gate(self, emit: Emit) -> None:
+        task = asyncio.create_task(self._respond_when_gate_ready(emit))
+        self._gate_watch_tasks.add(task)
+        task.add_done_callback(self._gate_watch_tasks.discard)
+
+    async def _respond_when_gate_ready(self, emit: Emit) -> None:
+        await self.adapter.flush(self.session)
+        async with self._response_lock:
+            if self.adapter.should_respond(self.session):
+                if self._response_task is not None and not self._response_task.done():
+                    await self.cancel_response()
+                self._response_task = asyncio.create_task(self._respond(emit))
 
     async def cancel_response(self) -> None:
         task = self._response_task
         if task is None or task.done():
+            self.session.barge_in()
+            await self.adapter.on_barge_in(self.session)
             return
         self.session.barge_in()
         await self.adapter.on_barge_in(self.session)

@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -84,8 +87,8 @@ def test_mage_vl_rejects_duplicate_session_and_releases_disconnect():
         with client.websocket_connect("/v1/mage-vl/duplex?session_id=one") as first:
             assert first.receive_json()["session_id"] == "one"
             with pytest.raises(WebSocketDisconnect) as denied:
-                with client.websocket_connect("/v1/mage-vl/duplex?session_id=two"):
-                    pass
+                with client.websocket_connect("/v1/mage-vl/duplex?session_id=two") as second:
+                    second.receive_json()
             assert denied.value.code == 4429
             first.send_json({"type": "close"})
 
@@ -102,3 +105,29 @@ def test_mage_vl_rejects_malformed_event():
             event = websocket.receive_json()
             assert event["type"] == "error"
             assert "JSON object" in event["message"]
+
+
+def test_mage_vl_cancel_is_not_blocked_by_slow_gate():
+    async def slow_gate(_session, _windows):
+        await asyncio.sleep(2)
+        return {"should_respond": True, "event_id": "late"}
+
+    def factory():
+        return MageVLDuplexAdapter(gate=slow_gate, window_size=1)
+
+    with TestClient(create_app(factory)) as client:
+        with client.websocket_connect("/v1/mage-vl/duplex") as websocket:
+            websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "input.append",
+                    "modality": "video",
+                    "data": {"segment_id": "slow", "frames": ["frame"]},
+                }
+            )
+            started = time.monotonic()
+            websocket.send_json({"type": "response.cancel"})
+            event = websocket.receive_json()
+            assert time.monotonic() - started < 0.5
+            assert event["type"] == "response.cancelled"
+            websocket.send_json({"type": "close"})
