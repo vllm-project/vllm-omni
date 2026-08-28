@@ -47,6 +47,10 @@ duplex_session:
   max_pending_turns_per_session: 4
   max_sessions: 1
   completed_append_cache_size: 256
+  # Startup warmup: run two silent frames through a throwaway session before
+  # real clients are admitted, so one-time costs (kernel JIT, first
+  # prefill/decode paths, codec caches) never land on the first user.
+  warmup_frames: 2
 
 async_chunk: true
 
