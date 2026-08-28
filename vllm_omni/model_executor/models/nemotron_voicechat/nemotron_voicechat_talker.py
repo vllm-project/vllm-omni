@@ -576,7 +576,6 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         info: dict[str, Any],
         device: torch.device,
         span: int,
-        is_prefill: bool,
         request_id: str,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
@@ -588,7 +587,6 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         # branch is decided by the engine POSITION, never by the prefill flag:
         # positions [0, init_len) carry the speaker-prompt prefill embeddings,
         # every later position consumes exactly one timeline step.
-        del is_prefill
         session = self._sessions.get(request_id)
         if session is None:
             session = self._init_native_session(request_id, info, device)
@@ -821,7 +819,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         request_id = require_request_id(info, "talker")
 
         if self._use_native_backbone:
-            return self._native_preprocess(input_ids, info, device, span, is_prefill, request_id)
+            return self._native_preprocess(input_ids, info, device, span, request_id)
 
         embeds = torch.zeros((span, self._hidden), device=device, dtype=self._dtype)
         if is_prefill or request_id not in self._sessions:
