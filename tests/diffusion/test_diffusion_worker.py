@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for DiffusionWorker class.
@@ -142,6 +142,20 @@ class TestDiffusionWorkerSleep:
         assert len(mock_gpu_worker._sleep_saved_buffers) == 2
         assert "buffer1" in mock_gpu_worker._sleep_saved_buffers
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
+
+    def test_sleep_level_2_releases_pipeline_captures(self, mocker: MockerFixture, mock_gpu_worker):
+        """A pipeline may hold CUDA graphs across requests. Level 2 discards the
+        memory those were captured against, so they have to go the same way
+        `model_runner.graph_runners` does."""
+        mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
+        mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
+        mock_platform.get_device_total_memory.return_value = 80 * 1024**3
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.get_process_gpu_memory", side_effect=[0, 0])
+        mock_gpu_worker.model_runner.pipeline.named_buffers = mocker.Mock(return_value=[])
+
+        mock_gpu_worker.sleep(level=2)
+
+        mock_gpu_worker.model_runner.pipeline.release_captured_graphs.assert_called_once_with()
 
     def test_sleep_memory_freed_validation(self, mocker: MockerFixture, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""

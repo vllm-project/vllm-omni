@@ -23,9 +23,11 @@ Scope, and when to delete this. The cache is model-local on purpose:
 ``ARDiffusionModelRunner`` lives under ``vllm_omni/experimental``. SenseNova runs
 its whole autoregressive loop inside one pipeline ``forward``, so the decode
 steps never surface to the scheduler and it cannot admit, pool, evict, reuse a
-prefix for, or continuously batch them. What is here is therefore per-request
-buffers behind an identity block table, not general paged-KV support: it holds
-while the pipeline serves one sequence per forward. Once the decode loop is
+prefix for, or continuously batch them. What is here is therefore one set of
+buffers behind an identity block table, reused by whichever request fits them,
+not general paged-KV support: it holds while the pipeline serves one sequence
+per forward, and is released when sleep discards the memory it captured
+against. Once the decode loop is
 driven by a scheduler-visible runner, or the pipeline handles more than one
 sequence per forward, delete this file and use the manager instead.
 """

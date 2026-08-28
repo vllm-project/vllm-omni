@@ -768,6 +768,14 @@ class SenseNovaU1Pipeline(
             return None
         return decode
 
+    def release_captured_graphs(self) -> None:
+        """Drop the reused paged cache and the graphs captured against it.
+
+        Sleep level 2 discards the memory a capture recorded, so anything held
+        across requests has to go with it. The next request rebuilds both.
+        """
+        self._paged_decode = None
+
     def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
         """One autoregressive token step. Constructs single-token `indexes` explicitly."""
         if decode is not None:

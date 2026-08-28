@@ -543,6 +543,21 @@ def test_the_decode_context_is_reused_across_requests(monkeypatch):
     assert bigger[0] is not first[0], "a prefill past the bucket must get new buffers"
 
 
+def test_releasing_the_captures_forces_a_rebuild(monkeypatch):
+    """Sleep level 2 discards the memory a capture recorded, so what the
+    pipeline reuses across requests has to be droppable."""
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", lambda lm, cache, dev: SimpleNamespace(cache=cache))
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    first = ctx(host, _dyn_cache(10))
+    assert ctx(host, _dyn_cache(10))[0] is first[0], "the fixture is not reusing to begin with"
+    pipe_mod.SenseNovaU1Pipeline.release_captured_graphs(host)
+    after = ctx(host, _dyn_cache(10))
+    assert after[0] is not first[0], "the cache survived the release"
+    assert after[1] is not first[1], "the runner survived the release"
+
+
 @cuda_only
 @pytest.mark.cuda
 @pytest.mark.L4
