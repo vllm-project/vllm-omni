@@ -18,6 +18,7 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_ramp_emit,
     max_ic_for_chunk_size,
     parse_chunk_ramp,
+    ramp_cumulative,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -57,17 +58,82 @@ def _qwen3_tts_degenerate_finished_payload():
 
 
 def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    """Return the newest codec frame, still on its own device.
+
+    Deliberately does no content inspection. Deciding here whether the frame is
+    all-zero padding costs a ``.item()`` device sync on every talker decode
+    step; the emptiness test is batched into ``_commit_pending_frames`` instead.
+    """
     audio_codes = multimodal_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
+        if frame.numel() == 0:
             return None
         return frame.to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
         return audio_codes.to(torch.long).reshape(-1)
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
+
+
+def _emit_threshold(
+    length: int,
+    *,
+    ramp: list[int] | None,
+    chunk_index: int,
+    chunk_size: int,
+    initial_chunk_size: int,
+) -> int:
+    """Smallest committed-frame count at which a chunk could be emitted.
+
+    Pure host arithmetic mirroring the emission gate below, used only to decide
+    whether the pending frames are worth resolving yet. Returning a value that
+    is too small costs an extra sync; returning one that is too large would
+    delay a chunk, so every branch here has to match the gate.
+    """
+    if ramp is not None:
+        return max(1, ramp_cumulative(chunk_index, ramp, chunk_size))
+    use_first_chunk = 0 < initial_chunk_size < chunk_size
+    if use_first_chunk and length < initial_chunk_size:
+        return initial_chunk_size
+    initial_coverage = initial_chunk_size if use_first_chunk else 0
+    remainder = max(0, length - initial_coverage) % chunk_size
+    return max(1, length + (chunk_size - remainder if remainder else 0))
+
+
+def _stack_frames(frames: list) -> torch.Tensor:
+    """Stack frames into ``[num_frames, num_quantizers]`` on one device.
+
+    Frames arriving from the talker are device tensors, but callers may seed
+    ``code_prompt_token_ids`` with plain lists, so coerce rather than assume.
+    A seeded host prefix followed by device frames would otherwise reach
+    ``torch.stack`` as a mixed-device list and raise, and the adapter swallows
+    processor exceptions, so that surfaces as a silently dropped chunk. Pick the
+    first tensor's device and normalize everything onto it.
+    """
+    device = next((f.device for f in frames if isinstance(f, torch.Tensor)), None)
+    return torch.stack([torch.as_tensor(f, dtype=torch.long, device=device) for f in frames])
+
+
+def _commit_pending_frames(committed: list, pending: list) -> None:
+    """Move real frames from ``pending`` into ``committed``, dropping padding.
+
+    One ``.tolist()`` for the whole pending batch, so the emptiness test costs a
+    single device sync per resolve instead of one per decode step. Frames stay
+    on-device; only the boolean mask crosses to the host.
+
+    Padding is dropped *here*, not at emit, so ``len(committed)`` keeps meaning
+    "real frames so far". The gate below is driven by that count, and roughly
+    2% of mid-stream frames are all-zero padding (the talker zeroes any frame
+    whose layer-0 id is out of codebook range, which covers EOS and the prefill
+    span), so counting padding would move every chunk boundary.
+    """
+    if not pending:
+        return
+    keep = _stack_frames(pending).any(dim=1).tolist()
+    committed.extend(frame for frame, ok in zip(pending, keep) if ok)
+    pending.clear()
 
 
 def talker2code2wav_async_chunk(
@@ -83,11 +149,18 @@ def talker2code2wav_async_chunk(
         request_payload = {}
         transfer_manager.request_payload = request_payload
 
+    pending_frames = getattr(transfer_manager, "pending_frames", None)
+    if pending_frames is None:
+        pending_frames = {}
+        transfer_manager.pending_frames = pending_frames
+
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Hold on-device and unclassified. Both the emptiness test and the
+            # host copy are deferred to the resolve below, so the per-step save
+            # path costs no device sync at all.
+            pending_frames.setdefault(request_id, []).append(frame)
         ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -132,7 +205,15 @@ def talker2code2wav_async_chunk(
             transfer_manager._cached_ic = _ic_cache
         if request_id not in _ic_cache:
             max_ic = max_ic_for_chunk_size(chunk_size)
-            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            # A request counts as active once it has produced any frame. Frames
+            # sit in `pending_frames` before their first resolve, so counting
+            # only the committed side would under-report load by one for every
+            # request still inside its first chunk -- including this one, which
+            # the pre-batching code always counted.
+            active = len(
+                {rid for rid, frames in transfer_manager.code_prompt_token_ids.items() if frames}
+                | {rid for rid, frames in pending_frames.items() if frames}
+            )
             capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
@@ -158,7 +239,27 @@ def talker2code2wav_async_chunk(
             chunk_size,
         )
         initial_chunk_size = chunk_size
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+
+    # Resolve the pending frames only when they could actually change the
+    # emission decision: when the request is finishing, or when committing all
+    # of them could reach the next threshold. Below that, no sync happens --
+    # this is what turns a per-step device sync into roughly one per chunk.
+    committed = transfer_manager.code_prompt_token_ids[request_id]
+    pending = pending_frames.get(request_id)
+    if pending and (
+        finished
+        or len(committed) + len(pending)
+        >= _emit_threshold(
+            len(committed),
+            ramp=ramp,
+            chunk_index=int(transfer_manager.ramp_chunk_count.get(request_id, 0)) if ramp is not None else 0,
+            chunk_size=chunk_size,
+            initial_chunk_size=initial_chunk_size,
+        )
+    ):
+        _commit_pending_frames(committed, pending)
+
+    length = len(committed)
 
     if length <= 0:
         if finished:
@@ -246,17 +347,19 @@ def talker2code2wav_async_chunk(
         if ref_context_size > 0:
             if emitted_chunks <= 0:
                 ref_context_request_id = request_id
-                ref_frames = ref_context.tolist()
-                window_frames = ref_frames + window_frames
                 ref_context_included = True
                 left_context_size = ref_context_size
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
-    )
+    # Committed frames are device tensors and already padding-free, so the
+    # codebook-major flatten is one transpose instead of a Python double loop
+    # over num_quantizers x num_frames. The ref context is a host tensor; it is
+    # moved onto the window's device before the concat. One `.cpu()` at the end
+    # keeps the payload host-resident, matching the full-payload path and the
+    # behavior every consumer of CodesStruct.audio already expects.
+    window = _stack_frames(window_frames)
+    if ref_context_included:
+        window = torch.cat([ref_context.to(device=window.device, dtype=window.dtype), window], dim=0)
+    code_predictor_codes = window.transpose(0, 1).reshape(-1).to(device="cpu", dtype=torch.long)
 
     meta = MetaStruct(
         request_id=request_id,

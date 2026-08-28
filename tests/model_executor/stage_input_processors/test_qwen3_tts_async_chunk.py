@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -941,3 +941,238 @@ class TestChunkRampEmission:
         p_seg2_0 = self._emit(tm, rid, 4)
         assert p_seg2_0 is not None
         assert p_seg2_0.meta.left_context_size == 0
+
+
+# ---------------------------------------------------------------------------
+# W3: the per-step device sync is batched, without moving chunk boundaries.
+#
+# The talker zeroes any frame whose layer-0 id is out of codebook range, which
+# covers EOS and the whole prefill span, so all-zero frames are a routine
+# ~2% of a stream rather than an edge case. `length` drives every emission
+# gate, so padding must not be counted -- these tests pin that.
+# ---------------------------------------------------------------------------
+
+
+def _feed(tm, rid, frames, *, ic, finished_on_last=False):
+    """Drive the save path one frame at a time, as the talker does."""
+    emissions = []
+    for i, f in enumerate(frames):
+        last = i == len(frames) - 1
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor([f], dtype=torch.long)}},
+            request=_req(rid, finished=finished_on_last and last, initial_codec_chunk_frames=ic),
+            is_finished=finished_on_last and last,
+        )
+        if payload is not None:
+            emissions.append((i, payload))
+    return emissions
+
+
+def test_padding_frames_do_not_advance_the_chunk_boundary():
+    """A zero frame must not count toward the emission threshold.
+
+    With chunk/IC of 3 and a zero at step 1, the third *real* frame arrives at
+    step 3. Counting the zero would emit one step early carrying two frames.
+    """
+    tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
+    emissions = _feed(tm, "r-pad", ([1, 1, 1, 1], [0, 0, 0, 0], [2, 2, 2, 2], [3, 3, 3, 3]), ic=3)
+
+    assert [step for step, _ in emissions] == [3], "emission must wait for the third real frame"
+    payload = emissions[0][1]
+    # Codebook-major over exactly the three real frames.
+    assert payload.codes.audio.tolist() == [1, 2, 3] * 4
+    # The accumulator holds real frames only, so `length` keeps its meaning.
+    assert len(tm.code_prompt_token_ids["r-pad"]) == 3
+
+
+def test_padding_only_stream_emits_nothing_until_finished():
+    tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
+    emissions = _feed(tm, "r-allpad", ([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]), ic=3)
+    assert emissions == []
+    assert len(tm.code_prompt_token_ids["r-allpad"]) == 0
+
+
+def test_terminal_padding_still_yields_the_empty_finished_payload():
+    """An all-padding take that finishes keeps main's empty-finished sentinel.
+
+    The async-chunk adapter handles an empty terminal payload; substituting a
+    placeholder frame here would inject audible audio and, with a ref code
+    present, trip the reference-prefix check in code2wav.
+    """
+    tm = _tm(chunk_frames=3, left_context=0, initial_chunk_frames=3)
+    emissions = _feed(tm, "r-term", ([0, 0, 0, 0], [0, 0, 0, 0]), ic=3, finished_on_last=True)
+    assert len(emissions) == 1
+    payload = emissions[0][1]
+    assert payload.codes.audio.numel() == 0
+    assert bool(payload.meta.finished)
+
+
+def test_emptiness_check_is_batched_not_per_step(monkeypatch):
+    """The whole point: syncs scale with chunks, not with decode steps."""
+    calls = {"n": 0}
+    real_tolist = torch.Tensor.tolist
+
+    def counting_tolist(self):
+        calls["n"] += 1
+        return real_tolist(self)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+
+    tm = _tm(chunk_frames=25, left_context=0, initial_chunk_frames=25)
+    frames = [[i + 1, i + 1, i + 1, i + 1] for i in range(60)]
+    _feed(tm, "r-sync", frames, ic=25)
+
+    # 60 decode steps, chunk size 25 -> a handful of resolves. The pre-W3 path
+    # did one device sync per step; anything near 60 means the batching broke.
+    assert calls["n"] <= 10, f"expected batched syncs, saw {calls['n']} for 60 steps"
+
+    # Frames past the last threshold stay pending on purpose -- that deferral is
+    # what avoids the sync. Nothing is lost: every frame is in one bucket or the
+    # other, and finishing flushes the remainder.
+    committed = tm.code_prompt_token_ids["r-sync"]
+    pending = tm.pending_frames.get("r-sync", [])
+    assert len(committed) + len(pending) == 60
+    assert pending, "expected frames past the last threshold to still be deferred"
+
+    talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([[61, 61, 61, 61]], dtype=torch.long)}},
+        request=_req("r-sync", finished=True, initial_codec_chunk_frames=25),
+        is_finished=True,
+    )
+    assert len(tm.code_prompt_token_ids["r-sync"]) == 61
+    assert not tm.pending_frames.get("r-sync")
+
+
+def test_committed_frames_survive_a_resolve_boundary():
+    """Frames held pending across a non-resolving step are not dropped."""
+    tm = _tm(chunk_frames=5, left_context=0, initial_chunk_frames=5)
+    frames = [[i + 1, i + 1, i + 1, i + 1] for i in range(5)]
+    emissions = _feed(tm, "r-hold", frames, ic=5)
+    assert [step for step, _ in emissions] == [4]
+    assert emissions[0][1].codes.audio.tolist() == [1, 2, 3, 4, 5] * 4
+
+
+@pytest.mark.parametrize(
+    "chunk_frames,ic,ramp", [(3, 3, None), (5, 2, None), (25, 0, None), (4, 4, None), (5, 0, "1,2,3")]
+)
+@pytest.mark.parametrize("seed", range(8))
+def test_padding_is_invisible_to_the_emission_schedule(chunk_frames, ic, ramp, seed):
+    """The contract: padding must not change which frames go out, or how grouped.
+
+    A stream with padding interleaved must deliver the same real frames, in the
+    same chunk groupings, as the same stream with no padding at all. This is the
+    property the closed PR #5178 broke -- it counted padding toward ``length``,
+    so every chunk boundary moved -- and the property ``_emit_threshold`` exists
+    to preserve. Checked across chunk/initial-chunk/ramp configurations rather
+    than at one hand-picked size.
+
+    Consecutive duplicate windows are collapsed first. A padding frame arriving
+    while the accumulator sits exactly on a chunk boundary makes the gate re-emit
+    the window it just sent; running this same test against upstream's processor
+    reproduces it identically, so it is pre-existing behavior rather than
+    something this change introduces, and it is normalized away here instead of
+    being asserted on.
+    """
+    import random
+
+    rng = random.Random(seed)
+    real = [[i + 1, i + 1, i + 1, i + 1] for i in range(12)]
+    withpad = []
+    for f in real:
+        while rng.random() < 0.3:
+            withpad.append([0, 0, 0, 0])
+        withpad.append(f)
+
+    def run(frames, rid):
+        tm = _tm(chunk_frames=chunk_frames, left_context=0, initial_chunk_frames=ic, chunk_ramp=ramp)
+        out = []
+        for i, f in enumerate(frames):
+            payload = talker2code2wav_async_chunk(
+                transfer_manager=tm,
+                multimodal_output={"codes": {"audio": torch.tensor([f], dtype=torch.long)}},
+                request=_req(rid, finished=i == len(frames) - 1, initial_codec_chunk_frames=ic or None),
+                is_finished=i == len(frames) - 1,
+            )
+            if payload is not None:
+                window = payload.codes.audio.tolist()
+                if not out or out[-1] != window:
+                    out.append(window)
+        return out
+
+    assert run(withpad, "r-pad") == run(real, "r-clean")
+
+
+def test_dynamic_ic_load_counts_requests_still_inside_their_first_chunk():
+    """A request counts toward load from its first frame, not its first resolve.
+
+    Dynamic IC reads how many requests are active. Frames now sit in
+    `pending_frames` until a resolve, so counting only `code_prompt_token_ids`
+    would under-report load by one for every request still inside its first
+    chunk. That is invisible to the padding tests -- both arms would shift
+    together -- so it is pinned directly here.
+    """
+    tm = _tm(chunk_frames=25, left_context=0, max_num_seqs=8)
+
+    # Eight requests each emit one frame. None has resolved into
+    # code_prompt_token_ids yet, but all eight are active.
+    for i in range(8):
+        talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor([[7, 7, 7, 7]], dtype=torch.long)}},
+            request=_req(f"load-{i}", finished=False),
+            is_finished=False,
+        )
+
+    committed_total = sum(len(v) for v in tm.code_prompt_token_ids.values())
+    pending_total = sum(len(v) for v in tm.pending_frames.values())
+    assert committed_total + pending_total == 8
+
+    # A ninth request arriving under that load must see a saturated load factor
+    # (8/8) and therefore the largest IC, not the smallest.
+    max_ic = max_ic_for_chunk_size(25)
+    talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([[9, 9, 9, 9]], dtype=torch.long)}},
+        request=_req("load-new", finished=False),
+        is_finished=False,
+    )
+    assert tm._cached_ic["load-new"] == max_ic
+
+
+def test_abort_releases_accumulated_frames():
+    """Aborted requests must not strand codec frames.
+
+    `finish_requests` handles abort/error/eviction, where no terminal chunk is
+    sent and `cleanup_sender` never runs. The frames are device tensors now, so
+    stranding them holds GPU memory for the adapter's lifetime rather than a
+    small host list.
+    """
+    from vllm.v1.request import RequestStatus
+
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+        OmniChunkTransferAdapter,
+    )
+
+    adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
+    adapter.waiting_for_chunk_waiting_requests = deque()
+    adapter.waiting_for_chunk_running_requests = deque()
+    adapter._held_non_active = deque()
+    adapter.code_prompt_token_ids = defaultdict(list)
+    adapter.pending_frames = {}
+    adapter.cleanup_receiver = lambda _rid: None
+
+    # The two id namespaces must differ here. `finish_requests` is called with
+    # the scheduler's internal id, while both frame stores are keyed by the
+    # user-facing one; a fixture that uses one string for both cannot tell a
+    # working cleanup from a no-op.
+    internal_id, external_id = "internal-uuid-1", "user-facing-1"
+    adapter.request_ids_mapping = {internal_id: external_id}
+    adapter.code_prompt_token_ids[external_id] = [torch.tensor([1, 2, 3, 4])]
+    adapter.pending_frames[external_id] = [torch.tensor([5, 6, 7, 8])]
+
+    adapter.finish_requests(internal_id, RequestStatus.FINISHED_ABORTED, requests={})
+
+    assert external_id not in adapter.code_prompt_token_ids
+    assert external_id not in adapter.pending_frames
