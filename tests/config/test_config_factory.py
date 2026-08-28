@@ -6,7 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2765,6 +2765,36 @@ class TestCLIOverrideFlow:
         for s in stages:
             s.runtime_overrides = StageConfigFactory._merge_cli_overrides(s, overrides)
             assert s.runtime_overrides["enforce_eager"] is True
+
+    def test_topology_owned_fields_survive_final_legacy_merge(self):
+        stage = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="topology_override_test",
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="consumer",
+                        requires_full_payload_input=True,
+                        scheduling_metadata_adapter="pipeline.Adapter",
+                    ),
+                ),
+            ),
+            DeployConfig(),
+        )[0]
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "stage_0_requires_full_payload_input": False,
+                "stage_0_scheduling_metadata_adapter": "cli.Adapter",
+            },
+        )
+
+        assert stage.runtime_overrides["requires_full_payload_input"] is False
+        assert stage.runtime_overrides["scheduling_metadata_adapter"] == "cli.Adapter"
+
+        final_config = stage.to_omegaconf()
+        assert final_config.engine_args.requires_full_payload_input is True
+        assert final_config.engine_args.scheduling_metadata_adapter == "pipeline.Adapter"
 
 
 class TestAuraOmniDeploy:
