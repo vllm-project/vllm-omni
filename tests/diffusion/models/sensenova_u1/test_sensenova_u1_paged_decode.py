@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.lora.layers import BaseLayerWithLoRA
 
 import vllm_omni.diffusion.models.sensenova_u1.paged_decode as paged_decode
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
@@ -391,13 +392,14 @@ def test_a_whole_decode_loop_matches_the_unpaged_path():
     assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
 
 
-class _StubLM:
+class _StubLM(torch.nn.Module):
     """Just enough CUDA work inside the capture for a pool to be allocated."""
 
     def __init__(self, device):
+        super().__init__()
         self.w = torch.randn(16, 64, device=device)
 
-    def __call__(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+    def forward(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
         x = input_ids.float().expand(1, 16) @ self.w
         return SimpleNamespace(logits=x.unsqueeze(0))
 
@@ -545,10 +547,13 @@ def _pipeline_host(monkeypatch, device="cpu", language_model=None):
     monkeypatch.setattr(pipe_mod, "paged_decode_supported", lambda dev, head_dim: True)
     layer = SimpleNamespace(self_attn=SimpleNamespace(head_dim=HEAD_DIM))
     host = object.__new__(pipe_mod.SenseNovaU1Pipeline)
+    # The pipeline is an nn.Module, and the language model assigned below is one
+    # too, so the bookkeeping has to exist before the assignment.
+    torch.nn.Module.__init__(host)
     host.device = device
-    host.language_model = language_model or SimpleNamespace(model=SimpleNamespace(layers=[layer] * LAYERS))
-    if language_model is not None:
-        language_model.model = SimpleNamespace(layers=[layer] * LAYERS)
+    lm = language_model if language_model is not None else torch.nn.Module()
+    lm.model = SimpleNamespace(layers=[layer] * LAYERS)
+    host.language_model = lm
     return pipe_mod, host
 
 
@@ -593,6 +598,41 @@ def test_releasing_the_captures_forces_a_rebuild(monkeypatch):
     after = ctx(host, _dyn_cache(10))
     assert after[0] is not first[0], "the cache survived the release"
     assert after[1] is not first[1], "the runner survived the release"
+
+
+class _FakeLoRAWrapper(BaseLayerWithLoRA):
+    """Stands in for what ``replace_submodule`` leaves in the module tree."""
+
+    def __init__(self):
+        super().__init__()
+
+
+def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypatch):
+    """Base -> LoRA -> base. The reuse test cannot see an adapter change.
+
+    ``DiffusionLoRAManager`` replaces the decode path's linear layers with
+    ``BaseLayerWithLoRA`` and binds, rescales or resets slot 0 per request, and
+    the wrappers stay in the tree afterwards. A graph captured before an adapter
+    was bound would replay without its matmuls; one captured with it bound would
+    survive its removal. Neither moves the shape, dtype or bucket that decide
+    reuse, so the wrappers themselves have to end it.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", lambda lm, cache, dev: SimpleNamespace(cache=cache))
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    base = ctx(host, _dyn_cache(10))
+    assert ctx(host, _dyn_cache(10))[0] is base[0], "the fixture is not reusing to begin with"
+
+    host.language_model.add_module("q_proj", _FakeLoRAWrapper())
+    adapted = ctx(host, _dyn_cache(10))
+    assert adapted[0] is not base[0], "an adapted request reused the base capture"
+    assert adapted[1] is not base[1], "an adapted request reused the base runner"
+
+    back = ctx(host, _dyn_cache(10))
+    assert back[0] is not adapted[0], "a later request reused the adapted capture"
+    assert back[1] is not adapted[1], "a later request reused the adapted runner"
+    assert getattr(host, "_paged_decode", None) is None, "an adapted capture was left on the pipeline"
 
 
 @cuda_only

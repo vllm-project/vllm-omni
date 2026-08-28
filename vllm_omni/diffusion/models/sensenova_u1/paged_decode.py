@@ -91,6 +91,27 @@ def paged_decode_supported(device: torch.device, head_dim: int) -> bool:
     return True
 
 
+def dynamic_lora_wrappers_present(module) -> bool:
+    """True once ``DiffusionLoRAManager`` has wrapped layers under ``module``.
+
+    The manager replaces linear layers with ``BaseLayerWithLoRA`` and then
+    binds, rescales or resets slot 0 per request; the wrappers stay in the tree
+    afterwards. Capture records the module tree and the branches that ran during
+    it, so a graph taken before an adapter was bound would replay without the
+    adapter's matmuls and one taken with it bound would survive its removal --
+    both silently, and neither visible in the shape, dtype and bucket that decide
+    reuse. Nothing captured may outlive a request once these exist.
+
+    The distilled LoRA is not affected: it is fused one-way into the weights and
+    leaves no wrapper behind.
+    """
+    try:
+        from vllm.lora.layers import BaseLayerWithLoRA
+    except ImportError:  # pragma: no cover - depends on the wheel
+        return False
+    return any(isinstance(m, BaseLayerWithLoRA) for m in module.modules())
+
+
 def _bucket_for(length: int) -> int:
     for b in BUCKETS:
         if length <= b:
@@ -316,11 +337,11 @@ class DecodeGraphRunner:
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
-        # A runner is built per request, so capturing into a private pool would
-        # hand every request its own arena and never give it back: measured, that
-        # grew device memory by about 40 MiB per request and never levelled off.
-        # The platform pool is shared, which is what every other captured path
-        # in the tree uses.
+        # A private pool would hand every runner its own arena and never give it
+        # back, and a runner is rebuilt whenever the cache reallocates or a LoRA
+        # wrapper appears: measured, that grew device memory by about 40 MiB per
+        # request and never levelled off. The platform pool is shared, which is
+        # what every other captured path in the tree uses.
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
             logits = self._forward()
         self.captures += 1

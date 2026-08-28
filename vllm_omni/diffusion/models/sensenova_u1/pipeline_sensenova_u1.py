@@ -54,6 +54,7 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
 from .paged_decode import (
     DecodeGraphRunner,
     PagedDecodeCache,
+    dynamic_lora_wrappers_present,
     paged_decode_supported,
 )
 from .sensenova_u1_transformer import (
@@ -737,12 +738,13 @@ class SenseNovaU1Pipeline(
         the kernel reads only ``seqused_k`` of them, which is what lets one
         capture serve every step until the next bucket.
 
-        Both live on the pipeline and are reused across requests. A capture
-        binds the addresses it recorded, so a cache built per request forces a
-        capture per request: measured, that left about 40 MiB of device memory
-        behind on every request and re-captured every time. Reuse rests on the
-        same thing the paged path already rests on -- one sequence in flight per
-        pipeline forward.
+        Both live on the pipeline and are reused across requests unless a LoRA
+        adapter is being served dynamically. A capture binds the addresses it
+        recorded, so a cache built per request forces a capture per request:
+        measured, that left about 40 MiB of device memory behind on every
+        request and re-captured every time. Reuse rests on the same thing the
+        paged path already rests on -- one sequence in flight per pipeline
+        forward.
         """
         if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
             return None
@@ -757,13 +759,17 @@ class SenseNovaU1Pipeline(
         _, kv_heads, prefix, kv_head_dim = layer0.keys.shape
         device = torch.device(self.device)
         num_layers = len(self.language_model.model.layers)
-        decode = getattr(self, "_paged_decode", None)
+        # Reuse is off once the LoRA manager holds the decode path: the test
+        # below sees shape, dtype and bucket, none of which move when an adapter
+        # is bound, rescaled or reset between requests.
+        reuse = not dynamic_lora_wrappers_present(self.language_model)
+        decode = getattr(self, "_paged_decode", None) if reuse else None
         if decode is None or not decode[0].reusable_for(
             num_layers, kv_heads, kv_head_dim, layer0.keys.dtype, prefix + 1
         ):
             cache = PagedDecodeCache(num_layers, kv_heads, kv_head_dim, prefix + 1, device, layer0.keys.dtype)
             decode = (cache, DecodeGraphRunner(self.language_model, cache, device))
-            self._paged_decode = decode
+            self._paged_decode = decode if reuse else None
         if not decode[0].load_prefix(past_key_values):
             return None
         return decode
