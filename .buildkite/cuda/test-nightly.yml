@@ -12,7 +12,6 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
 
-      # Split by cards_* so 1-GPU omni cases do not reserve h100_2.
       - label: ":full_moon: Omni · Function Test with H100 · Single-GPU"
         timeout_in_minutes: 90
         commands:
@@ -37,13 +36,6 @@ steps:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/examples/ -m "full_model and omni and L4" --run-level "full_model"
         mirror_hardwares: l4_4
-
-      # Split by cards_* so 1-GPU omni doc examples do not reserve h100_2.
-      - label: ":full_moon: Omni · Doc Test with H100 · Single-GPU"
-        timeout_in_minutes: 90
-        commands:
-          - pytest -s -v tests/examples/ -m "full_model and omni and H100 and cards_1" --run-level "full_model"
-        mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         timeout_in_minutes: 90
@@ -158,7 +150,7 @@ steps:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m cards_1
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and cards_1"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -172,7 +164,7 @@ steps:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m cards_2
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json -m "H100 and cards_2"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
@@ -207,7 +199,6 @@ steps:
       build.pull_request.labels includes "nightly-test" ||
       build.pull_request.labels includes "diffusion-x2iat-test"
     steps:
-      # Use explicit file shards so single-card cases do not reserve 2+ GPUs.
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · Single-GPU"
         timeout_in_minutes: 120
@@ -228,14 +219,6 @@ steps:
             -m "full_model and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2
-
-      # Split by cards_* so 1-GPU x2i cases do not reserve l4_4.
-      # Multi-GPU stays on l4_4 because zimage / sd3 / flux2 expansion need 4 cards.
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Single-GPU"
-        timeout_in_minutes: 120
-        commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and L4 and cards_1" --run-level "full_model" --ignore=tests/e2e/accuracy
-        mirror_hardwares: l4_1
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Multi-GPU"
         timeout_in_minutes: 120
@@ -271,7 +254,6 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
-      # Split by cards_* so 1-GPU Qwen-Image perf does not reserve h100_4.
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
         key: nightly-diffusion-x2iat-performance-qwen-image-single
         timeout_in_minutes: 180
@@ -281,7 +263,7 @@ steps:
           - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m cards_1
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and cards_1"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -297,7 +279,7 @@ steps:
           - export CACHE_DIT_VERSION=1.5.0
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m cards_4
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and cards_4"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -313,29 +295,28 @@ steps:
       build.pull_request.labels includes "diffusion-x2v-test"
     steps:
 
-      # Split by cards_* so 1-GPU Wan cases do not reserve h100_2.
       - label: ":full_moon: Diffusion X2V · Wan2.2 T2V Function Test · Single-GPU"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and cards_1" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 T2V Function Test · 2-GPU"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and cards_2" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 I2V/TI2V Function Test · Single-GPU"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and cards_1" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 I2V/TI2V Function Test · 2-GPU"
         timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and cards_2" --run-level "full_model"
+          - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Doc Test"
@@ -370,8 +351,6 @@ steps:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
-      # Split by cards_* so 1-GPU Wan perf does not reserve h100_2.
-      # Cosmos3 cases are all cards_2; only Wan has a single-device baseline.
       - label: ":full_moon: Diffusion X2V · Perf Test · Single-GPU"
         key: nightly-diffusion-x2v-performance-single
         timeout_in_minutes: 180
@@ -380,7 +359,7 @@ steps:
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m cards_1
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and cards_1"
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -395,9 +374,9 @@ steps:
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
           - |
             set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m cards_2
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and cards_2"
             EXIT1=$$?
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json -m cards_2
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json -m "H100 and cards_2"
             EXIT2=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
@@ -431,9 +410,6 @@ steps:
           - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_4
 
-      # Split by cards_* so 2-GPU distributed cases do not reserve h100_4.
-      # 8-card EP (test_expert_parallel) is not collected here: it is core_model
-      # and skips on 4-GPU boxes; no h100_8 nightly pool.
       - label: ":full_moon: Diffusion · Distributed Test with H100 · 2-GPU"
         timeout_in_minutes: 60
         commands:
