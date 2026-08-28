@@ -66,7 +66,7 @@ class TestGetProcessGpuMemory:
         tensor = torch.zeros(1000, 1000, device=device)
 
         memory = get_process_gpu_memory(0)
-        assert memory >= 0
+        assert memory is not None and memory > 0
 
         del tensor
         torch.accelerator.empty_cache()

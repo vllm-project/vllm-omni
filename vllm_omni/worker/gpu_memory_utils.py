@@ -122,8 +122,7 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
                 return proc.usedGpuMemory
         logger.warning(
             "PID %d is not in the NVML compute-process list for GPU %d, so per-process "
-            "memory cannot be measured (a PID namespace mismatch is the usual cause); "
-            "will use profiling fallback.",
+            "memory cannot be measured (a PID namespace mismatch is the usual cause).",
             my_pid,
             local_rank,
         )
