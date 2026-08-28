@@ -82,15 +82,15 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .lora import (
-    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
-    load_minimax_h3_native_lora,
-    load_minimax_h3_turbo_lora,
-)
+from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
+)
+from .npu.lora import (
+    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
+    load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
     minimax_h3_packed_sequence,

@@ -11,8 +11,8 @@ from safetensors.torch import save_file
 from vllm.lora.lora_weights import PackedLoRALayerWeights
 
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
-from vllm_omni.diffusion.models.minimax_h3 import lora as lora_module
-from vllm_omni.diffusion.models.minimax_h3.lora import load_minimax_h3_native_lora
+from vllm_omni.diffusion.models.minimax_h3.npu import lora as lora_module
+from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_lora
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
@@ -747,3 +747,78 @@ def test_lora_manager_tp2_splits_native_packed_qkv_per_rank():
         assert lora_b_list[0][0, 0].item() == 1.0
         assert lora_b_list[1][0, 0].item() == 2.0
         assert lora_b_list[2][0, 0].item() == 3.0
+
+
+# 259 modules, of which 52 qkv expand to 3 slices and 52 fc1 expand to 2.
+_EXPECTED_NATIVE_SLICE_PAIRS = 415
+
+
+def _iter_native_slice_pairs(lora_model):
+    """Yield ``(module_name, lora_a, lora_b)`` per slice, flattening packed weights."""
+    for module_name, weights in lora_model.loras.items():
+        lora_a = weights.lora_a if isinstance(weights.lora_a, list) else [weights.lora_a]
+        lora_b = weights.lora_b if isinstance(weights.lora_b, list) else [weights.lora_b]
+        for a, b in zip(lora_a, lora_b, strict=True):
+            yield module_name, a, b
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
+    """The artifact is trained on Ascend, but loading it is not Ascend-only.
+
+    This whole module runs in the CPU job with no ``torch_npu`` present, so a
+    passing run is itself the evidence. The assertions pin the property that
+    makes it portable: tensors land on CPU in exactly the requested dtype and
+    the loader never picks a device, leaving placement to the pipeline.
+    """
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path)
+
+    loaded = load_minimax_h3_native_lora(
+        partition="fl2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=dtype,
+    )
+
+    assert loaded is not None
+    lora_model, _, _ = loaded
+    tensors = {
+        f"{module_name}.{side}": tensor
+        for module_name, a, b in _iter_native_slice_pairs(lora_model)
+        for side, tensor in (("lora_a", a), ("lora_b", b))
+    }
+    assert sum(1 for _ in _iter_native_slice_pairs(lora_model)) == _EXPECTED_NATIVE_SLICE_PAIRS
+    assert {name: tensor.device.type for name, tensor in tensors.items() if tensor.device.type != "cpu"} == {}
+    assert {name: tensor.dtype for name, tensor in tensors.items() if tensor.dtype != dtype} == {}
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
+    """The packed adapter produces the same delta weight on CUDA as on CPU.
+
+    Covers the GPU side of the same artifact: every ``lora_b @ lora_a`` product,
+    including the reordered q/k/v slices, is recomputed on CUDA and compared
+    against the CPU result, so a GPU deployment cannot silently diverge.
+    """
+    path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_native(path)
+
+    loaded = load_minimax_h3_native_lora(
+        partition="fl2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    lora_model, _, _ = loaded
+    checked = 0
+    for module_name, a, b in _iter_native_slice_pairs(lora_model):
+        cpu_delta = b @ a
+        cuda_delta = b.cuda() @ a.cuda()
+        assert cuda_delta.device.type == "cuda"
+        torch.testing.assert_close(cuda_delta.cpu(), cpu_delta, msg=f"delta mismatch for {module_name}")
+        checked += 1
+    assert checked == _EXPECTED_NATIVE_SLICE_PAIRS
